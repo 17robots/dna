@@ -1,0 +1,102 @@
+use "./platform" sdl
+use "std/c"
+use "std/process"
+
+// Document storage outlives rendering. SDL input is copied before the next event.
+// ASCII only for this debug-font experiment; no data is saved to disk.
+struct Editor { bytes: [8192]u8, length: usize, insert: bool, popup: bool, wide: bool }
+fn append(editor: *Editor, text: []const u8) {
+  if editor.length + #len(text) >= 8192 { return }
+  for byte in text { if byte != 10 && (byte < 32 || byte > 126) { return } }
+  for copied_byte in text { editor.bytes[editor.length] = copied_byte editor.length += 1 }
+  editor.bytes[editor.length] = 0
+}
+fn draw(renderer: rawptr, editor: *const Editor) {
+  if !sdl.color(renderer, 17, 22, 26, 255) || !sdl.clear(renderer) { #panic("clear failed") }
+  if !sdl.color(renderer, 201, 213, 220, 255) || !sdl.text(renderer, 14.0, 14.0, &editor.bytes[0]) { #panic("text draw failed") }
+  if editor.insert {
+    column: usize = 0 row: usize = 0
+    for byte in editor.bytes[..editor.length] { if byte == 10 { row += 1 column = 0 } else { column += 1 } }
+    cursor := sdl.Rect{x: 14.0 + #cast(f32) column * 8.0, y: 14.0 + #cast(f32) row * 8.0, width: 2.0, height: 8.0}
+    if !sdl.fill(renderer, &cursor) { #panic("cursor draw failed") }
+  }
+  if editor.popup {
+    width: i32 = 0 height: i32 = 0
+    if !sdl.size(renderer, &width, &height) { #panic("size failed") }
+    fraction: f32 = 0.7 if editor.wide { fraction = 0.9 }
+    logical_width := #cast(f32) width / 2.0 logical_height := #cast(f32) height / 2.0
+    rect := sdl.Rect{x: logical_width * (1.0-fraction) / 2.0, y: logical_height * 0.25, width: logical_width * fraction, height: logical_height * 0.5}
+    if !sdl.color(renderer, 36, 49, 46, 255) || !sdl.fill(renderer, &rect) || !sdl.color(renderer, 210, 228, 216, 255) { #panic("popup draw failed") }
+    label: [256]u8 = []
+    encoded := c.string_from_bytes(label[..], "COMMANDS\n\n1  Layout: compact popup\n2  Layout: wide popup\n\nEscape  return to buffer")
+    if !encoded.ok || !sdl.text(renderer, rect.x + 10.0, rect.y + 10.0, encoded.value) { #panic("palette draw failed") }
+  }
+  if !sdl.present(renderer) { #panic("present failed") }
+}
+// Synthetic SDL events use the same ABI and event loop as keyboard input.
+fn queue_key(value: u32) {
+  event := sdl.Event{}
+  key := #cast(*sdl.KeyEvent) &event
+  key.kind = 768 key.key = value key.down = true
+  if !sdl.push(&event) { #panic("queue key failed") }
+}
+fn main() {
+  editor := Editor{}
+  append(&editor, "fn main() {\n    text := \"hello\"\n    _ = text\n}\n")
+  if !sdl.init(32) { #panic("SDL video init failed") }
+  defer sdl.quit()
+  title: [64]u8 = [] encoded_title := c.string_from_bytes(title[..], "DNA - native experiment")
+  if !encoded_title.ok { #panic("title capacity") }
+  window := sdl.create_window(encoded_title.value, 1000, 700, 32)
+  if window == nil { #panic("window creation failed") }
+  defer sdl.destroy_window(window)
+  renderer := sdl.create_renderer(window, nil)
+  if renderer == nil { #panic("renderer creation failed") }
+  defer sdl.destroy_renderer(renderer)
+  if !sdl.scale(renderer, 2.0, 2.0) { #panic("render scale failed") }
+  draw(renderer, &editor)
+  environment: [16]u8 = [] smoke := process.environment("DYN_EDITOR_SMOKE", environment[..])
+  input_storage: [64]u8 = []
+  initial_length := editor.length
+  if smoke.ok && smoke.found {
+    if #sizeof(sdl.Event) != 128 || #alignof(sdl.Event) != 8 || #sizeof(sdl.KeyEvent) != 40 || #sizeof(sdl.TextEvent) != 32 { #panic("unexpected event ABI") }
+    queue_key(105)
+    simulated := sdl.Event{}
+    incoming_test := #cast(*sdl.TextEvent) &simulated
+    incoming_test.kind = 771
+    input_text := c.string_from_bytes(input_storage[..], "abc")
+    if !input_text.ok { #panic("test text capacity") }
+    incoming_test.text = input_text.value
+    if !sdl.push(&simulated) { #panic("queue text failed") }
+    queue_key(8) queue_key(13) queue_key(27)
+    queue_key(32) queue_key(50) queue_key(32) queue_key(27)
+    quit_event := sdl.Event{} quit_event.words[0] = 256
+    if !sdl.push(&quit_event) { #panic("queue quit failed") }
+  }
+  event := sdl.Event{}
+  for true {
+    if !sdl.wait(&event) { #panic("event wait failed") }
+    kind := #cast(u32) (event.words[0] & 4294967295)
+    if kind == 256 || kind == 528 { break }
+    if kind == 768 {
+      key := #cast(*const sdl.KeyEvent) &event
+      if key.key == 27 { editor.popup = false editor.insert = false if !sdl.stop_text(window) { #panic("stop text failed") } }
+      else if !editor.insert && (key.key == 32 || key.key == 1073741882) { editor.popup = true }
+      else if editor.popup && (key.key == 49 || key.key == 50) { editor.wide = key.key == 50 editor.popup = false }
+      else if !editor.popup && !editor.insert && key.key == 105 { editor.insert = true if !sdl.start_text(window) { #panic("start text failed") } }
+      else if editor.insert && key.key == 8 && editor.length > 0 { editor.length -= 1 editor.bytes[editor.length] = 0 }
+      else if editor.insert && key.key == 13 { append(&editor, "\n") }
+    }
+    if kind == 771 && editor.insert && !editor.popup {
+      incoming := #cast(*const sdl.TextEvent) &event
+      if incoming.text != nil {
+        length := c.string_length(incoming.text, 8192)
+        if length < 8192 { append(&editor, incoming.text[..length]) }
+      }
+    }
+    if kind == 768 || kind == 771 || (kind >= 512 && kind <= 540) { draw(renderer, &editor) }
+  }
+  if smoke.ok && smoke.found {
+    if editor.length != initial_length + 3 || editor.bytes[initial_length] != 97 || editor.bytes[initial_length + 1] != 98 || editor.bytes[initial_length + 2] != 10 || editor.bytes[editor.length] != 0 || editor.insert || editor.popup || !editor.wide { #panic("input and popup smoke failed") }
+  }
+}
