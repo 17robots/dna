@@ -1,0 +1,128 @@
+fn save_command(app: *App, text: []const u8) {
+  // These fixtures edit app.config directly instead of calling config_reload.
+  file_config_invalidate(app)
+  panel(app, Panel.Commands)
+  app.prompt_state.length = copy_text(app.prompt_state.text[..], text)
+  command_submit(app, nil)
+}
+fn finish_saves(app: *App) {
+  deadline := sdl.ticks() + 3000
+  for app.documents.saving.active && sdl.ticks() < deadline {
+    _ = format_tick(app)
+    save_sequence_tick(app)
+    language_test_delay(1)
+  }
+  if app.documents.saving.active {
+    #panic("save sequence deadline")
+  }
+}
+fn save_sequence_smoke() {
+  directory: [4096]u8 = []
+  root := process.environment("DNA_WORKFLOW_TEST", directory[..4095])
+  if !root.found {
+    return
+  }
+  owned := mem.arena_create(#sizeof(App) + 128)
+  scratch := mem.arena_create(2097152)
+  if !owned.ok || !scratch.ok {
+    #panic("save fixture memory")
+  }
+  defer _ = mem.arena_release(&owned.arena)
+  defer _ = mem.arena_release(&scratch.arena)
+  app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
+  app.scratch = &scratch.arena
+  app.running = true
+  settings.defaults(&app.config)
+  defer release_editor_state(app)
+  defer format_release(app)
+  app.directory_state.length = copy_text(app.directory_state.path[..], root.value)
+  first: [4096]u8 = []
+  first_length := copy_text(first[..], root.value)
+  add_text(first[..], &first_length, "/save-first.txt")
+  second: [4096]u8 = []
+  second_length := copy_text(second[..], root.value)
+  add_text(second[..], &second_length, "/save-second.txt")
+  if !fs.write_all(first[..first_length], "first").ok || !fs.write_all(second[..second_length], "second").ok {
+    #panic("save fixture files")
+  }
+  if !new_buffer(app) {
+    #panic("save fixture buffer")
+  }
+  open_file(app, first[..first_length])
+  first_slot := app.documents.active
+  _ = buffer.replace(app.documents.current, "A")
+  open_file(app, second[..second_length])
+  second_slot := app.documents.active
+  _ = buffer.replace(app.documents.current, "B")
+  // Exercise asynchronous format-on-save before advancing to the next file.
+  app.config.language_count = 1
+  language := &app.config.languages[0]
+  language.name_length = copy_text(language.name[..], "text")
+  language.formatter_length = copy_text(language.formatter[..], "cat")
+  language.format_on_save = true
+  save_command(app, "wa")
+  finish_saves(app)
+  if app.documents.active != second_slot || buffer.dirty_cached(app.documents.slots[first_slot].document) || buffer.dirty_cached(app.documents.current) {
+    #panic("wa saves every file and restores focus")
+  }
+  buffer.checkpoint(app.documents.current)
+  _ = buffer.replace(app.documents.current, "failure")
+  buffer.checkpoint(app.documents.current)
+  language.formatter_length = copy_text(language.formatter[..], "false")
+  save_command(app, "xa")
+  finish_saves(app)
+  if !app.running || !buffer.dirty_cached(app.documents.current) {
+    #panic("formatter failure must stop xa")
+  }
+  buffer.undo(app.documents.current)
+  app.config.language_count = 0
+  save_command(app, "x")
+  if app.documents.count != 1 || app.documents.slots[second_slot].document != nil {
+    #panic("x closes active buffer")
+  }
+  if !new_buffer(app) || !buffer.replace(app.documents.current, "unnamed") {
+    #panic("unnamed save fixture")
+  }
+  save_command(app, "xa")
+  if app.prompt_state.panel != Panel.SaveAs || !app.documents.saving.active {
+    #panic("xa requests unnamed destination")
+  }
+  key_input(app, nil, 27, 0)
+  save_sequence_tick(app)
+  if app.documents.saving.active || !app.running || !buffer.dirty_cached(app.documents.current) {
+    #panic("cancel xa preserves buffer")
+  }
+  save_command(app, "xa")
+  app.prompt_state.length = copy_text(app.prompt_state.text[..], root.value)
+  add_text(app.prompt_state.text[..], &app.prompt_state.length, "/missing-parent/output.txt")
+  submit(app, nil)
+  save_sequence_tick(app)
+  if app.documents.saving.active || !app.running || !buffer.dirty_cached(app.documents.current) {
+    #panic("failed xa preserves unsaved buffer")
+  }
+  save_command(app, "xa")
+  app.prompt_state.length = copy_text(app.prompt_state.text[..], root.value)
+  add_text(app.prompt_state.text[..], &app.prompt_state.length, "/save-unnamed.txt")
+  submit(app, nil)
+  finish_saves(app)
+  if app.running || buffer.dirty_cached(app.documents.current) {
+    #panic("xa saves then exits")
+  }
+}
+fn language_popup_smoke(app: *App, typography: *Typography, renderer: rawptr, window: rawptr) {
+  pane := sdl.PixelRect{x: 300, y: 100, width: 400, height: 300}
+  below := language_popup_rect(pane, 30.0, 40.0, 200.0, 60.0, 20.0, 1.0)
+  edge := language_popup_rect(pane, 390.0, 260.0, 250.0, 100.0, 20.0, 1.0)
+  if below.x != 330.0 || below.y != 160.0 || edge.x + edge.width > 700.0 || edge.y + edge.height > 360.0 || edge.y < 100.0 {
+    #panic("localized popup geometry")
+  }
+  hover_notice(app, "Localized hover\nSecond line")
+  draw(renderer, window, app, typography)
+  if app.prompt_state.panel != Panel.Hover {
+    #panic("hover uses localized panel")
+  }
+  key_input(app, typography, 27, 0)
+  if app.prompt_state.panel != Panel.None {
+    #panic("hover escape")
+  }
+}

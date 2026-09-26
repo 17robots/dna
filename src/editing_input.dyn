@@ -1,0 +1,500 @@
+// Shared document editing semantics for file text and explorer drafts.
+fn edit_key(app: *App, key: u32, modifiers: u16) {
+  if !app.view.insert && (modifiers & ModAlt) != 0 {
+    if key == KeyMinus || key == KeyUnderscore {
+      buffer.merge_selections(app.documents.current, key == KeyUnderscore || (modifiers & ModShift) != 0)
+      return
+    }
+    if key == KeyColon || (key == KeySemicolon && (modifiers & ModShift) != 0) {
+      buffer.forward_selections(app.documents.current)
+      return
+    }
+  }
+  if !app.view.insert && (modifiers & ModAlt) != 0 && (key == KeyO || key == KeyI || key == KeyP || key == KeyN) {
+    mode: u32 = 0
+    if key == KeyI {
+      mode = 1
+    } else if key == KeyP {
+      mode = 2
+    } else if key == KeyN {
+      mode = 3
+    }
+    syntax_selection(app, mode)
+    return
+  }
+  if !app.view.insert && key == KeyC && (modifiers & ModShift) != 0 {
+    buffer.checkpoint(app.documents.current)
+    copies := app.input_state.repeat_count
+    if copies == 0 {
+      copies = 1
+    }
+    app.input_state.repeat_count = 0
+    for copied in 0..copies {
+      if !buffer.add_cursor(app.documents.current, (modifiers & ModAlt) == 0) {
+        break
+      }
+    }
+    return
+  }
+  if !app.view.insert && key == KeyComma && (modifiers & ModShift) == 0 {
+    if (modifiers & ModAlt) != 0 && app.documents.current.secondary.count > 0 {
+      app.documents.current.secondary.count -= 1
+      remaining := app.documents.current.secondary.ranges[app.documents.current.secondary.count]
+      app.documents.current.cursor = remaining.cursor
+      app.documents.current.anchor = remaining.anchor
+    }
+    else {
+      app.documents.current.secondary.count = 0
+    }
+    return
+  }
+  if !app.view.insert && (key == KeyI || key == KeyA) && (modifiers & ModShift) != 0 {
+    buffer.checkpoint(app.documents.current)
+    buffer.insert_line_positions(app.documents.current, key == KeyA)
+    app.view.insert = true
+    app.view.extend = false
+    return
+  }
+  if !app.view.insert && (key == KeyI || key == KeyA) && (modifiers & ModShift) == 0 && app.documents.current.secondary.count > 0 {
+    buffer.checkpoint(app.documents.current)
+    buffer.insert_positions(app.documents.current, key == KeyA)
+    app.view.insert = true
+    app.view.extend = false
+    return
+  }
+  if !app.view.insert && (modifiers & ModShift) == 0 && key >= Key0 && key <= Key9 && (key != Key0 || app.input_state.repeat_count > 0) {
+    app.input_state.repeat_count = app.input_state.repeat_count * 10 + #cast(usize) (key - 48)
+    if app.input_state.repeat_count > 999 {
+      app.input_state.repeat_count = 999
+    }
+    return
+  }
+  counted := app.input_state.repeat_count > 0
+  count := app.input_state.repeat_count
+  app.input_state.repeat_count = 0
+  if count == 0 {
+    count = 1
+  }
+  if !app.view.insert && key == KeyO && (modifiers & ModAlt) == 0 {
+    if !buffer.open_lines_count(app.documents.current, (modifiers & ModShift) != 0, count) {
+      notice(app, "Opening lines exceeds document capacity.")
+      return
+    }
+    app.view.insert = true
+    app.view.extend = false
+    return
+  }
+  if !app.view.insert && (key == KeyLeftParen || key == KeyRightParen || ((modifiers & ModShift) != 0 && (key == Key9 || key == Key0))) {
+    backward := key == KeyLeftParen || key == Key9
+    if (modifiers & ModAlt) != 0 {
+      if !buffer.rotate_contents(app.documents.current, backward, count) {
+        notice(app, "Cannot rotate overlapping selections or allocate rotation storage.")
+      }
+    }
+    else {
+      buffer.rotate_selections(app.documents.current, backward, count)
+    }
+    return
+  }
+  if !app.view.insert && (key == KeyF || key == KeyT || key == KeyR) && (modifiers & ModAlt) == 0 {
+    app.input_state.pending = 1
+    if key == KeyT {
+      app.input_state.pending = 3
+    }
+    if (modifiers & ModShift) != 0 {
+      app.input_state.pending += 1
+    }
+    if key == KeyR {
+      if (modifiers & ModShift) != 0 {
+        app.input_state.pending = 0
+        paste_selection(app, false, true)
+        return
+      }
+      app.input_state.pending = 5
+    }
+    app.input_state.pending_count = count
+    return
+  }
+  if !app.view.insert && key == KeyG && (modifiers & ModShift) != 0 {
+    destination := app.documents.current.length
+    if counted {
+      destination = buffer.line_position(app.documents.current, count)
+    }
+    buffer.move_to(app.documents.current, destination, app.view.extend)
+    return
+  }
+  if !app.view.insert && (key == KeyGreater || key == KeyLess || ((key == KeyPeriod || key == KeyComma) && (modifiers & ModShift) != 0)) {
+    if !buffer.indent_lines_by(app.documents.current, key == KeyLess || key == KeyComma, count, indent_width(app), use_tabs(app)) {
+      notice(app, "Indentation exceeds document capacity.")
+    }
+    return
+  }
+  repeatable := key == KeyW || key == KeyB || key == KeyE || key == KeyH || key == KeyJ || key == KeyK || key == KeyL || key == KeyX
+  if !repeatable || app.view.insert {
+    count = 1
+  }
+  original := app.documents.current.cursor
+  extending := app.view.extend
+  secondary_origins: [31]usize = []
+  step: usize = 0
+  for step < count {
+    edit_key_once(app, key, modifiers)
+    if step == 0 && !extending && (key == KeyW || key == KeyB || key == KeyE) {
+      original = app.documents.current.anchor
+    }
+    motion := key == KeyH || key == KeyJ || key == KeyK || key == KeyL || key == KeyW || key == KeyB || key == KeyE || key == KeyX || key == KeyV || key == KeySemicolon || key == KeyUnderscore || (key == KeyMinus && (modifiers & ModShift) != 0) || key == Key0 || key == KeyDollar || (key == Key4 && (modifiers & ModShift) != 0) || (key >= KeyHome && key <= KeyUp)
+    if motion && !(key == KeyJ && (modifiers & ModShift) != 0) {
+      primary := buffer.Selection{cursor: app.documents.current.cursor, anchor: app.documents.current.anchor}
+      primary_extend := app.view.extend
+      index: usize = 0
+      for index < app.documents.current.secondary.count {
+        selection := app.documents.current.secondary.ranges[index]
+        app.documents.current.cursor = selection.cursor
+        app.documents.current.anchor = selection.anchor
+        if key == KeyV {
+          app.view.extend = !primary_extend
+        }
+        edit_key_once(app, key, modifiers)
+        if !extending && (key == KeyW || key == KeyB || key == KeyE) {
+          if step == 0 {
+            secondary_origins[index] = app.documents.current.anchor
+          } else {
+            app.documents.current.anchor = secondary_origins[index]
+          }
+        }
+        app.documents.current.secondary.ranges[index] = buffer.Selection{cursor: app.documents.current.cursor, anchor: app.documents.current.anchor}
+        index += 1
+      }
+      app.documents.current.cursor = primary.cursor
+      app.documents.current.anchor = primary.anchor
+      app.view.extend = primary_extend
+    }
+    step += 1
+    if key == KeyW || key == KeyB || key == KeyE {
+      if !extending {
+        app.documents.current.anchor = original
+      }
+    }
+  }
+}
+fn edit_key_once(app: *App, key: u32, modifiers: u16) {
+  doc := app.documents.current
+  shift := (modifiers & ModShift) != 0
+  extend := app.view.extend || shift
+  if !app.view.insert && (key == KeyH || key == KeyL || key == KeyJ || key == KeyK || (key >= KeyRight && key <= KeyUp)) && !(shift && (key == KeyJ || key == KeyK)) {
+    buffer.checkpoint(doc)
+    if key == KeyJ || key == KeyK || key == KeyDown || key == KeyUp {
+      buffer.select_vertical(doc, key == KeyJ || key == KeyDown, extend)
+    }
+    else {
+      motion_position := buffer.head(doc)
+      if key == KeyH || key == KeyLeft {
+        motion_position = buffer.previous(doc, motion_position)
+      } else {
+        motion_position = buffer.next(doc, motion_position)
+      }
+      buffer.select_to(doc, motion_position, extend)
+    }
+    return
+  }
+  if !app.view.insert && (key == KeyHome || key == KeyEnd || key == Key0 || key == KeyDollar || (key == Key4 && shift)) {
+    line_key: u32 = KeyH
+    if key == KeyEnd || key == KeyDollar || key == Key4 {
+      line_key = KeyL
+    }
+    goto_motion(doc, line_key, 0, app.view.extend)
+    return
+  }
+  if !app.view.insert && key == KeyJ && shift {
+    buffer.join_lines(doc)
+    return
+  }
+  if !app.view.insert && key == KeyX && shift {
+    buffer.extend_line_above(doc)
+    return
+  }
+  if !app.view.insert && (key == KeyUnderscore || (key == KeyMinus && shift)) {
+    buffer.trim_selection(doc)
+    return
+  }
+  if !app.view.insert && (key == KeyTilde || key == KeyGrave) {
+    mode: u8 = 0
+    if key == KeyGrave && !shift {
+      mode = 1
+      if (modifiers & ModAlt) != 0 {
+        mode = 2
+      }
+    }
+    buffer.change_case(doc, mode)
+    return
+  }
+  if key == KeyLeft || (!app.view.insert && key == KeyH) {
+    buffer.checkpoint(doc)
+    buffer.move_to(doc, buffer.previous(doc, doc.cursor), extend)
+  }
+  else if key == KeyRight || (!app.view.insert && key == KeyL) {
+    buffer.checkpoint(doc)
+    buffer.move_to(doc, buffer.next(doc, doc.cursor), extend)
+  }
+  else if key == KeyUp || (!app.view.insert && key == KeyK) {
+    buffer.checkpoint(doc)
+    buffer.vertical(doc, false, extend)
+  }
+  else if key == KeyDown || (!app.view.insert && key == KeyJ) {
+    buffer.checkpoint(doc)
+    buffer.vertical(doc, true, extend)
+  }
+  else if key == KeyHome {
+    buffer.move_to(doc, buffer.line_start(doc, doc.cursor), extend)
+  }
+  else if key == KeyEnd {
+    buffer.move_to(doc, buffer.line_end(doc, doc.cursor), extend)
+  }
+  else if key == KeyPageUp || key == KeyPageDown {
+    buffer.checkpoint(doc)
+    for count in 0..20 {
+      buffer.vertical(doc, key == KeyPageDown, extend)
+    }
+  }
+  else if app.view.insert {
+    if key == KeyBackspace {
+      buffer.erase_all(doc, true)
+    }
+    else if key == KeyDelete {
+      buffer.erase_all(doc, false)
+    }
+    else if key == KeyReturn {
+      changed(app, "\n")
+    }
+    else if key == KeyTab {
+      if use_tabs(app) {
+        changed(app, "\t")
+        return
+      }
+      spaces: [16]u8 = []
+      indent := indent_width(app)
+      for fill in 0..indent {
+        spaces[fill] = 32
+      }
+      changed(app, spaces[..indent])
+    }
+  }
+  else if key == KeyW || key == KeyB || key == KeyE {
+    buffer.checkpoint(doc)
+    direction: u8 = 0
+    if key == KeyB {
+      direction = 1
+    } else if key == KeyE {
+      direction = 2
+    }
+    buffer.word(doc, direction, shift, app.view.extend)
+  }
+  else if key == KeyPercent || (key == Key5 && shift) {
+    doc.anchor = 0
+    doc.cursor = doc.length
+    app.view.extend = true
+  }
+  else if key == KeySemicolon {
+    if (modifiers & ModAlt) != 0 {
+      saved := doc.anchor
+      doc.anchor = doc.cursor
+      doc.cursor = saved
+    } else {
+      buffer.select_to(doc, buffer.head(doc), false)
+      app.view.extend = false
+    }
+  }
+  else if key == Key0 {
+    buffer.move_to(doc, buffer.line_start(doc, doc.cursor), app.view.extend)
+  }
+  else if key == KeyDollar || (key == Key4 && shift) {
+    buffer.move_to(doc, buffer.line_end(doc, doc.cursor), app.view.extend)
+  }
+  else if key == KeyI {
+    position := buffer.start(doc)
+    if shift {
+      position = buffer.line_nonblank(doc, buffer.head(doc))
+    }
+    buffer.move_to(doc, position, false)
+    buffer.checkpoint(doc)
+    app.view.insert = true
+    app.view.extend = false
+  }
+  else if key == KeyA {
+    position_after := buffer.end(doc)
+    if doc.cursor == doc.anchor {
+      position_after = buffer.next(doc, doc.cursor)
+    }
+    if shift {
+      position_after = buffer.line_end(doc, buffer.head(doc))
+    }
+    buffer.move_to(doc, position_after, false)
+    buffer.checkpoint(doc)
+    app.view.insert = true
+    app.view.extend = false
+  }
+  else if key == KeyO {
+    if !buffer.open_lines(doc, shift) {
+      notice(app, "Opening lines exceeds document capacity.")
+      return
+    }
+    app.view.insert = true
+    app.view.extend = false
+  }
+  else if key == KeyV {
+    app.view.extend = !app.view.extend
+    if app.view.extend {
+      buffer.select_current(doc)
+    }
+  }
+  else if key == KeyX {
+    low := buffer.start(doc)
+    high := buffer.end(doc)
+    if buffer.lines_selected(doc) {
+      doc.cursor = buffer.line_end(doc, high)
+      if doc.cursor < doc.length {
+        doc.cursor += 1
+      }
+      doc.anchor = low
+    } else {
+      buffer.select_line(doc)
+    }
+    doc.goal_valid = false
+  }
+  else if key == KeyD || key == KeyC {
+    if (modifiers & ModAlt) == 0 {
+      if doc.anchor == doc.cursor {
+        doc.anchor = buffer.next(doc, doc.cursor)
+      }
+      if !clipboard_copy(app) {
+        return
+      }
+      app.register_state.selected = 0
+    }
+    buffer.checkpoint(doc)
+    buffer.erase_all(doc, false)
+    if key != KeyC {
+      buffer.checkpoint(doc)
+    }
+    app.view.extend = false
+    if key == KeyC {
+      app.view.insert = true
+    }
+  }
+  else if key == KeyU {
+    if shift {
+      buffer.redo(doc)
+    } else {
+      buffer.undo(doc)
+    }
+  }
+  else if key == KeyG {
+    if shift {
+      buffer.move_to(doc, doc.length, extend)
+    } else {
+      buffer.move_to(doc, 0, extend)
+    }
+  }
+  else if key == KeyY {
+    _ = clipboard_copy(app)
+    app.register_state.selected = 0
+  }
+  else if key == KeyP {
+    paste_selection(app, shift, false)
+  }
+}
+
+fn goto_key(app: *App, typography: *Typography, key: u32) {
+  if !app.input_state.goto_explorer && (key == KeyD || key == KeyR || key == KeyY || key == KeyI) {
+    app.prompt_state.panel = Panel.None
+    kind: usize = 3
+    if key == KeyR {
+      kind = 4
+    } else if key == KeyY {
+      kind = 11
+    } else if key == KeyI {
+      kind = 12
+    }
+    lsp_request(app, kind, "")
+    return
+  }
+  doc := app.documents.current
+  if app.input_state.goto_explorer {
+    doc = app.explorer.document
+  }
+  if key == KeyG || key == KeyE || key == KeyH || key == KeyL || key == KeyS {
+    if doc == nil {
+      return
+    }
+    buffer.checkpoint(doc)
+    extend := app.view.extend
+    if app.input_state.goto_explorer {
+      extend = app.explorer.extend
+    }
+    goto_motion(doc, key, app.input_state.goto_count, extend)
+    primary := buffer.Selection{cursor: doc.cursor, anchor: doc.anchor}
+    index: usize = 0
+    for index < doc.secondary.count {
+      selection := doc.secondary.ranges[index]
+      doc.cursor = selection.cursor
+      doc.anchor = selection.anchor
+      goto_motion(doc, key, app.input_state.goto_count, extend)
+      doc.secondary.ranges[index] = buffer.Selection{cursor: doc.cursor, anchor: doc.anchor}
+      index += 1
+    }
+    doc.cursor = primary.cursor
+    doc.anchor = primary.anchor
+    app.prompt_state.panel = Panel.None
+    if app.input_state.goto_explorer {
+      app.prompt_state.panel = Panel.Directory
+      explorer_selected(app)
+    }
+  } else if !app.input_state.goto_explorer && (key == KeyT || key == KeyC || key == KeyB) {
+    app.prompt_state.panel = Panel.None
+    goto_screen(app, typography, key)
+  }
+  else if !app.input_state.goto_explorer && key == KeyA {
+    app.prompt_state.panel = Panel.None
+    goto_alternate(app)
+  }
+  else if !app.input_state.goto_explorer && key == KeyF {
+    app.prompt_state.panel = Panel.None
+    goto_file(app)
+  }
+  else if key == KeyN {
+    action(app, typography, 22)
+  }
+  else if key == KeyP {
+    action(app, typography, 23)
+  }
+  else {
+    return
+  }
+  app.input_state.goto_explorer = false
+}
+
+fn goto_motion(doc: *buffer.Document, key: u32, count: usize, extend: bool) {
+  position: usize = 0
+  current := buffer.head(doc)
+  if key == KeyG && count > 0 {
+    position = buffer.line_position(doc, count)
+  }
+  else if key == KeyE {
+    position = doc.length
+  }
+  else if key == KeyH {
+    position = buffer.line_start(doc, current)
+  }
+  else if key == KeyL {
+    position = buffer.line_last(doc, current)
+  }
+  else if key == KeyS {
+    position = buffer.line_nonblank(doc, current)
+  }
+  if key == KeyH || key == KeyL || key == KeyS {
+    buffer.select_to(doc, position, extend)
+  }
+  else {
+    buffer.move_to(doc, position, extend)
+  }
+}

@@ -1,0 +1,67 @@
+struct DiagnosticRect { x, y, w, h: f32 }
+struct DiagnosticText { text: *const u8 }
+extern fn diagnostic_color "SDL_GetRenderDrawColor"(renderer: rawptr, r: *u8, g: *u8, b: *u8, a: *u8) bool
+extern fn diagnostic_find "strstr"(text: *const u8, needle: *const u8) *const u8
+extern fn diagnostic_character "strchr"(text: *const u8, character: i32) *const u8
+extern fn diagnostic_ticks "SDL_GetTicks"() u64
+band: DiagnosticRect = DiagnosticRect{}
+stage: u32 = 0
+underline: bool = false
+hover: bool = false
+started: u64 = 0
+pub fn SDL_RenderFillRect(renderer: rawptr, rectangle: *const DiagnosticRect) bool {
+  red: u8 = 0
+  green: u8 = 0
+  blue: u8 = 0
+  alpha: u8 = 0
+  _ = diagnostic_color(renderer, &red, &green, &blue, &alpha)
+  if rectangle != nil && red == 230 && green == 110 && blue == 110 && rectangle.h <= 4.0 && rectangle.w > 1.0 {
+    band = rectangle.*
+    underline = true
+  }
+  next := #cast(*fn(rawptr, *const DiagnosticRect) bool) probe_next("SDL_RenderFillRect\0")
+  return next(renderer, rectangle)
+}
+pub fn TTF_DrawRendererText(text: *DiagnosticText, x: f32, y: f32) bool {
+  invalid: []const u8 = "invalid syntax\0"
+  normal: []const u8 = "NORMAL\0"
+  if stage >= 3 && text.text != nil && diagnostic_find(text.text, &invalid[0]) != nil && diagnostic_character(text.text, 10) == nil && diagnostic_find(text.text, &normal[0]) == nil {
+    hover = true
+  }
+  next := #cast(*fn(*DiagnosticText, f32, f32) bool) probe_next("TTF_DrawRendererText\0")
+  return next(text, x, y)
+}
+pub fn SDL_WaitEventTimeout(event: rawptr, milliseconds: i32) bool {
+  if started == 0 {
+    started = diagnostic_ticks()
+  }
+  probe_clear(event)
+  if stage < 2 {
+    probe_kind(event).* = 768
+    probe_u32(event, 28).* = 103
+    if stage != 0 {
+      probe_u32(event, 28).* = 101
+    }
+    stage += 1
+    return true
+  }
+  if underline && stage == 2 {
+    stage = 3
+    probe_kind(event).* = 1024
+    probe_float(event, 28).* = band.x + band.w * 0.5
+    probe_float(event, 32).* = band.y - 8.0
+    return true
+  }
+  if hover {
+    probe_log("PASS visible diagnostic underline and delayed mouse hover\n")
+    probe_kind(event).* = 256
+    return true
+  }
+  probe_check(diagnostic_ticks() - started <= 7000, "diagnostic underline/hover deadline")
+  timeout := milliseconds
+  if timeout > 50 {
+    timeout = 50
+  }
+  next := #cast(*fn(rawptr, i32) bool) probe_next("SDL_WaitEventTimeout\0")
+  return next(event, timeout)
+}

@@ -1,149 +1,842 @@
-use "std/unicode/utf8" utf8
-pub const Capacity: usize = 65535
-pub struct Snapshot { bytes: [65536]u8, length: usize, cursor: usize, anchor: usize }
+use "std/unicode/utf8"
+use "std/mem"
+
+#link("c")
+
+// Largest document in bytes. Storage is reserved address space (see
+// reserve), so only the text actually present occupies memory.
+pub const Capacity: usize = 268435455
+// Documents of this size or larger skip syntax highlighting and language servers.
+pub const LargeFile: usize = 16777216
+
+pub struct RowAnchors { count: usize, offsets: [256]usize }
+pub struct Snapshot {
+  line_positions: bool,
+  prefix: usize,
+  removed: usize,
+  inserted: usize,
+  offset: usize,
+  length: usize,
+  cursor: usize,
+  anchor: usize,
+  bytes: []u8,
+  secondary: SelectionSet,
+  rows: RowAnchors,
+}
+
 // Allocate Document in an arena, not on the call stack. All retained bytes are
 // owned here; no slices from file I/O, SDL, or frame scratch survive a call.
 pub struct Document {
-  bytes: [65536]u8, length: usize, cursor: usize, anchor: usize,
-  saved: [65536]u8, saved_length: usize,
-  history: [64]Snapshot, history_count: usize, history_at: usize,
-  revision: u64,
+  batching, goal_valid: bool,
+  dirty_cached, dirty_text: bool,
+  dirty_revision, dirty_epoch, dirty_scans: u64,
+  // Borrowed views, valid until the next document mutation. They share bytes
+  // until an edit materializes their separate owned backing below.
+  saved, checkpoint_bytes: []u8,
+  secondary: SelectionSet,
+  length, cursor, anchor, saved_length, history_next, history_count, history_at, line_count, goal_column, goal_cursor, goal_anchor: usize,
+  history: [64]Snapshot,
+  saved_epoch, checkpoint_revision, revision, goal_revision: u64,
+  marks: [992]usize,
+  rows, saved_rows: RowAnchors,
+  // Keep byte storage after metadata. Only initialized prefixes are ever read.
+  // Capacity + 1 each; undo history holds four documents' worth of deltas.
+  bytes: [268435456]u8, saved_storage: [268435456]u8, history_storage: [1073741824]u8,
+  line_offsets: [268435456]u32, checkpoint_storage: [268435456]u8,
+}
+
+// The Dyn runtime links its own byte-at-a-time memcpy/memmove into every
+// executable. Bulk document copies call glibc's checked entry points, which
+// reach its vectorized implementations. The bound is length + 1 because LLVM
+// rewrites a check it can prove (bound == length) back into plain memcpy.
+extern fn copy_checked "__memcpy_chk"(destination: *u8, source: *const u8, length: usize, room: usize) rawptr
+extern fn move_checked "__memmove_chk"(destination: *u8, source: *const u8, length: usize, room: usize) rawptr
+pub fn copy_bytes(destination: *u8, source: *const u8, length: usize) rawptr {
+  return copy_checked(destination, source, length, length + 1)
+}
+pub fn move_bytes(destination: *u8, source: *const u8, length: usize) rawptr {
+  return move_checked(destination, source, length, length + 1)
+}
+extern fn compare_bytes "memcmp"(a: *const u8, b: *const u8, length: usize) i32
+extern fn find_byte "memchr"(source: *const u8, byte: i32, length: usize) rawptr
+
+// Reserved, not committed: pages cost memory only once written, and the
+// mapping is exempt from overcommit accounting, so Capacity-sized storage is
+// cheap for small files. Release with mem.arena_release like any owned arena.
+pub fn reserve(size: usize) mem.ArenaResult {
+  if size == 0 {
+    return mem.ArenaResult{error: mem.ErrorKind.Capacity}
+  }
+  // PROT_READ | PROT_WRITE; MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE.
+  address := #syscall(9, 0, size, 3, 16418, -1, 0)
+  if address < 0 {
+    return mem.ArenaResult{error: mem.ErrorKind.System, code: address}
+  }
+  return mem.ArenaResult{arena: mem.Arena{data: (#cast(*u8) address)[..size], owns_memory: true}, ok: true}
+}
+// Own the full bounded address range without eagerly touching unused text/undo
+// pages. Works with reused/poisoned arenas too: metadata is explicitly zeroed,
+// and load/checkpoint initialize every byte before it becomes readable.
+pub fn allocate(arena: *mem.Arena) *Document {
+  // Sparse bounded storage must not fault 2 MiB huge pages for tiny prefixes.
+  // Owned arenas are page-aligned mappings; borrowed arenas remain untouched.
+  if arena.owns_memory {
+    _ = #syscall(28, &arena.data[0], #len(arena.data), 15)
+  }
+  memory := mem.arena_push_uninit(arena, #sizeof(Document), #alignof(Document))
+  document := #cast(*Document) memory
+  metadata := #cast(usize) &document.bytes[0] - #cast(usize) memory
+  mem.zero(memory[..metadata])
+  _ = load(document, "")
+  return document
 }
 pub fn equal(a: []const u8, b: []const u8) bool {
-  if #len(a) != #len(b) { return false }
-  index: usize = 0 for index < #len(a) { if a[index] != b[index] { return false } index += 1 }
-  return true
+  if #len(a) != #len(b) {
+    return false
+  }
+  if #len(a) == 0 {
+    return true
+  }
+  return compare_bytes(&a[0], &b[0], #len(a)) == 0
 }
+// UTF-8 without NUL. Aligned ASCII runs are checked a word at a time, so
+// loading a large file costs a fraction of decoding it byte by byte.
 pub fn valid(text: []const u8) bool {
-  if #len(text) > Capacity || !utf8.valid(text) { return false }
-  for byte in text { if byte == 0 { return false } }
+  length := #len(text)
+  if length > Capacity {
+    return false
+  }
+  at: usize = 0
+  for at < length {
+    if length - at >= 8 && (#cast(usize) &text[at] & 7) == 0 {
+      word := (#cast(*const u64) &text[at]).*
+      // No high bits means every byte is ASCII; adding 0x7f to each byte then
+      // sets its high bit exactly when the byte is nonzero, without carries.
+      if (word & 0x8080808080808080) == 0 && ((word + 0x7f7f7f7f7f7f7f7f) & 0x8080808080808080) == 0x8080808080808080 {
+        at += 8
+        continue
+      }
+    }
+    byte := text[at]
+    if byte == 0 {
+      return false
+    }
+    if byte < 128 {
+      at += 1
+      continue
+    }
+    decoded := utf8.decode(text, at)
+    if !decoded.ok {
+      return false
+    }
+    at += decoded.width
+  }
   return true
 }
 fn snapshot(document: *Document, index: usize) {
+  document.checkpoint_revision = document.revision
   entry := &document.history[index]
-  entry.length = document.length entry.cursor = document.cursor entry.anchor = document.anchor
-  position: usize = 0 for position <= document.length { entry.bytes[position] = document.bytes[position] position += 1 }
+  entry.secondary = document.secondary
+  entry.rows = document.rows
+  entry.length = document.length
+  entry.cursor = document.cursor
+  entry.anchor = document.anchor
+  document.checkpoint_bytes = document.bytes[..]
 }
 pub fn mark_saved(document: *Document) {
+  document.saved_epoch += 1
+  document.saved_rows = document.rows
   document.saved_length = document.length
-  index: usize = 0 for index <= document.length { document.saved[index] = document.bytes[index] index += 1 }
+  document.saved = document.bytes[..]
+}
+// A saved/checkpoint baseline can share unchanged text. Materialize its owned
+// backing immediately before mutation, so read-only buffers need one text copy.
+fn preserve_saved(document: *Document) {
+  if &document.saved[0] == &document.bytes[0] {
+    _ = copy_bytes(&document.saved_storage[0], &document.bytes[0], document.length + 1)
+    document.saved = document.saved_storage[..]
+  }
+}
+fn before_change(document: *Document) {
+  preserve_saved(document)
+  if &document.checkpoint_bytes[0] == &document.bytes[0] {
+    _ = copy_bytes(&document.checkpoint_storage[0], &document.bytes[0], document.length + 1)
+    document.checkpoint_bytes = document.checkpoint_storage[..]
+  }
 }
 pub fn load(document: *Document, text: []const u8) bool {
-  if !valid(text) { return false }
-  document.length = #len(text) document.cursor = 0 document.anchor = 0
-  index: usize = 0 for index < #len(text) { document.bytes[index] = text[index] index += 1 }
+  // Storage is fixed; larger text would overrun the byte arrays.
+  if #len(text) > Capacity || !valid(text) {
+    return false
+  }
+  for marker in 0..992 {
+    document.marks[marker] = 0
+  }
+  document.secondary.count = 0
+  document.rows.count = 0
+  document.length = #len(text)
+  document.cursor = 0
+  document.anchor = 0
+  if #len(text) > 0 {
+    _ = move_bytes(&document.bytes[0], &text[0], #len(text))
+  }
   document.bytes[document.length] = 0
-  document.history_at = 0 document.history_count = 1 document.revision += 1
-  mark_saved(document) snapshot(document, 0)
+  document.history_at = 0
+  document.history_count = 1
+  document.revision += 1
+  document.history_next = 1
+  document.history[0].offset = 0
+  document.history[0].bytes = document.history_storage[..1]
+  document.history[0].prefix = 0
+  document.history[0].removed = 0
+  document.history[0].inserted = 0
+  document.history_storage[0] = 0
+  index_lines(document)
+  mark_saved(document)
+  snapshot(document, 0)
   return true
 }
-pub fn dirty(document: *const Document) bool { return !equal(document.bytes[..document.length], document.saved[..document.saved_length]) }
-pub fn start(document: *const Document) usize { if document.cursor < document.anchor { return document.cursor } return document.anchor }
-pub fn end(document: *const Document) usize { if document.cursor > document.anchor { return document.cursor } return document.anchor }
-pub fn previous(document: *const Document, offset: usize) usize {
-  if offset == 0 { return 0 }
-  at := offset - 1 for at > 0 && (document.bytes[at] & 192) == 128 { at -= 1 }
-  return at
-}
-pub fn next(document: *const Document, offset: usize) usize {
-  if offset >= document.length { return document.length }
-  decoded := utf8.decode(document.bytes[..document.length], offset)
-  return offset + decoded.width
-}
-pub fn replace(document: *Document, text: []const u8) bool {
-  if !valid(text) { return false }
-  low := start(document) high := end(document)
-  removed := high - low
-  if #len(text) > Capacity - (document.length - removed) { return false }
-  tail := document.length - high
-  if #len(text) > removed {
-    index := tail for index > 0 { index -= 1 document.bytes[low + #len(text) + index] = document.bytes[high + index] }
-  } else {
-    forward: usize = 0 for forward < tail { document.bytes[low + #len(text) + forward] = document.bytes[high + forward] forward += 1 }
+fn same_rows(a: *const RowAnchors, b: *const RowAnchors) bool {
+  if a.count != b.count {
+    return false
   }
-  copied: usize = 0 for copied < #len(text) { document.bytes[low + copied] = text[copied] copied += 1 }
-  document.length = document.length - removed + #len(text)
-  document.bytes[document.length] = 0 document.cursor = low + #len(text) document.anchor = document.cursor document.revision += 1
+  for index in 0..a.count {
+    if a.offsets[index] != b.offsets[index] {
+      return false
+    }
+  }
   return true
 }
-pub fn checkpoint(document: *Document) {
-  entry := &document.history[document.history_at]
-  if equal(document.bytes[..document.length], entry.bytes[..entry.length]) { return }
-  if document.history_at == 63 {
-    index: usize = 1 for index < 64 { destination := &document.history[index - 1] source := &document.history[index]
-      destination.length = source.length destination.cursor = source.cursor destination.anchor = source.anchor
-      copied: usize = 0 for copied <= source.length { destination.bytes[copied] = source.bytes[copied] copied += 1 } index += 1 }
-    document.history_at = 62
+// Optional stable row identities, kept outside editable/clipboard text and in history.
+pub fn track_rows(document: *Document, count: usize) {
+  if count > 256 {
+    return
   }
-  document.history_at += 1 document.history_count = document.history_at + 1
+
+  checkpoint(document)
+  document.rows.count = count
+  offset: usize = 0
+
+  for index in 0..count {
+    document.rows.offsets[index] = offset
+    offset = line_end(document, offset) + 1
+  }
+
+  mark_saved(document)
   snapshot(document, document.history_at)
 }
-fn restore(document: *Document) {
-  entry := &document.history[document.history_at]
-  document.length = entry.length document.cursor = entry.cursor document.anchor = entry.anchor
-  index: usize = 0 for index <= entry.length { document.bytes[index] = entry.bytes[index] index += 1 }
+// 257 means an ambiguous join of two existing rows. Callers must not apply it.
+pub fn row_id(document: *const Document, offset: usize) usize {
+  beginning := line_start(document, offset)
+  found: usize = 0
+
+  for index in 0..document.rows.count {
+    if document.rows.offsets[index] == beginning {
+      if found != 0 {
+        return 257
+      }
+      found = index + 1
+    }
+  }
+  return found
+}
+// Text equality is stable until content or the saved baseline changes. Row
+// identities remain independently compared because explorer staging edits them.
+pub fn dirty_cached(document: *Document) bool {
+  if !document.dirty_cached || document.dirty_revision != document.revision || document.dirty_epoch != document.saved_epoch {
+    document.dirty_text = !equal(document.bytes[..document.length], document.saved[..document.saved_length])
+    document.dirty_revision = document.revision
+    document.dirty_epoch = document.saved_epoch
+    document.dirty_cached = true
+    document.dirty_scans += 1
+  }
+  return document.dirty_text || !same_rows(&document.rows, &document.saved_rows)
+}
+pub fn dirty(document: *const Document) bool {
+  return !equal(document.bytes[..document.length], document.saved[..document.saved_length]) || !same_rows(&document.rows, &document.saved_rows)
+}
+pub fn start(document: *const Document) usize {
+  if document.cursor < document.anchor {
+    return document.cursor
+  }
+  return document.anchor
+}
+pub fn end(document: *const Document) usize {
+  if document.cursor > document.anchor {
+    return document.cursor
+  }
+  return document.anchor
+}
+// Retained view positions follow edits, including changes applied by undo/redo.
+fn move_marks(document: *Document, low: usize, high: usize, inserted: usize) {
+  for mark in 0..992 {
+    offset := document.marks[mark]
+    if offset > document.length {
+      offset = document.length
+    }
+    if offset >= high {
+      offset = offset - (high - low) + inserted
+    }
+    else if offset > low {
+      offset = low + inserted
+    }
+    document.marks[mark] = offset
+  }
+  selection: usize = 0
+  for selection < document.secondary.count {
+    range := &document.secondary.ranges[selection]
+    range.cursor = shifted_mark(range.cursor, low, high, inserted, document.length)
+    range.anchor = shifted_mark(range.anchor, low, high, inserted, document.length)
+    selection += 1
+  }
+}
+fn shifted_mark(position: usize, low: usize, high: usize, inserted: usize, length: usize) usize {
+  offset := position
+  if offset > length {
+    offset = length
+  }
+  if offset >= high {
+    return offset - (high - low) + inserted
+  }
+  if offset > low {
+    return low + inserted
+  }
+  return offset
+}
+pub fn replace(document: *Document, text: []const u8) bool {
+  if !valid(text) {
+    return false
+  }
+  low := start(document)
+  high := end(document)
+  removed := high - low
+  if #len(text) > Capacity - (document.length - removed) {
+    return false
+  }
+  before_change(document)
+  move_marks(document, low, high, #len(text))
+  // Whole-row deletion removes its identity; filename replacement retains it.
+  // Inserting at a row start moves its identity with the original text.
+  identity: usize = 0
+  for identity < document.rows.count {
+    offset := document.rows.offsets[identity]
+    if offset <= document.length {
+      ending := line_end(document, offset)
+      if low <= offset && high > ending {
+        offset = Capacity + 1
+      }
+      else if offset >= high {
+        offset = offset - removed + #len(text)
+      }
+      else if offset >= low {
+        offset = low
+      }
+      document.rows.offsets[identity] = offset
+    }
+    identity += 1
+  }
+  replace_lines(document, low, high, text)
+  tail := document.length - high
+  if tail > 0 {
+    _ = move_bytes(&document.bytes[low + #len(text)], &document.bytes[high], tail)
+  }
+  if #len(text) > 0 {
+    _ = copy_bytes(&document.bytes[low], &text[0], #len(text))
+  }
+  document.length = document.length - removed + #len(text)
+  document.bytes[document.length] = 0
+  document.cursor = low + #len(text)
+  document.anchor = document.cursor
   document.revision += 1
+  identity = 0
+  for identity < document.rows.count {
+    if document.rows.offsets[identity] <= document.length {
+      document.rows.offsets[identity] = line_start(document, document.rows.offsets[identity])
+    }
+    identity += 1
+  }
+  return true
+}
+// Shrinking block sizes for the checkpoint diff's prefix and suffix scans.
+const Blocks: [4]usize = [65536, 1024, 16, 1]
+pub fn checkpoint(document: *Document) {
+  if document.batching {
+    return
+  }
+  entry := &document.history[document.history_at]
+  if (document.checkpoint_revision == document.revision || equal(document.bytes[..document.length], document.checkpoint_bytes[..entry.length])) && same_rows(&document.rows, &entry.rows) {
+    entry.cursor = document.cursor
+    entry.anchor = document.anchor
+    entry.secondary = document.secondary
+    document.checkpoint_revision = document.revision
+    return
+  }
+  prefix: usize = 0
+  old_end := entry.length
+  new_end := document.length
+  // Compare unchanged runs in libc with shrinking blocks, then locate the
+  // exact changed bytes; a large file costs a few thousand calls, not millions.
+  for block in Blocks {
+    for prefix + block <= old_end && prefix + block <= new_end && equal(document.checkpoint_bytes[prefix..prefix + block], document.bytes[prefix..prefix + block]) {
+      prefix += block
+    }
+  }
+  for block in Blocks {
+    for old_end >= prefix + block && new_end >= prefix + block && equal(document.checkpoint_bytes[old_end - block..old_end], document.bytes[new_end - block..new_end]) {
+      old_end -= block
+      new_end -= block
+    }
+  }
+  removed := old_end - prefix
+  inserted := new_end - prefix
+  // Redo discarded by a new branch is reusable immediately; do not keep
+  // touching fresh pages for edit/undo/edit cycles.
+  if document.history_count > document.history_at + 1 {
+    document.history_next = entry.offset + #len(entry.bytes)
+  }
+  document.history_count = document.history_at + 1
+  beginning := document.history_next
+  needed := removed + inserted
+  if needed == 0 {
+    needed = 1
+  }
+  if beginning + needed > #len(document.history_storage) {
+    beginning = 0
+  }
+  for true {
+    overlap := document.history_count == 64
+    scan: usize = 0
+    for scan < document.history_count {
+      retained := &document.history[scan]
+      if beginning < retained.offset + #len(retained.bytes) && beginning + needed > retained.offset {
+        overlap = true
+      }
+      scan += 1
+    }
+    if !overlap {
+      break
+    }
+    for shifted in 1..document.history_count {
+      document.history[shifted - 1] = document.history[shifted]
+    }
+    document.history_count -= 1
+  }
+  document.history_at = document.history_count
+  document.history_count += 1
+  target := &document.history[document.history_at]
+  target.offset = beginning
+  target.bytes = document.history_storage[beginning..beginning + needed]
+  target.line_positions = false
+  target.prefix = prefix
+  target.removed = removed
+  target.inserted = inserted
+  if removed > 0 {
+    _ = copy_bytes(&target.bytes[0], &document.checkpoint_bytes[prefix], removed)
+  }
+  if inserted > 0 {
+    _ = copy_bytes(&target.bytes[removed], &document.bytes[prefix], inserted)
+  }
+  if removed + inserted == 0 {
+    target.bytes[0] = 0
+  }
+  document.history_next = beginning + needed
+  snapshot(document, document.history_at)
+}
+fn restore(document: *Document, delta: *const Snapshot, forward: bool) {
+  preserve_saved(document)
+  retained_positions: [992]TextPosition = []
+  if delta.line_positions {
+    for saved_mark in 0..992 {
+      retained_positions[saved_mark] = text_position(document, document.marks[saved_mark])
+    }
+  }
+  removed := delta.inserted
+  inserted := delta.removed
+  source: usize = 0
+  if forward {
+    removed = delta.removed
+    inserted = delta.inserted
+    source = delta.removed
+  }
+  low := delta.prefix
+  high := low + removed
+  move_marks(document, low, high, inserted)
+  tail := document.length - high
+  if tail > 0 {
+    _ = move_bytes(&document.bytes[low + inserted], &document.bytes[high], tail)
+  }
+  if inserted > 0 {
+    _ = copy_bytes(&document.bytes[low], &delta.bytes[source], inserted)
+  }
+  entry := &document.history[document.history_at]
+  document.secondary = entry.secondary
+  document.rows = entry.rows
+  document.length = entry.length
+  document.cursor = entry.cursor
+  document.anchor = entry.anchor
+  document.bytes[document.length] = 0
+  document.checkpoint_bytes = document.bytes[..]
+  document.revision += 1
+  index_lines(document)
+  document.checkpoint_revision = document.revision
+  if delta.line_positions {
+    for restored_mark in 0..992 {
+      document.marks[restored_mark] = position_offset(document, retained_positions[restored_mark])
+    }
+  }
 }
 pub fn undo(document: *Document) {
   checkpoint(document)
-  if document.history_at > 0 { document.history_at -= 1 restore(document) }
+  if document.history_at > 0 {
+    delta := &document.history[document.history_at]
+    document.history_at -= 1
+    restore(document, delta, false)
+  }
 }
 pub fn redo(document: *Document) {
   entry := &document.history[document.history_at]
-  if !equal(document.bytes[..document.length], entry.bytes[..entry.length]) { return }
-  if document.history_at + 1 < document.history_count { document.history_at += 1 restore(document) }
+  if !equal(document.bytes[..document.length], document.checkpoint_bytes[..entry.length]) || !same_rows(&document.rows, &entry.rows) {
+    return
+  }
+  if document.history_at + 1 < document.history_count {
+    document.history_at += 1
+    restore(document, &document.history[document.history_at], true)
+  }
 }
 pub fn move_to(document: *Document, position: usize, extend: bool) {
-  if position > document.length { return }
-  document.cursor = position if !extend { document.anchor = position }
+  if position > document.length {
+    return
+  }
+  document.goal_valid = false
+  document.cursor = position
+  if !extend {
+    document.anchor = position
+  }
 }
 pub fn line_start(document: *const Document, position: usize) usize {
-  at := position for at > 0 && document.bytes[at - 1] != 10 { at -= 1 } return at
+  return row_start(document, row_at(document, position))
 }
 pub fn line_end(document: *const Document, position: usize) usize {
-  at := position for at < document.length && document.bytes[at] != 10 { at += 1 } return at
+  row := row_at(document, position)
+  if row + 1 >= document.line_count {
+    return document.length
+  }
+  return row_start(document, row + 1) - 1
+}
+fn vertical_goal_valid(document: *const Document) bool {
+  return document.goal_valid && document.goal_cursor == document.cursor && document.goal_anchor == document.anchor && document.goal_revision == document.revision
+}
+fn remember_vertical(document: *Document, column: usize) {
+  document.goal_valid = true
+  document.goal_column = column
+  document.goal_cursor = document.cursor
+  document.goal_anchor = document.anchor
+  document.goal_revision = document.revision
 }
 pub fn vertical(document: *Document, down: bool, extend: bool) {
   beginning := line_start(document, document.cursor)
-  column: usize = 0 scan := beginning
-  for scan < document.cursor { scan = next(document, scan) column += 1 }
+  column: usize = 0
+  scan := beginning
+  if vertical_goal_valid(document) {
+    column = document.goal_column
+  }
+  else {
+    for scan < document.cursor {
+      scan = next(document, scan)
+      column += 1
+    }
+  }
+  remember_vertical(document, column)
   destination: usize = 0
   if down {
     ending := line_end(document, document.cursor)
-    if ending == document.length { return }
+    if ending == document.length {
+      return
+    }
     destination = ending + 1
   } else {
-    if beginning == 0 { return }
+    if beginning == 0 {
+      return
+    }
     destination = line_start(document, beginning - 1)
   }
   moved: usize = 0
-  for moved < column && destination < document.length && document.bytes[destination] != 10 { destination = next(document, destination) moved += 1 }
+  for moved < column && destination < document.length && document.bytes[destination] != 10 {
+    destination = next(document, destination)
+    moved += 1
+  }
   move_to(document, destination, extend)
+  remember_vertical(document, column)
 }
 pub fn erase(document: *Document, backward: bool) {
   if document.cursor == document.anchor {
-    if backward { document.anchor = previous(document, document.cursor) }
-    else { document.anchor = next(document, document.cursor) }
+    if backward {
+      document.anchor = previous(document, document.cursor)
+    }
+    else {
+      document.anchor = next(document, document.cursor)
+    }
   }
   _ = replace(document, "")
 }
+// Select every line the selection touches. A one-character selection on a
+// newline belongs to that newline's line, not the following one.
 pub fn select_line(document: *Document) {
-  document.anchor = line_start(document, document.cursor)
-  document.cursor = line_end(document, document.cursor)
-  if document.cursor < document.length { document.cursor += 1 }
+  low := start(document)
+  high := end(document)
+  last := high
+  if high > low {
+    last = high - 1
+  }
+  document.anchor = line_start(document, low)
+  document.cursor = line_end(document, last)
+  if document.cursor < document.length {
+    document.cursor += 1
+  }
+}
+// Whole lines already selected: starts at a line start and ends after a
+// newline or at the document end. A cursor on an empty line counts.
+pub fn lines_selected(document: *const Document) bool {
+  low := start(document)
+  high := end(document)
+  if high <= low || line_start(document, low) != low {
+    return false
+  }
+  if high != document.length && document.bytes[high - 1] != 10 {
+    return false
+  }
+  return true
+}
+// Extend the selection by one whole line upward, keeping the head on top.
+pub fn extend_line_above(document: *Document) {
+  if !lines_selected(document) {
+    select_line(document)
+  }
+  low := start(document)
+  high := end(document)
+  if low > 0 {
+    low = line_start(document, low - 1)
+  }
+  document.goal_valid = false
+  document.anchor = high
+  document.cursor = low
 }
 pub fn find(document: *Document, query: []const u8, backwards: bool) bool {
-  if #len(query) == 0 || #len(query) > document.length { return false }
+  if #len(query) == 0 || #len(query) > document.length {
+    return false
+  }
   base := document.cursor
-  if backwards { base = start(document) }
+  if backwards {
+    base = start(document)
+  }
   step: usize = 0
   for step <= document.length + 1 {
     at := (base + step) % (document.length + 1)
-    if backwards { at = (base + document.length - (step % (document.length + 1))) % (document.length + 1) }
+    if backwards {
+      at = (base + document.length - (step % (document.length + 1))) % (document.length + 1)
+    }
     if at + #len(query) <= document.length && equal(document.bytes[at..at + #len(query)], query) {
-      document.anchor = at document.cursor = at + #len(query) return true
+      document.anchor = at
+      document.cursor = at + #len(query)
+      return true
     }
     step += 1
   }
   return false
+}
+
+// Whitespace, identifier text (including UTF-8), and punctuation form runs.
+fn word_class(document: *const Document, at: usize, big: bool) u8 {
+  if at >= document.length {
+    return 0
+  }
+  byte := document.bytes[at]
+  if byte == 32 || byte == 9 || byte == 10 || byte == 13 {
+    return 0
+  }
+  if byte >= 128 && !big {
+    rune := utf8.decode(document.bytes[..document.length], at)
+    category := unicode_category(#cast(i32) rune.codepoint)
+    if category >= 23 && category <= 25 {
+      return 0
+    }
+    if category >= 1 && category <= 11 {
+      return 1
+    }
+    return 2
+  }
+  if big || byte >= 128 || byte == 95 || (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) {
+    return 1
+  }
+  return 2
+}
+pub fn word(document: *Document, direction: u8, big: bool, extend: bool) {
+  at := document.cursor
+  origin := document.cursor
+  single := document.cursor > document.anchor && next(document, document.anchor) == document.cursor
+  if single {
+    if direction == 1 {
+      at = document.anchor
+    }
+    else {
+      origin = document.anchor
+    }
+  }
+  if direction == 0 {
+    kind := word_class(document, at, big)
+    for at < document.length && word_class(document, at, big) == kind {
+      at = next(document, at)
+    }
+    for at < document.length && word_class(document, at, big) == 0 {
+      at = next(document, at)
+    }
+  } else if direction == 1 {
+    at = previous(document, at)
+    for at > 0 && word_class(document, at, big) == 0 {
+      at = previous(document, at)
+    }
+    backward_kind := word_class(document, at, big)
+    for at > 0 && word_class(document, previous(document, at), big) == backward_kind {
+      at = previous(document, at)
+    }
+  } else {
+    for at < document.length && word_class(document, at, big) == 0 {
+      at = next(document, at)
+    }
+    ending_kind := word_class(document, at, big)
+    for at < document.length && word_class(document, at, big) == ending_kind {
+      at = next(document, at)
+    }
+  }
+  // Selection-first: word motions select their traversed range in normal mode.
+  if !extend {
+    document.anchor = origin
+  }
+  document.cursor = at
+}
+pub fn boundary(document: *const Document, offset: usize) usize {
+  at := offset
+  if at > document.length {
+    at = document.length
+  }
+  for at > 0 && at < document.length && (document.bytes[at] & 192) == 128 {
+    at -= 1
+  }
+  if at > 0 && at < document.length && (document.bytes[at] >= 128 || document.bytes[at - 1] >= 128) {
+    preceding := previous(document, at)
+    if next(document, preceding) > at {
+      at = preceding
+    }
+  }
+  return at
+}
+
+pub fn line_nonblank(document: *const Document, position: usize) usize {
+  beginning := line_start(document, position)
+  ending := line_end(document, position)
+  at := beginning
+  for at < ending && (document.bytes[at] == 32 || document.bytes[at] == 9 || document.bytes[at] == 13) {
+    at += 1
+  }
+  if at == ending {
+    return beginning
+  }
+  return at
+}
+pub fn line_last(document: *const Document, position: usize) usize {
+  beginning := line_start(document, position)
+  ending := line_end(document, position)
+  if ending > beginning && document.bytes[ending - 1] == 13 {
+    ending -= 1
+  }
+  if ending > beginning {
+    return previous(document, ending)
+  }
+  return beginning
+}
+
+// Zero-based line lookup. The final empty line after a newline is a real row.
+pub fn row_at(document: *const Document, position: usize) usize {
+  low: usize = 0
+  high := document.line_count
+  for low + 1 < high {
+    middle := (low + high) / 2
+    if #cast(usize) document.line_offsets[middle] <= position {
+      low = middle
+    } else {
+      high = middle
+    }
+  }
+  return low
+}
+pub fn row_start(document: *const Document, row: usize) usize {
+  if row >= document.line_count {
+    return document.length
+  }
+  return #cast(usize) document.line_offsets[row]
+}
+fn index_lines(document: *Document) {
+  document.line_count = 1
+  document.line_offsets[0] = 0
+  // libc memchr scans many bytes per step; this runs on every load and undo.
+  at: usize = 0
+  for at < document.length {
+    found := find_byte(&document.bytes[at], 10, document.length - at)
+    if found == nil {
+      break
+    }
+    at = #cast(usize) found - #cast(usize) &document.bytes[0] + 1
+    document.line_offsets[document.line_count] = #cast(u32) at
+    document.line_count += 1
+  }
+}
+fn replace_lines(document: *Document, low: usize, high: usize, text: []const u8) {
+  first := row_at(document, low) + 1
+  last := row_at(document, high) + 1
+  added := count_newlines(text)
+  tail := document.line_count - last
+  if first + added > last {
+    for back in #reverse(0..tail) {
+      document.line_offsets[first + added + back] = #cast(u32) (#cast(usize) document.line_offsets[last + back] - (high - low) + #len(text))
+    }
+  } else {
+    for forward in 0..tail {
+      document.line_offsets[first + added + forward] = #cast(u32) (#cast(usize) document.line_offsets[last + forward] - (high - low) + #len(text))
+    }
+  }
+  inserted: usize = 0
+  offset: usize = 0
+  for offset < #len(text) {
+    found := find_byte(&text[offset], 10, #len(text) - offset)
+    if found == nil {
+      break
+    }
+    offset = #cast(usize) found - #cast(usize) &text[0] + 1
+    document.line_offsets[first + inserted] = #cast(u32) (low + offset)
+    inserted += 1
+  }
+  document.line_count = first + added + tail
+}
+fn count_newlines(text: []const u8) usize {
+  count: usize = 0
+  offset: usize = 0
+  for offset < #len(text) {
+    found := find_byte(&text[offset], 10, #len(text) - offset)
+    if found == nil {
+      break
+    }
+    offset = #cast(usize) found - #cast(usize) &text[0] + 1
+    count += 1
+  }
+  return count
+}
+
+pub fn codepoints(document: *const Document, low: usize, high: usize) usize {
+  count: usize = 0
+  for at in low..high {
+    if (document.bytes[at] & 192) != 128 {
+      count += 1
+    }
+  }
+  return count
 }

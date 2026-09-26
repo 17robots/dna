@@ -1,0 +1,228 @@
+// Main-thread operation clocks and bounded reusable workspaces. Reservation bytes
+// are tracked arena capacity, not resident memory or third-party heap allocations.
+struct OperationStamp { wall: u64, cpu: u64, process_cpu: u64 }
+struct ThreadTime { seconds: i64, nanoseconds: i64 }
+struct WorkArena { arena: mem.Arena, capacity: usize, born: u64 }
+struct OperationState {
+  lsp_receive: WorkArena,
+  recovery_encode: WorkArena,
+  // Reused between document syncs instead of mapping a fresh buffer per change.
+  lsp_send: WorkArena,
+  allocations, releases, reserved, peak_reserved, allocated_bytes, reused: usize,
+}
+extern fn thread_clock "clock_gettime"(kind: i32, time: *ThreadTime) i32
+fn operation_begin(app: *const App) OperationStamp {
+  if !app.render_trace.enabled {
+    return OperationStamp{}
+  }
+  time := ThreadTime{}
+  cpu: u64 = 0
+  if thread_clock(3, &time) == 0 {
+    cpu = #cast(u64) time.seconds * 1000000000 + #cast(u64) time.nanoseconds
+  }
+  process_time := ThreadTime{}
+  process_cpu: u64 = 0
+  if thread_clock(2, &process_time) == 0 {
+    process_cpu = #cast(u64) process_time.seconds * 1000000000 + #cast(u64) process_time.nanoseconds
+  }
+  return OperationStamp{wall: render_clock(), cpu: cpu, process_cpu: process_cpu}
+}
+fn operation_record(app: *App, kind: []const u8) bool {
+  trace := &app.render_trace
+  if !trace.enabled || trace.failed || trace.truncated {
+    return false
+  }
+  if trace.written + trace.used >= 67106816 {
+    trace.truncated = true
+    return false
+  }
+  if trace.used + 2048 >= 16384 {
+    render_trace_flush(trace)
+  }
+  if trace.failed {
+    return false
+  }
+  add_text(trace.bytes[..], &trace.used, "{\"type\":\"")
+  add_text(trace.bytes[..], &trace.used, kind)
+  add_text(trace.bytes[..], &trace.used, "\"")
+  return true
+}
+fn operation_name(app: *App, name: []const u8) {
+  add_text(app.render_trace.bytes[..], &app.render_trace.used, ",\"name\":\"")
+  add_text(app.render_trace.bytes[..], &app.render_trace.used, name)
+  add_text(app.render_trace.bytes[..], &app.render_trace.used, "\"")
+}
+fn operation_end(app: *App, name: []const u8, started: OperationStamp) {
+  if !app.render_trace.enabled {
+    return
+  }
+  finished := operation_begin(app)
+  if !operation_record(app, "operation") {
+    return
+  }
+  operation_name(app, name)
+  trace := &app.render_trace
+  render_field(trace.bytes[..], &trace.used, "at_us", #cast(usize) ((started.wall - trace.epoch) / 1000))
+  render_field(trace.bytes[..], &trace.used, "wall_us", #cast(usize) ((finished.wall - started.wall) / 1000))
+  cpu: u64 = 0
+  if started.cpu != 0 && finished.cpu >= started.cpu {
+    cpu = finished.cpu - started.cpu
+  }
+  render_field(trace.bytes[..], &trace.used, "cpu_us", #cast(usize) (cpu / 1000))
+  render_field(trace.bytes[..], &trace.used, "process_cpu_us", operation_delta(started.process_cpu, finished.process_cpu))
+  add_text(trace.bytes[..], &trace.used, "}\n")
+}
+fn operation_bytes(app: *App, name: []const u8, bytes: usize) {
+  if !operation_record(app, "copy") {
+    return
+  }
+  operation_name(app, name)
+  render_field(app.render_trace.bytes[..], &app.render_trace.used, "at_us", #cast(usize) ((render_clock() - app.render_trace.epoch) / 1000))
+  render_field(app.render_trace.bytes[..], &app.render_trace.used, "bytes", bytes)
+  add_text(app.render_trace.bytes[..], &app.render_trace.used, "}\n")
+}
+fn allocation_record(app: *App, name: []const u8, size: usize, born: u64, release: bool) {
+  stats := &app.operations
+  if release {
+    stats.releases += 1
+    stats.reserved -= size
+  }
+  else {
+    stats.allocations += 1
+    stats.reserved += size
+    stats.allocated_bytes += size
+    if stats.reserved > stats.peak_reserved {
+      stats.peak_reserved = stats.reserved
+    }
+  }
+  if !operation_record(app, "allocation") {
+    return
+  }
+  operation_name(app, name)
+  trace := &app.render_trace
+  render_field(trace.bytes[..], &trace.used, "at_us", #cast(usize) ((render_clock() - trace.epoch) / 1000))
+  render_field(trace.bytes[..], &trace.used, "bytes", size)
+  render_field(trace.bytes[..], &trace.used, "release", render_bool(release))
+  lifetime: usize = 0
+  if release && born != 0 {
+    lifetime = #cast(usize) ((render_clock() - born) / 1000)
+  }
+  render_field(trace.bytes[..], &trace.used, "lifetime_us", lifetime)
+  render_field(trace.bytes[..], &trace.used, "reserved", stats.reserved)
+  add_text(trace.bytes[..], &trace.used, "}\n")
+}
+fn work_drop(app: *App, work: *WorkArena, name: []const u8) {
+  if work.capacity == 0 {
+    return
+  }
+  _ = mem.arena_release(&work.arena)
+  allocation_record(app, name, work.capacity, work.born, true)
+  work.capacity = 0
+  work.born = 0
+}
+fn work_acquire(app: *App, work: *WorkArena, needed: usize, name: []const u8) bool {
+  if work.capacity >= needed {
+    mem.arena_reset(&work.arena)
+    app.operations.reused += 1
+    return true
+  }
+  work_drop(app, work, name)
+  capacity: usize = 65536
+  for capacity < needed && capacity < 2097152 {
+    capacity *= 2
+  }
+  if needed > capacity {
+    capacity = needed
+  }
+  allocated := mem.arena_create(capacity)
+  if !allocated.ok {
+    return false
+  }
+  work.arena = allocated.arena
+  work.capacity = capacity
+  if app.render_trace.enabled {
+    work.born = render_clock()
+  }
+  allocation_record(app, name, capacity, work.born, false)
+  return true
+}
+fn work_finish(app: *App, work: *WorkArena, name: []const u8) {
+  // Large one-off messages/sessions must not raise the permanent memory floor.
+  if work.capacity > 2097152 {
+    work_drop(app, work, name)
+  }
+  else {
+    mem.arena_reset(&work.arena)
+  }
+}
+fn operations_release(app: *App) {
+  work_drop(app, &app.operations.lsp_receive, "lsp_receive")
+  work_drop(app, &app.operations.recovery_encode, "recovery_encode")
+  work_drop(app, &app.operations.lsp_send, "lsp_send")
+}
+fn operation_wake(app: *App, name: []const u8, requested: i32, ready: bool, started: OperationStamp) {
+  if !app.render_trace.enabled {
+    return
+  }
+  finished := operation_begin(app)
+  if !operation_record(app, "wake") {
+    return
+  }
+  operation_name(app, name)
+  trace := &app.render_trace
+  render_field(trace.bytes[..], &trace.used, "at_us", #cast(usize) ((started.wall - trace.epoch) / 1000))
+  render_field(trace.bytes[..], &trace.used, "requested_ms", #cast(usize) requested)
+  render_field(trace.bytes[..], &trace.used, "wall_us", #cast(usize) ((finished.wall - started.wall) / 1000))
+  render_field(trace.bytes[..], &trace.used, "event", render_bool(ready))
+  render_field(trace.bytes[..], &trace.used, "cpu_us", operation_delta(started.cpu, finished.cpu))
+  render_field(trace.bytes[..], &trace.used, "process_cpu_us", operation_delta(started.process_cpu, finished.process_cpu))
+  add_text(trace.bytes[..], &trace.used, "}\n")
+}
+
+fn operation_delta(before: u64, after: u64) usize {
+  if before == 0 || after < before {
+    return 0
+  }
+  return #cast(usize) ((after - before) / 1000)
+}
+
+extern fn native_memory_snapshot "dna_memory_snapshot"(category: u32, output: *u64)
+fn native_memory_name(category: u32) []const u8 {
+  if category == 0 {
+    return "syntax_native"
+  }
+  if category == 1 {
+    return "search_results"
+  }
+  if category == 2 {
+    return "terminal_native"
+  }
+  if category == 3 {
+    return "disk_native"
+  }
+  if category == 4 {
+    return "tree_sitter"
+  }
+  return "text_objects"
+}
+fn native_memory_report(app: *App) {
+  if !app.render_trace.enabled {
+    return
+  }
+  for category in 0..#cast(u32) 6 {
+    values: [7]u64 = []
+    native_memory_snapshot(category, &values[0])
+    if operation_record(app, "native_memory") {
+      operation_name(app, native_memory_name(category))
+      trace := &app.render_trace
+      render_field(trace.bytes[..], &trace.used, "allocations", #cast(usize) values[0])
+      render_field(trace.bytes[..], &trace.used, "releases", #cast(usize) values[1])
+      render_field(trace.bytes[..], &trace.used, "live_bytes", #cast(usize) values[2])
+      render_field(trace.bytes[..], &trace.used, "peak_bytes", #cast(usize) values[3])
+      render_field(trace.bytes[..], &trace.used, "allocated_bytes", #cast(usize) values[4])
+      render_field(trace.bytes[..], &trace.used, "max_lifetime_us", #cast(usize) (values[5] / 1000))
+      render_field(trace.bytes[..], &trace.used, "live_objects", #cast(usize) values[6])
+      add_text(trace.bytes[..], &trace.used, "}\n")
+    }
+  }
+}

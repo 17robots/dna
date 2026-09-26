@@ -1,0 +1,386 @@
+// Syntax colors for popup previews: file and buffer pickers, the explorer
+// preview, and hover code blocks. A few highlighters are pooled by file
+// extension or language name, so moving through a picker reuses parsers
+// instead of loading a grammar for every file.
+struct PreviewHighlighter { handle: rawptr, key: [64]u8, key_length: usize, used: u64, open: bool }
+struct PreviewColors {
+  handle: rawptr,
+  revision, hash: u64,
+  length: usize,
+  ready, pending: bool,
+  colors: [8192]u8,
+}
+struct PreviewSyntaxState {
+  pool: [4]PreviewHighlighter,
+  serial: u64,
+  picker, explorer, hover: PreviewColors,
+  // Code regions of the current hover text and their language.
+  hover_starts, hover_ends: [16]usize,
+  hover_count: usize,
+  hover_language: [64]u8,
+  hover_language_length: usize,
+}
+
+// Colored spans are drawn over the base text, like document highlighting.
+struct PreviewSpan { text: rawptr, dx, dy: f32, style: u8 }
+struct PreviewSpans { spans: [256]PreviewSpan, count: usize, hash: u64, line: f32, colored: bool }
+
+fn preview_hash(key: []const u8, bytes: []const u8) u64 {
+  hash: u64 = 5381
+  for byte in key {
+    hash = ((hash * 33) ^ #cast(u64) byte) % 1099511627776
+  }
+  hash = ((hash * 33) ^ 255) % 1099511627776
+  for value in bytes {
+    hash = ((hash * 33) ^ #cast(u64) value) % 1099511627776
+  }
+  return (hash ^ (#cast(u64) #len(bytes) << 40)) + 1
+}
+fn preview_close(handle: rawptr) {
+  if handle != nil && syntax_retire(handle) == 0 {
+    syntax_close(handle)
+  }
+}
+fn preview_forget(request: *PreviewColors, handle: rawptr) {
+  if request.handle == handle {
+    request.handle = nil
+    request.pending = false
+    request.ready = false
+    request.hash = 0
+  }
+}
+fn preview_syntax_release(app: *App) {
+  state := &app.previews
+  for index in 0..4 {
+    pooled := &state.pool[index]
+    if pooled.handle != nil {
+      syntax_close(pooled.handle)
+    }
+    pooled.* = PreviewHighlighter{}
+  }
+  preview_forget(&state.picker, state.picker.handle)
+  preview_forget(&state.explorer, state.explorer.handle)
+  preview_forget(&state.hover, state.hover.handle)
+}
+// Extension (or whole leaf name) selects the pooled grammar for a path.
+fn preview_path_key(path: []const u8) []const u8 {
+  leaf := #len(path)
+  for leaf > 0 && path[leaf - 1] != '/' {
+    leaf -= 1
+  }
+  dot := #len(path)
+  for dot > leaf && path[dot - 1] != '.' {
+    dot -= 1
+  }
+  if dot > leaf + 1 {
+    return path[dot - 1..]
+  }
+  return path[leaf..]
+}
+fn preview_highlighter(app: *App, key: []const u8, source: []const u8, by_name: bool) rawptr {
+  state := &app.previews
+  if #len(key) == 0 || #len(key) >= 64 || #len(source) >= 4096 {
+    return nil
+  }
+  now := sdl.ticks()
+  chosen: usize = 0
+  for index in 0..4 {
+    entry := &state.pool[index]
+    if entry.open && buffer.equal(entry.key[..entry.key_length], key) {
+      entry.used = now
+      return entry.handle
+    }
+    if !entry.open || (state.pool[chosen].open && entry.used < state.pool[chosen].used) {
+      chosen = index
+    }
+  }
+  victim := &state.pool[chosen]
+  if victim.handle != nil {
+    preview_forget(&state.picker, victim.handle)
+    preview_forget(&state.explorer, victim.handle)
+    preview_forget(&state.hover, victim.handle)
+    preview_close(victim.handle)
+  }
+  terminated: [4096]u8 = []
+  _ = copy_text(terminated[..], source)
+  if by_name {
+    victim.handle = syntax_open_named(&app.workspace.language_root[0], &terminated[0])
+  }
+  else {
+    victim.handle = syntax_open(&app.workspace.language_root[0], &terminated[0])
+  }
+  victim.key_length = copy_text(victim.key[..], key)
+  victim.used = now
+  victim.open = true
+  return victim.handle
+}
+fn preview_poll(request: *PreviewColors) bool {
+  if !request.pending || request.handle == nil {
+    return false
+  }
+  if syntax_colors(request.handle, &request.colors[0], #cast(u32) request.length, request.revision) == 0 {
+    return false
+  }
+  request.pending = false
+  request.ready = true
+  return true
+}
+// Returns colors for bytes once the worker has parsed them; nil while pending
+// or when no grammar matches. Parsing never blocks drawing.
+fn preview_request(app: *App, request: *PreviewColors, key: []const u8, source: []const u8, by_name: bool, bytes: []const u8) []const u8 {
+  if !app.config.syntax_enabled || #len(bytes) == 0 || #len(bytes) > 8192 {
+    return request.colors[..0]
+  }
+  handle := preview_highlighter(app, key, source, by_name)
+  if handle == nil {
+    request.ready = false
+    request.pending = false
+    return request.colors[..0]
+  }
+  hash := preview_hash(key, bytes)
+  if request.handle != handle || request.hash != hash {
+    app.previews.serial += 1
+    request.handle = handle
+    request.hash = hash
+    request.length = #len(bytes)
+    request.revision = app.previews.serial
+    request.ready = false
+    request.pending = true
+    syntax_update(handle, &bytes[0], #cast(u32) #len(bytes), request.revision)
+  }
+  _ = preview_poll(request)
+  if !request.ready {
+    return request.colors[..0]
+  }
+  return request.colors[..request.length]
+}
+fn preview_syntax_tick(app: *App) bool {
+  changed := preview_poll(&app.previews.picker)
+  if preview_poll(&app.previews.explorer) {
+    changed = true
+  }
+  if preview_poll(&app.previews.hover) {
+    changed = true
+  }
+  return changed
+}
+fn preview_syntax_waiting(app: *const App) bool {
+  return app.previews.picker.pending || app.previews.explorer.pending || app.previews.hover.pending
+}
+
+// base already holds bytes; colors is empty until highlighting is ready.
+fn preview_spans_update(typography: *Typography, spans: *PreviewSpans, base: rawptr, bytes: []const u8, colors: []const u8) {
+  hash := preview_hash("", bytes)
+  colored := #len(colors) == #len(bytes) && #len(bytes) > 0
+  if spans.hash == hash && spans.colored == colored && spans.line == typography.line {
+    return
+  }
+  spans.hash = hash
+  spans.colored = colored
+  spans.line = typography.line
+  spans.count = 0
+  if !colored {
+    return
+  }
+  at: usize = 0
+  for at < #len(bytes) && spans.count < 256 {
+    if bytes[at] == 9 || bytes[at] == 10 || bytes[at] == 13 {
+      at += 1
+      continue
+    }
+    style := colors[at]
+    end := at + 1
+    for end < #len(bytes) && colors[end] == style && bytes[end] != 9 && bytes[end] != 10 && bytes[end] != 13 {
+      end += 1
+    }
+    if style != 0 {
+      span := &spans.spans[spans.count]
+      if span.text == nil {
+        blank: [1]u8 = [0]
+        span.text = ttf.create(typography.engine, typography.font, &blank[0], 0)
+        if span.text == nil {
+          return
+        }
+      }
+      first := ttf.Substring{}
+      origin := ttf.Substring{}
+      if ttf.set(span.text, &bytes[at], end - at) && ttf.substring(base, #cast(i32) at, &first) && ttf.substring(span.text, 0, &origin) {
+        span.dx = #cast(f32) (first.x - origin.x)
+        span.dy = #cast(f32) (first.y - origin.y)
+        span.style = style
+        spans.count += 1
+      }
+    }
+    at = end
+  }
+}
+fn preview_spans_draw(spans: *PreviewSpans, x: f32, y: f32) {
+  index: usize = 0
+  for index < spans.count {
+    span := &spans.spans[index]
+    if !tint(span.text, syntax_color(span.style)) || !ttf.draw(span.text, x + span.dx, y + span.dy) {
+      #panic("preview span draw")
+    }
+    index += 1
+  }
+}
+fn preview_spans_release(spans: *PreviewSpans) {
+  for index in 0..256 {
+    if spans.spans[index].text != nil {
+      ttf.destroy(spans.spans[index].text)
+    }
+  }
+  spans.* = PreviewSpans{}
+}
+// Font changes and shutdown drop every preview text object; they are rebuilt lazily.
+fn preview_text_release(typography: *Typography) {
+  preview_spans_release(&typography.picker_spans)
+  preview_spans_release(&typography.explorer_spans)
+  preview_spans_release(&typography.hover_spans)
+  if typography.explorer_preview != nil {
+    ttf.destroy(typography.explorer_preview)
+    typography.explorer_preview = nil
+  }
+  typography.explorer_preview_hash = 0
+}
+
+fn hover_language_alias(name: []const u8) []const u8 {
+  if buffer.equal(name, "ts") {
+    return "typescript"
+  }
+  if buffer.equal(name, "js") {
+    return "javascript"
+  }
+  if buffer.equal(name, "py") {
+    return "python"
+  }
+  if buffer.equal(name, "rs") {
+    return "rust"
+  }
+  if buffer.equal(name, "sh") || buffer.equal(name, "shell") || buffer.equal(name, "zsh") {
+    return "bash"
+  }
+  if buffer.equal(name, "c++") {
+    return "cpp"
+  }
+  return name
+}
+fn hover_code_range(state: *PreviewSyntaxState, start: usize, end: usize) {
+  if end > start && state.hover_count < 16 {
+    state.hover_starts[state.hover_count] = start
+    state.hover_ends[state.hover_count] = end
+    state.hover_count += 1
+  }
+}
+// Markdown hover: drop ``` fence lines, remember the code between them.
+fn hover_markdown(app: *App, text: []const u8, contents: *const json.Value) {
+  output: [8192]u8 = []
+  used: usize = 0
+  language: [64]u8 = []
+  language_length: usize = 0
+  starts: [16]usize = []
+  ends: [16]usize = []
+  count: usize = 0
+  code := false
+  start: usize = 0
+  at: usize = 0
+  for at < #len(text) {
+    end := at
+    for end < #len(text) && text[end] != 10 {
+      end += 1
+    }
+    first := at
+    for first < end && (text[first] == 32 || text[first] == 9) {
+      first += 1
+    }
+    if end - first >= 3 && text[first] == '`' && text[first + 1] == '`' && text[first + 2] == '`' {
+      if !code {
+        code = true
+        start = used
+        name := text[first + 3..end]
+        trimmed := #len(name)
+        for trimmed > 0 && (name[trimmed - 1] == 32 || name[trimmed - 1] == 13) {
+          trimmed -= 1
+        }
+        if language_length == 0 && trimmed > 0 && trimmed < 64 {
+          language_length = copy_text(language[..], hover_language_alias(name[..trimmed]))
+        }
+      } else {
+        code = false
+        if count < 16 && used > start {
+          starts[count] = start
+          ends[count] = used
+          count += 1
+        }
+      }
+    } else {
+      add_text(output[..], &used, text[at..end])
+      if end < #len(text) {
+        add_text(output[..], &used, "\n")
+      }
+    }
+    at = end + 1
+  }
+  if code && count < 16 && used > start {
+    starts[count] = start
+    ends[count] = used
+    count += 1
+  }
+  // A MarkedString object with a language is code as a whole.
+  whole := json.is_object(contents) && #len(json_text(contents, "language")) > 0
+  if whole {
+    count = 0
+    starts[0] = 0
+    ends[0] = used
+    count = 1
+    language_length = copy_text(language[..], hover_language_alias(json_text(contents, "language")))
+  }
+  for used > 0 && output[used - 1] == 10 {
+    used -= 1
+  }
+  hover_notice(app, output[..used])
+  state := &app.previews
+  state.hover_count = 0
+  for index in 0..count {
+    limit := ends[index]
+    if limit > used {
+      limit = used
+    }
+    hover_code_range(state, starts[index], limit)
+  }
+  state.hover_language_length = copy_text(state.hover_language[..], language[..language_length])
+}
+fn hover_colors_draw(app: *App, typography: *Typography, x: f32, y: f32) {
+  state := &app.previews
+  text := app.prompt_state.message[..app.prompt_state.message_length]
+  colors: []const u8 = text[..0]
+  if state.hover_count > 0 && #len(text) > 0 && #len(text) <= 8192 {
+    name: []const u8 = state.hover_language[..state.hover_language_length]
+    if #len(name) == 0 {
+      name = filetype_name(&app.documents.slots[app.documents.active])
+    }
+    key: [80]u8 = []
+    key_length := copy_text(key[..], "lang:")
+    add_text(key[..], &key_length, name)
+    masked: [8192]u8 = []
+    _ = mem.copy(masked[..#len(text)], text)
+    at: usize = 0
+    for at < #len(text) {
+      inside := false
+      for range in 0..state.hover_count {
+        if at >= state.hover_starts[range] && at < state.hover_ends[range] {
+          inside = true
+        }
+      }
+      if !inside && masked[at] != 10 {
+        masked[at] = 32
+      }
+      at += 1
+    }
+    if #len(name) > 0 {
+      colors = preview_request(app, &state.hover, key[..key_length], name, true, masked[..#len(text)])
+    }
+  }
+  preview_spans_update(typography, &typography.hover_spans, typography.palette, text, colors)
+  preview_spans_draw(&typography.hover_spans, x, y)
+}

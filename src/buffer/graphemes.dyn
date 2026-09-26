@@ -1,0 +1,62 @@
+#link("utf8proc")
+
+extern fn grapheme_break "utf8proc_grapheme_break_stateful"(first: i32, second: i32, state: *i32) bool
+extern fn unicode_category "utf8proc_category"(codepoint: i32) i32
+// Editing moves by extended grapheme clusters. Byte-oriented protocol positions
+// and line indexing remain separate. ASCII retains a constant-time fast path.
+pub fn next(document: *const Document, offset: usize) usize {
+  if offset >= document.length {
+    return document.length
+  }
+  first := document.bytes[offset]
+  if first < 128 && (offset + 1 == document.length || document.bytes[offset + 1] < 128) {
+    if first == 13 && offset + 1 < document.length && document.bytes[offset + 1] == 10 {
+      return offset + 2
+    }
+    return offset + 1
+  }
+  rune := utf8.decode(document.bytes[..document.length], offset)
+  at := offset + rune.width
+  state: i32 = 0
+  previous_rune := #cast(i32) rune.codepoint
+  for at < document.length {
+    current := utf8.decode(document.bytes[..document.length], at)
+    if grapheme_break(previous_rune, #cast(i32) current.codepoint, &state) {
+      break
+    }
+    previous_rune = #cast(i32) current.codepoint
+    at += current.width
+  }
+  return at
+}
+pub fn previous(document: *const Document, offset: usize) usize {
+  if offset == 0 {
+    return 0
+  }
+  if document.bytes[offset - 1] < 128 && (offset < 2 || document.bytes[offset - 2] < 128) {
+    if document.bytes[offset - 1] == 10 && offset >= 2 && document.bytes[offset - 2] == 13 {
+      return offset - 2
+    }
+    return offset - 1
+  }
+  // Regional indicators/ZWJ sequences need forward state. Start at the nearest
+  // preceding ASCII character (or file start), then walk complete clusters.
+  beginning := offset - 1
+  if document.bytes[beginning] < 128 && beginning > 0 && document.bytes[beginning - 1] >= 128 {
+    beginning -= 1
+  }
+  for beginning > 0 && document.bytes[beginning] >= 128 {
+    beginning -= 1
+  }
+  at := beginning
+  last := beginning
+  for at < offset {
+    last = at
+    following := next(document, at)
+    if following >= offset {
+      return last
+    }
+    at = following
+  }
+  return last
+}

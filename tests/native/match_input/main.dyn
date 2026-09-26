@@ -1,0 +1,54 @@
+input_window: rawptr = nil
+step: usize = 0
+complete: bool = false
+extern fn match_active "SDL_TextInputActive"(window: rawptr) bool
+extern fn match_compare "memcmp"(left: *const u8, right: *const u8, size: usize) i32
+pub fn SDL_StartTextInput(window: rawptr) bool {
+  input_window = window
+  next := #cast(*fn(rawptr) bool) probe_next("SDL_StartTextInput\0")
+  return next(window)
+}
+pub fn SDL_WaitEventTimeout(event: rawptr, milliseconds: i32) bool {
+  _ = milliseconds
+  keys: [17]u32 = [105, 0, 27, 103, 103, 109, 105, 0, 109, 105, 0, 109, 105, 0, 99, 0, 27]
+  if step >= #len(keys) {
+    probe_check(complete, "match input did not replace inner word")
+    probe_log("PASS match input: mi(, mi{, miw across event-loop passes\n")
+    probe_exit(0)
+  }
+  probe_clear(event)
+  key := keys[step]
+  if key != 0 {
+    probe_kind(event).* = 768
+    probe_u32(event, 28).* = key
+    probe_byte(event, 36).* = 1
+  } else {
+    probe_check(input_window != nil && match_active(input_window), "match text input disabled")
+    probe_kind(event).* = 771
+    text: []const u8 = "PASS\0"
+    if step == 1 {
+      text = "({word})\0"
+    }
+    else if step == 7 {
+      text = "(\0"
+    }
+    else if step == 10 {
+      text = "{\0"
+    }
+    else if step == 13 {
+      text = "w\0"
+    }
+    pointer := #cast(**const u8) (#cast(usize) event + 24)
+    pointer.* = &text[0]
+  }
+  step += 1
+  return true
+}
+pub fn TTF_SetTextString(text: rawptr, string: *const u8, length: usize) bool {
+  expected: []const u8 = "({PASS})"
+  if length == 8 && match_compare(string, &expected[0], 8) == 0 {
+    complete = true
+  }
+  next := #cast(*fn(rawptr, *const u8, usize) bool) probe_next("TTF_SetTextString\0")
+  return next(text, string, length)
+}

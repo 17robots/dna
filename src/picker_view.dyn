@@ -1,0 +1,671 @@
+struct PickerState {
+  index: *PickerIndex,
+  arena: mem.Arena,
+  rows: usize,
+  epoch: u64,
+  preview: PickerPreview,
+  closing: bool,
+  close_target: usize,
+  close_return: usize,
+  close_row: usize,
+  close_query: [4096]u8,
+  close_query_length: usize,
+}
+
+struct PickerPreview {
+  bytes: [8192]u8,
+  path: [4096]u8,
+  path_length: usize,
+  rows: usize,
+  length: usize,
+  epoch: u64,
+  revision: u64,
+  document: *buffer.Document,
+  ready: bool,
+}
+struct KeyHint { key, label: []const u8 }
+
+fn ui_text(typography: *Typography, text: []const u8, x: f32, y: f32, color: Rgb) {
+  if #len(text) == 0 {
+    return
+  }
+  cached := cached_ui_text(typography, text)
+  if cached != nil {
+    if !tint(cached, color) || !ttf.draw(cached, x, y) {
+      #panic("cached UI text")
+    }
+    return
+  }
+  if !tint(typography.chrome, color) || !ttf.set(typography.chrome, &text[0], #len(text)) || !ttf.draw(typography.chrome, x, y) {
+    #panic("UI text")
+  }
+}
+fn ui_box(renderer: rawptr, rect: sdl.Rect, scale: f32) {
+  inner := sdl.Rect{x: rect.x + scale, y: rect.y + scale, width: rect.width - scale * 2.0, height: rect.height - scale * 2.0}
+  if !paint(renderer, theme().border) || !sdl.fill(renderer, &rect) || !paint(renderer, theme().surface) || !sdl.fill(renderer, &inner) {
+    #panic("UI border")
+  }
+}
+fn goto_hint(index: usize) KeyHint {
+  labels: [16]KeyHint = [
+    KeyHint{key: "g", label: "file start"}, KeyHint{key: "e", label: "file end"},
+    KeyHint{key: "h", label: "line start"}, KeyHint{key: "l", label: "line end"},
+    KeyHint{key: "s", label: "first nonblank"}, KeyHint{key: "t", label: "screen top"},
+    KeyHint{key: "c", label: "screen center"}, KeyHint{key: "b", label: "screen bottom"},
+    KeyHint{key: "a", label: "last buffer"}, KeyHint{key: "f", label: "file under cursor"},
+    KeyHint{key: "n", label: "next buffer"}, KeyHint{key: "p", label: "previous buffer"},
+    KeyHint{key: "d", label: "definition"}, KeyHint{key: "r", label: "references"},
+    KeyHint{key: "y", label: "type definition"}, KeyHint{key: "i", label: "implementation"},
+  ]
+  if index < 16 {
+    return labels[index]
+  }
+  return KeyHint{key: "", label: ""}
+}
+fn view_hint(index: usize) KeyHint {
+  labels: [5]KeyHint = [
+    KeyHint{key: "z", label: "center cursor"}, KeyHint{key: "t", label: "cursor at top"},
+    KeyHint{key: "b", label: "cursor at bottom"}, KeyHint{key: "k", label: "scroll up"},
+    KeyHint{key: "j", label: "scroll down"},
+  ]
+  if index < 5 {
+    return labels[index]
+  }
+  return KeyHint{key: "", label: ""}
+}
+fn bracket_hint(index: usize) KeyHint {
+  labels: [4]KeyHint = [
+    KeyHint{key: "d", label: "diagnostic"}, KeyHint{key: "D", label: "first/last diagnostic"},
+    KeyHint{key: "p", label: "paragraph"}, KeyHint{key: " ", label: "add blank line"},
+  ]
+  if index < 4 {
+    return labels[index]
+  }
+  return KeyHint{key: "", label: ""}
+}
+fn key_hint(goto: bool, index: usize) KeyHint {
+  if goto {
+    return goto_hint(index)
+  }
+  info := command_info(leader_command(index))
+  return KeyHint{key: info.key, label: info.hint}
+}
+fn key_menu_count(app: *const App) usize {
+  if app.prompt_state.panel == Panel.Leader {
+    return 12
+  }
+  if app.prompt_state.panel == Panel.Goto {
+    return 16
+  }
+  if app.prompt_state.panel == Panel.View {
+    return 5
+  }
+  if app.prompt_state.panel == Panel.Bracket {
+    return 4
+  }
+  if app.prompt_state.panel == Panel.Windows {
+    return 10
+  }
+  if app.prompt_state.panel == Panel.Match {
+    if app.match_state.stage >= 3 {
+      return 0
+    }
+    if app.match_state.stage != 0 {
+      return 14
+    }
+    return 6
+  }
+  return 11
+}
+fn key_menu_hint(app: *const App, index: usize) KeyHint {
+  hint := key_hint(app.prompt_state.panel == Panel.Goto, index)
+  if app.prompt_state.panel == Panel.Windows {
+    hint = window_hint(index)
+  }
+  if app.prompt_state.panel == Panel.Match {
+    hint = match_hint(app.match_state.stage, index)
+  }
+  if app.prompt_state.panel == Panel.View {
+    hint = view_hint(index)
+  }
+  if app.prompt_state.panel == Panel.Bracket {
+    hint = bracket_hint(index)
+  }
+  if app.prompt_state.panel == Panel.Leader && app.input_state.leader_explorer && index == 6 {
+    hint.label = "hide explorer"
+  }
+  return hint
+}
+fn key_menu_is(panel: Panel) bool {
+  return panel == Panel.Leader || panel == Panel.Goto || panel == Panel.Windows || panel == Panel.Match || panel == Panel.View || panel == Panel.Bracket
+}
+// Key menus: a clickable grid of hints anchored bottom-right.
+fn draw_key_menu(renderer: rawptr, app: *App, typography: *Typography, width: i32, height: i32, status: f32) {
+  ui := &app.ui
+  ui_panel_begin(ui, typography)
+  scale := typography.scale
+  padding := 10.0 * scale
+  margin := 12.0 * scale
+  columns: usize = 2
+  if #cast(f32) width < typography.cell * 52.0 + padding * 2.0 {
+    columns = 1
+  }
+  count := key_menu_count(app)
+  rows := (count + columns - 1) / columns
+  box_width := typography.cell * 25.0 * #cast(f32) columns + padding * 2.0
+  if box_width > #cast(f32) width - margin * 2.0 {
+    box_width = #cast(f32) width - margin * 2.0
+  }
+  box_height := typography.line * #cast(f32) (rows + 2) + padding * 2.0
+  available := #cast(f32) height - status - margin * 2.0
+  if box_height > available {
+    box_height = available
+  }
+  // Menus rise into place as they fade in.
+  if !key_menu_is(app.view.animation.panel) {
+    motion.snap(&ui.menu_open, 10.0 * scale)
+  }
+  rise := animated_value(app, &ui.menu_open, 0.0, app.config.popup_animation_ms * 2.0, false)
+  placed := place_rect(app, SurfaceMenu, width, height, status, scale, sdl.Rect{x: #cast(f32) width - box_width - margin, y: #cast(f32) height - status - box_height - margin, width: box_width, height: box_height})
+  box_width = placed.width
+  box_height = placed.height
+  menu := ui_make(ui, ui_hash(0, "key menu"), UiFloating | UiBackground | UiBorder | UiClip)
+  ui.boxes[menu].floating[0] = placed.x
+  ui.boxes[menu].floating[1] = placed.y + rise
+  ui.boxes[menu].fill = theme().surface
+  ui.boxes[menu].padding[0] = padding
+  ui.boxes[menu].padding[1] = padding
+  ui_size(ui, menu, UiAxisX, UiSizeKind.Pixels, box_width / scale, 1.0)
+  ui_size(ui, menu, UiAxisY, UiSizeKind.Pixels, box_height / scale, 1.0)
+  ui_push(ui, menu)
+  title: []const u8 = "space"
+  if app.prompt_state.panel == Panel.Goto {
+    title = "goto (g)"
+  }
+  if app.prompt_state.panel == Panel.Windows {
+    title = "windows (space w / ctrl-w)"
+  }
+  if app.prompt_state.panel == Panel.Match {
+    title = match_title(app)
+  }
+  if app.prompt_state.panel == Panel.View {
+    title = "view (z)"
+    if app.input_state.view_sticky {
+      title = "view (Z, sticky)"
+    }
+  }
+  if app.prompt_state.panel == Panel.Bracket {
+    title = "previous ([)"
+    if app.input_state.bracket_forward {
+      title = "next (])"
+    }
+  }
+  _ = ui_label(ui, "title", title, UiMuted)
+  grid := ui_make(ui, ui_key(ui, "grid"), 0)
+  ui.boxes[grid].axis = UiAxisX
+  ui_size(ui, grid, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
+  for column in 0..columns {
+    ui_push(ui, grid)
+    lane := ui_make(ui, ui_hash_number(ui.boxes[grid].key, column), 0)
+    ui_size(ui, lane, UiAxisX, UiSizeKind.Percent, 1.0 / #cast(f32) columns, 0.0)
+    ui_push(ui, lane)
+    index := column * rows
+    for index < count && index < (column + 1) * rows {
+      hint := key_menu_hint(app, index)
+      entry := ui_make(ui, ui_hash_number(ui.boxes[lane].key, index), UiClickable | UiHover)
+      ui.boxes[entry].axis = UiAxisX
+      ui.boxes[entry].value = index
+      ui_size(ui, entry, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
+      ui_push(ui, entry)
+      shortcut := ui_label(ui, "key", hint.key, UiAccent)
+      ui_size(ui, shortcut, UiAxisX, UiSizeKind.Pixels, typography.cell * 3.0 / scale, 1.0)
+      label := ui_label(ui, "label", hint.label, 0)
+      ui_size(ui, label, UiAxisX, UiSizeKind.Percent, 1.0, 0.0)
+      ui_pop(ui)
+      ui_animate(app, ui, entry, false)
+      index += 1
+    }
+    ui_pop(ui)
+    ui_pop(ui)
+  }
+  footer: []const u8 = "esc  cancel"
+  if app.prompt_state.panel == Panel.Match && (app.match_state.stage == 1 || app.match_state.stage == 2) {
+    footer = "esc cancel; syntax objects need queries"
+  }
+  if app.prompt_state.panel == Panel.Match && app.match_state.error {
+    footer = "No object/pair, or edit limit. Esc cancels."
+  }
+  if app.prompt_state.panel == Panel.Match && app.match_state.syntax_error {
+    footer = "No syntax object; check query or wait."
+  }
+  _ = ui_label(ui, "footer", footer, UiMuted)
+  ui_pop(ui)
+  ui_layout(ui)
+  ui_render(renderer, ui, typography, width, height)
+}
+// Clicking a hint presses its key.
+fn key_menu_mouse(app: *App, typography: *Typography, x: f32, y: f32, pressed: bool, moved: bool) {
+  ui := &app.ui
+  if moved {
+    ui_pointer(ui, x, y)
+    return
+  }
+  if !pressed {
+    return
+  }
+  hit := ui_hit(ui, x, y)
+  if hit == 0 {
+    menu := ui_make_lookup(ui, ui_hash(0, "key menu"))
+    if menu == 0 || !ui_contains(ui.boxes[menu].rect, x, y) {
+      key_input(app, typography, KeyEscape, 0)
+    }
+    return
+  }
+  hint := key_menu_hint(app, ui.boxes[hit].value)
+  if #len(hint.key) == 0 {
+    return
+  }
+  if app.prompt_state.panel == Panel.Match && app.match_state.stage != 0 {
+    // Object and delimiter stages read typed characters.
+    text_input(app, hint.key[..1])
+    return
+  }
+  code := #cast(u32) hint.key[0]
+  modifiers: u16 = 0
+  if code >= 'A' && code <= 'Z' {
+    code += 32
+    modifiers = 1
+  }
+  key_input(app, typography, code, modifiers)
+}
+
+fn preview_update(app: *App, typography: *Typography, path: []const u8, doc: *buffer.Document) {
+  state := &app.picker_state.preview
+  revision: u64 = 0
+  if doc != nil {
+    revision = doc.revision
+  }
+  if state.ready && state.epoch == app.picker_state.epoch && state.document == doc && state.revision == revision && state.rows == app.picker_state.rows && buffer.equal(state.path[..state.path_length], path) {
+    return
+  }
+  state.ready = true
+  state.epoch = app.picker_state.epoch
+  state.document = doc
+  state.revision = revision
+  state.rows = app.picker_state.rows
+  state.path_length = copy_text(state.path[..], path)
+  mark := mem.arena_mark(app.scratch)
+  defer mem.arena_rewind(app.scratch, mark)
+  content: []const u8 = "No file selected."
+  if doc != nil {
+    content = doc.bytes[..doc.length]
+  }
+  else if #len(path) > 0 {
+    // Only the top of the file is ever visible in the preview.
+    read := files.read_prefix(app.scratch, path, 262144)
+    if buffer.valid(read) && (#len(read) > 0 || files.metadata(path).size == 0) {
+      content = read
+    }
+    else {
+      content = "Preview unavailable (binary or unreadable)."
+    }
+  }
+  visible: usize = 0
+  lines: usize = 0
+  for visible < #len(content) && lines < app.picker_state.rows {
+    if content[visible] == 10 {
+      lines += 1
+    }
+    visible += 1
+  }
+  length := visible
+  if length > 8191 {
+    length = 8191
+    for length > 0 && (content[length] & 192) == 128 {
+      length -= 1
+    }
+  }
+  state.length = copy_text(state.bytes[..], content[..length])
+  if !ttf.set(typography.preview_text, &state.bytes[0], state.length) {
+    #panic("picker preview text")
+  }
+}
+// Open buffers reuse their live highlighting; files use a pooled preview parser.
+fn picker_preview_colors(app: *App, path: []const u8, doc: *buffer.Document, shown: []const u8) []const u8 {
+  if #len(shown) == 0 || !app.config.syntax_enabled {
+    return shown[..0]
+  }
+  if doc != nil {
+    for index in 0..16 {
+      slot := &app.documents.slots[index]
+      if slot.document == doc && slot.syntax != nil && slot.syntax_revision == doc.revision && #len(shown) <= doc.length {
+        return slot.colors[..#len(shown)]
+      }
+    }
+  }
+  if #len(path) == 0 {
+    return shown[..0]
+  }
+  return preview_request(app, &app.previews.picker, preview_path_key(path), path, false, shown)
+}
+struct PickerGeometry {
+  rect: sdl.Rect,
+  padding: f32,
+  body_y: f32,
+  rows: usize,
+  preview: bool,
+  footer: bool,
+  list_width: f32,
+}
+// Compact and dropdown pickers: the query and a list sized to its matches,
+// without the preview or footer.
+fn picker_slim_geometry(app: *const App, typography: *const Typography, width: i32, height: i32, status: f32, count: usize) PickerGeometry {
+  scale := typography.scale
+  line := typography.line
+  padding := 10.0 * scale
+  limit: usize = 12
+  if app.config.picker_style == 2 {
+    limit = 10
+  }
+  room := (#cast(f32) height - status) * 0.7 / line - 2.0
+  rows := count
+  if rows > limit {
+    rows = limit
+  }
+  if room < 1.0 {
+    rows = 1
+  }
+  else if #cast(usize) room < rows {
+    rows = #cast(usize) room
+  }
+  if rows == 0 {
+    rows = 1
+  }
+  content := #cast(f32) (rows + 2) * line + padding * 2.0
+  natural := picker_compact_rect(width, height, status, content, scale)
+  if app.config.picker_style == 2 {
+    natural = picker_dropdown_rect(width, content, scale)
+  }
+  rect := place_rect(app, SurfacePicker, width, height, status, scale, natural)
+  return PickerGeometry{rect: rect, padding: padding, body_y: rect.y + padding + line * 2.0, rows: rows, preview: false, footer: false, list_width: rect.width - padding * 2.0}
+}
+fn picker_geometry(app: *const App, typography: *const Typography, width: i32, height: i32, status: f32, count: usize) PickerGeometry {
+  if app.config.picker_style != 0 {
+    return picker_slim_geometry(app, typography, width, height, status, count)
+  }
+  padding := 12.0 * typography.scale
+  rect := place_rect(app, SurfacePicker, width, height, status, typography.scale, sdl.Rect{x: #cast(f32) width * (1.0 - app.config.picker_width) / 2.0, y: (#cast(f32) height - status) * (1.0 - app.config.picker_height) / 2.0, width: #cast(f32) width * app.config.picker_width, height: (#cast(f32) height - status) * app.config.picker_height})
+  body_y := rect.y + padding + typography.line * 2.0
+  body_height := rect.height - padding * 2.0 - typography.line * 3.0
+  rows: usize = 1
+  if body_height > typography.line {
+    rows = #cast(usize) (body_height / typography.line)
+  }
+  preview := app.config.picker_preview && rect.width >= typography.cell * 80.0 && !app.resource_state.fonts && app.resource_state.kind == 0
+  list_width := rect.width - padding * 2.0
+  if preview {
+    list_width = (rect.width - padding * 3.0) * 0.45
+  }
+  return PickerGeometry{rect: rect, padding: padding, body_y: body_y, rows: rows, preview: preview, footer: true, list_width: list_width}
+}
+fn picker_state_counts(app: *App) PickerCounts {
+  if app.prompt_state.panel == Panel.Buffers {
+    buffer_matches(app)
+    return PickerCounts{count: app.prompt_state.match_count, selected: app.prompt_state.selected}
+  }
+  return PickerCounts{count: app.completion.count, selected: app.completion.selected}
+}
+struct PickerCounts { count, selected: usize }
+// File, buffer and resource pickers: a list that scrolls smoothly beside an
+// optional syntax-highlighted preview.
+fn draw_picker(renderer: rawptr, app: *App, typography: *Typography, width: i32, height: i32, status: f32) {
+  counts := picker_state_counts(app)
+  count := counts.count
+  selected := counts.selected
+  geometry := picker_geometry(app, typography, width, height, status, count)
+  rect := geometry.rect
+  padding := geometry.padding
+  rows := geometry.rows
+  preview := geometry.preview
+  scale := typography.scale
+  line := typography.line
+  app.picker_state.rows = rows
+  buffers := app.prompt_state.panel == Panel.Buffers
+  ui := &app.ui
+  ui_panel_begin(ui, typography)
+  opening := app.view.animation.panel != Panel.Open && app.view.animation.panel != Panel.Buffers
+  if opening {
+    motion.snap(&ui.picker_open, -12.0 * scale)
+  }
+  slide := animated_value(app, &ui.picker_open, 0.0, app.config.popup_animation_ms * 2.0, false)
+  frame := ui_make(ui, ui_hash(0, "picker"), UiFloating | UiBackground | UiBorder | UiClip)
+  ui.boxes[frame].floating[0] = rect.x
+  ui.boxes[frame].floating[1] = rect.y + slide
+  ui.boxes[frame].fill = theme().surface
+  ui.boxes[frame].padding[0] = padding
+  ui.boxes[frame].padding[1] = padding
+  ui_size(ui, frame, UiAxisX, UiSizeKind.Pixels, rect.width / scale, 1.0)
+  ui_size(ui, frame, UiAxisY, UiSizeKind.Pixels, rect.height / scale, 1.0)
+  ui_push(ui, frame)
+  head: [8192]u8 = []
+  used: usize = 0
+  if buffers {
+    add_text(head[..], &used, "buffers > ")
+  }
+  else if app.resource_state.kind == 1 {
+    add_text(head[..], &used, "themes > ")
+  }
+  else if app.resource_state.kind == 2 {
+    add_text(head[..], &used, "layouts > ")
+  }
+  else if app.resource_state.kind == 5 {
+    add_text(head[..], &used, "task diagnostics > ")
+  }
+  else if app.resource_state.kind == 4 {
+    add_text(head[..], &used, "recovery snapshots > ")
+  }
+  add_text(head[..], &used, app.prompt_state.text[..app.prompt_state.length])
+  add_text(head[..], &used, "_")
+  header := ui_label(ui, "header", head[..used], 0)
+  ui_size(ui, header, UiAxisX, UiSizeKind.Percent, 1.0, 0.0)
+  spacer := ui_make(ui, ui_key(ui, "above divider"), 0)
+  ui_size(ui, spacer, UiAxisY, UiSizeKind.Pixels, line * 0.5 / scale, 1.0)
+  divider := ui_make(ui, ui_key(ui, "divider"), UiBackground)
+  ui.boxes[divider].fill = theme().border
+  ui_size(ui, divider, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
+  ui_size(ui, divider, UiAxisY, UiSizeKind.Pixels, 1.0, 1.0)
+  below := ui_make(ui, ui_key(ui, "below divider"), 0)
+  ui_size(ui, below, UiAxisY, UiSizeKind.Pixels, line * 0.5 / scale - 1.0, 1.0)
+  body := ui_make(ui, ui_key(ui, "body"), 0)
+  ui.boxes[body].axis = UiAxisX
+  ui_size(ui, body, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
+  ui_size(ui, body, UiAxisY, UiSizeKind.Pixels, line * #cast(f32) rows / scale, 1.0)
+  ui_push(ui, body)
+  list := ui_make(ui, ui_key(ui, "list"), UiClip | UiScroll)
+  ui_size(ui, list, UiAxisX, UiSizeKind.Pixels, geometry.list_width / scale, 1.0)
+  ui_size(ui, list, UiAxisY, UiSizeKind.Percent, 1.0, 1.0)
+  ui_list_scroll(app, ui, list, count, selected, line * #cast(f32) rows, opening, opening || selected != ui.picker_selected || count != ui.picker_count)
+  window := ui_list_window(ui, list, count, line * #cast(f32) rows)
+  ui_push(ui, list)
+  preview_box: usize = 0
+  ui_spacer(ui, "above", #cast(f32) window.first * line)
+  for row in window.first..window.last {
+    label: [8192]u8 = []
+    length: usize = 0
+    key: u64 = 0
+    if buffers {
+      slot := &app.documents.slots[app.prompt_state.matches[row]]
+      name := files.name(&slot.file)
+      key = ui_hash_number(ui.boxes[list].key, #cast(usize) (slot.identity % 1099511627776))
+      if app.prompt_state.matches[row] == app.documents.active {
+        add_text(label[..], &length, "* ")
+      }
+      if buffer.dirty_cached(slot.document) {
+        add_text(label[..], &length, "+ ")
+      }
+      if slot.terminal.handle != nil {
+        add_text(label[..], &length, "Terminal")
+      }
+      else if #len(name) == 0 {
+        add_text(label[..], &length, "Untitled")
+      }
+      else {
+        leaf := #len(name)
+        for leaf > 0 && name[leaf - 1] != '/' {
+          leaf -= 1
+        }
+        add_text(label[..], &length, name[leaf..])
+        add_text(label[..], &length, "  ")
+        add_text(label[..], &length, name[..leaf])
+      }
+    }
+    else {
+      entry := &app.completion.entries[row]
+      add_text(label[..], &length, entry.name[..entry.length])
+      key = ui_hash(ui.boxes[list].key, entry.name[..entry.length])
+    }
+    item := ui_make(ui, key, UiClickable | UiHover | UiText)
+    ui_text_set(ui, item, label[..length])
+    ui.boxes[item].value = row
+    ui.boxes[item].padding[0] = typography.cell
+    ui_size(ui, item, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
+    ui_size(ui, item, UiAxisY, UiSizeKind.Pixels, line / scale, 1.0)
+    ui_animate(app, ui, item, row == selected)
+  }
+  ui_spacer(ui, "below", #cast(f32) (count - window.last) * line)
+  if count == 0 {
+    empty := ui_label(ui, "empty", "No matches", UiMuted)
+    ui.boxes[empty].padding[0] = typography.cell
+  }
+  ui_pop(ui)
+  if preview {
+    gutter := ui_make(ui, ui_key(ui, "gutter"), 0)
+    ui.boxes[gutter].axis = UiAxisX
+    ui_size(ui, gutter, UiAxisX, UiSizeKind.Pixels, padding / scale, 1.0)
+    ui_size(ui, gutter, UiAxisY, UiSizeKind.Percent, 1.0, 1.0)
+    ui_push(ui, gutter)
+    before := ui_make(ui, ui_key(ui, "before"), 0)
+    ui_size(ui, before, UiAxisX, UiSizeKind.Pixels, padding * 0.5 / scale, 1.0)
+    separator := ui_make(ui, ui_key(ui, "separator"), UiBackground)
+    ui.boxes[separator].fill = theme().border
+    ui_size(ui, separator, UiAxisX, UiSizeKind.Pixels, 1.0, 1.0)
+    ui_size(ui, separator, UiAxisY, UiSizeKind.Percent, 1.0, 1.0)
+    ui_pop(ui)
+    preview_box = ui_make(ui, ui_key(ui, "preview"), UiClip)
+    ui_size(ui, preview_box, UiAxisX, UiSizeKind.Percent, 1.0, 0.0)
+    ui_size(ui, preview_box, UiAxisY, UiSizeKind.Percent, 1.0, 1.0)
+  }
+  ui_pop(ui)
+  if geometry.footer {
+    footer: [512]u8 = []
+    footer_length: usize = 0
+    if count > 0 {
+      add_number(footer[..], &footer_length, selected + 1)
+    }
+    else {
+      add_number(footer[..], &footer_length, 0)
+    }
+    add_text(footer[..], &footer_length, "/")
+    add_number(footer[..], &footer_length, count)
+    add_text(footer[..], &footer_length, "  arrows choose  enter opens  double-click opens")
+    if buffers {
+      add_text(footer[..], &footer_length, "  ctrl-x closes buffer")
+    }
+    add_text(footer[..], &footer_length, "  esc cancels")
+    if !buffers && app.picker_state.index != nil {
+      if app.picker_state.index.limited {
+        add_text(footer[..], &footer_length, "  [index limited]")
+      }
+      if app.completion.error {
+        add_text(footer[..], &footer_length, "  [some paths unreadable]")
+      }
+    }
+    // Keep the footer on the bottom edge: fill the remaining height first.
+    filler := ui_make(ui, ui_key(ui, "filler"), 0)
+    ui_size(ui, filler, UiAxisY, UiSizeKind.Percent, 1.0, 0.0)
+    footer_box := ui_label(ui, "footer", footer[..footer_length], UiMuted)
+    ui_size(ui, footer_box, UiAxisX, UiSizeKind.Percent, 1.0, 0.0)
+  }
+  ui_pop(ui)
+  ui.picker_selected = selected
+  ui.picker_count = count
+  ui_layout(ui)
+  ui_render(renderer, ui, typography, width, height)
+  if preview {
+    area := ui.boxes[preview_box].rect
+    path: [4096]u8 = []
+    path_length: usize = 0
+    doc: *buffer.Document = nil
+    if selected < count {
+      if buffers {
+        chosen := &app.documents.slots[app.prompt_state.matches[selected]]
+        doc = chosen.document
+        path_length = copy_text(path[..], files.name(&chosen.file))
+      }
+      else {
+        candidate := &app.completion.entries[selected]
+        add_text(path[..], &path_length, app.completion.prefix[..app.completion.prefix_length])
+        add_text(path[..], &path_length, candidate.name[..candidate.length])
+      }
+    }
+    preview_update(app, typography, path[..path_length], doc)
+    shown := app.picker_state.preview.bytes[..app.picker_state.preview.length]
+    colors := picker_preview_colors(app, path[..path_length], doc, shown)
+    preview_spans_update(typography, &typography.picker_spans, typography.preview_text, shown, colors)
+    preview_clip := sdl.PixelRect{x: #cast(i32) area.x, y: #cast(i32) area.y, width: #cast(i32) area.width, height: #cast(i32) area.height}
+    if !sdl.clip(renderer, &preview_clip) || !ttf.draw(typography.preview_text, area.x, area.y) {
+      #panic("picker preview draw")
+    }
+    preview_spans_draw(&typography.picker_spans, area.x, area.y)
+    if !sdl.clip(renderer, nil) {
+      #panic("picker preview reset")
+    }
+  }
+}
+
+fn picker_release(app: *App) {
+  if app.picker_state.index != nil {
+    _ = mem.arena_release(&app.picker_state.arena)
+    app.picker_state.index = nil
+  }
+}
+// Click selects a row; double-click opens it; clicking outside cancels.
+fn picker_ui_mouse(app: *App, typography: *Typography, x: f32, y: f32, pressed: bool, moved: bool, clicks: u8) {
+  ui := &app.ui
+  if !app.config.mouse_enabled {
+    return
+  }
+  if moved {
+    ui_pointer(ui, x, y)
+    return
+  }
+  if !pressed {
+    return
+  }
+  hit := ui_hit(ui, x, y)
+  if hit == 0 {
+    frame := ui_make_lookup(ui, ui_hash(0, "picker"))
+    if frame == 0 || !ui_contains(ui.boxes[frame].rect, x, y) {
+      key_input(app, typography, KeyEscape, 0)
+    }
+    return
+  }
+  row := ui.boxes[hit].value
+  if app.prompt_state.panel == Panel.Buffers {
+    buffer_matches(app)
+    if row >= app.prompt_state.match_count {
+      return
+    }
+    app.prompt_state.selected = row
+  }
+  else {
+    if row >= app.completion.count {
+      return
+    }
+    app.completion.selected = row
+    app.completion.chosen = true
+  }
+  if clicks >= 2 {
+    submit(app, typography)
+  }
+}

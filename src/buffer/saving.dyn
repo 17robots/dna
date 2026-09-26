@@ -1,0 +1,62 @@
+// Save policies run as one undoable edit. A failed capacity check changes nothing.
+pub fn prepare_save(document: *Document, trim_whitespace: bool, final_newline: bool) bool {
+  if !trim_whitespace && !final_newline {
+    return true
+  }
+  // The result is at most the text plus a final CRLF.
+  reserved := reserve(document.length + 3)
+  if !reserved.ok {
+    return false
+  }
+  defer _ = mem.arena_release(&reserved.arena)
+  output := reserved.arena.data
+  used: usize = 0
+  at: usize = 0
+  newline: []const u8 = "\n"
+  detected: bool = false
+  for at < document.length {
+    end := at
+    for end < document.length && document.bytes[end] != 10 {
+      end += 1
+    }
+    ending := end
+    crlf := ending > at && document.bytes[ending - 1] == 13
+    if crlf {
+      ending -= 1
+    }
+    if end < document.length && !detected {
+      if crlf {
+        newline = "\r\n"
+      }
+      detected = true
+    }
+    if trim_whitespace {
+      for ending > at && (document.bytes[ending - 1] == 32 || document.bytes[ending - 1] == 9) {
+        ending -= 1
+      }
+    }
+    for byte in document.bytes[at..ending] {
+      output[used] = byte
+      used += 1
+    }
+    if crlf {
+      output[used] = 13
+      used += 1
+    }
+    if end < document.length {
+      output[used] = 10
+      used += 1
+    }
+    at = end + 1
+  }
+  if final_newline && used > 0 && output[used - 1] != 10 {
+    if #len(newline) > Capacity - used {
+      return false
+    }
+    for ending_byte in newline {
+      output[used] = ending_byte
+      used += 1
+    }
+  }
+  return transform(document, output[..used])
+}

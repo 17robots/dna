@@ -1,0 +1,1009 @@
+extern fn language_test_delay "SDL_Delay"(milliseconds: u32)
+fn language_wait(app: *App) {
+  deadline := sdl.ticks() + 3000
+  for sdl.ticks() < deadline {
+    _ = lsp_tick(app)
+    if app.lsp.pending == 0 && app.lsp.servers[0].ready {
+      return
+    }
+    language_test_delay(1)
+  }
+  #panic("language response deadline")
+}
+fn language_smoke() {
+  command: [4096]u8 = []
+  configured := process.environment("DNA_TEST_LSP", command[..4095])
+  if !configured.ok || !configured.found {
+    return
+  }
+  directory: [4096]u8 = []
+  root := process.environment("DNA_WORKFLOW_TEST", directory[..4095])
+  if !root.found {
+    return
+  }
+  owned := mem.arena_create(#sizeof(App) + 128)
+  scratch := mem.arena_create(2097152)
+  if !owned.ok || !scratch.ok {
+    #panic("language test memory")
+  }
+  defer _ = mem.arena_release(&owned.arena)
+  defer _ = mem.arena_release(&scratch.arena)
+  app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
+  app.scratch = &scratch.arena
+  app.config = settings.Settings{}
+  defer release_editor_state(app)
+  defer lsp_release(app)
+  app.workspace.project_length = copy_text(app.workspace.project[..], root.value)
+  if !new_buffer(app) {
+    #panic("language buffer")
+  }
+  path: [4096]u8 = []
+  length := copy_text(path[..], root.value)
+  add_text(path[..], &length, "/language test.dyn")
+  if !fs.write_all(path[..length], "al é😀\n").ok {
+    #panic("language fixture")
+  }
+  if #len(files.open(app.documents.file, app.documents.current, path[..length], app.scratch)) != 0 {
+    #panic("language open")
+  }
+  slot := &app.documents.slots[app.documents.active]
+  slot.filetype_length = copy_text(slot.filetype[..], "dyn")
+  lsp_start(app, "dyn", configured.value)
+  language_wait(app)
+  buffer.mark_saved(app.documents.current)
+  lsp_sync(app, 0, true)
+  save_deadline := sdl.ticks() + 3000
+  for !contains(app.lsp.log[..app.lsp.log_length], "fixture saved") && sdl.ticks() < save_deadline {
+    _ = lsp_tick(app)
+    language_test_delay(1)
+  }
+  if !contains(app.lsp.log[..app.lsp.log_length], "fixture saved") {
+    #panic("save notification")
+  }
+  // Incremental sync: mid-document edits around multi-byte text, then a save
+  // the fixture server checks against its own copy (it exits on mismatch).
+  incremental := app.documents.current
+  original: [64]u8 = []
+  original_length := copy_text(original[..], incremental.bytes[..incremental.length])
+  incremental.anchor = 3
+  incremental.cursor = 3
+  _ = buffer.replace(incremental, "XY😀")
+  lsp_sync(app, 0, true)
+  incremental.anchor = 1
+  incremental.cursor = 4
+  _ = buffer.replace(incremental, "")
+  lsp_sync(app, 0, true)
+  incremental.anchor = incremental.length
+  incremental.cursor = incremental.length
+  _ = buffer.replace(incremental, "\nend é")
+  lsp_sync(app, 0, true)
+  if !app.lsp.shadows[0].ready || app.lsp.shadows[0].length != incremental.length {
+    #panic("incremental sync keeps the sent text")
+  }
+  app.lsp.log_length = 0
+  buffer.mark_saved(incremental)
+  lsp_sync(app, 0, true)
+  verify_deadline := sdl.ticks() + 3000
+  for !contains(app.lsp.log[..app.lsp.log_length], "fixture saved") && sdl.ticks() < verify_deadline {
+    _ = lsp_tick(app)
+    language_test_delay(1)
+  }
+  if !contains(app.lsp.log[..app.lsp.log_length], "fixture saved") || app.lsp.servers[0].process == nil {
+    #panic("incremental edits diverged from the server copy")
+  }
+  incremental.anchor = 0
+  incremental.cursor = incremental.length
+  _ = buffer.replace(incremental, original[..original_length])
+  buffer.mark_saved(incremental)
+  lsp_sync(app, 0, true)
+  buffer.move_to(app.documents.current, 2, false)
+  app.view.insert = true
+  lsp_request(app, 1, "")
+  language_wait(app)
+  if app.prompt_state.panel != Panel.LspResults || app.lsp.results.count != 1 {
+    #panic("completion result")
+  }
+  lsp_accept(app)
+  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "alphabet é😀\n") || !app.view.insert || app.documents.current.cursor != 8 {
+    #panic("completion apply")
+  }
+  buffer.undo(app.documents.current)
+  app.prompt_state.panel = Panel.None
+  app.view.insert = false
+  buffer.move_to(app.documents.current, 0, false)
+  if !app.config.automatic_completion {
+    #panic("completion enabled by default")
+  }
+  app.view.insert = true
+  buffer.move_to(app.documents.current, 2, false)
+  buffer.checkpoint(app.documents.current)
+  // Cursor motion alone never opens completion; typed text does.
+  completion_tick(app)
+  if app.lsp.completion_due != 0 {
+    #panic("cursor motion must not arm completion")
+  }
+  app.lsp.completion_typed = true
+  completion_armed := sdl.ticks()
+  completion_tick(app)
+  if app.lsp.completion_due < completion_armed + #cast(u64) app.config.completion_delay_ms || app.lsp.pending != 0 {
+    #panic("completion must preserve configured typing pause")
+  }
+  if editor_wait_ms(app, true) > #cast(i32) app.config.completion_delay_ms {
+    #panic("completion deadline must wake editor")
+  }
+  completion_deadline := sdl.ticks() + 1000
+  for app.lsp.pending == 0 && sdl.ticks() < completion_deadline {
+    completion_tick(app)
+    language_test_delay(1)
+  }
+  if app.lsp.pending == 0 {
+    #panic("automatic completion timer")
+  }
+  language_wait(app)
+  if !completion_visible(app) || !wants_text_input(app) {
+    #panic("automatic completion must retain text input")
+  }
+  if !contains(app.lsp.log[..app.lsp.log_length], "Automatic completion: 1 results; popup opened.") {
+    #panic("completion response must replace pending status")
+  }
+  lsp_status(app)
+  if !contains(app.prompt_state.message[..app.prompt_state.message_length], configured.value) || !contains(app.prompt_state.message[..app.prompt_state.message_length], "Completion delay: 25 ms") || !contains(app.prompt_state.message[..app.prompt_state.message_length], "Last response:") {
+    #panic("language status must identify server and timings")
+  }
+  // A transient panel must not permanently suppress automatic completion.
+  app.prompt_state.panel = Panel.None
+  lsp_request(app, 1, "")
+  app.lsp.automatic = true
+  app.prompt_state.panel = Panel.Commands
+  completion_tick(app)
+  language_wait(app)
+  if !contains(app.lsp.log[..app.lsp.log_length], "another panel is open") {
+    #panic("stale completion must identify panel interruption")
+  }
+  app.prompt_state.panel = Panel.None
+  completion_tick(app)
+  if app.lsp.completion_due == 0 {
+    #panic("completion must resume after interrupted response")
+  }
+  completion_deadline = sdl.ticks() + 1000
+  for app.lsp.pending == 0 && sdl.ticks() < completion_deadline {
+    completion_tick(app)
+    language_test_delay(1)
+  }
+  language_wait(app)
+  if !completion_visible(app) {
+    #panic("interrupted completion popup must recover")
+  }
+  app.prompt_state.panel = Panel.None
+  lsp_request(app, 1, "")
+  app.lsp.automatic = true
+  text_input(app, "z")
+  lsp_sync(app, 0, true)
+  app.lsp.completion_due = sdl.ticks()
+  if editor_wait_ms(app, true) == 0 {
+    #panic("pending completion must not spin on expired debounce")
+  }
+  language_wait(app)
+  if app.prompt_state.panel != Panel.None || !contains(app.lsp.log[..app.lsp.log_length], "document changed") {
+    #panic("stale completion must reject old document")
+  }
+  completion_tick(app)
+  completion_deadline = sdl.ticks() + 1000
+  for app.lsp.pending == 0 && sdl.ticks() < completion_deadline {
+    completion_tick(app)
+    language_test_delay(1)
+  }
+  text_input(app, "q")
+  completion_tick(app)
+  if app.lsp.pending != 0 || app.lsp.completion_due == 0 {
+    #panic("obsolete automatic completion must cancel and rearm")
+  }
+  completion_deadline = sdl.ticks() + 1000
+  for app.lsp.pending == 0 && sdl.ticks() < completion_deadline {
+    completion_tick(app)
+    language_test_delay(1)
+  }
+  language_wait(app)
+  if !completion_visible(app) || app.lsp.results.revision != app.documents.current.revision {
+    #panic("completion must retry current document")
+  }
+  buffer.checkpoint(app.documents.current)
+  buffer.undo(app.documents.current)
+  buffer.move_to(app.documents.current, 2, false)
+  text_input(app, "x")
+  buffer.checkpoint(app.documents.current)
+  if app.prompt_state.panel != Panel.None || !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "alx é😀\n") {
+    #panic("typing through completion")
+  }
+  buffer.undo(app.documents.current)
+  buffer.move_to(app.documents.current, 2, false)
+  lsp_request(app, 1, "")
+  language_wait(app)
+  key_input(app, nil, 9, 0)
+  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "alphabet é😀\n") || !app.view.insert {
+    #panic("Tab accepts completion")
+  }
+  buffer.undo(app.documents.current)
+  app.config.automatic_completion = false
+  app.view.insert = false
+  lsp_request(app, 2, "")
+  language_wait(app)
+  if app.prompt_state.panel != Panel.Hover || !contains(app.prompt_state.message[..app.prompt_state.message_length], "fixture hover") {
+    #panic("hover")
+  }
+  app.prompt_state.panel = Panel.None
+  lsp_request(app, 9, "")
+  language_wait(app)
+  if app.prompt_state.panel != Panel.Hover || !contains(app.prompt_state.message[..app.prompt_state.message_length], "fixture signature") {
+    #panic("signature help")
+  }
+  app.prompt_state.panel = Panel.None
+  lsp_request(app, 10, "")
+  language_wait(app)
+  if app.prompt_state.panel != Panel.LspEdit {
+    #panic("LSP formatting preview")
+  }
+  lsp_apply(app)
+  if !contains(app.documents.current.bytes[..app.documents.current.length], "formatted") {
+    #panic("LSP formatting apply")
+  }
+  buffer.undo(app.documents.current)
+  app.prompt_state.panel = Panel.None
+  lsp_request(app, 3, "")
+  language_wait(app)
+  if app.prompt_state.panel != Panel.LspResults {
+    #panic("definition")
+  }
+  lsp_accept(app)
+  if app.documents.current.anchor != 0 || app.documents.current.cursor != 2 {
+    #panic("definition selection")
+  }
+  app.prompt_state.panel = Panel.None
+  lsp_request(app, 4, "")
+  language_wait(app)
+  if app.lsp.results.count != 1 {
+    #panic("references")
+  }
+  app.prompt_state.panel = Panel.None
+  goto_key(app, nil, 121)
+  language_wait(app)
+  if app.lsp.results.kind != 11 || app.lsp.results.count != 1 {
+    #panic("type definition binding")
+  }
+  app.prompt_state.panel = Panel.None
+  goto_key(app, nil, 105)
+  language_wait(app)
+  if app.lsp.results.kind != 12 || app.lsp.results.count != 1 {
+    #panic("implementation binding")
+  }
+  app.prompt_state.panel = Panel.None
+  lsp_request(app, 5, "renamed")
+  language_wait(app)
+  if app.prompt_state.panel != Panel.LspEdit || !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "al é😀\n") {
+    #panic("rename must preview")
+  }
+  lsp_apply(app)
+  if !contains(app.documents.current.bytes[..app.documents.current.length], "renamed") {
+    #panic("rename apply")
+  }
+  buffer.undo(app.documents.current)
+  app.prompt_state.panel = Panel.None
+  lsp_request(app, 6, "")
+  language_wait(app)
+  lsp_accept(app)
+  if app.prompt_state.panel != Panel.LspEdit {
+    #panic("action preview")
+  }
+  lsp_edits_release(app)
+  app.prompt_state.panel = Panel.None
+  lsp_request(app, 6, "")
+  language_wait(app)
+  app.prompt_state.selected = 1
+  lsp_accept(app)
+  language_wait(app)
+  if app.prompt_state.panel != Panel.LspResults || !app.lsp.results.resolved {
+    #panic("resolved action result")
+  }
+  lsp_accept(app)
+  if app.prompt_state.panel != Panel.LspEdit {
+    #panic("resolved action preview")
+  }
+  lsp_apply(app)
+  if !contains(app.documents.current.bytes[..app.documents.current.length], "resolved") {
+    #panic("resolved action apply")
+  }
+  buffer.undo(app.documents.current)
+  app.prompt_state.panel = Panel.None
+  lsp_request(app, 6, "")
+  language_wait(app)
+  app.prompt_state.selected = 2
+  lsp_accept(app)
+  action_deadline := sdl.ticks() + 3000
+  for app.prompt_state.panel != Panel.LspEdit && sdl.ticks() < action_deadline {
+    _ = lsp_tick(app)
+    language_test_delay(1)
+  }
+  if app.prompt_state.panel != Panel.LspEdit {
+    #panic("command edit preview")
+  }
+  lsp_apply(app)
+  language_wait(app)
+  if !contains(app.documents.current.bytes[..app.documents.current.length], "command") {
+    #panic("command edit apply")
+  }
+  buffer.undo(app.documents.current)
+  app.prompt_state.panel = Panel.None
+  lsp_request(app, 6, "")
+  language_wait(app)
+  lsp_accept(app)
+  // Edits after preview must prevent the entire plan from applying.
+  buffer.move_to(app.documents.current, 0, false)
+  _ = buffer.replace(app.documents.current, "x")
+  lsp_apply(app)
+  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "xal é😀\n") {
+    #panic("stale action applied")
+  }
+  app.prompt_state.panel = Panel.None
+  lsp_request(app, 2, "")
+  _ = buffer.replace(app.documents.current, "y")
+  language_wait(app)
+  if app.prompt_state.panel != Panel.None {
+    #panic("stale hover opened popup")
+  }
+}
+fn disk_smoke() {
+  directory: [4096]u8 = []
+  root := process.environment("DNA_WORKFLOW_TEST", directory[..4095])
+  if !root.found {
+    return
+  }
+  owned := mem.arena_create(#sizeof(App) + 128)
+  scratch := mem.arena_create(2097152)
+  if !owned.ok || !scratch.ok {
+    #panic("disk test memory")
+  }
+  defer _ = mem.arena_release(&owned.arena)
+  defer _ = mem.arena_release(&scratch.arena)
+  app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
+  app.scratch = &scratch.arena
+  app.config = settings.Settings{}
+  defer release_editor_state(app)
+  defer disk_release(app)
+  if !new_buffer(app) {
+    #panic("disk test buffer")
+  }
+  path: [4096]u8 = []
+  length := copy_text(path[..], root.value)
+  add_text(path[..], &length, "/watched.txt")
+  if !fs.write_all(path[..length], "original").ok || #len(files.open(app.documents.file, app.documents.current, path[..length], app.scratch)) != 0 {
+    #panic("disk fixture")
+  }
+  _ = disk_tick(app)
+  if !fs.write_all(path[..length], "external").ok {
+    #panic("external write")
+  }
+  deadline := sdl.ticks() + 3000
+  for !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "external") && sdl.ticks() < deadline {
+    _ = disk_tick(app)
+    language_test_delay(1)
+  }
+  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "external") || buffer.dirty(app.documents.current) {
+    #panic("automatic clean reload")
+  }
+  buffer.move_to(app.documents.current, 0, false)
+  _ = buffer.replace(app.documents.current, "local ")
+  if !fs.write_all(path[..length], "conflicting").ok {
+    #panic("conflicting write")
+  }
+  deadline = sdl.ticks() + 3000
+  for !app.documents.slots[app.documents.active].disk_changed && sdl.ticks() < deadline {
+    _ = disk_tick(app)
+    language_test_delay(1)
+  }
+  if !app.documents.slots[app.documents.active].disk_changed || !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "local external") {
+    #panic("dirty buffer protection")
+  }
+  disk_reload(app, false)
+  if app.prompt_state.panel != Panel.FileConflict {
+    #panic("reload must confirm dirty buffer")
+  }
+  typography := Typography{}
+  key_input(app, &typography, 27, 0)
+  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "local external") {
+    #panic("reload cancel")
+  }
+  disk_reload(app, true)
+  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "conflicting") || buffer.dirty(app.documents.current) {
+    #panic("confirmed reload")
+  }
+}
+
+fn clipboard_smoke() {
+  owned := mem.arena_create(#sizeof(App) + 128)
+  if !owned.ok {
+    #panic("clipboard test memory")
+  }
+  defer _ = mem.arena_release(&owned.arena)
+  app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
+  defer release_editor_state(app)
+  if !new_buffer(app) {
+    #panic("clipboard test buffer")
+  }
+  doc := app.documents.current
+  _ = buffer.load(doc, "one two")
+  doc.anchor = 0
+  doc.cursor = 3
+  doc.secondary.count = 1
+  doc.secondary.ranges[0] = buffer.Selection{anchor: 4, cursor: 7}
+  _ = clipboard_copy(app)
+  _ = buffer.load(doc, "a b")
+  doc.anchor = 0
+  doc.cursor = 1
+  doc.secondary.count = 1
+  doc.secondary.ranges[0] = buffer.Selection{anchor: 2, cursor: 3}
+  paste_selection(app, false, true)
+  if !buffer.equal(doc.bytes[..doc.length], "one two") {
+    #panic("clipboard distributed roundtrip")
+  }
+  buffer.undo(doc)
+  if !buffer.equal(doc.bytes[..doc.length], "a b") {
+    #panic("clipboard roundtrip undo")
+  }
+}
+
+fn formatting_wait(app: *App) {
+  deadline := sdl.ticks() + 3000
+  for app.formatting.process != nil && sdl.ticks() < deadline {
+    _ = format_tick(app)
+    language_test_delay(1)
+  }
+  if app.formatting.process != nil {
+    #panic("formatter deadline")
+  }
+}
+fn formatting_smoke() {
+  owned := mem.arena_create(#sizeof(App) + 128)
+  scratch := mem.arena_create(2097152)
+  if !owned.ok || !scratch.ok {
+    #panic("formatter test memory")
+  }
+  defer _ = mem.arena_release(&owned.arena)
+  defer _ = mem.arena_release(&scratch.arena)
+  app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
+  app.scratch = &scratch.arena
+  defer release_editor_state(app)
+  defer format_release(app)
+  if !settings.parse("[languages.text]\nformatter = \"tr a-z A-Z\"\n", &app.config) || !new_buffer(app) {
+    #panic("formatter test setup")
+  }
+  app.directory_state.length = copy_text(app.directory_state.path[..], "/tmp")
+  slot := &app.documents.slots[app.documents.active]
+  slot.filetype_length = copy_text(slot.filetype[..], "text")
+  doc := app.documents.current
+  _ = buffer.load(doc, "hello")
+  doc.anchor = 1
+  doc.cursor = 4
+  doc.secondary.count = 1
+  doc.secondary.ranges[0] = buffer.Selection{anchor: 0, cursor: 1}
+  doc.marks[0] = 2
+  format_start(app, false, "")
+  formatting_wait(app)
+  if !buffer.equal(doc.bytes[..doc.length], "HELLO") || doc.anchor != 1 || doc.cursor != 4 || doc.secondary.count != 1 || doc.secondary.ranges[0].cursor != 1 || doc.marks[0] != 2 {
+    #panic("formatter apply preserves positions")
+  }
+  buffer.undo(doc)
+  if !buffer.equal(doc.bytes[..doc.length], "hello") {
+    #panic("formatter undo")
+  }
+  format_start(app, false, "")
+  buffer.move_to(doc, doc.length, false)
+  _ = buffer.replace(doc, "!")
+  formatting_wait(app)
+  if !buffer.equal(doc.bytes[..doc.length], "hello!") || !contains(app.prompt_state.message[..app.prompt_state.message_length], "discarded") {
+    #panic("stale formatter protection")
+  }
+  before := app.scratch.offset
+  format_start(app, false, "")
+  formatting_wait(app)
+  if app.scratch.offset != before {
+    #panic("formatter scratch ownership")
+  }
+}
+
+fn composition_smoke(app: *App, typography: *Typography) {
+  original := app.documents.active
+  if !new_buffer(app) {
+    #panic("IME fixture")
+  }
+  app.prompt_state.panel = Panel.None
+  app.view.insert = true
+  text: [32]u8 = []
+  encoded := c.string_from_bytes(text[..], "にほん")
+  event := sdl.EditingEvent{text: encoded.value, start: 0, length: 3}
+  composition_update(app, &event)
+  if app.composition.length != 9 || app.documents.current.length != 0 {
+    #panic("composition must not commit")
+  }
+  text_input(app, "日本")
+  if app.composition.length != 0 || !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "日本") {
+    #panic("IME commit")
+  }
+  key_input(app, typography, 27, 0)
+  buffer.undo(app.documents.current)
+  if app.documents.current.length != 0 {
+    #panic("IME undo")
+  }
+  close_clean(app)
+  activate(app, original)
+}
+
+fn format_save_smoke() {
+  storage: [4096]u8 = []
+  fixture := process.environment("DNA_WORKFLOW_TEST", storage[..])
+  if !fixture.ok || !fixture.found {
+    return
+  }
+  owned := mem.arena_create(#sizeof(App) + 128)
+  scratch := mem.arena_create(2097152)
+  if !owned.ok || !scratch.ok {
+    #panic("format save memory")
+  }
+  defer _ = mem.arena_release(&owned.arena)
+  defer _ = mem.arena_release(&scratch.arena)
+  app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
+  app.scratch = &scratch.arena
+  defer release_editor_state(app)
+  defer format_release(app)
+  if !settings.parse("[languages.text]\nformatter = \"tr a-z A-Z\"\nformat_on_save = true\n", &app.config) || !new_buffer(app) {
+    #panic("format save setup")
+  }
+  app.directory_state.length = copy_text(app.directory_state.path[..], fixture.value)
+  slot := &app.documents.slots[app.documents.active]
+  slot.filetype_length = copy_text(slot.filetype[..], "text")
+  _ = buffer.load(app.documents.current, "hello")
+  path: [4096]u8 = []
+  length := copy_text(path[..], fixture.value)
+  add_text(path[..], &length, "/formatted.txt")
+  save_file(app, path[..length])
+  formatting_wait(app)
+  mark := mem.arena_mark(app.scratch)
+  read := fs.read_all(app.scratch, path[..length], 32)
+  if !read.ok || !buffer.equal(read.data, "HELLO") || buffer.dirty(app.documents.current) {
+    #panic("format before save")
+  }
+  mem.arena_rewind(app.scratch, mark)
+  // A concurrent outside edit must never be overwritten by formatting on save.
+  buffer.move_to(app.documents.current, app.documents.current.length, false)
+  _ = buffer.replace(app.documents.current, " changed")
+  save_file(app, path[..length])
+  if !fs.write_all(path[..length], "external").ok {
+    #panic("format conflict fixture")
+  }
+  formatting_wait(app)
+  verify := fs.read_all(app.scratch, path[..length], 32)
+  if !verify.ok || !buffer.equal(verify.data, "external") || !buffer.dirty(app.documents.current) {
+    #panic("formatter overwrote external edit")
+  }
+}
+
+fn settings_inspector_smoke(typography: *Typography) {
+  owned := mem.arena_create(#sizeof(App) + 128)
+  if !owned.ok {
+    #panic("settings inspector memory")
+  }
+  defer _ = mem.arena_release(&owned.arena)
+  app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
+  if !settings.parse("terminal_escape = \"alt-x\"\n[keys.normal]\n\"f2\" = \"write\"\n[languages.dyn]\nindent_width = 2\nformatter = \"dyn fmt\"\n", &app.config) {
+    #panic("inspector config")
+  }
+  app.configuration.path_length = copy_text(app.configuration.path[..], "/tmp/dna-inspector.toml")
+  if !setting_inspect(app, typography, "terminal_escape") || !contains(app.prompt_state.message[..app.prompt_state.message_length], "alt-x") || !contains(app.prompt_state.message[..app.prompt_state.message_length], "ctrl-backslash") {
+    #panic("terminal escape inspector")
+  }
+  if !setting_inspect(app, typography, "[keys.normal]") || !contains(app.prompt_state.message[..app.prompt_state.message_length], "\"f2\" = \"write\"") {
+    #panic("key binding inspector")
+  }
+  if !setting_inspect(app, typography, "[keys.space]") || !contains(app.prompt_state.message[..app.prompt_state.message_length], "none") {
+    #panic("empty key binding inspector")
+  }
+  if !setting_inspect(app, typography, "[languages.dyn]") || !contains(app.prompt_state.message[..app.prompt_state.message_length], "2 (language override)") || !contains(app.prompt_state.message[..app.prompt_state.message_length], "false (global setting)") || !contains(app.prompt_state.message[..app.prompt_state.message_length], "dyn fmt") {
+    #panic("language settings inspector")
+  }
+  if !setting_inspect(app, typography, "[languages.rust]") || !contains(app.prompt_state.message[..app.prompt_state.message_length], "4 (global setting)") {
+    #panic("unconfigured language inspector")
+  }
+  if !new_buffer(app) {
+    #panic("settings picker buffer")
+  }
+  defer release_editor_state(app)
+  resource_picker(app, 3)
+  if !contains(app.resource_state.font_list[..app.resource_state.font_list_length], "[languages.dyn]") {
+    #panic("language settings discovery")
+  }
+}
+
+// Picker rows hit-test the last drawn frame, so each click follows a draw.
+fn picker_mouse_smoke(renderer: rawptr, typography: *Typography) {
+  owned := mem.arena_create(#sizeof(App) + 128)
+  if !owned.ok {
+    #panic("picker mouse memory")
+  }
+  defer _ = mem.arena_release(&owned.arena)
+  scratch := mem.arena_create(2097152)
+  if !scratch.ok {
+    #panic("picker mouse scratch")
+  }
+  defer _ = mem.arena_release(&scratch.arena)
+  app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
+  app.scratch = &scratch.arena
+  settings.defaults(&app.config)
+  if !new_buffer(app) {
+    #panic("picker mouse buffer")
+  }
+  defer release_editor_state(app)
+  app.view.status_line = true
+  app.view.reduced_motion = true
+  resource_picker(app, 3)
+  draw_picker(renderer, app, typography, 1200, 800, typography.line)
+  app.view.animation.panel = Panel.Open
+  geometry := picker_geometry(app, typography, 1200, 800, typography.line, picker_state_counts(app).count)
+  x := geometry.rect.x + geometry.padding + typography.cell
+  y := geometry.body_y + typography.line * 0.5
+  picker_ui_mouse(app, typography, x, y + typography.line, true, false, 1)
+  if app.completion.selected != 1 || app.prompt_state.panel != Panel.Open {
+    #panic("picker single click selects")
+  }
+  app.config.mouse_enabled = false
+  picker_ui_mouse(app, typography, x, y, true, false, 2)
+  if app.completion.selected != 1 || app.prompt_state.panel != Panel.Open {
+    #panic("disabled picker mouse")
+  }
+  app.config.mouse_enabled = true
+  draw_picker(renderer, app, typography, 1200, 800, typography.line)
+  picker_ui_mouse(app, typography, x, geometry.body_y - 1.0, true, false, 1)
+  if app.completion.selected != 1 || app.prompt_state.panel != Panel.Open {
+    #panic("picker header must not select")
+  }
+  app.completion.selected = geometry.rows + 2
+  draw_picker(renderer, app, typography, 1200, 800, typography.line)
+  picker_ui_mouse(app, typography, x, y, true, false, 1)
+  if app.completion.selected != 3 {
+    #panic("picker scrolled click")
+  }
+  draw_picker(renderer, app, typography, 1200, 800, typography.line)
+  list_top := app.ui.boxes[ui_hit(&app.ui, x, y)].value
+  if list_top != 3 {
+    #panic("picker click must not shift viewport")
+  }
+  app.completion.selected = 0
+  draw_picker(renderer, app, typography, 1200, 800, typography.line)
+  picker_ui_mouse(app, typography, x, y, true, false, 2)
+  if app.prompt_state.panel != Panel.Setting || !buffer.equal(app.configuration.setting_key[..app.configuration.setting_key_length], "font") {
+    #panic("picker double click opens setting")
+  }
+  app.prompt_state.panel = Panel.None
+  original := app.documents.active
+  if !new_buffer(app) {
+    #panic("second picker mouse buffer")
+  }
+  second := app.documents.active
+  activate(app, original)
+  app.resource_state.kind = 0
+  panel(app, Panel.Buffers)
+  app.view.animation.panel = Panel.None
+  draw_picker(renderer, app, typography, 1200, 800, typography.line)
+  app.view.animation.panel = Panel.Buffers
+  picker_ui_mouse(app, typography, x, y + typography.line, true, false, 1)
+  if app.documents.active != original || app.prompt_state.selected != 1 {
+    #panic("buffer click must not activate")
+  }
+  draw_picker(renderer, app, typography, 1200, 800, typography.line)
+  picker_ui_mouse(app, typography, x, y + typography.line, true, false, 2)
+  if app.documents.active != second || app.prompt_state.panel != Panel.None {
+    #panic("buffer double click activates")
+  }
+  // Clicking outside the picker cancels it.
+  panel(app, Panel.Buffers)
+  draw_picker(renderer, app, typography, 1200, 800, typography.line)
+  picker_ui_mouse(app, typography, 2.0, 2.0, true, false, 1)
+  if app.prompt_state.panel != Panel.None {
+    #panic("outside click cancels picker")
+  }
+}
+
+fn font_identity_smoke(app: *App, typography: *Typography) {
+  active: [4096]u8 = []
+  length := copy_text(active[..], app.fonts.active_font_path[..app.fonts.active_font_length])
+  if length == 0 {
+    #panic("startup font identity")
+  }
+  configured: [4096]u8 = []
+  configured_length := copy_text(configured[..], app.config.font)
+  font_select(app, typography, active[..length])
+  if !buffer.equal(app.fonts.active_font_path[..app.fonts.active_font_length], active[..length]) || !buffer.equal(app.config.font, configured[..configured_length]) {
+    #panic("font picker runtime/config separation")
+  }
+  if !setting_inspect(app, typography, "font") || !contains(app.prompt_state.message[..app.prompt_state.message_length], active[..length]) {
+    #panic("resolved font inspector")
+  }
+  font_select(app, typography, "/nonexistent-dna-font-fixture.ttf")
+  if !buffer.equal(app.fonts.active_font_path[..app.fonts.active_font_length], active[..length]) {
+    #panic("invalid font changes identity")
+  }
+  app.prompt_state.panel = Panel.None
+}
+
+fn dyn_language_smoke(renderer: rawptr, typography: *Typography) {
+  directory: [4096]u8 = []
+  root := process.environment("DNA_WORKFLOW_TEST", directory[..4095])
+  if !root.found {
+    return
+  }
+  owned := mem.arena_create(#sizeof(App) + 128)
+  scratch := mem.arena_create(2097152)
+  if !owned.ok || !scratch.ok {
+    #panic("real Dyn LSP test memory")
+  }
+  defer _ = mem.arena_release(&owned.arena)
+  defer _ = mem.arena_release(&scratch.arena)
+  app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
+  app.scratch = &scratch.arena
+  settings.defaults(&app.config)
+  defer release_editor_state(app)
+  defer lsp_release(app)
+  path: [4096]u8 = []
+  used := copy_text(path[..], root.value)
+  add_text(path[..], &used, "/real-dyn")
+  if !fs.make_directory(path[..used], 448).ok {
+    #panic("real Dyn fixture directory")
+  }
+  app.workspace.project_length = copy_text(app.workspace.project[..], path[..used])
+  add_text(path[..], &used, "/main.dyn")
+  source := "fn helper(value: i32) i32 { return value }\nfn main() { hel }\n"
+  if !fs.write_all(path[..used], source).ok || !new_buffer(app) {
+    #panic("real Dyn fixture")
+  }
+  if #len(files.open(app.documents.file, app.documents.current, path[..used], app.scratch)) != 0 {
+    #panic("real Dyn open")
+  }
+  lsp_auto_start(app)
+  if lsp_for(app) == 8 {
+    #panic("Dyn LSP should start without configuration")
+  }
+  language_wait(app)
+  deadline := sdl.ticks() + 5000
+  for app.documents.slots[app.documents.active].diagnostics.count == 0 && sdl.ticks() < deadline {
+    _ = lsp_tick(app)
+    language_test_delay(1)
+  }
+  if app.documents.slots[app.documents.active].diagnostics.count == 0 {
+    #panic("real Dyn diagnostics")
+  }
+  buffer.move_to(app.documents.current, #len(source) - 3, false)
+  app.view.insert = true
+  lsp_request(app, 1, "")
+  language_wait(app)
+  found: bool = false
+  index: usize = 0
+  for index < app.lsp.results.count {
+    if buffer.equal(json_text(app.lsp.results.items[index], "label"), "helper") {
+      app.prompt_state.selected = index
+      found = true
+      break
+    }
+    index += 1
+  }
+  if !found {
+    #panic("real Dyn completion")
+  }
+  lsp_accept(app)
+  if !contains(app.documents.current.bytes[..app.documents.current.length], "helper(value)") || app.prompt_state.panel != Panel.None {
+    #panic("real Dyn snippet completion acceptance")
+  }
+  _ = buffer.load(app.documents.current, "fn main() { #le }\n")
+  app.prompt_state.panel = Panel.None
+  buffer.move_to(app.documents.current, app.documents.current.length - 3, false)
+  lsp_request(app, 1, "")
+  language_wait(app)
+  found = false
+  index = 0
+  for index < app.lsp.results.count {
+    if buffer.equal(json_text(app.lsp.results.items[index], "label"), "#len") {
+      app.prompt_state.selected = index
+      found = true
+      break
+    }
+    index += 1
+  }
+  if !found {
+    #panic("real Dyn builtin completion")
+  }
+  lsp_accept(app)
+  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "fn main() { #len(array_or_slice) }\n") {
+    #panic("builtin completion preserves one hash prefix")
+  }
+  // Exercise actual Dyn responses through DNA, against unsaved contents.
+  probe_source := "fn helper(value: i32) i32 { return value }\nfn main() { result := helper(2) _ = result }\n"
+  app.documents.current.anchor = 0
+  app.documents.current.cursor = app.documents.current.length
+  if !buffer.replace(app.documents.current, probe_source) {
+    #panic("real Dyn tooling fixture")
+  }
+  app.prompt_state.panel = Panel.None
+  app.documents.slots[app.documents.active].diagnostics.count = 0
+  call_offset := #len(probe_source) - #len("helper(2) _ = result }\n")
+  buffer.move_to(app.documents.current, call_offset, false)
+  lsp_request(app, 2, "")
+  language_wait(app)
+  if app.prompt_state.panel != Panel.Hover || !contains(app.prompt_state.message[..app.prompt_state.message_length], "helper") {
+    #panic("real Dyn symbol hover")
+  }
+  app.prompt_state.panel = Panel.None
+  lsp_request(app, 4, "")
+  language_wait(app)
+  if app.prompt_state.panel != Panel.LspResults || app.lsp.results.count < 2 {
+    #panic("real Dyn references")
+  }
+  app.prompt_state.panel = Panel.None
+  lsp_request(app, 3, "")
+  language_wait(app)
+  if app.prompt_state.panel != Panel.LspResults || app.lsp.results.count != 1 {
+    #panic("real Dyn definition")
+  }
+  app.prompt_state.selected = 0
+  lsp_accept(app)
+  if app.documents.current.cursor >= call_offset {
+    #panic("real Dyn definition navigation")
+  }
+  buffer.move_to(app.documents.current, 3, false)
+  app.prompt_state.panel = Panel.None
+  lsp_request(app, 5, "renamed_helper")
+  language_wait(app)
+  if app.prompt_state.panel != Panel.LspEdit {
+    #panic("real Dyn rename preview")
+  }
+  lsp_apply(app)
+  if !contains(app.documents.current.bytes[..app.documents.current.length], "fn renamed_helper(") || !contains(app.documents.current.bytes[..app.documents.current.length], "result := renamed_helper(2)") {
+    #panic("real Dyn rename application")
+  }
+  buffer.undo(app.documents.current)
+  app.prompt_state.panel = Panel.None
+  format_source := "fn helper(value: i32) i32 { return value }  \r\nfn main() { result := helper(2) _ = result } \t"
+  app.documents.current.anchor = 0
+  app.documents.current.cursor = app.documents.current.length
+  if !buffer.replace(app.documents.current, format_source) {
+    #panic("real Dyn format fixture")
+  }
+  app.documents.current.anchor = 3
+  app.documents.current.cursor = 9
+  app.documents.current.secondary.count = 1
+  app.documents.current.secondary.ranges[0] = buffer.Selection{anchor: 1, cursor: 2}
+  app.documents.current.marks[0] = 6
+  lsp_request(app, 10, "")
+  language_wait(app)
+  if app.prompt_state.panel != Panel.LspEdit {
+    #panic("real Dyn formatting preview")
+  }
+  lsp_apply(app)
+  // Dyn's formatter places block bodies on their own lines.
+  formatted_source := "fn helper(value: i32) i32 {\n  return value\n}\nfn main() {\n  result := helper(2)\n  _ = result\n}\n"
+  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], formatted_source) {
+    #panic("real Dyn formatting application")
+  }
+  if app.documents.current.anchor != 3 || app.documents.current.cursor != 9 || app.documents.current.secondary.count != 1 || app.documents.current.secondary.ranges[0].cursor != 2 || app.documents.current.marks[0] != 6 {
+    #panic("LSP formatting must preserve selections and pane marks")
+  }
+  buffer.undo(app.documents.current)
+  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], format_source) || app.documents.current.anchor != 3 || app.documents.current.cursor != 9 || app.documents.current.secondary.count != 1 {
+    #panic("LSP formatting undo must preserve selections")
+  }
+  disk_mark := mem.arena_mark(app.scratch)
+  disk_source := fs.read_all(app.scratch, path[..used], buffer.Capacity)
+  if !disk_source.ok || !buffer.equal(disk_source.data, source) {
+    #panic("language edits must remain unsaved")
+  }
+  mem.arena_rewind(app.scratch, disk_mark)
+  if !new_buffer(app) {
+    #panic("platform fixture buffer")
+  }
+  used = copy_text(path[..], root.value)
+  add_text(path[..], &used, "/real-platform/platform.dyn")
+  if #len(files.open(app.documents.file, app.documents.current, path[..used], app.scratch)) != 0 {
+    #panic("platform diagnostic fixture open")
+  }
+  app.documents.slots[app.documents.active].diagnostics.count = 0
+  lsp_sync(app, 0, true)
+  buffer.move_to(app.documents.current, 0, false)
+  lsp_request(app, 2, "")
+  language_wait(app)
+  app.prompt_state.panel = Panel.None
+  valid_length := app.documents.current.length
+  buffer.move_to(app.documents.current, valid_length, false)
+  if !buffer.replace(app.documents.current, "\nffefefefefefe\n") {
+    #panic("unsaved platform error fixture")
+  }
+  lsp_sync(app, 0, true)
+  platform_deadline := sdl.ticks() + 5000
+  for app.documents.slots[app.documents.active].diagnostics.count == 0 && sdl.ticks() < platform_deadline {
+    _ = lsp_tick(app)
+    language_test_delay(1)
+  }
+  if app.documents.slots[app.documents.active].diagnostics.count == 0 {
+    #panic("platform invalid token diagnostic")
+  }
+  diagnostic_render_smoke(renderer, typography, app)
+  app.documents.current.anchor = valid_length
+  app.documents.current.cursor = app.documents.current.length
+  if !buffer.replace(app.documents.current, "") {
+    #panic("fix platform error")
+  }
+  lsp_sync(app, 0, true)
+  clear_deadline := sdl.ticks() + 5000
+  diagnostics := &app.documents.slots[app.documents.active].diagnostics
+  for (diagnostics.revision != app.documents.current.revision || diagnostics.count != 0) && sdl.ticks() < clear_deadline {
+    _ = lsp_tick(app)
+    language_test_delay(1)
+  }
+  if diagnostics.revision != app.documents.current.revision || diagnostics.count != 0 {
+    #panic("fixed unsaved error must clear diagnostics")
+  }
+  lsp_stop(app, 0)
+  app.lsp.auto_started = 0
+  if !settings.parse("[languages.dyn]\nauto_start = false\n", &app.config) {
+    #panic("Dyn LSP opt-out config")
+  }
+  lsp_auto_start(app)
+  if lsp_for(app) != 8 {
+    #panic("Dyn LSP opt-out ignored")
+  }
+  server_tool(app, "server-start", "dyn")
+  language_wait(app)
+  if lsp_for(app) == 8 || !app.lsp.servers[0].ready {
+    #panic("explicit Dyn server start")
+  }
+}
+
+fn diagnostic_render_smoke(renderer: rawptr, typography: *Typography, app: *App) {
+  doc := app.documents.current
+  token := doc.length - 14 // ffefefefefefe plus newline.
+  beginning := buffer.line_start(doc, token)
+  row := buffer.row_at(doc, beginning)
+  viewport := TextViewport{start: beginning, end: doc.length, y: #cast(f32) row * typography.line}
+  temporary := LineLayout{}
+  _ = line_layout_update(typography, &temporary, doc, 0, viewport)
+  defer line_layout_release(&temporary)
+  previous := typography.layout
+  previous_pane := typography.current_pane
+  typography.layout = &temporary
+  typography.current_pane = 0
+  defer typography.layout = previous
+  defer typography.current_pane = previous_pane
+  pane_init(app)
+  pane_layout(app, 0, sdl.PixelRect{width: 1200, height: 800})
+  app.prompt_state.panel = Panel.None
+  if draw_diagnostics(renderer, app, typography, viewport, 20.0, 20.0 - viewport.y) == 0 {
+    #panic("error token must have a visible underline")
+  }
+  app.pointer.seen = true
+  app.pointer.x = 20.0 + typography.cell
+  app.pointer.y = 20.0 + typography.line * 0.5
+  app.pointer.hover_due = 0
+  _ = draw_diagnostics(renderer, app, typography, viewport, 20.0, 20.0 - viewport.y)
+  if app.pointer.hover_index >= app.documents.slots[app.documents.active].diagnostics.count {
+    #panic("error token mouse hover")
+  }
+  draw_diagnostic_hover(renderer, app, typography, 1200, 800)
+  buffer.move_to(doc, beginning, false)
+  app.view.insert = true
+  if !diagnostic_cursor_hover(app) || app.prompt_state.message_length == 0 {
+    #panic("error token keyboard hover")
+  }
+  app.prompt_state.panel = Panel.None
+  // Editing invalidates decorations immediately; a stale diagnostic must not
+  // remain attached to different text while the server computes its update.
+  doc.revision += 1
+  if draw_diagnostics(renderer, app, typography, viewport, 20.0, 20.0 - viewport.y) != 0 || diagnostic_cursor_hover(app) {
+    #panic("stale diagnostic decoration")
+  }
+  doc.revision -= 1
+}

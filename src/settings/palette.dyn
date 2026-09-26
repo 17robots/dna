@@ -1,0 +1,230 @@
+// italic: syntax styles drawn in italics where the frontend can (bit 0
+// comment, 1 string, 2 keyword, 3 function, 4 type, 5 constant).
+pub struct Palette { colors: [32]u32, mask: u32, light: bool, error_line: usize, italic: u8, italic_set: bool }
+pub fn italic_styles(value: []const u8) u8 {
+  if #len(value) < 2 || value[0] != 34 || value[#len(value) - 1] != 34 {
+    return 255
+  }
+  words := value[1..#len(value) - 1]
+  names: [6][]const u8 = ["comment", "string", "keyword", "function", "type", "constant"]
+  result: u8 = 0
+  at: usize = 0
+  for at < #len(words) {
+    for at < #len(words) && words[at] == ' ' {
+      at += 1
+    }
+    end := at
+    for end < #len(words) && words[end] != ' ' {
+      end += 1
+    }
+    if end > at {
+      found := false
+      for index in 0..6 {
+        if buffer.equal(words[at..end], names[index]) {
+          result = result | (#cast(u8) 1 << #cast(u8) index)
+          found = true
+        }
+      }
+      if !found {
+        return 255
+      }
+    }
+    at = end
+  }
+  return result
+}
+
+pub fn color_key(key: []const u8) usize {
+  if buffer.equal(key, "border") {
+    return 0
+  }
+  if buffer.equal(key, "background") {
+    return 1
+  }
+  if buffer.equal(key, "surface") {
+    return 2
+  }
+  if buffer.equal(key, "line") {
+    return 3
+  }
+  if buffer.equal(key, "text") {
+    return 4
+  }
+  if buffer.equal(key, "muted") {
+    return 5
+  }
+  if buffer.equal(key, "selection") {
+    return 6
+  }
+  if buffer.equal(key, "cursor") {
+    return 7
+  }
+  if buffer.equal(key, "syntax_comment") {
+    return 8
+  }
+  if buffer.equal(key, "syntax_string") {
+    return 9
+  }
+  if buffer.equal(key, "syntax_keyword") {
+    return 10
+  }
+  if buffer.equal(key, "syntax_function") {
+    return 11
+  }
+  if buffer.equal(key, "syntax_type") {
+    return 12
+  }
+  if buffer.equal(key, "syntax_constant") {
+    return 13
+  }
+  if buffer.equal(key, "terminal_black") {
+    return 14
+  }
+  if buffer.equal(key, "terminal_red") {
+    return 15
+  }
+  if buffer.equal(key, "terminal_green") {
+    return 16
+  }
+  if buffer.equal(key, "terminal_yellow") {
+    return 17
+  }
+  if buffer.equal(key, "terminal_blue") {
+    return 18
+  }
+  if buffer.equal(key, "terminal_magenta") {
+    return 19
+  }
+  if buffer.equal(key, "terminal_cyan") {
+    return 20
+  }
+  if buffer.equal(key, "terminal_white") {
+    return 21
+  }
+  if buffer.equal(key, "terminal_bright_black") {
+    return 22
+  }
+  if buffer.equal(key, "terminal_bright_red") {
+    return 23
+  }
+  if buffer.equal(key, "terminal_bright_green") {
+    return 24
+  }
+  if buffer.equal(key, "terminal_bright_yellow") {
+    return 25
+  }
+  if buffer.equal(key, "terminal_bright_blue") {
+    return 26
+  }
+  if buffer.equal(key, "terminal_bright_magenta") {
+    return 27
+  }
+  if buffer.equal(key, "terminal_bright_cyan") {
+    return 28
+  }
+  if buffer.equal(key, "terminal_bright_white") {
+    return 29
+  }
+  if buffer.equal(key, "diagnostic_error") {
+    return 30
+  }
+  if buffer.equal(key, "diagnostic_warning") {
+    return 31
+  }
+  return 32
+}
+pub fn parse_palette(source: []const u8, result: *Palette) bool {
+  result.* = Palette{}
+  at: usize = 0
+  base_seen: bool = false
+  explicit: u32 = 0
+  italic_explicit: bool = false
+  for at < #len(source) {
+    result.error_line += 1
+    end := at
+    for end < #len(source) && source[end] != 10 {
+      end += 1
+    }
+    line := trim(source[at..end])
+    at = end + 1
+    if #len(line) == 0 || line[0] == 35 {
+      continue
+    }
+    split: usize = 0
+    for split < #len(line) && line[split] != 61 {
+      split += 1
+    }
+    if split == #len(line) {
+      return false
+    }
+    key := trim(line[..split])
+    value := trim(line[split + 1..])
+    if buffer.equal(key, "base") {
+      if base_seen {
+        return false
+      }
+      base_seen = true
+      // A built-in base fills every colour the file has not set yet; keys
+      // after it still override.
+      base := Palette{}
+      if #len(value) < 2 || value[0] != 34 || value[#len(value) - 1] != 34 ||
+          !builtin_palette(value[1..#len(value) - 1], &base) {
+        return false
+      }
+      result.light = base.light
+      for index in 0..32 {
+        bit := #cast(u32) 1 << #cast(u32) index
+        if (base.mask & bit) != 0 && (explicit & bit) == 0 {
+          result.colors[index] = base.colors[index]
+          result.mask = result.mask | bit
+        }
+      }
+      if base.italic_set && !italic_explicit {
+        result.italic = base.italic
+        result.italic_set = true
+      }
+      continue
+    }
+    if buffer.equal(key, "italic") {
+      styles := italic_styles(value)
+      if styles == 255 || italic_explicit {
+        return false
+      }
+      result.italic = styles
+      result.italic_set = true
+      italic_explicit = true
+      continue
+    }
+    index := color_key(key)
+    if index == 32 || #len(value) != 9 || value[0] != 34 || value[1] != 35 || value[8] != 34 {
+      return false
+    }
+    bit := #cast(u32) 1 << #cast(u32) index
+    if (explicit & bit) != 0 {
+      return false
+    }
+    explicit = explicit | bit
+    color: u32 = 0
+    for digit in 2..8 {
+      byte := value[digit]
+      number: u32 = 16
+      if byte >= 48 && byte <= 57 {
+        number = #cast(u32) (byte - 48)
+      }
+      else if byte >= 65 && byte <= 70 {
+        number = #cast(u32) (byte - 65) + 10
+      }
+      else if byte >= 97 && byte <= 102 {
+        number = #cast(u32) (byte - 97) + 10
+      }
+      if number == 16 {
+        return false
+      }
+      color = color * 16 + number
+    }
+    result.colors[index] = color
+    result.mask = result.mask | bit
+  }
+  result.error_line = 0
+  return true
+}

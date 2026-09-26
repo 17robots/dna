@@ -1,0 +1,310 @@
+// Vim profile through key_input/text_input, as SDL delivers them: keys
+// always, text only while inserting (text input is off in normal mode).
+fn vim_type(app: *App, typography: *Typography, keys: []const u8) {
+  for byte in keys {
+    inserting := app.view.insert
+    key := #cast(u32) byte
+    modifiers: u16 = 0
+    character := #cast(u32) byte
+    if byte == 27 {
+      key = KeyEscape
+      character = 0
+    }
+    else if byte == 10 {
+      key = KeyReturn
+      character = 0
+    }
+    else if byte >= 'A' && byte <= 'Z' {
+      key = #cast(u32) byte + 32
+      modifiers = ModShift
+    }
+    app.input_state.character = character
+    key_input(app, typography, key, modifiers)
+    app.input_state.character = 0
+    if inserting && byte != 27 && byte != 10 {
+      single: [1]u8 = [byte]
+      text_input(app, single[..])
+    }
+    else if inserting && byte == 10 && app.view.insert {
+      text_input(app, "\n")
+    }
+  }
+}
+fn vim_ex(app: *App, typography: *Typography, command: []const u8) {
+  key_input(app, typography, KeyColon, 0)
+  if app.prompt_state.panel != Panel.Commands {
+    line: [256]u8 = []
+    used := copy_text(line[..], "vim : opens the command palette, before :")
+    add_text(line[..], &used, command)
+    #panic(line[..used])
+  }
+  text_input(app, command)
+  key_input(app, typography, KeyReturn, 0)
+}
+fn vim_control_key(app: *App, typography: *Typography, key: u32) {
+  key_input(app, typography, key, ModCtrl)
+}
+fn vim_expect(app: *App, text: []const u8, head: usize, message: []const u8) {
+  doc := app.documents.current
+  if !buffer.equal(doc.bytes[..doc.length], text) || buffer.head(doc) != head || app.view.insert || app.vim.mode != VimMode.Normal {
+    line: [4096]u8 = []
+    used: usize = 0
+    add_text(line[..], &used, "vim smoke: ")
+    add_text(line[..], &used, message)
+    add_text(line[..], &used, " | head ")
+    add_number(line[..], &used, buffer.head(doc))
+    add_text(line[..], &used, " want ")
+    add_number(line[..], &used, head)
+    if app.view.insert {
+      add_text(line[..], &used, " (insert)")
+    }
+    add_text(line[..], &used, " text [")
+    shown := doc.length
+    if shown > 200 {
+      shown = 200
+    }
+    add_text(line[..], &used, doc.bytes[..shown])
+    add_text(line[..], &used, "]\n")
+    _ = #syscall(1, 2, &line[0], used)
+    #panic("vim key behaviour")
+  }
+}
+fn vim_start(app: *App, text: []const u8) {
+  doc := app.documents.current
+  _ = buffer.load(doc, text)
+  app.prompt_state.panel = Panel.None
+  app.view.insert = false
+  app.view.extend = false
+  vim_reset(app)
+  vim_place(app, 0)
+}
+fn vim_smoke(app: *App, typography: *Typography) {
+  saved_keys := app.config.vim_keys
+  app.config.vim_keys = true
+  defer app.config.vim_keys = saved_keys
+  config := active_file_config(app)
+  saved_file_config := config.*
+  defer config.* = saved_file_config
+  config.indent_explicit = true
+  config.indent_width = 4
+  config.insert_tabs = false
+  // Motions.
+  vim_start(app, "hello world foo\nsecond line here\n\nlast (a (b) c) end\n")
+  vim_type(app, typography, "w")
+  vim_expect(app, app.documents.current.bytes[..app.documents.current.length], 6, "w")
+  vim_type(app, typography, "e")
+  vim_expect(app, app.documents.current.bytes[..app.documents.current.length], 10, "e")
+  vim_type(app, typography, "b0$")
+  vim_expect(app, app.documents.current.bytes[..app.documents.current.length], 14, "b 0 $")
+  vim_type(app, typography, "j")
+  vim_expect(app, app.documents.current.bytes[..app.documents.current.length], 31, "$ then j keeps end of line")
+  vim_type(app, typography, "gg2w")
+  vim_expect(app, app.documents.current.bytes[..app.documents.current.length], 12, "gg 2w")
+  vim_type(app, typography, "G")
+  vim_expect(app, app.documents.current.bytes[..app.documents.current.length], 34, "G to last line first non-blank")
+  vim_type(app, typography, "f(%")
+  vim_expect(app, app.documents.current.bytes[..app.documents.current.length], 47, "f( then % matches")
+  vim_type(app, typography, "%;")
+  vim_expect(app, app.documents.current.bytes[..app.documents.current.length], 42, "% back then ; repeats f(")
+  vim_type(app, typography, "2G}")
+  vim_expect(app, app.documents.current.bytes[..app.documents.current.length], 33, "} to the blank line")
+  vim_type(app, typography, "{")
+  vim_expect(app, app.documents.current.bytes[..app.documents.current.length], 0, "{ to the start")
+  // Operators, counts, undo and dot repeat.
+  vim_start(app, "one two three four\n")
+  vim_type(app, typography, "dw")
+  vim_expect(app, "two three four\n", 0, "dw")
+  vim_type(app, typography, ".")
+  vim_expect(app, "three four\n", 0, ". repeats dw")
+  vim_type(app, typography, "u")
+  vim_expect(app, "two three four\n", 0, "u undoes the repeat")
+  vim_type(app, typography, "2dw")
+  vim_expect(app, "four\n", 0, "2dw")
+  vim_type(app, typography, "x")
+  vim_expect(app, "our\n", 0, "x")
+  vim_type(app, typography, "$x")
+  vim_expect(app, "ou\n", 1, "x at line end steps back")
+  vim_start(app, "alpha beta\n")
+  vim_type(app, typography, "cwgamma\x1b")
+  vim_expect(app, "gamma beta\n", 4, "cw changes to the word end")
+  vim_type(app, typography, "w.")
+  vim_expect(app, "gamma gamma\n", 10, ". repeats the change with its text")
+  vim_type(app, typography, "0ciwx\x1b")
+  vim_expect(app, "x gamma\n", 0, "ciw")
+  vim_type(app, typography, "D")
+  vim_expect(app, "\n", 0, "D")
+  // Lines: dd, yy, p, P, o, O, J, >>, counts.
+  vim_start(app, "a\nb\nc\nd\n")
+  vim_type(app, typography, "dd")
+  vim_expect(app, "b\nc\nd\n", 0, "dd")
+  vim_type(app, typography, "p")
+  vim_expect(app, "b\na\nc\nd\n", 2, "p puts the line below")
+  vim_type(app, typography, "yyP")
+  vim_expect(app, "b\na\na\nc\nd\n", 2, "yy P puts above")
+  vim_type(app, typography, "2dd")
+  vim_expect(app, "b\nc\nd\n", 2, "2dd")
+  vim_type(app, typography, "Gdd")
+  vim_expect(app, "b\nc\n", 2, "dd on the last line")
+  vim_type(app, typography, "ggJ")
+  vim_expect(app, "b c\n", 1, "J joins with a space")
+  vim_type(app, typography, "onew\x1b")
+  vim_expect(app, "b c\nnew\n", 6, "o opens a line below")
+  vim_type(app, typography, "Otop\x1b")
+  vim_expect(app, "b c\ntop\nnew\n", 6, "O opens a line above")
+  vim_type(app, typography, ">>")
+  vim_expect(app, "b c\n    top\nnew\n", 8, ">> indents")
+  vim_type(app, typography, "<<")
+  vim_expect(app, "b c\ntop\nnew\n", 4, "<< unindents")
+  // Insert variants, counts and r, ~, Ctrl-a.
+  vim_start(app, "  word\n")
+  vim_type(app, typography, "A!\x1b")
+  vim_expect(app, "  word!\n", 6, "A appends")
+  vim_type(app, typography, "I-\x1b")
+  vim_expect(app, "  -word!\n", 2, "I inserts at the first non-blank")
+  vim_type(app, typography, "3ax\x1b")
+  vim_expect(app, "  -xxxword!\n", 5, "3a repeats the insert")
+  vim_type(app, typography, "0wrZ")
+  vim_expect(app, "  Zxxxword!\n", 2, "w from the indent, then r")
+  vim_start(app, "abc 41\n")
+  vim_type(app, typography, "rZ~")
+  vim_expect(app, "zbc 41\n", 1, "r then ~ toggles it back")
+  vim_type(app, typography, "~")
+  vim_expect(app, "zBc 41\n", 2, "~ toggles and moves")
+  vim_control_key(app, typography, KeyA)
+  vim_expect(app, "zBc 42\n", 5, "Ctrl-a increments")
+  app.vim.count = 5
+  vim_control_key(app, typography, KeyX)
+  vim_expect(app, "zBc 37\n", 5, "5 Ctrl-x decrements")
+  // Text objects and case operators.
+  vim_start(app, "call(one, two) end\n")
+  vim_type(app, typography, "fodi(")
+  vim_expect(app, "call() end\n", 5, "di(")
+  vim_type(app, typography, "wgUiw")
+  vim_expect(app, "call() END\n", 7, "gUiw")
+  vim_type(app, typography, "0guu")
+  vim_expect(app, "call() end\n", 0, "guu")
+  vim_type(app, typography, "daw")
+  vim_expect(app, "() end\n", 0, "daw")
+  // Visual modes.
+  vim_start(app, "one two\nthree four\nfive\n")
+  vim_type(app, typography, "vjd")
+  vim_expect(app, "hree four\nfive\n", 0, "vjd deletes charwise through the column")
+  vim_type(app, typography, "Vjd")
+  vim_expect(app, "", 0, "Vjd deletes lines")
+  vim_start(app, "abc\nabc\nabc\n")
+  vim_type(app, typography, "l")
+  vim_control_key(app, typography, KeyV)
+  vim_type(app, typography, "jjd")
+  vim_expect(app, "ac\nac\nac\n", 1, "Ctrl-v block delete")
+  vim_start(app, "keep this\n")
+  vim_type(app, typography, "wviwy0P")
+  vim_expect(app, "thiskeep this\n", 3, "viw y then P")
+  vim_type(app, typography, "gv")
+  if app.vim.mode != VimMode.Visual {
+    #panic("gv restores the visual selection")
+  }
+  vim_type(app, typography, "\x1b")
+  // Named registers and the black hole.
+  vim_start(app, "red green\n")
+  vim_type(app, typography, "\"ayiw")
+  vim_expect(app, "red green\n", 0, "\"ayiw")
+  vim_type(app, typography, "w\"_dw")
+  vim_expect(app, "red \n", 3, "dw on the last word keeps the newline")
+  vim_type(app, typography, "\"ap")
+  vim_expect(app, "red red\n", 6, "\"a register survives a black-hole delete")
+  // More operators and line forms.
+  vim_start(app, "  abc\nx\n")
+  vim_type(app, typography, "ccnew\x1b")
+  vim_expect(app, "  new\nx\n", 4, "cc keeps the indentation")
+  vim_start(app, "a\nb\nc\n")
+  vim_type(app, typography, "dj")
+  vim_expect(app, "c\n", 0, "dj deletes two lines")
+  vim_start(app, "a\nb\nc\n")
+  vim_type(app, typography, "jdG")
+  vim_expect(app, "a\n", 0, "dG deletes to the end")
+  vim_start(app, "x\n")
+  vim_type(app, typography, "3oab\x1b")
+  vim_expect(app, "x\nab\nab\nab\n", 9, "3o repeats the opened line")
+  vim_start(app, "a\nb\n")
+  vim_type(app, typography, "A;\x1bj.")
+  vim_expect(app, "a;\nb;\n", 4, ". repeats an append")
+  vim_start(app, "a\nb\n")
+  vim_type(app, typography, "Vj>")
+  vim_expect(app, "    a\n    b\n", 4, "V> indents the lines")
+  vim_start(app, "one two\n")
+  vim_type(app, typography, "yiwwviwp")
+  vim_expect(app, "one one\n", 4, "visual p replaces the selection")
+  vim_start(app, "a\nb\n")
+  vim_type(app, typography, "YjP")
+  vim_expect(app, "a\na\nb\n", 2, "Y then P")
+  vim_start(app, "say \"hi there\" now\n")
+  vim_type(app, typography, "fhci\"x\x1b")
+  vim_expect(app, "say \"x\" now\n", 5, "ci\" changes inside quotes")
+  vim_start(app, "a,b,c,d\n")
+  vim_type(app, typography, "t,;")
+  vim_expect(app, "a,b,c,d\n", 2, "t, then ; skips the adjacent match")
+  vim_type(app, typography, ",")
+  vim_expect(app, "a,b,c,d\n", 2, ", reverses as T,")
+  vim_start(app, "abcdef\n")
+  vim_type(app, typography, "3xu")
+  vim_expect(app, "abcdef\n", 0, "u restores 3x")
+  vim_control_key(app, typography, KeyR)
+  vim_expect(app, "def\n", 0, "Ctrl-r redoes")
+  vim_type(app, typography, "d2l")
+  vim_expect(app, "f\n", 0, "d2l")
+  // Macros: qa ... q, then @a.
+  vim_start(app, "a\nb\nc\n")
+  vim_type(app, typography, "qaA;\x1bjq@a")
+  vim_expect(app, "a;\nb;\nc\n", 6, "@a replays the macro")
+  // / search rests on the match start; n repeats.
+  vim_start(app, "foo bar foo bar\n")
+  vim_type(app, typography, "/")
+  text_input(app, "bar")
+  key_input(app, typography, KeyReturn, 0)
+  vim_expect(app, "foo bar foo bar\n", 4, "/ search")
+  vim_type(app, typography, "n")
+  vim_expect(app, "foo bar foo bar\n", 12, "n")
+  vim_type(app, typography, "dn")
+  vim_expect(app, "foo bar\n", 4, "dn deletes to the wrapped match")
+  // Ex commands through the palette: :N and :s.
+  vim_start(app, "foo one\nfoo two foo\nbar\n")
+  vim_ex(app, typography, "%s/foo/X/g")
+  vim_expect(app, "X one\nX two X\nbar\n", 6, ":%s///g")
+  vim_ex(app, typography, "1")
+  vim_expect(app, "X one\nX two X\nbar\n", 0, ":1")
+  vim_ex(app, typography, "s/one/[&]/")
+  vim_expect(app, "X [one]\nX two X\nbar\n", 0, ":s with &")
+  vim_ex(app, typography, "2,3s/X|bar/y/g")
+  vim_expect(app, "X [one]\ny two y\ny\n", 16, ":2,3s with alternation")
+  vim_type(app, typography, "ggVj\x1b")
+  vim_ex(app, typography, "'<,'>s/y/z/")
+  vim_expect(app, "X [one]\nz two y\ny\n", 8, ":'<,'>s")
+  vim_ex(app, typography, "%s/nothing/x/")
+  vim_expect(app, "X [one]\nz two y\ny\n", 8, ":s without a match")
+  // Line 0 in a range is line 1; an empty end is not an underflow.
+  vim_start(app, "X one\nz two\n")
+  vim_ex(app, typography, "0,1s/X/W/")
+  vim_expect(app, "W one\nz two\n", 0, ":0,1s")
+  vim_ex(app, typography, "2,s/z/q/")
+  // Rejected, the palette stays open with the command for correction.
+  key_input(app, typography, KeyEscape, 0)
+  vim_expect(app, "W one\nz two\n", 0, ":2,s is rejected, not a crash")
+  // Every indent path follows the file's width and tab preference.
+  config.indent_width = 2
+  vim_start(app, "a\nb\n")
+  vim_type(app, typography, ">>")
+  vim_expect(app, "  a\nb\n", 2, ">> uses file width")
+  vim_type(app, typography, "<<Vj>")
+  vim_expect(app, "  a\n  b\n", 2, "visual indent uses file width")
+  config.insert_tabs = true
+  vim_start(app, "a\nb\n")
+  vim_type(app, typography, ">>")
+  vim_expect(app, "\ta\nb\n", 1, ">> inserts a tab")
+  vim_type(app, typography, "<<")
+  vim_expect(app, "a\nb\n", 0, "<< removes a tab")
+  // Escape cancels pending operators and counts.
+  vim_start(app, "abc\n")
+  vim_type(app, typography, "3d\x1bx")
+  vim_expect(app, "bc\n", 0, "Escape cancels 3d")
+  vim_start(app, "")
+}

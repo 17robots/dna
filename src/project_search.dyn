@@ -1,0 +1,175 @@
+struct ProjectSearchState {
+  worker: rawptr,
+  count: usize,
+  status: i32,
+  root: [4096]u8,
+  root_length: usize,
+  query: [4096]u8,
+  query_length: usize,
+}
+
+// Owns one cancellable search worker. Results describe saved files, never dirty
+// buffers; opening rechecks the match against the current buffer contents.
+struct ProjectHit { path: [4096]u8, text: [256]u8, start, end, line, column: usize }
+
+extern fn project_search_create "dna_search_open"() rawptr
+extern fn project_search_destroy "dna_search_close"(search: rawptr)
+extern fn project_search_submit "dna_search_submit"(search: rawptr, root: *const u8, query: *const u8)
+extern fn project_search_count "dna_search_count"(search: rawptr, status: *i32) usize
+extern fn project_search_row "dna_search_row"(search: rawptr, index: usize, row: *ProjectHit) i32
+
+fn project_search_open(app: *App) {
+  if app.project_find.worker == nil {
+    app.project_find.worker = project_search_create()
+  }
+  if app.project_find.worker == nil {
+    notice(app, "Cannot allocate project search worker.")
+    return
+  }
+  panel(app, Panel.ProjectSearch)
+  app.project_find.root_length = copy_text(app.project_find.root[..], app.workspace.project[..app.workspace.project_length])
+  project_search_refresh(app)
+}
+fn project_search_refresh(app: *App) {
+  app.project_find.query_length = copy_text(app.project_find.query[..], app.prompt_state.text[..app.prompt_state.length])
+  app.prompt_state.selected = 0
+  app.project_find.count = 0
+  app.project_find.status = 1
+  project_search_submit(app.project_find.worker, &app.project_find.root[0], &app.prompt_state.text[0])
+}
+fn project_search_tick(app: *App) bool {
+  status: i32 = 0
+  count := project_search_count(app.project_find.worker, &status)
+  changed := count != app.project_find.count || status != app.project_find.status
+  app.project_find.count = count
+  app.project_find.status = status
+  return changed && app.prompt_state.panel == Panel.ProjectSearch
+}
+fn project_search_accept(app: *App) {
+  hit := ProjectHit{}
+  if project_search_row(app.project_find.worker, app.prompt_state.selected, &hit) == 0 {
+    return
+  }
+  path: [4096]u8 = []
+  length := copy_text(path[..], app.project_find.root[..app.project_find.root_length])
+  relative_length := c.string_length(&hit.path[0], 4096)
+  if length + relative_length + 1 >= 4096 {
+    notice(app, "Search result path is too long.")
+    return
+  }
+  add_text(path[..], &length, "/")
+  add_text(path[..], &length, hit.path[..relative_length])
+  compiled := pattern.open_lines(app.prompt_state.text[..app.prompt_state.length])
+  defer pattern.close(&compiled)
+  open_file(app, path[..length])
+  if app.prompt_state.panel == Panel.Message {
+    return
+  }
+  found := pattern.find(&compiled, app.documents.current.bytes[..app.documents.current.length], hit.start)
+  if !found.found || found.start != hit.start || found.end != hit.end {
+    notice(app, "File changed since search. Search again for current locations.")
+    return
+  }
+  app.documents.current.anchor = hit.start
+  app.documents.current.cursor = hit.end
+  app.documents.current.secondary.count = 0
+  app.view.extend = false
+  app.view.insert = false
+  app.prompt_state.panel = Panel.None
+}
+fn draw_project_search(renderer: rawptr, app: *App, typography: *Typography, width: i32, height: i32, status: f32) {
+  ui := &app.ui
+  ui_panel_begin(ui, typography)
+  line := typography.line
+  head: [8192]u8 = []
+  length: usize = 0
+  add_text(head[..], &length, "project regex > ")
+  add_text(head[..], &length, app.prompt_state.text[..app.prompt_state.length])
+  add_text(head[..], &length, "_")
+  rows := ui_sheet_rows(typography, height, status)
+  app.picker_state.rows = rows
+  count := app.project_find.count
+  selected := app.prompt_state.selected
+  opening := app.view.animation.panel != Panel.ProjectSearch
+  list := ui_sheet_begin(app, ui, typography, "project search", width, height, status, head[..length])
+  ui_list_scroll(app, ui, list, count, selected, line * #cast(f32) rows, opening || count < ui.sheet_count, opening || selected != ui.sheet_selected || count != ui.sheet_count)
+  window := ui_list_window(ui, list, count, line * #cast(f32) rows)
+  ui_push(ui, list)
+  ui_spacer(ui, "above", #cast(f32) window.first * line)
+  for index in window.first..window.last {
+    hit := ProjectHit{}
+    if project_search_row(app.project_find.worker, index, &hit) == 0 {
+      break
+    }
+    label: [8192]u8 = []
+    used: usize = 0
+    add_text(label[..], &used, hit.path[..c.string_length(&hit.path[0], 4096)])
+    add_text(label[..], &used, ":")
+    add_number(label[..], &used, hit.line)
+    add_text(label[..], &used, ":")
+    add_number(label[..], &used, hit.column)
+    add_text(label[..], &used, "  ")
+    add_text(label[..], &used, hit.text[..c.string_length(&hit.text[0], 256)])
+    row := ui_make(ui, ui_hash_number(ui.boxes[list].key, index), UiClickable | UiHover | UiText)
+    ui_text_set(ui, row, label[..used])
+    ui.boxes[row].value = index
+    ui_size(ui, row, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
+    ui_size(ui, row, UiAxisY, UiSizeKind.Pixels, line / typography.scale, 1.0)
+    ui_animate(app, ui, row, index == selected)
+  }
+  ui_spacer(ui, "below", #cast(f32) (count - window.last) * line)
+  ui_pop(ui)
+  footer: []const u8 = "Saved files • arrows choose • enter or double-click opens • esc closes"
+  if count == 0 {
+    footer = "No matches in saved files. Type a regular expression."
+  }
+  if app.project_find.status == 1 {
+    footer = "Searching saved files… edit query to restart; esc closes"
+  }
+  if app.project_find.status == 2 {
+    footer = "Invalid regular expression. Edit query to retry."
+  }
+  if app.project_find.status == 3 {
+    footer = "Partial results: file/work limit or unreadable files. Narrow search."
+  }
+  ui_sheet_end(ui, footer)
+  ui.sheet_selected = selected
+  ui.sheet_count = count
+  ui_layout(ui)
+  ui_render(renderer, ui, typography, width, height)
+}
+
+fn project_search_release(app: *App) {
+  if app.project_find.worker != nil {
+    project_search_destroy(app.project_find.worker)
+    app.project_find.worker = nil
+  }
+}
+// Click selects a result, double-click opens it; outside closes (both sheets).
+fn sheet_mouse(app: *App, typography: *Typography, x: f32, y: f32, pressed: bool, moved: bool, clicks: u8) {
+  ui := &app.ui
+  if moved {
+    ui_pointer(ui, x, y)
+    return
+  }
+  if !pressed {
+    return
+  }
+  name: []const u8 = "project search"
+  if app.prompt_state.panel == Panel.ReplacePreview {
+    name = "replace preview"
+  }
+  frame := ui_make_lookup(ui, ui_hash(0, name))
+  if frame == 0 || !ui_contains(ui.boxes[frame].rect, x, y) {
+    key_input(app, typography, KeyEscape, 0)
+    return
+  }
+  hit := ui_hit(ui, x, y)
+  if hit == 0 || app.prompt_state.panel != Panel.ProjectSearch || ui.boxes[hit].value >= app.project_find.count {
+    return
+  }
+  app.prompt_state.selected = ui.boxes[hit].value
+  if clicks >= 2 {
+    submit(app, typography)
+  }
+}

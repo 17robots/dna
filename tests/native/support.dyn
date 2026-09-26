@@ -1,0 +1,67 @@
+// Shared support for native ABI interposers. Event offsets match platform_abi.py.
+use "std/fmt" probe_fmt
+#link("c")
+#link("dl")
+extern fn probe_symbol "dlsym"(handle: rawptr, name: *const u8) rawptr
+extern fn probe_exit "_Exit"(status: i32)
+extern fn probe_getenv "getenv"(name: *const u8) *const u8
+extern fn probe_write "write"(fd: i32, bytes: *const u8, size: usize) isize
+extern fn probe_push "SDL_PushEvent"(event: rawptr) bool
+extern fn probe_delay "SDL_Delay"(milliseconds: u32)
+struct ProbeEvent { words: [16]u64 }
+fn probe_next(name: []const u8) rawptr {
+  result := probe_symbol(#cast(rawptr) (#cast(isize) -1), &name[0])
+  if result == nil { probe_exit(97) }
+  return result
+}
+fn probe_env(name: []const u8) *const u8 { return probe_getenv(&name[0]) }
+fn probe_log(text: []const u8) { if #len(text) != 0 { _ = probe_write(2, &text[0], #len(text)) } }
+fn probe_number(value: u64) {
+  bytes: [32]u8 = []
+  probe_log(probe_fmt.u64_decimal(bytes[..], value))
+}
+fn probe_check(ok: bool, message: []const u8) {
+  if !ok { probe_log(message)
+    probe_log("\n")
+    probe_exit(1) }
+}
+fn probe_kind(event: rawptr) *u32 { return #cast(*u32) event }
+fn probe_u32(event: rawptr, offset: usize) *u32 { return #cast(*u32) (#cast(usize) event + offset) }
+fn probe_float(event: rawptr, offset: usize) *f32 { return #cast(*f32) (#cast(usize) event + offset) }
+fn probe_byte(event: rawptr, offset: usize) *u8 { return #cast(*u8) (#cast(usize) event + offset) }
+fn probe_clear(event: rawptr) { (#cast(*ProbeEvent) event).* = ProbeEvent{} }
+fn probe_key(code: u32) {
+  event := ProbeEvent{}
+  pointer := #cast(rawptr) &event
+  probe_kind(pointer).* = 768
+  probe_u32(pointer, 28).* = code
+  probe_byte(pointer, 36).* = 1
+  probe_check(probe_push(pointer), "event push failed")
+}
+fn probe_decimal(value: f64) {
+  scaled := #cast(u64) (value * 1000.0)
+  probe_number(scaled / 1000)
+  probe_log(".")
+  fraction := scaled % 1000
+  if fraction < 100 { probe_log("0") }
+  if fraction < 10 { probe_log("0") }
+  probe_number(fraction)
+}
+fn probe_key_mod(code: u32, modifiers: u16) {
+  event := ProbeEvent{}
+  pointer := #cast(rawptr) &event
+  probe_kind(pointer).* = 768
+  probe_u32(pointer, 28).* = code
+  modifier_pointer := #cast(*u16) (#cast(usize) pointer + 32)
+  modifier_pointer.* = modifiers
+  probe_byte(pointer, 36).* = 1
+  probe_check(probe_push(pointer), "event push failed")
+}
+fn probe_text(text: []const u8) {
+  event := ProbeEvent{}
+  pointer := #cast(rawptr) &event
+  probe_kind(pointer).* = 771
+  text_pointer := #cast(**const u8) (#cast(usize) pointer + 24)
+  text_pointer.* = &text[0]
+  probe_check(probe_push(pointer), "text push failed")
+}

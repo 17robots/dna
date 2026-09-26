@@ -1,0 +1,326 @@
+// Opt-in frame tracing. Disabled tracing performs no timing or file I/O.
+// Fixed buffer and 64 MiB output cap prevent tracing from growing editor memory.
+struct RenderTrace {
+  file: fs.File,
+  enabled: bool,
+  failed: bool,
+  truncated: bool,
+  pending: u32,
+  events: usize,
+  last_event: u32,
+  frames: usize,
+  epoch: u64,
+  cpu_started, process_cpu_started: u64,
+  started: u64,
+  panes_finished: u64,
+  present_started: u64,
+  document_updates: u64,
+  ui_updates, ui_hits, ui_creations: u64,
+  palette_updates: u64,
+  total_us: usize,
+  max_us: usize,
+  reasons: [18]usize,
+  bytes: [16384]u8,
+  used: usize,
+  written: usize,
+}
+// SDL resets its tick epoch on shutdown; tracing outlives SDL cleanup.
+fn render_clock() u64 {
+  time := ThreadTime{}
+  if thread_clock(1, &time) != 0 {
+    return 0
+  }
+  return #cast(u64) time.seconds * 1000000000 + #cast(u64) time.nanoseconds
+}
+const RenderStartup: u32 = 1
+const RenderKey: u32 = 2
+const RenderText: u32 = 4
+const RenderMouse: u32 = 8
+const RenderWindow: u32 = 16
+const RenderIme: u32 = 32
+const RenderAnimation: u32 = 64
+const RenderConfig: u32 = 128
+const RenderSyntax: u32 = 256
+const RenderPlugin: u32 = 512
+const RenderDisk: u32 = 1024
+const RenderLsp: u32 = 2048
+const RenderFormat: u32 = 4096
+const RenderSearch: u32 = 8192
+const RenderMacro: u32 = 16384
+const RenderTerminal: u32 = 32768
+const RenderHover: u32 = 65536
+const RenderExplicit: u32 = 131072
+
+fn render_trace_flush(trace: *RenderTrace) {
+  if trace.used == 0 || trace.failed {
+    return
+  }
+  result := fs.write(&trace.file, trace.bytes[..trace.used])
+  trace.written += result.transferred
+  trace.used = 0
+  if !result.ok {
+    trace.failed = true
+  }
+}
+fn render_trace_open(app: *App) {
+  storage: [4096]u8 = []
+  path := process.environment("DNA_RENDER_TRACE", storage[..])
+  if !path.ok || !path.found || #len(path.value) == 0 {
+    return
+  }
+  // Refuse existing paths: diagnostics must never overwrite user files.
+  opened := fs.create_exclusive(path.value)
+  if !opened.ok {
+    warning: []const u8 = "DNA: cannot create render trace (path must not exist).\n"
+    _ = #syscall(1, 2, &warning[0], #len(warning))
+    return
+  }
+  trace := &app.render_trace
+  trace.file = opened.file
+  trace.enabled = true
+  trace.epoch = render_clock()
+  initial_cpu := operation_begin(app)
+  trace.cpu_started = initial_cpu.cpu
+  trace.process_cpu_started = initial_cpu.process_cpu
+  add_text(trace.bytes[..], &trace.used, "{\"type\":\"schema\",\"version\":1,\"reasons\":{\"1\":\"startup\",\"2\":\"key\",\"4\":\"text\",\"8\":\"mouse\",\"16\":\"window\",\"32\":\"ime\",\"64\":\"animation\",\"128\":\"config\",\"256\":\"syntax\",\"512\":\"plugin\",\"1024\":\"disk\",\"2048\":\"lsp\",\"4096\":\"format\",\"8192\":\"search\",\"16384\":\"macro\",\"32768\":\"terminal\",\"65536\":\"hover\",\"131072\":\"explicit\"},\"time_unit\":\"us\",\"limit_bytes\":67108864}\n")
+  render_trace_flush(trace)
+}
+fn render_request(app: *App, reason: u32) {
+  app.render_trace.pending |= reason
+}
+fn render_trace_begin(app: *App, typography: *Typography) {
+  trace := &app.render_trace
+  if !trace.enabled {
+    return
+  }
+  trace.started = render_clock()
+  trace.panes_finished = trace.started
+  trace.present_started = trace.started
+  trace.ui_updates = typography.ui_updates
+  trace.ui_hits = typography.ui_hits
+  trace.ui_creations = typography.ui_creations
+  trace.document_updates = typography.document_updates
+  trace.palette_updates = typography.palette_updates
+}
+fn render_field(bytes: []u8, used: *usize, name: []const u8, value: usize) {
+  add_text(bytes, used, ",\"")
+  add_text(bytes, used, name)
+  add_text(bytes, used, "\":")
+  add_number(bytes, used, value)
+}
+fn render_trace_end(app: *App, typography: *Typography) {
+  trace := &app.render_trace
+  reasons := trace.pending
+  trace.pending = 0
+  if !trace.enabled {
+    trace.events = 0
+    return
+  }
+  finished := render_clock()
+  elapsed := #cast(usize) ((finished - trace.started) / 1000)
+  if reasons == 0 {
+    reasons = RenderExplicit
+  }
+  trace.frames += 1
+  trace.total_us += elapsed
+  if elapsed > trace.max_us {
+    trace.max_us = elapsed
+  }
+  mask: u32 = 1
+  for index in 0..18 {
+    if (reasons & mask) != 0 {
+      trace.reasons[index] += 1
+    }
+    mask <<= 1
+  }
+  if trace.written + trace.used >= 67106816 {
+    trace.truncated = true
+  }
+  if !trace.failed && !trace.truncated {
+    if trace.used + 1024 >= 16384 {
+      render_trace_flush(trace)
+    }
+    add_text(trace.bytes[..], &trace.used, "{\"type\":\"frame\"")
+    render_field(trace.bytes[..], &trace.used, "frame", trace.frames)
+    render_field(trace.bytes[..], &trace.used, "at_us", #cast(usize) ((trace.started - trace.epoch) / 1000))
+    render_field(trace.bytes[..], &trace.used, "reasons", #cast(usize) reasons)
+    render_field(trace.bytes[..], &trace.used, "events", trace.events)
+    render_field(trace.bytes[..], &trace.used, "last_event", #cast(usize) trace.last_event)
+    render_field(trace.bytes[..], &trace.used, "total_us", elapsed)
+    render_field(trace.bytes[..], &trace.used, "panes_us", #cast(usize) ((trace.panes_finished - trace.started) / 1000))
+    render_field(trace.bytes[..], &trace.used, "present_us", #cast(usize) ((finished - trace.present_started) / 1000))
+    render_field(trace.bytes[..], &trace.used, "document_updates", #cast(usize) (typography.document_updates - trace.document_updates))
+    render_field(trace.bytes[..], &trace.used, "palette_updates", #cast(usize) (typography.palette_updates - trace.palette_updates))
+    render_field(trace.bytes[..], &trace.used, "ui_updates", #cast(usize) (typography.ui_updates - trace.ui_updates))
+    render_field(trace.bytes[..], &trace.used, "ui_hits", #cast(usize) (typography.ui_hits - trace.ui_hits))
+    render_field(trace.bytes[..], &trace.used, "ui_creations", #cast(usize) (typography.ui_creations - trace.ui_creations))
+    add_text(trace.bytes[..], &trace.used, ",\"panel\":\"")
+    add_text(trace.bytes[..], &trace.used, render_panel(app.prompt_state.panel))
+    add_text(trace.bytes[..], &trace.used, "\"")
+    render_field(trace.bytes[..], &trace.used, "animation", render_bool(app.view.animation.active))
+    add_text(trace.bytes[..], &trace.used, "}\n")
+  }
+  trace.events = 0
+}
+fn render_trace_close(app: *App) {
+  trace := &app.render_trace
+  if !trace.enabled {
+    return
+  }
+  render_trace_flush(trace)
+  native_memory_report(app)
+  render_trace_flush(trace)
+  final_cpu := operation_begin(app)
+  add_text(trace.bytes[..], &trace.used, "{\"type\":\"summary\"")
+  render_field(trace.bytes[..], &trace.used, "elapsed_us", #cast(usize) ((final_cpu.wall - trace.epoch) / 1000))
+  render_field(trace.bytes[..], &trace.used, "main_cpu_us", operation_delta(trace.cpu_started, final_cpu.cpu))
+  render_field(trace.bytes[..], &trace.used, "process_cpu_us", operation_delta(trace.process_cpu_started, final_cpu.process_cpu))
+  render_field(trace.bytes[..], &trace.used, "frames", trace.frames)
+  render_field(trace.bytes[..], &trace.used, "total_us", trace.total_us)
+  render_field(trace.bytes[..], &trace.used, "max_us", trace.max_us)
+  render_field(trace.bytes[..], &trace.used, "truncated", render_bool(trace.truncated))
+  render_field(trace.bytes[..], &trace.used, "arena_allocations", app.operations.allocations)
+  render_field(trace.bytes[..], &trace.used, "arena_releases", app.operations.releases)
+  render_field(trace.bytes[..], &trace.used, "arena_peak_reserved", app.operations.peak_reserved)
+  render_field(trace.bytes[..], &trace.used, "arena_reserved", app.operations.reserved)
+  render_field(trace.bytes[..], &trace.used, "arena_allocated_bytes", app.operations.allocated_bytes)
+  render_field(trace.bytes[..], &trace.used, "arena_reuses", app.operations.reused)
+  add_text(trace.bytes[..], &trace.used, ",\"reason_frames\":[")
+  for index in 0..18 {
+    if index > 0 {
+      add_text(trace.bytes[..], &trace.used, ",")
+    }
+    add_number(trace.bytes[..], &trace.used, trace.reasons[index])
+  }
+  add_text(trace.bytes[..], &trace.used, "]}\n")
+  render_trace_flush(trace)
+  if !fs.close(&trace.file).ok {
+    trace.failed = true
+  }
+  if trace.failed {
+    warning: []const u8 = "DNA: render trace write failed; trace incomplete.\n"
+    _ = #syscall(1, 2, &warning[0], #len(warning))
+  }
+  trace.enabled = false
+}
+
+fn render_bool(value: bool) usize {
+  if value {
+    return 1
+  }
+  return 0
+}
+fn render_panel(value: Panel) []const u8 {
+  if value == Panel.Buffers {
+    return "Buffers"
+  }
+  if value == Panel.Commands {
+    return "Commands"
+  }
+  if value == Panel.Create {
+    return "Create"
+  }
+  if value == Panel.Diagnostics {
+    return "Diagnostics"
+  }
+  if value == Panel.Directory {
+    return "Directory"
+  }
+  if value == Panel.DirectoryApply {
+    return "DirectoryApply"
+  }
+  if value == Panel.DirectoryDiscard {
+    return "DirectoryDiscard"
+  }
+  if value == Panel.FileConflict {
+    return "FileConflict"
+  }
+  if value == Panel.Goto {
+    return "Goto"
+  }
+  if value == Panel.Hover {
+    return "Hover"
+  }
+  if value == Panel.Keep {
+    return "Keep"
+  }
+  if value == Panel.Layout {
+    return "Layout"
+  }
+  if value == Panel.Leader {
+    return "Leader"
+  }
+  if value == Panel.LspEdit {
+    return "LspEdit"
+  }
+  if value == Panel.LspResults {
+    return "LspResults"
+  }
+  if value == Panel.Match {
+    return "Match"
+  }
+  if value == Panel.Message {
+    return "Message"
+  }
+  if value == Panel.None {
+    return "None"
+  }
+  if value == Panel.PluginGrant {
+    return "PluginGrant"
+  }
+  if value == Panel.PluginEdit {
+    return "PluginEdit"
+  }
+  if value == Panel.Open {
+    return "Open"
+  }
+  if value == Panel.ProjectSearch {
+    return "ProjectSearch"
+  }
+  if value == Panel.Quit {
+    return "Quit"
+  }
+  if value == Panel.Remove {
+    return "Remove"
+  }
+  if value == Panel.Rename {
+    return "Rename"
+  }
+  if value == Panel.ReplacePreview {
+    return "ReplacePreview"
+  }
+  if value == Panel.SaveAs {
+    return "SaveAs"
+  }
+  if value == Panel.Search {
+    return "Search"
+  }
+  if value == Panel.Select {
+    return "Select"
+  }
+  if value == Panel.Setting {
+    return "Setting"
+  }
+  if value == Panel.Split {
+    return "Split"
+  }
+  if value == Panel.Terminal {
+    return "Terminal"
+  }
+  if value == Panel.TerminalClose {
+    return "TerminalClose"
+  }
+  if value == Panel.Trash {
+    return "Trash"
+  }
+  if value == Panel.Windows {
+    return "Windows"
+  }
+  if value == Panel.View {
+    return "View"
+  }
+  if value == Panel.Bracket {
+    return "Bracket"
+  }
+  return "Unknown"
+}

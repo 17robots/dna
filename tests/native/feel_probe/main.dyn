@@ -1,0 +1,194 @@
+// Real-display timing: held-key input, rendering, present, vsync and trails.
+extern fn ticks "SDL_GetTicksNS"() u64
+extern fn ticks_ms "SDL_GetTicks"() u64
+key_sent: u64 = 0
+latency_total: u64 = 0
+latency_worst: u64 = 0
+latencies: u64 = 0
+present_total: u64 = 0
+present_worst: u64 = 0
+presents: u64 = 0
+vsync_total: u64 = 0
+vsync_worst: u64 = 0
+vsync_calls: u64 = 0
+frame_start: u64 = 0
+render_total: u64 = 0
+render_worst: u64 = 0
+phase_started: u64 = 0
+last_injected: u64 = 0
+phase: u32 = 0
+injected: u32 = 0
+trails: u64 = 0
+fn key(code: u32, modifiers: u16) {
+  probe_key_mod(code, modifiers)
+  if key_sent == 0 {
+    key_sent = ticks()
+  }
+}
+pub fn SDL_RenderClear(renderer: rawptr) bool {
+  frame_start = ticks()
+  next := #cast(*fn(rawptr) bool) probe_next("SDL_RenderClear\0")
+  return next(renderer)
+}
+pub fn SDL_SetRenderVSync(renderer: rawptr, vsync: i32) bool {
+  start := ticks()
+  next := #cast(*fn(rawptr, i32) bool) probe_next("SDL_SetRenderVSync\0")
+  result := next(renderer, vsync)
+  spent := ticks() - start
+  vsync_total += spent
+  vsync_calls += 1
+  if spent > vsync_worst {
+    vsync_worst = spent
+  }
+  return result
+}
+pub fn SDL_RenderGeometry(renderer: rawptr, texture: rawptr, vertices: rawptr, count: i32, indices: *const i32, index_count: i32) bool {
+  if texture == nil && count == 4 {
+    trails += 1
+  }
+  next := #cast(*fn(rawptr, rawptr, rawptr, i32, *const i32, i32) bool) probe_next("SDL_RenderGeometry\0")
+  return next(renderer, texture, vertices, count, indices, index_count)
+}
+pub fn SDL_RenderPresent(renderer: rawptr) bool {
+  start := ticks()
+  if frame_start != 0 {
+    render := start - frame_start
+    render_total += render
+    if render > render_worst {
+      render_worst = render
+    }
+  }
+  next := #cast(*fn(rawptr) bool) probe_next("SDL_RenderPresent\0")
+  result := next(renderer)
+  end := ticks()
+  spent := end - start
+  present_total += spent
+  presents += 1
+  if spent > present_worst {
+    present_worst = spent
+  }
+  if key_sent != 0 {
+    latency := end - key_sent
+    latency_total += latency
+    latencies += 1
+    if latency > latency_worst {
+      latency_worst = latency
+    }
+    key_sent = 0
+  }
+  return result
+}
+fn milliseconds(nanoseconds: u64) {
+  hundredths := (nanoseconds + 5000) / 10000
+  probe_number(hundredths / 100)
+  probe_log(".")
+  if hundredths % 100 < 10 {
+    probe_log("0")
+  }
+  probe_number(hundredths % 100)
+}
+fn mean(total: u64, count: u64) {
+  average: u64 = 0
+  if count != 0 {
+    average = total / count
+  }
+  milliseconds(average)
+}
+fn report(name: []const u8) {
+  probe_log(name)
+  for i in #len(name)..10 {
+    probe_log(" ")
+  }
+  probe_log(" frames/key ")
+  tenths := (presents + 3) / 6
+  probe_number(tenths / 10)
+  probe_log(".")
+  probe_number(tenths % 10)
+  probe_log(" | input->present mean ")
+  mean(latency_total, latencies)
+  probe_log(" ms worst ")
+  milliseconds(latency_worst)
+  probe_log(" | render mean ")
+  mean(render_total, presents)
+  probe_log(" worst ")
+  milliseconds(render_worst)
+  probe_log(" | present mean ")
+  mean(present_total, presents)
+  probe_log(" worst ")
+  milliseconds(present_worst)
+  probe_log(" (")
+  probe_number(presents)
+  probe_log(") | vsync switches ")
+  probe_number(vsync_calls)
+  probe_log(" mean ")
+  mean(vsync_total, vsync_calls)
+  probe_log(" worst ")
+  milliseconds(vsync_worst)
+  probe_log(" ms | trail frames ")
+  probe_number(trails)
+  probe_log("\n")
+  trails = 0
+  latency_total = 0
+  latency_worst = 0
+  latencies = 0
+  present_total = 0
+  present_worst = 0
+  presents = 0
+  vsync_total = 0
+  vsync_worst = 0
+  vsync_calls = 0
+  render_total = 0
+  render_worst = 0
+}
+// Four phases at 33ms repeat intervals, with the original settling delays.
+pub fn SDL_WaitEventTimeout(event: rawptr, milliseconds: i32) bool {
+  now := ticks_ms()
+  if phase_started == 0 {
+    phase_started = now + 800
+  }
+  if now >= phase_started && now - last_injected >= 33 {
+    last_injected = now
+    if phase == 0 {
+      key(106, 0)
+    }
+    else if phase == 1 {
+      if injected == 0 {
+        key(27, 0)
+        key(103, 0)
+        key(103, 0)
+        key(111, 0)
+      }
+      else {
+        key(97, 0)
+        probe_text("a\0")
+      }
+    } else if phase == 2 {
+      if injected % 6 == 0 {
+        key(1073741902, 0)
+      }
+    } else if phase == 3 {
+      if injected == 0 {
+        key(27, 0)
+      }
+      key(107, 0)
+    }
+    injected += 1
+    if injected == 60 {
+      names: [4][]const u8 = ["held j", "typing", "page down", "held k"]
+      key_sent = 0
+      probe_delay(400)
+      report(names[#cast(usize) phase])
+      injected = 0
+      phase += 1
+      if phase == 4 {
+        probe_exit(0)
+      }
+    }
+  }
+  next := #cast(*fn(rawptr, i32) bool) probe_next("SDL_WaitEventTimeout\0")
+  timeout := milliseconds
+  if timeout > 2 {
+    timeout = 2
+  }
+  return next(event, timeout)
+}

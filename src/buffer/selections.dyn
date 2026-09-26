@@ -1,0 +1,719 @@
+pub struct Selection { cursor, anchor: usize }
+pub struct SelectionSet { count: usize, ranges: [31]Selection }
+struct EditRange { low, high, inserted: usize, primary, reversed: bool }
+
+pub fn head(document: *const Document) usize {
+  if document.cursor > document.anchor {
+    return previous(document, document.cursor)
+  }
+  return document.cursor
+}
+pub fn select_to(document: *Document, position: usize, extend: bool) {
+  document.goal_valid = false
+  point := boundary(document, position)
+  fixed := point
+  if extend {
+    fixed = document.anchor
+    if document.cursor < document.anchor {
+      fixed = previous(document, fixed)
+    }
+  }
+  if point < fixed {
+    document.cursor = point
+    document.anchor = next(document, fixed)
+  }
+  else {
+    document.anchor = fixed
+    document.cursor = next(document, point)
+  }
+}
+pub fn select_current(document: *Document) {
+  if document.cursor == document.anchor {
+    document.cursor = next(document, document.cursor)
+  }
+}
+pub fn select_vertical(document: *Document, down: bool, extend: bool) {
+  saved_cursor := document.cursor
+  saved_anchor := document.anchor
+  retained := vertical_goal_valid(document)
+  document.cursor = head(document)
+  if retained {
+    document.goal_cursor = document.cursor
+  }
+  else {
+    document.goal_valid = false
+  }
+  vertical(document, down, false)
+  position := document.cursor
+  column := document.goal_column
+  document.cursor = saved_cursor
+  document.anchor = saved_anchor
+  select_to(document, position, extend)
+  remember_vertical(document, column)
+}
+fn shifted_line(document: *Document, position: usize, down: bool) usize {
+  document.goal_valid = false
+  document.cursor = position
+  vertical(document, down, false)
+  return document.cursor
+}
+pub fn add_cursor(document: *Document, down: bool) bool {
+  if document.secondary.count >= 31 {
+    return false
+  }
+  saved := Selection{cursor: document.cursor, anchor: document.anchor}
+  base := head(document)
+  beginning := line_start(document, base)
+  if (down && line_end(document, base) == document.length) || (!down && beginning == 0) {
+    return false
+  }
+  // Copy endpoints by codepoint column; a selected newline remains a newline.
+  low := start(document)
+  high := end(document)
+  linewise := high > low && document.bytes[high - 1] == 10
+  new_low := shifted_line(document, low, down)
+  new_high: usize = 0
+  if linewise {
+    new_high = line_end(document, new_low)
+    if new_high < document.length {
+      new_high += 1
+    }
+  }
+  else {
+    new_high = shifted_line(document, high, down)
+  }
+  document.cursor = saved.cursor
+  document.anchor = saved.anchor
+  candidate := Selection{anchor: new_low, cursor: new_high}
+  if saved.cursor < saved.anchor {
+    candidate.anchor = new_high
+    candidate.cursor = new_low
+  }
+  if candidate.cursor == saved.cursor && candidate.anchor == saved.anchor {
+    return false
+  }
+  for index in 0..document.secondary.count {
+    existing := document.secondary.ranges[index]
+    if existing.cursor == candidate.cursor && existing.anchor == candidate.anchor {
+      return false
+    }
+  }
+  document.secondary.ranges[document.secondary.count] = saved
+  document.secondary.count += 1
+  document.cursor = candidate.cursor
+  document.anchor = candidate.anchor
+  return true
+}
+// Validate and merge the entire batch before changing any bytes. Descending
+// writes retain original offsets; resulting cursors are rebuilt in ascending order.
+pub fn replace_all(document: *Document, text: []const u8) bool {
+  return replace_many(document, text, false)
+}
+pub fn replace_characters(document: *Document, text: []const u8) bool {
+  if document.cursor == document.anchor {
+    document.cursor = next(document, document.cursor)
+  }
+  for index in 0..document.secondary.count {
+    selection := &document.secondary.ranges[index]
+    if selection.cursor == selection.anchor {
+      selection.cursor = next(document, selection.cursor)
+    }
+  }
+  checkpoint(document)
+  ok := replace_many(document, text, true)
+  if ok {
+    checkpoint(document)
+  }
+  return ok
+}
+fn replace_many(document: *Document, text: []const u8, characters: bool) bool {
+  if !characters && document.secondary.count == 0 {
+    return replace(document, text)
+  }
+  if !valid(text) {
+    return false
+  }
+
+  ranges: [32]EditRange = []
+  count := document.secondary.count + 1
+  ranges[0] = EditRange{low: start(document), high: end(document), primary: true}
+
+  for index in 1..count {
+    selection := document.secondary.ranges[index - 1]
+    low := selection.anchor
+    high := selection.cursor
+    if low > high {
+      swap := low
+      low = high
+      high = swap
+    }
+    ranges[index] = EditRange{low: low, high: high}
+  }
+  for index in 1..count {
+    moving := ranges[index]
+    at := index
+    for at > 0 && ranges[at - 1].low > moving.low {
+      ranges[at] = ranges[at - 1]
+      at -= 1
+    }
+    ranges[at] = moving
+  }
+  merged: usize = 0
+  for index in 0..count {
+    current := ranges[index]
+    if merged > 0 && (current.low < ranges[merged - 1].high || current.low == ranges[merged - 1].low) {
+      if current.high > ranges[merged - 1].high {
+        ranges[merged - 1].high = current.high
+      }
+      ranges[merged - 1].primary = ranges[merged - 1].primary || current.primary
+    } else {
+      ranges[merged] = current
+      merged += 1
+    }
+  }
+  removed: usize = 0
+  for index in 0..merged {
+    removed += ranges[index].high - ranges[index].low
+  }
+  available := Capacity - (document.length - removed)
+  total: usize = 0
+  largest: usize = 0
+  for index in 0..merged {
+    times: usize = 1
+    if characters {
+      times = 0
+      scan := ranges[index].low
+      for scan < ranges[index].high {
+        times += 1
+        scan = next(document, scan)
+      }
+    }
+    size := #len(text) * times
+    if size > available - total {
+      return false
+    }
+    ranges[index].inserted = size
+    total += size
+    if size > largest {
+      largest = size
+    }
+  }
+  // Character replacement repeats text across the longest range.
+  scratch := mem.ArenaResult{}
+  repeated := scratch.arena.data
+  if characters && #len(text) > 0 {
+    scratch = reserve(largest + 1)
+    if !scratch.ok {
+      return false
+    }
+    repeated = scratch.arena.data
+  }
+  defer {
+    if scratch.ok {
+      _ = mem.arena_release(&scratch.arena)
+    }
+  }
+  filled: usize = 0
+  if characters && #len(text) > 0 {
+    for filled < largest {
+      for byte in text {
+        repeated[filled] = byte
+        filled += 1
+      }
+    }
+  }
+  // Delete all ranges first: a final-size-valid batch may otherwise overflow
+  // transiently if a high range grows before a lower range shrinks.
+  document.secondary.count = 0
+  index := merged
+  for index > 0 {
+    index -= 1
+    document.anchor = ranges[index].low
+    document.cursor = ranges[index].high
+    _ = replace(document, "")
+  }
+  removed_before: usize = 0
+  inserted_before: usize = 0
+  index = 0
+  for index < merged {
+    range := ranges[index]
+    insertion := range.low - removed_before + inserted_before
+    document.anchor = insertion
+    document.cursor = insertion
+    replacement := text
+    if characters {
+      replacement = repeated[..range.inserted]
+    }
+    _ = replace(document, replacement)
+    removed_before += range.high - range.low
+    inserted_before += range.inserted
+    index += 1
+  }
+  deleted: usize = 0
+  inserted: usize = 0
+  index = 0
+  for index < merged {
+    edited := ranges[index]
+    position := edited.low - deleted + inserted + edited.inserted
+    anchor := position
+    if characters {
+      anchor -= edited.inserted
+    }
+    if edited.primary {
+      document.cursor = position
+      document.anchor = anchor
+    }
+    else {
+      document.secondary.ranges[document.secondary.count] = Selection{cursor: position, anchor: anchor}
+      document.secondary.count += 1
+    }
+    deleted += edited.high - edited.low
+    inserted += edited.inserted
+    index += 1
+  }
+  return true
+}
+pub fn erase_all(document: *Document, backward: bool) {
+  if document.cursor == document.anchor {
+    if backward {
+      document.anchor = previous(document, document.cursor)
+    } else {
+      document.anchor = next(document, document.cursor)
+    }
+  }
+  for index in 0..document.secondary.count {
+    selection := &document.secondary.ranges[index]
+    if selection.cursor == selection.anchor {
+      if backward {
+        selection.anchor = previous(document, selection.cursor)
+      } else {
+        selection.anchor = next(document, selection.cursor)
+      }
+    }
+  }
+  _ = replace_all(document, "")
+}
+pub fn insert_positions(document: *Document, after: bool) {
+  position := start(document)
+  if after {
+    position = end(document)
+  }
+  document.cursor = position
+  document.anchor = position
+  for index in 0..document.secondary.count {
+    selection := &document.secondary.ranges[index]
+    low := selection.anchor
+    high := selection.cursor
+    if low > high {
+      swap := low
+      low = high
+      high = swap
+    }
+    target := low
+    if after {
+      target = high
+    }
+    selection.cursor = target
+    selection.anchor = target
+  }
+}
+pub fn leave_insert(document: *Document) {
+  if document.cursor == document.anchor {
+    point := document.cursor
+    if point > line_start(document, point) {
+      point = previous(document, point)
+    }
+    document.anchor = point
+    document.cursor = next(document, point)
+  }
+  for index in 0..document.secondary.count {
+    selection := &document.secondary.ranges[index]
+    if selection.cursor == selection.anchor {
+      point_extra := selection.cursor
+      if point_extra > line_start(document, point_extra) {
+        point_extra = previous(document, point_extra)
+      }
+      selection.anchor = point_extra
+      selection.cursor = next(document, point_extra)
+    }
+  }
+}
+
+// Resolve each cursor's visible line before converting it into an insertion point.
+pub fn insert_line_positions(document: *Document, after: bool) {
+  saved := Selection{cursor: document.cursor, anchor: document.anchor}
+  position := line_nonblank(document, head(document))
+  if after {
+    position = line_end(document, head(document))
+  }
+  for index in 0..document.secondary.count {
+    selection := document.secondary.ranges[index]
+    document.cursor = selection.cursor
+    document.anchor = selection.anchor
+    secondary_position := line_nonblank(document, head(document))
+    if after {
+      secondary_position = line_end(document, head(document))
+    }
+    document.secondary.ranges[index] = Selection{cursor: secondary_position, anchor: secondary_position}
+  }
+  document.cursor = saved.cursor
+  document.anchor = saved.anchor
+  move_to(document, position, false)
+}
+
+// Clipboard fragments correspond to selections in document order. Validate the
+// whole batch before mutation; differing fragment sizes cannot partially paste.
+pub fn replace_fragments(document: *Document, fragments: []const []const u8) bool {
+  count := document.secondary.count + 1
+  if #len(fragments) != count {
+    return false
+  }
+  ranges: [32]EditRange = []
+  ranges[0] = EditRange{low: start(document), high: end(document), primary: true}
+  for index in 1..count {
+    selection := document.secondary.ranges[index - 1]
+    low := selection.anchor
+    high := selection.cursor
+    if low > high {
+      swap := low
+      low = high
+      high = swap
+    }
+    ranges[index] = EditRange{low: low, high: high}
+  }
+  for index in 1..count {
+    moving := ranges[index]
+    at := index
+    for at > 0 && ranges[at - 1].low > moving.low {
+      ranges[at] = ranges[at - 1]
+      at -= 1
+    }
+    ranges[at] = moving
+  }
+  removed: usize = 0
+  inserted: usize = 0
+  for index in 0..count {
+    range := ranges[index]
+    if range.high > document.length || (index > 0 && (range.low < ranges[index - 1].high || range.low == ranges[index - 1].low)) || !valid(fragments[index]) {
+      return false
+    }
+    removed += range.high - range.low
+    if #len(fragments[index]) > Capacity - inserted {
+      return false
+    }
+    inserted += #len(fragments[index])
+  }
+  if inserted > Capacity - (document.length - removed) {
+    return false
+  }
+  document.secondary.count = 0
+  index := count
+  for index > 0 {
+    index -= 1
+    document.anchor = ranges[index].low
+    document.cursor = ranges[index].high
+    _ = replace(document, "")
+  }
+  deleted: usize = 0
+  added: usize = 0
+  index = 0
+  for index < count {
+    entry := ranges[index]
+    position := entry.low - deleted + added
+    document.anchor = position
+    document.cursor = position
+    _ = replace(document, fragments[index])
+    deleted += entry.high - entry.low
+    added += #len(fragments[index])
+    index += 1
+  }
+  deleted = 0
+  added = 0
+  index = 0
+  for index < count {
+    final := ranges[index]
+    point := final.low - deleted + added + #len(fragments[index])
+    if final.primary {
+      document.cursor = point
+      document.anchor = point
+    } else {
+      document.secondary.ranges[document.secondary.count] = Selection{cursor: point, anchor: point}
+      document.secondary.count += 1
+    }
+    deleted += final.high - final.low
+    added += #len(fragments[index])
+    index += 1
+  }
+  return true
+}
+
+pub fn open_lines(document: *Document, above: bool) bool {
+  return open_lines_count(document, above, 1)
+}
+pub fn open_lines_count(document: *Document, above: bool, count: usize) bool {
+  if count == 0 || count > 999 {
+    return false
+  }
+  newlines: [999]u8 = []
+  for fill in 0..count {
+    newlines[fill] = 10
+  }
+  // Save selection state so a capacity failure has no visible side effects.
+  saved := Selection{anchor: document.anchor, cursor: document.cursor}
+  extras := document.secondary
+  checkpoint(document)
+  point := line_end(document, head(document))
+  if above {
+    point = line_start(document, head(document))
+  }
+  for index in 0..document.secondary.count {
+    selected := document.secondary.ranges[index]
+    document.anchor = selected.anchor
+    document.cursor = selected.cursor
+    other := line_end(document, head(document))
+    if above {
+      other = line_start(document, head(document))
+    }
+    document.secondary.ranges[index] = Selection{anchor: other, cursor: other}
+  }
+  document.anchor = point
+  document.cursor = point
+  if !replace_all(document, newlines[..count]) {
+    document.anchor = saved.anchor
+    document.cursor = saved.cursor
+    document.secondary = extras
+    return false
+  }
+  if above {
+    document.cursor -= count
+    document.anchor = document.cursor
+    for index in 0..document.secondary.count {
+      document.secondary.ranges[index].cursor -= count
+      document.secondary.ranges[index].anchor = document.secondary.ranges[index].cursor
+    }
+  }
+  return true
+}
+
+// Rotation order follows the document, independent of cursor creation order.
+pub fn rotate_selections(document: *Document, backward: bool, count: usize) {
+  selections: [32]Selection = []
+  selections[0] = Selection{cursor: document.cursor, anchor: document.anchor}
+  size := document.secondary.count + 1
+  if size < 2 {
+    return
+  }
+  primary: usize = 0
+  for index in 1..size {
+    selections[index] = document.secondary.ranges[index - 1]
+  }
+  for index in 1..size {
+    moving := selections[index]
+    low := moving.anchor
+    if moving.cursor < low {
+      low = moving.cursor
+    }
+    at := index
+    for at > 0 {
+      earlier := selections[at - 1]
+      earlier_low := earlier.anchor
+      if earlier.cursor < earlier_low {
+        earlier_low = earlier.cursor
+      }
+      if earlier_low <= low {
+        break
+      }
+      selections[at] = earlier
+      if primary == at - 1 {
+        primary = at
+      }
+      at -= 1
+    }
+    selections[at] = moving
+  }
+  step := count % size
+  target := (primary + step) % size
+  if backward {
+    target = (primary + size - step) % size
+  }
+  document.anchor = selections[target].anchor
+  document.cursor = selections[target].cursor
+  document.secondary.count = 0
+  for index in 0..size {
+    if index != target {
+      document.secondary.ranges[document.secondary.count] = selections[index]
+      document.secondary.count += 1
+    }
+  }
+  document.goal_valid = false
+}
+
+pub fn rotate_contents(document: *Document, backward: bool, count: usize) bool {
+  size := document.secondary.count + 1
+  if size < 2 {
+    return true
+  }
+  ranges: [32]EditRange = []
+  ranges[0] = EditRange{low: start(document), high: end(document), primary: true, reversed: document.cursor < document.anchor}
+  for index in 1..size {
+    selected := document.secondary.ranges[index - 1]
+    low := selected.anchor
+    high := selected.cursor
+    if low > high {
+      swap := low
+      low = high
+      high = swap
+    }
+    ranges[index] = EditRange{low: low, high: high, reversed: selected.cursor < selected.anchor}
+  }
+  for index in 1..size {
+    moving := ranges[index]
+    at := index
+    for at > 0 && ranges[at - 1].low > moving.low {
+      ranges[at] = ranges[at - 1]
+      at -= 1
+    }
+    ranges[at] = moving
+  }
+  total: usize = 0
+  for index in 0..size {
+    if index > 0 && (ranges[index].low < ranges[index - 1].high || ranges[index].low == ranges[index - 1].low) {
+      return false
+    }
+    total += ranges[index].high - ranges[index].low
+  }
+  if total == 0 {
+    return true
+  }
+  owned := mem.arena_create(total)
+  if !owned.ok {
+    return false
+  }
+  defer _ = mem.arena_release(&owned.arena)
+  storage := mem.arena_push_uninit(&owned.arena, total, 1)[..total]
+  original: [32][]const u8 = []
+  fragments: [32][]const u8 = []
+  used: usize = 0
+  for index in 0..size {
+    length := ranges[index].high - ranges[index].low
+    if length > 0 {
+      _ = copy_bytes(&storage[used], &document.bytes[ranges[index].low], length)
+    }
+    original[index] = storage[used..used + length]
+    used += length
+  }
+  steps := count % size
+  for index in 0..size {
+    source := (index + size - steps) % size
+    if backward {
+      source = (index + steps) % size
+    }
+    fragments[index] = original[source]
+  }
+  checkpoint(document)
+  if !replace_fragments(document, fragments[..size]) {
+    return false
+  }
+  removed: usize = 0
+  added: usize = 0
+  document.secondary.count = 0
+  for index in 0..size {
+    entry := ranges[index]
+    position := entry.low - removed + added
+    selected_end := position + #len(fragments[index])
+    range_anchor := position
+    range_cursor := selected_end
+    if entry.reversed {
+      range_anchor = selected_end
+      range_cursor = position
+    }
+    if entry.primary {
+      document.anchor = range_anchor
+      document.cursor = range_cursor
+    }
+    else {
+      document.secondary.ranges[document.secondary.count] = Selection{anchor: range_anchor, cursor: range_cursor}
+      document.secondary.count += 1
+    }
+    removed += entry.high - entry.low
+    added += #len(fragments[index])
+  }
+  checkpoint(document)
+  return true
+}
+
+pub fn merge_selections(document: *Document, consecutive: bool) {
+  ranges: [32]EditRange = []
+  ranges[0] = EditRange{low: start(document), high: end(document), primary: true, reversed: document.cursor < document.anchor}
+  size := document.secondary.count + 1
+  for index in 1..size {
+    selected := document.secondary.ranges[index - 1]
+    low := selected.anchor
+    high := selected.cursor
+    if low > high {
+      low = selected.cursor
+      high = selected.anchor
+    }
+    ranges[index] = EditRange{low: low, high: high, reversed: selected.cursor < selected.anchor}
+  }
+  for index in 1..size {
+    moving := ranges[index]
+    at := index
+    for at > 0 && ranges[at - 1].low > moving.low {
+      ranges[at] = ranges[at - 1]
+      at -= 1
+    }
+    ranges[at] = moving
+  }
+  count: usize = 1
+  for index in 1..size {
+    previous := &ranges[count - 1]
+    next := ranges[index]
+    if !consecutive || next.low <= previous.high {
+      if next.high > previous.high {
+        previous.high = next.high
+      }
+      if next.primary {
+        previous.primary = true
+        previous.reversed = next.reversed
+      }
+    } else {
+      ranges[count] = next
+      count += 1
+    }
+  }
+  document.secondary.count = 0
+  for index in 0..count {
+    range := ranges[index]
+    selection := Selection{anchor: range.low, cursor: range.high}
+    if range.reversed {
+      selection.anchor = range.high
+      selection.cursor = range.low
+    }
+    if range.primary {
+      document.anchor = selection.anchor
+      document.cursor = selection.cursor
+    }
+    else {
+      document.secondary.ranges[document.secondary.count] = selection
+      document.secondary.count += 1
+    }
+  }
+  document.goal_valid = false
+}
+pub fn forward_selections(document: *Document) {
+  document.goal_valid = false
+  if document.cursor < document.anchor {
+    saved := document.cursor
+    document.cursor = document.anchor
+    document.anchor = saved
+  }
+  for index in 0..document.secondary.count {
+    selected := &document.secondary.ranges[index]
+    if selected.cursor < selected.anchor {
+      previous_cursor := selected.cursor
+      selected.cursor = selected.anchor
+      selected.anchor = previous_cursor
+    }
+  }
+}

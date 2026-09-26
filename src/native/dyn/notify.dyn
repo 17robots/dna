@@ -1,0 +1,122 @@
+// Readiness events contain descriptors, never pointers to worker-owned objects.
+// epoll_event is packed on Linux x86_64: encode its 12 bytes explicitly.
+notify_queue: i32 = 0
+notify_stop_fd: i32 = 0
+notify_thread: rawptr = nil
+notify_enabled: bool = false
+notify_delivery: NativeMutex = NativeMutex{}
+extern fn notify_epoll_create "epoll_create1"(flags: i32) i32
+extern fn notify_eventfd "eventfd"(initial: u32, flags: i32) i32
+extern fn notify_epoll_ctl "epoll_ctl"(queue: i32, operation: i32, fd: i32, event: rawptr) i32
+extern fn notify_epoll_wait "epoll_wait"(queue: i32, events: rawptr, capacity: i32, timeout: i32) i32
+fn notify_tty() {
+  dna_tty_wake()
+}
+fn notify_event(event: []u8, flags: u32, fd: i32) {
+  descriptor := #cast(u32) fd
+  for index in 0..4 {
+    event[index] = #cast(u8) (flags >> (#cast(u32) index * 8))
+    event[index+4] = #cast(u8) (descriptor >> (#cast(u32) index * 8))
+  }
+}
+pub fn dna_notify() {
+  _ = sync_mutex_lock(#cast(rawptr) &notify_delivery)
+  if notify_enabled {
+    notify_gui()
+    notify_tty()
+  }
+  _ = sync_mutex_unlock(#cast(rawptr) &notify_delivery)
+}
+fn notify_worker(unused: rawptr) i32 {
+  _ = unused
+  events: [384]u8 = []
+  for true {
+    count := notify_epoll_wait(notify_queue, #cast(rawptr) &events[0], 32, -1)
+    if count < 0 {
+      if rec_errno().* == 4 {
+        continue
+      }
+      return 0
+    }
+    for index in 0..#cast(usize) count {
+      at := index * 12 + 4
+      descriptor: u32 = 0
+      for byte in 0..4 {
+        descriptor |= #cast(u32) events[at+byte] << (#cast(u32) byte * 8)
+      }
+      if #cast(i32) descriptor == notify_stop_fd {
+        return 0
+      }
+    }
+    if count != 0 {
+      dna_notify()
+    }
+  }
+  return 0
+}
+pub fn dna_notify_start() i32 {
+  native_initialize()
+  notify_queue = notify_epoll_create(524288)
+  notify_stop_fd = notify_eventfd(0, 524288)
+  event: [12]u8 = []
+  notify_event(event[..], 1, notify_stop_fd)
+  if notify_queue >= 0 && notify_stop_fd >= 0 && notify_epoll_ctl(notify_queue, 1, notify_stop_fd, #cast(rawptr) &event[0]) == 0 {
+    _ = sync_mutex_lock(#cast(rawptr) &notify_delivery)
+    notify_enabled = true
+    _ = sync_mutex_unlock(#cast(rawptr) &notify_delivery)
+    notify_thread = dna_thread_create(&notify_worker, nil)
+    if notify_thread != nil {
+      return 1
+    }
+    _ = sync_mutex_lock(#cast(rawptr) &notify_delivery)
+    notify_enabled = false
+    _ = sync_mutex_unlock(#cast(rawptr) &notify_delivery)
+  }
+  if notify_queue >= 0 {
+    _ = rec_close(notify_queue)
+  }
+  if notify_stop_fd >= 0 {
+    _ = rec_close(notify_stop_fd)
+  }
+  notify_queue = -1
+  notify_stop_fd = -1
+  return 0
+}
+pub fn dna_notify_stop() {
+  _ = sync_mutex_lock(#cast(rawptr) &notify_delivery)
+  running := notify_enabled
+  notify_enabled = false
+  _ = sync_mutex_unlock(#cast(rawptr) &notify_delivery)
+  if !running {
+    return
+  }
+  one: u64 = 1
+  _ = rec_write(notify_stop_fd, #cast(*const u8) &one, 8)
+  dna_thread_join(notify_thread, nil)
+  notify_thread = nil
+  _ = rec_close(notify_queue)
+  _ = rec_close(notify_stop_fd)
+  notify_queue = -1
+  notify_stop_fd = -1
+}
+pub fn dna_watch(fd: i32, writing: i32) {
+  native_initialize()
+  if notify_queue < 0 || fd < 0 {
+    return
+  }
+  flags: u32 = 1073741825
+  if writing != 0 {
+    flags = 1073741828
+  }
+  event: [12]u8 = []
+  notify_event(event[..], flags, fd)
+  if notify_epoll_ctl(notify_queue, 3, fd, #cast(rawptr) &event[0]) != 0 && rec_errno().* == 2 {
+    _ = notify_epoll_ctl(notify_queue, 1, fd, #cast(rawptr) &event[0])
+  }
+}
+pub fn dna_unwatch(fd: i32) {
+  native_initialize()
+  if notify_queue >= 0 && fd >= 0 {
+    _ = notify_epoll_ctl(notify_queue, 2, fd, nil)
+  }
+}

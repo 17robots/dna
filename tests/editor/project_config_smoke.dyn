@@ -1,0 +1,256 @@
+// dna.toml over the global config: plain keys apply, locked and personal keys
+// never do, and command keys wait for :trust (which an edit revokes).
+fn project_config_write(path: []const u8, text: []const u8) {
+  if !fs.write_all(path, text).ok {
+    #panic("project config fixture write")
+  }
+}
+fn project_config_smoke(app: *App, typography: *Typography) {
+  storage: [4096]u8 = []
+  base_env := process.environment("DNA_WORKFLOW_TEST", storage[..])
+  if !base_env.ok || !base_env.found {
+    return
+  }
+  base: [4096]u8 = []
+  base_length := copy_text(base[..], base_env.value)
+  add_text(base[..], &base_length, "/project-config")
+  nested: [4200]u8 = []
+  nested_length := copy_text(nested[..], base[..base_length])
+  add_text(nested[..], &nested_length, "/repo/src/deep")
+  if config_directories(&nested[0]) == 0 {
+    #panic("project config fixture directories")
+  }
+  global: [4200]u8 = []
+  global_length := copy_text(global[..], base[..base_length])
+  add_text(global[..], &global_length, "/global.toml")
+  project: [4200]u8 = []
+  project_length := copy_text(project[..], base[..base_length])
+  add_text(project[..], &project_length, "/repo/dna.toml")
+  project_config_write(global[..global_length], "lock = [\"theme\"]\n[editor]\nindent_width = 4\n")
+  project_config_write(project[..project_length], "theme = \"light\"\n[editor]\nindent_width = 2\nvim_keys = true\n[tasks]\nbuild_command = \"make it\"\n")
+  saved_path_length := app.configuration.path_length
+  saved_path: [4096]u8 = app.configuration.path
+  saved_project_length := app.workspace.project_length
+  saved_project: [4096]u8 = app.workspace.project
+  saved_vim := app.config.vim_keys
+  app.configuration.path_length = copy_text(app.configuration.path[..], global[..global_length])
+  // Found from a subdirectory, walking up.
+  app.workspace.project_length = copy_text(app.workspace.project[..], nested[..nested_length])
+  config_reload(app, typography, false)
+  if app.project_config.path_length == 0 || !buffer.equal(app.project_config.path[..app.project_config.path_length], project[..project_length]) {
+    #panic("dna.toml found from a subdirectory")
+  }
+  if app.config.indent_width != 2 {
+    #panic("dna.toml plain key applies")
+  }
+  if app.config.light_theme {
+    #panic("locked theme ignored from dna.toml")
+  }
+  if app.config.vim_keys {
+    #panic("keymap is personal, never from dna.toml")
+  }
+  if #len(app.config.build_command) != 0 || app.project_config.trusted {
+    #panic("build command waits for :trust")
+  }
+  trust_project(app, typography)
+  if !app.project_config.trusted || !buffer.equal(app.config.build_command, "make it") {
+    #panic(":trust applies command keys")
+  }
+  // Any edit revokes trust.
+  project_config_write(project[..project_length], "[editor]\nindent_width = 3\n[tasks]\nbuild_command = \"make other\"\n")
+  config_reload(app, typography, false)
+  if app.project_config.trusted || app.config.indent_width != 3 || #len(app.config.build_command) != 0 {
+    #panic("an edited dna.toml is untrusted again")
+  }
+  // An invalid dna.toml leaves the global settings.
+  project_config_write(project[..project_length], "[editor]\nindent_width = nope\n")
+  config_reload(app, typography, false)
+  if app.config.indent_width != 4 {
+    #panic("invalid dna.toml keeps global settings")
+  }
+  app.configuration.path = saved_path
+  app.configuration.path_length = saved_path_length
+  app.workspace.project = saved_project
+  app.workspace.project_length = saved_project_length
+  config_reload(app, typography, false)
+  app.config.vim_keys = saved_vim
+}
+
+// Default servers start only when their program is on PATH.
+fn default_server_smoke() {
+  if !on_path("sh") || on_path("dna-no-such-language-server --stdio") || on_path("") {
+    #panic("default server PATH lookup")
+  }
+  for index in 0..DefaultServers {
+    entry := default_server(index)
+    if #len(entry.language) == 0 || #len(entry.command) == 0 {
+      #panic("default server table entry")
+    }
+  }
+}
+
+// [modules] and :module: choices outside the build fall back with a notice.
+fn modules_smoke(app: *App) {
+  saved := app.config
+  parsed := settings.Settings{}
+  if !settings.parse("[modules]\nkeymap = \"vim\"\npicker = \"compact\"\n", &parsed) || !parsed.vim_keys || parsed.picker_style != 1 {
+    #panic("[modules] keymap and picker parse")
+  }
+  rejected := settings.Settings{}
+  // keymap and vim_keys are one choice: disagreeing in one file is an error.
+  if settings.parse("[modules]\nkeymap = \"vim\"\n[editor]\nvim_keys = false\n", &rejected) || !settings.parse("[editor]\nvim_keys = true\n[modules]\nkeymap = \"vim\"\n", &rejected) || !rejected.vim_keys {
+    #panic("keymap and vim_keys must agree")
+  }
+  if command_named("place") != 98 || command_named("modules") != 99 || command_named("module") != 100 || command_named("keymap") != 101 || command_named("frontend") != 102 {
+    #panic("module and placement commands are in the palette")
+  }
+  if settings.parse("[modules]\nkeymap = \"emacs\"\n", &rejected) {
+    #panic("unknown keymap rejected")
+  }
+  app.config = parsed
+  modules_validate(app)
+  // This build includes every module, so each choice stands. Builds that
+  // leave one out fall back (see the minimal profile in just smoke).
+  if !app.config.vim_keys || app.config.picker_style != 1 {
+    #panic("compiled-in vim and compact picker kept")
+  }
+  module_command(app, "keymap helix")
+  if app.config.vim_keys {
+    #panic(":module keymap helix")
+  }
+  module_command(app, "picker dropdown")
+  module_command(app, "explorer tree")
+  if app.config.picker_style != 2 || app.config.explorer_style != 1 {
+    #panic(":module picker dropdown and explorer tree")
+  }
+  module_command(app, "picker sideways")
+  if app.config.picker_style != 2 {
+    #panic(":module rejects unknown module names")
+  }
+  app.config = saved
+  app.prompt_state.panel = Panel.None
+}
+
+// Placement: anchors, docks taking pane space, defaults untouched.
+fn placement_smoke(app: *App) {
+  saved := app.config
+  saved_panel := app.prompt_state.panel
+  parsed := settings.Settings{}
+  if !settings.parse("[place.picker]\nanchor = \"bottom-right\"\nwidth = 0.5\nheight = 200\n[place.explorer]\nside = \"left\"\nsize = 0.25\n", &parsed) {
+    #panic("[place.*] parse")
+  }
+  rejected := settings.Settings{}
+  if settings.parse("[place.sidebar]\nanchor = \"top\"\n", &rejected) || settings.parse("[place.picker]\nanchor = \"middle\"\n", &rejected) {
+    #panic("unknown surfaces and anchors rejected")
+  }
+  app.config = parsed
+  natural := sdl.Rect{x: 10.0, y: 10.0, width: 300.0, height: 100.0}
+  picker := place_rect(app, SurfacePicker, 1000, 800, 0.0, 1.0, natural)
+  if picker.width != 500.0 || picker.height != 200.0 || picker.x != 1000.0 - 500.0 - 12.0 || picker.y != 800.0 - 200.0 - 12.0 {
+    #panic("float bottom-right with fraction and pixel sizes")
+  }
+  if place_rect(app, SurfacePalette, 1000, 800, 0.0, 1.0, natural).x != 10.0 {
+    #panic("unconfigured surfaces keep their natural place")
+  }
+  app.prompt_state.panel = Panel.None
+  if editor_area(app, 1000, 800, 1.0).width != 1000 {
+    #panic("a closed dock reserves nothing")
+  }
+  app.prompt_state.panel = Panel.Directory
+  area := editor_area(app, 1000, 800, 1.0)
+  explorer := place_rect(app, SurfaceExplorer, 1000, 800, 0.0, 1.0, natural)
+  if area.x != 250 || area.width != 750 || explorer.width != 250.0 || explorer.x != 0.0 || explorer.height != 800.0 {
+    #panic("a visible dock takes its strip from the panes")
+  }
+  place_command(app, "explorer float center 0.5 0.5")
+  if app.config.places[SurfaceExplorer].mode != settings.PlaceFloat || editor_area(app, 1000, 800, 1.0).width != 1000 {
+    #panic(":place explorer float")
+  }
+  app.config = saved
+  app.prompt_state.panel = saved_panel
+}
+
+// Palette: every command name resolves, options are searchable, Tab and
+// Enter complete arguments, and :set changes an option for the session.
+fn palette_query(app: *App, text: []const u8) {
+  panel(app, Panel.Commands)
+  app.prompt_state.length = copy_text(app.prompt_state.text[..], text)
+  app.command_menu.cached = false
+  matches(app)
+}
+fn palette_text(app: *App) []const u8 {
+  return app.prompt_state.text[..app.prompt_state.length]
+}
+fn palette_has(app: *App, label: []const u8) bool {
+  for index in 0..app.prompt_state.match_count {
+    if buffer.equal(command_title(command_name(app, app.prompt_state.matches[index])), label) {
+      return true
+    }
+  }
+  return false
+}
+fn palette_completion_smoke(app: *App, typography: *Typography) {
+  verbs: [24][]const u8 = ["cd", "comment", "filetype", "ft", "format", "format-cancel", "layout", "layout-save", "plugin-install", "plugin-load", "plugin-update", "plugin-rollback", "plugin-remove", "plugin-disable", "server-install", "server-update", "server-start", "lsp-start", "language-install", "resize", "replace-preview", "theme", "rename-symbol", "set"]
+  for verb in verbs {
+    if command_named(verb) >= BuiltinCommands {
+      #panic("every palette verb is a command")
+    }
+  }
+  // Options show as rows by name, with their current value.
+  palette_query(app, "plugin_timeout")
+  if !palette_has(app, "Set option plugin_timeout_ms") {
+    #panic("options are searchable in the palette")
+  }
+  // Tab completes a command, then its arguments word by word.
+  palette_query(app, "plac")
+  palette_tab(app)
+  if !buffer.equal(palette_text(app), "place ") {
+    #panic("Tab completes a command name")
+  }
+  palette_query(app, "place pic")
+  palette_tab(app)
+  if !buffer.equal(palette_text(app), "place picker ") || !app.command_menu.arguments {
+    #panic("Tab completes a surface")
+  }
+  palette_query(app, "place picker float ")
+  if !palette_has(app, "top-right") || !palette_has(app, "bottom-left") {
+    #panic("anchors suggested after float")
+  }
+  palette_query(app, "set line_numbers ")
+  if !palette_has(app, "true") || !palette_has(app, "false") {
+    #panic("flag values suggested")
+  }
+  palette_query(app, "module explorer ")
+  if !palette_has(app, "tree") || !palette_has(app, "buffer") {
+    #panic("module names suggested")
+  }
+  palette_query(app, "theme li")
+  if !palette_has(app, "light") {
+    #panic("themes suggested")
+  }
+  // Enter fills the selected suggestion; free values typed stay as typed.
+  palette_query(app, "set scroll_m")
+  if !palette_enter(app) || !buffer.equal(palette_text(app), "set scroll_margin ") {
+    #panic("Enter on an option name waits for its value")
+  }
+  // The default 18 matches "1", but a typed number is kept.
+  palette_query(app, "set document_padding 1")
+  if palette_enter(app) || !buffer.equal(palette_text(app), "set document_padding 1") {
+    #panic("Enter keeps a typed number")
+  }
+  // :set applies now, layered over the files, and KEY& takes it back.
+  saved_explorer := app.config.explorer_style
+  set_command(app, typography, "explorer tree")
+  if app.config.explorer_style != 1 {
+    #panic(":set explorer tree")
+  }
+  set_command(app, typography, "explorer&")
+  if app.config.explorer_style != saved_explorer {
+    #panic(":set explorer& restores the file's value")
+  }
+  set_command(app, typography, "font_size large")
+  if app.configuration.overrides_length != 0 || app.prompt_state.panel != Panel.Message {
+    #panic(":set rejects an invalid value")
+  }
+  app.prompt_state.panel = Panel.None
+}

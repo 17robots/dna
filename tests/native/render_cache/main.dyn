@@ -1,0 +1,162 @@
+extern fn ticks "SDL_GetTicksNS"() u64
+extern fn string_length "strlen"(text: *const u8) usize
+stage: u32 = 0
+repeats: u32 = 0
+measuring: bool = false
+largest_vertices: i32 = 0
+geometry_queries: u32 = 0
+text_updates: u32 = 0
+shaped: usize = 0
+started: u64 = 0
+total: u64 = 0
+maximum: u64 = 0
+frames: u32 = 0
+chrome: rawptr = nil
+creations: u32 = 0
+pub fn TTF_CreateText(engine: rawptr, font: rawptr, text: *const u8, length: usize) rawptr {
+  next := #cast(*fn(rawptr, rawptr, *const u8, usize) rawptr) probe_next("TTF_CreateText\0")
+  result := next(engine, font, text, length)
+  if creations == 2 {
+    chrome = result
+  }
+  creations += 1
+  return result
+}
+pub fn TTF_SetTextString(text: rawptr, string: *const u8, length: usize) bool {
+  if measuring {
+    text_updates += 1
+  }
+  if text != chrome && measuring {
+    size := length
+    if size == 0 {
+      size = string_length(string)
+    }
+    if size > 64 {
+      shaped += size
+    }
+  }
+  next := #cast(*fn(rawptr, *const u8, usize) bool) probe_next("TTF_SetTextString\0")
+  return next(text, string, length)
+}
+fn expose() {
+  event := ProbeEvent{}
+  pointer := #cast(rawptr) &event
+  probe_kind(pointer).* = 514
+  probe_check(probe_push(pointer), "expose push failed")
+}
+fn milliseconds(nanoseconds: u64) {
+  hundredths := (nanoseconds + 5000) / 10000
+  probe_number(hundredths / 100)
+  probe_log(".")
+  if hundredths % 100 < 10 {
+    probe_log("0")
+  }
+  probe_number(hundredths % 100)
+}
+pub fn SDL_WaitEventTimeout(event: rawptr, timeout: i32) bool {
+  if timeout >= 500 {
+    picker := probe_env("DNA_PICKER_CACHE\0") != nil
+    stress := probe_env("DNA_STRESS_RENDER\0") != nil
+    if picker && stage < 4 {
+      if stage == 0 {
+        probe_key(32)
+      }
+      else if stage == 1 {
+        probe_key(102)
+      }
+      else {
+        expose()
+      }
+      stage += 1
+    } else if stress && stage < 4 {
+      if stage == 0 {
+        probe_key(103)
+      }
+      else if stage == 1 {
+        probe_key(101)
+      }
+      else if stage == 2 {
+        probe_key(37)
+      }
+      else {
+        expose()
+      }
+      stage += 1
+    } else if stage == 0 {
+      probe_key(32)
+      stage += 1
+    }
+    else if stage == 1 {
+      probe_key(119)
+      stage += 1
+    }
+    else if stage == 2 {
+      probe_key(118)
+      stage += 1
+    }
+    else if stage == 3 {
+      probe_key(1073741905)
+      stage += 1
+    }
+    else if repeats < 30 {
+      repeats += 1
+      measuring = true
+      started = ticks()
+      expose()
+    } else {
+      probe_log("text updates: ")
+      probe_number(#cast(u64) text_updates)
+      probe_log("\nsteady redraws shaped ")
+      probe_number(#cast(u64) shaped)
+      probe_log(" bytes; mean ")
+      average: u64 = 0
+      if frames > 0 {
+        average = total / #cast(u64) frames
+      }
+      milliseconds(average)
+      probe_log(" ms, max ")
+      milliseconds(maximum)
+      probe_log(" ms\ngeometry lookups: ")
+      probe_number(#cast(u64) geometry_queries)
+      probe_log(" over ")
+      probe_number(#cast(u64) frames)
+      probe_log(" frames\nlargest geometry submission: ")
+      probe_number(#cast(u64) largest_vertices)
+      probe_log(" vertices\n")
+      if text_updates != 0 || shaped != 0 || (!stress && geometry_queries > frames * 20) || (stress && largest_vertices > 8192) {
+        probe_exit(1)
+      }
+      probe_exit(0)
+    }
+  }
+  next := #cast(*fn(rawptr, i32) bool) probe_next("SDL_WaitEventTimeout\0")
+  return next(event, timeout)
+}
+pub fn SDL_RenderPresent(renderer: rawptr) bool {
+  next := #cast(*fn(rawptr) bool) probe_next("SDL_RenderPresent\0")
+  result := next(renderer)
+  if started != 0 {
+    elapsed := ticks() - started
+    total += elapsed
+    if elapsed > maximum {
+      maximum = elapsed
+    }
+    frames += 1
+    started = 0
+  }
+  return result
+}
+pub fn SDL_RenderGeometryRaw(renderer: rawptr, texture: rawptr, xy: *const f32, xy_stride: i32, colors: rawptr, color_stride: i32, uv: *const f32, uv_stride: i32, vertices: i32, indices: rawptr, index_count: i32, index_size: i32) bool {
+  if measuring && vertices > largest_vertices {
+    largest_vertices = vertices
+  }
+  next := #cast(*fn(rawptr, rawptr, *const f32, i32, rawptr, i32, *const f32, i32, i32, rawptr, i32, i32) bool) probe_next("SDL_RenderGeometryRaw\0")
+  return next(renderer, texture, xy, xy_stride, colors, color_stride, uv, uv_stride, vertices, indices, index_count, index_size)
+}
+pub fn TTF_GetTextSubString(text: rawptr, offset: i32, substring: rawptr) bool {
+  if measuring {
+    geometry_queries += 1
+  }
+  next := #cast(*fn(rawptr, i32, rawptr) bool) probe_next("TTF_GetTextSubString\0")
+  return next(text, offset, substring)
+}

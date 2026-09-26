@@ -1,0 +1,460 @@
+// EditorConfig (https://editorconfig.org): per-file indentation and
+// whitespace rules most repositories already ship. The caller finds the
+// .editorconfig files above a document and applies them outermost first, so
+// closer files win; within one file, later sections win.
+
+// 0 means unset. indent_size 255 is "tab" (use tab_width). Flags store 1 for
+// false and 2 for true.
+pub struct EditorConfig {
+  indent_style: u8,
+  indent_size: u8,
+  tab_width: u8,
+  trim_trailing_whitespace: u8,
+  insert_final_newline: u8,
+  matched: bool,
+}
+pub const EditorSpace: u8 = 1
+pub const EditorTab: u8 = 2
+pub const EditorSizeTab: u8 = 255
+
+fn lower_equal(text: []const u8, word: []const u8) bool {
+  if #len(text) != #len(word) {
+    return false
+  }
+  for index in 0..#len(text) {
+    byte := text[index]
+    if byte >= 'A' && byte <= 'Z' {
+      byte = byte + 32
+    }
+    if byte != word[index] {
+      return false
+    }
+  }
+  return true
+}
+fn small_number(text: []const u8) u8 {
+  if #len(text) == 0 || #len(text) > 3 {
+    return 0
+  }
+  value: usize = 0
+  for byte in text {
+    if byte < '0' || byte > '9' {
+      return 0
+    }
+    value = value * 10 + #cast(usize) (byte - '0')
+  }
+  if value == 0 || value > 64 {
+    return 0
+  }
+  return #cast(u8) value
+}
+fn flag_value(text: []const u8) u8 {
+  if lower_equal(text, "true") {
+    return 2
+  }
+  if lower_equal(text, "false") {
+    return 1
+  }
+  return 0
+}
+// One "key = value" line inside a matching section.
+fn editorconfig_property(result: *EditorConfig, key: []const u8, value: []const u8) {
+  unset := lower_equal(value, "unset")
+  if lower_equal(key, "indent_style") {
+    result.indent_style = 0
+    if lower_equal(value, "space") {
+      result.indent_style = EditorSpace
+    }
+    else if lower_equal(value, "tab") {
+      result.indent_style = EditorTab
+    }
+  }
+  else if lower_equal(key, "indent_size") {
+    result.indent_size = small_number(value)
+    if lower_equal(value, "tab") {
+      result.indent_size = EditorSizeTab
+    }
+  }
+  else if lower_equal(key, "tab_width") {
+    result.tab_width = small_number(value)
+  }
+  else if lower_equal(key, "trim_trailing_whitespace") {
+    result.trim_trailing_whitespace = flag_value(value)
+  }
+  else if lower_equal(key, "insert_final_newline") {
+    result.insert_final_newline = flag_value(value)
+  }
+  else {
+    return
+  }
+  if !unset {
+    result.matched = true
+  }
+}
+// True when the preamble (lines before the first section) says root = true:
+// files further up are not read.
+pub fn editorconfig_root(text: []const u8) bool {
+  at: usize = 0
+  for at < #len(text) {
+    end := at
+    for end < #len(text) && text[end] != 10 {
+      end += 1
+    }
+    line := trim(text[at..end])
+    at = end + 1
+    if #len(line) == 0 || line[0] == '#' || line[0] == ';' {
+      continue
+    }
+    if line[0] == '[' {
+      return false
+    }
+    split: usize = 0
+    for split < #len(line) && line[split] != '=' {
+      split += 1
+    }
+    if split < #len(line) && lower_equal(trim(line[..split]), "root") && lower_equal(trim(line[split + 1..]), "true") {
+      return true
+    }
+  }
+  return false
+}
+// Applies one .editorconfig to `path`, given relative to that file's
+// directory with '/' separators.
+pub fn editorconfig_apply(text: []const u8, path: []const u8, result: *EditorConfig) {
+  matching := false
+  at: usize = 0
+  for at < #len(text) {
+    end := at
+    for end < #len(text) && text[end] != 10 {
+      end += 1
+    }
+    line := trim(text[at..end])
+    at = end + 1
+    if #len(line) == 0 || line[0] == '#' || line[0] == ';' {
+      continue
+    }
+    if line[0] == '[' {
+      close := #len(line)
+      for close > 1 && line[close - 1] != ']' {
+        close -= 1
+      }
+      matching = close > 2 && editorconfig_section_matches(line[1..close - 1], path)
+      continue
+    }
+    if !matching {
+      continue
+    }
+    split: usize = 0
+    for split < #len(line) && line[split] != '=' {
+      split += 1
+    }
+    if split < #len(line) {
+      editorconfig_property(result, trim(line[..split]), trim(line[split + 1..]))
+    }
+  }
+}
+// A glob without '/' matches the file name in any directory; with '/', it is
+// relative to the .editorconfig's directory.
+pub fn editorconfig_section_matches(glob: []const u8, path: []const u8) bool {
+  if #len(glob) > 480 {
+    return false
+  }
+  slash := false
+  for byte in glob {
+    if byte == '/' {
+      slash = true
+    }
+  }
+  if slash {
+    if glob[0] == '/' {
+      return glob_match(glob[1..], path)
+    }
+    return glob_match(glob, path)
+  }
+  if glob_match(glob, path) {
+    return true
+  }
+  anywhere: [512]u8 = []
+  used: usize = 0
+  for byte in "**/" {
+    anywhere[used] = byte
+    used += 1
+  }
+  for byte in glob {
+    anywhere[used] = byte
+    used += 1
+  }
+  return glob_match(anywhere[..used], path)
+}
+// EditorConfig globs: * (within a directory), ** (across directories), ?,
+// [set], [!set], {a,b,c}, {1..9} and backslash escapes.
+pub fn glob_match(pattern: []const u8, path: []const u8) bool {
+  // A depth limit alone does not bound backtracking across wildcard branches.
+  work: usize = 16384
+  return glob_at(pattern, path, 0, &work)
+}
+fn glob_at(pattern: []const u8, path: []const u8, depth: usize, work: *usize) bool {
+  if depth > 48 || work.* == 0 {
+    return false
+  }
+  p: usize = 0
+  s: usize = 0
+  for p < #len(pattern) {
+    if work.* == 0 {
+      return false
+    }
+    work.* -= 1
+    byte := pattern[p]
+    if byte == '*' {
+      if p + 1 < #len(pattern) && pattern[p + 1] == '*' {
+        rest := pattern[p + 2..]
+        last := #len(path) + 1
+        for start in s..last {
+          if work.* == 0 {
+            return false
+          }
+          if glob_at(rest, path[start..], depth + 1, work) {
+            return true
+          }
+        }
+        return false
+      }
+      rest := pattern[p + 1..]
+      start := s
+      for {
+        if work.* == 0 {
+          return false
+        }
+        if glob_at(rest, path[start..], depth + 1, work) {
+          return true
+        }
+        if start == #len(path) || path[start] == '/' {
+          return false
+        }
+        start += 1
+      }
+    }
+    if byte == '?' {
+      if s == #len(path) || path[s] == '/' {
+        return false
+      }
+      p += 1
+      s += 1
+      continue
+    }
+    if byte == '[' {
+      close := p + 1
+      if close < #len(pattern) && pattern[close] == '!' {
+        close += 1
+      }
+      if close < #len(pattern) && pattern[close] == ']' {
+        close += 1
+      }
+      for close < #len(pattern) && pattern[close] != ']' && pattern[close] != '/' {
+        close += 1
+      }
+      if close < #len(pattern) && pattern[close] == ']' {
+        if s == #len(path) || path[s] == '/' {
+          return false
+        }
+        if !glob_class(pattern[p + 1..close], path[s]) {
+          return false
+        }
+        p = close + 1
+        s += 1
+        continue
+      }
+    }
+    if byte == '{' {
+      close := p + 1
+      nesting: usize = 0
+      for close < #len(pattern) && !(pattern[close] == '}' && nesting == 0) {
+        if pattern[close] == '{' {
+          nesting += 1
+        }
+        else if pattern[close] == '}' {
+          nesting -= 1
+        }
+        else if pattern[close] == '\\' {
+          close += 1
+        }
+        close += 1
+      }
+      if close < #len(pattern) {
+        inner := pattern[p + 1..close]
+        rest := pattern[close + 1..]
+        bounds := glob_range(inner)
+        if bounds.valid {
+          return glob_number(bounds, rest, path[s..], depth, work)
+        }
+        if glob_alternatives(inner, rest, path[s..], depth, work) {
+          return true
+        }
+        if glob_has_comma(inner) {
+          return false
+        }
+      }
+    }
+    if byte == '\\' && p + 1 < #len(pattern) {
+      p += 1
+      byte = pattern[p]
+    }
+    if s == #len(path) || path[s] != byte {
+      return false
+    }
+    p += 1
+    s += 1
+  }
+  return s == #len(path)
+}
+fn glob_class(set: []const u8, byte: u8) bool {
+  negate := #len(set) > 0 && set[0] == '!'
+  at: usize = 0
+  if negate {
+    at = 1
+  }
+  found := false
+  for at < #len(set) {
+    first := set[at]
+    if at + 2 < #len(set) && set[at + 1] == '-' {
+      if byte >= first && byte <= set[at + 2] {
+        found = true
+      }
+      at += 3
+      continue
+    }
+    if byte == first {
+      found = true
+    }
+    at += 1
+  }
+  return found != negate
+}
+fn glob_has_comma(inner: []const u8) bool {
+  nesting: usize = 0
+  at: usize = 0
+  for at < #len(inner) {
+    byte := inner[at]
+    if byte == '\\' {
+      at += 2
+      continue
+    }
+    if byte == '{' {
+      nesting += 1
+    }
+    else if byte == '}' && nesting > 0 {
+      nesting -= 1
+    }
+    else if byte == ',' && nesting == 0 {
+      return true
+    }
+    at += 1
+  }
+  return false
+}
+// {a,b,c}: each top-level alternative followed by the rest of the pattern.
+fn glob_alternatives(inner: []const u8, rest: []const u8, path: []const u8, depth: usize, work: *usize) bool {
+  if !glob_has_comma(inner) {
+    return false
+  }
+  nesting: usize = 0
+  start: usize = 0
+  at: usize = 0
+  for at <= #len(inner) {
+    if work.* == 0 {
+      return false
+    }
+    work.* -= 1
+    if at < #len(inner) && inner[at] == '\\' {
+      at += 2
+      continue
+    }
+    if at == #len(inner) || (inner[at] == ',' && nesting == 0) {
+      combined: [1024]u8 = []
+      alternative := inner[start..at]
+      if #len(alternative) + #len(rest) <= #len(combined) {
+        used: usize = 0
+        for byte in alternative {
+          combined[used] = byte
+          used += 1
+        }
+        for byte in rest {
+          combined[used] = byte
+          used += 1
+        }
+        if glob_at(combined[..used], path, depth + 1, work) {
+          return true
+        }
+      }
+      start = at + 1
+    }
+    else if inner[at] == '{' {
+      nesting += 1
+    }
+    else if inner[at] == '}' && nesting > 0 {
+      nesting -= 1
+    }
+    at += 1
+  }
+  return false
+}
+struct GlobRange { valid: bool, low, high: i64 }
+fn glob_integer(text: []const u8) GlobRange {
+  if #len(text) == 0 || #len(text) > 18 {
+    return GlobRange{}
+  }
+  negative := text[0] == '-' || text[0] == '+'
+  digits := text
+  if negative {
+    digits = text[1..]
+  }
+  if #len(digits) == 0 {
+    return GlobRange{}
+  }
+  value: i64 = 0
+  for byte in digits {
+    if byte < '0' || byte > '9' {
+      return GlobRange{}
+    }
+    value = value * 10 + #cast(i64) (byte - '0')
+  }
+  if text[0] == '-' {
+    value = -value
+  }
+  return GlobRange{valid: true, low: value, high: value}
+}
+// {num1..num2}
+fn glob_range(inner: []const u8) GlobRange {
+  for at in 0..#len(inner) {
+    if at + 1 < #len(inner) && inner[at] == '.' && inner[at + 1] == '.' {
+      low := glob_integer(inner[..at])
+      high := glob_integer(inner[at + 2..])
+      if !low.valid || !high.valid {
+        return GlobRange{}
+      }
+      if low.low > high.low {
+        return GlobRange{valid: true, low: high.low, high: low.low}
+      }
+      return GlobRange{valid: true, low: low.low, high: high.low}
+    }
+  }
+  return GlobRange{}
+}
+fn glob_number(range: GlobRange, rest: []const u8, path: []const u8, depth: usize, work: *usize) bool {
+  end: usize = 0
+  if end < #len(path) && path[end] == '-' {
+    end += 1
+  }
+  digits_start := end
+  for end < #len(path) && path[end] >= '0' && path[end] <= '9' {
+    end += 1
+  }
+  if end == digits_start {
+    return false
+  }
+  number := glob_integer(path[..end])
+  if !number.valid || number.low < range.low || number.low > range.high {
+    return false
+  }
+  return glob_at(rest, path[end..], depth + 1, work)
+}

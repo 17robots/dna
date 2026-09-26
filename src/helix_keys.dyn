@@ -1,0 +1,488 @@
+// Helix normal-mode bindings beyond the original set: view mode (z/Z),
+// screen-relative and alternate-buffer goto, bracket navigation (]/[),
+// search for selection (*), shrink to lines (Alt-x), align selections (&)
+// and line-comment toggling (:comment).
+
+// Rows visible in the focused document pane.
+fn view_rows(app: *App, typography: *Typography) usize {
+  pane_init(app)
+  height := #cast(f32) app.view.panes[app.view.focused].rect.height
+  available := height - app.config.document_padding * typography.scale * 2.0
+  if app.view.status_line {
+    available -= typography.line
+  }
+  if available < typography.line {
+    return 1
+  }
+  return #cast(usize) (available / typography.line)
+}
+fn cursor_row(app: *App) usize {
+  doc := app.documents.current
+  head := doc.cursor
+  if !app.view.insert {
+    head = buffer.head(doc)
+  }
+  return buffer.row_at(doc, head)
+}
+
+// z / Z view mode. z closes after one command; Z stays until Escape.
+fn view_open(app: *App, sticky: bool) {
+  app.input_state.view_sticky = sticky
+  panel(app, Panel.View)
+}
+fn view_key(app: *App, typography: *Typography, key: u32) {
+  line := typography.line
+  rows := view_rows(app, typography)
+  row := cursor_row(app)
+  height := #cast(f32) rows * line
+  if key == KeyZ || key == KeyC {
+    app.view.scroll_y = #cast(f32) row * line - (height - line) * 0.5
+  }
+  else if key == KeyT {
+    app.view.scroll_y = #cast(f32) row * line
+  }
+  else if key == KeyB {
+    app.view.scroll_y = #cast(f32) (row + 1) * line - height
+  }
+  else if key == KeyK || key == KeyUp {
+    view_scroll_lines(app, typography, false)
+  }
+  else if key == KeyJ || key == KeyDown {
+    view_scroll_lines(app, typography, true)
+  }
+  else {
+    app.prompt_state.panel = Panel.None
+    return
+  }
+  if app.view.scroll_y < 0.0 {
+    app.view.scroll_y = 0.0
+  }
+  if !app.input_state.view_sticky {
+    app.prompt_state.panel = Panel.None
+  }
+}
+// Scroll one line; the cursor moves only when it would leave the view.
+fn view_scroll_lines(app: *App, typography: *Typography, down: bool) {
+  doc := app.documents.current
+  line := typography.line
+  rows := view_rows(app, typography)
+  margin := #cast(usize) app.config.scroll_margin
+  if down {
+    app.view.scroll_y += line
+  }
+  else if app.view.scroll_y >= line {
+    app.view.scroll_y -= line
+  }
+  else {
+    app.view.scroll_y = 0.0
+  }
+  first := #cast(usize) (app.view.scroll_y / line)
+  row := cursor_row(app)
+  if row < first + margin && first + margin < doc.line_count {
+    goto_row(app, first + margin)
+  }
+  else if rows > margin && row + margin + 1 > first + rows {
+    goto_row(app, first + rows - margin - 1)
+  }
+}
+fn goto_row(app: *App, row: usize) {
+  doc := app.documents.current
+  target := row
+  if target >= doc.line_count {
+    target = doc.line_count - 1
+  }
+  buffer.checkpoint(doc)
+  buffer.select_to(doc, buffer.row_start(doc, target), app.view.extend)
+}
+// gt / gc / gb: top, center or bottom of the visible screen (inside the
+// scroll margin, like Helix's scrolloff).
+fn goto_screen(app: *App, typography: *Typography, key: u32) {
+  doc := app.documents.current
+  rows := view_rows(app, typography)
+  first := #cast(usize) (app.view.scroll_y / typography.line)
+  margin := #cast(usize) app.config.scroll_margin
+  if margin * 2 >= rows {
+    margin = 0
+  }
+  target := first + margin
+  if key == KeyC {
+    target = first + rows / 2
+  }
+  else if key == KeyB {
+    target = first + rows - 1 - margin
+  }
+  if target >= doc.line_count {
+    target = doc.line_count - 1
+  }
+  goto_row(app, target)
+}
+// ga: the previously active buffer.
+fn goto_alternate(app: *App) {
+  previous := app.documents.previous
+  if previous >= 16 || previous == app.documents.active || app.documents.slots[previous].document == nil {
+    notice(app, "No alternate buffer.")
+    return
+  }
+  activate(app, previous)
+}
+// gf: open the file path in the selection, or under the cursor.
+fn goto_file(app: *App) {
+  doc := app.documents.current
+  low := buffer.start(doc)
+  high := buffer.end(doc)
+  if high - low <= 1 {
+    low = buffer.head(doc)
+    high = low
+    for low > 0 && path_byte(doc.bytes[low - 1]) {
+      low -= 1
+    }
+    for high < doc.length && path_byte(doc.bytes[high]) {
+      high += 1
+    }
+  }
+  if high <= low || high - low >= 4000 {
+    notice(app, "No file path under the cursor.")
+    return
+  }
+  name := doc.bytes[low..high]
+  storage: [4096]u8 = []
+  path := expand_home(name, storage[..])
+  if #len(path) > 0 && path[0] != '/' {
+    // Relative paths resolve against the current file's directory first.
+    directory_storage: [4096]u8 = []
+    directory := files.name(app.documents.file)
+    leaf := #len(directory)
+    for leaf > 0 && directory[leaf - 1] != '/' {
+      leaf -= 1
+    }
+    used := copy_text(directory_storage[..], directory[..leaf])
+    add_text(directory_storage[..], &used, path)
+    if leaf > 0 && files.metadata(directory_storage[..used]).ok {
+      open_file(app, directory_storage[..used])
+      return
+    }
+  }
+  open_file(app, path)
+}
+fn path_byte(byte: u8) bool {
+  return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || (byte >= '0' && byte <= '9') || byte == '/' || byte == '.' || byte == '_' || byte == '-' || byte == '~' || byte == '+'
+}
+
+// ] / [ navigation. The panel remembers the direction.
+fn bracket_open(app: *App, forward: bool) {
+  app.input_state.bracket_forward = forward
+  panel(app, Panel.Bracket)
+}
+fn bracket_key(app: *App, key: u32, modifiers: u16) {
+  app.prompt_state.panel = Panel.None
+  forward := app.input_state.bracket_forward
+  doc := app.documents.current
+  shift := (modifiers & ModShift) != 0
+  if key == KeyD && shift {
+    diagnostic_edge(app, forward)
+  }
+  else if key == KeyD {
+    diagnostic_jump(app, !forward)
+  }
+  else if key == KeyP {
+    buffer.checkpoint(doc)
+    buffer.select_to(doc, paragraph_edge(doc, buffer.head(doc), forward), app.view.extend)
+  }
+  else if key == KeySpace {
+    blank_line(app, forward)
+  }
+}
+// ]D / [D: last or first diagnostic in the buffer.
+fn diagnostic_edge(app: *App, last: bool) {
+  doc := app.documents.current
+  saved_cursor := doc.cursor
+  saved_anchor := doc.anchor
+  if last {
+    doc.cursor = doc.length
+    doc.anchor = doc.length
+  }
+  else {
+    doc.cursor = 0
+    doc.anchor = 0
+  }
+  diagnostic_jump(app, last)
+  if app.prompt_state.panel != Panel.None {
+    doc.cursor = saved_cursor
+    doc.anchor = saved_anchor
+  }
+}
+fn blank_row(doc: *const buffer.Document, row: usize) bool {
+  beginning := buffer.row_start(doc, row)
+  for at in beginning..buffer.line_end(doc, beginning) {
+    if doc.bytes[at] != ' ' && doc.bytes[at] != 9 && doc.bytes[at] != 13 {
+      return false
+    }
+  }
+  return true
+}
+// Start of the next (or previous) paragraph: the first non-blank line after
+// a run of blank lines.
+fn paragraph_edge(doc: *const buffer.Document, position: usize, forward: bool) usize {
+  row := buffer.row_at(doc, position)
+  if forward {
+    for row + 1 < doc.line_count && !blank_row(doc, row) {
+      row += 1
+    }
+    for row + 1 < doc.line_count && blank_row(doc, row) {
+      row += 1
+    }
+    return buffer.row_start(doc, row)
+  }
+  if row > 0 {
+    row -= 1
+  }
+  for row > 0 && blank_row(doc, row) {
+    row -= 1
+  }
+  for row > 0 && !blank_row(doc, row - 1) {
+    row -= 1
+  }
+  return buffer.row_start(doc, row)
+}
+// ]<space> / [<space>: add an empty line below or above, keeping the cursor.
+fn blank_line(app: *App, below: bool) {
+  doc := app.documents.current
+  saved_cursor := doc.cursor
+  saved_anchor := doc.anchor
+  secondary := doc.secondary.count
+  doc.secondary.count = 0
+  head := buffer.head(doc)
+  at := buffer.line_start(doc, head)
+  if below {
+    at = buffer.line_end(doc, head)
+  }
+  buffer.checkpoint(doc)
+  doc.anchor = at
+  doc.cursor = at
+  if !buffer.replace(doc, "\n") {
+    notice(app, "Adding a line exceeds document capacity.")
+  }
+  buffer.checkpoint(doc)
+  if !below {
+    saved_cursor += 1
+    saved_anchor += 1
+  }
+  doc.cursor = saved_cursor
+  doc.anchor = saved_anchor
+  doc.secondary.count = secondary
+}
+
+// *: search for the primary selection's text (regex-escaped).
+fn search_selection(app: *App) {
+  doc := app.documents.current
+  low := buffer.start(doc)
+  high := buffer.end(doc)
+  if high <= low {
+    high = buffer.next(doc, low)
+  }
+  used: usize = 0
+  at := low
+  for at < high && used + 2 < #len(app.search_history.text) {
+    byte := doc.bytes[at]
+    if byte == '\\' || byte == '.' || byte == '^' || byte == '$' || byte == '*' || byte == '+' || byte == '?' || byte == '(' || byte == ')' || byte == '[' || byte == ']' || byte == '{' || byte == '}' || byte == '|' {
+      app.search_history.text[used] = '\\'
+      used += 1
+    }
+    app.search_history.text[used] = byte
+    used += 1
+    at += 1
+  }
+  app.search_history.text[used] = 0
+  app.search_history.length = used
+}
+// Alt-x: shrink each selection to the whole lines it fully covers.
+fn shrink_to_lines(doc: *buffer.Document) {
+  low := buffer.start(doc)
+  high := buffer.end(doc)
+  first := low
+  if buffer.line_start(doc, low) != low {
+    first = buffer.line_end(doc, low)
+    if first < doc.length {
+      first += 1
+    }
+  }
+  last := high
+  if high < doc.length && (high == 0 || doc.bytes[high - 1] != 10) {
+    last = buffer.line_start(doc, high)
+  }
+  if last > first {
+    doc.anchor = first
+    doc.cursor = last
+  }
+}
+// &: pad every selection with spaces so all start in the same column.
+fn align_selections(app: *App) {
+  doc := app.documents.current
+  count := doc.secondary.count + 1
+  starts: [32]usize = []
+  ends: [32]usize = []
+  reversed: [32]bool = []
+  starts[0] = buffer.start(doc)
+  ends[0] = buffer.end(doc)
+  reversed[0] = doc.cursor < doc.anchor
+  for index in 1..count {
+    selection := doc.secondary.ranges[index - 1]
+    reversed[index] = selection.cursor < selection.anchor
+    starts[index] = selection.anchor
+    ends[index] = selection.cursor
+    if reversed[index] {
+      starts[index] = selection.cursor
+      ends[index] = selection.anchor
+    }
+  }
+  target: usize = 0
+  for index in 0..count {
+    column := buffer.codepoints(doc, buffer.line_start(doc, starts[index]), starts[index])
+    if column > target {
+      target = column
+    }
+  }
+  // Insert from the last position back, so earlier positions stay valid.
+  order: [32]usize = []
+  for index in 0..count {
+    order[index] = index
+  }
+  for index in 1..count {
+    moving := order[index]
+    at := index
+    for at > 0 && starts[order[at - 1]] < starts[moving] {
+      order[at] = order[at - 1]
+      at -= 1
+    }
+    order[at] = moving
+  }
+  doc.secondary.count = 0
+  buffer.checkpoint(doc)
+  spaces: [256]u8 = []
+  for position in 0..count {
+    index := order[position]
+    column := buffer.codepoints(doc, buffer.line_start(doc, starts[index]), starts[index])
+    pad := target - column
+    if pad == 0 || pad > 256 {
+      continue
+    }
+    for fill in 0..pad {
+      spaces[fill] = ' '
+    }
+    doc.anchor = starts[index]
+    doc.cursor = starts[index]
+    if !buffer.replace(doc, spaces[..pad]) {
+      notice(app, "Aligning exceeds document capacity.")
+      break
+    }
+    // Shift this and every later selection by the inserted padding.
+    for other in 0..count {
+      if starts[other] > starts[index] || other == index {
+        starts[other] += pad
+        ends[other] += pad
+      }
+      else if ends[other] > starts[index] {
+        ends[other] += pad
+      }
+    }
+  }
+  buffer.checkpoint(doc)
+  for index in 0..count {
+    anchor := starts[index]
+    cursor := ends[index]
+    if reversed[index] {
+      anchor = ends[index]
+      cursor = starts[index]
+    }
+    if index == 0 {
+      doc.anchor = anchor
+      doc.cursor = cursor
+    }
+    else {
+      doc.secondary.ranges[index - 1] = buffer.Selection{anchor: anchor, cursor: cursor}
+    }
+  }
+  doc.secondary.count = count - 1
+}
+
+// :comment toggles line comments on every line touched by the selections,
+// using the filetype's line-comment token.
+fn comment_token(app: *App) []const u8 {
+  name := filetype_name(&app.documents.slots[app.documents.active])
+  if buffer.equal(name, "python") || buffer.equal(name, "bash") || buffer.equal(name, "sh") || buffer.equal(name, "toml") || buffer.equal(name, "yaml") || buffer.equal(name, "ruby") || buffer.equal(name, "make") || buffer.equal(name, "fish") || buffer.equal(name, "nix") {
+    return "#"
+  }
+  if buffer.equal(name, "lua") || buffer.equal(name, "sql") || buffer.equal(name, "haskell") {
+    return "--"
+  }
+  if buffer.equal(name, "dyn") || buffer.equal(name, "c") || buffer.equal(name, "cpp") || buffer.equal(name, "rust") || buffer.equal(name, "go") || buffer.equal(name, "zig") || buffer.equal(name, "javascript") || buffer.equal(name, "typescript") || buffer.equal(name, "tsx") || buffer.equal(name, "java") || buffer.equal(name, "jsonc") || buffer.equal(name, "odin") || buffer.equal(name, "swift") || buffer.equal(name, "kotlin") || buffer.equal(name, "css") {
+    // "\x2f/" is "//": Dyn's grammar misreads a string that starts with
+    // two slashes as a comment (preview 11).
+    return "\x2f/"
+  }
+  return ""
+}
+fn comment_toggle(app: *App) {
+  token := comment_token(app)
+  if #len(token) == 0 {
+    notice(app, "No line comment token for this filetype.")
+    return
+  }
+  doc := app.documents.current
+  first := buffer.row_at(doc, buffer.start(doc))
+  ending := buffer.end(doc)
+  if ending > buffer.start(doc) {
+    ending -= 1
+  }
+  last := buffer.row_at(doc, ending)
+  // Comment unless every non-blank line is already commented.
+  commented := true
+  for row in first..=last {
+    if blank_row(doc, row) {
+      continue
+    }
+    at := buffer.row_start(doc, row)
+    for at < doc.length && (doc.bytes[at] == ' ' || doc.bytes[at] == 9) {
+      at += 1
+    }
+    if at + #len(token) > doc.length || !buffer.equal(doc.bytes[at..at + #len(token)], token) {
+      commented = false
+    }
+  }
+  doc.secondary.count = 0
+  buffer.checkpoint(doc)
+  for row in #reverse(first..=last) {
+    if blank_row(doc, row) {
+      continue
+    }
+    at := buffer.row_start(doc, row)
+    for at < doc.length && (doc.bytes[at] == ' ' || doc.bytes[at] == 9) {
+      at += 1
+    }
+    if commented {
+      remove := #len(token)
+      if at + remove < doc.length && doc.bytes[at + remove] == ' ' {
+        remove += 1
+      }
+      doc.anchor = at
+      doc.cursor = at + remove
+      _ = buffer.replace(doc, "")
+    }
+    else {
+      inserted: [8]u8 = []
+      used := copy_text(inserted[..], token)
+      add_text(inserted[..], &used, " ")
+      doc.anchor = at
+      doc.cursor = at
+      if !buffer.replace(doc, inserted[..used]) {
+        notice(app, "Commenting exceeds document capacity.")
+        break
+      }
+    }
+  }
+  buffer.checkpoint(doc)
+  first_start := buffer.row_start(doc, first)
+  last_end := buffer.line_end(doc, buffer.row_start(doc, last))
+  doc.anchor = first_start
+  doc.cursor = last_end
+}

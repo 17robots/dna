@@ -1,0 +1,76 @@
+#link("dna_native")
+#link("SDL3_ttf")
+extern fn terminal_init "SDL_Init"(flags: u32) bool
+extern fn terminal_quit "SDL_Quit"()
+extern fn terminal_window "SDL_CreateWindow"(title: *const u8, width: i32, height: i32, flags: u64) rawptr
+extern fn terminal_renderer "SDL_CreateRenderer"(window: rawptr, name: *const u8) rawptr
+extern fn terminal_renderer_close "SDL_DestroyRenderer"(renderer: rawptr)
+extern fn terminal_window_close "SDL_DestroyWindow"(window: rawptr)
+extern fn terminal_ttf "TTF_Init"() bool
+extern fn terminal_ttf_quit "TTF_Quit"()
+extern fn terminal_font "TTF_OpenFont"(path: *const u8, size: f32) rawptr
+extern fn terminal_font_close "TTF_CloseFont"(font: rawptr)
+extern fn terminal_default_font "dna_default_font"(path: *u8, capacity: usize) i32
+extern fn terminal_open "dna_terminal_open"(directory: *const u8, shell: *const u8, command: *const u8) rawptr
+extern fn terminal_poll "dna_terminal_poll"(terminal: rawptr) i32
+extern fn terminal_alive "dna_terminal_alive"(terminal: rawptr) i32
+extern fn terminal_close "dna_terminal_close"(terminal: rawptr)
+extern fn terminal_draw "dna_terminal_draw"(terminal: rawptr, renderer: rawptr, font: rawptr, x: f32, y: f32, width: f32, height: f32, cell_width: f32, cell_height: f32, focused: i32)
+extern fn terminal_ticks "SDL_GetTicks"() u64
+extern fn terminal_snapshot "dna_terminal_snapshot"(terminal: rawptr, output: *u8, capacity: usize) usize
+extern fn terminal_log "dna_terminal_log"(terminal: rawptr, output: *u8, capacity: usize) usize
+extern fn terminal_mouse "dna_terminal_application_mouse"(terminal: rawptr, x: f32, y: f32, phase: i32, modifiers: u32) i32
+extern fn terminal_find "strstr"(text: *const u8, needle: *const u8) *const u8
+fn terminal_contains(bytes: *const u8, needle: []const u8) bool {
+  return terminal_find(bytes, &needle[0]) != nil
+}
+fn main() {
+  probe_check(terminal_init(32) && terminal_ttf(), "SDL and TTF initialization")
+  title: []const u8 = "terminal test\0"
+  window := terminal_window(&title[0], 640, 400, 0)
+  probe_check(window != nil, "window")
+  renderer := terminal_renderer(window, nil)
+  probe_check(renderer != nil, "renderer")
+  path: [4096]u8 = []
+  probe_check(terminal_default_font(&path[0], 4096) != 0, "default font")
+  font := terminal_font(&path[0], 16.0)
+  probe_check(font != nil, "font")
+  directory: []const u8 = "/tmp\0"
+  shell: []const u8 = "/bin/sh\0"
+  command: []const u8 = "stty raw -echo; printf '\\033[?1000h\\033[?1006hMOUSE_READY'; dd bs=1 count=18 2>/dev/null | od -An -tx1\0"
+  terminal := terminal_open(&directory[0], &shell[0], &command[0])
+  probe_check(terminal != nil, "terminal")
+  text: [65536]u8 = []
+  deadline := terminal_ticks() + 3000
+  for terminal_ticks() < deadline {
+    _ = terminal_poll(terminal)
+    length := terminal_snapshot(terminal, &text[0], 65535)
+    text[length] = 0
+    if terminal_contains(&text[0], "MOUSE_READY\0") {
+      break
+    }
+    probe_delay(1)
+  }
+  probe_check(terminal_contains(&text[0], "MOUSE_READY\0"), "mouse application ready")
+  terminal_draw(terminal, renderer, font, 0.0, 0.0, 640.0, 400.0, 8.0, 16.0, 1)
+  probe_check(terminal_mouse(terminal, 1.0, 1.0, 0, 1) == 0, "Shift selects locally")
+  probe_check(terminal_mouse(terminal, 1.0, 1.0, 0, 0) != 0, "application mouse press")
+  probe_check(terminal_mouse(terminal, 1.0, 1.0, 2, 0) != 0, "application mouse release")
+  deadline = terminal_ticks() + 3000
+  for terminal_alive(terminal) != 0 && terminal_ticks() < deadline {
+    _ = terminal_poll(terminal)
+    probe_delay(1)
+  }
+  probe_check(terminal_alive(terminal) == 0, "application exited")
+  length := terminal_log(terminal, &text[0], 65535)
+  text[length] = 0
+  probe_check(terminal_contains(&text[0], "1b 5b 3c 30 3b 31 3b 31 4d\0"), "SGR mouse press bytes")
+  probe_check(terminal_contains(&text[0], "6d\0"), "SGR mouse release bytes")
+  terminal_close(terminal)
+  terminal_font_close(font)
+  terminal_renderer_close(renderer)
+  terminal_window_close(window)
+  terminal_ttf_quit()
+  terminal_quit()
+  probe_log("PASS terminal application mouse protocol and Shift selection bypass\n")
+}

@@ -1,73 +1,236 @@
-// Documents own their storage; switching views never copies text or undo history.
-struct Slot { arena: mem.Arena, document: *buffer.Document, file: files.State, scroll_x: f32, scroll_y: f32, insert: bool, extend: bool, recovery_revision: u64 }
 fn activate(app: *App, index: usize) {
-  if app.document != nil {
-    previous := &app.slots[app.active]
-    buffer.checkpoint(app.document)
-    previous.scroll_x = app.scroll_x previous.scroll_y = app.scroll_y previous.insert = app.insert previous.extend = app.extend
+  terminal_escape_flush(app)
+  terminal_mode(app).goto_pending = false
+  pane_store(app)
+  if app.documents.current != nil {
+    previous := &app.documents.slots[app.documents.active]
+    buffer.checkpoint(app.documents.current)
+    previous.scroll_x = app.view.scroll_x
+    previous.scroll_y = app.view.scroll_y
+    previous.insert = app.view.insert
+    previous.extend = app.view.extend
   }
-  app.view_revision += 1
-  app.active = index current := &app.slots[index]
-  app.document = current.document app.file = &current.file
-  app.scroll_x = current.scroll_x app.scroll_y = current.scroll_y app.insert = current.insert app.extend = current.extend
-  app.panel = Panel.None
-}
-fn new_buffer(app: *App) bool {
-  index: usize = 0 for index < 16 && app.slots[index].document != nil { index += 1 }
-  if index == 16 { notice(app, "Buffer limit reached (16). Close a buffer first.") return false }
-  allocated := mem.arena_create(#sizeof(buffer.Document))
-  if !allocated.ok { notice(app, "Cannot allocate document.") return false }
-  slot := &app.slots[index] slot.arena = allocated.arena
-  slot.document = #cast(*buffer.Document) mem.arena_push(&slot.arena, #sizeof(buffer.Document), #alignof(buffer.Document))
-  _ = buffer.load(slot.document, "")
-  app.buffer_count += 1 activate(app, index) return true
-}
-fn release_buffers(app: *App) {
-  index: usize = 0 for index < 16 {
-    slot := &app.slots[index]
-    if slot.document != nil { if !buffer.dirty(slot.document) { files.discard_recovery(&slot.file) } _ = mem.arena_release(&slot.arena) }
-    index += 1
+  app.view.revision += 1
+  if index != app.documents.active {
+    app.documents.previous = app.documents.active
   }
+  app.documents.active = index
+  current := &app.documents.slots[index]
+  app.documents.current = current.document
+  app.documents.file = &current.file
+  app.view.scroll_x = current.scroll_x
+  app.view.scroll_y = current.scroll_y
+  app.view.insert = current.insert
+  app.view.extend = current.extend
+  app.prompt_state.panel = Panel.None
+  pane_store(app)
 }
 fn next_buffer(app: *App, backwards: bool) {
-  step: usize = 1 for step <= 16 {
-    index := (app.active + step) % 16 if backwards { index = (app.active + 16 - step) % 16 }
-    if app.slots[index].document != nil { activate(app, index) return } step += 1
+  for step in 1..=16 {
+    index := (app.documents.active + step) % 16
+    if backwards {
+      index = (app.documents.active + 16 - step) % 16
+    }
+    if app.documents.slots[index].document != nil {
+      activate(app, index)
+      return
+    }
   }
 }
-fn close_clean(app: *App) {
-  slot := &app.slots[app.active]
-  files.discard_recovery(&slot.file)
-  if app.buffer_count == 1 {
-    _ = buffer.load(slot.document, "") slot.file.length = 0 slot.file.path[0] = 0
-    app.scroll_x = 0.0 app.scroll_y = 0.0 app.insert = false app.extend = false app.panel = Panel.None app.view_revision += 1
+fn request_buffer_close(app: *App) {
+  if app.documents.slots[app.documents.active].terminal.handle != nil && terminal_alive(app.documents.slots[app.documents.active].terminal.handle) != 0 {
+    app.terminal_state.closing_all = false
+    app.prompt_state.panel = Panel.TerminalClose
     return
   }
-  _ = mem.arena_release(&slot.arena)
-  slot.document = nil slot.file.length = 0 slot.file.recovery_owned = false slot.scroll_x = 0.0 slot.scroll_y = 0.0 slot.insert = false slot.extend = false slot.recovery_revision = 0
-  app.document = nil app.buffer_count -= 1
-  if app.buffer_count == 0 { _ = new_buffer(app) } else { next_buffer(app, false) }
+  if buffer.dirty_cached(app.documents.current) {
+    app.documents.closing_one = true
+    panel(app, Panel.Quit)
+  } else {
+    close_clean(app)
+  }
+}
+fn quit_view(app: *App) {
+  if app.view.pane_ready && app.view.focused != 0 {
+    pane_close(app)
+    return
+  }
+  if app.documents.count == 1 && app.documents.file.length == 0 && app.documents.current.length == 0 && !buffer.dirty_cached(app.documents.current) {
+    request_quit(app)
+    return
+  }
+  request_buffer_close(app)
+}
+fn close_clean(app: *App) {
+    close_slot(app, app.documents.active)
+    app.prompt_state.panel = Panel.None
+    finish_picker_close(app)
+}
+fn close_slot(app: *App, closed: usize) {
+  if app.documents.slots[closed].terminal.handle != nil {
+    terminal_mode(app).escape_pending = false
+    pane_remove_terminal(app, closed)
+  }
+  slot_syntax_release(&app.documents.slots[closed])
+  if app.documents.slots[closed].terminal.handle != nil {
+    terminal_close(app.documents.slots[closed].terminal.handle)
+    app.documents.slots[closed].terminal.handle = nil
+  }
+  slot := &app.documents.slots[closed]
+  slot.terminal.keep_output = false
+  slot.filetype_length = 0
+  slot.inferred_filetype = false
+  files.discard_recovery(&slot.file)
+  if app.documents.count == 1 {
+    app.documents.next_identity += 1
+    slot.identity = app.documents.next_identity
+    _ = buffer.load(slot.document, "")
+    slot.file.length = 0
+    slot.file.path[0] = 0
+    app.view.scroll_x = 0.0
+    app.view.scroll_y = 0.0
+    app.view.insert = false
+    app.view.extend = false
+    app.prompt_state.panel = Panel.None
+    app.view.revision += 1
+    return
+  }
+  document_release(app, slot)
+  slot.document = nil
+  slot.file.length = 0
+  slot.file.recovery_owned = false
+  slot.scroll_x = 0.0
+  slot.scroll_y = 0.0
+  slot.insert = false
+  slot.extend = false
+  app.documents.count -= 1
+  app.view.revision += 1
+  if closed == app.documents.active {
+    app.documents.current = nil
+    next_buffer(app, false)
+  }
+  for index in 0..15 {
+    pane := &app.view.panes[index]
+    if pane.used && !pane.branch && pane.slot == closed {
+      pane.secondary_count = 0
+      pane.slot = app.documents.active
+      pane.scroll_x = 0.0
+      pane.scroll_y = 0.0
+      pane.insert = false
+      pane.extend = false
+      app.documents.current.marks[index * 2] = 0
+      app.documents.current.marks[index * 2 + 1] = 0
+    }
+  }
+  pane_store(app)
 }
 fn request_quit(app: *App) {
   app.explorer.commands = false
-  if explorer_dirty(app) { app.explorer.quit_after_discard = true app.panel = Panel.DirectoryDiscard return }
-  index: usize = 0 for index < 16 {
-    if app.slots[index].document != nil && buffer.dirty(app.slots[index].document) {
-      activate(app, index) app.closing_one = false panel(app, Panel.Quit) return
+  if explorer_dirty(app) {
+    app.explorer.quit_after_discard = true
+    app.prompt_state.panel = Panel.DirectoryDiscard
+    return
+  }
+  for index in 0..16 {
+    if app.documents.slots[index].document != nil && buffer.dirty_cached(app.documents.slots[index].document) {
+      activate(app, index)
+      app.documents.closing_one = false
+      panel(app, Panel.Quit)
+      return
     }
-    index += 1
+  }
+  if !app.terminal_state.quit_confirmed && terminals_running(app) {
+    app.terminal_state.closing_all = true
+    app.prompt_state.panel = Panel.TerminalClose
+    return
   }
   app.running = false
 }
 fn buffer_matches(app: *App) {
-  app.match_count = 0 index: usize = 0
-  for index < 16 {
-    slot := &app.slots[index]
+  app.prompt_state.match_count = 0
+  for index in 0..16 {
+    slot := &app.documents.slots[index]
     if slot.document != nil {
-      name := files.name(&slot.file) if #len(name) == 0 { name = "Untitled" }
-      if contains(name, app.prompt[..app.prompt_length]) { app.matches[app.match_count] = index app.match_count += 1 }
+      name := files.name(&slot.file)
+      if #len(name) == 0 {
+        name = "Untitled"
+      }
+      if slot.terminal.handle != nil {
+        name = "Terminal"
+      }
+      if picker_match(name, app.prompt_state.text[..app.prompt_state.length]) {
+        app.prompt_state.matches[app.prompt_state.match_count] = index
+        app.prompt_state.match_count += 1
+      }
     }
-    index += 1
   }
-  if app.selected >= app.match_count { app.selected = 0 }
+  if app.prompt_state.selected >= app.prompt_state.match_count {
+    app.prompt_state.selected = 0
+  }
 }
+
+fn picker_close_selected(app: *App) {
+  buffer_matches(app)
+  if app.prompt_state.match_count == 0 || app.prompt_state.selected >= app.prompt_state.match_count {
+    return
+  }
+  target := app.prompt_state.matches[app.prompt_state.selected]
+  app.picker_state.closing = true
+  app.picker_state.close_target = target
+  app.picker_state.close_return = app.documents.active
+  app.picker_state.close_row = app.prompt_state.selected
+  app.picker_state.close_query_length = copy_text(app.picker_state.close_query[..], app.prompt_state.text[..app.prompt_state.length])
+  slot := &app.documents.slots[target]
+  if slot.terminal.handle != nil && terminal_alive(slot.terminal.handle) != 0 {
+    app.terminal_state.closing_all = false
+    app.prompt_state.panel = Panel.TerminalClose
+    return
+  }
+  if buffer.dirty_cached(slot.document) {
+    app.documents.closing_one = true
+    panel(app, Panel.Quit)
+    return
+  }
+  close_slot(app, target)
+  finish_picker_close(app)
+}
+fn finish_picker_close(app: *App) {
+  if !app.picker_state.closing {
+    return
+  }
+  app.picker_state.closing = false
+  app.documents.closing_one = false
+  app.documents.quit_after_save = false
+  if app.documents.slots[app.picker_state.close_return].document != nil && app.documents.active != app.picker_state.close_return {
+    activate(app, app.picker_state.close_return)
+  }
+  app.prompt_state.panel = Panel.Buffers
+  app.prompt_state.length = copy_text(app.prompt_state.text[..], app.picker_state.close_query[..app.picker_state.close_query_length])
+  app.prompt_state.selected = 0
+  buffer_matches(app)
+  if app.prompt_state.match_count > 0 {
+    app.prompt_state.selected = app.picker_state.close_row
+    if app.prompt_state.selected >= app.prompt_state.match_count {
+      app.prompt_state.selected = app.prompt_state.match_count - 1
+    }
+    index: usize = 0
+    for index < app.prompt_state.match_count {
+      if app.prompt_state.matches[index] == app.picker_state.close_target {
+        app.prompt_state.selected = index
+        break
+      }
+      index += 1
+    }
+  }
+  app.picker_state.preview.ready = false
+  app.view.revision += 1
+}
+fn cancel_buffer_close(app: *App) {
+  save_cancel(app)
+  app.prompt_state.panel = Panel.None
+  app.documents.quit_after_save = false
+  app.documents.closing_one = false
+  app.terminal_state.closing_all = false
+  finish_picker_close(app)
+}
+

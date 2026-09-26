@@ -1,0 +1,460 @@
+// Real-event-loop workflow probe: search/open/edit/undo, bounded RSS and drawing.
+extern fn perf_ticks "SDL_GetTicksNS"() u64
+extern fn perf_strlen "strlen"(text: *const u8) usize
+extern fn perf_find "memmem"(text: *const u8, length: usize, needle: *const u8, size: usize) rawptr
+extern fn perf_strstr "strstr"(text: *const u8, needle: *const u8) rawptr
+extern fn perf_compare "strcmp"(left: *const u8, right: *const u8) i32
+extern fn perf_copy "memcpy"(out: rawptr, bytes: rawptr, length: usize) rawptr
+extern fn perf_alloc "calloc"(count: usize, size: usize) rawptr
+extern fn perf_free "free"(pointer: rawptr)
+extern fn perf_atoi "atoi"(text: *const u8) i32
+extern fn perf_open "open"(path: *const u8, flags: i32) i32
+extern fn perf_read "read"(fd: i32, output: *u8, size: usize) isize
+extern fn perf_close "close"(fd: i32) i32
+extern fn perf_sysconf "sysconf"(name: i32) i64
+extern fn perf_driver "SDL_GetCurrentVideoDriver"() *const u8
+extern fn perf_get_color "TTF_GetTextColor"(text: rawptr, red: *u8, green: *u8, blue: *u8, alpha: *u8) bool
+extern fn perf_set_color "TTF_SetTextColor"(text: rawptr, red: u8, green: u8, blue: u8, alpha: u8) bool
+extern fn perf_font "TTF_GetTextFont"(text: rawptr) rawptr
+extern fn perf_font_size "TTF_GetFontSize"(font: rawptr) f32
+extern fn perf_pixels "SDL_RenderReadPixels"(renderer: rawptr, area: rawptr) rawptr
+extern fn perf_bitmap "SDL_SaveBMP"(surface: rawptr, path: *const u8) bool
+extern fn perf_surface_free "SDL_DestroySurface"(surface: rawptr)
+struct PerfText { text: rawptr, length: usize }
+struct PerfSyntax { revision: u64, length: u32, colors: [1048576]u8 }
+perf_stage: i32 = 0
+perf_cycle: i32 = 0
+perf_ready: bool = false
+perf_moves: i32 = 0
+perf_busy_terminal: rawptr = nil
+perf_zoom_queued: bool = false
+perf_capture_font_size: f32 = 0.0
+perf_opened: u32 = 0
+perf_syntax_results: u32 = 0
+perf_samples: usize = 0
+perf_document: rawptr = nil
+perf_span: rawptr = nil
+perf_name_line: rawptr = nil
+perf_name_x: f32 = 0.0
+perf_name_y: f32 = 0.0
+perf_incoming: ProbeEvent = ProbeEvent{}
+perf_queued: bool = false
+perf_baseline: i64 = 0
+perf_warmed: i64 = 0
+perf_started: u64 = 0
+perf_maximum: f64 = 0.0
+perf_total: f64 = 0.0
+perf_frame_bytes: usize = 0
+perf_largest_frame: usize = 0
+perf_texts: [4096]PerfText = []
+perf_query: [100]u8 = []
+perf_setup: u32 = 0
+perf_confirmation: u32 = 0
+perf_captured: bool = false
+fn perf_enabled(name: []const u8) bool {
+  return probe_env(name) != nil
+}
+fn perf_remember(text: rawptr, length: usize) {
+  for index in 0..4096 {
+    if perf_texts[index].text == nil || perf_texts[index].text == text {
+      perf_texts[index] = PerfText{text: text, length: length}
+      return
+    }
+  }
+  probe_exit(1)
+}
+fn perf_number(value: i64) {
+  if value < 0 {
+    probe_log("-")
+    probe_number(#cast(u64) -value)
+  } else {
+      probe_number(#cast(u64) value)
+    }
+}
+fn perf_rss() i64 {
+  path: []const u8 = "/proc/self/statm\0"
+  fd := perf_open(&path[0], 0)
+  if fd < 0 {
+    return 0
+  }
+  bytes: [128]u8 = []
+  length := perf_read(fd, &bytes[0], 127)
+  _ = perf_close(fd)
+  probe_check(length > 0, "RSS read failed")
+  at: usize = 0
+  for at < #cast(usize) length && bytes[at] >= 48 && bytes[at] <= 57 {
+    at += 1
+  }
+  probe_check(at > 0 && at < #cast(usize) length, "RSS parse failed")
+  for at < #cast(usize) length && bytes[at] == 32 {
+    at += 1
+  }
+  start := at
+  resident: i64 = 0
+  for at < #cast(usize) length && bytes[at] >= 48 && bytes[at] <= 57 {
+    resident = resident * 10 + #cast(i64) (bytes[at] - 48)
+    at += 1
+  }
+  probe_check(at > start, "RSS resident parse failed")
+  return resident * perf_sysconf(30) / 1024
+}
+fn perf_key(code: u32) {
+  event := #cast(rawptr) &perf_incoming
+  probe_clear(event)
+  probe_kind(event).* = 768
+  probe_u32(event, 28).* = code
+  probe_byte(event, 36).* = 1
+  perf_queued = true
+}
+fn perf_text(text: *const u8) {
+  event := #cast(rawptr) &perf_incoming
+  probe_clear(event)
+  probe_kind(event).* = 771
+  pointer := #cast(**const u8) (#cast(usize) event + 24)
+  pointer.* = text
+  perf_queued = true
+}
+fn perf_literal(text: []const u8) {
+  perf_text(&text[0])
+}
+fn perf_quit() {
+  probe_clear(#cast(rawptr) &perf_incoming)
+  probe_kind(#cast(rawptr) &perf_incoming).* = 256
+  perf_queued = true
+}
+pub fn dna_terminal_open(directory: *const u8, shell: *const u8, command: *const u8) rawptr {
+  next := #cast(*fn(*const u8, *const u8, *const u8) rawptr) probe_next("dna_terminal_open\0")
+  result := next(directory, shell, command)
+  if perf_enabled("DNA_PERF_COMBINED\0") {
+    perf_busy_terminal = result
+  }
+  return result
+}
+pub fn dna_terminal_close(handle: rawptr) {
+  next := #cast(*fn(rawptr)) probe_next("dna_terminal_close\0")
+  if handle == perf_busy_terminal {
+    perf_busy_terminal = nil
+  }
+  next(handle)
+}
+pub fn TTF_CreateText(engine: rawptr, font: rawptr, bytes: *const u8, length: usize) rawptr {
+  next := #cast(*fn(rawptr, rawptr, *const u8, usize) rawptr) probe_next("TTF_CreateText\0")
+  text := next(engine, font, bytes, length)
+  remembered := length
+  if remembered == 0 {
+    remembered = perf_strlen(bytes)
+  }
+  perf_remember(text, remembered)
+  if perf_document == nil {
+    perf_document = text
+  }
+  return text
+}
+pub fn TTF_SetTextString(text: rawptr, bytes: *const u8, length: usize) bool {
+  name: []const u8 = "\"name\""
+  if perf_enabled("DNA_PERF_CAPTURE\0") && text != perf_document && length == 6 && perf_find(bytes, length, &name[0], 6) != nil {
+    perf_span = text
+  }
+  if length > 6 && perf_find(bytes, length, &name[0], 6) != nil {
+    perf_name_line = text
+  }
+  remembered := length
+  if remembered == 0 {
+    remembered = perf_strlen(bytes)
+  }
+  perf_remember(text, remembered)
+  next := #cast(*fn(rawptr, *const u8, usize) bool) probe_next("TTF_SetTextString\0")
+  return next(text, bytes, length)
+}
+pub fn TTF_DrawRendererText(text: rawptr, x: f32, y: f32) bool {
+  for index in 0..4096 {
+    if perf_texts[index].text == text {
+      perf_frame_bytes += perf_texts[index].length
+      break
+    }
+  }
+  next := #cast(*fn(rawptr, f32, f32) bool) probe_next("TTF_DrawRendererText\0")
+  if text == perf_name_line {
+    perf_name_x = x
+    perf_name_y = y
+  }
+  if perf_enabled("DNA_PERF_REFERENCE\0") && text == perf_span {
+    color: [4]u8 = []
+    old: [4]u8 = []
+    _ = perf_get_color(text, &color[0], &color[1], &color[2], &color[3])
+    _ = perf_get_color(perf_name_line, &old[0], &old[1], &old[2], &old[3])
+    _ = perf_set_color(perf_name_line, color[0], color[1], color[2], color[3])
+    result := next(perf_name_line, perf_name_x, perf_name_y)
+    _ = perf_set_color(perf_name_line, old[0], old[1], old[2], old[3])
+    return result
+  }
+  return next(text, x, y)
+}
+pub fn dna_search_count(state: rawptr, status: *i32) usize {
+  next := #cast(*fn(rawptr, *i32) usize) probe_next("dna_search_count\0")
+  count := next(state, status)
+  if state != nil && (status.* == 0 || status.* == 3) && count != 0 {
+    perf_ready = true
+  }
+  return count
+}
+pub fn SDL_WaitEventTimeout(event: rawptr, milliseconds: i32) bool {
+  next := #cast(*fn(rawptr, i32) bool) probe_next("SDL_WaitEventTimeout\0")
+  if perf_enabled("DNA_PERF_CAPTURE\0") {
+    return next(event, milliseconds)
+  }
+  if perf_enabled("DNA_PERF_COMBINED\0") && perf_setup < 11 {
+    step := perf_setup
+    perf_setup += 1
+    if step == 0 || step == 3 {
+      perf_key(58)
+    }
+    if step == 1 {
+      perf_literal("vsplit\0")
+    }
+    if step == 2 || step == 5 {
+      perf_key(13)
+    }
+    if step == 4 {
+      perf_literal("run while :; do printf 'background output\\n'; sleep 0.05; done\0")
+    }
+    if step == 6 || step == 7 {
+      perf_key(27)
+    }
+    if step == 8 {
+      perf_key(32)
+    }
+    if step == 9 {
+      perf_key(119)
+    }
+    if step == 10 {
+      perf_key(107)
+    }
+    (#cast(*ProbeEvent) event).* = perf_incoming
+    perf_queued = false
+    return true
+  }
+  if perf_stage == 0 {
+    perf_baseline = perf_rss()
+    perf_stage = 1
+  }
+  if perf_stage == 1 {
+    perf_ready = false
+    perf_key(32)
+    prefix: []const u8 = "needle-"
+    _ = perf_copy(#cast(rawptr) &perf_query[0], #cast(rawptr) &prefix[0], 7)
+    number := perf_cycle % 12
+    perf_query[7] = #cast(u8) (48 + number / 10)
+    perf_query[8] = #cast(u8) (48 + number % 10)
+    perf_query[9] = 0
+    perf_stage = 5
+  } else if perf_stage == 5 {
+    perf_key(47)
+    perf_stage = 7
+  } else if perf_stage == 7 {
+    perf_ready = false
+    perf_text(&perf_query[0])
+    perf_stage = 2
+  } else if perf_stage == 2 && perf_ready {
+    perf_key(13)
+    perf_stage = 3
+    perf_moves = 0
+  } else if perf_stage == 3 {
+    perf_key(1073741905)
+    perf_started = perf_ticks()
+    perf_moves += 1
+    if perf_moves == 15 {
+      perf_stage = 8
+    }
+  } else if perf_stage == 8 {
+    perf_key(105)
+    perf_stage = 9
+  } else if perf_stage == 9 {
+    perf_literal("z\0")
+    perf_started = perf_ticks()
+    perf_stage = 10
+  } else if perf_stage == 10 {
+    perf_key(27)
+    perf_stage = 11
+  } else if perf_stage == 11 {
+    perf_key(117)
+    perf_stage = 12
+  } else if perf_stage == 12 {
+    perf_cycle += 1
+    if perf_cycle == 12 {
+      perf_warmed = perf_rss()
+    }
+    rounds: i32 = 2
+    configured := probe_env("DNA_PERF_ROUNDS\0")
+    if configured != nil {
+      rounds = perf_atoi(configured)
+    }
+    probe_check(rounds >= 2 && rounds <= 100, "invalid workflow rounds")
+    perf_stage = 1
+    if perf_cycle == 12 * rounds {
+      perf_stage = 4
+    }
+  } else if perf_stage == 4 {
+    probe_log("workflow: RSS baseline ")
+    perf_number(perf_baseline)
+    probe_log(" KiB, final ")
+    perf_number(perf_rss())
+    probe_log(" KiB; input mean ")
+    probe_decimal(perf_total / #cast(f64) perf_samples)
+    probe_log(" ms, max ")
+    probe_decimal(perf_maximum)
+    probe_log(" ms\nrendered text: max ")
+    probe_number(#cast(u64) perf_largest_frame)
+    probe_log(" bytes/frame, ")
+    probe_number(#cast(u64) perf_syntax_results)
+    probe_log(" syntax results\nRSS growth after first pass: ")
+    perf_number(perf_rss() - perf_warmed)
+    probe_log(" KiB\n")
+    dummy: []const u8 = "dummy\0"
+    headless := perf_compare(perf_driver(), &dummy[0]) == 0
+    limit: i64 = 40960
+    if perf_enabled("DNA_PERF_REAL_SYNTAX\0") {
+      limit = 71680
+    }
+    excessive := headless && perf_rss() - perf_baseline > limit
+    if excessive || perf_rss() - perf_warmed > 16384 || perf_largest_frame > 65536 || perf_syntax_results == 0 || perf_opened != 4095 {
+      probe_log("FAIL: excessive memory or text submission\n")
+      if perf_busy_terminal != nil {
+        dna_terminal_close(perf_busy_terminal)
+      }
+      probe_exit(1)
+    }
+    perf_quit()
+    perf_stage = 99
+  } else if perf_stage == 99 {
+    if perf_confirmation % 2 != 0 {
+      perf_key(13)
+    } else {
+      perf_key(100)
+    }
+    perf_confirmation += 1
+  }
+  if perf_queued {
+    (#cast(*ProbeEvent) event).* = perf_incoming
+    perf_queued = false
+    return true
+  }
+  return next(event, milliseconds)
+}
+pub fn SDL_RenderPresent(renderer: rawptr) bool {
+  capture := probe_env("DNA_PERF_CAPTURE\0")
+  if capture != nil && perf_syntax_results != 0 && perf_span != nil && perf_enabled("DNA_PERF_ZOOM\0") && !perf_zoom_queued {
+    perf_capture_font_size = perf_font_size(perf_font(perf_document))
+    probe_key_mod(61, 192)
+    perf_zoom_queued = true
+  }
+  if capture != nil && !perf_captured && perf_syntax_results != 0 && perf_span != nil && (!perf_enabled("DNA_PERF_ZOOM\0") || perf_font_size(perf_font(perf_document)) > perf_capture_font_size) {
+    surface := perf_pixels(renderer, nil)
+    probe_check(surface != nil && perf_bitmap(surface, capture), "capture failed")
+    perf_surface_free(surface)
+    perf_captured = true
+    quit := ProbeEvent{}
+    probe_kind(#cast(rawptr) &quit).* = 256
+    probe_check(probe_push(#cast(rawptr) &quit), "quit push failed")
+  }
+  next := #cast(*fn(rawptr) bool) probe_next("SDL_RenderPresent\0")
+  result := next(renderer)
+  if perf_frame_bytes > perf_largest_frame {
+    perf_largest_frame = perf_frame_bytes
+  }
+  perf_frame_bytes = 0
+  if perf_started != 0 {
+    perf_samples += 1
+    elapsed := #cast(f64) (perf_ticks() - perf_started) / 1000000.0
+    perf_total += elapsed
+    if elapsed > perf_maximum {
+      perf_maximum = elapsed
+    }
+    perf_started = 0
+  }
+  return result
+}
+pub fn dna_syntax_open(root: *const u8, path: *const u8) rawptr {
+  if perf_enabled("DNA_PERF_REAL_SYNTAX\0") {
+    next := #cast(*fn(*const u8, *const u8) rawptr) probe_next("dna_syntax_open\0")
+    return next(root, path)
+  }
+  return perf_alloc(1, #sizeof(PerfSyntax))
+}
+pub fn dna_syntax_name(state: rawptr) *const u8 {
+  if perf_enabled("DNA_PERF_REAL_SYNTAX\0") {
+    next := #cast(*fn(rawptr) *const u8) probe_next("dna_syntax_name\0")
+    return next(state)
+  }
+  name: []const u8 = "json\0"
+  return &name[0]
+}
+pub fn dna_syntax_update(handle: rawptr, text: *const u8, length: u32, revision: u64) {
+  if perf_enabled("DNA_PERF_REAL_SYNTAX\0") {
+    next := #cast(*fn(rawptr, *const u8, u32, u64)) probe_next("dna_syntax_update\0")
+    next(handle, text, length, revision)
+    return
+  }
+  state := #cast(*PerfSyntax) handle
+  if state.revision == revision {
+    return
+  }
+  probe_check(length <= 1048576, "syntax fixture exceeds capacity")
+  quoted := false
+  for index in 0..length {
+    byte := text[..length][index]
+    if byte == 34 {
+      state.colors[index] = 2
+      quoted = !quoted
+    } else if quoted {
+      state.colors[index] = 2
+    }
+    else if byte >= 48 && byte <= 57 {
+      state.colors[index] = 6
+    }
+    else {
+      state.colors[index] = 0
+    }
+  }
+  state.revision = revision
+  state.length = length
+}
+pub fn dna_syntax_colors(handle: rawptr, output: *u8, length: u32, revision: u64) i32 {
+  result: i32 = 0
+  if perf_enabled("DNA_PERF_REAL_SYNTAX\0") {
+    next := #cast(*fn(rawptr, *u8, u32, u64) i32) probe_next("dna_syntax_colors\0")
+    result = next(handle, output, length, revision)
+  } else {
+    state := #cast(*PerfSyntax) handle
+    if state.revision == revision && length == state.length {
+      result = 1
+      _ = perf_copy(#cast(rawptr) output, #cast(rawptr) &state.colors[0], #cast(usize) length)
+    }
+  }
+  if result != 0 {
+    perf_syntax_results += 1
+  }
+  return result
+}
+pub fn dna_syntax_close(state: rawptr) {
+  if perf_enabled("DNA_PERF_REAL_SYNTAX\0") {
+    next := #cast(*fn(rawptr)) probe_next("dna_syntax_close\0")
+    next(state)
+  } else {
+    perf_free(state)
+  }
+}
+pub fn SDL_SetWindowTitle(window: rawptr, title: *const u8) bool {
+  for index in 0..12 {
+    name: [16]u8 = []
+    name[0] = #cast(u8) (#cast(usize) 48 + index / 10)
+    name[1] = #cast(u8) (#cast(usize) 48 + index % 10)
+    suffix: []const u8 = ".json\0"
+    _ = perf_copy(#cast(rawptr) &name[2], #cast(rawptr) &suffix[0], 6)
+    if perf_strstr(title, &name[0]) != nil {
+      perf_opened |= #cast(u32) 1 << #cast(u32) index
+    }
+  }
+  next := #cast(*fn(rawptr, *const u8) bool) probe_next("SDL_SetWindowTitle\0")
+  return next(window, title)
+}

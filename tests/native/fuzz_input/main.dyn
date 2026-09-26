@@ -1,0 +1,242 @@
+// Run only inside tests/fuzz_input.py's sandbox: random commands mutate files.
+extern fn string_length "strlen"(text: *const u8) usize
+extern fn unsigned_number "strtoull"(text: *const u8, end: rawptr, base: i32) u64
+extern fn integer_number "atoi"(text: *const u8) i32
+extern fn open_trace "open"(path: *const u8, flags: i32, mode: u32) i32
+state: u64 = 0
+budget: u32 = 0
+sent: u32 = 0
+trace: i32 = -1
+// Stable event strings avoid leaking one SDL_strdup allocation per fuzz input.
+characters: [256][2]u8 = []
+fn random() u32 {
+  state = state ^ ((state & 2251799813685247) << 13)
+  state = state ^ (state >> 7)
+  state = state ^ ((state & 140737488355327) << 17)
+  return #cast(u32) ((state >> 11) & 4294967295)
+}
+fn trace_text(value: []const u8) {
+  if trace >= 0 && #len(value) != 0 {
+    _ = probe_write(trace, &value[0], #len(value))
+  }
+}
+fn trace_number(value: u64) {
+  bytes: [32]u8 = []
+  trace_text(probe_fmt.u64_decimal(bytes[..], value))
+}
+fn push(event: rawptr) {
+  if !probe_push(event) {
+    probe_exit(3)
+  }
+}
+fn key(code: u32, modifiers: u16) {
+  event := ProbeEvent{}
+  pointer := #cast(rawptr) &event
+  probe_kind(pointer).* = 768
+  probe_u32(pointer, 28).* = code
+  modifier_pointer := #cast(*u16) (#cast(usize) pointer + 32)
+  modifier_pointer.* = modifiers
+  probe_byte(pointer, 36).* = 1
+  push(pointer)
+  trace_text("key ")
+  trace_number(#cast(u64) code)
+  trace_text(" ")
+  trace_number(#cast(u64) modifiers)
+  trace_text("\n")
+}
+fn text(value: []const u8) {
+  event := ProbeEvent{}
+  pointer := #cast(rawptr) &event
+  probe_kind(pointer).* = 771
+  (#cast(**const u8) (#cast(usize) pointer + 24)).* = &value[0]
+  push(pointer)
+  trace_text("text ")
+  trace_text(value[..#len(value) - 1])
+  trace_text("\n")
+}
+fn character(byte: u8) {
+  text(characters[#cast(usize) byte][..])
+}
+fn type_script(script: []const u8) {
+  for byte in script {
+    if byte == 27 || byte == 10 || byte == 9 || byte == 8 {
+      code := #cast(u32) byte
+      if byte == 10 {
+        code = 13
+      }
+      key(code, 0)
+      continue
+    }
+    if byte == 58 {
+      key(58, 0)
+      continue
+    }
+    code := #cast(u32) byte
+    modifiers: u16 = 0
+    if byte >= 65 && byte <= 90 {
+      code += 32
+      modifiers = 1
+    }
+    key(code, modifiers)
+    character(byte)
+  }
+}
+fn equal(value: *const u8, expected: []const u8) bool {
+  length := string_length(value)
+  if length != #len(expected) {
+    return false
+  }
+  for i in 0..length {
+    if value[..length][i] != expected[i] {
+      return false
+    }
+  }
+  return true
+}
+fn focused_event() bool {
+  focus := probe_env("DNA_FUZZ_FOCUS\0")
+  if focus == nil || random() % 100 >= 35 {
+    return false
+  }
+  if equal(focus, "explorer") {
+    scripts: [16][]const u8 = ["\x1b e", "o", "fuzz-new.txt\x1b", "ggj", "dd", "x", "i", "renamed\x1b", ":write\n", "\n", "u", "\x08", "O", "folder/\x1b", "j", "\n"]
+    type_script(scripts[#cast(usize) (random() % 16)])
+  } else if equal(focus, "session") {
+    scripts: [8][]const u8 = ["\x1b:session-save fz.session\n", "\x1b:session-load fz.session\n", "\x1b:e sub/data.json\n", "\x1b:e notes.txt\n", "\x1b:vsplit\n", "\x1b:write\n", "\x1bihello\x1b", "\x1b:bn\n"]
+    type_script(scripts[#cast(usize) (random() % 8)])
+  } else if equal(focus, "completion") {
+    scripts: [15][]const u8 = ["\x1bGo", "  _ = he", "l", "per", "\t", "\n", "(", "\x1b", "ma", "\x08", "\x1bgg", "o", "fn extra() {\n}\x1b", "\x1bki  ", "hel"]
+    type_script(scripts[#cast(usize) (random() % 15)])
+  } else {
+    return false
+  }
+  sent += 1
+  return true
+}
+fn random_event() {
+  if focused_event() {
+    return
+  }
+  kind := random() % 100
+  if kind < 55 {
+    printable: []const u8 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 :/?%;,.<>()[]{}\"'`~-_=+!@#$^&*|\\"
+    byte := printable[#cast(usize) random() % #len(printable)]
+    code := #cast(u32) byte
+    modifiers: u16 = 0
+    if byte >= 65 && byte <= 90 {
+      code += 32
+      modifiers = 1
+    }
+    key(code, modifiers)
+    character(byte)
+  } else if kind < 80 {
+    special: [13]u32 = [27, 13, 9, 8, 127, 1073741904, 1073741903, 1073741906, 1073741905, 1073741899, 1073741902, 1073741898, 1073741901]
+    // GCC evaluates the legacy key() arguments right-to-left. Keep seed traces.
+    modifiers: u16 = 0
+    if random() % 6 == 0 {
+      modifiers = 1
+    }
+    key(special[#cast(usize) (random() % 13)], modifiers)
+  } else if kind < 90 {
+    chords: []const u8 = "abcdefghijklmnoprstuvwxyz0-=+ \0"
+    byte := chords[#cast(usize) (random() % 30)]
+    modifiers: u16 = 256
+    if random() % 2 != 0 {
+      modifiers = 64
+    }
+    key(#cast(u32) byte, modifiers)
+  } else if kind < 95 {
+    values: [6][]const u8 = ["é\0", "中\0", "😀\0", "\t\0", "ab cd\0", "\n\0"]
+    text(values[#cast(usize) (random() % 6)])
+  } else {
+    event := ProbeEvent{}
+    event_pointer := #cast(rawptr) &event
+    pointer := random() % 4
+    x := random() % 1100
+    y := random() % 760
+    if pointer == 0 {
+      probe_kind(event_pointer).* = 1024
+      probe_float(event_pointer, 28).* = #cast(f32) x
+      probe_float(event_pointer, 32).* = #cast(f32) y
+    } else if pointer == 3 {
+      probe_kind(event_pointer).* = 1027
+      amount: f32 = -1.0
+      if random() % 2 != 0 {
+        amount = 1.0
+      }
+      probe_float(event_pointer, 28).* = amount
+      probe_float(event_pointer, 36).* = #cast(f32) x
+      probe_float(event_pointer, 40).* = #cast(f32) y
+    } else {
+      probe_kind(event_pointer).* = 1026
+      if pointer == 1 {
+        probe_kind(event_pointer).* = 1025
+        probe_byte(event_pointer, 25).* = 1
+      }
+      probe_byte(event_pointer, 24).* = 1
+      probe_byte(event_pointer, 26).* = #cast(u8) (#cast(u32) 1 + random() % 2)
+      probe_float(event_pointer, 28).* = #cast(f32) x
+      probe_float(event_pointer, 32).* = #cast(f32) y
+    }
+    push(event_pointer)
+    trace_text("pointer ")
+    trace_number(#cast(u64) pointer)
+    trace_text(" ")
+    trace_number(#cast(u64) x)
+    trace_text(" ")
+    trace_number(#cast(u64) y)
+    trace_text("\n")
+  }
+  sent += 1
+}
+fn feed() {
+  if budget == 0 {
+    seed := probe_env("DNA_FUZZ_SEED\0")
+    count := probe_env("DNA_FUZZ_EVENTS\0")
+    state = 1
+    if seed != nil {
+      number := unsigned_number(seed, nil, 10)
+      low := (number & 4294967295) * 2654435761
+      high := (((number >> 32) * 2654435761) + (low >> 32)) & 4294967295
+      state = (high << 32) | (low & 4294967295)
+      if state == 18446744073709551615 {
+        state = 0
+      } else {
+        state += 1
+      }
+    }
+    budget = 2000
+    if count != nil {
+      budget = #cast(u32) integer_number(count)
+    }
+    for i in 0..256 {
+      characters[i][0] = #cast(u8) i
+    }
+    path := probe_env("DNA_FUZZ_TRACE\0")
+    if path != nil {
+      trace = open_trace(path, 577, 438)
+    }
+  }
+  if sent >= budget {
+    trace_text("done ")
+    trace_number(#cast(u64) sent)
+    trace_text("\n")
+    probe_exit(0)
+  }
+  batch := #cast(u32) 1 + random() % 4
+  for i in 0..#cast(usize) batch {
+    if sent >= budget {
+      break
+    }
+    random_event()
+  }
+}
+pub fn SDL_WaitEventTimeout(event: rawptr, milliseconds: i32) bool {
+  feed()
+  next := #cast(*fn(rawptr, i32) bool) probe_next("SDL_WaitEventTimeout\0")
+  timeout := milliseconds
+  if timeout > 5 {
+    timeout = 5
+  }
+  return next(event, timeout)
+}

@@ -1,0 +1,124 @@
+fn setting_key_name(out: []u8, used: *usize, key: u32, modifiers: u16) {
+  if (modifiers & ModCtrl) != 0 {
+    add_text(out, used, "ctrl-")
+  }
+  if (modifiers & ModAlt) != 0 {
+    add_text(out, used, "alt-")
+  }
+  if (modifiers & ModShift) != 0 {
+    add_text(out, used, "shift-")
+  }
+  if key == KeyBackslash {
+    add_text(out, used, "backslash")
+  } else if key == KeySpace {
+    add_text(out, used, "space")
+  } else if key >= KeyF1 && key <= 1073741893 {
+    add_text(out, used, "f")
+    add_number(out, used, #cast(usize) (key - 1073741881))
+  } else {
+    character: [1]u8 = [#cast(u8) key]
+    add_text(out, used, character[..])
+  }
+}
+fn setting_group_finish(app: *App, key: []const u8) {
+  app.configuration.setting_key_length = copy_text(app.configuration.setting_key[..], key)
+  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\n\nConfig: ")
+  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, app.configuration.path[..app.configuration.path_length])
+  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\nEnter opens config / Escape closes.")
+  app.prompt_state.panel = Panel.Setting
+}
+fn setting_group(app: *App, key: []const u8) bool {
+  if buffer.equal(key, "[keys.normal]") || buffer.equal(key, "[keys.space]") {
+    scope: u8 = 1
+    if buffer.equal(key, "[keys.space]") {
+      scope = 2
+    }
+    app.prompt_state.message_length = copy_text(app.prompt_state.message[..], key)
+    add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\n\nCustom bindings override built-in commands in this scope.\nDefault: no custom overrides.\nConfigured overrides:\n")
+    index: usize = 0
+    count: usize = 0
+    for index < app.config.binding_count {
+      binding := &app.config.bindings[index]
+      if binding.scope == scope {
+        add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\n\"")
+        setting_key_name(app.prompt_state.message[..], &app.prompt_state.message_length, binding.key, binding.modifiers)
+        add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\" = \"")
+        add_text(app.prompt_state.message[..], &app.prompt_state.message_length, binding.command)
+        add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\"")
+        count += 1
+      }
+      index += 1
+    }
+    if count == 0 {
+      add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "none")
+    }
+    setting_group_finish(app, key)
+    return true
+  }
+  if #len(key) < 13 || !buffer.equal(key[..11], "[languages.") || key[#len(key) - 1] != ']' {
+    return false
+  }
+  name := key[11..#len(key) - 1]
+  configured := settings.language(&app.config, name)
+  builtin_dyn := buffer.equal(name, "dyn") && (configured == nil || (configured.seen & 16) == 0)
+  automatic := configured != nil && configured.auto_start
+  if builtin_dyn && (configured == nil || (configured.seen & 8) == 0) {
+    automatic = true
+  }
+  app.prompt_state.message_length = copy_text(app.prompt_state.message[..], key)
+  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\n\nEffective configuration (language overrides / inherited defaults):\n\nindent_width = ")
+  width := app.config.indent_width
+  tabs := app.config.insert_tabs
+  if configured != nil && (configured.seen & 1) != 0 {
+    width = configured.indent_width
+  }
+  if configured != nil && (configured.seen & 2) != 0 {
+    tabs = configured.insert_tabs
+  }
+  add_number(app.prompt_state.message[..], &app.prompt_state.message_length, width)
+  setting_language_source(app, configured, 1)
+  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\ninsert_tabs = ")
+  setting_bool(app.prompt_state.message[..], &app.prompt_state.message_length, tabs)
+  setting_language_source(app, configured, 2)
+  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\nformat_on_save = ")
+  setting_bool(app.prompt_state.message[..], &app.prompt_state.message_length, configured != nil && configured.format_on_save)
+  setting_language_source(app, configured, 4)
+  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\nauto_start = ")
+  setting_bool(app.prompt_state.message[..], &app.prompt_state.message_length, automatic)
+  setting_language_source(app, configured, 8)
+  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\nserver = ")
+  if configured != nil && configured.server_length > 0 {
+    add_text(app.prompt_state.message[..], &app.prompt_state.message_length, configured.server[..configured.server_length])
+  } else if builtin_dyn {
+    add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "dyn lsp")
+  } else {
+    add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "unset")
+  }
+  setting_language_source(app, configured, 16)
+  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\nformatter = ")
+  if configured != nil && configured.formatter_length > 0 {
+    add_text(app.prompt_state.message[..], &app.prompt_state.message_length, configured.formatter[..configured.formatter_length])
+  } else {
+    add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "unset")
+  }
+  setting_language_source(app, configured, 32)
+  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\nextensions = ")
+  if configured != nil && configured.extensions_length > 0 {
+    add_text(app.prompt_state.message[..], &app.prompt_state.message_length, configured.extensions[..configured.extensions_length])
+  } else {
+    add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "built-in detection")
+  }
+  setting_language_source(app, configured, 64)
+  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\n\nIndentation inherits global settings. Dyn defaults to dyn lsp with auto_start=true. Other servers default to false/unset.\nServer/formatter values are shell commands; installing a server does not enable auto_start.")
+  setting_group_finish(app, key)
+  return true
+}
+fn setting_language_source(app: *App, configured: *const settings.Language, bit: u32) {
+  if configured != nil && (configured.seen & bit) != 0 {
+    add_text(app.prompt_state.message[..], &app.prompt_state.message_length, " (language override)")
+  } else if bit == 1 || bit == 2 {
+    add_text(app.prompt_state.message[..], &app.prompt_state.message_length, " (global setting)")
+  } else {
+    add_text(app.prompt_state.message[..], &app.prompt_state.message_length, " (default)")
+  }
+}

@@ -1,0 +1,65 @@
+use "./buffer" buffer
+use "std/mem" mem
+use "std/time" time
+use "std/io" io
+fn main() {
+  owner := buffer.reserve(#sizeof(buffer.Document))
+  if !owner.ok {
+    #panic("arena")
+  }
+  defer _ = mem.arena_release(&owner.arena)
+  doc := buffer.allocate(&owner.arena)
+  text: [1000000]u8 = []
+  at: usize = 0
+  for at < 1000000 {
+    text[at] = 97
+    if at % 80 == 79 {
+      text[at] = 10
+    }
+    at += 1
+  }
+  _ = buffer.load(doc, text[..])
+  dirty_mode: usize = 0
+  for dirty_mode < 2 {
+    started := time.monotonic_now()
+    checks: usize = 0
+    for checks < 2000 {
+      changed: bool = false
+      if dirty_mode == 0 {
+        changed = buffer.dirty(doc)
+      } else {
+        changed = buffer.dirty_cached(doc)
+      }
+      if changed {
+        #panic("dirty benchmark changed clean document")
+      }
+      checks += 1
+    }
+    dirty_elapsed := time.elapsed(started, time.monotonic_now()).value
+    _ = io.println(io.stdout(), "dirty mode {}: 2000 checks, {} ns", dirty_mode, dirty_elapsed)
+    dirty_mode += 1
+  }
+  position: usize = 0
+  for position < 3 {
+    before := time.monotonic_now()
+    step: usize = 0
+    for step < 200 {
+      point: usize = 0
+      if position == 1 {
+        point = doc.length / 2
+      } else if position == 2 {
+        point = doc.length
+      }
+      buffer.move_to(doc, point, false)
+      _ = buffer.replace(doc, "z")
+      buffer.erase(doc, true)
+      step += 1
+    }
+    elapsed := time.elapsed(before, time.monotonic_now()).value / 400
+    _ = io.println(io.stdout(), "position {} mean edit {} ns", position, elapsed)
+    if doc.length != 1000000 || !buffer.equal(doc.bytes[..doc.length], text[..]) {
+      #panic("benchmark edit corrupted text")
+    }
+    position += 1
+  }
+}

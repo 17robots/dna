@@ -1,0 +1,453 @@
+// Per-file settings. Most settings are editor-wide; indentation, whitespace
+// on save and the formatter follow each document, so a file from another
+// repository gets that repository's rules. Lowest to highest:
+//   global config (and its [languages.NAME]), .editorconfig files above the
+//   file, the nearest dna.toml above the file, matching [project."PATH"]
+//   sections of the global config, then :set for this session.
+// A later layer wins only for keys it sets. Resolved lazily and cached per
+// slot until the path, filetype or configuration generation changes.
+
+// Where a value came from, for :config-sources.
+const SourceGlobal: u8 = 0
+const SourceEditorConfig: u8 = 1
+const SourceProject: u8 = 2
+const SourceSection: u8 = 3
+const SourceSession: u8 = 4
+
+struct FileConfig {
+  ready: bool,
+  generation: u64,
+  path: [4096]u8,
+  path_length: usize,
+  filetype: [65]u8,
+  filetype_length: usize,
+  indent_width: usize,
+  // Set by a language section or any layer above the global file; otherwise
+  // the indentation guessed from the file's contents wins.
+  indent_explicit: bool,
+  insert_tabs: bool,
+  trim_trailing_whitespace: bool,
+  final_newline: bool,
+  language: settings.Language,
+  has_language: bool,
+  // indent_width, insert_tabs, trim_trailing_whitespace, final_newline,
+  // formatter, format_on_save.
+  sources: [6]u8,
+  project: [4096]u8,
+  project_length: usize,
+  editorconfig_count: usize,
+}
+
+// The active document's settings.
+fn active_file_config(app: *App) *FileConfig {
+  return file_config(app, &app.documents.slots[app.documents.active])
+}
+fn file_config(app: *App, slot: *Slot) *FileConfig {
+  config := &slot.file_config
+  location: [4096]u8 = []
+  absolute := file_config_location(app, slot, location[..])
+  filetype := filetype_name(slot)
+  if !config.ready || config.generation != app.configuration.file_generation ||
+      !buffer.equal(config.path[..config.path_length], absolute) ||
+      !buffer.equal(config.filetype[..config.filetype_length], filetype) {
+    file_config_resolve(app, config, absolute, filetype)
+  }
+  return config
+}
+// Any configuration change: every document resolves again on next use.
+fn file_config_invalidate(app: *App) {
+  app.configuration.file_generation += 1
+}
+// The file's absolute path; an unnamed buffer stands in the project directory.
+fn file_config_location(app: *App, slot: *Slot, output: []u8) []const u8 {
+  name := files.name(&slot.file)
+  if #len(name) > 0 && slot.terminal.handle == nil {
+    resolved := files.resolve(name, output)
+    if #len(resolved) > 0 {
+      return resolved
+    }
+  }
+  used := copy_text(output[..4000], app.workspace.project[..app.workspace.project_length])
+  if used == 0 {
+    used = copy_text(output[..4000], app.directory_state.path[..app.directory_state.length])
+  }
+  if used == 0 || output[used - 1] != '/' {
+    add_text(output, &used, "/")
+  }
+  return output[..used]
+}
+fn file_config_resolve(app: *App, config: *FileConfig, absolute: []const u8, filetype: []const u8) {
+  config.* = FileConfig{}
+  config.generation = app.configuration.file_generation
+  config.path_length = copy_text(config.path[..], absolute)
+  config.filetype_length = copy_text(config.filetype[..], filetype)
+  mark := mem.arena_mark(app.scratch)
+  defer mem.arena_rewind(app.scratch, mark)
+
+  // Global file.
+  global := scratch_settings(app)
+  if global == nil {
+    // Out of scratch space: the editor-wide values stand in.
+    config.indent_width = app.config.indent_width
+    config.insert_tabs = app.config.insert_tabs
+    config.trim_trailing_whitespace = app.config.trim_trailing_whitespace
+    config.final_newline = app.config.final_newline
+    config.ready = false
+    return
+  }
+  global_layer := settings.Layer{}
+  global_text: []const u8 = ""
+  if app.configuration.global_source_ready {
+    global_text = app.configuration.global_source[..app.configuration.global_source_length]
+  } else if app.configuration.path_length > 0 && files.metadata(app.configuration.path[..app.configuration.path_length]).ok {
+    read := fs.read_all(app.scratch, app.configuration.path[..app.configuration.path_length], 16384)
+    if read.ok {
+      global_text = read.data
+    }
+  }
+  if !settings.parse_layer(global_text, global, &global_layer) {
+    settings.defaults(global)
+    global_layer = settings.Layer{}
+  }
+  if app.configuration.path_length == 0 {
+    global.* = app.config
+  }
+  config.indent_width = global.indent_width
+  config.indent_explicit = (global.explicit_legacy & 16) != 0
+  config.insert_tabs = global.insert_tabs
+  config.trim_trailing_whitespace = global.trim_trailing_whitespace
+  config.final_newline = global.final_newline
+  language := settings.language(global, filetype)
+  if language != nil {
+    config.language = language.*
+    config.has_language = true
+    if (language.seen & 1) != 0 {
+      config.indent_width = language.indent_width
+      config.indent_explicit = true
+    }
+    if (language.seen & 2) != 0 {
+      config.insert_tabs = language.insert_tabs
+    }
+  }
+
+  file_config_editorconfig(app, config, absolute, &global_layer)
+
+  // The dna.toml nearest the file, which need not be the project's.
+  directory := file_config_directory(absolute)
+  project: [4096]u8 = []
+  project_path := file_config_find_upward(directory, "dna.toml", project[..])
+  if #len(project_path) > 0 && !buffer.equal(project_path, app.configuration.path[..app.configuration.path_length]) {
+    read := fs.read_all(app.scratch, project_path, 16384)
+    if read.ok {
+      layered := scratch_settings(app)
+      if layered == nil {
+        return
+      }
+      settings.defaults(layered)
+      layer := settings.Layer{project: true, trusted: trust_check(app, project_path, read.data)}
+      layer.locks = global_layer.locks
+      layer.lock_count = global_layer.lock_count
+      if settings.parse_layer(read.data, layered, &layer) {
+        file_config_layer(config, layered, filetype, SourceProject)
+        config.project_length = copy_text(config.project[..], project_path)
+      }
+    }
+  }
+
+  // [project."PATH"] sections of the global file.
+  if #len(global_text) > 0 {
+    home_storage: [4096]u8 = []
+    home := process.environment("HOME", home_storage[..])
+    home_text: []const u8 = ""
+    if home.ok && home.found {
+      home_text = home.value
+    }
+    space := mem.arena_try_push(app.scratch, #len(global_text), 1)
+    if !space.ok {
+      return
+    }
+    output := space.memory[..#len(global_text)]
+    // Every section is copied into FileConfig before the next is parsed.
+    // Reuse one Settings value regardless of the number of matching sections.
+    layered := scratch_settings(app)
+    if layered == nil {
+      config.ready = false
+      return
+    }
+    at: usize = 0
+    for settings.project_section_next(global_text, absolute, home_text, &at, output) {
+      settings.defaults(layered)
+      layer := settings.Layer{project: true, trusted: true, session: true}
+      layer.locks = global_layer.locks
+      layer.lock_count = global_layer.lock_count
+      if settings.parse_layer(output, layered, &layer) {
+        file_config_layer(config, layered, filetype, SourceSection)
+      }
+    }
+  }
+
+  // :set values for this session.
+  if app.configuration.overrides_length > 0 || app.configuration.module_overrides_length > 0 {
+    space := mem.arena_try_push(app.scratch, 8192, 1)
+    layered := scratch_settings(app)
+    if !space.ok || layered == nil {
+      return
+    }
+    text := space.memory[..8192]
+    settings.defaults(layered)
+    layer := settings.Layer{project: true, trusted: true, session: true}
+    layer.locks = global_layer.locks
+    layer.lock_count = global_layer.lock_count
+    if settings.parse_layer(overrides_text(app, text), layered, &layer) {
+      file_config_layer(config, layered, filetype, SourceSession)
+    }
+  }
+  config.ready = true
+}
+fn scratch_settings(app: *App) *settings.Settings {
+  space := mem.arena_try_push(app.scratch, #sizeof(settings.Settings), #alignof(settings.Settings))
+  if !space.ok {
+    return nil
+  }
+  return #cast(*settings.Settings) space.memory
+}
+// Applies the keys one layer set explicitly: top-level ones, then its
+// section for this filetype.
+fn file_config_layer(config: *FileConfig, layered: *const settings.Settings, filetype: []const u8, source: u8) {
+  if (layered.explicit_legacy & 16) != 0 {
+    config.indent_width = layered.indent_width
+    config.indent_explicit = true
+    config.sources[0] = source
+  }
+  if (layered.explicit_extra & settings.explicit_extra_bit("insert_tabs")) != 0 {
+    config.insert_tabs = layered.insert_tabs
+    config.sources[1] = source
+  }
+  if (layered.explicit_extra & settings.explicit_extra_bit("trim_trailing_whitespace")) != 0 {
+    config.trim_trailing_whitespace = layered.trim_trailing_whitespace
+    config.sources[2] = source
+  }
+  if (layered.explicit_extra & settings.explicit_extra_bit("final_newline")) != 0 {
+    config.final_newline = layered.final_newline
+    config.sources[3] = source
+  }
+  language := settings.language(layered, filetype)
+  if language == nil || language.seen == 0 {
+    return
+  }
+  if !config.has_language {
+    config.language = settings.Language{}
+    config.language.name_length = copy_text(config.language.name[..64], filetype)
+    config.has_language = true
+  }
+  if (language.seen & 1) != 0 {
+    config.indent_width = language.indent_width
+    config.indent_explicit = true
+    config.sources[0] = source
+  }
+  if (language.seen & 2) != 0 {
+    config.insert_tabs = language.insert_tabs
+    config.sources[1] = source
+  }
+  if (language.seen & 4) != 0 {
+    config.language.format_on_save = language.format_on_save
+    config.sources[5] = source
+  }
+  if (language.seen & 32) != 0 {
+    config.language.formatter = language.formatter
+    config.language.formatter_length = language.formatter_length
+    config.sources[4] = source
+  }
+  config.language.seen = config.language.seen | language.seen
+}
+// .editorconfig files from the file's directory up to the first root = true.
+fn file_config_editorconfig(app: *App, config: *FileConfig, absolute: []const u8, global: *const settings.Layer) {
+  texts: [32][]const u8 = []
+  lengths: [32]usize = []
+  count: usize = 0
+  directory := file_config_directory(absolute)
+  length := #len(directory)
+  for count < 32 {
+    candidate: [4096]u8 = []
+    used := copy_text(candidate[..4000], absolute[..length])
+    add_text(candidate[..], &used, "/.editorconfig")
+    info := files.metadata(candidate[..used])
+    if info.ok && (info.mode & 61440) == 32768 {
+      read := fs.read_all(app.scratch, candidate[..used], 65536)
+      if read.ok {
+        texts[count] = read.data
+        lengths[count] = length
+        count += 1
+        if settings.editorconfig_root(read.data) {
+          break
+        }
+      }
+    }
+    if length == 0 {
+      break
+    }
+    // Up one directory; "/" itself is length 0.
+    length -= 1
+    for length > 0 && absolute[length] != '/' {
+      length -= 1
+    }
+  }
+  result := settings.EditorConfig{}
+  index := count
+  for index > 0 {
+    index -= 1
+    start := lengths[index] + 1
+    if start <= #len(absolute) {
+      settings.editorconfig_apply(texts[index], absolute[start..], &result)
+    }
+  }
+  config.editorconfig_count = count
+  if !result.matched {
+    return
+  }
+  if result.indent_style != 0 && !file_config_locked(global, "insert_tabs") {
+    config.insert_tabs = result.indent_style == settings.EditorTab
+    config.sources[1] = SourceEditorConfig
+  }
+  width: usize = #cast(usize) result.indent_size
+  if result.indent_size == settings.EditorSizeTab || (result.indent_size == 0 && result.indent_style == settings.EditorTab) {
+    width = #cast(usize) result.tab_width
+  }
+  if width >= 1 && width <= 16 && !file_config_locked(global, "indent_width") {
+    config.indent_width = width
+    config.indent_explicit = true
+    config.sources[0] = SourceEditorConfig
+  }
+  if result.trim_trailing_whitespace != 0 && !file_config_locked(global, "trim_trailing_whitespace") {
+    config.trim_trailing_whitespace = result.trim_trailing_whitespace == 2
+    config.sources[2] = SourceEditorConfig
+  }
+  if result.insert_final_newline != 0 && !file_config_locked(global, "final_newline") {
+    config.final_newline = result.insert_final_newline == 2
+    config.sources[3] = SourceEditorConfig
+  }
+}
+// "/a/b/c.txt" -> "/a/b"; "/a/b/" -> "/a/b"; "/c.txt" -> "".
+fn file_config_directory(absolute: []const u8) []const u8 {
+  end := #len(absolute)
+  for end > 0 && absolute[end - 1] != '/' {
+    end -= 1
+  }
+  if end > 0 {
+    end -= 1
+  }
+  return absolute[..end]
+}
+fn file_config_find_upward(directory: []const u8, name: []const u8, output: []u8) []const u8 {
+  length := #len(directory)
+  for {
+    used := copy_text(output[..4000], directory[..length])
+    add_text(output, &used, "/")
+    add_text(output, &used, name)
+    info := files.metadata(output[..used])
+    if info.ok && (info.mode & 61440) == 32768 {
+      return output[..used]
+    }
+    if length == 0 {
+      return output[..0]
+    }
+    length -= 1
+    for length > 0 && directory[length] != '/' {
+      length -= 1
+    }
+  }
+  return output[..0]
+}
+fn file_config_source_name(source: u8) []const u8 {
+  if source == SourceEditorConfig {
+    return ".editorconfig"
+  }
+  if source == SourceProject {
+    return "dna.toml"
+  }
+  if source == SourceSection {
+    return "[project] section"
+  }
+  if source == SourceSession {
+    return ":set"
+  }
+  return "global"
+}
+// :config-sources lines for the active document.
+fn file_config_report(app: *App, report: []u8, used: *usize) {
+  slot := &app.documents.slots[app.documents.active]
+  if slot.document == nil || slot.terminal.handle != nil {
+    return
+  }
+  config := file_config(app, slot)
+  add_text(report, used, "\nThis file: ")
+  add_text(report, used, config.path[..config.path_length])
+  add_text(report, used, "\n  dna.toml: ")
+  if config.project_length == 0 {
+    add_text(report, used, "none")
+  } else {
+    add_text(report, used, config.project[..config.project_length])
+  }
+  add_text(report, used, "\n  .editorconfig files: ")
+  add_number(report, used, config.editorconfig_count)
+  add_text(report, used, "\n  indent_width = ")
+  add_number(report, used, indent_width(app))
+  if config.indent_explicit {
+    add_text(report, used, " (")
+    add_text(report, used, file_config_source_name(config.sources[0]))
+    add_text(report, used, ")")
+  } else {
+    add_text(report, used, " (guessed or global)")
+  }
+  names: [5][]const u8 = ["insert_tabs", "trim_trailing_whitespace", "final_newline", "formatter", "format_on_save"]
+  for index in 0..5 {
+    add_text(report, used, "\n  ")
+    add_text(report, used, names[index])
+    add_text(report, used, " = ")
+    if index == 0 {
+      setting_bool(report, used, config.insert_tabs)
+    } else if index == 1 {
+      setting_bool(report, used, config.trim_trailing_whitespace)
+    } else if index == 2 {
+      setting_bool(report, used, config.final_newline)
+    } else if index == 3 {
+      if config.has_language && config.language.formatter_length > 0 {
+        add_text(report, used, config.language.formatter[..config.language.formatter_length])
+      } else {
+        add_text(report, used, "unset")
+      }
+    } else {
+      setting_bool(report, used, config.has_language && config.language.format_on_save)
+    }
+    add_text(report, used, " (")
+    add_text(report, used, file_config_source_name(config.sources[index + 1]))
+    add_text(report, used, ")")
+  }
+}
+
+// EditorConfig obeys the same global editor locks as dna.toml and :set.
+fn file_config_locked(layer: *const settings.Layer, key: []const u8) bool {
+  for index in 0..layer.lock_count {
+    if settings.lock_matches(layer.locks[index], "editor", key, key) {
+      return true
+    }
+  }
+  return false
+}
+
+// Save As uses the destination's rules before formatting or whitespace cleanup.
+fn save_file_config(app: *App, path: []const u8, output: *FileConfig) *FileConfig {
+  storage: [4096]u8 = []
+  absolute := files.resolve(path, storage[..])
+  current := active_file_config(app)
+  if #len(absolute) == 0 || buffer.equal(absolute, current.path[..current.path_length]) {
+    return current
+  }
+  slot := &app.documents.slots[app.documents.active]
+  filetype := filetype_path(absolute)
+  if slot.filetype_length > 0 && !slot.inferred_filetype {
+    filetype = slot.filetype[..slot.filetype_length]
+  }
+  file_config_resolve(app, output, absolute, filetype)
+  return output
+}

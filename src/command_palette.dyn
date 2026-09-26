@@ -1,0 +1,625 @@
+fn command_name(app: *App, id: usize) []const u8 {
+  if id >= PaletteRowBase {
+    return palette_row_label(app, id - PaletteRowBase)
+  }
+  if id < BuiltinCommands {
+    return command_info(id).label
+  }
+  if id >= PluginCommandBase && id < PluginCommandBase + app.plugin_state.command_count {
+    entry := &app.plugin_state.commands[id - PluginCommandBase]
+    if entry.length == 0 {
+      return ""
+    }
+    return entry.label[..entry.label_length]
+  }
+  return ""
+}
+// Labels pad a shortcut after the title with two or more spaces.
+fn command_title(label: []const u8) []const u8 {
+  end: usize = 0
+  for end + 1 < #len(label) && !(label[end] == ' ' && label[end + 1] == ' ') {
+    end += 1
+  }
+  if end + 1 >= #len(label) {
+    return label
+  }
+  return label[..end]
+}
+fn command_shortcut(label: []const u8) []const u8 {
+  at := #len(command_title(label))
+  for at < #len(label) && label[at] == ' ' {
+    at += 1
+  }
+  return label[at..]
+}
+fn command_alias(id: usize, query: []const u8) bool {
+  if id >= BuiltinCommands || #len(query) == 0 {
+    return false
+  }
+  aliases := command_info(id).aliases
+  at: usize = 0
+  for at < #len(aliases) {
+    end := at
+    for end < #len(aliases) && aliases[end] != '|' {
+      end += 1
+    }
+    if buffer.equal(query, aliases[at..end]) {
+      return true
+    }
+    at = end + 1
+  }
+  return false
+}
+fn matches(app: *App) {
+  if !app.command_menu.cached || app.command_menu.context != app.explorer.commands || !buffer.equal(app.command_menu.query[..app.command_menu.query_length], app.prompt_state.text[..app.prompt_state.length]) {
+    app.command_menu.count = 0
+    app.command_menu.filter_runs += 1
+    app.command_menu.query_length = copy_text(app.command_menu.query[..], app.prompt_state.text[..app.prompt_state.length])
+    app.command_menu.cached = true
+    app.command_menu.context = app.explorer.commands
+    app.command_menu.row_count = 0
+    app.command_menu.pool_used = 0
+    app.command_menu.arguments = false
+    // Fuzzy rank once per query; ties keep declaration order.
+    query := app.prompt_state.text[..app.prompt_state.length]
+    scores: [512]i32 = []
+    plain := !app.explorer.commands && !app.terminal_state.commands
+    // Argument suggestions rank first; commands whose titles match the whole
+    // query ("write explorer") still follow them.
+    arguments := plain && palette_arguments(app, query, scores[..])
+    for index in 0..PluginCommandBase + app.plugin_state.command_count {
+      if app.explorer.commands && index != 5 && index != 6 && index != 16 && (index < 29 || index > 31) {
+        continue
+      }
+      name := command_name(app, index)
+      if #len(name) == 0 {
+        continue
+      }
+      score := fuzzy_score(command_title(name), query)
+      if command_alias(index, query) {
+        score = 1000000
+      }
+      if score >= 0 {
+        menu_insert(app, scores[..], index, score)
+      }
+    }
+    if plain && !arguments {
+      palette_option_rows(app, query, scores[..])
+    }
+  }
+  app.prompt_state.match_count = app.command_menu.count
+  copied: usize = 0
+  for copied < app.prompt_state.match_count {
+    app.prompt_state.matches[copied] = app.command_menu.ids[copied]
+    copied += 1
+  }
+  if app.prompt_state.selected >= app.prompt_state.match_count {
+    app.prompt_state.selected = 0
+  }
+}
+// Built with the immediate-mode UI each drawn frame. Rows are keyed by
+// command, so hover and selection fades follow a command as results reorder.
+fn draw_command_palette(renderer: rawptr, app: *App, typography: *Typography, width: i32, height: i32) {
+  matches(app)
+  ui := &app.ui
+  ui_panel_begin(ui, typography)
+  scale := typography.scale
+  line := typography.line
+  count := app.prompt_state.match_count
+  selected := app.prompt_state.selected
+  rows: usize = 12
+  room := (#cast(f32) height * 0.7) / line - 2.0
+  if room < 1.0 {
+    rows = 1
+  }
+  else if #cast(usize) room < rows {
+    rows = #cast(usize) room
+  }
+  shown := count
+  if shown > rows {
+    shown = rows
+  }
+  if shown == 0 {
+    shown = 1
+  }
+  box_width := 680.0 * scale
+  if box_width > #cast(f32) width * 0.92 {
+    box_width = #cast(f32) width * 0.92
+  }
+  // Opening glides the palette down into place while the popup fades in.
+  opening := app.view.animation.panel != Panel.Commands
+  if opening {
+    motion.snap(&ui.palette_open, -12.0 * scale)
+  }
+  slide := animated_value(app, &ui.palette_open, 0.0, app.config.popup_animation_ms * 2.0, false)
+  // The palette's height follows its rows; placement uses that estimate.
+  natural := sdl.Rect{x: (#cast(f32) width - box_width) / 2.0, y: #cast(f32) height * 0.1, width: box_width, height: #cast(f32) (shown + 2) * line + 20.0 * scale}
+  if app.config.picker_style == 2 {
+    natural = picker_dropdown_rect(width, natural.height, scale)
+  }
+  placed := place_rect(app, SurfacePalette, width, height, 0.0, scale, natural)
+  box_width = placed.width
+  palette := ui_make(ui, ui_hash(0, "palette"), UiFloating | UiBackground | UiBorder | UiClip)
+  ui.boxes[palette].floating[0] = placed.x
+  ui.boxes[palette].floating[1] = placed.y + slide
+  ui.boxes[palette].fill = theme().surface
+  ui.boxes[palette].padding[0] = 10.0 * scale
+  ui.boxes[palette].padding[1] = 10.0 * scale
+  ui_size(ui, palette, UiAxisX, UiSizeKind.Pixels, box_width / scale, 1.0)
+  ui_push(ui, palette)
+  field := ui_make(ui, ui_key(ui, "field"), UiBackground)
+  ui.boxes[field].axis = UiAxisX
+  ui.boxes[field].fill = theme().line
+  ui.boxes[field].padding[0] = typography.cell * 0.5
+  ui_size(ui, field, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
+  ui_push(ui, field)
+  query: [4200]u8 = []
+  query_length: usize = 0
+  add_text(query[..], &query_length, "> ")
+  add_text(query[..], &query_length, app.prompt_state.text[..app.prompt_state.length])
+  add_text(query[..], &query_length, "_")
+  _ = ui_label(ui, "query", query[..query_length], 0)
+  if app.prompt_state.length == 0 {
+    hint: []const u8 = "Type a command or :name args"
+    if app.explorer.commands {
+      hint = "Explorer commands"
+    }
+    _ = ui_label(ui, "hint", hint, UiMuted)
+  }
+  ui_pop(ui)
+  gap := ui_make(ui, ui_key(ui, "gap"), 0)
+  ui_size(ui, gap, UiAxisY, UiSizeKind.Pixels, 10.0, 1.0)
+  list := ui_make(ui, ui_key(ui, "list"), UiClip | UiScroll)
+  ui_size(ui, list, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
+  ui_size(ui, list, UiAxisY, UiSizeKind.Pixels, line * #cast(f32) shown / scale, 1.0)
+  changed := ui.palette_query != app.command_menu.filter_runs
+  ui_list_scroll(app, ui, list, count, selected, line * #cast(f32) shown, opening || changed, opening || changed || selected != ui.palette_selected)
+  window := ui_list_window(ui, list, count, line * #cast(f32) shown)
+  ui_push(ui, list)
+  ui_spacer(ui, "above", #cast(f32) window.first * line)
+  for row in window.first..window.last {
+    id := app.prompt_state.matches[row]
+    name := command_name(app, id)
+    item := ui_make(ui, ui_hash_number(ui.boxes[list].key, id), UiClickable | UiHover)
+    ui.boxes[item].axis = UiAxisX
+    ui.boxes[item].value = row
+    ui.boxes[item].padding[0] = typography.cell
+    ui_size(ui, item, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
+    ui_size(ui, item, UiAxisY, UiSizeKind.Pixels, line / scale, 1.0)
+    ui_push(ui, item)
+    title := ui_label(ui, "title", command_title(name), 0)
+    // The title yields space so a shortcut stays readable on narrow windows.
+    ui_size(ui, title, UiAxisX, UiSizeKind.Percent, 1.0, 0.0)
+    shortcut := command_shortcut(name)
+    if #len(shortcut) > 0 {
+      _ = ui_label(ui, "shortcut", shortcut, UiMuted)
+    }
+    ui_pop(ui)
+    ui_animate(app, ui, item, row == selected)
+  }
+  ui_spacer(ui, "below", #cast(f32) (count - window.last) * line)
+  if count == 0 {
+    nothing: []const u8 = "No matching commands"
+    if app.command_menu.arguments {
+      nothing = "No suggestions; Enter runs it as typed"
+    }
+    empty := ui_label(ui, "empty", nothing, UiMuted)
+    ui.boxes[empty].padding[0] = typography.cell
+  }
+  ui_pop(ui)
+  ui_pop(ui)
+  // Keyboard moves keep the selection visible; the wheel scrolls freely.
+  // Either way the list glides to its new offset.
+  ui.palette_selected = selected
+  ui.palette_query = app.command_menu.filter_runs
+  ui_layout(ui)
+  ui_render(renderer, ui, typography, width, height)
+}
+// Mouse input for the palette, hit-tested against the last drawn frame.
+// Returns true when the event was consumed.
+fn command_palette_mouse(app: *App, typography: *Typography, x: f32, y: f32, pressed: bool, moved: bool) bool {
+  ui := &app.ui
+  if moved {
+    ui_pointer(ui, x, y)
+    return true
+  }
+  if !pressed {
+    return true
+  }
+  hit := ui_hit(ui, x, y)
+  if hit == 0 {
+    palette := ui_make_lookup(ui, ui_hash(0, "palette"))
+    if palette == 0 || !ui_contains(ui.boxes[palette].rect, x, y) {
+      // Clicking outside dismisses the palette, like Escape.
+      key_input(app, typography, KeyEscape, 0)
+    }
+    return true
+  }
+  row := ui.boxes[hit].value
+  if row >= app.prompt_state.match_count {
+    return true
+  }
+  app.prompt_state.selected = row
+  command_run(app, typography, app.prompt_state.matches[row])
+  return true
+}
+
+fn action(app: *App, typography: *Typography, id: usize) {
+  if id >= PaletteRowBase {
+    palette_row_choose(app, typography, id - PaletteRowBase, false)
+    return
+  }
+  // Commands that need an argument type their name into the palette, where
+  // suggestions for it appear.
+  if id < BuiltinCommands && #len(command_info(id).arguments) > 0 && command_info(id).arguments[0] == '!' {
+    palette_prefill(app, command_primary(id))
+    return
+  }
+  if id == 104 {
+    app.prompt_state.panel = Panel.None
+    comment_toggle(app)
+    return
+  }
+  if id == 105 {
+    app.prompt_state.panel = Panel.None
+    format_start(app, false, "")
+    return
+  }
+  if id == 106 {
+    format_release(app)
+    save_cancel(app)
+    app.prompt_state.panel = Panel.None
+    return
+  }
+  if id == 93 {
+    save_close(app)
+    return
+  }
+  if id == 94 || id == 95 {
+    save_all(app, id == 95)
+    return
+  }
+  if id == 96 {
+    trust_project(app, typography)
+    return
+  }
+  if id == 97 {
+    config_sources(app)
+    return
+  }
+  if id == 99 {
+    modules_report(app)
+    return
+  }
+  if id == 103 {
+    app.prompt_state.panel = Panel.None
+    suspend_command(app)
+    return
+  }
+  if (id == 18 || id == 19 || id == 20) && explorer_dirty(app) {
+    notice(app, "Apply or discard staged explorer edits before using individual file actions.")
+    return
+  }
+  app.prompt_state.panel = Panel.None
+  if id >= 74 && id <= 79 {
+    lsp_request(app, id - 73, "")
+    return
+  }
+  if id == 89 {
+    panel(app, Panel.Windows)
+    return
+  }
+  if id == 90 {
+    app.input_state.goto_explorer = app.input_state.leader_explorer
+    panel(app, Panel.Goto)
+    return
+  }
+  if id == 91 {
+    app.explorer.commands = app.input_state.leader_explorer
+    panel(app, Panel.Commands)
+    return
+  }
+  if id == 92 {
+    request_buffer_close(app)
+    return
+  }
+  if id == 80 {
+    diagnostics_show(app)
+    return
+  }
+  if id == 81 {
+    lsp_config(app)
+    return
+  }
+  if id == 83 {
+    _ = lsp_command(app, "lsp-restart", "")
+    return
+  }
+  if id == 84 {
+    notice(app, app.lsp.log[..app.lsp.log_length])
+    return
+  }
+  if id == 85 {
+    lsp_release(app)
+    return
+  }
+  if id == 86 {
+    disk_reload(app, false)
+    return
+  }
+  if id >= PluginCommandBase {
+    plugin_run_command(app, id - PluginCommandBase)
+    return
+  }
+  if id == 67 {
+    task_picker(app)
+    return
+  }
+  if id == 68 {
+    task_previous_error(app)
+    return
+  }
+  if id == 69 {
+    resource_picker(app, 4)
+    return
+  }
+  if id == 73 {
+    plugin_list(app)
+    return
+  }
+  if id == 56 {
+    resource_picker(app, 1)
+    return
+  }
+  if id == 57 {
+    resource_picker(app, 2)
+    return
+  }
+  if id == 58 {
+    resource_picker(app, 3)
+    return
+  }
+  if id == 60 {
+    pane_equalize(app)
+    return
+  }
+  if id == 61 {
+    _ = session_save(app, "")
+    return
+  }
+  if id == 62 {
+    _ = session_restore(app, "")
+    return
+  }
+  if id == 64 {
+    notice(app, app.plugin_state.log[..app.plugin_state.log_length])
+    return
+  }
+  if id == 65 {
+    plugin_release(app)
+    return
+  }
+  if id == 0 {
+    app.resource_state.kind = 0
+    app.resource_state.fonts = false
+    panel(app, Panel.Open)
+  }
+  else if id == 1 {
+    if app.documents.file.length == 0 {
+      panel(app, Panel.SaveAs)
+    } else {
+      save_file(app, files.name(app.documents.file))
+    }
+  }
+  else if id == 2 {
+    panel(app, Panel.SaveAs)
+    app.prompt_state.length = copy_text(app.prompt_state.text[..], files.name(app.documents.file))
+  }
+  else if id == 3 {
+    search_open(app, Panel.Search, false)
+  }
+  else if id == 4 {
+    search_repeat(app, false, false)
+  }
+  else if id == 5 {
+    buffer.undo(app.documents.current)
+  }
+  else if id == 6 {
+    buffer.redo(app.documents.current)
+  }
+  else if id == 7 {
+    explorer_open(app)
+  }
+  else if id == 8 {
+    panel(app, Panel.Layout)
+  }
+  else if id == 9 {
+    app.view.popup_width = 0.64
+    app.view.popup_height = 0.56
+  }
+  else if id == 10 {
+    app.view.popup_width = 0.86
+    app.view.popup_height = 0.8
+  }
+  else if id == 11 {
+    if typography.points < 72.0 {
+      typography.points += 1.0
+    }
+    resize_font(typography)
+  }
+  else if id == 12 {
+    if typography.points > 8.0 {
+      typography.points -= 1.0
+    }
+    resize_font(typography)
+  }
+  else if id == 13 {
+    typography.points = app.config.font_size
+    resize_font(typography)
+  }
+  else if id == 14 {
+    error := files.recover(app.documents.file, app.documents.current, app.scratch)
+    if #len(error) > 0 {
+      notice(app, error)
+    }
+  }
+  else if id == 15 {
+    panel(app, Panel.Message)
+    app.prompt_state.message_length = copy_text(app.prompt_state.message[..], "Discard edits? Press D to discard, or Escape to cancel.")
+    app.prompt_state.selected = 15
+  }
+  else if id == 16 {
+    request_quit(app)
+  }
+  else if id == 17 {
+    _ = new_buffer(app)
+  }
+  else if id == 18 {
+    panel(app, Panel.Create)
+  }
+  else if id == 19 {
+    if app.directory_state.count == 0 {
+      notice(app, "Open a directory and select an entry first.")
+    } else {
+      app.prompt_state.panel = Panel.Rename
+      app.prompt_state.length = 0
+      app.prompt_state.text[0] = 0
+    }
+  }
+  else if id == 21 {
+    panel(app, Panel.Buffers)
+  }
+  else if id == 22 {
+    next_buffer(app, false)
+  }
+  else if id == 23 {
+    next_buffer(app, true)
+  }
+  else if id == 24 {
+    quit_view(app)
+  }
+  else if id == 25 {
+    app.view.line_numbers = !app.view.line_numbers
+  }
+  else if id == 26 {
+    app.view.status_line = !app.view.status_line
+  }
+  else if id == 27 {
+    app.view.relative_numbers = !app.view.relative_numbers
+  }
+  else if id == 28 {
+    app.view.highlight_line = !app.view.highlight_line
+  }
+  else if id == 29 {
+    explorer_preview(app)
+  }
+  else if id == 30 {
+    app.explorer.quit_after_discard = false
+    panel(app, Panel.DirectoryDiscard)
+  }
+  else if id == 31 {
+    directory_refresh(app)
+    if app.prompt_state.panel != Panel.Message {
+      app.prompt_state.panel = Panel.Directory
+    }
+  }
+  else if id == 32 {
+    pane_split(app, true)
+  }
+  else if id == 33 {
+    pane_split(app, false)
+  }
+  else if id == 34 {
+    pane_close(app)
+  }
+  else if id == 35 {
+    pane_only(app)
+  }
+  else if id == 36 {
+    terminal_show(app, false, "")
+  }
+  else if id == 37 {
+    terminal_show(app, true, "")
+  }
+  else if id == 38 {
+    terminal_promote(app)
+  }
+  else if id == 39 {
+    config_reload(app, typography, false)
+  }
+  else if id == 40 {
+    open_file(app, app.configuration.path[..app.configuration.path_length])
+  }
+  else if id == 41 {
+    notice(app, app.workspace.project[..app.workspace.project_length])
+  }
+  else if id == 42 {
+    font_picker(app)
+  }
+  else if id == 43 {
+    language_install(app, "")
+  }
+  else if id == 44 {
+    syntax_release(app)
+  }
+  else if id == 45 {
+    run_task(app, app.config.build_command)
+  }
+  else if id == 46 {
+    run_task(app, app.config.test_command)
+  }
+  else if id == 47 {
+    run_task(app, app.config.run_command)
+  }
+  else if id == 48 {
+    task_next_error(app)
+  }
+  else if id == 52 {
+    pane_new(app, true)
+  }
+  else if id == 53 {
+    pane_new(app, false)
+  }
+  else if id == 55 {
+    project_search_open(app)
+  }
+  else if id == 20 {
+    if app.directory_state.count == 0 {
+      notice(app, "Open a directory and select a file first.")
+    } else {
+      app.prompt_state.panel = Panel.Trash
+    }
+  }
+}
+// Commands the explorer palette offers; false for anything else.
+fn explorer_command(app: *App, typography: *Typography, chosen: usize) bool {
+  if chosen >= 29 && chosen <= 31 {
+    action(app, typography, chosen)
+    return true
+  }
+  if chosen == 5 {
+    buffer.undo(app.explorer.document)
+    app.prompt_state.panel = Panel.Directory
+    return true
+  }
+  if chosen == 6 {
+    buffer.redo(app.explorer.document)
+    app.prompt_state.panel = Panel.Directory
+    return true
+  }
+  if chosen == 16 {
+    app.prompt_state.panel = Panel.None
+    return true
+  }
+  return false
+}
+// Runs a palette row directly, as when it is clicked.
+fn command_run(app: *App, typography: *Typography, id: usize) {
+  app.terminal_state.commands = false
+  if app.explorer.commands {
+    app.explorer.commands = false
+    _ = explorer_command(app, typography, id)
+    return
+  }
+  action(app, typography, id)
+}

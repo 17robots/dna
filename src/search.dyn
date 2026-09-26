@@ -1,0 +1,349 @@
+use "./pattern"
+
+struct SearchHistory { text: [4096]u8, length: usize }
+
+struct SearchState {
+  document: *buffer.Document,
+  primary: buffer.Selection,
+  secondary: buffer.SelectionSet,
+  explorer: bool,
+  extend: bool,
+  status: u8,
+  error_offset: usize,
+  scroll_x: f32,
+  scroll_y: f32,
+}
+
+fn search_prompt(kind: Panel) bool {
+  return kind == Panel.Search || kind == Panel.Select || kind == Panel.Split || kind == Panel.Keep || kind == Panel.Remove
+}
+fn search_open(app: *App, kind: Panel, explorer: bool) {
+  doc := app.documents.current
+  extending := app.view.extend
+  scroll_x := app.view.scroll_x
+  scroll_y := app.view.scroll_y
+  if explorer {
+    doc = app.explorer.document
+    extending = app.explorer.extend
+    scroll_x = app.explorer.scroll_x
+    scroll_y = app.explorer.scroll_y
+  }
+  panel(app, kind)
+  app.search_state = SearchState{document: doc, primary: buffer.Selection{cursor: doc.cursor, anchor: doc.anchor}, secondary: doc.secondary, explorer: explorer, extend: extending, scroll_x: scroll_x, scroll_y: scroll_y}
+}
+fn search_restore(app: *App) {
+  state := &app.search_state
+  doc := state.document
+  if doc == nil {
+    return
+  }
+  doc.cursor = state.primary.cursor
+  doc.anchor = state.primary.anchor
+  doc.secondary = state.secondary
+  if state.explorer {
+    app.explorer.scroll_x = state.scroll_x
+    app.explorer.scroll_y = state.scroll_y
+  } else {
+    app.view.scroll_x = state.scroll_x
+    app.view.scroll_y = state.scroll_y
+  }
+}
+fn search_close(app: *App) {
+  app.prompt_state.panel = Panel.None
+  if app.search_state.explorer {
+    app.prompt_state.panel = Panel.Directory
+  }
+}
+fn search_step(doc: *const buffer.Document, compiled: *pattern.Pattern, selection: buffer.Selection, backwards: bool) pattern.Match {
+  base := selection.cursor
+  if !backwards {
+    if selection.cursor == selection.anchor && base < doc.length {
+      base = buffer.next(doc, base)
+    }
+    // Skip a zero-width match at the current cursor when repeating.
+    result := pattern.find(compiled, doc.bytes[..doc.length], base)
+    if result.found || result.error {
+      return result
+    }
+    return pattern.find(compiled, doc.bytes[..doc.length], 0)
+  }
+  if selection.anchor < base {
+    base = selection.anchor
+  }
+  // Scan forward to the last match before the cursor. Positions strictly
+  // advance, so the scan is linear and needs no attempt cap.
+  previous := pattern.Match{}
+  wrapped := pattern.Match{}
+  at: usize = 0
+  for at <= doc.length {
+    candidate := pattern.find(compiled, doc.bytes[..doc.length], at)
+    if candidate.error {
+      return candidate
+    }
+    if !candidate.found {
+      break
+    }
+    if candidate.start >= base && previous.found {
+      return previous
+    }
+    wrapped = candidate
+    if candidate.start < base {
+      previous = candidate
+    }
+    if candidate.end > at {
+      at = candidate.end
+    } else {
+      if candidate.end == doc.length {
+        break
+      }
+      at = buffer.next(doc, candidate.end)
+    }
+  }
+  if previous.found {
+    return previous
+  }
+  return wrapped
+}
+fn search_range(doc: *const buffer.Document, original: buffer.Selection, match: pattern.Match, extending: bool, backwards: bool) buffer.Selection {
+  if !extending {
+    return buffer.Selection{anchor: match.start, cursor: match.end}
+  }
+  fixed := original.anchor
+  if original.cursor < original.anchor {
+    fixed = buffer.previous(doc, fixed)
+  }
+  destination := match.end
+  if backwards {
+    destination = match.start
+  }
+  if destination < fixed {
+    return buffer.Selection{anchor: buffer.next(doc, fixed), cursor: destination}
+  }
+  return buffer.Selection{anchor: fixed, cursor: destination}
+}
+fn search_apply(doc: *buffer.Document, compiled: *pattern.Pattern, extending: bool, backwards: bool) u8 {
+  primary := buffer.Selection{cursor: doc.cursor, anchor: doc.anchor}
+  secondary := doc.secondary
+  main_match := search_step(doc, compiled, primary, backwards)
+  if main_match.error {
+    return 3
+  }
+  if !main_match.found {
+    return 1
+  }
+  updated := search_range(doc, primary, main_match, extending, backwards)
+  index: usize = 0
+  for index < secondary.count {
+    original := secondary.ranges[index]
+    result := search_step(doc, compiled, original, backwards)
+    if result.error {
+      return 3
+    }
+    if result.found {
+      secondary.ranges[index] = search_range(doc, original, result, extending, backwards)
+    }
+    index += 1
+  }
+  doc.cursor = updated.cursor
+  doc.anchor = updated.anchor
+  doc.secondary = secondary
+  return 0
+}
+fn selection_add(output: []buffer.Selection, count: *usize, low: usize, high: usize) bool {
+  for index in 0..count.* {
+    if output[index].anchor == low && output[index].cursor == high {
+      return true
+    }
+  }
+  if count.* == #len(output) {
+    return false
+  }
+  output[count.*] = buffer.Selection{anchor: low, cursor: high}
+  count.* += 1
+  return true
+}
+fn select_matches(doc: *buffer.Document, compiled: *pattern.Pattern, split: bool) u8 {
+  originals: [32]buffer.Selection = []
+  originals[0] = buffer.Selection{cursor: doc.cursor, anchor: doc.anchor}
+  for index in 0..doc.secondary.count {
+    originals[index + 1] = doc.secondary.ranges[index]
+  }
+  output: [32]buffer.Selection = []
+  count: usize = 0
+  current: usize = 0
+  for current <= doc.secondary.count {
+    original := originals[current]
+    low := original.anchor
+    high := original.cursor
+    if low > high {
+      swap := low
+      low = high
+      high = swap
+    }
+    text := doc.bytes[low..high]
+    at: usize = 0
+    segment: usize = 0
+    attempts: usize = 0
+    for at <= #len(text) {
+      if attempts == 4096 {
+        return 3
+      }
+      attempts += 1
+      found := pattern.find(compiled, text, at)
+      if found.error {
+        return 3
+      }
+      if !found.found {
+        break
+      }
+      if split {
+        if found.start > segment && !selection_add(output[..], &count, low + segment, low + found.start) {
+          return 4
+        }
+        segment = found.end
+      } else if !selection_add(output[..], &count, low + found.start, low + found.end) {
+        return 4
+      }
+      if found.end > at {
+        at = found.end
+      }
+      else {
+        if found.end == #len(text) {
+          break
+        }
+        at = buffer.next(doc, low + found.end) - low
+      }
+    }
+    if split && segment < #len(text) && !selection_add(output[..], &count, low + segment, high) {
+      return 4
+    }
+    current += 1
+  }
+  if count == 0 {
+    return 1
+  }
+  doc.anchor = output[0].anchor
+  doc.cursor = output[0].cursor
+  doc.secondary.count = count - 1
+  for index in 1..count {
+    doc.secondary.ranges[index - 1] = output[index]
+  }
+  return 0
+}
+fn search_preview(app: *App) {
+  search_restore(app)
+  state := &app.search_state
+  state.status = 0
+  if app.prompt_state.length == 0 {
+    return
+  }
+  compiled := pattern.open(app.prompt_state.text[..app.prompt_state.length])
+  defer pattern.close(&compiled)
+  if !compiled.ok {
+    state.status = 2
+    state.error_offset = compiled.error_offset
+    return
+  }
+  if app.prompt_state.panel == Panel.Search {
+    state.status = search_apply(state.document, &compiled, state.extend, app.input_state.search_backwards)
+  }
+  else if app.prompt_state.panel == Panel.Keep || app.prompt_state.panel == Panel.Remove {
+    state.status = filter_selections(state.document, &compiled, app.prompt_state.panel == Panel.Remove)
+  }
+  else {
+    state.status = select_matches(state.document, &compiled, app.prompt_state.panel == Panel.Split)
+  }
+}
+fn search_submit(app: *App) {
+  search_preview(app)
+  if app.prompt_state.length == 0 || app.search_state.status != 0 {
+    return
+  }
+  if app.prompt_state.panel == Panel.Search {
+    app.search_history.length = copy_text(app.search_history.text[..], app.prompt_state.text[..app.prompt_state.length])
+  }
+  search_close(app)
+  vim_after_search(app)
+}
+fn search_repeat(app: *App, backwards: bool, explorer: bool) {
+  if app.search_history.length == 0 {
+    return
+  }
+  doc := app.documents.current
+  extending := app.view.extend
+  if explorer {
+    doc = app.explorer.document
+    extending = app.explorer.extend
+  }
+  compiled := pattern.open(app.search_history.text[..app.search_history.length])
+  defer pattern.close(&compiled)
+  if !compiled.ok {
+    return
+  }
+  result := search_apply(doc, &compiled, extending, backwards)
+  if result != 0 {
+    notice(app, "No match, or search exceeded its work limit.")
+  }
+}
+fn search_label(app: *const App) []const u8 {
+  if app.prompt_state.length == 0 {
+    return "Type a regular expression. Escape cancels."
+  }
+  if app.search_state.status == 1 {
+    return "No matches. Edit pattern or Escape to cancel."
+  }
+  if app.search_state.status == 2 {
+    return "Invalid regular expression. Edit pattern or Escape to cancel."
+  }
+  if app.search_state.status == 3 {
+    return "Pattern exceeded its work limit. Try a simpler expression."
+  }
+  if app.search_state.status == 4 {
+    return "More than 32 selections. Narrow the pattern; selection unchanged."
+  }
+  return "Enter accepts. Escape restores the original selection."
+}
+
+fn filter_selections(doc: *buffer.Document, compiled: *pattern.Pattern, remove: bool) u8 {
+  originals: [32]buffer.Selection = []
+  originals[0] = buffer.Selection{cursor: doc.cursor, anchor: doc.anchor}
+  index: usize = 0
+  for index < doc.secondary.count {
+    originals[index + 1] = doc.secondary.ranges[index]
+    index += 1
+  }
+  output: [32]buffer.Selection = []
+  count: usize = 0
+  index = 0
+  for index <= doc.secondary.count {
+    selected := originals[index]
+    low := selected.anchor
+    high := selected.cursor
+    if low > high {
+      low = selected.cursor
+      high = selected.anchor
+    }
+    found := pattern.find(compiled, doc.bytes[low..high], 0)
+    if found.error {
+      return 3
+    }
+    if found.found != remove {
+      output[count] = selected
+      count += 1
+    }
+    index += 1
+  }
+  if count == 0 {
+    return 1
+  }
+  doc.cursor = output[0].cursor
+  doc.anchor = output[0].anchor
+  doc.secondary.count = count - 1
+  doc.goal_valid = false
+  index = 1
+  for index < count {
+    doc.secondary.ranges[index - 1] = output[index]
+    index += 1
+  }
+  return 0
+}

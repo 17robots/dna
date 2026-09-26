@@ -1,0 +1,129 @@
+// Input-to-SDL-present timings, with deterministic bounded-layout assertions.
+extern fn line_skip "TTF_GetFontLineSkip"(font: rawptr) i32
+extern fn output_size "SDL_GetRenderOutputSize"(renderer: rawptr, width, height: *i32) bool
+extern fn ticks "SDL_GetTicksNS"() u64
+document: rawptr = nil
+document_font: rawptr = nil
+document_renderer: rawptr = nil
+step: u32 = 0
+samples: u32 = 0
+updates: u32 = 0
+largest_rows: u32 = 0
+started: u64 = 0
+total: u64 = 0
+maximum: u64 = 0
+moving: bool = false
+last_offset: i32 = 0
+pub fn TTF_CreateText(engine: rawptr, font: rawptr, text: *const u8, length: usize) rawptr {
+  next := #cast(*fn(rawptr, rawptr, *const u8, usize) rawptr) probe_next("TTF_CreateText\0")
+  result := next(engine, font, text, length)
+  if document == nil {
+    document = result
+    document_font = font
+  }
+  return result
+}
+pub fn SDL_CreateRenderer(window: rawptr, name: *const u8) rawptr {
+  next := #cast(*fn(rawptr, *const u8) rawptr) probe_next("SDL_CreateRenderer\0")
+  document_renderer = next(window, name)
+  return document_renderer
+}
+pub fn TTF_SetTextString(text: rawptr, string: *const u8, length: usize) bool {
+  if text != document {
+    rows: u32 = 1
+    for i in 0..length {
+      if string[..length][i] == 10 {
+        rows += 1
+      }
+    }
+    if rows > largest_rows {
+      largest_rows = rows
+    }
+    width: i32 = 0
+    height: i32 = 0
+    line := line_skip(document_font)
+    probe_check(line > 0 && output_size(document_renderer, &width, &height), "FAIL: viewport measurement")
+    budget := #cast(u32) (height / line) + 4
+    if rows > budget {
+      probe_log("FAIL: shaped ")
+      probe_number(#cast(u64) rows)
+      probe_log(" rows for a small viewport\n")
+      probe_exit(1)
+    }
+    updates += 1
+  }
+  next := #cast(*fn(rawptr, *const u8, usize) bool) probe_next("TTF_SetTextString\0")
+  return next(text, string, length)
+}
+pub fn TTF_GetTextSubString(text: rawptr, offset: i32, substring: rawptr) bool {
+  if text != document {
+    last_offset = offset
+  }
+  next := #cast(*fn(rawptr, i32, rawptr) bool) probe_next("TTF_GetTextSubString\0")
+  return next(text, offset, substring)
+}
+pub fn SDL_WaitEventTimeout(event: rawptr, milliseconds: i32) bool {
+  if step == 0 {
+    moving = probe_env("DNA_LATENCY_MOVE\0") != nil
+    if moving {
+      probe_key(1073741903)
+    } else {
+      probe_key(105)
+    }
+  } else {
+    if moving {
+      probe_key(1073741905)
+    }
+    else {
+      input := ProbeEvent{}
+      pointer := #cast(rawptr) &input
+      probe_kind(pointer).* = 771
+      text: []const u8 = "x\0"
+      (#cast(**const u8) (#cast(usize) pointer + 24)).* = &text[0]
+      probe_check(probe_push(pointer), "text push failed")
+    }
+    started = ticks()
+  }
+  step += 1
+  next := #cast(*fn(rawptr, i32) bool) probe_next("SDL_WaitEventTimeout\0")
+  return next(event, milliseconds)
+}
+fn milliseconds(nanoseconds: u64) {
+  hundredths := (nanoseconds + 5000) / 10000
+  probe_number(hundredths / 100)
+  probe_log(".")
+  if hundredths % 100 < 10 {
+    probe_log("0")
+  }
+  probe_number(hundredths % 100)
+}
+pub fn SDL_RenderPresent(renderer: rawptr) bool {
+  next := #cast(*fn(rawptr) bool) probe_next("SDL_RenderPresent\0")
+  result := next(renderer)
+  if started != 0 {
+    elapsed := ticks() - started
+    total += elapsed
+    if elapsed > maximum {
+      maximum = elapsed
+    }
+    started = 0
+    samples += 1
+    if samples == 60 {
+      if moving {
+        probe_log("movement")
+      } else {
+        probe_log("typing")
+      }
+      probe_log(": mean ")
+      milliseconds(total / #cast(u64) samples)
+      probe_log(" ms, max ")
+      milliseconds(maximum)
+      probe_log(" ms, layout <= ")
+      probe_number(#cast(u64) largest_rows)
+      probe_log(" rows\n")
+      probe_check(updates != 0 && last_offset > 0 && (moving || (updates >= 2 && last_offset == 60)), "FAIL: input did not reach document geometry")
+      probe_exit(0)
+    }
+  }
+  return result
+}

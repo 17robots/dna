@@ -1,0 +1,521 @@
+struct Views {
+  panes: [15]Pane,
+  // Presentation waits for the display's vertical blank when vsync is on;
+  // otherwise animated frames are paced from the display refresh interval.
+  vsync: bool,
+  vsync_supported: bool,
+  refresh_ms: f32,
+  focused: usize,
+  revision: u64,
+  scroll_x: f32,
+  scroll_y: f32,
+  popup_width: f32 = 0.64,
+  popup_height: f32 = 0.56,
+  pane_ready: bool,
+  insert: bool,
+  extend: bool,
+  line_numbers: bool,
+  relative_numbers: bool,
+  status_line: bool,
+  highlight_line: bool,
+  reduced_motion: bool,
+  animation: Animation,
+}
+// Split tree contains views only. Slots retain ownership of text and history.
+struct Pane {
+  scroll_x: f32,
+  scroll_y: f32,
+  split_fraction: f32,
+  used: bool,
+  branch: bool,
+  vertical: bool,
+  insert: bool,
+  extend: bool,
+  parent: usize,
+  first: usize,
+  second: usize,
+  slot: usize,
+  secondary_count: usize,
+  rect: sdl.PixelRect,
+}
+
+fn pane_init(app: *App) {
+  if app.view.pane_ready {
+    return
+  }
+  app.view.pane_ready = true
+  app.view.focused = 0
+  app.view.panes[0].used = true
+  app.view.panes[0].slot = app.documents.active
+  pane_store(app)
+}
+fn pane_store(app: *App) {
+  if !app.view.pane_ready || app.documents.current == nil {
+    return
+  }
+  pane := &app.view.panes[app.view.focused]
+  pane.slot = app.documents.active
+  pane.scroll_x = app.view.scroll_x
+  pane.scroll_y = app.view.scroll_y
+  pane.insert = app.view.insert
+  pane.extend = app.view.extend
+  pane.secondary_count = app.documents.current.secondary.count
+  for extra in 0..pane.secondary_count {
+    selection := app.documents.current.secondary.ranges[extra]
+    offset := #cast(usize) 32 + app.view.focused * 64 + extra * 2
+    app.documents.current.marks[offset] = selection.cursor
+    app.documents.current.marks[offset + 1] = selection.anchor
+  }
+  app.documents.current.marks[app.view.focused * 2] = app.documents.current.cursor
+  app.documents.current.marks[app.view.focused * 2 + 1] = app.documents.current.anchor
+}
+fn pane_load(app: *App, index: usize) {
+  pane := &app.view.panes[index]
+  slot := &app.documents.slots[pane.slot]
+  app.documents.active = pane.slot
+  app.documents.current = slot.document
+  app.documents.file = &slot.file
+  app.view.scroll_x = pane.scroll_x
+  app.view.scroll_y = pane.scroll_y
+  app.view.insert = pane.insert
+  app.view.extend = pane.extend
+  app.documents.current.secondary.count = pane.secondary_count
+  for extra in 0..pane.secondary_count {
+    offset := #cast(usize) 32 + index * 64 + extra * 2
+    app.documents.current.secondary.ranges[extra] = buffer.Selection{cursor: buffer.boundary(app.documents.current, app.documents.current.marks[offset]), anchor: buffer.boundary(app.documents.current, app.documents.current.marks[offset + 1])}
+  }
+  app.documents.current.cursor = buffer.boundary(app.documents.current, app.documents.current.marks[index * 2])
+  app.documents.current.anchor = buffer.boundary(app.documents.current, app.documents.current.marks[index * 2 + 1])
+}
+fn pane_focus(app: *App, index: usize) {
+  terminal_escape_flush(app)
+  terminal_mode(app).goto_pending = false
+  pane_store(app)
+  buffer.checkpoint(app.documents.current)
+  app.view.focused = index
+  pane_load(app, index)
+  app.prompt_state.panel = Panel.None
+  app.view.revision += 1
+}
+fn pane_split(app: *App, vertical: bool) {
+  pane_init(app)
+  pane_store(app)
+  first: usize = 15
+  second: usize = 15
+  for index in 0..15 {
+    if !app.view.panes[index].used {
+      if first == 15 {
+        first = index
+      } else {
+        second = index
+        break
+      }
+    }
+  }
+  if second == 15 {
+    notice(app, "Window limit reached (8). Close a window first.")
+    return
+  }
+  parent := app.view.focused
+  original := app.view.panes[parent]
+  app.view.panes[first] = original
+  app.view.panes[second] = original
+  app.view.panes[first].parent = parent
+  app.view.panes[second].parent = parent
+  app.view.panes[parent].branch = true
+  app.view.panes[parent].split_fraction = app.config.split_ratio
+  if app.view.panes[parent].split_fraction < 0.1 {
+    app.view.panes[parent].split_fraction = 0.5
+  }
+  app.view.panes[parent].vertical = vertical
+  app.view.panes[parent].first = first
+  app.view.panes[parent].second = second
+  app.documents.current.marks[first * 2] = app.documents.current.cursor
+  app.documents.current.marks[first * 2 + 1] = app.documents.current.anchor
+  app.documents.current.marks[second * 2] = app.documents.current.cursor
+  app.documents.current.marks[second * 2 + 1] = app.documents.current.anchor
+  pane_layout(app, parent, original.rect)
+  if app.config.equalize_splits {
+    pane_balance(app)
+  }
+  app.view.focused = first
+  pane_store(app)
+  app.view.focused = second
+  pane_store(app)
+  app.prompt_state.panel = Panel.None
+  app.view.revision += 1
+}
+fn pane_only(app: *App) {
+  pane_init(app)
+  pane_store(app)
+  current := app.view.panes[app.view.focused]
+  for index in 0..15 {
+    app.view.panes[index].used = false
+  }
+  app.view.panes[0] = current
+  app.view.panes[0].parent = 0
+  app.view.focused = 0
+  pane_store(app)
+  app.prompt_state.panel = Panel.None
+  app.view.revision += 1
+}
+fn pane_close(app: *App) {
+  pane_init(app)
+  pane_remove(app, app.view.focused)
+  app.prompt_state.panel = Panel.None
+}
+fn pane_remove(app: *App, closing: usize) {
+  if closing == 0 {
+    return
+  }
+  pane_store(app)
+  parent := app.view.panes[closing].parent
+  sibling := app.view.panes[parent].first
+  if sibling == closing {
+    sibling = app.view.panes[parent].second
+  }
+  parent_rect := app.view.panes[parent].rect
+  grandparent := app.view.panes[parent].parent
+  app.view.panes[parent] = app.view.panes[sibling]
+  app.view.panes[parent].parent = grandparent
+  app.view.panes[closing].used = false
+  app.view.panes[sibling].used = false
+  if app.view.panes[parent].branch {
+    app.view.panes[app.view.panes[parent].first].parent = parent
+    app.view.panes[app.view.panes[parent].second].parent = parent
+  } else {
+    doc := app.documents.slots[app.view.panes[parent].slot].document
+    for extra in 0..app.view.panes[parent].secondary_count {
+      from := #cast(usize) 32 + sibling * 64 + extra * 2
+      to := #cast(usize) 32 + parent * 64 + extra * 2
+      doc.marks[to] = doc.marks[from]
+      doc.marks[to + 1] = doc.marks[from + 1]
+    }
+    doc.marks[parent * 2] = doc.marks[sibling * 2]
+    doc.marks[parent * 2 + 1] = doc.marks[sibling * 2 + 1]
+  }
+  pane_layout(app, parent, parent_rect)
+  if app.config.equalize_splits {
+    pane_balance(app)
+  }
+  destination := app.view.focused
+  if destination == closing {
+    destination = parent
+    for app.view.panes[destination].branch {
+      destination = app.view.panes[destination].first
+    }
+  }
+  else if destination == sibling {
+    destination = parent
+  }
+  app.view.focused = destination
+  pane_load(app, destination)
+  app.view.revision += 1
+}
+fn pane_layout(app: *App, index: usize, rect: sdl.PixelRect) {
+  pane := &app.view.panes[index]
+  pane.rect = rect
+  if !pane.branch {
+    return
+  }
+  first := rect
+  second := rect
+  if pane.vertical {
+    first.width = #cast(i32) (#cast(f32) rect.width * pane.split_fraction)
+    second.x += first.width
+    second.width -= first.width
+  }
+  else {
+    first.height = #cast(i32) (#cast(f32) rect.height * pane.split_fraction)
+    second.y += first.height
+    second.height -= first.height
+  }
+  pane_layout(app, pane.first, first)
+  pane_layout(app, pane.second, second)
+}
+fn pane_direction(app: *App, key: u32) {
+  pane_init(app)
+  current := app.view.panes[app.view.focused].rect
+  cx := current.x + current.width / 2
+  cy := current.y + current.height / 2
+  chosen := app.view.focused
+  best: i32 = 2147483647
+  index: usize = 0
+  for index < 15 {
+    pane := &app.view.panes[index]
+    if pane.used && !pane.branch && index != app.view.focused {
+      x := pane.rect.x + pane.rect.width / 2
+      y := pane.rect.y + pane.rect.height / 2
+      dx := x - cx
+      dy := y - cy
+      eligible := (key == KeyH && dx < 0) || (key == KeyL && dx > 0) || (key == KeyK && dy < 0) || (key == KeyJ && dy > 0)
+      if dx < 0 {
+        dx = -dx
+      }
+      if dy < 0 {
+        dy = -dy
+      }
+      distance := dx + dy
+      if eligible && distance < best {
+        best = distance
+        chosen = index
+      }
+    }
+    index += 1
+  }
+  pane_focus(app, chosen)
+}
+fn window_key(app: *App, key: u32) {
+  if key == KeyLeft {
+    pane_direction(app, 104)
+    return
+  }
+  if key == KeyRight {
+    pane_direction(app, 108)
+    return
+  }
+  if key == KeyUp {
+    pane_direction(app, 107)
+    return
+  }
+  if key == KeyDown {
+    pane_direction(app, 106)
+    return
+  }
+  if key == KeyEquals {
+    pane_equalize(app)
+  }
+  else if key == KeyV {
+    pane_split(app, true)
+  }
+  else if key == KeyS {
+    pane_split(app, false)
+  }
+  else if key == KeyC || key == KeyQ {
+    pane_close(app)
+  }
+  else if key == KeyO {
+    pane_only(app)
+  }
+  else if key == KeyH || key == KeyJ || key == KeyK || key == KeyL {
+    pane_direction(app, key)
+  }
+  else if key == KeyW {
+    pane_init(app)
+    for step in 1..15 {
+      index := (app.view.focused + step) % 15
+      if app.view.panes[index].used && !app.view.panes[index].branch {
+        pane_focus(app, index)
+        return
+      }
+    }
+    app.prompt_state.panel = Panel.None
+  }
+}
+fn window_hint(index: usize) KeyHint {
+  if index == 0 {
+    return KeyHint{key: "v", label: "split vertically"}
+  }
+  if index == 1 {
+    return KeyHint{key: "s", label: "split horizontally"}
+  }
+  if index == 2 {
+    return KeyHint{key: "h", label: "focus left"}
+  }
+  if index == 3 {
+    return KeyHint{key: "l", label: "focus right"}
+  }
+  if index == 4 {
+    return KeyHint{key: "k", label: "focus above"}
+  }
+  if index == 5 {
+    return KeyHint{key: "j", label: "focus below"}
+  }
+  if index == 6 {
+    return KeyHint{key: "w", label: "next window"}
+  }
+  if index == 7 {
+    return KeyHint{key: "c", label: "close window"}
+  }
+  if index == 8 {
+    return KeyHint{key: "o", label: "only this window"}
+  }
+  return KeyHint{key: "=", label: "equalize splits"}
+}
+
+// Split the view, then give the new view its own empty document.
+fn pane_new(app: *App, vertical: bool) {
+  if app.documents.count >= 16 {
+    notice(app, "Buffer limit reached (16). Close a buffer first.")
+    return
+  }
+  pane_init(app)
+  previous := app.view.focused
+  pane_split(app, vertical)
+  if app.view.focused == previous {
+    return
+  }
+  if !new_buffer(app) {
+    pane_close(app)
+    notice(app, "Cannot allocate a new buffer; split cancelled.")
+  }
+}
+
+fn pane_remove_terminal(app: *App, slot: usize) {
+  if !app.view.pane_ready {
+    return
+  }
+  index: usize = 1
+  for index < 15 {
+    if app.view.panes[index].used && !app.view.panes[index].branch && app.view.panes[index].slot == slot {
+      pane_remove(app, index)
+      index = 1
+    }
+    else {
+      index += 1
+    }
+  }
+}
+
+// Resize the nearest split containing the focused view. Percent describes the
+// focused side, so a bottom terminal uses :resize 25 for a quarter-height pane.
+fn pane_resize(app: *App, percent: f32) {
+  pane_init(app)
+  if app.view.focused == 0 {
+    notice(app, "Split the window before resizing a pane.")
+    return
+  }
+  if percent < 10.0 || percent > 90.0 {
+    notice(app, "Pane size must be between 10 and 90 percent.")
+    return
+  }
+  parent := app.view.panes[app.view.focused].parent
+  fraction := percent / 100.0
+  if app.view.panes[parent].second == app.view.focused {
+    fraction = 1.0 - fraction
+  }
+  app.view.panes[parent].split_fraction = fraction
+  pane_layout(app, parent, app.view.panes[parent].rect)
+  app.prompt_state.panel = Panel.None
+  app.view.revision += 1
+}
+// Panes side by side along an axis: splits along it add up, splits across
+// it count as their widest part. Three columns take a third each, even when
+// the tree nests them as (a | (b | c)).
+fn pane_terminal(app: *const App, index: usize) bool {
+  pane := &app.view.panes[index]
+  return !pane.branch && app.documents.slots[pane.slot].terminal.handle != nil
+}
+fn pane_weight(app: *const App, index: usize, vertical: bool) usize {
+  pane := &app.view.panes[index]
+  if !pane.branch {
+    return 1
+  }
+  // A terminal split keeps its own height; its partner carries the weight.
+  if pane_terminal(app, pane.first) {
+    return pane_weight(app, pane.second, vertical)
+  }
+  if pane_terminal(app, pane.second) {
+    return pane_weight(app, pane.first, vertical)
+  }
+  first := pane_weight(app, pane.first, vertical)
+  second := pane_weight(app, pane.second, vertical)
+  if pane.vertical == vertical {
+    return first + second
+  }
+  if first > second {
+    return first
+  }
+  return second
+}
+fn pane_balance(app: *App) {
+  for index in 0..15 {
+    pane := &app.view.panes[index]
+    if pane.used && pane.branch && !pane_terminal(app, pane.first) && !pane_terminal(app, pane.second) {
+      first := pane_weight(app, pane.first, pane.vertical)
+      second := pane_weight(app, pane.second, pane.vertical)
+      pane.split_fraction = #cast(f32) first / #cast(f32) (first + second)
+    }
+  }
+  pane_layout(app, 0, app.view.panes[0].rect)
+}
+fn pane_equalize(app: *App) {
+  pane_init(app)
+  pane_balance(app)
+  app.prompt_state.panel = Panel.None
+  app.view.revision += 1
+}
+
+// Visibility is independent of ownership: hidden buffers still process updates.
+fn slot_visible(app: *const App, slot: usize) bool {
+  if app.documents.active == slot {
+    return true
+  }
+  if app.prompt_state.panel == Panel.Terminal && app.terminal_state.slot == slot {
+    return true
+  }
+  for index in 0..15 {
+    pane := &app.view.panes[index]
+    if pane.used && !pane.branch && pane.slot == slot {
+      return true
+    }
+  }
+  return false
+}
+const SplitBase: usize = 2000000
+// Draggable handles on split borders; they highlight on hover and while
+// dragged. Double-click equalizes a split.
+fn draw_split_handles(renderer: rawptr, app: *App, typography: *Typography, width: i32, height: i32) {
+  ui := &app.ui
+  ui_panel_begin(ui, typography)
+  scale := typography.scale
+  grip := 6.0 * scale
+  for index in 0..15 {
+    pane := &app.view.panes[index]
+    if pane.used && pane.branch {
+      first := app.view.panes[pane.first].rect
+      handle := ui_make(ui, ui_hash_number(ui_hash(0, "split"), index), UiFloating | UiClickable | UiHover)
+      ui.boxes[handle].value = SplitBase + index
+      if pane.vertical {
+        ui.boxes[handle].floating[0] = #cast(f32) (first.x + first.width) - grip * 0.5
+        ui.boxes[handle].floating[1] = #cast(f32) pane.rect.y
+        ui_size(ui, handle, UiAxisX, UiSizeKind.Pixels, grip / scale, 1.0)
+        ui_size(ui, handle, UiAxisY, UiSizeKind.Pixels, #cast(f32) pane.rect.height / scale, 1.0)
+      }
+      else {
+        ui.boxes[handle].floating[0] = #cast(f32) pane.rect.x
+        ui.boxes[handle].floating[1] = #cast(f32) (first.y + first.height) - grip * 0.5
+        ui_size(ui, handle, UiAxisX, UiSizeKind.Pixels, #cast(f32) pane.rect.width / scale, 1.0)
+        ui_size(ui, handle, UiAxisY, UiSizeKind.Pixels, grip / scale, 1.0)
+      }
+      ui_animate(app, ui, handle, ui.split_drag == index + 1)
+      ui_layout(ui)
+      ui_render(renderer, ui, typography, width, height)
+    }
+  }
+}
+fn split_drag_move(app: *App, x: f32, y: f32) {
+  if app.ui.split_drag == 0 {
+    return
+  }
+  pane := &app.view.panes[app.ui.split_drag - 1]
+  if !pane.used || !pane.branch {
+    app.ui.split_drag = 0
+    return
+  }
+  fraction: f32 = 0.5
+  if pane.vertical && pane.rect.width > 0 {
+    fraction = (x - #cast(f32) pane.rect.x) / #cast(f32) pane.rect.width
+  }
+  else if !pane.vertical && pane.rect.height > 0 {
+    fraction = (y - #cast(f32) pane.rect.y) / #cast(f32) pane.rect.height
+  }
+  if fraction < 0.1 {
+    fraction = 0.1
+  }
+  if fraction > 0.9 {
+    fraction = 0.9
+  }
+  pane.split_fraction = fraction
+  app.ui.redraw = true
+}

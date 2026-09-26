@@ -1,0 +1,372 @@
+// Drive settled editor frames through the real scheduler; capture and time them.
+step: u32 = 0
+frames: u32 = 0
+animated_frames: u32 = 0
+frame_started: u64 = 0
+worst_ns: u64 = 0
+total_ns: u64 = 0
+capture_next: bool = false
+capture_name: []const u8 = ""
+extern fn palette_ticks "SDL_GetTicksNS"() u64
+extern fn palette_pixels "SDL_RenderReadPixels"(renderer: rawptr, rect: rawptr) rawptr
+extern fn palette_save "SDL_SaveBMP"(surface: rawptr, path: *const u8) bool
+extern fn palette_destroy "SDL_DestroySurface"(surface: rawptr)
+extern fn palette_length "strlen"(text: *const u8) usize
+fn palette_motion(x: f32, y: f32, buttons: u32) {
+  event := ProbeEvent{}
+  pointer := #cast(rawptr) &event
+  probe_kind(pointer).* = 1024
+  probe_u32(pointer, 24).* = buttons
+  probe_float(pointer, 28).* = x
+  probe_float(pointer, 32).* = y
+  probe_check(probe_push(pointer), "motion push")
+}
+fn palette_wheel(amount: f32, x: f32, y: f32) {
+  event := ProbeEvent{}
+  pointer := #cast(rawptr) &event
+  probe_kind(pointer).* = 1027
+  probe_float(pointer, 28).* = amount
+  probe_float(pointer, 36).* = x
+  probe_float(pointer, 40).* = y
+  probe_check(probe_push(pointer), "wheel push")
+}
+fn palette_button(down: bool, x: f32, y: f32, clicks: u8) {
+  event := ProbeEvent{}
+  pointer := #cast(rawptr) &event
+  probe_kind(pointer).* = 1026
+  if down {
+    probe_kind(pointer).* = 1025
+    probe_byte(pointer, 25).* = 1
+  }
+  probe_byte(pointer, 24).* = 1
+  probe_byte(pointer, 26).* = clicks
+  probe_float(pointer, 28).* = x
+  probe_float(pointer, 32).* = y
+  probe_check(probe_push(pointer), "button push")
+}
+fn palette_capture(name: []const u8) {
+  capture_name = name
+  capture_next = true
+}
+fn palette_report(label: []const u8, timings: bool) {
+  probe_log(label)
+  probe_log(": ")
+  probe_number(#cast(u64) frames)
+  probe_log(" frames")
+  if timings {
+    probe_log(" (")
+    probe_number(#cast(u64) animated_frames)
+    probe_log(" animated), mean ")
+    mean: f64 = 0.0
+    if frames > 0 {
+      mean = #cast(f64) total_ns / 1000000.0 / #cast(f64) frames
+    }
+    probe_decimal(mean)
+    probe_log(" ms, worst ")
+    probe_decimal(#cast(f64) worst_ns / 1000000.0)
+    probe_log(" ms")
+  }
+  probe_log("\n")
+  probe_exit(0)
+}
+pub fn SDL_RenderPresent(renderer: rawptr) bool {
+  now := palette_ticks()
+  if frame_started != 0 {
+    spent := now - frame_started
+    total_ns += spent
+    if spent > worst_ns {
+      worst_ns = spent
+    }
+  }
+  frames += 1
+  if capture_next {
+    capture_next = false
+    directory := probe_env("DNA_PALETTE_CAPTURE\0")
+    if directory != nil {
+      path: [4096]u8 = []
+      prefix := directory[..palette_length(directory)]
+      used: usize = 0
+      chunks: [4][]const u8 = [prefix, "/palette-", capture_name, ".bmp"]
+      for chunk in chunks {
+        probe_check(#len(chunk) < 4096 - used, "capture path length")
+        for byte in chunk {
+          path[used] = byte
+          used += 1
+        }
+      }
+      surface := palette_pixels(renderer, nil)
+      if surface == nil || !palette_save(surface, &path[0]) {
+        probe_exit(4)
+      }
+      palette_destroy(surface)
+    }
+  }
+  next := #cast(*fn(rawptr) bool) probe_next("SDL_RenderPresent\0")
+  return next(renderer)
+}
+pub fn SDL_RenderClear(renderer: rawptr) bool {
+  frame_started = palette_ticks()
+  next := #cast(*fn(rawptr) bool) probe_next("SDL_RenderClear\0")
+  return next(renderer)
+}
+pub fn SDL_WaitEventTimeout(event: rawptr, milliseconds: i32) bool {
+  if milliseconds < 100 {
+    animated_frames += 1
+  }
+  else if probe_env("DNA_UI_RUN\0") != nil {
+    current := step
+    step += 1
+    if current == 0 {
+      probe_key(58)
+      probe_text("run htop\0")
+      probe_key(13)
+    }
+    else if current == 1 {
+      probe_delay(800)
+      probe_key(0)
+    }
+    else if current == 2 {
+      palette_capture("run-htop")
+      probe_key(113)
+      probe_text("q\0")
+    }
+    else if current == 3 {
+      probe_delay(400)
+      probe_key(0)
+    }
+    else if current == 4 {
+      palette_capture("run-after-q")
+      probe_key(113)
+      probe_text("q\0")
+    }
+    else if current == 5 {
+      probe_delay(300)
+      probe_key(0)
+    }
+    else if current == 6 {
+      palette_capture("run-after-second-q")
+      probe_key(0)
+    }
+    else {
+      palette_report("run", false)
+    }
+  }
+  else if probe_env("DNA_UI_TERMINAL\0") != nil {
+    current := step
+    step += 1
+    if current == 0 {
+      probe_key(32)
+      probe_key(116)
+    }
+    else if current == 1 {
+      probe_delay(400)
+      probe_key(0)
+    }
+    else if current == 2 {
+      palette_capture("terminal-open")
+      program := probe_env("DNA_TERMINAL_PROGRAM\0")
+      if program != nil {
+        probe_text(program[..palette_length(program) + 1])
+      } else {
+        probe_text("less README.md\0")
+      }
+      probe_key(13)
+    }
+    else if current == 3 {
+      probe_delay(600)
+      probe_key(0)
+    }
+    else if current == 4 {
+      palette_capture("terminal-less")
+      probe_key(113)
+      probe_text("q\0")
+    }
+    else if current == 5 {
+      probe_delay(400)
+      probe_key(0)
+    }
+    else if current == 6 {
+      palette_capture("terminal-after-q")
+      probe_key(0)
+    }
+    else {
+      palette_report("terminal", false)
+    }
+  }
+  else if probe_env("DNA_UI_PANES\0") != nil {
+    current := step
+    step += 1
+    if current == 0 {
+      probe_key_mod(119, 64)
+      probe_key(118)
+    }
+    else if current == 1 {
+      palette_motion(110.0, 750.0, 0)
+    }
+    else if current == 2 {
+      palette_capture("status-hover")
+      probe_key(0)
+    }
+    else if current == 3 {
+      palette_button(true, 550.0, 300.0, 1)
+      palette_motion(360.0, 300.0, 1)
+    }
+    else if current == 4 {
+      palette_capture("split-dragging")
+      probe_key(0)
+    }
+    else if current == 5 {
+      palette_button(false, 360.0, 300.0, 0)
+      palette_motion(700.0, 300.0, 0)
+    }
+    else if current == 6 {
+      palette_capture("split-resized")
+      probe_key(0)
+    }
+    else {
+      palette_report("panes", true)
+    }
+  }
+  else if probe_env("DNA_UI_DIALOGS\0") != nil {
+    current := step
+    step += 1
+    if current == 0 {
+      probe_key(105)
+      probe_text("edited \0")
+    }
+    else if current == 1 {
+      probe_key(27)
+    }
+    else if current == 2 {
+      probe_key(0)
+    }
+    else if current == 3 {
+      probe_key_mod(113, 64)
+    }
+    else if current == 4 {
+      palette_capture("quit-dialog")
+      probe_key(0)
+    }
+    else if current == 5 {
+      probe_key(99)
+      probe_key(58)
+      probe_text("pwd\0")
+      probe_key(13)
+    }
+    else if current == 6 {
+      palette_capture("message")
+      probe_key(0)
+    }
+    else if current == 7 {
+      probe_key(27)
+      probe_key(47)
+      probe_text("DNA\0")
+    }
+    else if current == 8 {
+      palette_capture("search-prompt")
+      probe_key(0)
+    }
+    else {
+      palette_report("dialogs", true)
+    }
+  }
+  else if probe_env("DNA_UI_MENUS\0") != nil {
+    current := step
+    step += 1
+    if current == 0 {
+      probe_key(32)
+    }
+    else if current == 1 {
+      palette_motion(900.0, 640.0, 0)
+    }
+    else if current == 2 {
+      palette_capture("space-menu")
+      probe_key(0)
+    }
+    else if current == 3 {
+      probe_key(27)
+      probe_key(103)
+    }
+    else if current == 4 {
+      palette_capture("goto-menu")
+      probe_key(0)
+    }
+    else if current == 5 {
+      probe_key(27)
+      probe_key(32)
+      probe_key(102)
+    }
+    else if current == 6 {
+      probe_key(1073741905)
+      probe_key(1073741905)
+      palette_motion(200.0, 190.0, 0)
+    }
+    else if current == 7 {
+      palette_capture("picker")
+      probe_key(0)
+    }
+    else if current == 8 {
+      palette_wheel(-3.0, 200.0, 190.0)
+    }
+    else if current == 9 {
+      palette_capture("picker-scrolled")
+      probe_key(0)
+    }
+    else {
+      palette_report("menus", true)
+    }
+  }
+  else {
+    current := step
+    step += 1
+    if current == 0 {
+      probe_key(58)
+    }
+    else if current == 1 {
+      palette_capture("open")
+      probe_key(0)
+    }
+    else if current == 2 {
+      probe_text("t\0")
+    }
+    else if current == 3 {
+      palette_capture("filtered")
+      probe_key(0)
+    }
+    else if current == 4 {
+      probe_key(1073741905)
+      probe_key(1073741905)
+    }
+    else if current == 5 {
+      palette_motion(400.0, 190.0, 0)
+    }
+    else if current == 6 {
+      palette_capture("hover")
+      probe_key(0)
+    }
+    else if current == 7 {
+      palette_wheel(-2.0, 400.0, 190.0)
+    }
+    else if current == 8 {
+      palette_capture("scrolled")
+      probe_key(0)
+    }
+    else if current == 9 {
+      probe_key(8)
+      probe_text("toggle line numbers\0")
+    }
+    else if current == 10 {
+      palette_button(true, 400.0, 128.0, 1)
+      palette_button(false, 400.0, 128.0, 1)
+    }
+    else if current == 11 {
+      palette_capture("clicked")
+      probe_key(0)
+    }
+    else {
+      palette_report("palette", true)
+    }
+  }
+  next := #cast(*fn(rawptr, i32) bool) probe_next("SDL_WaitEventTimeout\0")
+  return next(event, milliseconds)
+}

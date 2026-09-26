@@ -1,0 +1,961 @@
+// PTY ownership and libvterm adapter. Cell bitfields match libvterm's C ABI;
+// renderer ownership lives in terminal_gui.dyn (stubbed for terminal-only builds).
+#link("vterm")
+#link("util")
+struct TermColor { kind, red, green, blue: u8 }
+struct TermCell { chars: [6]u32, width: u8, attributes: u32, fg, bg: TermColor }
+struct TermPos { row, col: i32 }
+struct TermCallbacks {
+  damage, moverect, movecursor: rawptr,
+  property: *fn(i32, *i32, rawptr) i32,
+  bell, resize: rawptr,
+  pushline: *fn(i32, *const TermCell, rawptr) i32,
+  popline, clear: rawptr,
+}
+struct TermReviewCell { cell: TermCell, offset: u32 }
+struct TermReviewRow { start, count, offset: u32 }
+struct Terminal {
+  theme_generation, selection_color, cursor_color: u32,
+  vt, screen: rawptr,
+  pid, fd, exit_fd, rows, cols, exited, status, read_closed: i32,
+  pending: [65536]u8, pending_len: usize,
+  history: *TermCell, history_count, history_head, scroll: i32,
+  glyphs: *rawptr, font, engine: rawptr, points: f32,
+  glyph_chars: *u32, x, y, cw, lh: f32,
+  selection_a, selection_b, selected, mouse_mode: i32,
+  review: *TermReviewCell, review_lines: [2100]TermReviewRow, review_length: usize,
+  review_rows, review_cols, review_cursor_row, review_cursor_col, review_top, review_left: i32,
+  review_low, review_high: usize,
+  cursor_x, cursor_y, cursor_width, cursor_height: f32,
+  cursor_override, cursor_visible: i32,
+}
+extern fn term_new "vterm_new"(rows: i32, cols: i32) rawptr
+extern fn term_free "vterm_free"(vt: rawptr)
+extern fn term_utf8 "vterm_set_utf8"(vt: rawptr, enabled: i32)
+extern fn term_screen "vterm_obtain_screen"(vt: rawptr) rawptr
+extern fn term_state "vterm_obtain_state"(vt: rawptr) rawptr
+extern fn term_altscreen "vterm_screen_enable_altscreen"(screen: rawptr, enabled: i32)
+extern fn term_callbacks "vterm_screen_set_callbacks"(screen: rawptr, callbacks: *const TermCallbacks, state: rawptr)
+extern fn term_default "vterm_state_set_default_colors"(state: rawptr, fg: *const TermColor, bg: *const TermColor)
+extern fn term_get_default "vterm_state_get_default_colors"(state: rawptr, fg: *TermColor, bg: *TermColor)
+extern fn term_screen_default "vterm_screen_set_default_colors"(screen: rawptr, fg: *const TermColor, bg: *const TermColor)
+extern fn term_palette "vterm_state_set_palette_color"(state: rawptr, index: i32, color: *const TermColor)
+extern fn term_reset "vterm_screen_reset"(screen: rawptr, hard: i32)
+extern fn term_output "vterm_output_read"(vt: rawptr, bytes: *u8, size: usize) usize
+extern fn term_input "vterm_input_write"(vt: rawptr, bytes: *const u8, size: usize) usize
+extern fn term_damage "vterm_screen_flush_damage"(screen: rawptr)
+extern fn term_unicode "vterm_keyboard_unichar"(vt: rawptr, cp: u32, mods: i32)
+extern fn term_key "vterm_keyboard_key"(vt: rawptr, key: i32, mods: i32)
+extern fn term_cell "vterm_screen_get_cell"(screen: rawptr, position: TermPos, cell: *TermCell) i32
+extern fn term_size "vterm_set_size"(vt: rawptr, rows: i32, cols: i32)
+extern fn term_rgb "vterm_screen_convert_color_to_rgb"(screen: rawptr, color: *TermColor)
+extern fn term_cursor "vterm_state_get_cursorpos"(state: rawptr, position: *TermPos)
+extern fn term_paste_start "vterm_keyboard_start_paste"(vt: rawptr)
+extern fn term_paste_end "vterm_keyboard_end_paste"(vt: rawptr)
+extern fn term_mouse_move "vterm_mouse_move"(vt: rawptr, row: i32, col: i32, mods: i32)
+extern fn term_mouse_button "vterm_mouse_button"(vt: rawptr, button: i32, pressed: bool, mods: i32)
+extern fn term_forkpty "forkpty"(fd: *i32, name: rawptr, termios: rawptr, size: *const TtySize) i32
+extern fn term_chdir "chdir"(path: *const u8) i32
+extern fn term_exit "_exit"(status: i32)
+extern fn term_execve "execve"(path: *const u8, args: **const u8, environment: **const u8) i32
+
+fn terminal_color(rgb: u32) TermColor {
+  return TermColor{ red: #cast(u8) (rgb >> 16), green: #cast(u8) (rgb >> 8), blue: #cast(u8) rgb }
+}
+fn terminal_rgb(color: TermColor) u32 {
+  return (#cast(u32) color.red << 16) | (#cast(u32) color.green << 8) | #cast(u32) color.blue
+}
+fn terminal_pushline(cols: i32, cells: *const TermCell, user: rawptr) i32 {
+  t := #cast(*Terminal) user
+  base := #cast(usize) t.history_head * 240
+  for col in 0..240 {
+    t.history[..480000][base + col] = TermCell{}
+  }
+  count := cols
+  if count > 240 {
+    count = 240
+  }
+  _ = copy(#cast(*u8) &t.history[..480000][base], #cast(*const u8) cells, #cast(usize) count * #sizeof(TermCell))
+  t.history_head = (t.history_head + 1) % 2000
+  if t.history_count < 2000 {
+    t.history_count += 1
+  }
+  if t.scroll != 0 && t.scroll < t.history_count {
+    t.scroll += 1
+  }
+  return 1
+}
+fn terminal_property(property: i32, value: *i32, user: rawptr) i32 {
+  t := #cast(*Terminal) user
+  if property == 1 {
+    t.cursor_visible = value.*
+  }
+  if property == 8 {
+    t.mouse_mode = value.*
+  }
+  return 1
+}
+terminal_callbacks: TermCallbacks = TermCallbacks{}
+fn terminal_dispose(t: *Terminal) {
+  if t.vt != nil {
+    term_free(t.vt)
+  }
+  dna_memory_free(#cast(rawptr) t.review)
+  dna_memory_free(#cast(rawptr) t.history)
+  dna_memory_free(#cast(rawptr) t.glyphs)
+  dna_memory_free(#cast(rawptr) t.glyph_chars)
+  dna_memory_free(#cast(rawptr) t)
+}
+fn terminal_prefix(text: *const u8, prefix: []const u8) bool {
+  for index in 0..#len(prefix) {
+    if text[..#len(prefix)][#cast(usize) (index)] != prefix[#cast(usize) (index)] {
+      return false
+    }
+  }
+  return true
+}
+pub fn dna_terminal_open(cwd: *const u8, shell: *const u8, command: *const u8) *Terminal {
+  native_initialize()
+  t := #cast(*Terminal) dna_memory_calloc(1, #sizeof(Terminal), 2)
+  if t == nil {
+    return nil
+  }
+  t.fd = -1
+  t.exit_fd = -1
+  t.theme_generation = 4294967295
+  t.selection_color = 3490128
+  t.cursor_color = 9151422
+  t.cursor_visible = 1
+  t.rows = 24
+  t.cols = 80
+  t.history = #cast(*TermCell) dna_memory_calloc(480000, #sizeof(TermCell), 2)
+  t.glyphs = #cast(*rawptr) dna_memory_calloc(24000, #sizeof(rawptr), 2)
+  t.glyph_chars = #cast(*u32) dna_memory_calloc(24000, #sizeof(u32), 2)
+  t.vt = term_new(t.rows, t.cols)
+  if t.history == nil || t.glyphs == nil || t.glyph_chars == nil || t.vt == nil {
+    terminal_dispose(t)
+    return nil
+  }
+  term_utf8(t.vt, 1)
+  t.screen = term_screen(t.vt)
+  term_altscreen(t.screen, 1)
+  term_callbacks(t.screen, &terminal_callbacks, #cast(rawptr) t)
+  fg := terminal_color(13948116)
+  bg := terminal_color(1579032)
+  term_default(term_state(t.vt), &fg, &bg)
+  term_reset(t.screen, 1)
+  size := TtySize{ rows: 24, columns: 80 }
+  env_name: []const u8 = "environ\0"
+  env_pointer := #cast(***const u8) proc_symbol(nil, &env_name[0])
+  if env_pointer == nil {
+    terminal_dispose(t)
+    return nil
+  }
+  environment := env_pointer.*
+  count: usize = 0
+  for environment[..count + 1][count] != nil {
+    count += 1
+  }
+  filtered := #cast(**const u8) dna_memory_calloc(count + 2, #sizeof(rawptr), 2)
+  if filtered == nil {
+    terminal_dispose(t)
+    return nil
+  }
+  kept: usize = 0
+  for index in 0..count {
+    entry := environment[..count][#cast(usize) (index)]
+    if !terminal_prefix(entry, "TERM=") && !terminal_prefix(entry, "COLUMNS=") && !terminal_prefix(entry, "LINES=") {
+      filtered[..count + 2][kept] = entry
+      kept += 1
+    }
+  }
+  term_env: []const u8 = "TERM=xterm-256color\0"
+  interactive: []const u8 = "-i\0"
+  execute: []const u8 = "-c\0"
+  filtered[..count + 2][kept] = &term_env[0]
+  interactive_args: [3]*const u8 = [shell, &interactive[0], nil]
+  command_args: [4]*const u8 = [shell, &execute[0], command, nil]
+  t.pid = term_forkpty(&t.fd, nil, nil, &size)
+  if t.pid < 0 {
+    dna_memory_free(#cast(rawptr) filtered)
+    terminal_dispose(t)
+    return nil
+  }
+  if t.pid == 0 {
+    if term_chdir(cwd) != 0 {
+      term_exit(126)
+    }
+    args := &interactive_args[0]
+    if command != nil && command.* != 0 {
+      args = &command_args[0]
+    }
+    _ = term_execve(shell, args, filtered)
+    term_exit(127)
+  }
+  dna_memory_free(#cast(rawptr) filtered)
+  // PTY hangup may precede waitpid readiness. Watch child exit independently.
+  t.exit_fd = #cast(i32) #syscall(434, t.pid, 0) // pidfd_open, CLOEXEC
+  _ = proc_fcntl(t.fd, 4, proc_fcntl(t.fd, 3, 0) | 2048)
+  _ = proc_fcntl(t.fd, 2, 1)
+  return t
+}
+fn terminal_flush(t: *Terminal) {
+  bytes: [4096]u8 = []
+  for {
+    length := term_output(t.vt, &bytes[0], 4096)
+    if length == 0 {
+      break
+    }
+    if length <= 65536 - t.pending_len {
+      _ = copy(&t.pending[t.pending_len], &bytes[0], length)
+      t.pending_len += length
+    }
+  }
+  for t.pending_len > 0 {
+    sent := rec_write(t.fd, &t.pending[0], t.pending_len)
+    if sent < 0 && rec_errno().* == 4 {
+      continue
+    }
+    if sent <= 0 {
+      break
+    }
+    t.pending_len -= #cast(usize) sent
+    if t.pending_len > 0 {
+      _ = proc_move(&t.pending[0], &t.pending[#cast(usize) sent], t.pending_len)
+    }
+  }
+}
+pub fn dna_terminal_poll(t: *Terminal) i32 {
+  changed: i32 = 0
+  bytes: [8192]u8 = []
+  terminal_flush(t)
+  for attempt in 0..8 {
+    received := proc_read_raw(t.fd, &bytes[0], 8192)
+    if received > 0 {
+      _ = term_input(t.vt, &bytes[0], #cast(usize) received)
+      changed = 1
+    } else {
+      if received == 0 || (received < 0 && rec_errno().* == 5) {
+        t.read_closed = 1
+      }
+      break
+    }
+  }
+  term_damage(t.screen)
+  terminal_flush(t)
+  if t.exited == 0 && proc_wait(t.pid, &t.status, 1) == t.pid {
+    t.exited = 1
+    changed = 1
+  }
+  if t.exit_fd >= 0 {
+    if t.exited == 0 {
+      dna_watch(t.exit_fd, 0)
+    } else {
+      dna_unwatch(t.exit_fd)
+      _ = rec_close(t.exit_fd)
+      t.exit_fd = -1
+    }
+  }
+  if t.exited == 0 && t.read_closed == 0 {
+    writing: i32 = 0
+    if t.pending_len != 0 {
+      writing = 1
+    }
+    dna_watch(t.fd, writing)
+  } else {
+    dna_unwatch(t.fd)
+  }
+  return changed
+}
+pub fn dna_terminal_alive(t: *Terminal) i32 {
+  if t.exited == 0 {
+    return 1
+  }
+  return 0
+}
+pub fn dna_terminal_needs_poll(t: *Terminal) i32 {
+  // Older kernels or descriptor exhaustion still need a bounded exit check.
+  if t.exited == 0 && t.read_closed != 0 && t.exit_fd < 0 {
+    return 1
+  }
+  return 0
+}
+pub fn dna_terminal_text(t: *Terminal, text: *const u8, length: usize) {
+  t.scroll = 0
+  index: usize = 0
+  for index < length {
+    cp := #cast(u32) text[..length][#cast(usize) (index)]
+    index += 1
+    extra: u32 = 0
+    if cp >= 240 {
+      extra = 3
+    } else if cp >= 224 {
+      extra = 2
+    } else if cp >= 192 {
+      extra = 1
+    }
+    if extra > 0 {
+      cp &= (#cast(u32) 1 << (#cast(u32) 6 - extra)) - 1
+    }
+    for part in 0..extra {
+      if index >= length {
+        break
+      }
+      cp = (cp << 6) | #cast(u32) (text[..length][#cast(usize) (index)] & 63)
+      index += 1
+    }
+    term_unicode(t.vt, cp, 0)
+  }
+  terminal_flush(t)
+}
+pub fn dna_terminal_key(t: *Terminal, key: u32, mods: u16) {
+  modifier: i32 = 0
+  t.scroll = 0
+  if (mods & 3) != 0 {
+    modifier |= 1
+  }
+  if (mods & 192) != 0 {
+    modifier |= 4
+  }
+  if (mods & 768) != 0 {
+    modifier |= 2
+  }
+  code: i32 = 0
+  if key == 13 {
+    code = 1
+  }
+  if key == 9 {
+    code = 2
+  }
+  if key == 8 {
+    code = 3
+  }
+  if key == 27 {
+    code = 4
+  }
+  if key == 1073741906 {
+    code = 5
+  }
+  if key == 1073741905 {
+    code = 6
+  }
+  if key == 1073741904 {
+    code = 7
+  }
+  if key == 1073741903 {
+    code = 8
+  }
+  if key == 1073741897 {
+    code = 9
+  }
+  if key == 127 {
+    code = 10
+  }
+  if key == 1073741898 {
+    code = 11
+  }
+  if key == 1073741901 {
+    code = 12
+  }
+  if key == 1073741899 {
+    code = 13
+  }
+  if key == 1073741902 {
+    code = 14
+  }
+  if key >= 1073741882 && key <= 1073741893 {
+    code = #cast(i32) (key - 1073741882 + 257)
+  }
+  if code != 0 {
+    term_key(t.vt, code, modifier)
+  } else if (modifier & 6) != 0 && key < 128 {
+    term_unicode(t.vt, key, modifier)
+  }
+  terminal_flush(t)
+}
+pub fn dna_terminal_scroll(t: *Terminal, amount: i32) {
+  t.scroll += amount
+  if t.scroll < 0 {
+    t.scroll = 0
+  }
+  if t.scroll > t.history_count {
+    t.scroll = t.history_count
+  }
+}
+fn terminal_cell_at(t: *Terminal, row: i32, col: i32) TermCell {
+  cell := TermCell{}
+  if t.review != nil {
+    row += t.review_top
+    col += t.review_left
+    if row < t.review_rows && col < #cast(i32) t.review_lines[#cast(usize) (row)].count {
+      return t.review[..506100][t.review_lines[#cast(usize) (row)].start + #cast(u32) col].cell
+    }
+    term_get_default(term_state(t.vt), &cell.fg, &cell.bg)
+    return cell
+  }
+  if row < t.scroll {
+    index := t.history_head - t.scroll + row
+    for index < 0 {
+      index += 2000
+    }
+    cell = t.history[..480000][#cast(usize) ((index % 2000) * 240 + col)]
+  } else {
+    _ = term_cell(t.screen, TermPos{row: row - t.scroll, col: col}, &cell)
+  }
+  return cell
+}
+fn terminal_encode(cp: u32, text: *u8) usize {
+  if cp < 128 {
+    text.* = #cast(u8) cp
+    return 1
+  }
+  if cp < 2048 {
+    text[..2][0] = #cast(u8) (#cast(u32) 192 | (cp >> 6))
+    text[..2][1] = #cast(u8) (#cast(u32) 128 | (cp & 63))
+    return 2
+  }
+  if cp < 65536 {
+    text[..3][0] = #cast(u8) (#cast(u32) 224 | (cp >> 12))
+    text[..3][1] = #cast(u8) (#cast(u32) 128 | ((cp >> 6) & 63))
+    text[..3][2] = #cast(u8) (#cast(u32) 128 | (cp & 63))
+    return 3
+  }
+  text[..4][0] = #cast(u8) (#cast(u32) 240 | (cp >> 18))
+  text[..4][1] = #cast(u8) (#cast(u32) 128 | ((cp >> 12) & 63))
+  text[..4][2] = #cast(u8) (#cast(u32) 128 | ((cp >> 6) & 63))
+  text[..4][3] = #cast(u8) (#cast(u32) 128 | (cp & 63))
+  return 4
+}
+pub fn dna_terminal_copy(t: *Terminal, text: *u8, capacity: usize) usize {
+  // Four UTF-8 bytes per cell, one newline per row, and the final NUL.
+  if capacity < 96101 {
+    if capacity > 0 {
+      text.* = 0
+    }
+    return 0
+  }
+  used: usize = 0
+  for row in 0..t.rows {
+    start := used
+    for col in 0..t.cols {
+      low := t.selection_a
+      high := t.selection_b
+      if low > high {
+        swap := low
+        low = high
+        high = swap
+      }
+      if t.selected != 0 && (row * t.cols + col < low || row * t.cols + col > high) {
+        continue
+      }
+      cell := terminal_cell_at(t, row, col)
+      cp := cell.chars[0]
+      if cp == 4294967295 {
+        continue
+      }
+      if cp == 0 {
+        cp = 32
+      }
+      used += terminal_encode(cp, &text[..#cast(usize) capacity][used])
+    }
+    for used > start && text[..#cast(usize) capacity][used - 1] == 32 {
+      used -= 1
+    }
+    if used > start {
+      text[..#cast(usize) capacity][used] = 10
+      used += 1
+    }
+  }
+  text[..#cast(usize) capacity][used] = 0
+  return used
+}
+pub fn dna_terminal_resize(t: *Terminal, width: f32, height: f32, cw: f32, lh: f32) i32 {
+  if cw <= 0.0 || lh <= 0.0 {
+    return 0
+  }
+  cols := #cast(i32) (width / cw)
+  rows := #cast(i32) (height / lh)
+  if cols < 2 {
+    cols = 2
+  }
+  if cols > 240 {
+    cols = 240
+  }
+  if rows < 2 {
+    rows = 2
+  }
+  if rows > 100 {
+    rows = 100
+  }
+  if cols != t.cols || rows != t.rows {
+    t.cols = cols
+    t.rows = rows
+    term_size(t.vt, rows, cols)
+    size := TtySize{rows: #cast(u16) rows, columns: #cast(u16) cols}
+    _ = tty_ioctl(t.fd, 21524, #cast(rawptr) &size)
+    return 1
+  }
+  return 0
+}
+// Shared GUI/TUI cell styling preserves reverse video and review selection.
+fn terminal_styled_cell(t: *Terminal, row: i32, col: i32) TermCell {
+  cell := terminal_cell_at(t, row, col)
+  term_rgb(t.screen, &cell.fg)
+  term_rgb(t.screen, &cell.bg)
+  if (cell.attributes & 32) != 0 {
+    swap := cell.fg
+    cell.fg = cell.bg
+    cell.bg = swap
+  }
+  start := t.selection_a
+  end := t.selection_b
+  if start > end {
+    swap := start
+    start = end
+    end = swap
+  }
+  rr := row + t.review_top
+  rc := col + t.review_left
+  selected := false
+  if t.review != nil && rr < t.review_rows && rc < #cast(i32) t.review_lines[#cast(usize) (rr)].count {
+    offset := #cast(usize) t.review[..506100][t.review_lines[#cast(usize) (rr)].start + #cast(u32) rc].offset
+    selected = offset >= t.review_low && offset < t.review_high
+  }
+  if selected || (t.review == nil && t.selected != 0 && row * t.cols + col >= start && row * t.cols + col <= end) {
+    cell.bg = terminal_color(t.selection_color)
+  }
+  return cell
+}
+pub fn dna_terminal_cells(t: *Terminal, output: *u32, capacity: i32, width: f32, height: f32, cw: f32, lh: f32, focused: i32, cursor_col: *i32, cursor_row: *i32) i32 {
+  if (focused & 2) == 0 {
+    _ = dna_terminal_resize(t, width, height, cw, lh)
+  }
+  focused &= 1
+  if t.cols * t.rows * 3 > capacity {
+    return 0
+  }
+  cursor_col.* = -1
+  cursor_row.* = -1
+  if focused != 0 && t.review == nil && t.scroll == 0 && t.cursor_visible != 0 {
+    position := TermPos{}
+    term_cursor(term_state(t.vt), &position)
+    cursor_col.* = position.col
+    cursor_row.* = position.row
+  }
+  for row in 0..t.rows {
+    for col in 0..t.cols {
+      cell := terminal_styled_cell(t, row, col)
+      cp := cell.chars[0]
+      if cp == 4294967295 {
+        cp = 0
+      } else if cp == 0 {
+        cp = 32
+      }
+      cp |= (cell.attributes & 1) << 24
+      cp |= ((cell.attributes >> 3) & 1) << 25
+      underline := (cell.attributes >> 1) & 3
+      if underline != 0 {
+        cp |= 1 << 26
+      }
+      if underline == 3 {
+        cp |= 1 << 27
+      }
+      index := (row * t.cols + col) * 3
+      output[..#cast(usize) capacity][#cast(usize) (index)] = cp
+      output[..#cast(usize) capacity][#cast(usize) (index + 1)] = terminal_rgb(cell.fg)
+      output[..#cast(usize) capacity][#cast(usize) (index + 2)] = terminal_rgb(cell.bg)
+    }
+  }
+  return t.cols | (t.rows << 16)
+}
+pub fn dna_terminal_close(t: *Terminal) {
+  if t == nil {
+    return
+  }
+  dna_unwatch(t.fd)
+  _ = rec_close(t.fd)
+  if t.exit_fd >= 0 {
+    dna_unwatch(t.exit_fd)
+    _ = rec_close(t.exit_fd)
+  }
+  if t.exited == 0 {
+    _ = proc_kill(-t.pid, 1)
+    _ = proc_kill(t.pid, 1)
+    _ = proc_kill(-t.pid, 9)
+    _ = proc_kill(t.pid, 9)
+    _ = proc_wait(t.pid, nil, 0)
+  }
+  terminal_gui_close(t)
+  terminal_dispose(t)
+}
+pub fn dna_terminal_mouse(t: *Terminal, x: f32, y: f32, dragging: i32) {
+  if t.cw <= 0.0 || t.lh <= 0.0 {
+    return
+  }
+  col := #cast(i32) ((x - t.x) / t.cw)
+  row := #cast(i32) ((y - t.y) / t.lh)
+  if col < 0 {
+    col = 0
+  }
+  if col >= t.cols {
+    col = t.cols - 1
+  }
+  if row < 0 {
+    row = 0
+  }
+  if row >= t.rows {
+    row = t.rows - 1
+  }
+  at := row * t.cols + col
+  if dragging == 0 {
+    t.selection_a = at
+  }
+  t.selection_b = at
+  t.selected = 1
+}
+pub fn dna_terminal_paste(t: *Terminal, text: *const u8, length: usize) {
+  term_paste_start(t.vt)
+  dna_terminal_text(t, text, length)
+  term_paste_end(t.vt)
+  terminal_flush(t)
+}
+pub fn dna_terminal_snapshot(t: *Terminal, output: *u8, capacity: usize) usize {
+  used: usize = 0
+  for row in 0..t.rows {
+    for col in 0..t.cols {
+      cell := terminal_cell_at(t, row, col)
+      cp := cell.chars[0]
+      if cp == 4294967295 {
+        continue
+      }
+      if used + 5 >= capacity {
+        return used
+      }
+      if cp == 0 {
+        cp = 32
+      }
+      used += terminal_encode(cp, &output[..#cast(usize) capacity][used])
+    }
+    if used + 2 >= capacity {
+      return used
+    }
+    output[..#cast(usize) capacity][used] = 10
+    used += 1
+  }
+  output[..#cast(usize) capacity][used] = 0
+  return used
+}
+pub fn dna_terminal_log(t: *Terminal, output: *u8, capacity: usize) usize {
+  used: usize = 0
+  row := -t.history_count
+  for row < t.rows {
+    start := used
+    for col in 0..t.cols {
+      cell := TermCell{}
+      if row < 0 {
+        index := (t.history_head + row + 2000) % 2000
+        cell = t.history[..480000][#cast(usize) (index * 240 + col)]
+      } else {
+          _ = term_cell(t.screen, TermPos{row: row, col: col}, &cell)
+        }
+      cp := cell.chars[0]
+      if cp == 4294967295 {
+        continue
+      }
+      if used + 5 >= capacity {
+        output[..#cast(usize) capacity][used] = 0
+        return used
+      }
+      if cp == 0 {
+        cp = 32
+      }
+      used += terminal_encode(cp, &output[..#cast(usize) capacity][used])
+    }
+    for used > start && output[..#cast(usize) capacity][used - 1] == 32 {
+      used -= 1
+    }
+    if used + 2 >= capacity {
+      output[..#cast(usize) capacity][used] = 0
+      return used
+    }
+    output[..#cast(usize) capacity][used] = 10
+    used += 1
+    row += 1
+  }
+  output[..#cast(usize) capacity][used] = 0
+  return used
+}
+pub fn dna_terminal_theme(t: *Terminal, foreground: u32, background: u32, selection: u32, cursor: u32) {
+  current_generation := dna_theme_generation()
+  if t.theme_generation == current_generation {
+    return
+  }
+  t.theme_generation = current_generation
+  t.selection_color = selection
+  t.cursor_color = cursor
+  fg := terminal_color(foreground)
+  bg := terminal_color(background)
+  term_screen_default(t.screen, &fg, &bg)
+  defaults: [16]u32 = [1842204, 11820895, 8035173, 11901792, 7180469, 10584499, 6661027, 13948116, 7368816, 14256264, 10862987, 13811074, 9811159, 12755410, 9618885, 15790320]
+  for index in 0..16 {
+    color := dna_theme_override(#cast(u32) index + 14)
+    if color > 16777215 {
+      color = defaults[#cast(usize) (index)]
+    }
+    value := terminal_color(color)
+    term_palette(term_state(t.vt), #cast(i32) index, &value)
+  }
+}
+pub fn dna_terminal_application_mouse(t: *Terminal, x: f32, y: f32, event: i32, mods: u32) i32 {
+  if t.mouse_mode == 0 || t.scroll != 0 || (mods & 3) != 0 || t.cw <= 0.0 || t.lh <= 0.0 {
+    return 0
+  }
+  col := #cast(i32) ((x - t.x) / t.cw)
+  row := #cast(i32) ((y - t.y) / t.lh)
+  if col < 0 {
+    col = 0
+  }
+  if col >= t.cols {
+    col = t.cols - 1
+  }
+  if row < 0 {
+    row = 0
+  }
+  if row >= t.rows {
+    row = t.rows - 1
+  }
+  modifier: i32 = 0
+  if (mods & 192) != 0 {
+    modifier |= 4
+  }
+  if (mods & 768) != 0 {
+    modifier |= 2
+  }
+  term_mouse_move(t.vt, row, col, modifier)
+  if event != 1 {
+    term_mouse_button(t.vt, 1, event == 0, modifier)
+  }
+  t.selected = 0
+  terminal_flush(t)
+  return 1
+}
+pub fn dna_terminal_review_end(t: *Terminal) {
+  dna_memory_free(#cast(rawptr) t.review)
+  t.review = nil
+  t.review_length = 0
+  t.selected = 0
+}
+fn terminal_history_cell(t: *Terminal, row: i32, col: i32) TermCell {
+  cell := TermCell{}
+  if row < t.history_count {
+    index := (t.history_head - t.history_count + row + 2000) % 2000
+    cell = t.history[..480000][#cast(usize) (index * 240 + col)]
+  } else {
+    _ = term_cell(t.screen, TermPos{row: row - t.history_count, col: col}, &cell)
+  }
+  return cell
+}
+fn terminal_cell_text(cell: TermCell, text: *u8) usize {
+  if cell.chars[0] == 4294967295 {
+    return 0
+  }
+  length: usize = 0
+  for index in 0..6 {
+    if cell.chars[#cast(usize) (index)] == 0 {
+      break
+    }
+    length += terminal_encode(cell.chars[#cast(usize) (index)], &text[..32][length])
+  }
+  if length == 0 {
+    text.* = 32
+    length = 1
+  }
+  return length
+}
+pub fn dna_terminal_review(t: *Terminal, output: *u8, capacity: usize) usize {
+  dna_terminal_review_end(t)
+  if capacity < 2 {
+    return 0
+  }
+  widths: [2100]i32 = []
+  lengths: [2100]usize = []
+  rows := t.history_count + t.rows
+  position := TermPos{}
+  term_cursor(term_state(t.vt), &position)
+  bytes: usize = 0
+  count: usize = 0
+  for row in 0..rows {
+    width := t.cols
+    for width > 0 {
+      cell := terminal_history_cell(t, row, width - 1)
+      if cell.chars[0] != 0 && (cell.chars[0] != 32 || cell.chars[1] != 0) {
+        break
+      }
+      width -= 1
+    }
+    if row == t.history_count + position.row && width <= position.col {
+      width = position.col + 1
+    }
+    widths[#cast(usize) (row)] = width
+    lengths[#cast(usize) (row)] = 1
+    for col in 0..width {
+      text: [32]u8 = []
+      lengths[#cast(usize) (row)] += terminal_cell_text(terminal_history_cell(t, row, col), &text[0])
+    }
+    bytes += lengths[#cast(usize) (row)]
+    count += #cast(usize) (width + 1)
+  }
+  first: i32 = 0
+  for bytes >= capacity && first < rows {
+    bytes -= lengths[#cast(usize) (first)]
+    count -= #cast(usize) (widths[#cast(usize) (first)] + 1)
+    first += 1
+  }
+  if first == rows {
+    output.* = 0
+    return 0
+  }
+  cells := #cast(*TermReviewCell) dna_memory_alloc(count * #sizeof(TermReviewCell), 2)
+  if cells == nil {
+    return 0
+  }
+  used: usize = 0
+  at: usize = 0
+  for row in first..rows {
+    line := &t.review_lines[#cast(usize) (row - first)]
+    line.start = #cast(u32) at
+    line.count = #cast(u32) (widths[#cast(usize) (row)] + 1)
+    line.offset = #cast(u32) used
+    for col in 0..widths[#cast(usize) (row)] {
+      cells[..count][at].cell = terminal_history_cell(t, row, col)
+      cells[..count][at].offset = #cast(u32) used
+      text: [32]u8 = []
+      length := terminal_cell_text(cells[..count][at].cell, &text[0])
+      if length == 0 && col != 0 {
+        cells[..count][at].offset = cells[..count][at - 1].offset
+      }
+      _ = copy(&output[..#cast(usize) capacity][used], &text[0], length)
+      used += length
+      at += 1
+    }
+    cells[..count][at].cell = TermCell{}
+    cells[..count][at].offset = #cast(u32) used
+    term_get_default(term_state(t.vt), &cells[..count][at].cell.fg, &cells[..count][at].cell.bg)
+    at += 1
+    output[..#cast(usize) capacity][used] = 10
+    used += 1
+  }
+  output[..#cast(usize) capacity][used] = 0
+  t.review = cells
+  t.review_length = used
+  t.review_rows = rows - first
+  t.review_cols = t.cols
+  t.review_cursor_row = t.history_count + position.row - first
+  t.review_cursor_col = position.col
+  if t.scroll != 0 {
+    t.review_cursor_row = t.history_count - t.scroll - first
+    t.review_cursor_col = 0
+  }
+  if t.review_cursor_row < 0 {
+    t.review_cursor_row = 0
+  }
+  t.review_top = t.history_count - t.scroll - first
+  if t.review_top < 0 {
+    t.review_top = 0
+  }
+  t.review_left = 0
+  t.review_low = 0
+  t.review_high = 0
+  return used
+}
+pub fn dna_terminal_review_head(t: *Terminal) usize {
+  if t.review == nil {
+    return 0
+  }
+  line := t.review_lines[#cast(usize) (t.review_cursor_row)]
+  col := #cast(u32) t.review_cursor_col
+  if col >= line.count {
+    col = line.count - 1
+  }
+  return #cast(usize) t.review[..506100][line.start + col].offset
+}
+pub fn dna_terminal_review_select(t: *Terminal, low: usize, high: usize, head: usize) {
+  if t.review == nil {
+    return
+  }
+  t.review_low = low
+  t.review_high = high
+  first: i32 = 0
+  last := t.review_rows
+  for first + 1 < last {
+    middle := (first + last) / 2
+    if #cast(usize) t.review_lines[#cast(usize) (middle)].offset <= head {
+      first = middle
+    } else {
+      last = middle
+    }
+  }
+  line := t.review_lines[#cast(usize) (first)]
+  col: i32 = 0
+  for index in 0..line.count {
+    cell := &t.review[..506100][line.start + index]
+    if #cast(usize) cell.offset <= head && cell.cell.chars[0] != 4294967295 {
+      col = #cast(i32) index
+    }
+  }
+  t.review_cursor_row = first
+  t.review_cursor_col = col
+  if first < t.review_top {
+    t.review_top = first
+  }
+  if first >= t.review_top + t.rows {
+    t.review_top = first - t.rows + 1
+  }
+  if col < t.review_left {
+    t.review_left = col
+  }
+  if col >= t.review_left + t.cols {
+    t.review_left = col - t.cols + 1
+  }
+}
+pub fn dna_terminal_cursor(t: *Terminal, column: *i32, row: *i32) {
+  if t.review != nil {
+    column.* = t.review_cursor_col - t.review_left
+    row.* = t.review_cursor_row - t.review_top
+  } else {
+    position := TermPos{}
+    term_cursor(term_state(t.vt), &position)
+    column.* = position.col
+    row.* = position.row
+  }
+}
+pub fn dna_terminal_cursor_rect(t: *Terminal, x: f32, y: f32, width: f32, height: f32) {
+  t.cursor_x = x
+  t.cursor_y = y
+  t.cursor_width = width
+  t.cursor_height = height
+  t.cursor_override = 1
+}
+pub fn dna_terminal_review_point(t: *Terminal, x: f32, y: f32) usize {
+  if t.review == nil || t.cw <= 0.0 || t.lh <= 0.0 {
+    return 0
+  }
+  col := #cast(i32) ((x - t.x) / t.cw)
+  row := #cast(i32) ((y - t.y) / t.lh)
+  if col < 0 {
+    col = 0
+  }
+  if row < 0 {
+    row = 0
+  }
+  col += t.review_left
+  row += t.review_top
+  if row >= t.review_rows {
+    row = t.review_rows - 1
+  }
+  line := t.review_lines[#cast(usize) (row)]
+  if col >= #cast(i32) line.count {
+    col = #cast(i32) line.count - 1
+  }
+  return #cast(usize) t.review[..506100][line.start + #cast(u32) col].offset
+}

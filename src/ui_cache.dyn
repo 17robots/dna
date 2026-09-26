@@ -1,0 +1,173 @@
+// Bounded text cache with hash chains and global least-recently-used eviction.
+// Content and font identity define a reusable layout;
+// tint and screen position are applied per draw. Long labels use the existing path.
+struct UiCachedText {
+  handle: rawptr,
+  hash: u64,
+  stamp: u64,
+  length: usize,
+  next: usize
+}
+struct UiTextCache {
+  serial: u64,
+  count: usize,
+  buckets: [32]usize,
+  entries: [128]UiCachedText,
+  bytes: [1048576]u8,
+}
+fn ui_cache_clear(typography: *Typography) {
+  cache := typography.ui_cache
+
+  if cache == nil {
+    return
+  }
+
+
+  for index in 0..128 {
+    entry := &cache.entries[index]
+
+    if entry.handle != nil {
+      ttf.destroy(entry.handle)
+      entry.handle = nil
+    }
+
+    entry.length = 0
+    entry.stamp = 0
+    entry.next = 128
+  }
+
+  cache.count = 0
+
+  for index in 0..32 {
+    cache.buckets[index] = 128
+  }
+}
+fn ui_cache_release(typography: *Typography) {
+  ui_cache_clear(typography)
+
+  if typography.ui_cache != nil {
+    _ = mem.arena_release(&typography.ui_owner)
+
+    if typography.observer != nil {
+      allocation_record(typography.observer, "ui_text_cache", #sizeof(UiTextCache) + 16, typography.ui_born, true)
+    }
+
+    typography.ui_cache = nil
+  }
+}
+fn cached_ui_text(typography: *Typography, text: []const u8) rawptr {
+  if #len(text) == 0 || #len(text) >= 8192 {
+    return nil
+  }
+
+  if typography.ui_cache == nil {
+    allocated := mem.arena_create(#sizeof(UiTextCache) + 16)
+    if !allocated.ok {
+      return nil
+    }
+    typography.ui_owner = allocated.arena
+
+    if typography.observer != nil {
+      if typography.observer.render_trace.enabled {
+        typography.ui_born = render_clock()
+      }
+      allocation_record(typography.observer, "ui_text_cache", #sizeof(UiTextCache) + 16, typography.ui_born, false)
+    }
+
+    created_cache := #cast(*UiTextCache) mem.arena_push_uninit(&typography.ui_owner, #sizeof(UiTextCache), #alignof(UiTextCache))
+
+    if created_cache == nil {
+      _ = mem.arena_release(&typography.ui_owner)
+      if typography.observer != nil {
+        allocation_record(typography.observer, "ui_text_cache", #sizeof(UiTextCache) + 16, typography.ui_born, true)
+      }
+      return nil
+    }
+
+    // Initialize metadata only; byte slots are initialized when populated.
+    mem.zero((#cast(*u8) created_cache)[..#cast(usize) &created_cache.bytes[0] - #cast(usize) created_cache])
+    for bucket_index in 0..32 {
+      created_cache.buckets[bucket_index] = 128
+    }
+    typography.ui_cache = created_cache
+  }
+
+  cache := typography.ui_cache
+  cache.serial += 1
+  hash: u64 = 5381
+  for byte in text {
+    hash = ((hash * 33) ^ #cast(u64) byte) % 4294967296
+  }
+  bucket := #cast(usize) ((hash ^ (hash >> 16)) % 32)
+  index := cache.buckets[bucket]
+
+  for index != 128 {
+    entry := &cache.entries[index]
+
+    if entry.hash == hash && entry.length == #len(text) && buffer.equal(cache.bytes[index * 8192..index * 8192 + entry.length], text) {
+      entry.stamp = cache.serial
+      typography.ui_hits += 1
+      return entry.handle
+    }
+
+    index = entry.next
+  }
+
+  chosen := cache.count
+
+  if chosen == 128 {
+    chosen = 0
+    index = 1
+
+    for index < 128 {
+      if cache.entries[index].stamp < cache.entries[chosen].stamp {
+        chosen = index
+      }
+      index += 1
+    }
+
+    previous := &cache.entries[chosen]
+    old_bucket := #cast(usize) ((previous.hash ^ (previous.hash >> 16)) % 32)
+    link := &cache.buckets[old_bucket]
+
+    for link.* != 128 && link.* != chosen {
+      link = &cache.entries[link.*].next
+    }
+
+    if link.* == chosen {
+      link.* = previous.next
+    }
+  } else {
+    cache.count += 1
+  }
+
+  selected := &cache.entries[chosen]
+
+  if selected.handle == nil {
+    blank: [1]u8 = [0]
+    selected.handle = ttf.create(typography.engine, typography.font, &blank[0], 0)
+
+    if selected.handle != nil {
+      typography.ui_creations += 1
+    }
+  }
+  if selected.handle == nil {
+    selected.stamp = 0
+    selected.next = 128
+    return nil
+  }
+  if !ttf.set(selected.handle, &text[0], #len(text)) {
+    selected.stamp = 0
+    selected.length = 0
+    selected.next = 128
+    return nil
+  }
+
+  selected.length = copy_text(cache.bytes[chosen * 8192..(chosen + 1) * 8192], text)
+  selected.hash = hash
+  selected.stamp = cache.serial
+  selected.next = cache.buckets[bucket]
+  cache.buckets[bucket] = chosen
+  typography.ui_updates += 1
+  return selected.handle
+}

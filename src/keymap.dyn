@@ -1,0 +1,391 @@
+// Keymap profiles. Popups, terminals and insert-mode text are shared; only
+// normal-mode document keys differ. Helix is the built-in dispatch in
+// key_input/edit_key; the Vim profile (vim.dyn) claims the keys it handles
+// and leaves the rest to the shared handling.
+fn keymap_name(app: *const App) []const u8 {
+  if app.config.vim_keys {
+    return "vim"
+  }
+  return "helix"
+}
+// :keymap [helix|vim] reports or switches the profile for this session;
+// [editor] vim_keys in config.toml sets the default.
+fn keymap_command(app: *App, argument: []const u8) {
+  if (buffer.equal(argument, "vim") || buffer.equal(argument, "helix")) && (config_locked(app, "vim_keys") || config_locked(app, "keymap")) {
+    notice(app, "The keymap is locked in the global config.")
+    return
+  }
+  if buffer.equal(argument, "vim") {
+    if !profile_includes(ProfileKeymaps, "vim") {
+      module_unavailable(app, "keymap", "vim")
+      return
+    }
+    app.config.vim_keys = true
+    vim_reset(app)
+  }
+  else if buffer.equal(argument, "helix") {
+    app.config.vim_keys = false
+  }
+  else if #len(argument) > 0 {
+    notice(app, "Keymap must be helix or vim.")
+    return
+  }
+  if #len(argument) > 0 {
+    if app.config.vim_keys {
+      _ = session_record(app, "keymap", "\"vim\"", true)
+    } else {
+      _ = session_record(app, "keymap", "\"helix\"", true)
+    }
+  }
+  message: [64]u8 = []
+  used := copy_text(message[..], "Keymap: ")
+  add_text(message[..], &used, keymap_name(app))
+  notice(app, message[..used])
+}
+
+// Module slots: what this build includes, what is active, and switching.
+fn profile_includes(list: []const u8, name: []const u8) bool {
+  at: usize = 0
+  for at < #len(list) {
+    end := at
+    for end < #len(list) && list[end] != ' ' {
+      end += 1
+    }
+    if buffer.equal(list[at..end], name) {
+      return true
+    }
+    at = end + 1
+  }
+  return false
+}
+fn module_unavailable(app: *App, slot: []const u8, name: []const u8) {
+  message: [256]u8 = []
+  used := copy_text(message[..], "The ")
+  add_text(message[..], &used, slot)
+  add_text(message[..], &used, " module '")
+  add_text(message[..], &used, name)
+  add_text(message[..], &used, "' is not in this build (profile ")
+  add_text(message[..], &used, ProfileName)
+  add_text(message[..], &used, "); :modules lists what is.")
+  notice(app, message[..used])
+}
+// Names a slot accepts and the subset compiled into this build.
+fn module_slot(slot: []const u8) []const u8 {
+  if buffer.equal(slot, "keymap") {
+    return ProfileKeymaps
+  }
+  if buffer.equal(slot, "frontend") {
+    return ProfileFrontends
+  }
+  if buffer.equal(slot, "explorer") {
+    return ProfileExplorers
+  }
+  if buffer.equal(slot, "picker") {
+    return ProfilePickers
+  }
+  return ""
+}
+fn module_active(app: *const App, slot: []const u8) []const u8 {
+  if buffer.equal(slot, "keymap") {
+    return keymap_name(app)
+  }
+  if buffer.equal(slot, "frontend") {
+    if sdl.tui_active() {
+      return "tui"
+    }
+    return "gui"
+  }
+  if buffer.equal(slot, "explorer") {
+    if app.config.explorer_style == 1 {
+      return "tree"
+    }
+    return "buffer"
+  }
+  if app.config.picker_style == 1 {
+    return "compact"
+  }
+  if app.config.picker_style == 2 {
+    return "dropdown"
+  }
+  return "full"
+}
+// Settings choose modules the build may lack; fall back with a message.
+fn modules_validate(app: *App) {
+  if app.config.vim_keys && !profile_includes(ProfileKeymaps, "vim") {
+    app.config.vim_keys = false
+    module_unavailable(app, "keymap", "vim")
+  }
+  if app.config.frontend == 2 && !profile_includes(ProfileFrontends, "tui") {
+    app.config.frontend = 0
+    module_unavailable(app, "frontend", "tui")
+  }
+  if app.config.explorer_style == 1 && !profile_includes(ProfileExplorers, "tree") {
+    app.config.explorer_style = 0
+    module_unavailable(app, "explorer", "tree")
+  }
+  if app.config.picker_style == 1 && !profile_includes(ProfilePickers, "compact") {
+    app.config.picker_style = 0
+    module_unavailable(app, "picker", "compact")
+  }
+  if app.config.picker_style == 2 && !profile_includes(ProfilePickers, "dropdown") {
+    app.config.picker_style = 0
+    module_unavailable(app, "picker", "dropdown")
+  }
+}
+// :modules lists slots; :module SLOT NAME switches one for this session.
+fn modules_report(app: *App) {
+  report: [1024]u8 = []
+  used := copy_text(report[..], "Build profile: ")
+  add_text(report[..], &used, ProfileName)
+  slots: [4][]const u8 = ["keymap", "frontend", "explorer", "picker"]
+  for slot in slots {
+    add_text(report[..], &used, "\n")
+    add_text(report[..], &used, slot)
+    add_text(report[..], &used, ": ")
+    add_text(report[..], &used, module_active(app, slot))
+    add_text(report[..], &used, " (built in: ")
+    add_text(report[..], &used, module_slot(slot))
+    add_text(report[..], &used, ")")
+    if config_locked(app, slot) || (buffer.equal(slot, "keymap") && config_locked(app, "vim_keys")) {
+      add_text(report[..], &used, " locked")
+    }
+  }
+  hover_notice(app, report[..used])
+}
+fn module_command(app: *App, argument: []const u8) {
+  split: usize = 0
+  for split < #len(argument) && argument[split] != ' ' {
+    split += 1
+  }
+  slot := argument[..split]
+  name := settings.trim(argument[split..])
+  if #len(name) == 0 {
+    modules_report(app)
+    return
+  }
+  if buffer.equal(slot, "keymap") {
+    keymap_command(app, name)
+    return
+  }
+  canonical := "explorer_style"
+  if buffer.equal(slot, "frontend") {
+    canonical = "frontend"
+  }
+  else if buffer.equal(slot, "picker") {
+    canonical = "picker_style"
+  }
+  else if !buffer.equal(slot, "explorer") {
+    notice(app, "Module slots: keymap, frontend, explorer, picker.")
+    return
+  }
+  quoted: [80]u8 = []
+  quoted_length := copy_text(quoted[..], "\"")
+  add_text(quoted[..], &quoted_length, name)
+  add_text(quoted[..], &quoted_length, "\"")
+  choice := settings.module_choice(canonical, quoted[..quoted_length])
+  if choice == 255 {
+    notice(app, "Unknown module name for that slot; :modules lists them.")
+    return
+  }
+  if config_locked(app, slot) {
+    notice(app, "That module slot is locked in the global config.")
+    return
+  }
+  if !profile_includes(module_slot(slot), name) && !(buffer.equal(slot, "frontend") && buffer.equal(name, "auto")) {
+    module_unavailable(app, slot, name)
+    return
+  }
+  if buffer.equal(slot, "frontend") {
+    app.config.frontend = choice
+    if !buffer.equal(name, "auto") && buffer.equal(name, "tui") != sdl.tui_active() {
+      frontend_switch(app, name)
+      return
+    }
+  }
+  else if buffer.equal(slot, "picker") {
+    app.config.picker_style = choice
+  }
+  else {
+    app.config.explorer_style = choice
+  }
+  if !buffer.equal(slot, "frontend") {
+    _ = override_remove(app.configuration.overrides[..], &app.configuration.overrides_length, canonical)
+    _ = session_record(app, slot, quoted[..quoted_length], true)
+  }
+  modules_report(app)
+}
+
+extern fn frontend_isatty "isatty"(descriptor: i32) i32
+extern fn handoff_arm "dna_handoff_arm"(flag: *const u8, session: *const u8) i32
+extern fn handoff_unsetenv "unsetenv"(name: *const u8) i32
+extern fn handoff_setenv "setenv"(name: *const u8, value: *const u8, overwrite: i32) i32
+extern fn handoff_unlink "unlink"(path: *const u8) i32
+fn display_available() bool {
+  storage: [256]u8 = []
+  wayland := process.environment("WAYLAND_DISPLAY", storage[..])
+  x11 := process.environment("DISPLAY", storage[..])
+  return (wayland.ok && wayland.found && #len(wayland.value) > 0) || (x11.ok && x11.found && #len(x11.value) > 0)
+}
+// :frontend tui|gui moves this session to the other frontend: the session
+// (unsaved text, splits, cursors) is saved to the state directory, DNA quits
+// normally, and the same program starts again on the other frontend and
+// restores it. Undo history starts fresh. Refused when the target has no
+// terminal or display, or when terminals or explorer edits would be lost.
+fn frontend_switch(app: *App, name: []const u8) {
+  terminal := buffer.equal(name, "tui")
+  if !terminal && !buffer.equal(name, "gui") {
+    notice(app, "Frontends: tui, gui.")
+    return
+  }
+  if terminal == sdl.tui_active() {
+    notice(app, "Already using that frontend.")
+    return
+  }
+  if config_locked(app, "frontend") {
+    notice(app, "The frontend is locked in the global config.")
+    return
+  }
+  if !profile_includes(ProfileFrontends, name) {
+    module_unavailable(app, "frontend", name)
+    return
+  }
+  if terminal && (frontend_isatty(0) == 0 || frontend_isatty(1) == 0) {
+    notice(app, "No terminal to switch into: start DNA from a terminal to use the TUI.")
+    return
+  }
+  if !terminal && !display_available() {
+    notice(app, "No display to open a window on (WAYLAND_DISPLAY and DISPLAY are unset).")
+    return
+  }
+  if terminals_running(app) {
+    notice(app, "Close terminal panes before switching frontend; their shells cannot move.")
+    return
+  }
+  if explorer_dirty(app) {
+    notice(app, "Apply or discard explorer edits before switching frontend.")
+    return
+  }
+  store_storage: [4096]u8 = []
+  store := trust_store_path(store_storage[..])
+  if #len(store) < 6 || #len(store) > 3900 {
+    notice(app, "No state directory for the handoff: set HOME or XDG_STATE_HOME.")
+    return
+  }
+  // The store ends in "/trust"; the handoff sits beside it.
+  directory_length := #len(store) - 6
+  path: [4096]u8 = []
+  used := copy_text(path[..], store[..directory_length])
+  if config_directories(&path[0]) == 0 {
+    notice(app, "Cannot create the state directory for the handoff.")
+    return
+  }
+  add_text(path[..], &used, "/handoff-")
+  add_number(path[..], &used, #cast(usize) #syscall(39))
+  add_text(path[..], &used, ".session")
+  if !session_save(app, path[..used]) {
+    return
+  }
+  path[used] = 0
+  flag: []const u8 = "--gui\0"
+  if terminal {
+    flag = "--tui\0"
+  }
+  if handoff_arm(&flag[0], &path[0]) == 0 {
+    _ = handoff_unlink(&path[0])
+    notice(app, "Handoff path too long.")
+    return
+  }
+  // Session values (:set, :theme, :keymap, :module, placement) are not in
+  // the config the new process reads; they travel beside the session.
+  handoff_export("DNA_HANDOFF_SET\0", app.configuration.overrides[..app.configuration.overrides_length])
+  handoff_export("DNA_HANDOFF_MODULES\0", app.configuration.module_overrides[..app.configuration.module_overrides_length])
+  handoff_export("DNA_HANDOFF_PLACES\0", app.configuration.place_overrides[..app.configuration.place_overrides_length])
+  app.running = false
+}
+fn handoff_export(variable: []const u8, value: []const u8) {
+  if #len(value) == 0 {
+    return
+  }
+  text: [4097]u8 = []
+  length := copy_text(text[..4096], value)
+  text[length] = 0
+  _ = handoff_setenv(&variable[0], &text[0], 1)
+}
+// Takes a handed-over session block; returns its length (0 when absent).
+fn handoff_import(variable: []const u8, destination: []u8) usize {
+  storage: [4097]u8 = []
+  value := process.environment(variable[..#len(variable) - 1], storage[..4096])
+  _ = handoff_unsetenv(&variable[0])
+  if !value.ok || !value.found || #len(value.value) > #len(destination) {
+    return 0
+  }
+  return copy_text(destination, value.value)
+}
+// A handoff from :frontend: restore the saved session once, then forget it.
+fn frontend_handoff_restore(app: *App, typography: *Typography) {
+  storage: [4096]u8 = []
+  handoff := process.environment("DNA_HANDOFF", storage[..4095])
+  if !handoff.ok || !handoff.found || #len(handoff.value) == 0 {
+    return
+  }
+  length := #len(handoff.value)
+  name: []const u8 = "DNA_HANDOFF\0"
+  _ = handoff_unsetenv(&name[0])
+  // Session values first, so restored documents see the final settings.
+  configuration := &app.configuration
+  configuration.overrides_length = handoff_import("DNA_HANDOFF_SET\0", configuration.overrides[..])
+  configuration.module_overrides_length = handoff_import("DNA_HANDOFF_MODULES\0", configuration.module_overrides[..])
+  configuration.place_overrides_length = handoff_import("DNA_HANDOFF_PLACES\0", configuration.place_overrides[..])
+  if configuration.overrides_length > 0 || configuration.module_overrides_length > 0 || configuration.place_overrides_length > 0 {
+    config_reload(app, typography, false)
+  }
+  if session_restore(app, storage[..length]) {
+    storage[length] = 0
+    _ = handoff_unlink(&storage[0])
+  } else {
+    // Keep both the original failure and the path needed to retry recovery.
+    add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\n\nHandoff preserved. Retry with :session-restore ")
+    add_text(app.prompt_state.message[..], &app.prompt_state.message_length, storage[..length])
+  }
+}
+// Frontend for this launch: --tui or --gui, else [modules] frontend from the
+// global config, else auto: the terminal only when there is no display and
+// DNA runs in one. Returns true for the terminal.
+fn frontend_choose(app: *App, flag: u8) bool {
+  // A build without the GUI has only the terminal.
+  if !profile_includes(ProfileFrontends, "gui") {
+    return true
+  }
+  choice := flag
+  if choice == 0 && app.configuration.path_length > 0 {
+    mark := mem.arena_mark(app.scratch)
+    defer mem.arena_rewind(app.scratch, mark)
+    read := fs.read_all(app.scratch, app.configuration.path[..app.configuration.path_length], 16384)
+    parsed := settings.Settings{}
+    if read.ok && settings.parse(read.data, &parsed) {
+      choice = parsed.frontend
+    }
+  }
+  if choice == 2 {
+    return profile_includes(ProfileFrontends, "tui")
+  }
+  if choice == 1 || !profile_includes(ProfileFrontends, "tui") {
+    return false
+  }
+  storage: [256]u8 = []
+  wayland := process.environment("WAYLAND_DISPLAY", storage[..])
+  x11 := process.environment("DISPLAY", storage[..])
+  has_display := (wayland.ok && wayland.found && #len(wayland.value) > 0) || (x11.ok && x11.found && #len(x11.value) > 0)
+  return !has_display && frontend_isatty(0) != 0 && frontend_isatty(1) != 0
+}
+// :suspend (and Ctrl+Z with Vim keys): stop as a shell job in the terminal
+// frontend; `fg` brings DNA back. A window has nothing to suspend into.
+fn suspend_command(app: *App) {
+  if !sdl.tui_active() {
+    notice(app, "Suspend needs the terminal frontend; :frontend tui switches to it.")
+    return
+  }
+  if !sdl.tui_suspend() {
+    notice(app, "Could not suspend.")
+  }
+}

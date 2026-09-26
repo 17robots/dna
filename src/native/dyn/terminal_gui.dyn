@@ -1,0 +1,111 @@
+// GUI glyph cache and drawing. Terminal-only builds replace this file with stubs.
+struct TerminalRect { x, y, w, h: f32 }
+extern fn terminal_engine_create "TTF_CreateRendererTextEngine"(renderer: rawptr) rawptr
+extern fn terminal_engine_destroy "TTF_DestroyRendererTextEngine"(engine: rawptr)
+extern fn terminal_font_size "TTF_GetFontSize"(font: rawptr) f32
+extern fn terminal_text_string "TTF_SetTextString"(text: rawptr, string: *const u8, length: usize) bool
+extern fn terminal_text_color "TTF_SetTextColor"(text: rawptr, red: u8, green: u8, blue: u8, alpha: u8) bool
+extern fn terminal_text_draw "TTF_DrawRendererText"(text: rawptr, x: f32, y: f32) bool
+extern fn terminal_draw_color "SDL_SetRenderDrawColor"(renderer: rawptr, red: u8, green: u8, blue: u8, alpha: u8) bool
+extern fn terminal_fill_rect "SDL_RenderFillRect"(renderer: rawptr, rect: *const TerminalRect) bool
+fn terminal_gui_color(renderer: rawptr, rgb: u32) {
+  _ = terminal_draw_color(renderer, #cast(u8) (rgb >> 16), #cast(u8) (rgb >> 8), #cast(u8) rgb, 255)
+}
+pub fn dna_terminal_invalidate_font(t: *Terminal) {
+  for index in 0..24000 {
+    text := t.glyphs[..24000][#cast(usize) (index)]
+    if text != nil {
+      dna_text_destroy(text)
+    }
+    t.glyphs[..24000][#cast(usize) (index)] = nil
+  }
+  t.font = nil
+}
+fn terminal_gui_close(t: *Terminal) {
+  dna_terminal_invalidate_font(t)
+  if t.engine != nil {
+    terminal_engine_destroy(t.engine)
+  }
+}
+pub fn dna_terminal_draw(t: *Terminal, renderer: rawptr, font: rawptr, x: f32, y: f32, width: f32, height: f32, cw: f32, lh: f32, focused: i32) {
+  if (focused & 2) == 0 {
+    _ = dna_terminal_resize(t, width, height, cw, lh)
+  }
+  focused &= 1
+  if t.engine == nil {
+    t.engine = terminal_engine_create(renderer)
+  }
+  points := terminal_font_size(font)
+  if t.font != font || t.points != points {
+    dna_terminal_invalidate_font(t)
+    t.font = font
+    t.points = points
+  }
+  t.x = x
+  t.y = y
+  t.cw = cw
+  t.lh = lh
+  for pass in 0..2 {
+    background := TerminalRect{}
+    background_color: u32 = 0
+    background_pending := false
+    if pass == 1 && focused != 0 && t.cursor_override != 0 && (t.review != nil || (t.scroll == 0 && t.cursor_visible != 0)) {
+      cursor := TerminalRect{x: x + t.cursor_x, y: y + t.cursor_y, w: t.cursor_width, h: t.cursor_height}
+      terminal_gui_color(renderer, t.cursor_color)
+      _ = terminal_fill_rect(renderer, &cursor)
+    }
+    for row in 0..t.rows {
+      for col in 0..t.cols {
+        cell := terminal_styled_cell(t, row, col)
+        rect := TerminalRect{x: x + #cast(f32) col * cw, y: y + #cast(f32) row * lh, w: cw, h: lh}
+        if pass == 0 {
+          color := terminal_rgb(cell.bg)
+          if background_pending && (color != background_color || col == 0) {
+            terminal_gui_color(renderer, background_color)
+            _ = terminal_fill_rect(renderer, &background)
+            background_pending = false
+          }
+          if !background_pending {
+            background = rect
+            background_color = color
+            background_pending = true
+          } else {
+              background.w = rect.x + rect.w - background.x
+            }
+          continue
+        }
+        cp := cell.chars[0]
+        if cp == 0 || cp == 32 || cp == 4294967295 {
+          continue
+        }
+        index := row * 240 + col
+        utf: [32]u8 = []
+        length: usize = 0
+        for part in 0..6 {
+          if cell.chars[part] == 0 || length >= 24 {
+            break
+          }
+          length += terminal_encode(cell.chars[part], &utf[length])
+        }
+        hash: u32 = 2166136261
+        for byte in utf[..length] {
+          // Explicit widening/truncation retains C's wrapping FNV multiplication.
+          hash = #cast(u32) (#cast(u64) (hash ^ #cast(u32) byte) * 16777619)
+        }
+        if t.glyphs[..24000][#cast(usize) (index)] == nil {
+          t.glyphs[..24000][#cast(usize) (index)] = dna_text_create(t.engine, font, &utf[0], length)
+        }
+        else if t.glyph_chars[..24000][#cast(usize) (index)] != hash {
+          _ = terminal_text_string(t.glyphs[..24000][#cast(usize) (index)], &utf[0], length)
+        }
+        t.glyph_chars[..24000][#cast(usize) (index)] = hash
+        _ = terminal_text_color(t.glyphs[..24000][#cast(usize) (index)], cell.fg.red, cell.fg.green, cell.fg.blue, 255)
+        _ = terminal_text_draw(t.glyphs[..24000][#cast(usize) (index)], rect.x, rect.y)
+      }
+    }
+    if background_pending {
+      terminal_gui_color(renderer, background_color)
+      _ = terminal_fill_rect(renderer, &background)
+    }
+  }
+}

@@ -1,0 +1,305 @@
+// Linux recovery worker. Ownership: UI owns handle, worker owns detached snapshots.
+
+struct RecoveryWorker {
+  thread: rawptr,
+  lock: rawptr,
+  wake: rawptr,
+  path: [4096]u8,
+  directory: [4096]u8,
+  pending: *u8,
+  length: usize,
+  pending_capacity: usize,
+  spare: *u8,
+  spare_capacity: usize,
+  stop: bool,
+  error: bool,
+}
+
+extern fn rec_alloc "calloc"(count: usize, size: usize) rawptr
+extern fn rec_malloc "malloc"(size: usize) *u8
+extern fn rec_free "free"(value: rawptr)
+extern fn rec_open "open"(path: *const u8, flags: i32, mode: u32) i32
+extern fn rec_close "close"(fd: i32) i32
+extern fn rec_write "write"(fd: i32, bytes: *const u8, length: usize) isize
+extern fn rec_sync "fsync"(fd: i32) i32
+extern fn rec_rename "rename"(from: *const u8, to: *const u8) i32
+extern fn rec_unlink "unlink"(path: *const u8) i32
+extern fn rec_mkdir "mkdir"(path: *const u8, mode: u32) i32
+extern fn rec_temp "mkstemp"(path: *u8) i32
+extern fn rec_errno "__errno_location"() *i32
+fn rec_mutex() rawptr {
+  return dna_mutex_create()
+}
+fn rec_mutex_free(lock: rawptr) {
+  dna_mutex_destroy(lock)
+}
+fn rec_lock(lock: rawptr) {
+  dna_mutex_lock(lock)
+}
+fn rec_unlock(lock: rawptr) {
+  dna_mutex_unlock(lock)
+}
+fn rec_condition() rawptr {
+  return dna_condition_create()
+}
+fn rec_condition_free(wake: rawptr) {
+  dna_condition_destroy(wake)
+}
+fn rec_wait(wake: rawptr, lock: rawptr) {
+  dna_condition_wait(wake, lock)
+}
+fn rec_signal(wake: rawptr) {
+  dna_condition_signal(wake)
+}
+fn rec_thread(entry: *fn(rawptr) i32, state: rawptr) rawptr {
+  return dna_thread_create(entry, state)
+}
+fn rec_join(thread: rawptr, status: *i32) {
+  dna_thread_join(thread, status)
+}
+fn rec_notify() {
+  dna_notify()
+}
+
+pub fn dna_make_directories(path: *const u8) i32 {
+  if path == nil || path.* == 0 {
+    return 0
+  }
+  length := string_length(path)
+  if length >= 4096 {
+    return 0
+  }
+  storage: [4096]u8 = []
+  _ = copy(&storage[0], path, length + 1)
+  for index in 1..=length {
+    if storage[index] == 47 || storage[index] == 0 {
+      end := storage[index]
+      storage[index] = 0
+      if rec_mkdir(&storage[0], 448) != 0 && rec_errno().* != 17 {
+        return 0
+      }
+      fd := rec_open(&storage[0], 589824, 0)
+      if fd < 0 {
+        return 0
+      }
+      _ = rec_close(fd)
+      storage[index] = end
+    }
+  }
+  return 1
+}
+fn rec_snapshot(path: *const u8, bytes: *const u8, length: usize) bool {
+  temporary: [4096]u8 = []
+  size := string_length(path)
+  if size + 4 >= 4096 {
+    return false
+  }
+  _ = copy(&temporary[0], path, size)
+  suffix: []const u8 = ".tmp\0"
+  _ = copy(&temporary[size], &suffix[0], 5)
+  fd := rec_open(&temporary[0], 524481, 384)
+  if fd < 0 {
+    return false
+  }
+  offset: usize = 0
+  ok := true
+  for offset < length {
+    written := rec_write(fd, &bytes[..length][offset], length - offset)
+    if written < 0 && rec_errno().* == 4 {
+      continue
+    }
+    if written <= 0 {
+      ok = false
+      break
+    }
+    offset += #cast(usize) written
+  }
+  if rec_sync(fd) != 0 {
+    ok = false
+  }
+  if rec_close(fd) != 0 {
+    ok = false
+  }
+  if ok && rec_rename(&temporary[0], path) != 0 {
+    ok = false
+  }
+  if !ok {
+    _ = rec_unlink(&temporary[0])
+    return false
+  }
+  parent: [4096]u8 = []
+  _ = copy(&parent[0], path, size + 1)
+  slash := size
+  for slash > 0 && parent[slash - 1] != 47 {
+    slash -= 1
+  }
+  if slash > 0 {
+    if slash == 1 {
+      parent[1] = 0
+    } else {
+      parent[slash - 1] = 0
+    }
+    directory := rec_open(&parent[0], 589824, 0)
+    if directory < 0 {
+      return false
+    }
+    ok = rec_sync(directory) == 0
+    _ = rec_close(directory)
+  }
+  return ok
+}
+fn rec_path(state: *RecoveryWorker) bool {
+  if state.path[0] != 0 {
+    return true
+  }
+  if dna_make_directories(&state.directory[0]) == 0 {
+    return false
+  }
+  path: [4096]u8 = []
+  size := string_length(&state.directory[0])
+  suffix: []const u8 = "/session-XXXXXX\0"
+  if size + #len(suffix) > 4096 {
+    return false
+  }
+  _ = copy(&path[0], &state.directory[0], size)
+  _ = copy(&path[size], &suffix[0], #len(suffix))
+  fd := rec_temp(&path[0])
+  if fd < 0 {
+    return false
+  }
+  if rec_close(fd) != 0 {
+    _ = rec_unlink(&path[0])
+    return false
+  }
+  _ = copy(&state.path[0], &path[0], size + #len(suffix))
+  return true
+}
+fn rec_worker(context: rawptr) i32 {
+  state := #cast(*RecoveryWorker) context
+  for true {
+    rec_lock(state.lock)
+    for !state.stop && state.pending == nil {
+      rec_wait(state.wake, state.lock)
+    }
+    if state.stop {
+      rec_unlock(state.lock)
+      return 0
+    }
+    bytes := state.pending
+    length := state.length
+    capacity := state.pending_capacity
+    state.pending = nil
+    state.pending_capacity = 0
+    rec_unlock(state.lock)
+    ok := rec_path(state) && rec_snapshot(&state.path[0], bytes, length)
+    rec_lock(state.lock)
+    if capacity <= 2097152 && capacity > state.spare_capacity {
+      rec_free(#cast(rawptr) state.spare)
+      state.spare = bytes
+      state.spare_capacity = capacity
+    } else {
+      rec_free(#cast(rawptr) bytes)
+    }
+    state.error = state.error || !ok
+    rec_unlock(state.lock)
+    if !ok {
+      rec_notify()
+    }
+  }
+  return 0
+}
+pub fn dna_recovery_open(directory: *const u8) *RecoveryWorker {
+  if directory == nil || directory.* != 47 {
+    return nil
+  }
+  size := string_length(directory)
+  if size > 4000 {
+    return nil
+  }
+  state := #cast(*RecoveryWorker) rec_alloc(1, #sizeof(RecoveryWorker))
+  if state == nil {
+    return nil
+  }
+  _ = copy(&state.directory[0], directory, size + 1)
+  state.lock = rec_mutex()
+  state.wake = rec_condition()
+  if state.lock != nil && state.wake != nil {
+    state.thread = rec_thread(&rec_worker, #cast(rawptr) state)
+  }
+  if state.thread == nil {
+    rec_condition_free(state.wake)
+    rec_mutex_free(state.lock)
+    rec_free(#cast(rawptr) state)
+    return nil
+  }
+  return state
+}
+pub fn dna_recovery_submit(state: *RecoveryWorker, bytes: *const u8, length: usize) i32 {
+  if state == nil || bytes == nil || length == 0 || length > 34000000 {
+    return 0
+  }
+  // Pending snapshots may be replaced in place; the writer detaches its buffer
+  // under this same lock. Only completed small buffers enter the spare cache.
+  rec_lock(state.lock)
+  if state.pending_capacity < length {
+    if state.spare_capacity >= length {
+      rec_free(#cast(rawptr) state.pending)
+      state.pending = state.spare
+      state.pending_capacity = state.spare_capacity
+      state.spare = nil
+      state.spare_capacity = 0
+    } else {
+      capacity: usize = 65536
+      for capacity < length && capacity < 2097152 {
+        capacity *= 2
+      }
+      if length > capacity {
+        capacity = length
+      }
+      retained := rec_malloc(capacity)
+      if retained == nil {
+        rec_unlock(state.lock)
+        return 0
+      }
+      rec_free(#cast(rawptr) state.pending)
+      state.pending = retained
+      state.pending_capacity = capacity
+    }
+  }
+  _ = copy(state.pending, bytes, length)
+  state.length = length
+  rec_signal(state.wake)
+  rec_unlock(state.lock)
+  return 1
+}
+pub fn dna_recovery_error(state: *RecoveryWorker) i32 {
+  if state == nil {
+    return 0
+  }
+  rec_lock(state.lock)
+  failed := state.error
+  state.error = false
+  rec_unlock(state.lock)
+  if failed {
+    return 1
+  }
+  return 0
+}
+pub fn dna_recovery_close(state: *RecoveryWorker) {
+  if state == nil {
+    return
+  }
+  rec_lock(state.lock)
+  state.stop = true
+  rec_signal(state.wake)
+  rec_unlock(state.lock)
+  rec_join(state.thread, nil)
+  if state.path[0] != 0 {
+    _ = rec_unlink(&state.path[0])
+  }
+  rec_free(#cast(rawptr) state.pending)
+  rec_free(#cast(rawptr) state.spare)
+  rec_condition_free(state.wake)
+  rec_mutex_free(state.lock)
+  rec_free(#cast(rawptr) state)
+}

@@ -1,0 +1,147 @@
+// Measure real boundary jumps and bound shaping by each text object's length.
+extern fn jump_ticks "SDL_GetTicksNS"() u64
+extern fn jump_strlen "strlen"(text: *const u8) usize
+extern fn jump_find "memmem"(text: *const u8, length: usize, needle: *const u8, size: usize) rawptr
+struct JumpText { text: rawptr, length: usize, top, bottom: bool }
+jump_stage: u32 = 0
+jump_frames: u32 = 0
+jump_slow: u32 = 0
+jump_shaped: usize = 0
+jump_largest_shaped: usize = 0
+jump_in_document: bool = false
+jump_excessive: bool = false
+jump_landed: bool = false
+jump_largest_ratio: f64 = 0.0
+jump_started: u64 = 0
+jump_queued: u64 = 0
+jump_total: f64 = 0.0
+jump_maximum: f64 = 0.0
+jump_first_total: f64 = 0.0
+jump_texts: [1024]JumpText = []
+fn jump_entry(text: rawptr) usize {
+  slot := (#cast(usize) text >> 4) % 1024
+  for attempt in 0..1024 {
+    if jump_texts[slot].text == text || jump_texts[slot].text == nil {
+      jump_texts[slot].text = text
+      return slot
+    }
+    slot = (slot + 1) % 1024
+  }
+  probe_exit(3)
+  return 0
+}
+pub fn SDL_WaitEventTimeout(event: rawptr, milliseconds: i32) bool {
+  if milliseconds >= 100 {
+    probe_check(jump_stage == 0 || jump_landed, "FAIL: jump did not reach file boundary")
+    if jump_stage == 12 {
+      probe_log("jumps: first-frame mean ")
+      probe_decimal(jump_first_total / 12.0)
+      probe_log(" ms, frame mean ")
+      probe_decimal(jump_total / #cast(f64) jump_frames)
+      probe_log(" max ")
+      probe_decimal(jump_maximum)
+      probe_log(" ms, ")
+      probe_number(#cast(u64) jump_slow)
+      probe_log(" frames >8ms / ")
+      probe_number(#cast(u64) jump_frames)
+      probe_log(" frames\ndocument shaping: max ")
+      probe_number(#cast(u64) jump_largest_shaped)
+      probe_log(" input bytes, ")
+      probe_decimal(jump_largest_ratio)
+      probe_log("x viewport bytes\n")
+      probe_check(!jump_excessive && jump_largest_shaped != 0 && jump_frames >= 12, "FAIL: unwrapped viewport repeatedly shapes its remaining lines")
+      probe_exit(0)
+    }
+    jump_landed = false
+    probe_key(103)
+    if jump_stage % 2 != 0 {
+      probe_key(103)
+    } else {
+      probe_key(101)
+    }
+    jump_stage += 1
+    jump_queued = jump_ticks()
+  }
+  next := #cast(*fn(rawptr, i32) bool) probe_next("SDL_WaitEventTimeout\0")
+  result := next(event, milliseconds)
+  jump_started = jump_ticks()
+  return result
+}
+pub fn SDL_RenderPresent(renderer: rawptr) bool {
+  next := #cast(*fn(rawptr) bool) probe_next("SDL_RenderPresent\0")
+  result := next(renderer)
+  if jump_started != 0 {
+    elapsed := #cast(f64) (jump_ticks() - jump_started) / 1000000.0
+    jump_total += elapsed
+    jump_frames += 1
+    if elapsed > jump_maximum {
+      jump_maximum = elapsed
+    }
+    if elapsed > 8.0 {
+      jump_slow += 1
+    }
+    jump_started = 0
+  }
+  if jump_queued != 0 {
+    elapsed := #cast(f64) (jump_ticks() - jump_queued) / 1000000.0
+    if jump_stage % 2 != 0 {
+      probe_log("bottom ")
+    } else {
+      probe_log("top ")
+    }
+    probe_decimal(elapsed)
+    probe_log(" ms\n")
+    jump_first_total += elapsed
+    jump_queued = 0
+  }
+  return result
+}
+pub fn TTF_DrawRendererText(text: rawptr, x: f32, y: f32) bool {
+  slot := jump_entry(text)
+  if jump_stage != 0 {
+    if (jump_stage % 2 != 0 && jump_texts[slot].bottom) || (jump_stage % 2 == 0 && jump_texts[slot].top) {
+      jump_landed = true
+    }
+  }
+  next := #cast(*fn(rawptr, f32, f32) bool) probe_next("TTF_DrawRendererText\0")
+  return next(text, x, y)
+}
+pub fn TTF_SetTextString(text: rawptr, bytes: *const u8, length: usize) bool {
+  slot := jump_entry(text)
+  jump_texts[slot].length = length
+  top := probe_env("DNA_JUMP_TOP\0")
+  bottom := probe_env("DNA_JUMP_BOTTOM\0")
+  jump_texts[slot].top = top != nil && jump_find(bytes, length, top, jump_strlen(top)) != nil
+  jump_texts[slot].bottom = bottom != nil && jump_find(bytes, length, bottom, jump_strlen(bottom)) != nil
+  next := #cast(*fn(rawptr, *const u8, usize) bool) probe_next("TTF_SetTextString\0")
+  return next(text, bytes, length)
+}
+pub fn hb_buffer_add_utf8(buffer: rawptr, text: *const u8, length: i32, offset: u32, count: i32) {
+  if jump_in_document && length > 0 {
+    jump_shaped += #cast(usize) length
+  }
+  next := #cast(*fn(rawptr, *const u8, i32, u32, i32)) probe_next("hb_buffer_add_utf8\0")
+  next(buffer, text, length, offset, count)
+}
+pub fn TTF_UpdateText(text: rawptr) bool {
+  previous := jump_in_document
+  jump_in_document = true
+  jump_shaped = 0
+  next := #cast(*fn(rawptr) bool) probe_next("TTF_UpdateText\0")
+  result := next(text)
+  length := jump_texts[jump_entry(text)].length
+  if length != 0 {
+    ratio := #cast(f64) jump_shaped / #cast(f64) length
+    if ratio > jump_largest_ratio {
+      jump_largest_ratio = ratio
+    }
+    if jump_shaped > jump_largest_shaped {
+      jump_largest_shaped = jump_shaped
+    }
+    if jump_shaped > length * 4 + 128 {
+      jump_excessive = true
+    }
+  }
+  jump_in_document = previous
+  return result
+}

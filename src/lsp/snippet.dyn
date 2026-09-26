@@ -1,0 +1,109 @@
+// Compatibility helper for callers that only need materialized text.
+pub fn plain_snippet(source: []const u8, output: []u8) Offset {
+  parsed := parse_snippet(source, output)
+  return Offset{ok: parsed.ok, value: parsed.length}
+}
+
+pub struct SnippetStop { number, start, end, parent: usize, live: bool }
+pub struct Snippet { stops: [32]SnippetStop, count, length: usize, ok: bool }
+// Bounded numeric tabstops and nested defaults. Reject unsupported syntax before
+// touching the document; never leave raw snippet control text in a file.
+pub fn parse_snippet(source: []const u8, output: []u8) Snippet {
+  result := Snippet{}
+  at: usize = 0
+  result.ok = snippet_expand(source, output, &at, &result, false, 0, 32)
+  return result
+}
+fn snippet_expand(source: []const u8, output: []u8, at: *usize, result: *Snippet, nested: bool, depth: usize, parent: usize) bool {
+  if depth > 16 {
+    return false
+  }
+  for at.* < #len(source) {
+    byte := source[at.*]
+    at.* += 1
+    if byte == '}' && nested {
+      return true
+    }
+    if byte == 92 {
+      if at.* == #len(source) {
+        return false
+      }
+      byte = source[at.*]
+      at.* += 1
+      if byte != 92 && byte != '$' && byte != '}' {
+        return false
+      }
+    } else if byte == '$' {
+      if at.* == #len(source) || result.count == 31 {
+        return false
+      }
+      braces := source[at.*] == '{'
+      if braces {
+        at.* += 1
+      }
+      beginning := at.*
+      number: usize = 0
+      for at.* < #len(source) && source[at.*] >= '0' && source[at.*] <= '9' {
+        if number > 999999 {
+          return false
+        }
+        number = number * 10 + #cast(usize) (source[at.*] - '0')
+        at.* += 1
+      }
+      if at.* == beginning {
+        return false
+      }
+      index := result.count
+      result.count += 1
+      result.stops[index] = SnippetStop{number: number, parent: parent, start: result.length, end: #len(output) + 1, live: true}
+      defaulted: bool = false
+      if braces {
+        if at.* == #len(source) {
+          return false
+        }
+        separator := source[at.*]
+        at.* += 1
+        if separator == ':' {
+          defaulted = true
+          if !snippet_expand(source, output, at, result, true, depth + 1, index) {
+            return false
+          }
+        }
+        else if separator != '}' {
+          return false
+        }
+      }
+      for prior in 0..index {
+        previous := &result.stops[prior]
+        if previous.number == number {
+          // Repeated defaults and recursive self references are ambiguous here.
+          if defaulted || previous.end > result.length {
+            return false
+          }
+          for child in prior + 1..index {
+            if result.stops[child].parent == prior {
+              return false
+            }
+          }
+          size := previous.end - previous.start
+          if size > #len(output) - result.length {
+            return false
+          }
+          for offset in 0..size {
+            output[result.length] = output[previous.start + offset]
+            result.length += 1
+          }
+          break
+        }
+      }
+      result.stops[index].end = result.length
+      continue
+    }
+    if result.length == #len(output) {
+      return false
+    }
+    output[result.length] = byte
+    result.length += 1
+  }
+  return !nested
+}

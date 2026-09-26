@@ -1,94 +1,450 @@
+// Animation frames wait for vertical blank (even pacing, no tearing); frames
+// answering input present immediately, so typing never waits for a refresh.
+fn present_pacing(app: *App, renderer: rawptr) {
+  answering := (app.render_trace.pending & (RenderKey | RenderText | RenderMouse | RenderIme | RenderWindow)) != 0
+  wanted := app.view.vsync_supported && app.view.animation.active && !answering
+  if wanted != app.view.vsync {
+    interval: i32 = 0
+    if wanted {
+      interval = 1
+    }
+    if sdl.render_vsync(renderer, interval) {
+      app.view.vsync = wanted
+    }
+  }
+}
 fn draw(renderer: rawptr, window: rawptr, app: *App, typography: *Typography) {
-  if !sdl.color(renderer, 20, 24, 29, 255) || !sdl.clear(renderer) { #panic("clear failed") }
-  margin := 28.0 * typography.scale
-  width: i32 = 0 height: i32 = 0
-  if !sdl.size(renderer, &width, &height) { #panic("size failed") }
-  doc := app.document
-  if typography.rendered_revision != doc.revision || typography.rendered_document != doc || typography.rendered_view_revision != app.view_revision {
-    if !ttf.set(typography.document, &doc.bytes[0], doc.length) { #panic("document update failed") }
-    typography.rendered_revision = doc.revision typography.rendered_document = doc typography.rendered_view_revision = app.view_revision
+  present_pacing(app, renderer)
+  render_trace_begin(app, typography)
+
+  if !paint(renderer, theme().background) || !sdl.clear(renderer) {
+    #panic("clear failed")
   }
-  caret := ttf.Substring{}
-  if !ttf.substring(typography.document, #cast(i32) doc.cursor, &caret) { #panic("cursor geometry failed") }
-  caret_x := #cast(f32) caret.x caret_y := #cast(f32) caret.y
-  gutter: f32 = 0.0 if app.line_numbers { gutter = typography.cell * 7.0 }
-  origin := margin + gutter
-  status_height: f32 = 0.0 if app.status_line { status_height = typography.line }
-  visible_width := #cast(f32) width - origin - margin visible_height := #cast(f32) height - margin * 2.0 - status_height
-  if visible_width < typography.cell { visible_width = typography.cell }
-  if visible_height < typography.line { visible_height = typography.line }
-  if caret_x < app.scroll_x { app.scroll_x = caret_x }
-  if caret_y < app.scroll_y { app.scroll_y = caret_y }
-  if caret_x + typography.cell > app.scroll_x + visible_width { app.scroll_x = caret_x + typography.cell - visible_width }
-  if caret_y + typography.line > app.scroll_y + visible_height { app.scroll_y = caret_y + typography.line - visible_height }
-  clipping_document := sdl.PixelRect{x: #cast(i32) origin, y: 0, width: width - #cast(i32) origin, height: height - #cast(i32) status_height}
-  if clipping_document.width < 1 { clipping_document.width = 1 }
-  if clipping_document.height < 1 { clipping_document.height = 1 }
-  if !sdl.clip(renderer, &clipping_document) { #panic("document clip") }
-  if app.highlight_line {
-    highlight := sdl.Rect{x: origin, y: margin + caret_y - app.scroll_y, width: #cast(f32) width - origin, height: typography.line}
-    if !sdl.color(renderer, 25, 31, 37, 255) || !sdl.fill(renderer, &highlight) { #panic("current line") }
+
+  margin := app.config.document_padding * typography.scale
+  width: i32 = 0
+  height: i32 = 0
+
+  if !sdl.size(renderer, &width, &height) {
+    #panic("size failed")
   }
-  at := buffer.start(doc) ending := buffer.end(doc)
-  for at < ending {
-    part := ttf.Substring{}
-    if !ttf.substring(typography.document, #cast(i32) at, &part) { break }
-    rect := sdl.Rect{x: origin + #cast(f32) part.x - app.scroll_x, y: margin + #cast(f32) part.y - app.scroll_y, width: #cast(f32) part.width, height: typography.line}
-    if rect.width < 1.0 { rect.width = typography.cell }
-    if rect.y + rect.height >= 0.0 && rect.y < #cast(f32) height {
-      if !sdl.color(renderer, 53, 76, 84, 255) || !sdl.fill(renderer, &rect) { #panic("selection draw failed") }
+
+  animation_begin(app, typography, width, height)
+  // One UI frame per draw: status lines, split handles and every panel share
+  // it, so hit-testing sees everything on screen.
+  ui_begin(&app.ui, typography)
+  app.ui.in_draw = true
+  // A closed dialog forgets its button focus; the next one starts at its default.
+  if !dialog_panel(app) {
+    app.ui.dialog_focus_set = false
+  }
+  draw_panes(renderer, app, typography, width, height)
+  draw_split_handles(renderer, app, typography, width, height)
+  // A docked tree is part of the layout, drawn whether or not it has focus.
+  if tree_docked(app) {
+    draw_tree(renderer, app, typography, width, height)
+  }
+
+  if app.render_trace.enabled {
+    app.render_trace.panes_finished = render_clock()
+  }
+  doc := app.documents.current
+  status_height: f32 = 0.0
+  if app.view.status_line {
+    status_height = typography.line
+  }
+
+  if (search_prompt(app.prompt_state.panel) && app.search_state.explorer) || (app.prompt_state.panel == Panel.Match && app.match_state.explorer) {
+    draw_explorer(renderer, app, typography, width, height)
+  }
+  if popup_shown(app) {
+    popup_begin(renderer, app)
+  }
+  if app.prompt_state.panel == Panel.Terminal {
+    draw_terminal(renderer, app, typography, width, height, true, true)
+  } else if app.prompt_state.panel == Panel.Directory {
+    draw_explorer(renderer, app, typography, width, height)
+  } else if key_menu_is(app.prompt_state.panel) {
+    // Menus opened from the explorer overlay it instead of hiding it.
+    if (app.prompt_state.panel == Panel.Goto && app.input_state.goto_explorer) || (app.prompt_state.panel == Panel.Leader && app.input_state.leader_explorer) {
+      draw_explorer(renderer, app, typography, width, height)
     }
-    next := buffer.next(doc, at)
-    if part.length > 0 && #cast(usize) (part.offset + part.length) > next { next = #cast(usize) (part.offset + part.length) }
-    at = next
-  }
-  cursor_width := typography.cell if app.insert { cursor_width = 2.0 * typography.scale }
-  cursor := sdl.Rect{x: origin + caret_x - app.scroll_x, y: margin + caret_y - app.scroll_y, width: cursor_width, height: typography.points * typography.scale + 5.0 * typography.scale}
-  if !sdl.color(renderer, 143, 185, 166, 255) || !sdl.fill(renderer, &cursor) { #panic("cursor draw failed") }
-  if !ttf.draw(typography.document, origin - app.scroll_x, margin - app.scroll_y) { #panic("text draw failed") }
-  if !sdl.clip(renderer, nil) { #panic("document clip reset") }
-  draw_chrome(renderer, app, typography, width, height, margin, gutter)
-  if app.panel == Panel.Directory { draw_explorer(renderer, app, typography, width, height) }
-  else if app.panel != Panel.None {
-    popup_rect := sdl.Rect{x: #cast(f32) width * (1.0-app.popup_width) / 2.0, y: #cast(f32) height * (1.0-app.popup_height) / 2.0, width: #cast(f32) width * app.popup_width, height: #cast(f32) height * app.popup_height}
-    minimum := 520.0 * typography.scale
-    if popup_rect.width < minimum { popup_rect.width = minimum }
-    if popup_rect.width > #cast(f32) width { popup_rect.width = #cast(f32) width }
-    popup_rect.x = (#cast(f32) width - popup_rect.width) / 2.0
-    compact := app.panel == Panel.Commands
-    padding := margin if compact { padding = 10.0 * typography.scale }
-    labels: [16384]u8 = [] count := popup_text(app, labels[..])
-    wrap_width := #cast(i32) (popup_rect.width - padding * 2.0) if wrap_width < 1 { wrap_width = 1 }
-    if !buffer.equal(labels[..count], typography.palette_bytes[..typography.palette_length]) {
-      if !ttf.set(typography.palette, &labels[0], count) { #panic("popup text update failed") }
-      typography.palette_length = copy_text(typography.palette_bytes[..], labels[..count]) typography.palette_updates += 1
+    draw_key_menu(renderer, app, typography, width, height, status_height)
+  } else if app.prompt_state.panel == Panel.Hover {
+    draw_hover(renderer, app, typography, width, height)
+  } else if completion_visible(app) {
+    draw_completion(renderer, app, typography, width, height)
+  } else if app.prompt_state.panel == Panel.Commands {
+    if app.explorer.commands {
+      draw_explorer(renderer, app, typography, width, height)
     }
-    if typography.palette_wrap != wrap_width {
-      if !ttf.wrap(typography.palette, wrap_width) { #panic("popup wrap failed") }
-      typography.palette_wrap = wrap_width
+    draw_command_palette(renderer, app, typography, width, height)
+  } else if app.prompt_state.panel == Panel.ReplacePreview {
+    draw_replace_preview(renderer, app, typography, width, height, status_height)
+  } else if app.prompt_state.panel == Panel.ProjectSearch {
+    draw_project_search(renderer, app, typography, width, height, status_height)
+  } else if app.prompt_state.panel == Panel.Open || app.prompt_state.panel == Panel.Buffers {
+    draw_picker(renderer, app, typography, width, height, status_height)
+  } else if app.prompt_state.panel == Panel.Tree {
+    if !tree_docked(app) {
+      draw_tree(renderer, app, typography, width, height)
     }
-    text_width: i32 = 0 text_height: i32 = 0
-    if !ttf.size(typography.palette, &text_width, &text_height) { #panic("popup measure failed") }
-    needed := #cast(f32) text_height + padding * 2.0
-    if compact { popup_rect.height = needed }
-    if popup_rect.height < needed { popup_rect.height = needed }
-    if popup_rect.height > #cast(f32) height { popup_rect.height = #cast(f32) height }
-    popup_rect.y = (#cast(f32) height - popup_rect.height) / 2.0
-    if compact { popup_rect.y = #cast(f32) height - status_height - popup_rect.height - 12.0 * typography.scale if popup_rect.y < 0.0 { popup_rect.y = 0.0 } }
-    clipping := sdl.PixelRect{x: #cast(i32) popup_rect.x, y: #cast(i32) popup_rect.y, width: #cast(i32) popup_rect.width, height: #cast(i32) popup_rect.height}
-    if !sdl.clip(renderer, &clipping) { #panic("popup clip failed") }
-    if !sdl.color(renderer, 35, 43, 49, 255) || !sdl.fill(renderer, &popup_rect) { #panic("popup draw failed") }
-    if !ttf.draw(typography.palette, popup_rect.x + padding, popup_rect.y + padding) { #panic("popup text failed") }
-    if !sdl.clip(renderer, nil) { #panic("clip reset failed") }
+  } else if app.prompt_state.panel != Panel.None {
+    draw_dialog(renderer, app, typography, width, height, status_height)
   }
-  title: [8192]u8 = [] used: usize = 0
-  if buffer.dirty(doc) { add_text(title[..], &used, "[+] ") }
-  if app.insert { add_text(title[..], &used, "INSERT  ") } else if app.extend { add_text(title[..], &used, "SELECT  ") } else { add_text(title[..], &used, "NORMAL  ") }
-  if app.file.length == 0 { add_text(title[..], &used, "Untitled") } else { add_text(title[..], &used, files.name(app.file)) }
+  popup_present(renderer, app)
+  composition_draw(renderer, window, app, typography, width, height)
+  title: [8192]u8 = []
+  used: usize = 0
+
+  if buffer.dirty_cached(doc) {
+    add_text(title[..], &used, "[+] ")
+  }
+  if app.view.insert {
+    add_text(title[..], &used, "INSERT  ")
+  } else if app.view.extend {
+    add_text(title[..], &used, "SELECT  ")
+  } else {
+    add_text(title[..], &used, "NORMAL  ")
+  }
+  if app.documents.file.length == 0 {
+    add_text(title[..], &used, "Untitled")
+  } else {
+    add_text(title[..], &used, files.name(app.documents.file))
+  }
+
   add_text(title[..], &used, " — DNA")
-  if !buffer.equal(title[..used], app.window_title[..app.window_title_length]) {
-    if !sdl.title(window, &title[0]) { #panic("title update failed") }
-    app.window_title_length = copy_text(app.window_title[..], title[..used])
+
+  if !buffer.equal(title[..used], app.title_state.text[..app.title_state.length]) {
+    if !sdl.title(window, &title[0]) {
+      #panic("title update failed")
+    }
+    app.title_state.length = copy_text(app.title_state.text[..], title[..used])
   }
-  if !sdl.present(renderer) { #panic("present failed") }
+  if app.render_trace.enabled {
+    app.render_trace.present_started = render_clock()
+  }
+  app.ui.in_draw = false
+  if !sdl.present(renderer) {
+    #panic("present failed")
+  }
+
+  render_trace_end(app, typography)
+}
+
+fn draw_document(renderer: rawptr, app: *App, typography: *Typography, width: i32, height: i32, focused: bool) {
+  if app.documents.slots[app.documents.active].terminal.handle != nil {
+    draw_terminal(renderer, app, typography, width, height, false, focused)
+    return
+  }
+
+  margin := app.config.document_padding * typography.scale
+  doc := app.documents.current
+  gutter: f32 = 0.0
+  if app.view.line_numbers {
+    gutter = typography.cell * 7.0
+  }
+  origin := margin + gutter
+  status_height: f32 = 0.0
+  if app.view.status_line {
+    status_height = typography.line
+  }
+  visible_width := #cast(f32) width - origin - margin
+  visible_height := #cast(f32) height - margin * 2.0 - status_height
+
+  if visible_width < typography.cell {
+    visible_width = typography.cell
+  }
+  if visible_height < typography.line {
+    visible_height = typography.line
+  }
+
+  head := doc.cursor
+  if !app.view.insert {
+    head = buffer.head(doc)
+  }
+  caret_y := #cast(f32) (line_at(doc, head) - 1) * typography.line
+  scroll_margin := app.config.scroll_margin * typography.line
+  if scroll_margin > (visible_height - typography.line) * 0.5 {
+    scroll_margin = (visible_height - typography.line) * 0.5
+  }
+
+  if caret_y - scroll_margin < app.view.scroll_y {
+    app.view.scroll_y = caret_y - scroll_margin
+  }
+  if caret_y + typography.line + scroll_margin > app.view.scroll_y + visible_height {
+    app.view.scroll_y = caret_y + typography.line + scroll_margin - visible_height
+  }
+  if app.view.scroll_y < 0.0 {
+    app.view.scroll_y = 0.0
+  }
+
+  caret := measure_position(doc, typography, head)
+  caret_x := #cast(f32) caret.x
+  horizontal_margin := app.config.horizontal_scroll_margin * typography.cell
+  if horizontal_margin > visible_width * 0.4 {
+    horizontal_margin = visible_width * 0.4
+  }
+
+  if caret_x - horizontal_margin < app.view.scroll_x {
+    app.view.scroll_x = caret_x - horizontal_margin
+  }
+  if caret_x + typography.cell + horizontal_margin > app.view.scroll_x + visible_width {
+    app.view.scroll_x = caret_x + typography.cell + horizontal_margin - visible_width
+  }
+  if app.view.scroll_x < 0.0 {
+    app.view.scroll_x = 0.0
+  }
+
+  visual := &app.view.animation.file
+  animated_scroll(app, visual, app.view.scroll_x, app.view.scroll_y, visible_height, app.view.animation.reset)
+  scroll_x := visual.x.value
+  scroll_y := visual.y.value
+  viewport := visible_viewport(doc, typography.line, visible_height, scroll_y)
+
+  shaped := line_layout_update(typography, typography.layout, doc, app.documents.slots[app.documents.active].identity, viewport)
+  if shaped > 0 {
+    typography.document_updates += 1
+  }
+  if typography.rendered_revision != doc.revision || typography.rendered_document != doc || typography.rendered_view_revision != app.view.revision || typography.document_start != viewport.start || typography.document_end != viewport.end {
+    typography.rendered_revision = doc.revision
+    typography.rendered_document = doc
+    typography.rendered_view_revision = app.view.revision
+    typography.document_start = viewport.start
+    typography.document_end = viewport.end
+  }
+
+  clipping_document := sdl.PixelRect{x: #cast(i32) origin, y: 0, width: width - #cast(i32) origin, height: height - #cast(i32) status_height}
+
+  if clipping_document.width < 1 {
+    clipping_document.width = 1
+  }
+  if clipping_document.height < 1 {
+    clipping_document.height = 1
+  }
+  if !sdl.clip(renderer, &clipping_document) {
+    #panic("document clip")
+  }
+  if app.view.highlight_line {
+    highlight := sdl.Rect{x: origin, y: margin + caret_y - scroll_y, width: #cast(f32) width - origin, height: typography.line}
+    if !paint(renderer, theme().line) || !sdl.fill(renderer, &highlight) {
+      #panic("current line")
+    }
+  }
+
+  draw_selection(renderer, doc, typography.layout, viewport, typography, origin, margin, scroll_x, scroll_y, #cast(f32) width)
+  cursor_width := typography.cell
+  if app.view.insert {
+    cursor_width = app.config.cursor_thickness * typography.scale
+  }
+  cursor_target_x := origin + caret_x - scroll_x
+  cursor_target_y := margin + caret_y - scroll_y
+  cursor_snap := app.view.animation.reset || !app.config.smooth_cursor || cursor_step_snaps(&visual.cursor_x, &visual.cursor_y, cursor_target_x, cursor_target_y, typography.cell, typography.line)
+  cursor_x := animated_follow(app, &visual.cursor_x, cursor_target_x, app.config.cursor_animation_ms, cursor_snap)
+  cursor_y := animated_follow(app, &visual.cursor_y, cursor_target_y, app.config.cursor_animation_ms, cursor_snap)
+  cursor := sdl.Rect{x: cursor_x, y: cursor_y, width: cursor_width, height: typography.points * typography.scale + 5.0 * typography.scale}
+
+  cursor_target := sdl.Rect{x: cursor_target_x, y: cursor_target_y, width: cursor.width, height: cursor.height}
+  if focused && !draw_cursor_trail(renderer, app, &visual.trail, cursor_target, cursor_snap, theme().cursor) && (!paint(renderer, theme().cursor) || !sdl.fill(renderer, &cursor)) {
+    #panic("cursor draw failed")
+  }
+  if focused {
+    draw_extra_cursors(renderer, doc, typography.layout, viewport, typography, origin, margin, scroll_x, scroll_y, app.view.insert)
+  }
+  line_layout_draw(typography.layout, theme().text, origin - scroll_x, margin + viewport.y - scroll_y)
+
+  draw_syntax(renderer, app, typography, viewport, origin - scroll_x, margin + viewport.y - scroll_y, clipping_document)
+  _ = draw_diagnostics(renderer, app, typography, viewport, origin - scroll_x, margin - scroll_y)
+
+  if !sdl.clip(renderer, nil) {
+    #panic("document clip reset")
+  }
+  ui_scrollbar(renderer, typography.scale, sdl.Rect{x: 0.0, y: margin, width: #cast(f32) width, height: visible_height}, #cast(f32) doc.line_count * typography.line, scroll_y)
+
+  draw_chrome(renderer, app, typography, width, height, margin, gutter, scroll_y)
+
+  if focused {
+    draw_diagnostic_hover(renderer, app, typography, width, height)
+  }
+}
+
+fn draw_panes(renderer: rawptr, app: *App, typography: *Typography, width: i32, height: i32) {
+  pane_init(app)
+  pane_store(app)
+
+
+  for stale in 0..15 {
+    if !app.view.panes[stale].used || app.view.panes[stale].branch {
+      release_pane_cache(typography, stale)
+    }
+  }
+
+  pane_layout(app, 0, editor_area(app, width, height, typography.scale))
+  saved_visual := app.view.animation.file
+  saved_reset := app.view.animation.reset
+  // Draw inactive views first and restore the focused editing context last.
+  for pass in 0..2 {
+    for index in 0..15 {
+      pane := &app.view.panes[index]
+      focused := index == app.view.focused
+      if pane.used && !pane.branch && ((pass == 0 && !focused) || (pass == 1 && focused)) {
+        pane_load(app, index)
+        app.view.animation.reset = saved_reset || !focused
+
+        if focused {
+          app.view.animation.file = saved_visual
+        }
+        if !sdl.viewport(renderer, &pane.rect) {
+          #panic("pane viewport")
+        }
+
+        cached := &typography.pane_text[index]
+
+        if cached.text == nil {
+          if index == 0 {
+            cached.text = typography.primary_document
+          } else {
+            blank: [1]u8 = [0]
+            cached.text = ttf.create(typography.engine, typography.font, &blank[0], 0)
+          }
+          if cached.text == nil || !ttf.whitespace_visible(cached.text, true) || !ttf.wrap(cached.text, 0) {
+            #panic("pane text allocation")
+          }
+        }
+        if cached.caret == nil {
+          if index == 0 {
+            cached.caret = typography.primary_caret
+          } else {
+            caret_blank: [1]u8 = [0]
+            cached.caret = ttf.create(typography.engine, typography.font, &caret_blank[0], 0)
+          }
+          if cached.caret == nil || !ttf.whitespace_visible(cached.caret, true) || !ttf.wrap(cached.caret, 0) {
+            #panic("pane caret allocation")
+          }
+        }
+
+        typography.current_pane = index
+        typography.caret_text = cached.caret
+        typography.caret_document = cached.caret_document
+        typography.caret_revision = cached.caret_revision
+        typography.caret_start = cached.caret_start
+        typography.caret_end = cached.caret_end
+        typography.document = cached.text
+        typography.layout = &cached.layout
+        typography.rendered_document = cached.document
+        typography.rendered_revision = cached.revision
+        typography.document_start = cached.start
+        typography.document_end = cached.end
+
+        // Identity protects against arena addresses reused by another buffer.
+        if cached.identity != app.documents.slots[app.documents.active].identity {
+          typography.rendered_document = nil
+          typography.caret_document = nil
+        }
+
+        typography.rendered_view_revision = app.view.revision
+
+        if !tint(typography.document, theme().text) {
+          #panic("pane text color")
+        }
+
+        draw_document(renderer, app, typography, pane.rect.width, pane.rect.height, focused)
+        cached.caret_document = typography.caret_document
+        cached.caret_revision = typography.caret_revision
+        cached.caret_start = typography.caret_start
+        cached.caret_end = typography.caret_end
+        cached.document = typography.rendered_document
+        cached.revision = typography.rendered_revision
+        cached.start = typography.document_start
+        cached.end = typography.document_end
+        cached.identity = app.documents.slots[app.documents.active].identity
+        pane.scroll_x = app.view.scroll_x
+        pane.scroll_y = app.view.scroll_y
+
+        if app.view.panes[0].branch {
+          // In a terminal the top line would cost a row of text; the status
+          // line above already separates stacked panes there.
+          if !sdl.tui_active() {
+            border := sdl.Rect{x: 0.0, y: 0.0, width: #cast(f32) pane.rect.width, height: typography.scale}
+            color := theme().border
+            if focused {
+              color = theme().cursor
+            }
+
+            if !paint(renderer, color) || !sdl.fill(renderer, &border) {
+              #panic("pane border")
+            }
+          }
+          if pane.rect.x > 0 {
+            divider := sdl.Rect{x: 0.0, y: 0.0, width: typography.scale, height: #cast(f32) pane.rect.height}
+            if !paint(renderer, theme().border) || !sdl.fill(renderer, &divider) {
+              #panic("pane divider")
+            }
+          }
+        }
+      }
+    }
+  }
+  app.view.animation.reset = saved_reset
+  if !sdl.viewport(renderer, nil) {
+    #panic("pane viewport reset")
+  }
+}
+fn pane_text_font(typography: *Typography, font: rawptr) {
+  ui_cache_clear(typography)
+  line_layout_font(&typography.directory_layout, font)
+  preview_text_release(typography)
+  for index in 0..15 {
+    cached := &typography.pane_text[index]
+    if cached.text != nil {
+      _ = ttf.set_font(cached.text, font)
+      cached.document = nil
+    }
+    if cached.caret != nil {
+      _ = ttf.set_font(cached.caret, font)
+      cached.caret_document = nil
+    }
+    line_layout_font(&cached.layout, font)
+    for span in 0..128 {
+      item := &cached.spans[span]
+      item.geometry_ready = false
+      item.text_ready = false
+      if item.text != nil {
+        _ = ttf.set_font(item.text, font)
+      }
+    }
+  }
+  _ = ttf.set_font(typography.primary_document, font)
+  _ = ttf.set_font(typography.primary_caret, font)
+  typography.caret_document = nil
+}
+fn release_pane_cache(typography: *Typography, index: usize) {
+  cached := &typography.pane_text[index]
+
+  if cached.text == nil && cached.caret == nil {
+    return
+  }
+  if cached.text != nil && cached.text != typography.primary_document {
+    ttf.destroy(cached.text)
+  }
+  if cached.caret != nil && cached.caret != typography.primary_caret {
+    ttf.destroy(cached.caret)
+  }
+
+  for span in 0..128 {
+    if cached.spans[span].text != nil {
+      ttf.destroy(cached.spans[span].text)
+    }
+  }
+  line_layout_release(&cached.layout)
+  cached.* = PaneText{}
+}
+fn release_pane_text(typography: *Typography) {
+  preview_text_release(typography)
+  for index in 0..15 {
+    release_pane_cache(typography, index)
+  }
+  line_layout_release(&typography.directory_layout)
+  typography.document = typography.primary_document
+  typography.caret_text = typography.primary_caret
 }

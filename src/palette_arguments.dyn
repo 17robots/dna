@@ -1,0 +1,881 @@
+// Command palette search and completion beyond the command list: every
+// option as a "Set option" row, and suggestions for a command's arguments
+// (paths, themes, languages, module and placement names, option values).
+// Rows built for a query live in app.command_menu and are numbered from
+// PaletteRowBase, after commands and plugin commands. Tab fills the selected
+// command or suggestion; Enter fills it and runs the command, or keeps the
+// palette open when more input should follow (a folder, an option name).
+const PaletteRowBase: usize = 1024
+const PaletteRowLimit: usize = 512
+
+struct PaletteRow {
+  label_start, label_length, value_start, value_length: u32,
+  score: i32,
+  // An option row: choosing it types "set KEY ".
+  option: bool,
+  // More input follows this value (a folder, an option or slot name).
+  continues: bool,
+  // Enter on a folder runs the command instead of descending into it (cd).
+  runs: bool,
+  // A guess at a free value (a new file name, a number): Tab takes it, but
+  // Enter keeps what was typed.
+  soft: bool,
+}
+
+extern fn language_registry "dna_language_registry"(output: *u8, capacity: usize) i32
+
+fn palette_row_label(app: *App, row: usize) []const u8 {
+  if row >= app.command_menu.row_count {
+    return ""
+  }
+  entry := &app.command_menu.rows[row]
+  return app.command_menu.pool[#cast(usize) entry.label_start..#cast(usize) (entry.label_start + entry.label_length)]
+}
+fn palette_row_value(app: *App, row: usize) []const u8 {
+  entry := &app.command_menu.rows[row]
+  return app.command_menu.pool[#cast(usize) entry.value_start..#cast(usize) (entry.value_start + entry.value_length)]
+}
+// Open the palette with text typed, as if the user had entered it.
+fn palette_prefill(app: *App, text: []const u8) {
+  if app.prompt_state.panel != Panel.Commands {
+    panel(app, Panel.Commands)
+  }
+  app.prompt_state.length = copy_text(app.prompt_state.text[..4095], text)
+  app.prompt_state.text[app.prompt_state.length] = 0
+  app.prompt_state.selected = 0
+  app.command_menu.cached = false
+}
+// The first alias: the name a command is typed as.
+fn command_primary(id: usize) []const u8 {
+  aliases := command_info(id).aliases
+  end: usize = 0
+  for end < #len(aliases) && aliases[end] != '|' {
+    end += 1
+  }
+  if end == 0 {
+    return ""
+  }
+  return aliases[..end]
+}
+fn command_arguments(id: usize) []const u8 {
+  if id >= BuiltinCommands {
+    return ""
+  }
+  arguments := command_info(id).arguments
+  if #len(arguments) > 0 && arguments[0] == '!' {
+    return arguments[1..]
+  }
+  return arguments
+}
+// Keep the menu sorted by score; equal scores keep the order added.
+fn menu_insert(app: *App, scores: []i32, id: usize, score: i32) {
+  if app.command_menu.count >= #len(app.command_menu.ids) {
+    return
+  }
+  at := app.command_menu.count
+  for at > 0 && scores[at - 1] < score {
+    scores[at] = scores[at - 1]
+    app.command_menu.ids[at] = app.command_menu.ids[at - 1]
+    at -= 1
+  }
+  scores[at] = score
+  app.command_menu.ids[at] = id
+  app.command_menu.count += 1
+}
+fn pool_add(app: *App, text: []const u8) u32 {
+  start := app.command_menu.pool_used
+  if start + #len(text) > #len(app.command_menu.pool) {
+    return 4294967295
+  }
+  app.command_menu.pool_used += copy_text(app.command_menu.pool[start..], text)
+  return #cast(u32) start
+}
+// A row for this query, or PaletteRowLimit when there is no room.
+fn palette_add_row(app: *App, label: []const u8, value: []const u8) usize {
+  menu := &app.command_menu
+  if menu.row_count >= PaletteRowLimit {
+    return PaletteRowLimit
+  }
+  label_start := pool_add(app, label)
+  value_start := pool_add(app, value)
+  if label_start == 4294967295 || value_start == 4294967295 {
+    return PaletteRowLimit
+  }
+  row := menu.row_count
+  menu.rows[row] = PaletteRow{label_start: label_start, label_length: #cast(u32) #len(label), value_start: value_start, value_length: #cast(u32) #len(value)}
+  menu.row_count += 1
+  return row
+}
+
+// ---------------------------------------------------------------------------
+// Options
+
+const LegacyOptionCount: usize = 20
+fn legacy_option(index: usize) []const u8 {
+  names: [20][]const u8 = ["font", "font_family", "font_size", "line_height", "fallback_font", "theme", "indent_width", "reduced_motion", "line_numbers", "relative_numbers", "status_line", "highlight_line", "shell", "terminal_escape", "explorer_icons", "explorer_columns", "explorer_preview", "build_command", "test_command", "run_command"]
+  return names[index]
+}
+// Every option :set accepts: the top-level keys, the sectioned options by
+// their full names, and the [modules] slots.
+fn palette_option_count() usize {
+  return LegacyOptionCount + settings.ExtraCount + 4
+}
+fn palette_option_key(index: usize) []const u8 {
+  if index < LegacyOptionCount {
+    return legacy_option(index)
+  }
+  if index < LegacyOptionCount + settings.ExtraCount {
+    return settings.option(index - LegacyOptionCount).key
+  }
+  slots: [4][]const u8 = ["keymap", "frontend", "explorer", "picker"]
+  return slots[index - LegacyOptionCount - settings.ExtraCount]
+}
+fn module_option(key: []const u8) bool {
+  return buffer.equal(key, "keymap") || buffer.equal(key, "frontend") || buffer.equal(key, "explorer") || buffer.equal(key, "picker")
+}
+fn flag_option(key: []const u8) bool {
+  for index in 0..settings.ExtraCount {
+    spec := settings.option(index)
+    if buffer.equal(spec.key, key) {
+      return spec.flag
+    }
+  }
+  return buffer.equal(key, "reduced_motion") || buffer.equal(key, "line_numbers") || buffer.equal(key, "relative_numbers") || buffer.equal(key, "status_line") || buffer.equal(key, "highlight_line") || buffer.equal(key, "explorer_icons") || buffer.equal(key, "explorer_columns") || buffer.equal(key, "explorer_preview")
+}
+// The value an option has now, where DNA can tell; empty otherwise.
+fn option_current(app: *App, key: []const u8, output: []u8) []const u8 {
+  if module_option(key) {
+    return module_active(app, key)
+  }
+  for index in 0..settings.ExtraCount {
+    spec := settings.option(index)
+    if buffer.equal(spec.key, key) {
+      value := settings.option_value(&app.config, index)
+      if spec.flag {
+        if value != 0.0 {
+          return "true"
+        }
+        return "false"
+      }
+      used: usize = 0
+      setting_decimal(output, &used, value)
+      return output[..used]
+    }
+  }
+  return ""
+}
+fn palette_option_rows(app: *App, query: []const u8, scores: []i32) {
+  if #len(query) == 0 {
+    return
+  }
+  for index in 0..palette_option_count() {
+    key := palette_option_key(index)
+    title: [128]u8 = []
+    used := copy_text(title[..], "Set option ")
+    add_text(title[..], &used, key)
+    score := fuzzy_score(title[..used], query)
+    if buffer.equal(key, query) {
+      score = 900000
+    }
+    if score < 0 {
+      continue
+    }
+    current: [64]u8 = []
+    value := option_current(app, key, current[..])
+    if #len(value) > 0 {
+      add_text(title[..], &used, "  ")
+      add_text(title[..], &used, value)
+    }
+    row := palette_add_row(app, title[..used], key)
+    if row == PaletteRowLimit {
+      return
+    }
+    app.command_menu.rows[row].option = true
+    menu_insert(app, scores, PaletteRowBase + row, score)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Argument suggestions
+
+// One suggestion for the word being typed, kept when it matches it.
+fn suggest(app: *App, scores: []i32, fragment: []const u8, value: []const u8, hint: []const u8, continues: bool) usize {
+  score := fuzzy_score(value, fragment)
+  if score < 0 {
+    return PaletteRowLimit
+  }
+  if #len(fragment) > 0 && #len(value) >= #len(fragment) && buffer.equal(value[..#len(fragment)], fragment) {
+    score += 1000
+  }
+  // The same value twice (a language from two sources) shows once.
+  for row in 0..app.command_menu.row_count {
+    if buffer.equal(palette_row_value(app, row), value) {
+      return PaletteRowLimit
+    }
+  }
+  label: [600]u8 = []
+  used := copy_text(label[..512], value)
+  if #len(hint) > 0 {
+    add_text(label[..], &used, "  ")
+    add_text(label[..], &used, hint)
+  }
+  row := palette_add_row(app, label[..used], value)
+  if row == PaletteRowLimit {
+    return row
+  }
+  app.command_menu.rows[row].continues = continues
+  menu_insert(app, scores, PaletteRowBase + row, score)
+  return row
+}
+fn suggest_words(app: *App, scores: []i32, fragment: []const u8, words: []const u8, hint: []const u8, continues: bool) {
+  at: usize = 0
+  for at < #len(words) {
+    for at < #len(words) && words[at] == ' ' {
+      at += 1
+    }
+    end := at
+    for end < #len(words) && words[end] != ' ' {
+      end += 1
+    }
+    if end > at {
+      _ = suggest(app, scores, fragment, words[at..end], hint, continues)
+    }
+    at = end
+  }
+}
+// Files and folders for a path being typed; folders continue into their
+// contents. Hidden entries show once the name starts with a dot.
+fn suggest_paths(app: *App, scores: []i32, fragment: []const u8, folders_only: bool, folders_run: bool, soft: bool) {
+  split := #len(fragment)
+  for split > 0 && fragment[split - 1] != '/' {
+    split -= 1
+  }
+  typed_parent := fragment[..split]
+  name := fragment[split..]
+  expanded: [4096]u8 = []
+  parent := expand_home(typed_parent, expanded[..])
+  if #len(typed_parent) == 0 {
+    parent = "."
+  }
+  storage: [8192]u8 = []
+  opened := fs.open_directory(parent, storage[..])
+  if !opened.ok {
+    return
+  }
+  defer _ = fs.close_directory(&opened.directory)
+  for true {
+    entry := fs.directory_next(&opened.directory)
+    if !entry.ok {
+      break
+    }
+    candidate := entry.name
+    if buffer.equal(candidate, ".") || buffer.equal(candidate, "..") || #len(candidate) > 255 || !utf8.valid(candidate) {
+      continue
+    }
+    if candidate[0] == '.' && (#len(name) == 0 || name[0] != '.') {
+      continue
+    }
+    if #len(name) > 0 && (#len(candidate) < #len(name) || !buffer.equal(candidate[..#len(name)], name)) {
+      continue
+    }
+    full: [4096]u8 = []
+    full_length := copy_text(full[..], parent)
+    add_text(full[..], &full_length, "/")
+    add_text(full[..], &full_length, candidate)
+    info := files.metadata(full[..full_length])
+    folder := info.ok && (info.mode & 61440) == 16384
+    if folders_only && !folder {
+      continue
+    }
+    value: [4096]u8 = []
+    used := copy_text(value[..], typed_parent)
+    add_text(value[..], &used, candidate)
+    hint: []const u8 = ""
+    if folder {
+      add_text(value[..], &used, "/")
+      hint = "folder"
+    }
+    row := suggest(app, scores, fragment, value[..used], hint, folder)
+    if row < PaletteRowLimit {
+      app.command_menu.rows[row].runs = folder && folders_run
+      app.command_menu.rows[row].soft = soft && !folder
+    }
+  }
+}
+// Files in DNA's config folder (themes/, layouts/, plugins/) with a suffix.
+fn suggest_config_files(app: *App, scores: []i32, fragment: []const u8, folder: []const u8, suffix: []const u8, hint: []const u8) {
+  path: [4096]u8 = []
+  parent := app.configuration.path_length
+  for parent > 0 && app.configuration.path[parent - 1] != '/' {
+    parent -= 1
+  }
+  length := copy_text(path[..], app.configuration.path[..parent])
+  add_text(path[..], &length, folder)
+  storage: [8192]u8 = []
+  opened := fs.open_directory(path[..length], storage[..])
+  if !opened.ok {
+    return
+  }
+  defer _ = fs.close_directory(&opened.directory)
+  for true {
+    entry := fs.directory_next(&opened.directory)
+    if !entry.ok {
+      break
+    }
+    name := entry.name
+    if #len(name) <= #len(suffix) || #len(name) > 255 || !utf8.valid(name) || name[0] == '.' {
+      continue
+    }
+    if #len(suffix) == 0 {
+      // Plugins: installed folders by name.
+      if entry.kind == 4 {
+        _ = suggest(app, scores, fragment, name, hint, false)
+      }
+      continue
+    }
+    if !buffer.equal(name[#len(name) - #len(suffix)..], suffix) {
+      continue
+    }
+    full: [4096]u8 = []
+    full_length := copy_text(full[..], path[..length])
+    add_text(full[..], &full_length, name)
+    _ = suggest(app, scores, fragment, full[..full_length], hint, false)
+  }
+}
+// Language names: the grammar registry, configured languages and the
+// languages DNA knows a default server for.
+fn suggest_languages(app: *App, scores: []i32, fragment: []const u8) {
+  registry: [4096]u8 = []
+  if language_registry(&registry[0], 4096) != 0 {
+    mark := mem.arena_mark(app.scratch)
+    defer mem.arena_rewind(app.scratch, mark)
+    read := fs.read_all(app.scratch, registry[..c.string_length(&registry[0], 4096)], 262144)
+    if read.ok {
+      at: usize = 0
+      for at < #len(read.data) {
+        end := at
+        for end < #len(read.data) && read.data[end] != 10 {
+          end += 1
+        }
+        line := settings.trim(read.data[at..end])
+        if #len(line) > 2 && line[0] == '[' && line[#len(line) - 1] == ']' {
+          _ = suggest(app, scores, fragment, line[1..#len(line) - 1], "", false)
+        }
+        at = end + 1
+      }
+    }
+  }
+  for index in 0..app.config.language_count {
+    language := &app.config.languages[index]
+    _ = suggest(app, scores, fragment, language.name[..language.name_length], "configured", false)
+  }
+  for index in 0..DefaultServers {
+    _ = suggest(app, scores, fragment, default_server(index).language, "", false)
+  }
+  _ = suggest(app, scores, fragment, "text", "plain text", false)
+}
+fn suggest_fonts(app: *App, scores: []i32, fragment: []const u8) {
+  mark := mem.arena_mark(app.scratch)
+  defer mem.arena_rewind(app.scratch, mark)
+  list := (#cast(*u8) mem.arena_push_uninit(app.scratch, 65536, 1))[..65536]
+  length := system_fonts(&list[0], 65536)
+  at: usize = 0
+  for at < length {
+    end := at
+    for end < length && list[end] != 10 {
+      end += 1
+    }
+    if end > at {
+      if suggest(app, scores, fragment, list[at..end], "", false) == PaletteRowLimit && app.command_menu.row_count >= PaletteRowLimit {
+        return
+      }
+    }
+    at = end + 1
+  }
+}
+fn suggest_themes(app: *App, scores: []i32, fragment: []const u8) {
+  names := settings.BuiltinThemeNames
+  at: usize = 0
+  for at < #len(names) {
+    end := at
+    for names[end] != 10 {
+      end += 1
+    }
+    _ = suggest(app, scores, fragment, names[at..end], "built-in", false)
+    at = end + 1
+  }
+  suggest_config_files(app, scores, fragment, "themes/", ".toml", "theme file")
+}
+fn suggest_option_values(app: *App, scores: []i32, key: []const u8, fragment: []const u8) {
+  if flag_option(key) {
+    suggest_words(app, scores, fragment, "true false", "", false)
+    return
+  }
+  if module_option(key) {
+    names := module_slot(key)
+    if buffer.equal(key, "frontend") {
+      _ = suggest(app, scores, fragment, "auto", "terminal without a display", false)
+    }
+    suggest_words(app, scores, fragment, names, "", false)
+    return
+  }
+  if buffer.equal(key, "theme") {
+    suggest_themes(app, scores, fragment)
+    return
+  }
+  if buffer.equal(key, "font_family") {
+    suggest_fonts(app, scores, fragment)
+    return
+  }
+  if buffer.equal(key, "font") || buffer.equal(key, "fallback_font") {
+    suggest_paths(app, scores, fragment, false, false, true)
+    return
+  }
+  current: [64]u8 = []
+  value := option_current(app, key, current[..])
+  if #len(value) > 0 {
+    row := suggest(app, scores, fragment, value, "current", false)
+    if row < PaletteRowLimit {
+      app.command_menu.rows[row].soft = true
+    }
+  }
+  for index in 0..settings.ExtraCount {
+    spec := settings.option(index)
+    if buffer.equal(spec.key, key) {
+      row := suggest(app, scores, fragment, spec.default_value, "default", false)
+      if row < PaletteRowLimit {
+        app.command_menu.rows[row].soft = true
+      }
+    }
+  }
+}
+// Split "a b c" into words; the last is the one being typed.
+struct PaletteWords { words: [8][]const u8, count: usize, fragment: []const u8, fragment_start: usize }
+fn palette_words(text: []const u8, start: usize) PaletteWords {
+  result := PaletteWords{}
+  at := start
+  for true {
+    for at < #len(text) && text[at] == ' ' {
+      at += 1
+    }
+    end := at
+    for end < #len(text) && text[end] != ' ' {
+      end += 1
+    }
+    if end == #len(text) {
+      result.fragment = text[at..]
+      result.fragment_start = at
+      return result
+    }
+    if result.count < 8 {
+      result.words[result.count] = text[at..end]
+      result.count += 1
+    }
+    at = end
+  }
+  return result
+}
+// Suggestions when the query is "COMMAND args...". False when the query is
+// still a command name, or the command takes no arguments.
+fn palette_arguments(app: *App, query: []const u8, scores: []i32) bool {
+  split: usize = 0
+  for split < #len(query) && query[split] != ' ' {
+    split += 1
+  }
+  if split == #len(query) {
+    return false
+  }
+  verb := query[..split]
+  id := command_named(verb)
+  kind := command_arguments(id)
+  if #len(kind) == 0 {
+    return false
+  }
+  app.command_menu.arguments = true
+  rest := split
+  for rest < #len(query) && query[rest] == ' ' {
+    rest += 1
+  }
+  // Paths and free text are one argument, spaces included.
+  whole := query[rest..]
+  app.command_menu.fragment_start = rest
+  if buffer.equal(kind, "file") || buffer.equal(kind, "path") {
+    // "path" may name a file that does not exist yet.
+    suggest_paths(app, scores, whole, false, false, buffer.equal(kind, "path"))
+    return true
+  }
+  if buffer.equal(kind, "directory") {
+    suggest_paths(app, scores, whole, true, true, false)
+    return true
+  }
+  if buffer.equal(kind, "theme") {
+    suggest_themes(app, scores, whole)
+    return true
+  }
+  if buffer.equal(kind, "layout") {
+    suggest_words(app, scores, whole, "compact wide", "built-in", false)
+    suggest_config_files(app, scores, whole, "layouts/", ".dna-layout", "layout file")
+    return true
+  }
+  if buffer.equal(kind, "font") {
+    suggest_fonts(app, scores, whole)
+    return true
+  }
+  if buffer.equal(kind, "plugin") {
+    for index in 0..8 {
+      plugin := &app.plugin_state.slots[index]
+      if plugin.length > 0 {
+        _ = suggest(app, scores, whole, plugin.name[..plugin.length], "running", false)
+      }
+    }
+    suggest_config_files(app, scores, whole, "plugins/", "", "installed")
+    return true
+  }
+  words := palette_words(query, rest)
+  app.command_menu.fragment_start = words.fragment_start
+  fragment := words.fragment
+  if buffer.equal(kind, "language") || buffer.equal(kind, "filetype") {
+    if words.count == 0 {
+      suggest_languages(app, scores, fragment)
+    }
+    return true
+  }
+  if buffer.equal(kind, "keymap") || buffer.equal(kind, "frontend") {
+    if words.count == 0 {
+      suggest_words(app, scores, fragment, module_slot(kind), "", false)
+    }
+    return true
+  }
+  if buffer.equal(kind, "module") {
+    if words.count == 0 {
+      suggest_words(app, scores, fragment, "keymap frontend explorer picker", "slot", true)
+    }
+    else if words.count == 1 {
+      if buffer.equal(words.words[0], "frontend") {
+        _ = suggest(app, scores, fragment, "auto", "terminal without a display", false)
+      }
+      suggest_words(app, scores, fragment, module_slot(words.words[0]), "", false)
+    }
+    return true
+  }
+  if buffer.equal(kind, "place") {
+    if words.count == 0 {
+      suggest_words(app, scores, fragment, "palette picker menu dialog explorer terminal completion hover", "surface", true)
+    }
+    else if words.count == 1 {
+      suggest_words(app, scores, fragment, "float dock", "", true)
+      suggest_words(app, scores, fragment, "cursor default", "", false)
+    }
+    else if words.count == 2 && buffer.equal(words.words[1], "float") {
+      suggest_words(app, scores, fragment, "top-left top top-right left center right bottom-left bottom bottom-right", "anchor", false)
+    }
+    else if words.count == 2 && buffer.equal(words.words[1], "dock") {
+      suggest_words(app, scores, fragment, "left right top bottom", "side", false)
+    }
+    return true
+  }
+  if buffer.equal(kind, "set") {
+    if words.count == 0 {
+      for index in 0..palette_option_count() {
+        key := palette_option_key(index)
+        current: [64]u8 = []
+        _ = suggest(app, scores, fragment, key, option_current(app, key, current[..]), true)
+      }
+      return true
+    }
+    // The value is the rest of the line after the key.
+    key := words.words[0]
+    value_start := rest + #len(key)
+    for value_start < #len(query) && query[value_start] == ' ' {
+      value_start += 1
+    }
+    app.command_menu.fragment_start = value_start
+    suggest_option_values(app, scores, key, query[value_start..])
+    return true
+  }
+  // Free text and numbers: no suggestions, and no unrelated commands either.
+  return true
+}
+
+// ---------------------------------------------------------------------------
+// Choosing rows
+
+// Put a row's value in the query. Returns true when more input should follow.
+fn palette_fill(app: *App, row: usize) bool {
+  entry := app.command_menu.rows[row]
+  if entry.option {
+    used := copy_text(app.prompt_state.text[..], "set ")
+    add_text(app.prompt_state.text[..4094], &used, palette_row_value(app, row))
+    add_text(app.prompt_state.text[..4094], &used, " ")
+    app.prompt_state.length = used
+    app.prompt_state.text[used] = 0
+    app.prompt_state.selected = 0
+    app.command_menu.cached = false
+    return true
+  }
+  value: [4096]u8 = []
+  value_length := copy_text(value[..], palette_row_value(app, row))
+  used := app.command_menu.fragment_start
+  if used > app.prompt_state.length {
+    used = app.prompt_state.length
+  }
+  add_text(app.prompt_state.text[..4094], &used, value[..value_length])
+  folder := value_length > 0 && value[value_length - 1] == '/'
+  if entry.continues && !folder {
+    add_text(app.prompt_state.text[..4094], &used, " ")
+  }
+  app.prompt_state.length = used
+  app.prompt_state.text[used] = 0
+  app.prompt_state.selected = 0
+  app.command_menu.cached = false
+  return entry.continues && !entry.runs
+}
+// Tab: complete the selected command's name, or the selected suggestion.
+fn palette_tab(app: *App) {
+  matches(app)
+  if app.prompt_state.selected >= app.prompt_state.match_count {
+    return
+  }
+  id := app.prompt_state.matches[app.prompt_state.selected]
+  if id >= PaletteRowBase {
+    _ = palette_fill(app, id - PaletteRowBase)
+    return
+  }
+  if app.command_menu.arguments || id >= BuiltinCommands {
+    return
+  }
+  name := command_primary(id)
+  if #len(name) == 0 {
+    return
+  }
+  used := copy_text(app.prompt_state.text[..], name)
+  if #len(command_info(id).arguments) > 0 {
+    add_text(app.prompt_state.text[..], &used, " ")
+  }
+  app.prompt_state.length = used
+  app.prompt_state.text[used] = 0
+  app.prompt_state.selected = 0
+  app.command_menu.cached = false
+}
+// Enter with a suggestion selected fills it first. True when the palette
+// should stay open for more input instead of running the command.
+fn palette_enter(app: *App) bool {
+  matches(app)
+  if app.prompt_state.selected >= app.prompt_state.match_count {
+    return false
+  }
+  id := app.prompt_state.matches[app.prompt_state.selected]
+  if id < PaletteRowBase {
+    return false
+  }
+  row := id - PaletteRowBase
+  if app.command_menu.rows[row].option || app.command_menu.rows[row].soft {
+    return false
+  }
+  return palette_fill(app, row)
+}
+// A clicked row, or Enter on an option row.
+fn palette_row_choose(app: *App, typography: *Typography, row: usize, tab: bool) {
+  if row >= app.command_menu.row_count {
+    return
+  }
+  if palette_fill(app, row) || tab {
+    return
+  }
+  command_execute(app, typography)
+}
+
+// ---------------------------------------------------------------------------
+// :set
+
+// A value as written in the config: booleans, numbers, strings and arrays as
+// typed; anything else quoted.
+fn toml_value(value: []const u8, output: []u8) []const u8 {
+  if buffer.equal(value, "true") || buffer.equal(value, "false") || (#len(value) > 0 && (value[0] == '"' || value[0] == '[')) {
+    return value
+  }
+  numeric := #len(value) > 0
+  for byte in value {
+    if !((byte >= '0' && byte <= '9') || byte == '.' || byte == '-') {
+      numeric = false
+    }
+  }
+  if numeric {
+    return value
+  }
+  used := copy_text(output, "\"")
+  for byte in value {
+    if used + 3 >= #len(output) {
+      break
+    }
+    if byte == '"' || byte == '\\' {
+      output[used] = '\\'
+      used += 1
+    }
+    output[used] = byte
+    used += 1
+  }
+  add_text(output, &used, "\"")
+  return output[..used]
+}
+// Remove "KEY = ..." from a block of config lines.
+fn override_remove(block: []u8, length: *usize, key: []const u8) bool {
+  at: usize = 0
+  for at < length.* {
+    end := at
+    for end < length.* && block[end] != 10 {
+      end += 1
+    }
+    line := block[at..end]
+    if #len(line) > #len(key) + 2 && buffer.equal(line[..#len(key)], key) && line[#len(key)] == ' ' && line[#len(key) + 1] == '=' {
+      next := end + 1
+      if next > length.* {
+        next = length.*
+      }
+      removed := next - at
+      for index in next..length.* {
+        block[index - removed] = block[index]
+      }
+      length.* -= removed
+      return true
+    }
+    at = end + 1
+  }
+  return false
+}
+// The session overrides as config text: top-level keys, [modules], then
+// [place.NAME] sections.
+fn overrides_text(app: *const App, output: []u8) []const u8 {
+  used := copy_text(output, app.configuration.overrides[..app.configuration.overrides_length])
+  if app.configuration.module_overrides_length > 0 {
+    add_text(output, &used, "[modules]\n")
+    add_text(output, &used, app.configuration.module_overrides[..app.configuration.module_overrides_length])
+  }
+  add_text(output, &used, app.configuration.place_overrides[..app.configuration.place_overrides_length])
+  return output[..used]
+}
+// Records KEY = VALUE (already TOML) as a session value, replacing any
+// earlier one, without reloading: for commands that applied it themselves.
+fn session_record(app: *App, key: []const u8, value: []const u8, modules: bool) bool {
+  line: [1100]u8 = []
+  line_length := copy_text(line[..], key)
+  add_text(line[..], &line_length, " = ")
+  add_text(line[..], &line_length, value)
+  add_text(line[..], &line_length, "\n")
+  if line_length >= #len(line) {
+    return false
+  }
+  // vim_keys and [modules] keymap name the same choice; a stale one of the
+  // pair would contradict the new value and void every session value.
+  if modules && buffer.equal(key, "keymap") {
+    _ = override_remove(app.configuration.overrides[..], &app.configuration.overrides_length, "vim_keys")
+  }
+  if !modules && buffer.equal(key, "vim_keys") {
+    _ = override_remove(app.configuration.module_overrides[..], &app.configuration.module_overrides_length, "keymap")
+  }
+  if modules {
+    _ = override_remove(app.configuration.module_overrides[..], &app.configuration.module_overrides_length, key)
+    if app.configuration.module_overrides_length + line_length > #len(app.configuration.module_overrides) {
+      notice(app, "Too many :set values this session.")
+      return false
+    }
+    add_text(app.configuration.module_overrides[..], &app.configuration.module_overrides_length, line[..line_length])
+    return true
+  }
+  _ = override_remove(app.configuration.overrides[..], &app.configuration.overrides_length, key)
+  if app.configuration.overrides_length + line_length > #len(app.configuration.overrides) {
+    notice(app, "Too many :set values this session.")
+    return false
+  }
+  add_text(app.configuration.overrides[..], &app.configuration.overrides_length, line[..line_length])
+  return true
+}
+// :set KEY VALUE changes an option for this session, through the same parser
+// and checks as the config file. KEY? describes it; KEY& returns it to the
+// files' value.
+fn set_command(app: *App, typography: *Typography, argument: []const u8) {
+  text := settings.trim(argument)
+  split: usize = 0
+  for split < #len(text) && text[split] != ' ' {
+    split += 1
+  }
+  key := text[..split]
+  value := settings.trim(text[split..])
+  if #len(key) == 0 {
+    palette_prefill(app, "set ")
+    return
+  }
+  if key[#len(key) - 1] == '?' {
+    _ = setting_inspect(app, typography, key[..#len(key) - 1])
+    return
+  }
+  modules := false
+  if key[#len(key) - 1] == '&' {
+    name := key[..#len(key) - 1]
+    removed := override_remove(app.configuration.overrides[..], &app.configuration.overrides_length, name) || override_remove(app.configuration.module_overrides[..], &app.configuration.module_overrides_length, name)
+    if !removed {
+      notice(app, "That option has no :set value this session.")
+      return
+    }
+    config_reload(app, typography, false)
+    app.prompt_state.panel = Panel.None
+    return
+  }
+  known := false
+  for index in 0..palette_option_count() {
+    if buffer.equal(palette_option_key(index), key) {
+      known = true
+    }
+  }
+  if !known {
+    notice(app, "Unknown option; :set lists them (Tab completes).")
+    return
+  }
+  if #len(value) == 0 {
+    palette_prefill(app, text)
+    add_text(app.prompt_state.text[..4094], &app.prompt_state.length, " ")
+    return
+  }
+  modules = module_option(key)
+  canonical := key
+  if buffer.equal(key, "explorer") {
+    canonical = "explorer_style"
+  }
+  else if buffer.equal(key, "picker") {
+    canonical = "picker_style"
+  }
+  if config_locked(app, key) || config_locked(app, canonical) || (modules && config_locked(app, "modules")) {
+    notice(app, "That option is locked in the global config.")
+    return
+  }
+  quoted: [1024]u8 = []
+  line: [1100]u8 = []
+  line_length := copy_text(line[..], key)
+  add_text(line[..], &line_length, " = ")
+  add_text(line[..], &line_length, toml_value(value, quoted[..]))
+  add_text(line[..], &line_length, "\n")
+  // Check the line alone before keeping it.
+  check: [1200]u8 = []
+  check_length: usize = 0
+  if modules {
+    check_length = copy_text(check[..], "[modules]\n")
+  }
+  add_text(check[..], &check_length, line[..line_length])
+  trial := app.config
+  layer := settings.Layer{project: true, trusted: true, session: true}
+  if !settings.parse_layer(check[..check_length], &trial, &layer) {
+    message: [256]u8 = []
+    used := copy_text(message[..], "Invalid value for ")
+    add_text(message[..], &used, key)
+    add_text(message[..], &used, "; :set ")
+    add_text(message[..], &used, key)
+    add_text(message[..], &used, "? describes it.")
+    notice(app, message[..used])
+    return
+  }
+  if !session_record(app, key, toml_value(value, quoted[..]), modules) {
+    return
+  }
+  app.prompt_state.panel = Panel.None
+  config_reload(app, typography, false)
+}

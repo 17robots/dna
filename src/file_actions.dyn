@@ -1,0 +1,291 @@
+fn directory_refresh(app: *App) {
+  if app.explorer.document != nil && buffer.dirty_cached(app.explorer.document) {
+    notice(app, "Explorer has staged edits. Use :write to preview or discard explorer edits first.")
+    return
+  }
+  previous_name: [512]u8 = []
+  previous_length: usize = 0
+  if app.directory_state.selected < app.directory_state.count {
+    previous := &app.directory_state.entries[app.directory_state.selected]
+    previous_length = copy_text(previous_name[..], previous.name[..previous.length])
+  }
+  storage: [8192]u8 = []
+  opened := fs.open_directory(app.directory_state.path[..app.directory_state.length], storage[..])
+  if !opened.ok {
+    notice(app, "Cannot read directory.")
+    return
+  }
+  defer _ = fs.close_directory(&opened.directory)
+  app.directory_state.count = 0
+  app.directory_state.selected = 0
+  for app.directory_state.count < 256 {
+    entry := fs.directory_next(&opened.directory)
+    if !entry.ok {
+      if entry.error != 0 {
+        notice(app, "Directory read failed.")
+      }
+      break
+    }
+    if #len(entry.name) >= 512 || !utf8.valid(entry.name) {
+      continue
+    }
+    output := &app.directory_state.entries[app.directory_state.count]
+    output.length = copy_text(output.name[..], entry.name)
+    output.directory = entry.kind == 4
+    if buffer.equal(output.name[..output.length], previous_name[..previous_length]) {
+      app.directory_state.selected = app.directory_state.count
+    }
+    app.directory_state.count += 1
+  }
+  explorer_sort(app.directory_state.entries[..app.directory_state.count])
+  selected_index: usize = 0
+  for selected_index < app.directory_state.count {
+    candidate := &app.directory_state.entries[selected_index]
+    if buffer.equal(candidate.name[..candidate.length], previous_name[..previous_length]) {
+      app.directory_state.selected = selected_index
+      break
+    }
+    selected_index += 1
+  }
+  explorer_load(app)
+}
+fn joined(app: *const App, leaf: []const u8, output: []u8) []const u8 {
+  count: usize = 0
+  add_text(output, &count, app.directory_state.path[..app.directory_state.length])
+  separator: usize = 0
+  if app.directory_state.length > 0 && app.directory_state.path[app.directory_state.length - 1] != '/' {
+    add_text(output, &count, "/")
+    separator = 1
+  }
+  add_text(output, &count, leaf)
+  if count != app.directory_state.length + separator + #len(leaf) {
+    return output[..0]
+  }
+  return output[..count]
+}
+fn open_file(app: *App, path: []const u8) {
+  normalized: [4096]u8 = []
+  resolved := files.resolve(path, normalized[..])
+  if #len(resolved) == 0 {
+    notice(app, "Invalid path or missing parent directory.")
+    return
+  }
+  for index in 0..16 {
+    if app.documents.slots[index].document != nil && buffer.equal(files.name(&app.documents.slots[index].file), resolved) {
+      activate(app, index)
+      return
+    }
+  }
+  previous := app.documents.active
+  reuse := app.documents.slots[app.documents.active].terminal.handle == nil && app.documents.file.length == 0 && app.documents.current.length == 0 && !buffer.dirty_cached(app.documents.current)
+  if !reuse && !new_buffer(app) {
+    return
+  }
+  error := files.open(app.documents.file, app.documents.current, resolved, app.scratch)
+  if #len(error) > 0 {
+    if !reuse {
+      close_clean(app)
+      activate(app, previous)
+    }
+    notice(app, error)
+    return
+  }
+  syntax_reset(&app.documents.slots[app.documents.active])
+  app.documents.slots[app.documents.active].filetype_length = 0
+  app.prompt_state.panel = Panel.None
+  app.view.insert = false
+  app.view.extend = false
+  app.view.scroll_x = 0.0
+  app.view.scroll_y = 0.0
+  at := app.documents.file.length
+  for at > 0 && app.documents.file.path[at - 1] != '/' {
+    at -= 1
+  }
+  if at > 1 {
+    at -= 1
+  }
+  if at > 0 {
+    app.directory_state.length = copy_text(app.directory_state.path[..], app.documents.file.path[..at])
+  }
+  plugin_event(app, "buffer-opened")
+}
+fn save_file(app: *App, path: []const u8) {
+  if app.formatting.process != nil {
+    save_cancel(app)
+    notice(app, "A formatter is already running. Wait or use :format-cancel.")
+    return
+  }
+  destination := FileConfig{}
+  file := save_file_config(app, path, &destination)
+  if file.has_language && file.language.format_on_save {
+    format_start(app, true, path)
+    if app.formatting.process == nil {
+      save_cancel(app)
+    }
+    return
+  }
+  save_file_ready(app, path)
+}
+fn save_file_ready(app: *App, path: []const u8) {
+  if app.documents.slots[app.documents.active].terminal.handle != nil {
+    save_cancel(app)
+    notice(app, "Terminal buffers cannot be saved as files; copy their output instead.")
+    return
+  }
+  normalized: [4096]u8 = []
+  resolved := files.resolve(path, normalized[..])
+  destination := FileConfig{}
+  file := save_file_config(app, path, &destination)
+  if !buffer.prepare_save(app.documents.current, file.trim_trailing_whitespace, file.final_newline) {
+    save_cancel(app)
+    notice(app, "Save cleanup exceeds file capacity. Nothing changed.")
+    return
+  }
+  error := files.save(app.documents.file, app.documents.current, resolved, app.scratch)
+  if #len(error) > 0 {
+    save_cancel(app)
+    notice(app, error)
+    return
+  }
+  slot := &app.documents.slots[app.documents.active]
+  if slot.syntax != nil {
+    syntax_close(slot.syntax)
+    slot.syntax = nil
+  }
+  slot.syntax_checked = false
+  slot.syntax_revision = 0
+  buffer.checkpoint(app.documents.current)
+  app.prompt_state.panel = Panel.None
+  plugin_event(app, "buffer-saved")
+  // Saving a rules file changes other documents' settings.
+  leaf := files.name(app.documents.file)
+  leaf_start := #len(leaf)
+  for leaf_start > 0 && leaf[leaf_start - 1] != '/' {
+    leaf_start -= 1
+  }
+  if buffer.equal(leaf[leaf_start..], ".editorconfig") || buffer.equal(leaf[leaf_start..], "dna.toml") {
+    file_config_invalidate(app)
+  }
+  if app.documents.saving.active {
+    app.documents.saving.waiting = false
+    return
+  }
+  if app.documents.quit_after_save {
+    app.documents.quit_after_save = false
+    if app.documents.closing_one {
+      close_clean(app)
+    } else {
+      request_quit(app)
+    }
+  }
+}
+fn valid_leaf(name: []const u8) bool {
+  if #len(name) == 0 || #len(name) >= 512 || buffer.equal(name, ".") || buffer.equal(name, "..") {
+    return false
+  }
+  for byte in name {
+    if byte == '/' || byte < 32 || byte == 127 {
+      return false
+    }
+  }
+  return utf8.valid(name)
+}
+fn move_entry(app: *App, trash: bool) {
+  if app.explorer.path_length > 0 {
+    app.directory_state.length = copy_text(app.directory_state.path[..], app.explorer.path[..app.explorer.path_length])
+  }
+  if app.directory_state.selected >= app.directory_state.count {
+    notice(app, "No selected directory entry.")
+    return
+  }
+  entry := &app.directory_state.entries[app.directory_state.selected]
+  if entry.directory {
+    notice(app, "Directory moves are not enabled in this version.")
+    return
+  }
+  source_storage: [4096]u8 = []
+  source := joined(app, entry.name[..entry.length], source_storage[..])
+  for affected in 0..16 {
+    slot := &app.documents.slots[affected]
+    if slot.document != nil && buffer.equal(source, files.name(&slot.file)) && buffer.dirty_cached(slot.document) {
+      notice(app, "Save the affected buffer before moving its file.")
+      return
+    }
+  }
+  destination_storage: [4096]u8 = []
+  destination: []const u8 = destination_storage[..0]
+  if trash {
+    trash_storage: [4096]u8 = []
+    trash_path := joined(app, ".dna-trash", trash_storage[..])
+    link_storage: [4096]u8 = []
+    if fs.read_link(trash_path, link_storage[..]).ok {
+      notice(app, "Trash destination must not be a symlink.")
+      return
+    }
+    if !files.metadata(trash_path).ok && !fs.make_directory(trash_path, 448).ok {
+      notice(app, "Cannot create .dna-trash directory.")
+      return
+    }
+    free_leaf: [512]u8 = []
+    free_length := trash_leaf(app, entry.name[..entry.length], free_leaf[..])
+    if free_length == 0 {
+      notice(app, "Cannot choose a free name inside .dna-trash.")
+      return
+    }
+    used: usize = 0
+    add_text(destination_storage[..], &used, trash_path)
+    add_text(destination_storage[..], &used, "/")
+    add_text(destination_storage[..], &used, free_leaf[..free_length])
+    destination = destination_storage[..used]
+  } else {
+    if !valid_leaf(app.prompt_state.text[..app.prompt_state.length]) {
+      notice(app, "Enter a single valid filename.")
+      return
+    }
+    destination = joined(app, app.prompt_state.text[..app.prompt_state.length], destination_storage[..])
+  }
+  if #len(source) == 0 || #len(destination) == 0 {
+    notice(app, "Path is too long.")
+    return
+  }
+  if #syscall(316, -100, &source_storage[0], -100, &destination_storage[0], 1) != 0 {
+    notice(app, "Move failed: destination may already exist or permissions deny the move.")
+    return
+  }
+  for updated in 0..16 {
+    moved := &app.documents.slots[updated]
+    if moved.document != nil && buffer.equal(source, files.name(&moved.file)) {
+      files.discard_recovery(&moved.file)
+      _ = files.set_name(&moved.file, destination)
+    }
+  }
+  app.prompt_state.panel = Panel.Directory
+  directory_refresh(app)
+}
+// First free leaf inside .dna-trash: name, name.1, name.2, ... Trashing a
+// second file with a previously trashed name must not fail. 0 = none found.
+fn trash_leaf(app: *const App, name: []const u8, output: []u8) usize {
+  for suffix in 0..1000 {
+    leaf: [1024]u8 = []
+    used: usize = 0
+    add_text(leaf[..], &used, name)
+    if suffix > 0 {
+      add_text(leaf[..], &used, ".")
+      add_number(leaf[..], &used, suffix)
+    }
+    relative: [1100]u8 = []
+    relative_length: usize = 0
+    add_text(relative[..], &relative_length, ".dna-trash/")
+    add_text(relative[..], &relative_length, leaf[..used])
+    path: [4096]u8 = []
+    full := joined(app, relative[..relative_length], path[..])
+    if #len(full) == 0 || used >= #len(output) {
+      return 0
+    }
+    link: [4096]u8 = []
+    if !files.metadata(full).ok && !fs.read_link(full, link[..]).ok {
+      return copy_text(output, leaf[..used])
+    }
+  }
+  return 0
+}

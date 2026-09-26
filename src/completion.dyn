@@ -1,96 +1,471 @@
+struct CompletionState {
+  entries: [128]Entry,
+  count: usize,
+  selected: usize,
+  chosen: bool,
+  error: bool,
+  prefix: [4096]u8,
+  prefix_length: usize,
+}
+
+struct PickerIndex {
+  entries: []Entry,
+  count: usize,
+  visited: usize,
+  root: [4096]u8,
+  root_length: usize,
+  limited: bool,
+  error: bool,
+}
+
 fn expand_home(path: []const u8, output: []u8) []const u8 {
   if #len(path) > 0 && path[0] == '~' && (#len(path) == 1 || path[1] == '/') {
-    home_storage: [4096]u8 = [] result := process.environment("HOME", home_storage[..])
-    if !result.ok || !result.found || #len(result.value) + #len(path) >= #len(output) { return output[..0] }
-    used: usize = 0 add_text(output, &used, result.value)
-    if #len(path) == 1 { add_text(output, &used, "/") } else { add_text(output, &used, path[1..]) }
+    home_storage: [4096]u8 = []
+    result := process.environment("HOME", home_storage[..])
+    if !result.ok || !result.found || #len(result.value) + #len(path) >= #len(output) {
+      return output[..0]
+    }
+    used: usize = 0
+    add_text(output, &used, result.value)
+    if #len(path) == 1 {
+      add_text(output, &used, "/")
+    } else {
+      add_text(output, &used, path[1..])
+    }
     return output[..used]
   }
-  length := copy_text(output, path) return output[..length]
+  length := copy_text(output, path)
+  return output[..length]
+}
+// Bounded, cached file-only index. Typing filters memory, not the filesystem.
+fn picker_match(name: []const u8, query: []const u8) bool {
+  at: usize = 0
+  for byte in name {
+    if at < #len(query) && lower(byte) == lower(query[at]) {
+      at += 1
+    }
+  }
+  return at == #len(query)
+}
+fn picker_scan(index: *PickerIndex, root: []const u8, relative: []const u8, depth: usize) {
+  if depth > 12 || index.visited >= 8192 || index.count == 2048 {
+    index.limited = true
+    return
+  }
+  path: [4096]u8 = []
+  length := copy_text(path[..], root)
+  if length > 0 && path[length - 1] != '/' {
+    add_text(path[..], &length, "/")
+  }
+  if length + #len(relative) >= 4096 {
+    index.limited = true
+    return
+  }
+  add_text(path[..], &length, relative)
+  storage: [8192]u8 = []
+  opened := fs.open_directory(path[..length], storage[..])
+  if !opened.ok {
+    index.error = true
+    return
+  }
+  defer _ = fs.close_directory(&opened.directory)
+  name: [512]u8 = []
+  full: [4096]u8 = []
+  for index.count < 2048 && index.visited < 8192 {
+    item := fs.directory_next(&opened.directory)
+    if !item.ok {
+      if item.error != 0 {
+        index.error = true
+      }
+      return
+    }
+    index.visited += 1
+    if #len(item.name) == 0 || item.name[0] == '.' || !valid_leaf(item.name) {
+      continue
+    }
+    used := copy_text(name[..], relative)
+    if used + #len(item.name) >= 512 {
+      index.limited = true
+      continue
+    }
+    add_text(name[..], &used, item.name)
+    directory := item.kind == 4
+    regular := item.kind == 8
+    if item.kind == 0 || item.kind == 10 {
+      full_length := copy_text(full[..], path[..length])
+      if full_length + #len(item.name) + 1 >= 4096 {
+        index.limited = true
+        continue
+      }
+      if full_length > 0 && full[full_length - 1] != '/' {
+        add_text(full[..], &full_length, "/")
+      }
+      add_text(full[..], &full_length, item.name)
+      info := files.metadata(full[..full_length])
+      directory = info.ok && (info.mode & 61440) == 16384
+      regular = info.ok && (info.mode & 61440) == 32768
+    }
+    if directory {
+      if buffer.equal(item.name, "build") || buffer.equal(item.name, "node_modules") || buffer.equal(item.name, "target") {
+        continue
+      }
+      if used + 1 >= 512 {
+        index.limited = true
+        continue
+      }
+      add_text(name[..], &used, "/")
+      picker_scan(index, root, name[..used], depth + 1)
+    } else if regular {
+      entry := &index.entries[index.count]
+      entry.length = copy_text(entry.name[..], name[..used])
+      entry.directory = false
+      index.count += 1
+    }
+  }
+  index.limited = true
 }
 fn completion_refresh(app: *App) {
-  app.completion_count = 0 app.completion_selected = 0 app.completion_chosen = false app.completion_error = false
-  expanded: [4096]u8 = [] path := expand_home(app.prompt[..app.prompt_length], expanded[..])
-  split := #len(path) for split > 0 && path[split - 1] != '/' { split -= 1 }
-  app.completion_prefix_length = copy_text(app.completion_prefix[..], path[..split])
-  directory: []const u8 = "." if split > 0 { directory = path[..split] }
+  if app.resource_state.kind == 5 {
+    task_refresh(app)
+    return
+  }
+  if app.resource_state.fonts || app.resource_state.kind != 0 {
+    font_refresh(app)
+    return
+  }
+  app.completion.count = 0
+  app.completion.selected = 0
+  app.completion.chosen = false
+  app.completion.error = false
+  expanded: [4096]u8 = []
+  path := expand_home(app.prompt_state.text[..app.prompt_state.length], expanded[..])
+  split := #len(path)
+  for split > 0 && path[split - 1] != '/' {
+    split -= 1
+  }
+  app.completion.prefix_length = copy_text(app.completion.prefix[..], path[..split])
+  directory: []const u8 = "."
+  if split > 0 {
+    directory = path[..split]
+  }
   fragment := path[split..]
-  storage: [8192]u8 = [] opened := fs.open_directory(directory, storage[..])
-  if !opened.ok { app.completion_error = true return }
-  defer _ = fs.close_directory(&opened.directory)
-  for app.completion_count < 128 {
-    item := fs.directory_next(&opened.directory) if !item.ok { app.completion_error = item.error != 0 break }
-    if #len(item.name) < #len(fragment) || #len(item.name) >= 512 || !utf8.valid(item.name) { continue }
-    if !buffer.equal(item.name[..#len(fragment)], fragment) { continue }
-    valid: bool = true for byte in item.name { if byte < 32 { valid = false } } if !valid { continue }
-    entry := &app.completions[app.completion_count]
-    entry.length = copy_text(entry.name[..], item.name) entry.directory = item.kind == 4 app.completion_count += 1
+  if app.picker_state.index == nil {
+    allocated := mem.arena_create(#sizeof(PickerIndex) + #alignof(Entry) + #sizeof(Entry) * 2048)
+    if !allocated.ok {
+      app.completion.error = true
+      return
+    }
+    app.picker_state.arena = allocated.arena
+    // A fresh mapping is already zero; only touched entries become resident.
+    app.picker_state.index = #cast(*PickerIndex) mem.arena_push_uninit(&app.picker_state.arena, #sizeof(PickerIndex), #alignof(PickerIndex))
+    entries := #cast(*Entry) mem.arena_push_uninit(&app.picker_state.arena, #sizeof(Entry) * 2048, #alignof(Entry))
+    app.picker_state.index.entries = entries[..2048]
+  }
+  index := app.picker_state.index
+  if !buffer.equal(directory, index.root[..index.root_length]) {
+    index.root_length = copy_text(index.root[..], directory)
+    index.count = 0
+    index.visited = 0
+    index.error = false
+    index.limited = false
+    picker_scan(index, directory, "", 0)
+  }
+  app.completion.error = index.error
+  for pass in 0..3 {
+    row: usize = 0
+    for row < index.count && app.completion.count < 128 {
+      entry := &index.entries[row]
+      name := entry.name[..entry.length]
+      prefix := #len(fragment) <= #len(name) && contains(name[..#len(fragment)], fragment)
+      substring := contains(name, fragment)
+      if (pass == 0 && prefix) || (pass == 1 && !prefix && substring) || (pass == 2 && !substring && picker_match(name, fragment)) {
+        output := &app.completion.entries[app.completion.count]
+        output.length = copy_text(output.name[..], name)
+        output.directory = false
+        app.completion.count += 1
+      }
+      row += 1
+    }
   }
 }
 fn complete_path(app: *App) bool {
-  if app.completion_count == 0 { return false }
-  entry := &app.completions[app.completion_selected]
-  required := app.completion_prefix_length + entry.length + 1
-  if required >= 4096 { notice(app, "Completed path is too long.") return false }
-  app.prompt_length = copy_text(app.prompt[..], app.completion_prefix[..app.completion_prefix_length])
-  add_text(app.prompt[..], &app.prompt_length, entry.name[..entry.length])
-  if entry.directory { add_text(app.prompt[..], &app.prompt_length, "/") }
-  completion_refresh(app) return true
-}
-fn open_prompt(app: *App) {
-  if app.completion_chosen { _ = complete_path(app) }
-  expanded: [4096]u8 = [] path := expand_home(app.prompt[..app.prompt_length], expanded[..])
-  info := files.metadata(path)
-  if info.ok && (info.mode & 61440) == 16384 {
-    app.prompt_length = copy_text(app.prompt[..], path)
-    if app.prompt_length > 0 && app.prompt[app.prompt_length - 1] != '/' { add_text(app.prompt[..], &app.prompt_length, "/") }
-    completion_refresh(app) return
+  if app.completion.count == 0 {
+    return false
   }
-  if !info.ok && app.completion_count > 0 {
+  entry := &app.completion.entries[app.completion.selected]
+  if app.completion.prefix_length + entry.length >= 4096 {
+    notice(app, "Completed path is too long.")
+    return false
+  }
+  app.prompt_state.length = copy_text(app.prompt_state.text[..], app.completion.prefix[..app.completion.prefix_length])
+  add_text(app.prompt_state.text[..], &app.prompt_state.length, entry.name[..entry.length])
+  completion_refresh(app)
+  return true
+}
+fn open_prompt(app: *App, typography: *Typography) {
+  if app.resource_state.kind != 0 {
+    resource_select(app, typography)
+    return
+  }
+  if app.resource_state.fonts {
+    if app.completion.count > 0 {
+      entry := &app.completion.entries[app.completion.selected]
+      font_select(app, typography, entry.name[..entry.length])
+    }
+    return
+  }
+  expanded: [4096]u8 = []
+  path := expand_home(app.prompt_state.text[..app.prompt_state.length], expanded[..])
+  info := files.metadata(path)
+  if !app.completion.chosen && info.ok && (info.mode & 61440) == 32768 {
+    open_file(app, path)
+    return
+  }
+  if app.completion.count > 0 {
     if complete_path(app) {
-      finished: [4096]u8 = [] chosen := expand_home(app.prompt[..app.prompt_length], finished[..])
-      if app.prompt_length > 0 && app.prompt[app.prompt_length - 1] == '/' { return }
+      selected: [4096]u8 = []
+      chosen := expand_home(app.prompt_state.text[..app.prompt_state.length], selected[..])
       open_file(app, chosen)
     }
     return
   }
-  open_file(app, path)
+  // Keep an empty result in the picker; directories never turn into explorer rows.
 }
+// Enter in the palette: a selected suggestion fills in first; a folder or an
+// option name waits for the rest of the input.
 fn command_submit(app: *App, typography: *Typography) {
-  text := app.prompt[..app.prompt_length]
+  if palette_enter(app) {
+    return
+  }
+  command_execute(app, typography)
+}
+// Run the palette text exactly as written (key bindings run theirs this way).
+fn command_execute(app: *App, typography: *Typography) {
+  text := app.prompt_state.text[..app.prompt_state.length]
+  if app.terminal_state.commands {
+    app.terminal_state.commands = false
+    if buffer.equal(text, "q") || buffer.equal(text, "quit") {
+      app.prompt_state.panel = Panel.None
+      return
+    }
+    if buffer.equal(text, "bd") {
+      activate(app, app.terminal_state.slot)
+      request_buffer_close(app)
+      return
+    }
+  }
   if app.explorer.commands {
     app.explorer.commands = false
-    if buffer.equal(text, "write") || buffer.equal(text, "w") { explorer_preview(app) return }
-    if buffer.equal(text, "q") || buffer.equal(text, "quit") { app.panel = Panel.None return }
-    if buffer.equal(text, "undo") { buffer.undo(app.explorer.document) app.panel = Panel.Directory return }
-    if buffer.equal(text, "redo") { buffer.redo(app.explorer.document) app.panel = Panel.Directory return }
-    if buffer.equal(text, "discard") { action(app, typography, 30) return }
-    if buffer.equal(text, "refresh") { action(app, typography, 31) return }
-    app.explorer.commands = true matches(app) app.explorer.commands = false
-    if app.match_count > 0 {
-      chosen := app.matches[app.selected]
-      if chosen >= 29 { action(app, typography, chosen) return }
-      if chosen == 5 { buffer.undo(app.explorer.document) app.panel = Panel.Directory return }
-      if chosen == 6 { buffer.redo(app.explorer.document) app.panel = Panel.Directory return }
-      if chosen == 16 { app.panel = Panel.None return }
+    if buffer.equal(text, "write") || buffer.equal(text, "w") {
+      explorer_preview(app)
+      return
     }
-    notice(app, "Explorer commands: write, undo, redo, refresh, discard, quit. Explorer :write takes no path.") return
+    if buffer.equal(text, "q") || buffer.equal(text, "quit") {
+      app.prompt_state.panel = Panel.None
+      return
+    }
+    if buffer.equal(text, "undo") {
+      buffer.undo(app.explorer.document)
+      app.prompt_state.panel = Panel.Directory
+      return
+    }
+    if buffer.equal(text, "redo") {
+      buffer.redo(app.explorer.document)
+      app.prompt_state.panel = Panel.Directory
+      return
+    }
+    if buffer.equal(text, "discard") {
+      action(app, typography, 30)
+      return
+    }
+    if buffer.equal(text, "refresh") {
+      action(app, typography, 31)
+      return
+    }
+    app.explorer.commands = true
+    matches(app)
+    app.explorer.commands = false
+    if app.prompt_state.match_count > 0 {
+      if explorer_command(app, typography, app.prompt_state.matches[app.prompt_state.selected]) {
+        return
+      }
+    }
+    notice(app, "Explorer commands: write, undo, redo, refresh, discard, quit. Explorer :write takes no path.")
+    return
   }
-  split: usize = 0 for split < #len(text) && text[split] != ' ' { split += 1 }
-  verb := text[..split] argument := split for argument < #len(text) && text[argument] == ' ' { argument += 1 }
+  if vim_ex_command(app, text) {
+    return
+  }
+  split: usize = 0
+  for split < #len(text) && text[split] != ' ' {
+    split += 1
+  }
+  verb := text[..split]
+  argument := split
+  for argument < #len(text) && text[argument] == ' ' {
+    argument += 1
+  }
+  // Bare, these do something of their own; their palette rows ask for an argument.
+  if buffer.equal(text, "cd") {
+    project_cd(app, "")
+    return
+  }
+  if buffer.equal(text, "theme") {
+    theme_current(app)
+    return
+  }
+  if (buffer.equal(verb, "set") || buffer.equal(verb, "se")) && argument < #len(text) {
+    set_command(app, typography, text[argument..])
+    return
+  }
+  if argument == #len(text) {
+    command := command_named(verb)
+    if command < BuiltinCommands {
+      action(app, typography, command)
+      return
+    }
+  }
+  if buffer.equal(text, "comment") {
+    comment_toggle(app)
+    app.prompt_state.panel = Panel.None
+    return
+  }
+  if buffer.equal(verb, "keymap") {
+    keymap_command(app, settings.trim(text[argument..]))
+    return
+  }
+  if buffer.equal(verb, "frontend") {
+    frontend_switch(app, settings.trim(text[argument..]))
+    return
+  }
+  if buffer.equal(verb, "place") {
+    place_command(app, settings.trim(text[argument..]))
+    return
+  }
+  if buffer.equal(verb, "module") || buffer.equal(verb, "modules") {
+    module_command(app, settings.trim(text[argument..]))
+    return
+  }
+  if buffer.equal(verb, "reload") {
+    disk_reload(app, false)
+    return
+  }
+  if buffer.equal(verb, "format") {
+    format_start(app, false, "")
+    return
+  }
+  if buffer.equal(verb, "format-cancel") {
+    format_release(app)
+    save_cancel(app)
+    app.prompt_state.panel = Panel.None
+    return
+  }
+  if buffer.equal(verb, "server-install") || buffer.equal(verb, "server-update") || buffer.equal(verb, "server-start") {
+    server_tool(app, verb, settings.trim(text[argument..]))
+    return
+  }
+  if lsp_command(app, verb, text[argument..]) {
+    return
+  }
   if (buffer.equal(verb, "open") || buffer.equal(verb, "e")) && argument < #len(text) {
-    storage: [4096]u8 = [] path := expand_home(text[argument..], storage[..]) open_file(app, path) return
+    storage: [4096]u8 = []
+    path := expand_home(text[argument..], storage[..])
+    open_file(app, path)
+    return
   }
   if (buffer.equal(verb, "write") || buffer.equal(verb, "w")) && argument < #len(text) {
-    output: [4096]u8 = [] destination := expand_home(text[argument..], output[..]) save_file(app, destination) return
+    output: [4096]u8 = []
+    destination := expand_home(text[argument..], output[..])
+    save_file(app, destination)
+    return
   }
-  if buffer.equal(text, "w") || buffer.equal(text, "write") { action(app, typography, 1) }
-  else if buffer.equal(text, "q") || buffer.equal(text, "quit") { action(app, typography, 16) }
-  else if buffer.equal(text, "e") || buffer.equal(text, "open") { action(app, typography, 0) }
-  else if buffer.equal(text, "b") || buffer.equal(text, "buffers") { action(app, typography, 21) }
-  else if buffer.equal(text, "bn") { action(app, typography, 22) }
-  else if buffer.equal(text, "bp") { action(app, typography, 23) }
-  else if buffer.equal(text, "bd") { action(app, typography, 24) }
-  else if buffer.equal(text, "enew") { action(app, typography, 17) }
-  else { matches(app) if app.match_count > 0 { action(app, typography, app.matches[app.selected]) } }
+  if buffer.equal(verb, "search-global") {
+    query: [4096]u8 = []
+    query_length := copy_text(query[..], text[argument..])
+    project_search_open(app)
+    app.prompt_state.length = copy_text(app.prompt_state.text[..], query[..query_length])
+    project_search_refresh(app)
+    return
+  }
+  if buffer.equal(verb, "resize") {
+    pane_resize(app, settings.number(text[argument..]))
+    return
+  }
+  if buffer.equal(verb, "replace-preview") {
+    app.replacement.text_length = copy_text(app.replacement.text[..], text[argument..])
+    replace_prepare(app, app.replacement.text[..app.replacement.text_length])
+    return
+  }
+  if buffer.equal(verb, "session-save") {
+    _ = session_save(app, text[argument..])
+    return
+  }
+  if buffer.equal(verb, "session-load") {
+    _ = session_restore(app, text[argument..])
+    return
+  }
+  if buffer.equal(verb, "plugin-load") {
+    plugin_load_named(app, text[argument..])
+    return
+  }
+  if buffer.equal(verb, "plugin-rollback") {
+    plugin_rollback(app, text[argument..])
+    return
+  }
+  if buffer.equal(verb, "plugin-update") {
+    plugin_update(app, text[argument..])
+    return
+  }
+  if buffer.equal(verb, "plugin-remove") {
+    plugin_remove(app, text[argument..])
+    return
+  }
+  if buffer.equal(verb, "plugin-disable") {
+    plugin_disable_named(app, text[argument..])
+    return
+  }
+  if buffer.equal(verb, "plugin-install") {
+    plugin_install_named(app, text[argument..])
+    return
+  }
+  if buffer.equal(verb, "layout-save") {
+    layout_save(app, text[argument..])
+    return
+  }
+  if buffer.equal(verb, "layout") && argument < #len(text) {
+    target: [4096]u8 = []
+    target_length := copy_text(target[..], text[argument..])
+    panel(app, Panel.Layout)
+    app.prompt_state.length = copy_text(app.prompt_state.text[..], target[..target_length])
+    submit(app, typography)
+    return
+  }
+  if buffer.equal(verb, "filetype") || buffer.equal(verb, "ft") || buffer.equal(verb, "set-language") {
+    filetype_command(app, settings.trim(text[argument..]))
+    return
+  }
+  if #len(text) > 17 && buffer.equal(text[..17], "language-install ") {
+    language_install(app, settings.trim(text[17..]))
+    return
+  }
+  if #len(text) > 4 && buffer.equal(text[..4], "run ") {
+    terminal_show(app, true, text[4..])
+    return
+  }
+  if #len(text) > 6 && buffer.equal(text[..6], "theme ") {
+    theme_switch(app, typography, settings.trim(text[6..]))
+    return
+  }
+  if #len(text) > 5 && buffer.equal(text[..5], "font ") {
+    font_select(app, typography, text[5..])
+    return
+  }
+  if #len(text) > 3 && buffer.equal(text[..3], "cd ") {
+    project_cd(app, settings.trim(text[3..]))
+    return
+  }
+  matches(app)
+  if app.prompt_state.match_count > 0 {
+    action(app, typography, app.prompt_state.matches[app.prompt_state.selected])
+  }
 }

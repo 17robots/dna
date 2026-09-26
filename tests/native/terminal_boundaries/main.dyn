@@ -1,0 +1,101 @@
+// Stage beside production native sources: test actual private queue ownership,
+// without duplicating Terminal's layout or adding production-only test hooks.
+use "std/fmt" boundary_fmt
+extern fn boundary_memfd "memfd_create"(name: *const u8, flags: u32) i32
+fn main() {
+  directory: []const u8 = "/tmp\0"
+  shell: []const u8 = "/bin/sh\0"
+  command: []const u8 = "exit\0"
+  terminal := dna_terminal_open(&directory[0], &shell[0], &command[0])
+  if terminal == nil {
+    #panic("terminal open")
+  }
+  defer dna_terminal_close(terminal)
+  // Force the old-kernel path without depending on the host's pidfd support.
+  if terminal.exit_fd >= 0 {
+    _ = rec_close(terminal.exit_fd)
+    terminal.exit_fd = -1
+  }
+  terminal.read_closed = 1
+  if dna_terminal_needs_poll(terminal) != 1 {
+    #panic("closed PTY needs fallback exit polling without pidfd")
+  }
+  terminal.read_closed = 0
+  if dna_terminal_needs_poll(terminal) != 0 {
+    #panic("open PTY must not require fallback exit polling")
+  }
+  deadline := dna_ticks() + 3000
+  for dna_terminal_alive(terminal) != 0 && dna_ticks() < deadline {
+    _ = dna_terminal_poll(terminal)
+    _ = proc_poll(nil, 0, 1)
+  }
+  if dna_terminal_alive(terminal) != 0 {
+    #panic("terminal child exit")
+  }
+  if dna_terminal_needs_poll(terminal) != 0 {
+    #panic("reaped terminal must not require polling")
+  }
+  _ = dna_terminal_resize(terminal, #cast(f32) 240, #cast(f32) 100, #cast(f32) 1, #cast(f32) 1)
+  // Supplementary mathematical digits occupy one terminal cell but four UTF-8
+  // bytes. Every row also needs its newline, including the last row.
+  digit: []const u8 = "𝟘"
+  row_bytes: [960]u8 = []
+  for col in 0..240 {
+    _ = copy(&row_bytes[col * 4], &digit[0], 4)
+  }
+  for row in 0..100 {
+    sequence: [32]u8 = []
+    sequence[0] = 27
+    sequence[1] = 91
+    number_bytes: [24]u8 = []
+    number := boundary_fmt.u64_decimal(number_bytes[..], #cast(u64) row + 1)
+    _ = copy(&sequence[2], &number[0], #len(number))
+    suffix: []const u8 = ";1H"
+    _ = copy(&sequence[2 + #len(number)], &suffix[0], 3)
+    _ = term_input(terminal.vt, &sequence[0], 5 + #len(number))
+    _ = term_input(terminal.vt, &row_bytes[0], 960)
+  }
+  output: [96101]u8 = []
+  if dna_terminal_copy(terminal, &output[0], 96001) != 0 || output[0] != 0 {
+    #panic("undersized clipboard rejected")
+  }
+  length := dna_terminal_copy(terminal, &output[0], 96101)
+  if length != 96100 || output[length] != 0 {
+    #panic("full clipboard capacity includes row newlines")
+  }
+  for row in 0..100 {
+    for byte in 0..960 {
+      if output[row * 961 + byte] != row_bytes[byte] {
+        #panic("clipboard UTF-8 unchanged")
+      }
+    }
+    if output[row * 961 + 960] != 10 {
+      #panic("clipboard newline")
+    }
+  }
+  // A sink that accepts the whole buffer deterministically exercises the
+  // one-past-end source pointer formerly evaluated even for a zero-byte move.
+  name: []const u8 = "dna-terminal-queue-test\0"
+  sink := boundary_memfd(&name[0], 1)
+  if sink < 0 {
+    #panic("queue test sink")
+  }
+  defer _ = rec_close(sink)
+  original := terminal.fd
+  terminal.fd = sink
+  for i in 0..65536 {
+    terminal.pending[i] = 120
+  }
+  terminal.pending_len = 65536
+  terminal_flush(terminal)
+  terminal.fd = original
+  if terminal.pending_len != 0 {
+    #panic("full pending queue drains")
+  }
+  info := InstallStat{}
+  if install_fstat(sink, &info) != 0 || info.size != 65536 {
+    #panic("queue writes every byte")
+  }
+  message: []const u8 = "PASS terminal clipboard UTF-8/newline capacity and full pending-buffer flush\n"
+  _ = rec_write(1, &message[0], #len(message))
+}

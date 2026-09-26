@@ -1,0 +1,165 @@
+// Wake for the next real deadline. Worker notifications handle readiness;
+// fallback polling is used only when notification setup failed.
+fn deadline_wait(now: u64, deadline: u64, current: i32) i32 {
+  if deadline == 0 {
+    return current
+  }
+  if deadline <= now {
+    return 0
+  }
+  remaining := deadline - now
+  if remaining < #cast(u64) current {
+    return #cast(i32) remaining
+  }
+  return current
+}
+fn editor_wait_ms(app: *App, notifications: bool) i32 {
+  if app.documents.saving.active && !app.documents.saving.waiting {
+    return 0
+  }
+  now := sdl.ticks()
+  delay: i32 = 2147483647
+  if app.config.reload_config && app.configuration.path_length > 0 {
+    delay = deadline_wait(now, app.configuration.watch_due, delay)
+  }
+  if recovery_allowed(app) && recovery_needed(app) {
+    delay = deadline_wait(now, app.recovery.time + recovery_delay(app), delay)
+  }
+  if app.lsp.pending == 0 && app.lsp.completion_due != 0 && app.view.insert && (app.prompt_state.panel == Panel.None || completion_visible(app)) {
+    delay = deadline_wait(now, app.lsp.completion_due, delay)
+  }
+  delay = deadline_wait(now, app.pointer.hover_due, delay)
+  delay = deadline_wait(now, terminal_escape_due(app), delay)
+  if app.lsp.pending != 0 {
+    delay = deadline_wait(now, app.lsp.deadline, delay)
+  }
+  for index in 0..8 {
+    if app.lsp.servers[index].process != nil {
+      delay = deadline_wait(now, app.lsp.servers[index].deadline, delay)
+    }
+    if app.plugin_state.slots[index].process != nil {
+      delay = deadline_wait(now, app.plugin_state.slots[index].deadline, delay)
+    }
+  }
+  delay = lsp_wait_ms(app, delay)
+  if terminals_waiting_for_exit(app) && delay > 16 {
+    delay = 16
+  }
+  if !notifications && (terminals_running(app) || syntax_waiting(app) || app.project_find.status == 1 || plugins_running(app) || app.formatting.process != nil || lsp_running(app)) && delay > 16 {
+    delay = 16
+  }
+  if app.view.animation.active {
+    delay = deadline_wait(now, app.view.animation.frame + animation_interval(app), delay)
+  }
+  if app.macro_state.remaining > 0 {
+    return 0
+  }
+  return delay
+}
+fn lsp_running(app: *const App) bool {
+  for index in 0..8 {
+    if app.lsp.servers[index].process != nil {
+      return true
+    }
+  }
+  return false
+}
+
+// Service polling, timing and invalidation share one ordered scheduling seam.
+fn background_tick(app: *App, typography: *Typography) {
+  hover_changed: bool = false
+  if app.pointer.hover_due != 0 && sdl.ticks() >= app.pointer.hover_due {
+    app.pointer.hover_due = 0
+    hover_changed = true
+  }
+  operation_started := operation_begin(app)
+  config_changed := config_watch(app, typography)
+  operation_end(app, "config", operation_started)
+  _ = terminal_escape_tick(app)
+  operation_started = operation_begin(app)
+  recovery_tick(app)
+  operation_end(app, "recovery", operation_started)
+  operation_started = operation_begin(app)
+  syntax_changed := syntax_tick(app)
+  operation_end(app, "syntax", operation_started)
+  operation_started = operation_begin(app)
+  plugin_changed := plugin_tick(app)
+  operation_end(app, "plugins", operation_started)
+  operation_started = operation_begin(app)
+  configured_filetypes(app)
+  lsp_auto_start(app)
+  // Queue due completion with its document update before transport flushing.
+  completion_tick(app)
+  operation_end(app, "language_setup", operation_started)
+  operation_started = operation_begin(app)
+  disk_changed := disk_tick(app)
+  if tree_tick(app) {
+    disk_changed = true
+  }
+  operation_end(app, "disk", operation_started)
+  operation_started = operation_begin(app)
+  language_changed := lsp_tick(app)
+  // Consume replies before scheduling completion for the current document.
+  completion_tick(app)
+  operation_end(app, "lsp", operation_started)
+  operation_started = operation_begin(app)
+  format_changed := format_tick(app)
+  save_sequence_tick(app)
+  operation_end(app, "format", operation_started)
+  operation_started = operation_begin(app)
+  search_changed := project_search_tick(app)
+  operation_end(app, "search", operation_started)
+  operation_started = operation_begin(app)
+  macro_changed := macro_tick(app, typography)
+  operation_end(app, "macros", operation_started)
+  operation_started = operation_begin(app)
+  terminal_changed := terminal_tick(app)
+  operation_end(app, "terminal", operation_started)
+  if macro_changed {
+    render_request(app, RenderMacro)
+  }
+  if terminal_changed {
+    render_request(app, RenderTerminal)
+  }
+  if syntax_changed {
+    render_request(app, RenderSyntax)
+  }
+  if search_changed {
+    render_request(app, RenderSearch)
+  }
+  if plugin_changed {
+    render_request(app, RenderPlugin)
+  }
+  if language_changed {
+    render_request(app, RenderLsp)
+  }
+  if disk_changed {
+    render_request(app, RenderDisk)
+  }
+  if format_changed {
+    render_request(app, RenderFormat)
+  }
+  if config_changed {
+    render_request(app, RenderConfig)
+  }
+  if hover_changed {
+    render_request(app, RenderHover)
+  }
+}
+// Wait between animated frames. With vsync, presenting paces frames to the
+// display, so only the configured floor applies; without it, follow the
+// display refresh interval. frame_interval_ms stays a lower bound.
+fn animation_interval(app: *const App) u64 {
+  interval := app.config.frame_interval_ms
+  if !app.view.vsync && app.view.refresh_ms > interval {
+    interval = app.view.refresh_ms
+  }
+  return #cast(u64) interval
+}
+fn display_refresh(app: *App, window: rawptr) {
+  app.view.refresh_ms = 0.0
+  mode := sdl.display_mode(sdl.window_display(window))
+  if mode != nil && mode.refresh > 1.0 {
+    app.view.refresh_ms = 1000.0 / mode.refresh
+  }
+}

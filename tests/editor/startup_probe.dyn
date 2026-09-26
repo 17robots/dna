@@ -1,0 +1,438 @@
+fn queue_key(value: u32, modifiers: u16) {
+  event := sdl.Event{}
+  key := #cast(*sdl.KeyEvent) &event
+  key.kind = 768
+  key.key = value
+  key.modifiers = modifiers
+  key.down = true
+  if !sdl.push(&event) {
+    #panic("queue key failed")
+  }
+}
+fn startup_probe(app: *App, typography: *Typography, renderer: rawptr, window: rawptr, input_storage: []u8) {
+  app.view.reduced_motion = true
+  if #sizeof(sdl.Event) != 128 || #sizeof(sdl.KeyEvent) != 40 || #sizeof(sdl.TextEvent) != 32 || #sizeof(ttf.Substring) != 36 {
+    #panic("unexpected ABI")
+  }
+  save_sequence_smoke()
+  operations_smoke()
+  regression_smoke(app)
+  hover_scroll_smoke(app, typography, renderer)
+  dialog_click_smoke(app, typography, renderer)
+  dialog_focus_smoke(app, typography)
+  gutter_select_smoke(app, typography, renderer, window)
+  helix_keys_smoke(app, typography, renderer, window)
+  vim_smoke(app, typography)
+  project_config_smoke(app, typography)
+  file_config_smoke()
+  default_server_smoke()
+  modules_smoke(app)
+  placement_smoke(app)
+  palette_completion_smoke(app, typography)
+  dirty_cache_smoke(app)
+  syntax_budget_smoke()
+  empty_quit_smoke(app, typography)
+  whitespace_smoke(app, typography)
+  workflow_smoke(app, typography)
+  completion_smoke(app, typography)
+  session_smoke(app, typography)
+  explorer_smoke(app, typography)
+  if app.explorer.document != nil {
+    app.prompt_state.panel = Panel.Directory
+    draw(renderer, window, app, typography)
+  }
+  explorer_mouse_smoke(app, typography, renderer)
+  panes_ui_smoke(app, typography, renderer, window)
+  language_popup_smoke(app, typography, renderer, window)
+  palette_smoke(app)
+  panel(app, Panel.Commands)
+  text_input(app, "write")
+  draw(renderer, window, app, typography)
+  // Palette rows are cached UI text: an unchanged query reshapes nothing.
+  palette_creations := typography.ui_creations
+  palette_updates := typography.ui_updates
+  draw(renderer, window, app, typography)
+  if typography.ui_creations != palette_creations || typography.ui_updates != palette_updates {
+    #panic("unchanged palette text reshaped")
+  }
+  text_input(app, " explorer")
+  draw(renderer, window, app, typography)
+  if typography.ui_creations == palette_creations && typography.ui_updates == palette_updates {
+    #panic("palette rendering cache invalidation")
+  }
+  app.prompt_state.panel = Panel.None
+  picker_render_smoke(renderer, window, app, typography)
+  viewport_smoke(renderer, window, app, typography)
+  editing_smoke(renderer, window, app, typography)
+  bindings_smoke(app, typography)
+  batch_bindings_smoke(app, typography)
+  multiple_selection_smoke(renderer, window, app, typography)
+  visual_search_smoke(app, typography)
+  selection_search_smoke(renderer, window, app, typography)
+  match_menu_smoke(renderer, window, app, typography)
+  foundation_smoke(renderer, window, app, typography)
+  editor_commands_smoke(app, typography)
+  close_binding_smoke(app, typography)
+  picker_close_smoke(app, typography)
+  line_motion_smoke(app, typography)
+  newline_smoke(app, typography)
+  project_tools_smoke(renderer, window, app, typography)
+  persistence_smoke()
+  plugin_host_smoke(typography)
+  clipboard_smoke()
+  formatting_smoke()
+  format_save_smoke()
+  composition_smoke(app, typography)
+  snippet_smoke()
+  language_smoke()
+  dyn_language_smoke(renderer, typography)
+  disk_smoke()
+  _ = buffer.load(app.documents.current, "one\ntwo\nthree\n")
+  app.documents.file.length = 0
+  app.prompt_state.panel = Panel.None
+  queue_key(105, 0)
+  simulated := sdl.Event{}
+  incoming := #cast(*sdl.TextEvent) &simulated
+  incoming.kind = 771
+  input_text := c.string_from_bytes(input_storage[..], "aé中")
+  incoming.text = input_text.value
+  if !sdl.push(&simulated) {
+    #panic("queue text failed")
+  }
+  queue_key(8, 0)
+  queue_key(13, 0)
+  queue_key(27, 0)
+  queue_key(117, 0)
+  queue_key(117, 1)
+  queue_key(32, 0)
+  queue_key(27, 0)
+  queue_key(113, 64)
+  queue_key(100, 0)
+  }
+
+fn finish_probe(app: *App) {
+  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "one\ntwo\nthree\n") || app.view.insert {
+    #panic("editing smoke failed")
+  }
+}
+
+// Backward search past 4096 matches, and trashing a name already in the trash.
+fn regression_smoke(app: *App) {
+  doc := app.documents.current
+  many: [20000]u8 = []
+  index: usize = 0
+  for index < 20000 {
+    many[index] = 'e'
+    if index % 10 == 9 {
+      many[index] = 10
+    }
+    index += 1
+  }
+  _ = buffer.load(doc, many[..])
+  buffer.move_to(doc, 19990, false)
+  compiled := pattern.open("e")
+  defer pattern.close(&compiled)
+  if search_apply(doc, &compiled, false, true) != 0 || buffer.start(doc) != 19988 {
+    #panic("backward search over many matches")
+  }
+  _ = buffer.load(doc, "")
+  directory: [4096]u8 = []
+  root := process.environment("DNA_WORKFLOW_TEST", directory[..4095])
+  if !root.found {
+    return
+  }
+  saved_length := app.directory_state.length
+  saved: [4096]u8 = []
+  _ = copy_text(saved[..], app.directory_state.path[..saved_length])
+  // A private directory keeps this trash out of other fixtures' listings.
+  app.directory_state.length = copy_text(app.directory_state.path[..], root.value)
+  add_text(app.directory_state.path[..], &app.directory_state.length, "/regression")
+  if !fs.make_directory(app.directory_state.path[..app.directory_state.length], 448).ok {
+    #panic("regression fixture directory")
+  }
+  trash: [4096]u8 = []
+  trash_length := copy_text(trash[..], app.directory_state.path[..app.directory_state.length])
+  add_text(trash[..], &trash_length, "/.dna-trash")
+  if !fs.make_directory(trash[..trash_length], 448).ok {
+    #panic("trash fixture directory")
+  }
+  add_text(trash[..], &trash_length, "/twice.txt")
+  if !fs.write_all(trash[..trash_length], "old").ok {
+    #panic("trash fixture")
+  }
+  leaf: [512]u8 = []
+  length := trash_leaf(app, "twice.txt", leaf[..])
+  if !buffer.equal(leaf[..length], "twice.txt.1") || !buffer.equal(leaf[..trash_leaf(app, "fresh.txt", leaf[..])], "fresh.txt") {
+    #panic("trash name collision")
+  }
+  _ = fs.remove(trash[..trash_length])
+  app.directory_state.length = copy_text(app.directory_state.path[..], saved[..saved_length])
+}
+
+// Long hovers scroll by lines with arrows or the wheel and stop at the end.
+fn hover_scroll_smoke(app: *App, typography: *Typography, renderer: rawptr) {
+  long: [4096]u8 = []
+  used: usize = 0
+  row: usize = 0
+  for row < 60 {
+    add_text(long[..], &used, "hover line ")
+    add_number(long[..], &used, row)
+    add_text(long[..], &used, "\n")
+    row += 1
+  }
+  app.view.insert = false
+  app.view.panes[app.view.focused].rect = sdl.PixelRect{x: 0, y: 0, width: 1100, height: 760}
+  hover_notice(app, long[..used])
+  draw_hover(renderer, app, typography, 1100, 760)
+  app.view.animation.panel = Panel.Hover
+  key_input(app, typography, 1073741905, 0)
+  key_input(app, typography, 1073741905, 0)
+  if app.prompt_state.panel != Panel.Hover || app.prompt_state.selected != 2 {
+    #panic("hover arrow scroll")
+  }
+  app.ui.wheel = -2.0
+  draw_hover(renderer, app, typography, 1100, 760)
+  if app.prompt_state.selected != 8 {
+    #panic("hover wheel scroll")
+  }
+  app.prompt_state.selected = 500
+  draw_hover(renderer, app, typography, 1100, 760)
+  if app.prompt_state.selected >= 60 || app.prompt_state.selected == 0 {
+    #panic("hover scroll clamps at the end")
+  }
+  app.prompt_state.panel = Panel.None
+  app.view.animation.panel = Panel.None
+}
+
+// Dialog buttons press their keys; clicking outside cancels.
+fn dialog_click_smoke(app: *App, typography: *Typography, renderer: rawptr) {
+  app.view.panes[app.view.focused].rect = sdl.PixelRect{x: 0, y: 0, width: 1100, height: 760}
+  notice(app, "Dialog smoke message")
+  draw_dialog(renderer, app, typography, 1100, 760, typography.line)
+  if dialog_button_count(app) != 1 {
+    #panic("message dialog OK button")
+  }
+  ok := ui_make_lookup(&app.ui, ui_hash(ui_child_key("dialog", "buttons"), "OK"))
+  if ok == 0 {
+    #panic("OK button laid out")
+  }
+  rect := app.ui.boxes[ok].rect
+  dialog_mouse(app, typography, rect.x + rect.width * 0.5, rect.y + rect.height * 0.5, true, false)
+  if app.prompt_state.panel != Panel.None {
+    #panic("OK button closes message")
+  }
+  notice(app, "Dialog smoke message")
+  draw_dialog(renderer, app, typography, 1100, 760, typography.line)
+  dialog_mouse(app, typography, 2.0, 2.0, true, false)
+  if app.prompt_state.panel != Panel.None {
+    #panic("outside click cancels dialog")
+  }
+}
+
+// Clicking an explorer row selects it without typing.
+fn explorer_mouse_smoke(app: *App, typography: *Typography, renderer: rawptr) {
+  doc := app.explorer.document
+  if doc == nil || doc.line_count < 3 {
+    return
+  }
+  app.prompt_state.panel = Panel.Directory
+  app.explorer.insert = false
+  draw_explorer(renderer, app, typography, 1100, 760)
+  y := app.ui.explorer_top + typography.line * 1.5 - app.ui.explorer_scroll
+  explorer_mouse(app, typography, app.ui.explorer_body.x + app.ui.explorer_body.width * 0.5, y, true, false, 1)
+  if buffer.row_at(doc, buffer.head(doc)) != 1 || app.prompt_state.panel != Panel.Directory {
+    #panic("explorer row click")
+  }
+  app.prompt_state.panel = Panel.None
+}
+
+// Split handles resize within bounds; status segments run their commands.
+fn panes_ui_smoke(app: *App, typography: *Typography, renderer: rawptr, window: rawptr) {
+  app.prompt_state.panel = Panel.None
+  pane_split(app, true)
+  draw(renderer, window, app, typography)
+  branch: usize = 0
+  for branch < 15 && !(app.view.panes[branch].used && app.view.panes[branch].branch) {
+    branch += 1
+  }
+  if branch == 15 {
+    #panic("split branch")
+  }
+  handle := ui_make_lookup(&app.ui, ui_hash_number(ui_hash(0, "split"), branch))
+  if handle == 0 {
+    #panic("split handle drawn")
+  }
+  rect := app.view.panes[branch].rect
+  app.ui.split_drag = branch + 1
+  split_drag_move(app, #cast(f32) rect.x + #cast(f32) rect.width * 0.3, 10.0)
+  if app.view.panes[branch].split_fraction < 0.29 || app.view.panes[branch].split_fraction > 0.31 {
+    #panic("split drag fraction")
+  }
+  split_drag_move(app, #cast(f32) rect.x, 10.0)
+  if app.view.panes[branch].split_fraction != 0.1 {
+    #panic("split drag clamps")
+  }
+  app.ui.split_drag = 0
+  status_click(app, typography, app.view.focused * 1000 + 91)
+  if app.prompt_state.panel != Panel.Commands {
+    #panic("status commands segment")
+  }
+  app.prompt_state.panel = Panel.None
+  status_click(app, typography, app.view.focused * 1000 + 90)
+  if app.prompt_state.panel != Panel.Goto {
+    #panic("status location opens goto")
+  }
+  app.prompt_state.panel = Panel.None
+  pane_only(app)
+}
+
+// Enter presses the focused dialog button; destructive dialogs start on the
+// safe choice, and Tab moves focus.
+fn dialog_focus_smoke(app: *App, typography: *Typography) {
+  doc := app.documents.current
+  _ = buffer.load(doc, "saved text\n")
+  doc.anchor = 0
+  doc.cursor = 0
+  _ = buffer.replace(doc, "unsaved ")
+  action(app, typography, 15)
+  if app.prompt_state.panel != Panel.Message || dialog_focused(app) != 1 {
+    #panic("discard dialog starts on Cancel")
+  }
+  key_input(app, typography, 13, 0)
+  if app.prompt_state.panel != Panel.None || !buffer.dirty(doc) {
+    #panic("Enter on Cancel keeps edits")
+  }
+  action(app, typography, 15)
+  key_input(app, typography, 9, 1)
+  if dialog_focused(app) != 0 {
+    #panic("Shift+Tab moves dialog focus")
+  }
+  key_input(app, typography, 13, 0)
+  if app.prompt_state.panel != Panel.None || buffer.dirty(doc) {
+    #panic("Enter on focused Discard discards")
+  }
+}
+// Clicking a line number selects that whole line.
+fn gutter_select_smoke(app: *App, typography: *Typography, renderer: rawptr, window: rawptr) {
+  doc := app.documents.current
+  _ = buffer.load(doc, "first line\nsecond line\nthird line\n")
+  app.view.line_numbers = true
+  app.prompt_state.panel = Panel.None
+  app.view.insert = false
+  draw(renderer, window, app, typography)
+  pane := app.view.panes[app.view.focused].rect
+  margin := app.config.document_padding * typography.scale
+  y := #cast(f32) pane.y + margin + typography.line * 1.5
+  mouse_select(app, typography, #cast(f32) pane.x + margin + typography.cell, y, false, false, 1)
+  if buffer.start(doc) != 11 || buffer.end(doc) != 23 {
+    #panic("line number click selects the line")
+  }
+  mouse_select(app, typography, #cast(f32) pane.x + margin + typography.cell, y + typography.line, true, false, 1)
+  if buffer.start(doc) != 11 || buffer.end(doc) != 34 {
+    #panic("line number drag extends by lines")
+  }
+  app.view.extend = false
+}
+
+// Helix bindings added for parity: view mode, screen goto, alternate buffer,
+// bracket navigation, search-for-selection, shrink, align and comments.
+fn helix_keys_smoke(app: *App, typography: *Typography, renderer: rawptr, window: rawptr) {
+  doc := app.documents.current
+  lines: [4096]u8 = []
+  used: usize = 0
+  for row in 0..200 {
+    add_text(lines[..], &used, "line ")
+    add_number(lines[..], &used, row)
+    add_text(lines[..], &used, "\n")
+  }
+  _ = buffer.load(doc, lines[..used])
+  app.prompt_state.panel = Panel.None
+  app.view.insert = false
+  app.view.scroll_y = 0.0
+  draw(renderer, window, app, typography)
+  goto_row(app, 100)
+  view_open(app, false)
+  draw(renderer, window, app, typography)
+  key_input(app, typography, KeyZ, 0)
+  rows := view_rows(app, typography)
+  expected := 100.0 * typography.line - (#cast(f32) rows * typography.line - typography.line) * 0.5
+  if app.prompt_state.panel != Panel.None || app.view.scroll_y < expected - 1.0 || app.view.scroll_y > expected + 1.0 {
+    #panic("zz centers the cursor line")
+  }
+  first := #cast(usize) (app.view.scroll_y / typography.line)
+  goto_screen(app, typography, KeyT)
+  if cursor_row(app) != first + #cast(usize) app.config.scroll_margin {
+    #panic("gt moves to the screen top")
+  }
+  goto_screen(app, typography, KeyB)
+  if cursor_row(app) != first + rows - 1 - #cast(usize) app.config.scroll_margin {
+    #panic("gb moves to the screen bottom")
+  }
+  // Bracket paragraph motion and blank lines.
+  _ = buffer.load(doc, "one\ntwo\n\n\nthree\nfour\n\nfive\n")
+  buffer.move_to(doc, 0, false)
+  if paragraph_edge(doc, 0, true) != 10 || paragraph_edge(doc, 10, true) != 22 || paragraph_edge(doc, 22, false) != 10 {
+    #panic("]p and [p move by paragraphs")
+  }
+  buffer.select_to(doc, 0, false)
+  blank_line(app, true)
+  if !buffer.equal(doc.bytes[..8], "one\n\ntwo") || buffer.head(doc) != 0 {
+    #panic("]<space> adds a line below and keeps the cursor")
+  }
+  // * escapes regex characters in the selection.
+  _ = buffer.load(doc, "a.b(c)*\n")
+  doc.anchor = 0
+  doc.cursor = 7
+  search_selection(app)
+  if !buffer.equal(app.search_history.text[..app.search_history.length], "a\\.b\\(c\\)\\*") {
+    #panic("* searches for the escaped selection")
+  }
+  // Alt-x keeps only whole lines.
+  _ = buffer.load(doc, "aa\nbb\ncc\n")
+  doc.anchor = 1
+  doc.cursor = 7
+  shrink_to_lines(doc)
+  if buffer.start(doc) != 3 || buffer.end(doc) != 6 {
+    #panic("Alt-x shrinks to fully covered lines")
+  }
+  // & pads selections to a common column.
+  _ = buffer.load(doc, "x = 1\nlong = 2\n")
+  doc.anchor = 2
+  doc.cursor = 3
+  doc.secondary.count = 1
+  doc.secondary.ranges[0] = buffer.Selection{anchor: 11, cursor: 12}
+  align_selections(app)
+  if !buffer.equal(doc.bytes[..doc.length], "x    = 1\nlong = 2\n") || doc.secondary.count != 1 {
+    #panic("& aligns selection columns")
+  }
+  doc.secondary.count = 0
+  // :comment toggles line comments for the filetype.
+  slot := &app.documents.slots[app.documents.active]
+  saved_filetype := slot.filetype_length
+  slot.filetype_length = copy_text(slot.filetype[..], "dyn")
+  _ = buffer.load(doc, "fn a() {\n  b()\n}\n")
+  doc.anchor = 0
+  doc.cursor = doc.length
+  comment_toggle(app)
+  if !buffer.equal(doc.bytes[..doc.length], "\x2f/ fn a() {\n  \x2f/ b()\n\x2f/ }\n") {
+    #panic(":comment adds line comments")
+  }
+  doc.anchor = 0
+  doc.cursor = doc.length
+  comment_toggle(app)
+  if !buffer.equal(doc.bytes[..doc.length], "fn a() {\n  b()\n}\n") {
+    #panic(":comment removes line comments")
+  }
+  slot.filetype_length = saved_filetype
+  // New key menus draw.
+  view_open(app, true)
+  draw(renderer, window, app, typography)
+  key_input(app, typography, KeyEscape, 0)
+  bracket_open(app, true)
+  draw(renderer, window, app, typography)
+  key_input(app, typography, KeyEscape, 0)
+  if app.prompt_state.panel != Panel.None {
+    #panic("Escape closes view and bracket menus")
+  }
+  _ = buffer.load(doc, "")
+}

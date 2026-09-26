@@ -1,135 +1,323 @@
-use "std/fs" fs
-use "std/mem" mem
+use "std/fs"
+use "std/mem"
 use "std/c"
 use "std/path" paths
+use "../buffer"
+
 #link("c")
-extern fn realpath "realpath"(path: *const u8, output: *u8) *u8
-use "../buffer" buffer
+
 pub struct State { path: [4096]u8, length: usize, recovery_owned: bool }
-pub fn name(state: *const State) []const u8 { return state.path[..state.length] }
+
+extern fn realpath "realpath"(path: *const u8, output: *u8) *u8
+
+pub fn name(state: *const State) []const u8 {
+  return state.path[..state.length]
+}
 pub fn set_name(state: *State, path: []const u8) bool {
-  if #len(path) == 0 || #len(path) >= 4000 { return false }
-  for byte in path { if byte == 0 || byte == 10 || byte == 13 { return false } }
-  index: usize = 0 for index < #len(path) { state.path[index] = path[index] index += 1 }
-  state.length = #len(path) state.path[state.length] = 0 return true
+  if #len(path) == 0 || #len(path) >= 4000 {
+    return false
+  }
+  for byte in path {
+    if byte == 0 || byte == 10 || byte == 13 {
+      return false
+    }
+  }
+  for index in 0..#len(path) {
+    state.path[index] = path[index]
+  }
+  state.length = #len(path)
+  state.path[state.length] = 0
+  return true
 }
 fn suffix(path: []const u8, ending: []const u8, output: []u8) []const u8 {
-  if #len(path) + #len(ending) >= #len(output) { return output[..0] }
-  at: usize = 0 for byte in path { output[at] = byte at += 1 }
-  for extra in ending { output[at] = extra at += 1 }
-  output[at] = 0 return output[..at]
+  if #len(path) + #len(ending) >= #len(output) {
+    return output[..0]
+  }
+  at: usize = 0
+  for byte in path {
+    output[at] = byte
+    at += 1
+  }
+  for extra in ending {
+    output[at] = extra
+    at += 1
+  }
+  output[at] = 0
+  return output[..at]
 }
 // Resolve the parent, preserving the final component so symlinks can be refused.
 pub fn resolve(path: []const u8, output: []u8) []const u8 {
-  if #len(path) == 0 || #len(path) >= 4000 { return output[..0] }
-  for byte in path { if byte == 0 || byte == 10 || byte == 13 { return output[..0] } }
-  parent_storage: [4096]u8 = [] absolute: [4096]u8 = []
+  if #len(path) == 0 || #len(path) >= 4000 {
+    return output[..0]
+  }
+  for byte in path {
+    if byte == 0 || byte == 10 || byte == 13 {
+      return output[..0]
+    }
+  }
+  parent_storage: [4096]u8 = []
+  absolute: [4096]u8 = []
   parent := c.string_from_bytes(parent_storage[..], paths.dirname(path))
-  if !parent.ok || realpath(parent.value, &absolute[0]) == nil { return output[..0] }
+  if !parent.ok || realpath(parent.value, &absolute[0]) == nil {
+    return output[..0]
+  }
   length := c.string_length(&absolute[0], 4096)
   joined := paths.join(output[..#len(output) - 1], absolute[..length], paths.basename(path))
-  if !joined.ok || #len(joined.value) >= 4000 { return output[..0] }
-  output[#len(joined.value)] = 0 return joined.value
+  if !joined.ok || #len(joined.value) >= 4000 {
+    return output[..0]
+  }
+  output[#len(joined.value)] = 0
+  return joined.value
 }
 // Path stat must not open a FIFO/device and block the UI.
 pub fn metadata(path: []const u8) fs.Metadata {
-  storage: [4096]u8 = [] encoded := c.string_from_bytes(storage[..], path)
-  if !encoded.ok { return fs.Metadata{} }
+  storage: [4096]u8 = []
+  encoded := c.string_from_bytes(storage[..], path)
+  if !encoded.ok {
+    return fs.Metadata{}
+  }
   raw: [32]u64 = []
   result := #syscall(332, -100, encoded.value, 256, 2047, &raw[0])
-  if result < 0 || (raw[0] & 769) != 769 { return fs.Metadata{error: result} }
+  if result < 0 || (raw[0] & 769) != 769 {
+    return fs.Metadata{error: result}
+  }
   return fs.Metadata{size: raw[5], inode: raw[4], device: raw[17], mode: #cast(u16) (raw[3] >> 32), ok: true}
 }
+// A whole file read into its own reserved mapping, outside the bounded frame
+// scratch. Release with mem.arena_release(&text.arena) once copied.
+pub struct FileText { arena: mem.Arena, data: []const u8, ok: bool, too_large: bool }
+
+pub fn read_text(path: []const u8) FileText {
+  reserved := buffer.reserve(buffer.Capacity + 1)
+  if !reserved.ok {
+    return FileText{}
+  }
+  result := FileText{arena: reserved.arena}
+  opened := fs.open(path)
+  if !opened.ok {
+    _ = mem.arena_release(&result.arena)
+    return FileText{}
+  }
+  total: usize = 0
+  failed := false
+  for {
+    room := #len(result.arena.data) - total
+    if room == 0 {
+      // One byte past Capacity proves the file is too large.
+      result.too_large = true
+      break
+    }
+    if room > 1048576 {
+      room = 1048576
+    }
+    part := fs.read(&opened.file, result.arena.data[total..total + room])
+    if !part.ok {
+      failed = true
+      break
+    }
+    if part.transferred == 0 {
+      break
+    }
+    total += part.transferred
+  }
+  closed := fs.close(&opened.file)
+  if failed || result.too_large || total > buffer.Capacity || !closed.ok {
+    too_large := result.too_large || total > buffer.Capacity
+    _ = mem.arena_release(&result.arena)
+    return FileText{too_large: too_large}
+  }
+  result.data = result.arena.data[..total]
+  result.ok = true
+  return result
+}
+// The start of a file for previews: up to maximum bytes from arena, cut back
+// to the last complete line when the file continues past them.
+pub fn read_prefix(arena: *mem.Arena, path: []const u8, maximum: usize) []const u8 {
+  opened := fs.open(path)
+  if !opened.ok {
+    return ""
+  }
+  defer _ = fs.close(&opened.file)
+  if maximum > mem.arena_remaining(arena) {
+    maximum = mem.arena_remaining(arena)
+  }
+  storage := mem.arena_push_uninit(arena, maximum, 1)[..maximum]
+  total: usize = 0
+  for total < maximum {
+    part := fs.read(&opened.file, storage[total..])
+    if !part.ok {
+      return ""
+    }
+    if part.transferred == 0 {
+      return storage[..total]
+    }
+    total += part.transferred
+  }
+  for total > 0 && storage[total - 1] != 10 {
+    total -= 1
+  }
+  return storage[..total]
+}
+pub fn release_text(text: *FileText) {
+  if text.arena.owns_memory {
+    _ = mem.arena_release(&text.arena)
+  }
+  text.data = text.data[..0]
+  text.ok = false
+}
 pub fn open(state: *State, document: *buffer.Document, path: []const u8, scratch: *mem.Arena) []const u8 {
-  if buffer.dirty(document) { return "Save or discard the current changes before opening another file." }
-  if #len(path) == 0 || #len(path) >= 4000 { return "Invalid or too-long file path." }
+  if buffer.dirty(document) {
+    return "Save or discard the current changes before opening another file."
+  }
+  if #len(path) == 0 || #len(path) >= 4000 {
+    return "Invalid or too-long file path."
+  }
   link_storage: [4096]u8 = []
-  if fs.read_link(path, link_storage[..]).ok { return "Open the symlink target explicitly; symlink editing is not supported yet." }
+  if fs.read_link(path, link_storage[..]).ok {
+    return "Open the symlink target explicitly; symlink editing is not supported yet."
+  }
   info := metadata(path)
-  if !info.ok || (info.mode & 61440) != 32768 { return "Cannot open: expected a readable regular file." }
-  mark := mem.arena_mark(scratch) defer mem.arena_rewind(scratch, mark)
-  read := fs.read_all(scratch, path, buffer.Capacity)
-  if !read.ok { return "Read failed or file exceeds the current 64 KiB limit." }
-  if !buffer.valid(read.data) { return "File is not valid UTF-8 text, or contains NUL bytes." }
+  if !info.ok || (info.mode & 61440) != 32768 {
+    return "Cannot open: expected a readable regular file."
+  }
+  read := read_text(path)
+  defer release_text(&read)
+  if read.too_large {
+    return "File exceeds the 256 MiB limit."
+  }
+  if !read.ok {
+    return "Read failed."
+  }
+  if !buffer.valid(read.data) {
+    return "File is not valid UTF-8 text, or contains NUL bytes."
+  }
   discard_recovery(state)
-  if !set_name(state, path) { return "Invalid file path." }
-  _ = buffer.load(document, read.data) state.recovery_owned = false
+  if !set_name(state, path) {
+    return "Invalid file path."
+  }
+  _ = buffer.load(document, read.data)
+  state.recovery_owned = false
   return ""
 }
 fn unchanged(document: *const buffer.Document, path: []const u8, scratch: *mem.Arena) bool {
-  mark := mem.arena_mark(scratch) defer mem.arena_rewind(scratch, mark)
-  read := fs.read_all(scratch, path, buffer.Capacity)
+  read := read_text(path)
+  defer release_text(&read)
   return read.ok && buffer.equal(read.data, document.saved[..document.saved_length])
 }
 pub fn save(state: *State, document: *buffer.Document, path: []const u8, scratch: *mem.Arena) []const u8 {
-  if #len(path) == 0 || #len(path) >= 4000 { return "Enter a valid file path." }
-  validation := State{} if !set_name(&validation, path) { return "Invalid file path." }
+  if #len(path) == 0 || #len(path) >= 4000 {
+    return "Enter a valid file path."
+  }
+  validation := State{}
+  if !set_name(&validation, path) {
+    return "Invalid file path."
+  }
   same := buffer.equal(path, name(state))
   info := metadata(path)
   link_storage: [4096]u8 = []
-  if fs.read_link(path, link_storage[..]).ok { return "Refusing to replace a symlink." }
-  if info.ok && (!same || !unchanged(document, path, scratch)) { return "File exists or changed externally. Save As a different path." }
-  if same && !info.ok { return "Original file disappeared; use Save As." }
-  if info.ok && (info.mode & 61440) != 32768 { return "Destination is not a regular file." }
-  temporary_storage: [4096]u8 = [] temporary := suffix(path, ".dna-write", temporary_storage[..])
+  if fs.read_link(path, link_storage[..]).ok {
+    return "Refusing to replace a symlink."
+  }
+  if info.ok && (!same || !unchanged(document, path, scratch)) {
+    return "File exists or changed externally. Save As a different path."
+  }
+  if same && !info.ok {
+    return "Original file disappeared; use Save As."
+  }
+  if info.ok && (info.mode & 61440) != 32768 {
+    return "Destination is not a regular file."
+  }
+  temporary_storage: [4096]u8 = []
+  temporary := suffix(path, ".dna-write", temporary_storage[..])
   transaction := fs.atomic_begin(path, temporary)
-  if !transaction.ok { return "Cannot create save temporary file; check permissions or a leftover .dna-write file." }
-  defer { if transaction.transaction.active { _ = fs.atomic_abort(&transaction.transaction) } }
-  if info.ok && #syscall(91, transaction.transaction.file.descriptor, info.mode & 511) != 0 { return "Cannot preserve file permissions." }
+  if !transaction.ok {
+    return "Cannot create save temporary file; check permissions or a leftover .dna-write file."
+  }
+  defer {
+    if transaction.transaction.active {
+      _ = fs.atomic_abort(&transaction.transaction)
+    }
+  }
+  if info.ok && #syscall(91, transaction.transaction.file.descriptor, info.mode & 511) != 0 {
+    return "Cannot preserve file permissions."
+  }
   written := fs.write(&transaction.transaction.file, document.bytes[..document.length])
-  if !written.ok { return "Write failed; original file was not replaced." }
+  if !written.ok {
+    return "Write failed; original file was not replaced."
+  }
   if same {
-    if !unchanged(document, path, scratch) { return "File changed during save; original was not replaced." }
-    if !fs.atomic_commit(&transaction.transaction).ok { return "Atomic save failed." }
+    if !unchanged(document, path, scratch) {
+      return "File changed during save; original was not replaced."
+    }
+    if !fs.atomic_commit(&transaction.transaction).ok {
+      return "Atomic save failed."
+    }
   } else {
-    if !fs.sync(&transaction.transaction.file).ok || !fs.close(&transaction.transaction.file).ok { return "Cannot flush new file." }
-    destination_storage: [4096]u8 = [] destination := c.string_from_bytes(destination_storage[..], path)
-    if !destination.ok { return "Invalid destination." }
+    if !fs.sync(&transaction.transaction.file).ok || !fs.close(&transaction.transaction.file).ok {
+      return "Cannot flush new file."
+    }
+    destination_storage: [4096]u8 = []
+    destination := c.string_from_bytes(destination_storage[..], path)
+    if !destination.ok {
+      return "Invalid destination."
+    }
     // RENAME_NOREPLACE prevents a racing creator from being overwritten.
-    if #syscall(316, -100, &temporary_storage[0], -100, destination.value, 1) != 0 { return "Cannot create new file without replacing an existing destination." }
+    if #syscall(316, -100, &temporary_storage[0], -100, destination.value, 1) != 0 {
+      return "Cannot create new file without replacing an existing destination."
+    }
     transaction.transaction.active = false
   }
-  old_recovery: [4096]u8 = [] old_path := suffix(name(state), ".dna-recovery", old_recovery[..])
-  if state.recovery_owned { _ = fs.remove(old_path) }
-  _ = set_name(state, path) state.recovery_owned = false buffer.mark_saved(document)
+  old_recovery: [4096]u8 = []
+  old_path := suffix(name(state), ".dna-recovery", old_recovery[..])
+  if state.recovery_owned {
+    _ = fs.remove(old_path)
+  }
+  _ = set_name(state, path)
+  state.recovery_owned = false
+  buffer.mark_saved(document)
   return ""
 }
 pub fn recover(state: *State, document: *buffer.Document, scratch: *mem.Arena) []const u8 {
-  if state.length == 0 { return "Open a file before restoring its recovery snapshot." }
-  if buffer.dirty(document) { return "Save or discard current edits before restoring recovery." }
-  storage: [4096]u8 = [] path := suffix(name(state), ".dna-recovery", storage[..])
-  mark := mem.arena_mark(scratch) defer mem.arena_rewind(scratch, mark)
-  info := metadata(path)
-  if !info.ok || (info.mode & 61440) != 32768 { return "Recovery snapshot must be a regular file." }
-  result := fs.read_all(scratch, path, buffer.Capacity)
-  if !result.ok || !buffer.valid(result.data) { return "No readable text recovery snapshot." }
-  document.anchor = 0 document.cursor = document.length
-  _ = buffer.replace(document, result.data) buffer.checkpoint(document)
-  state.recovery_owned = true return ""
-}
-pub fn snapshot(state: *State, document: *const buffer.Document) []const u8 {
-  if state.length == 0 || !buffer.dirty(document) { return "" }
-  storage: [4096]u8 = [] path := suffix(name(state), ".dna-recovery", storage[..])
-  if !state.recovery_owned {
-    created := fs.create_exclusive(path)
-    if !created.ok { return "Recovery snapshot already exists or cannot be created. Restore it explicitly; current edits remain in memory." }
-    if #syscall(91, created.file.descriptor, 384) != 0 { _ = fs.close(&created.file) _ = fs.remove(path) return "Cannot protect recovery snapshot permissions." }
-    result := fs.write(&created.file, document.bytes[..document.length])
-    synced := fs.sync(&created.file) closed := fs.close(&created.file)
-    if !result.ok || !synced.ok || !closed.ok { _ = fs.remove(path) return "Recovery snapshot write failed." }
-    state.recovery_owned = true
-  } else {
-    temporary_storage: [4096]u8 = [] temporary := suffix(path, ".tmp", temporary_storage[..])
-    tx := fs.atomic_begin(path, temporary)
-    if !tx.ok { return "Cannot update recovery snapshot." }
-    defer { if tx.transaction.active { _ = fs.atomic_abort(&tx.transaction) } }
-    if #syscall(91, tx.transaction.file.descriptor, 384) != 0 || !fs.write(&tx.transaction.file, document.bytes[..document.length]).ok || !fs.atomic_commit(&tx.transaction).ok { return "Recovery snapshot update failed." }
+  if state.length == 0 {
+    return "Open a file before restoring its recovery snapshot."
   }
+  if buffer.dirty(document) {
+    return "Save or discard current edits before restoring recovery."
+  }
+  storage: [4096]u8 = []
+  path := suffix(name(state), ".dna-recovery", storage[..])
+  mark := mem.arena_mark(scratch)
+  defer mem.arena_rewind(scratch, mark)
+  info := metadata(path)
+  if !info.ok || (info.mode & 61440) != 32768 {
+    return "Recovery snapshot must be a regular file."
+  }
+  result := read_text(path)
+  defer release_text(&result)
+  if !result.ok || !buffer.valid(result.data) {
+    return "No readable text recovery snapshot."
+  }
+  document.anchor = 0
+  document.cursor = document.length
+  _ = buffer.replace(document, result.data)
+  buffer.checkpoint(document)
+  state.recovery_owned = true
   return ""
 }
 pub fn discard_recovery(state: *State) {
   if state.recovery_owned {
-    storage: [4096]u8 = [] path := suffix(name(state), ".dna-recovery", storage[..])
-    _ = fs.remove(path) state.recovery_owned = false
+    storage: [4096]u8 = []
+    path := suffix(name(state), ".dna-recovery", storage[..])
+    _ = fs.remove(path)
+    state.recovery_owned = false
   }
+}
+
+pub fn directory_path(path: []const u8, output: []u8) usize {
+  encoded: [4096]u8 = []
+  name := c.string_from_bytes(encoded[..], path)
+  if #len(output) < 4096 || !name.ok || realpath(name.value, &output[0]) == nil {
+    return 0
+  }
+  return c.string_length(&output[0], 4096)
 }

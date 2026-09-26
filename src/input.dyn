@@ -1,163 +1,889 @@
+struct InputState {
+  pending: u8,
+  pending_count: usize,
+  goto_count: usize,
+  repeat_count: usize,
+  search_backwards: bool,
+  goto_explorer: bool,
+  leader_explorer: bool,
+  // z (one command) or Z (sticky) view mode; ]/[ direction.
+  view_sticky, bracket_forward: bool,
+  // DNA_KEY_TRACE=1 prints how each key is routed, to stderr.
+  trace_checked, trace: bool,
+  // The typed character for the current key event (layout and Shift
+  // applied), or 0 when unknown; the Vim profile reads commands from it.
+  character: u32,
+}
+
+struct Clipboard {
+  arena: mem.Arena,
+  owned: bool,
+  text: []const u8,
+  count: usize,
+  starts: [32]usize,
+  lengths: [32]usize,
+  // Vim: the text is whole lines (dd, yy) and puts below or above.
+  linewise: bool,
+}
+
+fn selected_clipboard(app: *App) *Clipboard {
+  if app.register_state.selected > 0 {
+    return &app.register_state.named[app.register_state.selected - 1]
+  }
+  return &app.register_state.clipboard
+}
+fn clipboard_release(app: *App) {
+  if app.register_state.clipboard.owned {
+    _ = mem.arena_release(&app.register_state.clipboard.arena)
+  }
+  app.register_state.clipboard.owned = false
+  app.register_state.clipboard.count = 0
+}
+fn clipboard_replace(app: *App, doc: *buffer.Document, text: []const u8) bool {
+  retained := selected_clipboard(app)
+  if retained.owned && retained.count == doc.secondary.count + 1 && buffer.equal(retained.text, text) {
+    fragments: [32][]const u8 = []
+    for index in 0..retained.count {
+      fragments[index] = text[retained.starts[index]..retained.starts[index] + retained.lengths[index]]
+    }
+    return buffer.replace_fragments(doc, fragments[..retained.count])
+  }
+  return buffer.replace_all(doc, text)
+}
 // All input paths feed the same document operations, including smoke events.
 fn prompting(app: *const App) bool {
-  return app.panel == Panel.Buffers || app.panel == Panel.Commands || app.panel == Panel.Open || app.panel == Panel.SaveAs || app.panel == Panel.Search || app.panel == Panel.Layout || app.panel == Panel.Create || app.panel == Panel.Rename
+  return app.prompt_state.panel == Panel.ProjectSearch || app.prompt_state.panel == Panel.Buffers || app.prompt_state.panel == Panel.Commands || app.prompt_state.panel == Panel.Open || app.prompt_state.panel == Panel.SaveAs || search_prompt(app.prompt_state.panel) || app.prompt_state.panel == Panel.Layout || app.prompt_state.panel == Panel.Create || app.prompt_state.panel == Panel.Rename
+}
+// Keep text input enabled both while waiting and while draining queued events.
+fn wants_text_input(app: *App) bool {
+  if terminal_target(app) != nil {
+    return terminal_mode(app).input
+  }
+  return (app.prompt_state.panel == Panel.Hover && app.view.insert) || app.register_state.pending || completion_visible(app) || (app.prompt_state.panel == Panel.Match && app.match_state.stage != 0) || app.input_state.pending != 0 || prompting(app) || (app.prompt_state.panel == Panel.None && app.view.insert) || (app.prompt_state.panel == Panel.Directory && app.explorer.insert)
 }
 fn changed(app: *App, text: []const u8) {
-  if !buffer.replace(app.document, text) { notice(app, "Edit rejected: invalid UTF-8, NUL, or document exceeds 65535 bytes.") }
+  if snippet_replace(app, text) {
+    return
+  }
+  if !buffer.replace_all(app.documents.current, text) {
+    notice(app, "Edit rejected: invalid UTF-8, NUL, or document exceeds 256 MiB.")
+  }
 }
 fn text_input(app: *App, text: []const u8) {
-  if !buffer.valid(text) { notice(app, "Input must be UTF-8 text without NUL bytes.") return }
+  if app.macro_state.remaining > 0 && !app.macro_state.replaying {
+    return
+  }
+  macro_text(app, text)
+  vim_record_text(app, text)
+  app.composition.length = 0
+  if app.prompt_state.panel == Panel.Hover {
+    app.prompt_state.panel = Panel.None
+  }
+  // Word characters keep an open completion and refilter it; anything else closes it.
+  refilter := false
+  if completion_visible(app) {
+    refilter = #len(text) > 0
+    for byte in text {
+      if !completion_word_byte(byte) {
+        refilter = false
+      }
+    }
+    if !refilter {
+      app.prompt_state.panel = Panel.None
+      lsp_results_release(app)
+    }
+  }
+  if !buffer.valid(text) {
+    notice(app, "Input must be UTF-8 text without NUL bytes.")
+    return
+  }
+  target := terminal_target(app)
+  if target != nil {
+    if terminal_mode(app).input && #len(text) > 0 {
+      terminal_escape_flush(app)
+      terminal_text(target, &text[0], #len(text))
+    }
+    return
+  }
+  if app.register_state.pending {
+    app.register_state.pending = false
+    if #len(text) == 1 && text[0] >= 97 && text[0] <= 122 {
+      app.register_state.selected = #cast(usize) (text[0] - 97) + 1
+    }
+    else {
+      app.register_state.selected = 0
+      notice(app, "Register must be a-z.")
+    }
+    return
+  }
+  if app.prompt_state.panel == Panel.Match {
+    match_character(app, text)
+    return
+  }
+  if app.input_state.pending != 0 {
+    character_input(app, text)
+    return
+  }
   if prompting(app) {
-    if app.prompt_length + #len(text) >= 4096 { notice(app, "Input is too long.") return }
-    add_text(app.prompt[..], &app.prompt_length, text) app.selected = 0
-    if app.panel == Panel.Open { completion_refresh(app) }
-  } else if app.panel == Panel.Directory && app.explorer.insert {
-    if !buffer.replace(app.explorer.document, text) { notice(app, "Explorer edit exceeds text capacity.") }
-  } else if app.panel == Panel.None && app.insert { changed(app, text) }
+    if app.prompt_state.length + #len(text) >= 4096 {
+      notice(app, "Input is too long.")
+      return
+    }
+    add_text(app.prompt_state.text[..], &app.prompt_state.length, text)
+    app.prompt_state.selected = 0
+    if app.prompt_state.panel == Panel.Open {
+      completion_refresh(app)
+    }
+    if search_prompt(app.prompt_state.panel) {
+      search_preview(app)
+    }
+    if app.prompt_state.panel == Panel.ProjectSearch {
+      project_search_refresh(app)
+    }
+  } else if app.prompt_state.panel == Panel.Directory && app.explorer.insert {
+    if !buffer.replace_all(app.explorer.document, text) {
+      notice(app, "Explorer edit exceeds text capacity.")
+    }
+  } else if (app.prompt_state.panel == Panel.None || completion_visible(app)) && app.view.insert {
+    changed(app, text)
+    app.lsp.completion_typed = true
+    if refilter {
+      completion_refilter(app)
+    }
+  }
 }
-fn clipboard_copy(app: *App) {
-  storage: [65536]u8 = [] doc := app.document
-  if doc.cursor == doc.anchor { return }
-  _ = copy_text(storage[..], doc.bytes[buffer.start(doc)..buffer.end(doc)])
-  if !sdl.clipboard_set(&storage[0]) { notice(app, "Clipboard copy failed.") }
+fn clipboard_copy(app: *App) bool {
+  doc := app.documents.current
+  selections: [32]buffer.Selection = []
+  selections[0] = buffer.Selection{anchor: buffer.start(doc), cursor: buffer.end(doc)}
+  count := doc.secondary.count + 1
+  for index in 1..count {
+    selection := doc.secondary.ranges[index - 1]
+    if selection.anchor > selection.cursor {
+      swap := selection.anchor
+      selection.anchor = selection.cursor
+      selection.cursor = swap
+    }
+    selections[index] = selection
+  }
+  for index in 1..count {
+    moving := selections[index]
+    at := index
+    for at > 0 && selections[at - 1].anchor > moving.anchor {
+      selections[at] = selections[at - 1]
+      at -= 1
+    }
+    selections[at] = moving
+  }
+  // Selected text plus one newline separator per selection bounds the joined size.
+  total: usize = 0
+  for index in 0..count {
+    total += selections[index].cursor - selections[index].anchor + 1
+  }
+  if total == count {
+    return true
+  }
+  allocated := mem.arena_create(total + 1)
+  if !allocated.ok {
+    notice(app, "Cannot allocate register.")
+    return false
+  }
+  storage := (#cast(*u8) mem.arena_push_uninit(&allocated.arena, total + 1, 1))[..total + 1]
+  offsets: [32]usize = []
+  lengths: [32]usize = []
+  used: usize = 0
+  for index in 0..count {
+    selected := selections[index]
+    if used > 0 && storage[used - 1] != 10 {
+      add_text(storage, &used, "\n")
+    }
+    offsets[index] = used
+    lengths[index] = selected.cursor - selected.anchor
+    add_text(storage, &used, doc.bytes[selected.anchor..selected.cursor])
+  }
+  storage[used] = 0
+  if app.register_state.selected == 0 && !sdl.clipboard_set(&storage[0]) {
+    notice(app, "Clipboard copy failed.")
+    _ = mem.arena_release(&allocated.arena)
+    return false
+  }
+  slot := selected_clipboard(app)
+  if slot.owned {
+    _ = mem.arena_release(&slot.arena)
+  }
+  slot.arena = allocated.arena
+  slot.owned = true
+  slot.text = storage[..used]
+  slot.linewise = false
+  slot.count = count
+  slot.starts = offsets
+  slot.lengths = lengths
+  return true
+}
+// A paste from the terminal the TUI runs in. Terminal panes get it as a
+// bracketed paste; prompts and panels as typed text; documents take it raw
+// (no auto-pairs or indentation), at the caret in insert mode and before the
+// selection otherwise.
+fn paste_input(app: *App, text: []const u8) {
+  if #len(text) == 0 {
+    return
+  }
+  if !buffer.valid(text) {
+    notice(app, "Paste must be UTF-8 text without NUL bytes.")
+    return
+  }
+  target := terminal_target(app)
+  if target != nil {
+    if terminal_mode(app).input {
+      terminal_escape_flush(app)
+      terminal_paste(target, &text[0], #len(text))
+    }
+    return
+  }
+  if app.prompt_state.panel != Panel.None || app.input_state.pending != 0 || app.register_state.pending {
+    text_input(app, text)
+    return
+  }
+  if #len(text) > buffer.Capacity {
+    notice(app, "Paste exceeds document capacity.")
+    return
+  }
+  doc := app.documents.current
+  buffer.checkpoint(doc)
+  if !app.view.insert {
+    start := doc.anchor
+    if doc.cursor < start {
+      start = doc.cursor
+    }
+    buffer.move_to(doc, start, false)
+  }
+  if !clipboard_replace(app, doc, text) {
+    notice(app, "Paste exceeds capacity or has conflicting selections.")
+  }
+  buffer.checkpoint(doc)
 }
 fn clipboard_paste(app: *App) {
-  incoming := sdl.clipboard_get() if incoming == nil { notice(app, "Clipboard unavailable.") return }
+  incoming := sdl.clipboard_get()
+  if incoming == nil {
+    notice(app, "Clipboard unavailable.")
+    return
+  }
   defer sdl.free(#cast(rawptr) incoming)
-  length := c.string_length(incoming, 65536)
-  if length == 65536 { notice(app, "Clipboard exceeds document capacity.") return }
-  buffer.checkpoint(app.document) changed(app, incoming[..length]) buffer.checkpoint(app.document)
+  length := c.string_length(incoming, buffer.Capacity + 1)
+  if length > buffer.Capacity {
+    notice(app, "Clipboard exceeds document capacity.")
+    return
+  }
+  buffer.checkpoint(app.documents.current)
+  if !clipboard_replace(app, app.documents.current, incoming[..length]) {
+    notice(app, "Paste exceeds capacity or has conflicting selections.")
+  }
+  buffer.checkpoint(app.documents.current)
+}
+fn key_trace(app: *App, key: u32, modifiers: u16) {
+  if !app.input_state.trace_checked {
+    app.input_state.trace_checked = true
+    storage: [8]u8 = []
+    setting := process.environment("DNA_KEY_TRACE", storage[..])
+    app.input_state.trace = setting.ok && setting.found && buffer.equal(setting.value, "1")
+  }
+  if !app.input_state.trace {
+    return
+  }
+  line: [512]u8 = []
+  used: usize = 0
+  add_text(line[..], &used, "key ")
+  add_number(line[..], &used, #cast(usize) key)
+  add_text(line[..], &used, " mods ")
+  add_number(line[..], &used, #cast(usize) modifiers)
+  add_text(line[..], &used, " panel ")
+  add_text(line[..], &used, render_panel(app.prompt_state.panel))
+  add_text(line[..], &used, " active ")
+  add_number(line[..], &used, app.documents.active)
+  slot := &app.documents.slots[app.documents.active]
+  if slot.terminal.handle != nil {
+    add_text(line[..], &used, " terminal")
+    if slot.terminal.input {
+      add_text(line[..], &used, " input")
+    } else {
+      add_text(line[..], &used, " normal")
+    }
+  }
+  if terminal_target(app) != nil {
+    add_text(line[..], &used, " target")
+  }
+  if app.view.insert {
+    add_text(line[..], &used, " insert")
+  }
+  add_text(line[..], &used, " focused-pane ")
+  add_number(line[..], &used, app.view.focused)
+  add_text(line[..], &used, "\n")
+  _ = #syscall(1, 2, &line[0], used)
 }
 fn key_input(app: *App, typography: *Typography, key: u32, modifiers: u16) {
-  shift := (modifiers & 3) != 0 control := (modifiers & 192) != 0 doc := app.document
-  if app.panel == Panel.Directory { explorer_key(app, typography, key, modifiers) return }
-  if app.panel == Panel.DirectoryApply {
-    if key == 27 { app.panel = Panel.Directory }
-    else if key == 13 { explorer_apply(app) }
-    else if key == 1073741905 && app.explorer.preview_row + 1 < app.explorer.edit_count { app.explorer.preview_row += 1 }
-    else if key == 1073741906 && app.explorer.preview_row > 0 { app.explorer.preview_row -= 1 }
+  vim_record_key(app, key, modifiers)
+  key_dispatch(app, typography, key, modifiers)
+  vim_settle(app)
+}
+fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
+  key_trace(app, key, modifiers)
+  if app.macro_state.remaining > 0 && !app.macro_state.replaying {
+    if key == KeyEscape {
+      app.macro_state.remaining = 0
+    } else {
+      return
+    }
+  }
+  // Terminal input mode owns the keyboard: every key goes to the program
+  // (Ctrl-X for nano, Ctrl-W for shells, q for htop). Only the terminal's
+  // own escape, Esc Esc or the configured terminal_escape chord, leaves it.
+  if terminal_target(app) != nil && terminal_mode(app).input {
+    _ = terminal_input_key(app, key, modifiers)
     return
   }
-  if app.panel == Panel.DirectoryDiscard {
-    if key == 27 { app.panel = Panel.Directory app.explorer.quit_after_discard = false }
-    else if key == 100 {
-      if app.explorer.document != nil { buffer.mark_saved(app.explorer.document) }
-      app.panel = Panel.Directory directory_refresh(app)
-      if app.explorer.quit_after_discard { app.explorer.quit_after_discard = false request_quit(app) }
+  if dialog_key(app, typography, key, modifiers) {
+    return
+  }
+  // Macros only replay editing in text buffers, never in terminals.
+  if !app.config.vim_keys && app.prompt_state.panel == Panel.None && terminal_target(app) == nil && !app.view.insert && app.input_state.pending == 0 && !app.register_state.pending && key == KeyQ && (modifiers & ModCtrlAlt) == 0 {
+    if (modifiers & ModShift) != 0 {
+      macro_toggle(app)
+    } else {
+      macro_play(app, typography)
     }
     return
   }
-  if key == 27 {
-    if app.panel == Panel.Commands && app.explorer.commands { app.explorer.commands = false app.panel = Panel.Directory return }
-    if app.panel != Panel.None { app.panel = Panel.None app.quit_after_save = false }
-    else { buffer.checkpoint(doc) app.insert = false app.extend = false doc.anchor = doc.cursor }
+  macro_key(app, key, modifiers)
+  if app.prompt_state.panel == Panel.None && snippet_valid(app) {
+    if key == KeyTab {
+      _ = snippet_jump(app, (modifiers & ModShift) != 0)
+      return
+    }
+    if key == KeyBackspace || key == KeyDelete {
+      snippet_doc := app.documents.current
+      saved_anchor := snippet_doc.anchor
+      saved_cursor := snippet_doc.cursor
+      if snippet_doc.anchor == snippet_doc.cursor {
+        if key == KeyBackspace {
+          snippet_doc.anchor = buffer.previous(snippet_doc, snippet_doc.cursor)
+        }
+        else {
+          snippet_doc.cursor = buffer.next(snippet_doc, snippet_doc.cursor)
+        }
+      }
+      if snippet_replace(app, "") {
+        return
+      }
+      snippet_doc.anchor = saved_anchor
+      snippet_doc.cursor = saved_cursor
+    }
+    if key == KeyEscape || key >= 1073741881 || (modifiers & ModCtrlAlt) != 0 {
+      app.lsp.snippet.active = false
+      app.documents.current.secondary.count = 0
+    }
+  }
+  if app.prompt_state.panel == Panel.Hover {
+    if key == KeyDown {
+      app.prompt_state.selected += 1
+      return
+    }
+    if key == KeyUp {
+      if app.prompt_state.selected > 0 {
+        app.prompt_state.selected -= 1
+      }
+      return
+    }
+    app.prompt_state.panel = Panel.None
+    if key == KeyEscape {
+      return
+    }
+  }
+  // Printable keys reach text_input, which refilters or closes the completion.
+  printable := key >= KeySpace && key < KeyDelete && (modifiers & ModCtrlAlt) == 0
+  if completion_visible(app) && !printable && key != KeyTab && key != KeyEscape && key != KeyReturn && key != KeyDown && key != KeyUp {
+    app.prompt_state.panel = Panel.None
+    lsp_results_release(app)
+  }
+  if app.prompt_state.panel == Panel.Setting {
+    if key == KeyEscape {
+      app.prompt_state.panel = Panel.None
+    } else if key == KeyReturn {
+      setting_edit(app)
+    }
     return
   }
-  if app.panel == Panel.Quit {
-    if key == 115 { app.quit_after_save = true action(app, typography, 1) }
-    else if key == 100 {
-      files.discard_recovery(app.file)
-      if app.closing_one { close_clean(app) }
-      else { _ = buffer.load(doc, doc.saved[..doc.saved_length]) request_quit(app) }
+
+  if app.prompt_state.panel == Panel.FileConflict {
+    if key == KeyEscape || key == KeyK {
+      app.prompt_state.panel = Panel.None
+    }
+    else if key == KeyR {
+      disk_reload(app, true)
+    }
+    else if key == KeyS {
+      panel(app, Panel.SaveAs)
     }
     return
   }
-  if app.panel == Panel.Leader {
-    if key == 102 { action(app, typography, 0) }
-    else if key == 101 { action(app, typography, 7) }
-    else if key == 98 { action(app, typography, 21) }
-    else if key == 110 { action(app, typography, 22) }
-    else if key == 112 { action(app, typography, 23) }
-    else if key == 99 { action(app, typography, 24) }
-    else if key == 58 || (key == 59 && shift) || key == 32 { panel(app, Panel.Commands) }
+  if app.prompt_state.panel == Panel.LspResults || app.prompt_state.panel == Panel.LspEdit || app.prompt_state.panel == Panel.Diagnostics {
+    if key == KeyEscape {
+      if app.prompt_state.panel == Panel.LspEdit {
+        lsp_edits_release(app)
+      }
+      app.prompt_state.panel = Panel.None
+      return
+    }
+    if key == KeyReturn || (key == KeyTab && app.prompt_state.panel == Panel.LspResults && app.lsp.results.kind == 1) {
+      if app.prompt_state.panel == Panel.LspEdit {
+        lsp_apply(app)
+      }
+      else if app.prompt_state.panel == Panel.LspResults {
+        lsp_accept(app)
+      }
+      else {
+        diagnostics := &app.documents.slots[app.documents.active].diagnostics
+        if app.prompt_state.selected < diagnostics.count && diagnostics.revision == app.documents.current.revision {
+          item := &diagnostics.items[app.prompt_state.selected]
+          position := lsp.offset(app.documents.current.bytes[..app.documents.current.length], lsp.Position{line: item.line, character: item.character})
+          if position.ok {
+            buffer.move_to(app.documents.current, position.value, false)
+            buffer.select_current(app.documents.current)
+          }
+        }
+        app.prompt_state.panel = Panel.None
+      }
+      return
+    }
+    count := app.lsp.results.count
+    if app.prompt_state.panel == Panel.Diagnostics {
+      count = app.documents.slots[app.documents.active].diagnostics.count
+    }
+    if key == KeyDown && app.prompt_state.selected + 1 < count {
+      app.prompt_state.selected += 1
+    }
+    if key == KeyUp && app.prompt_state.selected > 0 {
+      app.prompt_state.selected -= 1
+    }
     return
   }
-  if app.panel == Panel.Message {
-    if app.selected == 15 && key == 100 {
-      files.discard_recovery(app.file) _ = buffer.load(doc, doc.saved[..doc.saved_length]) app.panel = Panel.None app.extend = false
-    } else if app.selected != 15 && key == 13 { if explorer_dirty(app) { app.panel = Panel.Directory } else { app.panel = Panel.None } }
+  if app.prompt_state.panel == Panel.None && terminal_target(app) == nil && (modifiers & ModCtrl) != 0 && key == KeySpace {
+    lsp_request(app, 1, "")
     return
   }
-  if app.panel != Panel.None {
-    if prompting(app) && control && key == 118 {
-      pasted := sdl.clipboard_get()
-      if pasted == nil { notice(app, "Clipboard unavailable.") return }
-      defer sdl.free(#cast(rawptr) pasted)
-      paste_length := c.string_length(pasted, 4096)
-      if paste_length >= 4096 { notice(app, "Clipboard exceeds prompt capacity.") return }
-      text_input(app, pasted[..paste_length]) return
+  if key != KeyEscape {
+    terminal_escape_flush(app)
+  }
+  if app.prompt_state.panel == Panel.PluginGrant || app.prompt_state.panel == Panel.PluginEdit {
+    if key == KeyEscape {
+      app.prompt_state.panel = Panel.None
     }
-    if key == 13 { submit(app, typography) return }
-    if app.panel == Panel.Open {
-      if key == 9 { _ = complete_path(app) return }
-      if key == 1073741905 && app.completion_selected + 1 < app.completion_count { app.completion_selected += 1 app.completion_chosen = true }
-      if key == 1073741906 { if app.completion_selected > 0 { app.completion_selected -= 1 } app.completion_chosen = true }
+    else if key == KeyReturn {
+      if app.prompt_state.panel == Panel.PluginGrant {
+        plugin_start_pending(app)
+      } else {
+        plugin_apply_edit(app)
+      }
     }
-    if app.panel == Panel.Commands || app.panel == Panel.Buffers {
-      if app.panel == Panel.Commands { matches(app) } else { buffer_matches(app) }
-      if key == 1073741905 && app.selected + 1 < app.match_count { app.selected += 1 }
-      if key == 1073741906 && app.selected > 0 { app.selected -= 1 }
+    return
+  }
+  if app.prompt_state.panel == Panel.ReplacePreview {
+    if key == KeyEscape {
+      replace_release(app)
+      app.prompt_state.panel = Panel.None
     }
-    if prompting(app) && key == 8 && app.prompt_length > 0 {
-      app.prompt_length -= 1
-      for app.prompt_length > 0 && (app.prompt[app.prompt_length] & 192) == 128 { app.prompt_length -= 1 }
-      app.prompt[app.prompt_length] = 0 app.selected = 0
-      if app.panel == Panel.Open { completion_refresh(app) }
+    else if key == KeyReturn {
+      replace_apply(app)
     }
+    else if key == KeyDown && app.prompt_state.selected + 1 < app.replacement.plan.count {
+      app.prompt_state.selected += 1
+    }
+    else if key == KeyUp && app.prompt_state.selected > 0 {
+      app.prompt_state.selected -= 1
+    }
+    return
+  }
+  if app.prompt_state.panel == Panel.TerminalClose {
+    if key == KeyEscape || key == KeyC {
+      cancel_buffer_close(app)
+    }
+    else if key == KeyReturn {
+      if app.picker_state.closing {
+        close_slot(app, app.picker_state.close_target)
+        finish_picker_close(app)
+      } else if app.terminal_state.closing_all {
+        app.terminal_state.quit_confirmed = true
+        request_quit(app)
+      } else {
+        close_clean(app)
+      }
+    }
+    return
+  }
+  if configured_key(app, typography, key, modifiers) {
+    return
+  }
+  if key == KeyX && (modifiers & ModCtrl) != 0 && app.prompt_state.panel == Panel.Buffers {
+    picker_close_selected(app)
+    return
+  }
+  // In the Vim profile Ctrl-x decrements numbers; :q closes instead.
+  if key == KeyX && (modifiers & ModCtrl) != 0 && ((app.prompt_state.panel == Panel.None && !(app.config.vim_keys && terminal_target(app) == nil)) || app.prompt_state.panel == Panel.Terminal) {
+    if app.prompt_state.panel == Panel.Terminal {
+      activate(app, app.terminal_state.slot)
+    }
+    app.input_state.pending = 0
+    app.input_state.repeat_count = 0
+    request_buffer_close(app)
+    return
+  }
+  if terminal_input_key(app, key, modifiers) {
+    return
+  }
+  shift := (modifiers & ModShift) != 0
+  control := (modifiers & ModCtrl) != 0
+  doc := app.documents.current
+  if (app.input_state.pending != 0 || app.register_state.pending) && key != KeyEscape {
+    return
+  }
+  if app.prompt_state.panel == Panel.Directory {
+    explorer_key(app, typography, key, modifiers)
+    return
+  }
+  if app.prompt_state.panel == Panel.Tree {
+    tree_key(app, typography, key, modifiers)
+    return
+  }
+  if app.prompt_state.panel == Panel.DirectoryApply {
+    if key == KeyEscape {
+      app.prompt_state.panel = Panel.Directory
+    }
+    else if key == KeyReturn {
+      explorer_apply(app)
+    }
+    else if key == KeyDown && app.explorer.preview_row + 1 < app.explorer.edit_count {
+      app.explorer.preview_row += 1
+    }
+    else if key == KeyUp && app.explorer.preview_row > 0 {
+      app.explorer.preview_row -= 1
+    }
+    return
+  }
+  if app.prompt_state.panel == Panel.DirectoryDiscard {
+    if key == KeyEscape {
+      app.prompt_state.panel = Panel.Directory
+      app.explorer.quit_after_discard = false
+    }
+    else if key == KeyD {
+      if app.explorer.document != nil {
+        buffer.mark_saved(app.explorer.document)
+      }
+      app.prompt_state.panel = Panel.Directory
+      directory_refresh(app)
+      if app.explorer.quit_after_discard {
+        app.explorer.quit_after_discard = false
+        request_quit(app)
+      }
+    }
+    return
+  }
+  if key == KeyEscape {
+    if app.prompt_state.panel == Panel.Open {
+      app.resource_state.fonts = false
+      app.resource_state.kind = 0
+    }
+    if app.prompt_state.panel == Panel.Commands && app.terminal_state.commands {
+      app.terminal_state.commands = false
+      app.prompt_state.panel = Panel.Terminal
+      return
+    }
+    app.input_state.repeat_count = 0
+    app.input_state.pending = 0
+    app.register_state.pending = false
+    app.register_state.selected = 0
+    if app.prompt_state.panel == Panel.Match {
+      match_close(app)
+      return
+    }
+    if search_prompt(app.prompt_state.panel) {
+      search_restore(app)
+      search_close(app)
+      return
+    }
+    if app.prompt_state.panel == Panel.Leader {
+      app.prompt_state.panel = Panel.None
+      if app.input_state.leader_explorer {
+        app.prompt_state.panel = Panel.Directory
+      }
+      app.input_state.leader_explorer = false
+      return
+    }
+    if app.prompt_state.panel == Panel.Goto {
+      app.prompt_state.panel = Panel.None
+      if app.input_state.goto_explorer {
+        app.prompt_state.panel = Panel.Directory
+      }
+      app.input_state.goto_explorer = false
+      return
+    }
+    if app.prompt_state.panel == Panel.Commands && app.explorer.commands {
+      app.explorer.commands = false
+      app.prompt_state.panel = Panel.Directory
+      return
+    }
+    if app.prompt_state.panel != Panel.None {
+      cancel_buffer_close(app)
+    }
+    else {
+      if app.config.vim_keys && app.view.insert {
+        vim_insert_finish(app)
+      }
+      buffer.checkpoint(doc)
+      if app.view.insert {
+        buffer.leave_insert(doc)
+      }
+      app.view.insert = false
+      app.view.extend = false
+      if app.config.vim_keys {
+        vim_escape(app)
+      }
+    }
+    return
+  }
+  if app.prompt_state.panel == Panel.Quit {
+    if key == KeyC {
+      cancel_buffer_close(app)
+    }
+    else if key == KeyS {
+      if app.picker_state.closing {
+        activate(app, app.picker_state.close_target)
+      }
+      app.documents.quit_after_save = true
+      action(app, typography, 1)
+    }
+    else if key == KeyD {
+      if app.picker_state.closing {
+        close_slot(app, app.picker_state.close_target)
+        finish_picker_close(app)
+        return
+      }
+      files.discard_recovery(app.documents.file)
+      if app.documents.closing_one {
+        close_clean(app)
+      }
+      else {
+        _ = buffer.load(doc, doc.saved[..doc.saved_length])
+        request_quit(app)
+      }
+    }
+    return
+  }
+  if app.prompt_state.panel == Panel.Match {
+    match_key(app, key)
+    return
+  }
+  if app.prompt_state.panel == Panel.Windows {
+    window_key(app, key)
+    return
+  }
+  if app.prompt_state.panel == Panel.Goto {
+    goto_key(app, typography, key)
+    return
+  }
+  if app.prompt_state.panel == Panel.View {
+    view_key(app, typography, key)
+    return
+  }
+  if app.prompt_state.panel == Panel.Bracket {
+    bracket_key(app, key, modifiers)
+    return
+  }
+  if app.prompt_state.panel == Panel.Leader {
+    normalized := key
+    if key == KeyUpperT {
+      normalized = KeyT
+    }
+    if key == KeySpace || (key == KeySemicolon && shift) {
+      normalized = KeyColon
+    }
+    chosen := PluginCommandBase
+    for index in 0..12 {
+      id := leader_command(index)
+      info := command_info(id)
+      if #len(info.key) == 1 && normalized == #cast(u32) info.key[0] {
+        chosen = id
+        break
+      }
+    }
+    if chosen == PluginCommandBase {
+      return
+    }
+    if chosen == 24 && app.input_state.leader_explorer {
+      app.prompt_state.panel = Panel.None
+    }
+    else {
+      action(app, typography, chosen)
+    }
+    app.input_state.leader_explorer = false
+    return
+  }
+  if app.prompt_state.panel == Panel.Message {
+    if app.prompt_state.selected == 15 && key == KeyD {
+      files.discard_recovery(app.documents.file)
+      _ = buffer.load(doc, doc.saved[..doc.saved_length])
+      app.prompt_state.panel = Panel.None
+      app.view.extend = false
+    } else if app.prompt_state.selected != 15 && key == KeyReturn {
+      if explorer_dirty(app) {
+        app.prompt_state.panel = Panel.Directory
+      } else {
+        app.prompt_state.panel = Panel.None
+      }
+    }
+    return
+  }
+  if app.prompt_state.panel != Panel.None {
+    prompt_key(app, typography, key, modifiers)
+    return
+  }
+  // Normal-mode document keys go to the active keymap profile first.
+  if app.config.vim_keys && vim_key(app, typography, key, modifiers) {
     return
   }
   if control {
-    if key == 111 { action(app, typography, 0) }
-    else if key == 115 { action(app, typography, 1) }
-    else if key == 112 { panel(app, Panel.Commands) }
-    else if key == 102 { action(app, typography, 3) }
-    else if key == 101 { action(app, typography, 7) }
-    else if key == 113 { action(app, typography, 16) }
-    else if key == 122 { if shift { buffer.redo(doc) } else { buffer.undo(doc) } }
-    else if key == 121 { buffer.redo(doc) }
-    else if key == 97 { doc.anchor = 0 doc.cursor = doc.length }
-    else if key == 99 { clipboard_copy(app) }
-    else if key == 118 { clipboard_paste(app) }
-    else if key == 61 || key == 43 { action(app, typography, 11) }
-    else if key == 45 { action(app, typography, 12) }
-    else if key == 48 { action(app, typography, 13) }
+    if !app.view.insert && (key == KeyB || key == KeyF || key == KeyD || key == KeyU) {
+      page_motion(app, typography, key == KeyF || key == KeyD, key == KeyD || key == KeyU)
+      return
+    }
+    if key == KeyW {
+      panel(app, Panel.Windows)
+    }
+    else if key == KeyO {
+      action(app, typography, 0)
+    }
+    else if key == KeyS {
+      action(app, typography, 1)
+    }
+    else if key == KeyP {
+      panel(app, Panel.Commands)
+    }
+    else if key == KeyF {
+      action(app, typography, 3)
+    }
+    else if key == KeyE {
+      action(app, typography, 7)
+    }
+    else if key == KeyQ {
+      action(app, typography, 16)
+    }
+    else if key == KeyZ {
+      if shift {
+        buffer.redo(doc)
+      } else {
+        buffer.undo(doc)
+      }
+    }
+    else if key == KeyY {
+      buffer.redo(doc)
+    }
+    else if key == KeyA {
+      doc.anchor = 0
+      doc.cursor = doc.length
+    }
+    else if key == KeyC {
+      _ = clipboard_copy(app)
+    }
+    else if key == KeyV {
+      clipboard_paste(app)
+    }
+    else if key == KeyEquals || key == KeyPlus {
+      action(app, typography, 11)
+    }
+    else if key == KeyMinus {
+      action(app, typography, 12)
+    }
+    else if key == Key0 {
+      action(app, typography, 13)
+    }
+    else if key == KeyLeft || key == KeyRight {
+      buffer.checkpoint(doc)
+      word_direction: u8 = 0
+      if key == KeyLeft {
+        word_direction = 1
+      }
+      buffer.word(doc, word_direction, false, app.view.extend || shift)
+      if !app.view.extend && !shift {
+        doc.anchor = doc.cursor
+      }
+    }
     return
   }
-  if !app.insert && key == 47 { action(app, typography, 3) }
-  else if !app.insert && key == 110 { if !buffer.find(doc, app.search[..app.search_length], shift) { notice(app, "No search match.") } }
-  else if !app.insert && key == 32 { panel(app, Panel.Leader) }
-  else if !app.insert && (key == 58 || (key == 59 && shift) || key == 1073741882) { panel(app, Panel.Commands) }
-  else { edit_key(app, key, modifiers) }
+  if !app.view.insert && (key == KeyQuote || (key == KeyApostrophe && shift)) {
+    app.register_state.pending = true
+  }
+  else if !app.view.insert && key == KeyM {
+    match_open(app, false)
+  }
+  else if !app.view.insert && key == KeyK && shift {
+    filter_kind := Panel.Keep
+    if (modifiers & ModAlt) != 0 {
+      filter_kind = Panel.Remove
+    }
+    search_open(app, filter_kind, false)
+  }
+  else if !app.view.insert && key == KeyG && !shift {
+    app.input_state.goto_count = app.input_state.repeat_count
+    app.input_state.goto_explorer = false
+    panel(app, Panel.Goto)
+  }
+  else if !app.view.insert && (key == KeySlash || key == KeyQuestion) {
+    app.input_state.search_backwards = shift || key == KeyQuestion
+    action(app, typography, 3)
+  }
+  else if !app.view.insert && key == KeyN && (modifiers & ModAlt) == 0 {
+    search_repeat(app, shift, false)
+  }
+  else if !app.view.insert && key == KeyS {
+    kind := Panel.Select
+    if shift {
+      kind = Panel.Split
+    }
+    search_open(app, kind, false)
+  }
+  else if !app.view.insert && key == KeySpace {
+    app.input_state.leader_explorer = false
+    panel(app, Panel.Leader)
+  }
+  else if !app.view.insert && (modifiers & ModAlt) == 0 && (key == KeyColon || (key == KeySemicolon && shift) || key == KeyF1) {
+    panel(app, Panel.Commands)
+  }
+  else if !app.view.insert && key == KeyZ && (modifiers & ModAlt) == 0 {
+    view_open(app, shift)
+  }
+  else if !app.view.insert && (key == KeyRightBracket || key == KeyLeftBracket) && !shift {
+    bracket_open(app, key == KeyRightBracket)
+  }
+  else if !app.view.insert && (key == KeyAsterisk || (key == Key8 && shift)) {
+    search_selection(app)
+  }
+  else if !app.view.insert && (key == KeyAmpersand || (key == Key7 && shift)) {
+    align_selections(app)
+  }
+  else if !app.view.insert && key == KeyX && (modifiers & ModAlt) != 0 {
+    buffer.checkpoint(doc)
+    shrink_to_lines(doc)
+  }
+  else {
+    edit_key(app, key, modifiers)
+  }
 }
-// Shared document editing semantics for file text and explorer drafts.
-fn edit_key(app: *App, key: u32, modifiers: u16) {
-  doc := app.document shift := (modifiers & 3) != 0
-  extend := app.extend || shift
-  if key == 1073741904 || (!app.insert && key == 104) { buffer.checkpoint(doc) buffer.move_to(doc, buffer.previous(doc, doc.cursor), extend) }
-  else if key == 1073741903 || (!app.insert && key == 108) { buffer.checkpoint(doc) buffer.move_to(doc, buffer.next(doc, doc.cursor), extend) }
-  else if key == 1073741906 || (!app.insert && key == 107) { buffer.checkpoint(doc) buffer.vertical(doc, false, extend) }
-  else if key == 1073741905 || (!app.insert && key == 106) { buffer.checkpoint(doc) buffer.vertical(doc, true, extend) }
-  else if key == 1073741898 { buffer.move_to(doc, buffer.line_start(doc, doc.cursor), extend) }
-  else if key == 1073741901 { buffer.move_to(doc, buffer.line_end(doc, doc.cursor), extend) }
-  else if key == 1073741899 || key == 1073741902 {
-    buffer.checkpoint(doc) count: usize = 0 for count < 20 { buffer.vertical(doc, key == 1073741902, extend) count += 1 }
+
+fn registers_release(app: *App) {
+  for index in 0..26 {
+    register := &app.register_state.named[index]
+    if register.owned {
+      _ = mem.arena_release(&register.arena)
+      register.owned = false
+    }
   }
-  else if app.insert {
-    if key == 8 { buffer.erase(doc, true) }
-    else if key == 127 { buffer.erase(doc, false) }
-    else if key == 13 { changed(app, "\n") }
-    else if key == 9 { changed(app, "    ") }
-  }
-  else if key == 105 { buffer.checkpoint(doc) app.insert = true app.extend = false }
-  else if key == 97 { buffer.move_to(doc, buffer.next(doc, doc.cursor), false) buffer.checkpoint(doc) app.insert = true app.extend = false }
-  else if key == 111 {
-    buffer.checkpoint(doc) buffer.move_to(doc, buffer.line_end(doc, doc.cursor), false) changed(app, "\n") app.insert = true app.extend = false
-  }
-  else if key == 118 { app.extend = !app.extend if app.extend { doc.anchor = doc.cursor } }
-  else if key == 120 { buffer.select_line(doc) }
-  else if key == 100 || key == 99 { buffer.checkpoint(doc) buffer.erase(doc, false) buffer.checkpoint(doc) app.extend = false if key == 99 { app.insert = true } }
-  else if key == 117 { if shift { buffer.redo(doc) } else { buffer.undo(doc) } }
-  else if key == 103 { if shift { buffer.move_to(doc, doc.length, extend) } else { buffer.move_to(doc, 0, extend) } }
-  else if key == 121 { clipboard_copy(app) }
-  else if key == 112 { clipboard_paste(app) }
+  clipboard_release(app)
 }

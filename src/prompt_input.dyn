@@ -1,0 +1,163 @@
+struct PromptState {
+  text: [4096]u8,
+  length: usize,
+  message: [8192]u8,
+  message_length: usize,
+  selected: usize,
+  matches: [512]usize,
+  match_count: usize,
+  panel: Panel,
+}
+
+// Prompt/picker input never falls through to editing commands.
+fn prompt_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
+  control := (modifiers & ModCtrl) != 0
+    // Picker/prompt navigation aliases do not fall through to document commands.
+    if control && (key == KeyN || key == KeyJ) {
+      key_input(app, typography, KeyDown, 0)
+      return
+    }
+    if control && (key == KeyP || key == KeyK) {
+      key_input(app, typography, KeyUp, 0)
+      return
+    }
+    if control && key == KeyU && prompting(app) {
+      app.prompt_state.length = 0
+      app.prompt_state.text[0] = 0
+      app.prompt_state.selected = 0
+      if app.prompt_state.panel == Panel.Open {
+        completion_refresh(app)
+      }
+      if search_prompt(app.prompt_state.panel) {
+        search_preview(app)
+      }
+      if app.prompt_state.panel == Panel.ProjectSearch {
+        project_search_refresh(app)
+      }
+      return
+    }
+    if prompting(app) && control && key == KeyV {
+      pasted := sdl.clipboard_get()
+      if pasted == nil {
+        notice(app, "Clipboard unavailable.")
+        return
+      }
+      defer sdl.free(#cast(rawptr) pasted)
+      paste_length := c.string_length(pasted, 4096)
+      if paste_length >= 4096 {
+        notice(app, "Clipboard exceeds prompt capacity.")
+        return
+      }
+      text_input(app, pasted[..paste_length])
+      return
+    }
+    if key == KeyReturn {
+      submit(app, typography)
+      return
+    }
+    if (app.prompt_state.panel == Panel.Open || app.prompt_state.panel == Panel.Buffers) && (key == KeyPageDown || key == KeyPageUp) {
+      count := app.completion.count
+      selected := app.completion.selected
+      if app.prompt_state.panel == Panel.Buffers {
+        buffer_matches(app)
+        count = app.prompt_state.match_count
+        selected = app.prompt_state.selected
+      }
+      step := app.picker_state.rows
+      if step == 0 {
+        step = 8
+      }
+      if count > 0 {
+        if key == KeyPageDown {
+          selected += step
+          if selected >= count {
+            selected = count - 1
+          }
+        }
+        else if selected > step {
+          selected -= step
+        } else {
+          selected = 0
+        }
+        if app.prompt_state.panel == Panel.Open {
+          app.completion.selected = selected
+          app.completion.chosen = true
+        } else {
+          app.prompt_state.selected = selected
+        }
+      }
+      return
+    }
+    if app.prompt_state.panel == Panel.ProjectSearch {
+      if key == KeyDown && app.prompt_state.selected + 1 < app.project_find.count {
+        app.prompt_state.selected += 1
+      }
+      if key == KeyUp && app.prompt_state.selected > 0 {
+        app.prompt_state.selected -= 1
+      }
+      if key == KeyPageDown && app.project_find.count > 0 {
+        app.prompt_state.selected += app.picker_state.rows
+        if app.prompt_state.selected >= app.project_find.count {
+          app.prompt_state.selected = app.project_find.count - 1
+        }
+      }
+      if key == KeyPageUp {
+        if app.prompt_state.selected > app.picker_state.rows {
+          app.prompt_state.selected -= app.picker_state.rows
+        } else {
+          app.prompt_state.selected = 0
+        }
+      }
+    }
+    if app.prompt_state.panel == Panel.Open {
+      if key == KeyTab {
+        _ = complete_path(app)
+        return
+      }
+      if key == KeyDown && app.completion.selected + 1 < app.completion.count {
+        app.completion.selected += 1
+        app.completion.chosen = true
+      }
+      if key == KeyUp {
+        if app.completion.selected > 0 {
+          app.completion.selected -= 1
+        }
+        app.completion.chosen = true
+      }
+    }
+    if app.prompt_state.panel == Panel.Commands && key == KeyTab {
+      palette_tab(app)
+      return
+    }
+    if app.prompt_state.panel == Panel.Commands || app.prompt_state.panel == Panel.Buffers {
+      if app.prompt_state.panel == Panel.Commands {
+        matches(app)
+      } else {
+        buffer_matches(app)
+      }
+      if key == KeyDown && app.prompt_state.selected + 1 < app.prompt_state.match_count {
+        app.prompt_state.selected += 1
+      }
+      if key == KeyUp && app.prompt_state.selected > 0 {
+        app.prompt_state.selected -= 1
+      }
+    }
+    if prompting(app) && key == KeyBackspace && app.prompt_state.length > 0 {
+      app.prompt_state.length -= 1
+      for app.prompt_state.length > 0 && (app.prompt_state.text[app.prompt_state.length] & 192) == 128 {
+        app.prompt_state.length -= 1
+      }
+      app.prompt_state.text[app.prompt_state.length] = 0
+      app.prompt_state.selected = 0
+      if app.prompt_state.panel == Panel.Open {
+        completion_refresh(app)
+      }
+      if search_prompt(app.prompt_state.panel) {
+        search_preview(app)
+      }
+      if app.prompt_state.panel == Panel.ProjectSearch {
+        project_search_refresh(app)
+      }
+    }
+    return
+}

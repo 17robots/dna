@@ -1,0 +1,772 @@
+
+// Immediate-mode UI core, after the RAD Debugger's design. Panels rebuild a
+// box tree every drawn frame; boxes are keyed by a hash of their name and
+// parent, so hover, selection and scroll animations persist across frames.
+// Layout solves each axis from declarative sizes, and input hit-tests the
+// rectangles from the previous frame. Nothing here runs on frames that are
+// not drawn, so idle cost stays zero.
+
+const UiClickable: u32 = 1
+const UiBackground: u32 = 2
+const UiBorder: u32 = 4
+const UiText: u32 = 8
+const UiClip: u32 = 16
+const UiScroll: u32 = 32
+const UiFloating: u32 = 64
+const UiHover: u32 = 128
+const UiTextRight: u32 = 256
+const UiMuted: u32 = 512
+const UiAccent: u32 = 1024
+
+const UiAxisX: usize = 0
+const UiAxisY: usize = 1
+const UiCapacity: usize = 512
+
+enum UiSizeKind { Pixels, Text, Percent, Children }
+// strictness 1 keeps the size; 0 lets overflow resolution shrink it fully.
+struct UiSize { kind: UiSizeKind, value, strictness: f32 }
+
+struct UiBox {
+  key: u64,
+  touched: u64,
+  // Build order within the frame; later boxes draw on top and win hits.
+  order: u64,
+  // Tree links for the frame being built; pool indexes, 0 means none.
+  parent, first, last, next: usize,
+  flags: u32,
+  axis: usize,
+  size: [2]UiSize,
+  padding: [2]f32,
+  floating: [2]f32,
+  text_start, text_length: usize,
+  fill: Rgb,
+  // Caller data, such as the command a row runs.
+  value: usize,
+  // Layout output. During the next build it still holds the last frame's
+  // geometry, which is what input hit-testing uses.
+  extent: [2]f32,
+  position: [2]f32,
+  rect: sdl.Rect,
+  // Persistent animation state.
+  hot, selected, scroll: motion.Tween,
+  scroll_target: f32,
+  // Scrollable content height: children's total, or set by custom drawing.
+  content: f32,
+}
+struct UiState {
+  boxes: [512]UiBox,
+  text: [32768]u8,
+  text_used: usize,
+  frame: u64,
+  made: u64,
+  // Set while draw() builds one frame shared by every panel on screen.
+  in_draw: bool,
+  root: usize,
+  stack: [32]usize,
+  depth: usize,
+  scale, cell, line: f32,
+  mouse_x, mouse_y: f32,
+  mouse_seen: bool,
+  // 1 + index of the split being dragged, or 0.
+  split_drag: usize,
+  cursors: [12]rawptr,
+  cursor_kind: u32,
+  // Set when pointer motion changes the hovered box, so plain motion over
+  // one row does not redraw.
+  redraw: bool,
+  wheel: f32,
+  // Panel state that outlives one frame.
+  palette_open: motion.Tween,
+  palette_selected: usize,
+  palette_query: u64,
+  menu_open: motion.Tween,
+  completion_open: motion.Tween,
+  hover_open: motion.Tween,
+  dialog_open: motion.Tween,
+  sheet_open: motion.Tween,
+  explorer_open: motion.Tween,
+  explorer_seen: u64,
+  // Explorer list geometry from the last drawn frame, for mouse rows.
+  explorer_top, explorer_scroll: f32,
+  explorer_body: sdl.Rect,
+  sheet_selected: usize,
+  sheet_count: usize,
+  dialog_text: u64,
+  dialog_panel: Panel,
+  dialog_seen: bool,
+  // Keyboard focus among dialog buttons, tracked per dialog kind.
+  dialog_focus: usize,
+  dialog_focus_panel: Panel,
+  dialog_focus_set: bool,
+  dialog_focus_identity: u64,
+  hover_text: u64,
+  completion_selected: usize,
+  completion_count: usize,
+  picker_open: motion.Tween,
+  picker_selected: usize,
+  picker_count: usize,
+}
+
+fn ui_hash(seed: u64, text: []const u8) u64 {
+  hash: u64 = (seed % 4294967296) ^ 5381
+  for byte in text {
+    hash = ((hash * 33) ^ #cast(u64) byte) % 1099511627776
+  }
+  return hash + 1
+}
+fn ui_hash_number(seed: u64, number: usize) u64 {
+  return ((seed % 1099511627776) * 31 + #cast(u64) number * 2654435761 % 1099511627776) % 1099511627776 + 1
+}
+// Panels call this; inside draw() the frame is already begun, so every panel
+// on screen shares one frame and hit-testing sees all of them. Standalone
+// callers (tests) begin a frame of their own.
+fn ui_panel_begin(ui: *UiState, typography: *const Typography) {
+  if !ui.in_draw {
+    ui_begin(ui, typography)
+  }
+  ui.depth = 0
+}
+fn ui_begin(ui: *UiState, typography: *const Typography) {
+  ui.frame += 1
+  ui.made = 0
+  ui.text_used = 0
+  ui.depth = 0
+  ui.root = 0
+  ui.scale = typography.scale
+  ui.cell = typography.cell
+  ui.line = typography.line
+}
+fn ui_parent(ui: *const UiState) usize {
+  if ui.depth == 0 {
+    return 0
+  }
+  return ui.stack[ui.depth - 1]
+}
+// Returns the pool index for key, creating it on first use. Boxes not built
+// in the previous frame are free for reuse.
+fn ui_make(ui: *UiState, key: u64, flags: u32) usize {
+  found: usize = 0
+  free: usize = 0
+  index: usize = 1
+  for index < UiCapacity && found == 0 {
+    candidate := &ui.boxes[index]
+    if candidate.key == key && candidate.touched + 1 >= ui.frame {
+      found = index
+    }
+    else if free == 0 && (candidate.key == 0 || candidate.touched + 1 < ui.frame) {
+      free = index
+    }
+    index += 1
+  }
+  if found == 0 {
+    if free == 0 {
+      #panic("UI box capacity")
+    }
+    found = free
+    ui.boxes[found] = UiBox{}
+    ui.boxes[found].key = key
+  }
+  made := &ui.boxes[found]
+  if made.touched == ui.frame {
+    // Equal names in one frame (e.g. overloaded completions) get a derived key.
+    return ui_make(ui, ui_hash_number(key, 7919), flags)
+  }
+  made.touched = ui.frame
+  ui.made += 1
+  made.order = ui.made
+  made.flags = flags
+  made.first = 0
+  made.last = 0
+  made.next = 0
+  made.axis = UiAxisY
+  made.size[0] = UiSize{kind: UiSizeKind.Children, value: 0.0, strictness: 1.0}
+  made.size[1] = UiSize{kind: UiSizeKind.Children, value: 0.0, strictness: 1.0}
+  made.padding[0] = 0.0
+  made.padding[1] = 0.0
+  made.text_length = 0
+  made.value = 0
+  made.content = 0.0
+  made.parent = ui_parent(ui)
+  if made.parent == 0 {
+    // Each top-level box is the root the next ui_layout/ui_render handle.
+    ui.root = found
+  }
+  else {
+    owner := &ui.boxes[made.parent]
+    if owner.last == 0 {
+      owner.first = found
+    }
+    else {
+      ui.boxes[owner.last].next = found
+    }
+    owner.last = found
+  }
+  return found
+}
+// Pool index of a box built in the last frame, or 0.
+fn ui_make_lookup(ui: *const UiState, key: u64) usize {
+  for index in 1..UiCapacity {
+    if ui.boxes[index].key == key && ui.boxes[index].touched == ui.frame {
+      return index
+    }
+  }
+  return 0
+}
+// Key of a named child of a named root, for finding boxes after layout.
+fn ui_child_key(root: []const u8, child: []const u8) u64 {
+  return ui_hash(ui_hash(0, root), child)
+}
+fn ui_key(ui: *const UiState, name: []const u8) u64 {
+  seed: u64 = 0
+  parent := ui_parent(ui)
+  if parent != 0 {
+    seed = ui.boxes[parent].key
+  }
+  return ui_hash(seed, name)
+}
+fn ui_push(ui: *UiState, index: usize) {
+  if ui.depth == 32 {
+    #panic("UI nesting depth")
+  }
+  ui.stack[ui.depth] = index
+  ui.depth += 1
+}
+fn ui_pop(ui: *UiState) {
+  if ui.depth > 0 {
+    ui.depth -= 1
+  }
+}
+fn ui_size(ui: *UiState, index: usize, axis: usize, kind: UiSizeKind, value: f32, strictness: f32) {
+  ui.boxes[index].size[axis] = UiSize{kind: kind, value: value, strictness: strictness}
+}
+fn ui_text_set(ui: *UiState, index: usize, text: []const u8) {
+  made := &ui.boxes[index]
+  made.text_start = ui.text_used
+  made.text_length = 0
+  if ui.text_used + #len(text) >= #len(ui.text) {
+    return
+  }
+  _ = mem.copy(ui.text[ui.text_used..ui.text_used + #len(text)], text)
+  ui.text_used += #len(text)
+  made.text_length = #len(text)
+}
+fn ui_text_of(ui: *const UiState, index: usize) []const u8 {
+  made := &ui.boxes[index]
+  return ui.text[made.text_start..made.text_start + made.text_length]
+}
+// A text box sized to its content.
+fn ui_label(ui: *UiState, name: []const u8, text: []const u8, flags: u32) usize {
+  label := ui_make(ui, ui_key(ui, name), flags | UiText)
+  ui_text_set(ui, label, text)
+  ui_size(ui, label, UiAxisX, UiSizeKind.Text, 0.0, 1.0)
+  ui_size(ui, label, UiAxisY, UiSizeKind.Text, 0.0, 1.0)
+  return label
+}
+fn ui_contains(rect: sdl.Rect, x: f32, y: f32) bool {
+  return rect.width > 0.0 && x >= rect.x && y >= rect.y && x < rect.x + rect.width && y < rect.y + rect.height
+}
+// Hover uses last frame's rectangle, clipped by every clipping ancestor.
+fn ui_visible_at(ui: *const UiState, index: usize, x: f32, y: f32) bool {
+  if !ui_contains(ui.boxes[index].rect, x, y) {
+    return false
+  }
+  ancestor := ui.boxes[index].parent
+  for ancestor != 0 {
+    if (ui.boxes[ancestor].flags & UiClip) != 0 && !ui_contains(ui.boxes[ancestor].rect, x, y) {
+      return false
+    }
+    ancestor = ui.boxes[ancestor].parent
+  }
+  return true
+}
+fn ui_hovered(ui: *const UiState, index: usize) bool {
+  return ui.mouse_seen && ui_visible_at(ui, index, ui.mouse_x, ui.mouse_y)
+}
+// Topmost clickable box built last frame under the point; 0 when none.
+fn ui_hit(ui: *const UiState, x: f32, y: f32) usize {
+  hit: usize = 0
+  for index in 1..UiCapacity {
+    candidate := &ui.boxes[index]
+    if candidate.key != 0 && candidate.touched == ui.frame && (candidate.flags & UiClickable) != 0 && ui_visible_at(ui, index, x, y) && (hit == 0 || candidate.order > ui.boxes[hit].order) {
+      hit = index
+    }
+  }
+  return hit
+}
+// Pointer motion; asks for a redraw only when the hovered box changes.
+fn ui_pointer(ui: *UiState, x: f32, y: f32) {
+  before: usize = 0
+  if ui.mouse_seen {
+    before = ui_hit(ui, ui.mouse_x, ui.mouse_y)
+  }
+  ui.mouse_x = x
+  ui.mouse_y = y
+  ui.mouse_seen = true
+  if ui_hit(ui, x, y) != before {
+    ui.redraw = true
+  }
+}
+// Animate hover and selection highlights toward their targets.
+fn ui_animate(app: *App, ui: *UiState, index: usize, selected: bool) {
+  made := &ui.boxes[index]
+  hot_target: f32 = 0.0
+  if ui_hovered(ui, index) {
+    hot_target = 1.0
+  }
+  selected_target: f32 = 0.0
+  if selected {
+    selected_target = 1.0
+  }
+  duration := app.config.popup_animation_ms
+  _ = animated_value(app, &made.hot, hot_target, duration, false)
+  _ = animated_value(app, &made.selected, selected_target, duration, false)
+}
+
+fn ui_text_width(ui: *const UiState, text: []const u8) f32 {
+  count: usize = 0
+  for byte in text {
+    if (byte & 192) != 128 {
+      count += 1
+    }
+  }
+  return #cast(f32) count * ui.cell
+}
+fn ui_standalone(ui: *UiState, index: usize, axis: usize) {
+  made := &ui.boxes[index]
+  if made.size[axis].kind == UiSizeKind.Pixels {
+    made.extent[axis] = made.size[axis].value * ui.scale
+  }
+  else if made.size[axis].kind == UiSizeKind.Text {
+    if axis == UiAxisX {
+      made.extent[axis] = ui_text_width(ui, ui_text_of(ui, index)) + made.padding[axis] * 2.0
+    }
+    else {
+      made.extent[axis] = ui.line + made.padding[axis] * 2.0
+    }
+  }
+  child := made.first
+  for child != 0 {
+    ui_standalone(ui, child, axis)
+    child = ui.boxes[child].next
+  }
+}
+fn ui_upward(ui: *UiState, index: usize, axis: usize) {
+  made := &ui.boxes[index]
+  if made.size[axis].kind == UiSizeKind.Percent && made.parent != 0 {
+    owner := &ui.boxes[made.parent]
+    made.extent[axis] = (owner.extent[axis] - owner.padding[axis] * 2.0) * made.size[axis].value
+  }
+  child := made.first
+  for child != 0 {
+    ui_upward(ui, child, axis)
+    child = ui.boxes[child].next
+  }
+}
+fn ui_downward(ui: *UiState, index: usize, axis: usize) {
+  made := &ui.boxes[index]
+  child := made.first
+  for child != 0 {
+    ui_downward(ui, child, axis)
+    child = ui.boxes[child].next
+  }
+  if made.size[axis].kind == UiSizeKind.Children {
+    total: f32 = 0.0
+    item := made.first
+    for item != 0 {
+      if axis == made.axis {
+        total += ui.boxes[item].extent[axis]
+      }
+      else if ui.boxes[item].extent[axis] > total {
+        total = ui.boxes[item].extent[axis]
+      }
+      item = ui.boxes[item].next
+    }
+    made.extent[axis] = total + made.padding[axis] * 2.0
+  }
+}
+// Shrink children that overflow their parent, taking only the slack each
+// child's strictness allows. Scrolling parents keep full child sizes.
+fn ui_solve(ui: *UiState, index: usize, axis: usize) {
+  made := &ui.boxes[index]
+  available := made.extent[axis] - made.padding[axis] * 2.0
+  if (made.flags & UiScroll) == 0 || axis != UiAxisY {
+    if axis == made.axis {
+      total: f32 = 0.0
+      slack: f32 = 0.0
+      item := made.first
+      for item != 0 {
+        total += ui.boxes[item].extent[axis]
+        slack += ui.boxes[item].extent[axis] * (1.0 - ui.boxes[item].size[axis].strictness)
+        item = ui.boxes[item].next
+      }
+      overflow := total - available
+      // Fully flexible children (strictness 0) give up space first, in order,
+      // so a filler takes exactly what is left; the rest shrink proportionally.
+      flexible := made.first
+      for flexible != 0 && overflow > 0.0 {
+        yielding := &ui.boxes[flexible]
+        if yielding.size[axis].strictness == 0.0 {
+          taken := yielding.extent[axis]
+          if taken > overflow {
+            taken = overflow
+          }
+          yielding.extent[axis] -= taken
+          overflow -= taken
+          slack -= taken
+        }
+        flexible = yielding.next
+      }
+      if overflow > 0.0 && slack > 0.0 {
+        fraction := overflow / slack
+        if fraction > 1.0 {
+          fraction = 1.0
+        }
+        shrink := made.first
+        for shrink != 0 {
+          sized := &ui.boxes[shrink]
+          sized.extent[axis] -= sized.extent[axis] * (1.0 - sized.size[axis].strictness) * fraction
+          shrink = sized.next
+        }
+      }
+    }
+    else {
+      clamp := made.first
+      for clamp != 0 {
+        bounded := &ui.boxes[clamp]
+        if bounded.extent[axis] > available {
+          bounded.extent[axis] = available
+        }
+        clamp = bounded.next
+      }
+    }
+  }
+  child := made.first
+  for child != 0 {
+    ui_solve(ui, child, axis)
+    child = ui.boxes[child].next
+  }
+}
+fn ui_place(ui: *UiState, index: usize, axis: usize) {
+  made := &ui.boxes[index]
+  if made.parent == 0 || (made.flags & UiFloating) != 0 {
+    made.position[axis] = made.floating[axis]
+  }
+  cursor := made.position[axis] + made.padding[axis]
+  if axis == UiAxisY && (made.flags & UiScroll) != 0 {
+    cursor -= made.scroll.value
+  }
+  child := made.first
+  for child != 0 {
+    placed := &ui.boxes[child]
+    if (placed.flags & UiFloating) == 0 {
+      if axis == made.axis {
+        placed.position[axis] = cursor
+        cursor += placed.extent[axis]
+      }
+      else {
+        placed.position[axis] = made.position[axis] + made.padding[axis]
+        if axis == UiAxisY && (made.flags & UiScroll) != 0 {
+          placed.position[axis] -= made.scroll.value
+        }
+      }
+    }
+    ui_place(ui, child, axis)
+    child = placed.next
+  }
+  if axis == UiAxisY {
+    made.rect = sdl.Rect{x: made.position[0], y: made.position[1], width: made.extent[0], height: made.extent[1]}
+    if made.first != 0 && (made.flags & UiScroll) != 0 {
+      made.content = cursor + made.scroll.value - made.position[1] - made.padding[1]
+    }
+  }
+}
+fn ui_layout(ui: *UiState) {
+  if ui.root == 0 {
+    return
+  }
+  for axis in 0..2 {
+    ui_standalone(ui, ui.root, axis)
+    ui_upward(ui, ui.root, axis)
+    ui_downward(ui, ui.root, axis)
+    ui_solve(ui, ui.root, axis)
+    ui_place(ui, ui.root, axis)
+  }
+}
+
+fn ui_mix(from: Rgb, to: Rgb, amount: f32) Rgb {
+  if amount <= 0.0 {
+    return from
+  }
+  if amount >= 1.0 {
+    return to
+  }
+  return Rgb{red: #cast(u8) (#cast(f32) from.red + (#cast(f32) to.red - #cast(f32) from.red) * amount), green: #cast(u8) (#cast(f32) from.green + (#cast(f32) to.green - #cast(f32) from.green) * amount), blue: #cast(u8) (#cast(f32) from.blue + (#cast(f32) to.blue - #cast(f32) from.blue) * amount)}
+}
+fn ui_intersect(a: sdl.PixelRect, b: sdl.Rect) sdl.PixelRect {
+  left := #cast(i32) b.x
+  top := #cast(i32) b.y
+  right := #cast(i32) (b.x + b.width)
+  bottom := #cast(i32) (b.y + b.height)
+  if left < a.x {
+    left = a.x
+  }
+  if top < a.y {
+    top = a.y
+  }
+  if right > a.x + a.width {
+    right = a.x + a.width
+  }
+  if bottom > a.y + a.height {
+    bottom = a.y + a.height
+  }
+  if right < left {
+    right = left
+  }
+  if bottom < top {
+    bottom = top
+  }
+  return sdl.PixelRect{x: left, y: top, width: right - left, height: bottom - top}
+}
+fn ui_draw_box(renderer: rawptr, ui: *UiState, typography: *Typography, index: usize, clip: sdl.PixelRect) {
+  made := &ui.boxes[index]
+  rect := made.rect
+  // Cull whole subtrees outside the visible clip.
+  if rect.x >= #cast(f32) (clip.x + clip.width) || rect.y >= #cast(f32) (clip.y + clip.height) || rect.x + rect.width <= #cast(f32) clip.x || rect.y + rect.height <= #cast(f32) clip.y {
+    return
+  }
+  colors := theme()
+  if (made.flags & UiBorder) != 0 {
+    if !paint(renderer, colors.border) || !sdl.fill(renderer, &rect) {
+      #panic("UI border")
+    }
+    rect = sdl.Rect{x: rect.x + ui.scale, y: rect.y + ui.scale, width: rect.width - ui.scale * 2.0, height: rect.height - ui.scale * 2.0}
+  }
+  fill := made.fill
+  painted := (made.flags & UiBackground) != 0
+  if (made.flags & UiHover) != 0 {
+    if !painted {
+      fill = colors.surface
+    }
+    if made.hot.value > 0.0 || made.selected.value > 0.0 {
+      // Hover tints partway toward the selection color; selection covers it.
+      fill = ui_mix(ui_mix(fill, colors.selection, made.hot.value * 0.45), colors.selection, made.selected.value)
+      painted = true
+    }
+  }
+  if painted && (!paint(renderer, fill) || !sdl.fill(renderer, &rect)) {
+    #panic("UI fill")
+  }
+  inner := clip
+  if (made.flags & UiClip) != 0 {
+    inner = ui_intersect(clip, made.rect)
+    if !sdl.clip(renderer, &inner) {
+      #panic("UI clip")
+    }
+  }
+  if (made.flags & UiText) != 0 && made.text_length > 0 {
+    text := ui_text_of(ui, index)
+    x := rect.x + made.padding[0]
+    // Right-aligned text that does not fit keeps its start visible instead.
+    if (made.flags & UiTextRight) != 0 && ui_text_width(ui, text) + made.padding[0] * 2.0 <= rect.width {
+      x = rect.x + rect.width - made.padding[0] - ui_text_width(ui, text)
+    }
+    ink := colors.text
+    if (made.flags & UiMuted) != 0 {
+      ink = colors.muted
+    }
+    if (made.flags & UiAccent) != 0 {
+      ink = colors.cursor
+    }
+    ui_text(typography, text, x, rect.y + (rect.height - ui.line) * 0.5, ink)
+  }
+  child := made.first
+  for child != 0 {
+    ui_draw_box(renderer, ui, typography, child, inner)
+    child = ui.boxes[child].next
+  }
+  if (made.flags & UiClip) != 0 && !sdl.clip(renderer, &clip) {
+    #panic("UI clip restore")
+  }
+  if (made.flags & UiScroll) != 0 {
+    ui_scrollbar(renderer, ui.scale, made.rect, made.content, made.scroll.value)
+  }
+}
+fn ui_render(renderer: rawptr, ui: *UiState, typography: *Typography, width: i32, height: i32) {
+  if ui.root == 0 {
+    return
+  }
+  full := sdl.PixelRect{x: 0, y: 0, width: width, height: height}
+  if !sdl.clip(renderer, &full) {
+    #panic("UI clip")
+  }
+  ui_draw_box(renderer, ui, typography, ui.root, full)
+  if !sdl.clip(renderer, nil) {
+    #panic("UI clip reset")
+  }
+}
+
+// Fixed-row lists. Keyboard moves keep the selection visible, the wheel
+// scrolls freely, and either way the list glides to its new offset.
+fn ui_list_scroll(app: *App, ui: *UiState, list: usize, count: usize, selected: usize, view: f32, reset: bool, follow: bool) {
+  line := ui.line
+  scrolled := &ui.boxes[list]
+  if reset {
+    scrolled.scroll_target = 0.0
+    motion.snap(&scrolled.scroll, 0.0)
+  }
+  if follow {
+    top := #cast(f32) selected * line
+    if top < scrolled.scroll_target {
+      scrolled.scroll_target = top
+    }
+    if top + line > scrolled.scroll_target + view {
+      scrolled.scroll_target = top + line - view
+    }
+  }
+  if ui.wheel != 0.0 {
+    scrolled.scroll_target -= ui.wheel * line * 3.0
+    ui.wheel = 0.0
+  }
+  limit := #cast(f32) count * line - view
+  if limit < 0.0 {
+    limit = 0.0
+  }
+  if scrolled.scroll_target > limit {
+    scrolled.scroll_target = limit
+  }
+  if scrolled.scroll_target < 0.0 {
+    scrolled.scroll_target = 0.0
+  }
+  _ = animated_follow(app, &scrolled.scroll, scrolled.scroll_target, app.config.scroll_animation_ms * 2.0, reset || !app.config.smooth_scroll)
+}
+struct UiWindow { first, last: usize }
+// Rows that can show this frame, covering the whole glide. Lists build only
+// these rows and stand in spacers for the rest, so size never limits them.
+fn ui_list_window(ui: *const UiState, list: usize, count: usize, view: f32) UiWindow {
+  scrolled := &ui.boxes[list]
+  low := scrolled.scroll.value
+  high := scrolled.scroll.value
+  if scrolled.scroll_target < low {
+    low = scrolled.scroll_target
+  }
+  if scrolled.scroll_target > high {
+    high = scrolled.scroll_target
+  }
+  if low < 0.0 {
+    low = 0.0
+  }
+  first := #cast(usize) (low / ui.line)
+  if first > 0 {
+    first -= 1
+  }
+  last := #cast(usize) ((high + view) / ui.line) + 2
+  if last > count {
+    last = count
+  }
+  if first > last {
+    first = last
+  }
+  return UiWindow{first: first, last: last}
+}
+// Empty vertical space standing in for rows that are not built.
+fn ui_spacer(ui: *UiState, name: []const u8, pixels: f32) {
+  if pixels <= 0.0 {
+    return
+  }
+  space := ui_make(ui, ui_key(ui, name), 0)
+  ui_size(ui, space, UiAxisY, UiSizeKind.Pixels, pixels / ui.scale, 1.0)
+}
+
+// Large centered panel used by project search and replace preview: a header,
+// a scrolling list, and a footer. Returns the list's pool index; rows are
+// added by the caller between ui_sheet_begin and ui_sheet_end.
+fn ui_sheet_begin(app: *App, ui: *UiState, typography: *const Typography, name: []const u8, width: i32, height: i32, status: f32, header: []const u8) usize {
+  scale := typography.scale
+  padding := 12.0 * scale
+  rect := sdl.Rect{x: #cast(f32) width * 0.05, y: (#cast(f32) height - status) * 0.06, width: #cast(f32) width * 0.9, height: (#cast(f32) height - status) * 0.88}
+  if app.view.animation.panel != app.prompt_state.panel {
+    motion.snap(&ui.sheet_open, -12.0 * scale)
+  }
+  slide := animated_value(app, &ui.sheet_open, 0.0, app.config.popup_animation_ms * 2.0, false)
+  frame := ui_make(ui, ui_hash(0, name), UiFloating | UiBackground | UiBorder | UiClip)
+  ui.boxes[frame].floating[0] = rect.x
+  ui.boxes[frame].floating[1] = rect.y + slide
+  ui.boxes[frame].fill = theme().surface
+  ui.boxes[frame].padding[0] = padding
+  ui.boxes[frame].padding[1] = padding
+  ui_size(ui, frame, UiAxisX, UiSizeKind.Pixels, rect.width / scale, 1.0)
+  ui_size(ui, frame, UiAxisY, UiSizeKind.Pixels, rect.height / scale, 1.0)
+  ui_push(ui, frame)
+  title := ui_label(ui, "header", header, 0)
+  ui_size(ui, title, UiAxisX, UiSizeKind.Percent, 1.0, 0.0)
+  ui_spacer(ui, "gap", typography.line)
+  list := ui_make(ui, ui_key(ui, "list"), UiClip | UiScroll)
+  ui_size(ui, list, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
+  ui_size(ui, list, UiAxisY, UiSizeKind.Percent, 1.0, 0.0)
+  return list
+}
+// Visible rows for a sheet list, from the frame height.
+fn ui_sheet_rows(typography: *const Typography, height: i32, status: f32) usize {
+  available := (#cast(f32) height - status) * 0.88 - 24.0 * typography.scale - typography.line * 3.0
+  if available < typography.line {
+    return 1
+  }
+  return #cast(usize) (available / typography.line)
+}
+fn ui_sheet_end(ui: *UiState, footer: []const u8) {
+  ending := ui_label(ui, "footer", footer, UiMuted)
+  ui_size(ui, ending, UiAxisX, UiSizeKind.Percent, 1.0, 0.0)
+  ui_pop(ui)
+}
+
+const UiCursorDefault: u32 = 0
+const UiCursorText: u32 = 1
+const UiCursorResizeX: u32 = 7
+const UiCursorResizeY: u32 = 8
+const UiCursorMove: u32 = 9
+const UiCursorPointer: u32 = 11
+// Mouse cursor shape; system cursors are created once and reused.
+fn ui_cursor(ui: *UiState, kind: u32) {
+  if kind == ui.cursor_kind || kind >= 12 {
+    return
+  }
+  if ui.cursors[kind] == nil {
+    ui.cursors[kind] = sdl.system_cursor(kind)
+  }
+  if ui.cursors[kind] != nil && sdl.set_cursor(ui.cursors[kind]) {
+    ui.cursor_kind = kind
+  }
+}
+fn ui_cursors_release(ui: *UiState) {
+  for index in 0..12 {
+    if ui.cursors[index] != nil {
+      sdl.destroy_cursor(ui.cursors[index])
+      ui.cursors[index] = nil
+    }
+  }
+}
+// Thin scrollbar thumb at the right edge when content exceeds the view.
+fn ui_scrollbar(renderer: rawptr, scale: f32, view: sdl.Rect, content: f32, offset: f32) {
+  if content <= view.height + 0.5 || view.height <= 0.0 {
+    return
+  }
+  thumb := view.height * view.height / content
+  if thumb < 16.0 * scale {
+    thumb = 16.0 * scale
+  }
+  if thumb > view.height {
+    thumb = view.height
+  }
+  travel := content - view.height
+  position := offset / travel
+  if position < 0.0 {
+    position = 0.0
+  }
+  if position > 1.0 {
+    position = 1.0
+  }
+  bar := sdl.Rect{x: view.x + view.width - 4.0 * scale, y: view.y + (view.height - thumb) * position, width: 3.0 * scale, height: thumb}
+  if !paint(renderer, theme().border) || !sdl.fill(renderer, &bar) {
+    #panic("scrollbar")
+  }
+}

@@ -1,156 +1,429 @@
 use "std/process"
-fn queue_key(value: u32, modifiers: u16) {
-  event := sdl.Event{} key := #cast(*sdl.KeyEvent) &event
-  key.kind = 768 key.key = value key.modifiers = modifiers key.down = true
-  if !sdl.push(&event) { #panic("queue key failed") }
-}
+
+extern fn notifications_start "dna_notify_start"() i32
+extern fn notifications_stop "dna_notify_stop"()
+
+extern fn handoff_run "dna_handoff_run"()
+// The editor returns after all its cleanup; a pending :frontend handoff then
+// replaces this process with the other frontend.
 fn main() {
+  editor_main()
+  handoff_run()
+}
+fn editor_main() {
   owned := mem.arena_create(#sizeof(App) + 128)
   scratch := mem.arena_create(2097152)
-  if !owned.ok || !scratch.ok { #panic("editor allocation failed") }
-  defer _ = mem.arena_release(&owned.arena)
+  if !owned.ok || !scratch.ok {
+    #panic("editor allocation failed")
+  }
+
   defer _ = mem.arena_release(&scratch.arena)
-  app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
-  app.scratch = &scratch.arena app.running = true app.popup_width = 0.64 app.popup_height = 0.56
-  app.line_numbers = true app.relative_numbers = true app.status_line = true app.highlight_line = true
-  if !new_buffer(app) { #panic("document allocation failed") }
-  defer release_buffers(app)
-  defer { if app.explorer.document != nil { _ = mem.arena_release(&app.explorer.arena) } }
-  cwd := #syscall(79, &app.directory[0], 4096)
-  if cwd <= 0 { #panic("working directory unavailable") }
-  app.directory_length = #cast(usize) cwd - 1
+  defer _ = mem.arena_release(&owned.arena)
+
+  // Fresh mappings are already zero. Pushing uninitialized memory and opting
+  // out of huge pages keeps untouched state (path buffers, caches, pools) off
+  // the resident set instead of faulting all of it in up front.
+  _ = #syscall(28, &owned.arena.data[0], #len(owned.arena.data), 15)
+  _ = #syscall(28, &scratch.arena.data[0], #len(scratch.arena.data), 15)
+  app := #cast(*App) mem.arena_push_uninit(&owned.arena, #sizeof(App), #alignof(App))
+  render_trace_open(app)
+  defer render_trace_close(app)
+  defer operations_release(app)
+
+  app.scratch = &scratch.arena
+  app.running = true
+  app.view.popup_width = 0.64
+  app.view.popup_height = 0.56
+  app.view.line_numbers = true
+  app.view.relative_numbers = true
+  app.view.status_line = true
+  app.view.highlight_line = true
+
+  if !new_buffer(app) {
+    #panic("document allocation failed")
+  }
+
+  // Keep conditional cleanup in helpers: repeating its guards in every unwind
+  // path makes current Dyn codegen spend tens of seconds compiling main.
+  defer release_editor_state(app)
+  defer replace_release(app)
+
+  cwd := #syscall(79, &app.directory_state.path[0], 4096)
+  if cwd <= 0 {
+    #panic("working directory unavailable")
+  }
+
+  app.directory_state.length = #cast(usize) cwd - 1
+  app.workspace.project_length = copy_text(app.workspace.project[..], app.directory_state.path[..app.directory_state.length])
+  config_location(app)
+  language_root(app)
+
   arguments := process.arguments(&scratch.arena)
-  if !arguments.ok { #panic("arguments unavailable") }
-  if #len(arguments.values) > 1 && #len(arguments.values[1]) > 0 { open_file(app, arguments.values[1]) }
-  if !sdl.init(32) { #panic("SDL video init failed") }
+  if !arguments.ok {
+    #panic("arguments unavailable")
+  }
+  // --tui and --gui choose the frontend for this launch; the first other
+  // argument is the file to open.
+  flag_frontend: u8 = 0
+  for index in 1..#len(arguments.values) {
+    argument := arguments.values[index]
+    if buffer.equal(argument, "--tui") {
+      flag_frontend = 2
+    }
+    else if buffer.equal(argument, "--gui") {
+      flag_frontend = 1
+    }
+    else if #len(argument) > 0 && app.documents.file.length == 0 {
+      open_file(app, argument)
+    }
+  }
+  terminal := frontend_choose(app, flag_frontend)
+  if terminal && !sdl.tui_start() {
+    #panic("--tui needs a terminal on stdin and stdout")
+  }
+  defer sdl.tui_stop()
+  // The terminal frontend still uses SDL's event queue for worker wake-ups.
+  sdl_flags: u32 = 32
+  if terminal {
+    sdl_flags = 16384
+  }
+  if !sdl.init(sdl_flags) {
+    #panic("SDL init failed")
+  }
   defer sdl.quit()
-  title: [64]u8 = [] encoded_title := c.string_from_bytes(title[..], "DNA")
-  if !encoded_title.ok { #panic("title capacity") }
+
+  notifications := notifications_start() != 0
+  app.configuration.notifications = notifications
+  defer notifications_stop()
+
+  title: [64]u8 = []
+  encoded_title := c.string_from_bytes(title[..], "DNA")
+  if !encoded_title.ok {
+    #panic("title capacity")
+  }
+
   window := sdl.create_window(encoded_title.value, 1100, 760, 8224)
-  if window == nil { #panic("window creation failed") }
+  if window == nil {
+    #panic("window creation failed")
+  }
   defer sdl.destroy_window(window)
+
   renderer := sdl.create_renderer(window, nil)
-  if renderer == nil { #panic("renderer creation failed") }
+  if renderer == nil {
+    #panic("renderer creation failed")
+  }
   defer sdl.destroy_renderer(renderer)
-  if !ttf.init() { #panic("font init failed") }
+  // Frames land on the display's refresh, evenly spaced and without tearing.
+  // DNA_VSYNC=0 opts out (timer pacing from the display refresh instead).
+  vsync_storage: [8]u8 = []
+  vsync_setting := process.environment("DNA_VSYNC", vsync_storage[..])
+  if !(vsync_setting.ok && vsync_setting.found && buffer.equal(vsync_setting.value, "0")) {
+    // Probe support, then start with immediate presentation; draw() turns
+    // vsync on only while something animates.
+    app.view.vsync_supported = sdl.render_vsync(renderer, 1) && sdl.render_vsync(renderer, 0)
+  }
+  display_refresh(app, window)
+
+  defer release_popup(app)
+
+  if !ttf.init() {
+    #panic("font init failed")
+  }
   defer ttf.quit()
+
   font_path: [4096]u8 = []
   configured := process.environment("DNA_FONT", font_path[..4095])
-  if !configured.ok { #panic("DNA_FONT is too long or unavailable") }
-  if configured.found { font_path[#len(configured.value)] = 0 }
+  if !configured.ok {
+    #panic("DNA_FONT is too long or unavailable")
+  }
+  if configured.found {
+    font_path[#len(configured.value)] = 0
+  }
   else {
     default_font := c.string_from_bytes(font_path[..], "/usr/share/fonts/TTF/ZedMonoNerdFontMono-Regular.ttf")
-    if !default_font.ok { #panic("font path capacity") }
+    if !default_font.ok {
+      #panic("font path capacity")
+    }
   }
-  font := ttf.open(&font_path[0], 20.0)
+  font := ttf.open(&font_path[0], 16.0)
   if font == nil && !configured.found {
     fallback := c.string_from_bytes(font_path[..], "/usr/share/fonts/noto/NotoSansMono-Regular.ttf")
-    if fallback.ok { font = ttf.open(fallback.value, 20.0) }
+    if fallback.ok {
+      font = ttf.open(fallback.value, 16.0)
+    }
   }
-  if font == nil { #panic("font unavailable: set DNA_FONT to a font file") }
+  if font == nil && !configured.found && default_system_font(&font_path[0], 4096) != 0 {
+    font = ttf.open(&font_path[0], 16.0)
+  }
+  if font == nil {
+    #panic("font unavailable: set DNA_FONT to a font file")
+  }
+  app.fonts.original_font_length = copy_text(app.fonts.original_font_path[..], font_path[..c.string_length(&font_path[0], 4096)])
+  app.fonts.active_font_length = copy_text(app.fonts.active_font_path[..], app.fonts.original_font_path[..app.fonts.original_font_length])
   defer ttf.close(font)
-  engine := ttf.engine(renderer) if engine == nil { #panic("text engine failed") }
+  engine := ttf.engine(renderer)
+  if engine == nil {
+    #panic("text engine failed")
+  }
   defer ttf.destroy_engine(engine)
 
-  document := ttf.create(engine, font, &app.document.bytes[0], app.document.length)
-  if document == nil { #panic("document text failed") }
+  document := ttf.create(engine, font, &app.documents.current.bytes[0], app.documents.current.length)
+  if document == nil {
+    #panic("document text failed")
+  }
   defer ttf.destroy(document)
   empty: [1]u8 = [0]
   palette := ttf.create(engine, font, &empty[0], 0)
-  if palette == nil { #panic("palette text failed") }
+  if palette == nil {
+    #panic("palette text failed")
+  }
   defer ttf.destroy(palette)
-  if !ttf.whitespace_visible(document, true) || !ttf.wrap(document, 0) || !ttf.color(document, 205, 214, 224, 255) || !ttf.color(palette, 218, 228, 235, 255) { #panic("text style failed") }
+  if !ttf.whitespace_visible(document, true) || !ttf.wrap(document, 0) || !tint(document, theme().text) || !tint(palette, theme().text) {
+    #panic("text style failed")
+  }
   chrome := ttf.create(engine, font, &empty[0], 0)
-  if chrome == nil { #panic("chrome text failed") }
+  if chrome == nil {
+    #panic("chrome text failed")
+  }
   defer ttf.destroy(chrome)
   directory_text := ttf.create(engine, font, &empty[0], 0)
-  if directory_text == nil || !ttf.whitespace_visible(directory_text, true) || !ttf.wrap(directory_text, 0) || !ttf.color(directory_text, 205, 214, 224, 255) { #panic("explorer text failed") }
-  defer ttf.destroy(directory_text)
-  typography := Typography{directory_text: directory_text, chrome: chrome,font: font, document: document, palette: palette, points: 20.0, scale: sdl.display_scale(window)}
-  if typography.scale <= 0.0 { typography.scale = 1.0 }
-  resize_font(&typography)
-  environment: [16]u8 = [] smoke := process.environment("DYN_EDITOR_SMOKE", environment[..])
-  input_storage: [64]u8 = []
-  if smoke.ok && smoke.found {
-    if #sizeof(sdl.Event) != 128 || #sizeof(sdl.KeyEvent) != 40 || #sizeof(sdl.TextEvent) != 32 || #sizeof(ttf.Substring) != 36 { #panic("unexpected ABI") }
-    whitespace_smoke(app, &typography)
-    workflow_smoke(app, &typography)
-    completion_smoke(app, &typography)
-    session_smoke(app, &typography)
-    explorer_smoke(app, &typography)
-    if app.explorer.document != nil { app.panel = Panel.Directory draw(renderer, window, app, &typography) }
-    palette_smoke(app)
-    panel(app, Panel.Commands) text_input(app, "write")
-    draw(renderer, window, app, &typography)
-    palette_updates := typography.palette_updates
-    draw(renderer, window, app, &typography)
-    if typography.palette_updates != palette_updates { #panic("unchanged palette text reshaped") }
-    text_input(app, " explorer") draw(renderer, window, app, &typography)
-    if typography.palette_updates != palette_updates + 1 { #panic("palette rendering cache invalidation") }
-    app.panel = Panel.None
-    _ = buffer.load(app.document, "one\ntwo\nthree\n") app.file.length = 0 app.panel = Panel.None
-    queue_key(105, 0)
-    simulated := sdl.Event{} incoming := #cast(*sdl.TextEvent) &simulated incoming.kind = 771
-    input_text := c.string_from_bytes(input_storage[..], "aé中") incoming.text = input_text.value
-    if !sdl.push(&simulated) { #panic("queue text failed") }
-    queue_key(8, 0) queue_key(13, 0) queue_key(27, 0)
-    queue_key(117, 0) queue_key(117, 1)
-    queue_key(32, 0) queue_key(27, 0)
-    queue_key(113, 64) queue_key(100, 0)
+  if directory_text == nil || !ttf.whitespace_visible(directory_text, true) || !ttf.wrap(directory_text, 0) || !tint(directory_text, theme().text) {
+    #panic("explorer text failed")
   }
+  defer ttf.destroy(directory_text)
+  caret_text := ttf.create(engine, font, &empty[0], 0)
+  if caret_text == nil || !ttf.whitespace_visible(caret_text, true) || !ttf.wrap(caret_text, 0) {
+    #panic("caret text")
+  }
+  defer ttf.destroy(caret_text)
+  preview_text := ttf.create(engine, font, &empty[0], 0)
+  if preview_text == nil || !ttf.wrap(preview_text, 0) || !tint(preview_text, theme().text) {
+    #panic("preview text")
+  }
+  defer ttf.destroy(preview_text)
+  syntax_text := ttf.create(engine, font, &empty[0], 0)
+  if syntax_text == nil || !ttf.whitespace_visible(syntax_text, true) || !ttf.wrap(syntax_text, 0) {
+    #panic("syntax text")
+  }
+  defer ttf.destroy(syntax_text)
+  typography := Typography{primary_caret: caret_text, engine: engine, primary_document: document, syntax_text: syntax_text, original_font: font, preview_text: preview_text, caret_text: caret_text, directory_text: directory_text, chrome: chrome, font: font, document: document, palette: palette, points: 16.0, scale: sdl.display_scale(window)}
+  typography.observer = app
+  if typography.scale <= 0.0 {
+    typography.scale = 1.0
+  }
+  defer cleanup_config_fonts(&typography)
+  defer ui_cache_release(&typography)
+  defer release_terminals(app)
+  defer syntax_release(app)
+  defer lsp_release(app)
+  defer disk_release(app)
+  defer tree_release(app)
+  defer recovery_release(app)
+  defer plugin_release(app)
+  defer format_release(app)
+  defer project_search_release(app)
+  resize_font(&typography)
+  config_reload(app, &typography, true)
+  if terminal {
+    app.config.document_padding = 0.0
+  }
+  environment: [16]u8 = []
+  smoke := process.environment("DYN_EDITOR_SMOKE", environment[..])
+  input_storage: [64]u8 = []
+  reduced_storage: [16]u8 = []
+  reduced := process.environment("DNA_REDUCED_MOTION", reduced_storage[..])
+  if reduced.ok && reduced.found {
+    app.view.reduced_motion = buffer.equal(reduced.value, "1")
+  }
+  // Terminals cannot animate smoothly; everything snaps.
+  if terminal {
+    app.view.reduced_motion = true
+  }
+  if smoke.ok && smoke.found {
+    startup_probe(app, &typography, renderer, window, input_storage[..])
+  }
+  frontend_handoff_restore(app, &typography)
+  render_request(app, RenderStartup)
   draw(renderer, window, app, &typography)
-  event := sdl.Event{} receiving: bool = false
+  event := sdl.Event{}
+  receiving: bool = false
   for app.running {
-    wants_text := prompting(app) || (app.panel == Panel.None && app.insert) || (app.panel == Panel.Directory && app.explorer.insert)
+    background_tick(app, &typography)
+    if !app.running {
+      break
+    }
+
+    // Geometry changes must be presented before interpreting queued pointer input.
+    if (app.render_trace.pending & (RenderConfig | RenderMacro)) != 0 {
+      draw(renderer, window, app, &typography)
+    }
+
+    wants_text := wants_text_input(app)
     if wants_text != receiving {
-      if wants_text { if !sdl.start_text(window) { #panic("start input failed") } }
-      else { if !sdl.stop_text(window) { #panic("stop input failed") } }
+      if wants_text {
+        if !sdl.start_text(window) {
+          #panic("start input failed")
+        }
+      }
+      else {
+        if !sdl.stop_text(window) {
+          #panic("stop input failed")
+        }
+      }
       receiving = wants_text
     }
-    if !sdl.wait_timeout(&event, 500) {
-      recovery_index: usize = 0 for recovery_index < 16 {
-        slot := &app.slots[recovery_index]
-        if slot.document != nil && slot.document.revision != slot.recovery_revision {
-          slot.recovery_revision = slot.document.revision
-          error := files.snapshot(&slot.file, slot.document)
-          if #len(error) > 0 { notice(app, error) draw(renderer, window, app, &typography) }
-        }
-        recovery_index += 1
-      }
-      continue
+
+    wait_ms := editor_wait_ms(app, notifications)
+
+    if app.render_trace.enabled && wait_ms >= 100 {
+      render_trace_flush(&app.render_trace)
     }
+
+    wait_started := operation_begin(app)
+
+    event_ready := false
+
+    if app.render_trace.pending != 0 {
+      // Combine a worker update with already queued input, without delaying paint.
+      event_ready = sdl.poll(&event)
+      operation_wake(app, "pending_poll", 0, event_ready, wait_started)
+      if !event_ready {
+        draw(renderer, window, app, &typography)
+        continue
+      }
+    } else {
+      event_ready = sdl.wait_timeout(&event, wait_ms)
+      operation_wake(app, "wait", wait_ms, event_ready, wait_started)
+      if !event_ready {
+        if app.view.animation.active {
+          render_request(app, RenderAnimation)
+          draw(renderer, window, app, &typography)
+        }
+        continue
+      }
+    }
+    input_started := operation_begin(app)
     // Preserve event order, but draw once per bounded batch instead of once
     // for both key-down and its following text event. Bound prevents starvation.
-    processed: usize = 0 redraw: bool = false
+    processed: usize = 0
+    redraw: bool = false
+
     for true {
       kind := #cast(u32) (event.words[0] & 4294967295)
-      if kind == 256 || kind == 528 { action(app, &typography, 16) }
-      else if kind == 768 { key := #cast(*const sdl.KeyEvent) &event key_input(app, &typography, key.key, key.modifiers) }
-      else if kind == 771 {
+      if app.render_trace.enabled {
+        app.render_trace.events += 1
+        app.render_trace.last_event = kind
+      }
+      if kind >= 1024 && kind <= 1026 && app.render_trace.pending != 0 {
+        draw(renderer, window, app, &typography)
+      }
+      if kind == 256 || kind == 528 {
+        action(app, &typography, 16)
+      } else if kind == 768 {
+        key := #cast(*const sdl.KeyEvent) &event
+        if app.composition.length > 0 {
+          if key.key == KeyEscape {
+            _ = sdl.clear_composition(window)
+            app.composition.length = 0
+            redraw = true
+            render_request(app, RenderIme)
+          }
+        } else if !(key.repeated && (key.key == KeyEscape || (key.key == KeyX && (key.modifiers & ModCtrl) != 0 && !terminal_typing(app)))) {
+          app.input_state.character = sdl.key_from_scancode(key.scancode, key.modifiers, false)
+          key_input(app, &typography, key.key, key.modifiers)
+          app.input_state.character = 0
+          redraw = true
+          render_request(app, RenderKey)
+        }
+      } else if kind >= 1024 && kind <= 1026 {
+        had_hover := diagnostic_hover_visible(app)
+        mouse_event(renderer, window, app, &typography, &event, kind)
+        if kind == 1024 {
+          ui_cursor_update(app)
+        }
+        if kind != 1024 || app.pointer.dragging || had_hover || app.ui.redraw {
+          app.ui.redraw = false
+          redraw = true
+          render_request(app, RenderMouse)
+        }
+      } else if kind == 1027 {
+        if mouse_wheel(renderer, window, app, &event) {
+          redraw = true
+          render_request(app, RenderMouse)
+        }
+      } else if kind == sdl.PasteEvent {
+        // A whole bracketed paste from the terminal frontend.
+        paste_input(app, sdl.tui_paste())
+        sdl.tui_paste_clear()
+        redraw = true
+        render_request(app, RenderText)
+      } else if kind == 770 {
+        composition_update(app, #cast(*const sdl.EditingEvent) &event)
+      } else if kind == 771 {
         received := #cast(*const sdl.TextEvent) &event
         if received.text != nil {
           length := c.string_length(received.text, 65536)
-          if length < 65536 { text_input(app, received.text[..length]) } else { notice(app, "Text input exceeds capacity.") }
+          if length < 65536 {
+            text_input(app, received.text[..length])
+          } else {
+            notice(app, "Text input exceeds capacity.")
+          }
         }
       }
       if kind >= 512 && kind <= 540 {
+        // Moving to another monitor can change its refresh rate.
+        display_refresh(app, window)
         scale := sdl.display_scale(window)
-        if scale > 0.0 && scale != typography.scale { typography.scale = scale resize_font(&typography) }
+        if scale > 0.0 && scale != typography.scale {
+          typography.scale = scale
+          resize_font(&typography)
+        }
       }
-      if kind == 768 || kind == 771 || kind == 256 || (kind >= 512 && kind <= 540) { redraw = true }
-      input_now := prompting(app) || (app.panel == Panel.None && app.insert) || (app.panel == Panel.Directory && app.explorer.insert)
+      if kind == 770 {
+        redraw = true
+        render_request(app, RenderIme)
+      }
+      if kind == 771 {
+        redraw = true
+        render_request(app, RenderText)
+      }
+      if kind == 256 || (kind >= 512 && kind <= 540) {
+        redraw = true
+        render_request(app, RenderWindow)
+      }
+
+      input_now := wants_text_input(app)
       if input_now != receiving {
-        if input_now { if !sdl.start_text(window) { #panic("start input failed") } }
-        else { if !sdl.stop_text(window) { #panic("stop input failed") } }
+        if input_now {
+          if !sdl.start_text(window) {
+            #panic("start input failed")
+          }
+        }
+        else {
+          if !sdl.stop_text(window) {
+            #panic("stop input failed")
+          }
+        }
         receiving = input_now
       }
       processed += 1
-      if !app.running || processed >= 64 || !sdl.poll(&event) { break }
+
+      if !app.running || processed >= 64 || !sdl.poll(&event) {
+        break
+      }
     }
-    if redraw { draw(renderer, window, app, &typography) }
+    operation_end(app, "input", input_started)
+
+    if (redraw || app.render_trace.pending != 0) && app.running {
+      draw(renderer, window, app, &typography)
+    }
   }
-  if !buffer.dirty(app.document) { files.discard_recovery(app.file) }
+
+  if !buffer.dirty_cached(app.documents.current) {
+    files.discard_recovery(app.documents.file)
+  }
+
   if smoke.ok && smoke.found {
-    if !buffer.equal(app.document.bytes[..app.document.length], "one\ntwo\nthree\n") || app.insert { #panic("editing smoke failed") }
+    finish_probe(app)
   }
 }

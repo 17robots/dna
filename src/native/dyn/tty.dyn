@@ -1,0 +1,224 @@
+// Linux/glibc terminal ownership. Signal handlers use only lock-free atomics
+// and async-signal-safe libc operations; layouts match the native ABI probe.
+struct TtyTermios { input, output, control, local: u32, line: u8, characters: [32]u8, input_speed, output_speed: u32 }
+struct TtySignalAction { handler: *fn(i32), mask: [16]u64, flags: i32, restore: *fn() }
+struct TtySize { rows, columns, width, height: u16 }
+extern fn tty_getattr "tcgetattr"(fd: i32, value: *TtyTermios) i32
+extern fn tty_setattr "tcsetattr"(fd: i32, action: i32, value: *const TtyTermios) i32
+extern fn tty_isatty "isatty"(fd: i32) i32
+extern fn tty_atexit "atexit"(handler: *fn()) i32
+extern fn tty_signal "signal"(number: i32, handler: *fn(i32)) rawptr
+extern fn tty_sigaction "sigaction"(number: i32, action: *const TtySignalAction, old: rawptr) i32
+extern fn tty_raise "raise"(number: i32) i32
+extern fn tty_ioctl "ioctl"(fd: i32, request: u64, output: rawptr) i32
+extern fn tty_setenv "setenv"(key: *const u8, value: *const u8, overwrite: i32) i32
+extern fn tty_execv "execv"(path: *const u8, arguments: **const u8) i32
+
+tty_saved: TtyTermios = TtyTermios{}
+tty_active: native_atomic.AtomicU32 = native_atomic.AtomicU32{}
+tty_resize_pending: native_atomic.AtomicU32 = native_atomic.AtomicU32{}
+tty_input: i32 = 0
+tty_output: i32 = 0
+tty_wake_descriptor: i32 = 0
+tty_registered: bool = false
+tty_handoff_flag: [8]u8 = []
+tty_handoff_session: [4096]u8 = []
+tty_command_line: [65536]u8 = []
+
+fn tty_write_all(bytes: *const u8, length: usize) {
+  offset: usize = 0
+  for offset < length {
+    written := rec_write(tty_output, &bytes[..length][offset], length - offset)
+    if written < 0 && rec_errno().* == 4 {
+      continue
+    }
+    if written <= 0 {
+      return
+    }
+    offset += #cast(usize) written
+  }
+}
+pub fn dna_tty_leave() {
+  if native_atomic.exchange_u32(&tty_active, 0) == 0 {
+    return
+  }
+  sequence: []const u8 = "\x1b[<u\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[0 q\x1b[0m\x1b[?25h\x1b[?1049l"
+  tty_write_all(&sequence[0], #len(sequence))
+  _ = tty_setattr(tty_input, 2, &tty_saved)
+}
+fn tty_exit_handler() {
+  dna_tty_leave()
+}
+fn tty_fatal(number: i32) {
+  dna_tty_leave()
+  _ = tty_signal(number, nil)
+  _ = tty_raise(number)
+}
+fn tty_resize(number: i32) {
+  _ = number
+  native_atomic.store_u32(&tty_resize_pending, 1)
+}
+pub fn dna_tty_enter() i32 {
+  native_initialize()
+  if native_atomic.load_u32(&tty_active) != 0 {
+    return 1
+  }
+  tty_input = 0
+  tty_output = 1
+  if tty_isatty(tty_input) == 0 || tty_isatty(tty_output) == 0 || tty_getattr(tty_input, &tty_saved) != 0 {
+    return 0
+  }
+  raw := tty_saved
+  raw.input &= ~#cast(u32) 1330 // BRKINT | ICRNL | INPCK | ISTRIP | IXON
+  raw.output &= ~#cast(u32) 1
+  raw.control |= 48
+  raw.local &= ~#cast(u32) 32779 // ECHO | ICANON | IEXTEN | ISIG
+  raw.characters[6] = 0
+  raw.characters[5] = 0
+  if tty_setattr(tty_input, 2, &raw) != 0 {
+    return 0
+  }
+  native_atomic.store_u32(&tty_active, 1)
+  if tty_wake_descriptor < 0 {
+    tty_wake_descriptor = notify_eventfd(0, 526336)
+  }
+  if !tty_registered {
+    tty_registered = true
+    _ = tty_atexit(&tty_exit_handler)
+    fatal: [8]i32 = [15, 1, 3, 11, 7, 6, 8, 4]
+    for number in fatal {
+      _ = tty_signal(number, &tty_fatal)
+    }
+    action := TtySignalAction{handler: &tty_resize}
+    _ = tty_sigaction(28, &action, nil)
+  }
+  sequence: []const u8 = "\x1b[?1049h\x1b[?25l\x1b[?2004h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[>1u"
+  tty_write_all(&sequence[0], #len(sequence))
+  return 1
+}
+pub fn dna_tty_size(columns: *i32, rows: *i32) i32 {
+  native_initialize()
+  size := TtySize{}
+  fd := tty_output
+  if fd < 0 {
+    fd = 1
+  }
+  if tty_ioctl(fd, 21523, #cast(rawptr) &size) != 0 || size.columns == 0 || size.rows == 0 {
+    return 0
+  }
+  columns.* = #cast(i32) size.columns
+  rows.* = #cast(i32) size.rows
+  return 1
+}
+pub fn dna_tty_resized() i32 {
+  if native_atomic.exchange_u32(&tty_resize_pending, 0) != 0 {
+    return 1
+  }
+  return 0
+}
+pub fn dna_tty_read(buffer: *u8, capacity: i32, timeout: i32) i32 {
+  native_initialize()
+  targets: [2]PollDescriptor = [PollDescriptor{fd: tty_input, events: 1}, PollDescriptor{fd: tty_wake_descriptor, events: 1}]
+  count: usize = 1
+  if tty_wake_descriptor >= 0 {
+    count = 2
+  }
+  if proc_poll(&targets[0], count, timeout) <= 0 {
+    return 0
+  }
+  if tty_wake_descriptor >= 0 && (targets[1].returned & 1) != 0 {
+    drained: u64 = 0
+    for proc_read_raw(tty_wake_descriptor, #cast(*u8) &drained, 8) > 0 {}
+    if (targets[0].returned & 1) == 0 {
+      return -2
+    }
+  }
+  if (targets[0].returned & 24) != 0 {
+    return -1
+  }
+  received := proc_read_raw(tty_input, buffer, #cast(usize) capacity)
+  if received < 0 {
+    if rec_errno().* == 4 || rec_errno().* == 11 {
+      return 0
+    }
+    return -1
+  }
+  if received == 0 {
+    return -1
+  }
+  return #cast(i32) received
+}
+pub fn dna_tty_write(bytes: *const u8, length: usize) {
+  native_initialize()
+  if tty_output >= 0 {
+    tty_write_all(bytes, length)
+  }
+}
+pub fn dna_handoff_run() {
+  if tty_handoff_flag[0] == 0 {
+    return
+  }
+  arguments: [256]*const u8 = []
+  count: usize = 0
+  length: isize = 0
+  command: []const u8 = "/proc/self/cmdline\0"
+  descriptor := rec_open(&command[0], 524288, 0)
+  if descriptor >= 0 {
+    length = proc_read_raw(descriptor, &tty_command_line[0], 65535)
+    _ = rec_close(descriptor)
+  }
+  at: usize = 0
+  for length > 0 && at < #cast(usize) length && count < 250 {
+    argument := &tty_command_line[at]
+    at += string_length(argument) + 1
+    if count == 0 || (argument[..2][0] == 45 && argument[..2][1] == 45 && !install_equal(argument, "--tui") && !install_equal(argument, "--gui")) {
+      arguments[count] = argument
+      count += 1
+    }
+  }
+  fallback: []const u8 = "dna\0"
+  if count == 0 {
+    arguments[count] = &fallback[0]
+    count += 1
+  }
+  arguments[count] = &tty_handoff_flag[0]
+  count += 1
+  arguments[count] = nil
+  variable: []const u8 = "DNA_HANDOFF\0"
+  executable: []const u8 = "/proc/self/exe\0"
+  _ = tty_setenv(&variable[0], &tty_handoff_session[0], 1)
+  _ = tty_execv(&executable[0], &arguments[0])
+  failed: []const u8 = "dna: frontend switch failed; :session-restore the file named by DNA_HANDOFF\n"
+  _ = rec_write(2, &failed[0], #len(failed))
+}
+pub fn dna_handoff_arm(flag: *const u8, session: *const u8) i32 {
+  flag_length := string_length(flag)
+  session_length := string_length(session)
+  if flag_length >= 8 || session_length >= 4096 {
+    return 0
+  }
+  _ = copy(&tty_handoff_flag[0], flag, flag_length + 1)
+  _ = copy(&tty_handoff_session[0], session, session_length + 1)
+  return 1
+}
+pub fn dna_tty_wake() {
+  native_initialize()
+  if tty_wake_descriptor >= 0 {
+    one: u64 = 1
+    _ = rec_write(tty_wake_descriptor, #cast(*const u8) &one, 8)
+  }
+}
+pub fn dna_tui_alloc(size: usize) rawptr {
+  return #cast(rawptr) rec_malloc(size)
+}
+pub fn dna_tui_free(pointer: rawptr) {
+  rec_free(pointer)
+}
+pub fn dna_tty_suspend() i32 {
+  if native_atomic.load_u32(&tty_active) == 0 {
+    return 0
+  }
+  dna_tty_leave()
+  _ = tty_raise(20)
+  return dna_tty_enter()
+}

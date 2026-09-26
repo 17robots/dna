@@ -1,0 +1,377 @@
+// Messages, confirmations, prompts and plain result lists, built with the
+// immediate-mode UI. The body is the same text the keyboard hints describe;
+// dialogs with choices also get clickable buttons that press the same keys.
+
+struct DialogButton { label: []const u8, key: u32 }
+
+fn dialog_button(app: *const App, index: usize) DialogButton {
+  panel := app.prompt_state.panel
+  if panel == Panel.Quit {
+    if index == 0 {
+      return DialogButton{label: "Save", key: 115}
+    }
+    if index == 1 {
+      return DialogButton{label: "Discard", key: 100}
+    }
+    if index == 2 {
+      return DialogButton{label: "Cancel", key: 99}
+    }
+  }
+  else if panel == Panel.FileConflict {
+    if index == 0 {
+      return DialogButton{label: "Reload", key: 114}
+    }
+    if index == 1 {
+      return DialogButton{label: "Save as", key: 115}
+    }
+    if index == 2 {
+      return DialogButton{label: "Keep edits", key: 107}
+    }
+  }
+  else if panel == Panel.TerminalClose {
+    if index == 0 {
+      return DialogButton{label: "Terminate", key: 13}
+    }
+    if index == 1 {
+      return DialogButton{label: "Cancel", key: 99}
+    }
+  }
+  else if panel == Panel.DirectoryDiscard {
+    if index == 0 {
+      return DialogButton{label: "Discard", key: 100}
+    }
+    if index == 1 {
+      return DialogButton{label: "Keep", key: 27}
+    }
+  }
+  else if panel == Panel.DirectoryApply || panel == Panel.LspEdit || panel == Panel.PluginEdit {
+    if index == 0 {
+      return DialogButton{label: "Apply", key: 13}
+    }
+    if index == 1 {
+      return DialogButton{label: "Cancel", key: 27}
+    }
+  }
+  else if panel == Panel.Trash {
+    if index == 0 {
+      return DialogButton{label: "Move to trash", key: 13}
+    }
+    if index == 1 {
+      return DialogButton{label: "Cancel", key: 27}
+    }
+  }
+  else if panel == Panel.PluginGrant {
+    if index == 0 {
+      return DialogButton{label: "Allow", key: 13}
+    }
+    if index == 1 {
+      return DialogButton{label: "Deny", key: 27}
+    }
+  }
+  else if panel == Panel.Message {
+    if app.prompt_state.selected == 15 {
+      if index == 0 {
+        return DialogButton{label: "Discard", key: 100}
+      }
+      if index == 1 {
+        return DialogButton{label: "Cancel", key: 27}
+      }
+    }
+    else if index == 0 {
+      return DialogButton{label: "OK", key: 13}
+    }
+  }
+  return DialogButton{label: "", key: 0}
+}
+fn dialog_button_count(app: *const App) usize {
+  count: usize = 0
+  for count < 4 && #len(dialog_button(app, count).label) > 0 {
+    count += 1
+  }
+  return count
+}
+// True for panels drawn by draw_dialog: everything without its own view.
+fn dialog_panel(app: *App) bool {
+  panel := app.prompt_state.panel
+  if panel == Panel.None || panel == Panel.Terminal || panel == Panel.Directory || panel == Panel.Hover || panel == Panel.Commands || panel == Panel.ReplacePreview || panel == Panel.ProjectSearch || panel == Panel.Open || panel == Panel.Buffers || key_menu_is(panel) {
+    return false
+  }
+  return !completion_visible(app)
+}
+// Line index of the "> " selection marker in list text, or none.
+fn dialog_marker_line(text: []const u8) usize {
+  line: usize = 0
+  at: usize = 0
+  for at + 1 < #len(text) {
+    if (at == 0 || text[at - 1] == 10) && text[at] == '>' && text[at + 1] == ' ' {
+      return line
+    }
+    if text[at] == 10 {
+      line += 1
+    }
+    at += 1
+  }
+  return 1000000
+}
+fn draw_dialog(renderer: rawptr, app: *App, typography: *Typography, width: i32, height: i32, status: f32) {
+  ui := &app.ui
+  ui_panel_begin(ui, typography)
+  scale := typography.scale
+  line := typography.line
+  compact := search_prompt(app.prompt_state.panel)
+  padding := app.config.document_padding * scale
+  if compact {
+    padding = app.config.popup_padding * scale
+  }
+  box_width := #cast(f32) width * app.view.popup_width
+  minimum := 520.0 * scale
+  if box_width < minimum {
+    box_width = minimum
+  }
+  if box_width > #cast(f32) width {
+    box_width = #cast(f32) width
+  }
+  // Placement may set the width first; text wraps to it.
+  box_width = place_rect(app, SurfaceDialog, width, height, status, scale, sdl.Rect{width: box_width, height: #cast(f32) height * 0.5}).width
+  labels: [16384]u8 = []
+  count := popup_text(app, labels[..])
+  wrap := #cast(i32) (box_width - padding * 2.0)
+  if wrap < 1 {
+    wrap = 1
+  }
+  if !buffer.equal(labels[..count], typography.palette_bytes[..typography.palette_length]) {
+    if !ttf.set(typography.palette, &labels[0], count) {
+      #panic("popup text update failed")
+    }
+    typography.palette_length = copy_text(typography.palette_bytes[..], labels[..count])
+    typography.palette_updates += 1
+  }
+  if typography.palette_wrap != wrap {
+    if !ttf.wrap(typography.palette, wrap) {
+      #panic("popup wrap failed")
+    }
+    typography.palette_wrap = wrap
+  }
+  text_width: i32 = 0
+  text_height: i32 = 0
+  if !ttf.size(typography.palette, &text_width, &text_height) {
+    #panic("popup measure failed")
+  }
+  buttons := dialog_button_count(app)
+  button_row: f32 = 0.0
+  if buttons > 0 {
+    button_row = line + 14.0 * scale
+  }
+  // Fit the content; long bodies stop at popup_height of the window and scroll.
+  limit := app.view.popup_height
+  if limit < 0.2 {
+    limit = 0.2
+  }
+  box_height := #cast(f32) text_height + padding * 2.0 + button_row
+  if box_height > #cast(f32) height * limit {
+    box_height = #cast(f32) height * limit
+  }
+  x := (#cast(f32) width - box_width) / 2.0
+  y := (#cast(f32) height - box_height) / 2.0
+  if compact {
+    y = #cast(f32) height - status - box_height - 12.0 * scale
+    if y < 0.0 {
+      y = 0.0
+    }
+  }
+  placed := place_rect(app, SurfaceDialog, width, height, status, scale, sdl.Rect{x: x, y: y, width: box_width, height: box_height})
+  x = placed.x
+  y = placed.y
+  box_height = placed.height
+  // Compact prompts rise from the status line; dialogs drop in from above.
+  opening := !dialog_panel_was(app)
+  if opening {
+    ui.dialog_focus_set = false
+    start := -10.0 * scale
+    if compact {
+      start = 10.0 * scale
+    }
+    motion.snap(&ui.dialog_open, start)
+  }
+  shift := animated_value(app, &ui.dialog_open, 0.0, app.config.popup_animation_ms * 2.0, false)
+  frame := ui_make(ui, ui_hash(0, "dialog"), UiFloating | UiBackground | UiBorder | UiClip)
+  ui.boxes[frame].floating[0] = x
+  ui.boxes[frame].floating[1] = y + shift
+  ui.boxes[frame].fill = theme().surface
+  ui.boxes[frame].padding[0] = padding
+  ui.boxes[frame].padding[1] = padding
+  ui_size(ui, frame, UiAxisX, UiSizeKind.Pixels, box_width / scale, 1.0)
+  ui_size(ui, frame, UiAxisY, UiSizeKind.Pixels, box_height / scale, 1.0)
+  ui_push(ui, frame)
+  content := ui_make(ui, ui_key(ui, "content"), UiClip | UiScroll)
+  ui_size(ui, content, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
+  ui_size(ui, content, UiAxisY, UiSizeKind.Percent, 1.0, 0.0)
+  if buttons > 0 {
+    gap := ui_make(ui, ui_key(ui, "gap"), 0)
+    ui_size(ui, gap, UiAxisY, UiSizeKind.Pixels, 8.0, 1.0)
+    row := ui_make(ui, ui_key(ui, "buttons"), 0)
+    ui.boxes[row].axis = UiAxisX
+    ui_size(ui, row, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
+    ui_push(ui, row)
+    push_right := ui_make(ui, ui_key(ui, "push right"), 0)
+    ui_size(ui, push_right, UiAxisX, UiSizeKind.Percent, 1.0, 0.0)
+    for index in 0..buttons {
+      choice := dialog_button(app, index)
+      if index > 0 {
+        space := ui_make(ui, ui_hash_number(ui.boxes[row].key, 100 + index), 0)
+        ui_size(ui, space, UiAxisX, UiSizeKind.Pixels, 8.0, 1.0)
+      }
+      button := ui_make(ui, ui_hash(ui.boxes[row].key, choice.label), UiClickable | UiHover | UiBorder | UiBackground | UiText)
+      ui_text_set(ui, button, choice.label)
+      ui.boxes[button].fill = theme().line
+      ui.boxes[button].value = index
+      ui.boxes[button].padding[0] = typography.cell * 1.5
+      ui.boxes[button].padding[1] = 3.0 * scale
+      ui_size(ui, button, UiAxisX, UiSizeKind.Text, 0.0, 1.0)
+      ui_size(ui, button, UiAxisY, UiSizeKind.Text, 0.0, 1.0)
+      ui_animate(app, ui, button, index == dialog_focused(app))
+    }
+    ui_pop(ui)
+  }
+  ui_pop(ui)
+  // Long bodies scroll with the wheel; list selections stay visible.
+  scrolled := &ui.boxes[content]
+  view := box_height - padding * 2.0 - button_row
+  maximum := #cast(f32) text_height - view
+  if maximum < 0.0 {
+    maximum = 0.0
+  }
+  new_text := ui.dialog_text != preview_hash("", labels[..count])
+  if opening {
+    scrolled.scroll_target = 0.0
+  }
+  marker := dialog_marker_line(labels[..count])
+  if marker != 1000000 && new_text {
+    top := #cast(f32) marker * line
+    if top < scrolled.scroll_target {
+      scrolled.scroll_target = top
+    }
+    if top + line > scrolled.scroll_target + view {
+      scrolled.scroll_target = top + line - view
+    }
+  }
+  if ui.wheel != 0.0 {
+    scrolled.scroll_target -= ui.wheel * line * 3.0
+    ui.wheel = 0.0
+  }
+  if scrolled.scroll_target > maximum {
+    scrolled.scroll_target = maximum
+  }
+  if scrolled.scroll_target < 0.0 {
+    scrolled.scroll_target = 0.0
+  }
+  ui.dialog_text = preview_hash("", labels[..count])
+  _ = animated_follow(app, &scrolled.scroll, scrolled.scroll_target, app.config.scroll_animation_ms * 2.0, opening || !app.config.smooth_scroll)
+  scrolled.content = #cast(f32) text_height
+  ui_layout(ui)
+  ui_render(renderer, ui, typography, width, height)
+  area := scrolled.rect
+  clip := sdl.PixelRect{x: #cast(i32) area.x, y: #cast(i32) area.y, width: #cast(i32) area.width, height: #cast(i32) area.height}
+  if !sdl.clip(renderer, &clip) || !ttf.draw(typography.palette, area.x, area.y - scrolled.scroll.value) {
+    #panic("popup text failed")
+  }
+  if !sdl.clip(renderer, nil) {
+    #panic("clip reset failed")
+  }
+  ui.dialog_panel = app.prompt_state.panel
+  ui.dialog_seen = true
+}
+// Whether the previous frame already showed this dialog, so switching from
+// one dialog to another still animates.
+fn dialog_panel_was(app: *const App) bool {
+  return app.view.animation.panel == app.prompt_state.panel && app.ui.dialog_seen && app.ui.dialog_panel == app.prompt_state.panel
+}
+// Buttons press their key; a click outside the dialog cancels like Escape.
+fn dialog_mouse(app: *App, typography: *Typography, x: f32, y: f32, pressed: bool, moved: bool) {
+  ui := &app.ui
+  if moved {
+    ui_pointer(ui, x, y)
+    return
+  }
+  if !pressed {
+    return
+  }
+  hit := ui_hit(ui, x, y)
+  if hit != 0 {
+    choice := dialog_button(app, ui.boxes[hit].value)
+    if choice.key != 0 {
+      key_input(app, typography, choice.key, 0)
+    }
+    return
+  }
+  frame := ui_make_lookup(ui, ui_hash(0, "dialog"))
+  if frame == 0 || !ui_contains(ui.boxes[frame].rect, x, y) {
+    key_input(app, typography, KeyEscape, 0)
+  }
+}
+// Initial button focus: the safe choice where a button would discard work.
+fn dialog_default(app: *const App) usize {
+  panel := app.prompt_state.panel
+  if panel == Panel.Quit {
+    return 2
+  }
+  if panel == Panel.FileConflict {
+    return 2
+  }
+  if panel == Panel.DirectoryDiscard {
+    return 1
+  }
+  if panel == Panel.Message && app.prompt_state.selected == 15 {
+    return 1
+  }
+  return 0
+}
+fn dialog_focused(app: *App) usize {
+  ui := &app.ui
+  // Same-kind dialogs with different content (a notice, then a discard
+  // confirmation) each start from their own default.
+  identity := ui_hash(ui_hash_number(0, app.prompt_state.selected), app.prompt_state.message[..app.prompt_state.message_length])
+  if !ui.dialog_focus_set || ui.dialog_focus_panel != app.prompt_state.panel || ui.dialog_focus_identity != identity {
+    ui.dialog_focus_identity = identity
+    ui.dialog_focus = dialog_default(app)
+    ui.dialog_focus_panel = app.prompt_state.panel
+    ui.dialog_focus_set = true
+  }
+  count := dialog_button_count(app)
+  if count > 0 && ui.dialog_focus >= count {
+    ui.dialog_focus = count - 1
+  }
+  return ui.dialog_focus
+}
+// Tab/Shift+Tab move button focus; Enter presses the focused button.
+// Returns true when the key was used.
+fn dialog_key(app: *App, typography: *Typography, key: u32, modifiers: u16) bool {
+  if !dialog_panel(app) {
+    return false
+  }
+  count := dialog_button_count(app)
+  if count == 0 {
+    return false
+  }
+  focus := dialog_focused(app)
+  if key == KeyTab {
+    if (modifiers & ModShift) != 0 {
+      app.ui.dialog_focus = (focus + count - 1) % count
+    }
+    else {
+      app.ui.dialog_focus = (focus + 1) % count
+    }
+    return true
+  }
+  if key == KeyReturn {
+    choice := dialog_button(app, focus)
+    // Buttons that are Enter already fall through to the dialog's own handler.
+    if choice.key == KeyReturn || choice.key == 0 {
+      return false
+    }
+    app.ui.dialog_focus_set = false
+    key_input(app, typography, choice.key, 0)
+    return true
+  }
+  return false
+}

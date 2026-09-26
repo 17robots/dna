@@ -1,0 +1,297 @@
+// Decorative explorer context never becomes editable document text.
+struct ExplorerContext {
+  children: [64]Entry,
+  parent: [64]Entry,
+  preview: [8192]u8,
+  preview_path: [4096]u8,
+  preview_path_length: usize,
+  preview_revision: u64,
+  parent_count: usize,
+  parent_selected: usize,
+  child_count: usize,
+  preview_length: usize,
+  preview_row: usize,
+  preview_directory: bool,
+  preview_ready: bool,
+}
+
+fn explorer_entry_before(a: *const Entry, b: *const Entry) bool {
+  if a.directory != b.directory {
+    return a.directory
+  }
+  index: usize = 0
+  for index < a.length && index < b.length {
+    if a.name[index] != b.name[index] {
+      return a.name[index] < b.name[index]
+    }
+    index += 1
+  }
+  return a.length < b.length
+}
+fn explorer_sort(entries: []Entry) {
+  for index in 1..#len(entries) {
+    moving := entries[index]
+    position := index
+    for position > 0 && explorer_entry_before(&moving, &entries[position - 1]) {
+      entries[position] = entries[position - 1]
+      position -= 1
+    }
+    entries[position] = moving
+  }
+}
+fn explorer_context_list(path: []const u8, entries: []Entry) usize {
+  storage: [8192]u8 = []
+  opened := fs.open_directory(path, storage[..])
+  if !opened.ok {
+    return 0
+  }
+  defer _ = fs.close_directory(&opened.directory)
+  count: usize = 0
+  for count < #len(entries) {
+    entry := fs.directory_next(&opened.directory)
+    if !entry.ok {
+      break
+    }
+    if #len(entry.name) >= 512 || !valid_leaf(entry.name) || !utf8.valid(entry.name) {
+      continue
+    }
+    entries[count].length = copy_text(entries[count].name[..], entry.name)
+    entries[count].directory = entry.kind == 4
+    count += 1
+  }
+  explorer_sort(entries[..count])
+  return count
+}
+fn explorer_parent_length(path: []const u8) usize {
+  length := #len(path)
+  for length > 1 && path[length - 1] == 47 {
+    length -= 1
+  }
+  for length > 1 && path[length - 1] != 47 {
+    length -= 1
+  }
+  if length > 1 {
+    length -= 1
+  }
+  return length
+}
+fn explorer_context_reset(app: *App) {
+  context := &app.explorer.context
+  context.preview_ready = false
+  context.parent_count = 0
+  context.parent_selected = 64
+  if !app.config.explorer_columns {
+    return
+  }
+  path := app.explorer.path[..app.explorer.path_length]
+  if #len(path) <= 1 {
+    return
+  }
+  parent := explorer_parent_length(path)
+  context.parent_count = explorer_context_list(path[..parent], context.parent[..])
+  leaf := #len(path)
+  for leaf > 0 && path[leaf - 1] != 47 {
+    leaf -= 1
+  }
+  for index in 0..context.parent_count {
+    entry := &context.parent[index]
+    if buffer.equal(entry.name[..entry.length], path[leaf..]) {
+      context.parent_selected = index
+    }
+  }
+}
+fn explorer_context_preview(app: *App) {
+  context := &app.explorer.context
+  doc := app.explorer.document
+  row := buffer.row_at(doc, buffer.head(doc))
+  if context.preview_ready && context.preview_revision == doc.revision && context.preview_row == row {
+    return
+  }
+  context.preview_ready = true
+  context.preview_revision = doc.revision
+  context.preview_row = row
+  context.preview_length = 0
+  context.child_count = 0
+  context.preview_directory = false
+  context.preview_path_length = 0
+  if !app.config.explorer_preview {
+    return
+  }
+  at := buffer.row_start(doc, row)
+  id := buffer.row_id(doc, at)
+  if id == 0 || id > app.directory_state.count {
+    context.preview_length = copy_text(context.preview[..], "New entry — apply with :write")
+    return
+  }
+  entry := &app.directory_state.entries[id - 1]
+  storage: [4096]u8 = []
+  path := joined(app, entry.name[..entry.length], storage[..])
+  info := files.metadata(path)
+  if !info.ok {
+    context.preview_length = copy_text(context.preview[..], "Entry is no longer available")
+    return
+  }
+  if (info.mode & 61440) == 16384 {
+    context.preview_directory = true
+    context.child_count = explorer_context_list(path, context.children[..])
+    return
+  }
+  if (info.mode & 61440) != 32768 {
+    context.preview_length = copy_text(context.preview[..], "No preview for symlinks or special files")
+    return
+  }
+  // Opening a raced-in FIFO must not block rendering; never follow a symlink.
+  descriptor := #syscall(257, -100, &storage[0], 657408, 0)
+  if descriptor < 0 {
+    context.preview_length = copy_text(context.preview[..], "Cannot read file")
+    return
+  }
+  opened := fs.adopt_handle(descriptor)
+  defer _ = fs.close(&opened)
+  actual := fs.file_metadata(&opened)
+  if !actual.ok || (actual.mode & 61440) != 32768 {
+    context.preview_length = copy_text(context.preview[..], "No preview for special files")
+    return
+  }
+  read := fs.read(&opened, context.preview[..8191])
+  if !read.ok {
+    return
+  }
+  length := read.transferred
+  // A bounded prefix may end inside a UTF-8 codepoint.
+  for length > 0 && !utf8.valid(context.preview[..length]) && read.transferred - length < 4 {
+    length -= 1
+  }
+  if !buffer.valid(context.preview[..length]) {
+    context.preview_length = copy_text(context.preview[..], "Binary or unsupported text")
+    return
+  }
+  context.preview[length] = 0
+  context.preview_length = length
+  context.preview_path_length = copy_text(context.preview_path[..], path)
+}
+fn explorer_parent(app: *App) {
+  if explorer_dirty(app) {
+    notice(app, "Apply or discard staged edits before changing directory.")
+    return
+  }
+  previous: [4096]u8 = []
+  old_length := copy_text(previous[..], app.directory_state.path[..app.directory_state.length])
+  leaf := old_length
+  for leaf > 1 && previous[leaf - 1] == 47 {
+    leaf -= 1
+  }
+  end := leaf
+  for leaf > 0 && previous[leaf - 1] != 47 {
+    leaf -= 1
+  }
+  app.directory_state.length = explorer_parent_length(previous[..old_length])
+  app.directory_state.path[app.directory_state.length] = 0
+  directory_refresh(app)
+  if app.prompt_state.panel != Panel.Directory {
+    return
+  }
+  for index in 0..app.directory_state.count {
+    entry := &app.directory_state.entries[index]
+    if buffer.equal(entry.name[..entry.length], previous[leaf..end]) {
+      app.directory_state.selected = index
+      buffer.move_to(app.explorer.document, buffer.row_start(app.explorer.document, index), false)
+      break
+    }
+  }
+}
+// Small native shapes work with any font; no Nerd Font/private-use glyph needed.
+fn explorer_icon(renderer: rawptr, typography: *Typography, name: []const u8, directory: bool, x: f32, y: f32) {
+  unit := typography.cell * 0.12
+  size := typography.cell * 1.25
+  color := theme().muted
+  if directory {
+    color = theme().syntax_type
+  }
+  else if explorer_suffix(name, ".dyn") || explorer_suffix(name, ".rs") || explorer_suffix(name, ".c") || explorer_suffix(name, ".py") || explorer_suffix(name, ".js") {
+    color = theme().syntax_function
+  }
+  else if explorer_suffix(name, ".json") || explorer_suffix(name, ".toml") || explorer_suffix(name, ".yaml") {
+    color = theme().syntax_constant
+  }
+  else if explorer_suffix(name, ".md") || explorer_suffix(name, ".txt") {
+    color = theme().syntax_string
+  }
+  top := y + (typography.line - size) * 0.5
+  outer := sdl.Rect{x: x, y: top, width: size * 0.8, height: size}
+  if directory {
+    outer.y += size * 0.25
+    outer.width = size
+    outer.height = size * 0.65
+  }
+  if !paint(renderer, color) || !sdl.fill(renderer, &outer) {
+    #panic("explorer icon")
+  }
+  if directory {
+    tab := sdl.Rect{x: x, y: top + size * 0.1, width: size * 0.45, height: size * 0.25}
+    if !sdl.fill(renderer, &tab) {
+      #panic("folder tab")
+    }
+  } else {
+    inner := sdl.Rect{x: outer.x + unit, y: outer.y + unit, width: outer.width - unit * 2.0, height: outer.height - unit * 2.0}
+    if !paint(renderer, theme().surface) || !sdl.fill(renderer, &inner) {
+      #panic("file icon inset")
+    }
+    stroke := sdl.Rect{x: x + unit * 2.0, y: top + size * 0.4, width: size * 0.35, height: unit}
+    if !paint(renderer, color) || !sdl.fill(renderer, &stroke) {
+      #panic("file icon line")
+    }
+    stroke.y += unit * 2.0
+    if !sdl.fill(renderer, &stroke) {
+      #panic("file icon line")
+    }
+  }
+}
+
+fn explorer_preview_text(app: *App, typography: *Typography, bytes: []const u8, path: []const u8, x: f32, y: f32, height: f32) {
+  rows := #cast(usize) (height / typography.line)
+  visible: usize = 0
+  lines: usize = 0
+  for visible < #len(bytes) && lines < rows {
+    if bytes[visible] == 10 {
+      lines += 1
+    }
+    visible += 1
+  }
+  shown := bytes[..visible]
+  if #len(shown) == 0 {
+    return
+  }
+  if typography.explorer_preview == nil {
+    blank: [1]u8 = [0]
+    typography.explorer_preview = ttf.create(typography.engine, typography.font, &blank[0], 0)
+    if typography.explorer_preview == nil || !ttf.wrap(typography.explorer_preview, 0) {
+      #panic("explorer preview text")
+    }
+    typography.explorer_preview_hash = 0
+  }
+  hash := preview_hash("", shown)
+  if typography.explorer_preview_hash != hash {
+    if !ttf.set(typography.explorer_preview, &shown[0], #len(shown)) {
+      #panic("explorer preview update")
+    }
+    typography.explorer_preview_hash = hash
+  }
+  colors: []const u8 = shown[..0]
+  if #len(path) > 0 {
+    colors = preview_request(app, &app.previews.explorer, preview_path_key(path), path, false, shown)
+  }
+  preview_spans_update(typography, &typography.explorer_spans, typography.explorer_preview, shown, colors)
+  base := theme().muted
+  if #len(path) > 0 {
+    base = theme().text
+  }
+  if !tint(typography.explorer_preview, base) || !ttf.draw(typography.explorer_preview, x, y) {
+    #panic("explorer preview draw")
+  }
+  preview_spans_draw(&typography.explorer_spans, x, y)
+}
+
+fn explorer_suffix(name: []const u8, suffix: []const u8) bool {
+  return #len(name) >= #len(suffix) && buffer.equal(name[#len(name) - #len(suffix)..], suffix)
+}

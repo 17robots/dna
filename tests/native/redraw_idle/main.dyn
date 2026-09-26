@@ -1,0 +1,48 @@
+frames: u32 = 0
+baseline: u32 = 0
+step: u32 = 0
+pub fn SDL_RenderPresent(renderer: rawptr) bool {
+  frames += 1
+  next := #cast(*fn(rawptr) bool) probe_next("SDL_RenderPresent\0")
+  return next(renderer)
+}
+pub fn SDL_WaitEventTimeout(event: rawptr, milliseconds: i32) bool {
+  _ = milliseconds
+  probe_clear(event)
+  if step == 0 {
+    startup := ProbeEvent{}
+    poll := #cast(*fn(rawptr) bool) probe_next("SDL_PollEvent\0")
+    for poll(#cast(rawptr) &startup) {}
+    baseline = frames
+  }
+  if step < 12 {
+    previous := step
+    step += 1
+    if previous % 2 == 0 {
+      probe_kind(event).* = 1024
+      probe_float(event, 28).* = #cast(f32) (step + 300)
+      probe_float(event, 32).* = 250.0
+      return true
+    }
+    probe_delay(360)
+    return false
+  }
+  previous := step
+  step += 1
+  if previous == 12 {
+    probe_kind(event).* = 768
+    probe_u32(event, 28).* = 27
+    probe_byte(event, 36).* = 1
+    probe_byte(event, 37).* = 1
+    return true
+  }
+  if step == 14 {
+    probe_log("idle pointer: ")
+    probe_number(#cast(u64) (frames - baseline))
+    probe_log(" unnecessary redraws\n")
+    probe_check(frames == baseline || probe_env("DNA_REDRAW_BASELINE\0") != nil, "idle redraw")
+    probe_kind(event).* = 256
+    return true
+  }
+  return false
+}

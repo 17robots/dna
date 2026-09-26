@@ -1,0 +1,118 @@
+// Linux/glibc synchronization. Use pthread threads: std/thread's raw clone
+// does not establish the TLS required by libc and the linked C libraries.
+// Opaque layouts are checked by the native ABI test before linking.
+#link("pthread")
+struct NativeMutex { storage: [5]u64 }
+struct NativeCondition { storage: [6]u64 }
+struct NativeTimespec { seconds: i64, nanoseconds: i64 }
+struct NativeThread { handle: usize, entry: *fn(rawptr) i32, state: rawptr, result: i32 }
+extern fn sync_mutex_init "pthread_mutex_init"(lock: rawptr, attributes: rawptr) i32
+extern fn sync_mutex_destroy "pthread_mutex_destroy"(lock: rawptr) i32
+extern fn sync_mutex_lock "pthread_mutex_lock"(lock: rawptr) i32
+extern fn sync_mutex_unlock "pthread_mutex_unlock"(lock: rawptr) i32
+extern fn sync_condition_init "pthread_cond_init"(condition: rawptr, attributes: rawptr) i32
+extern fn sync_condition_destroy "pthread_cond_destroy"(condition: rawptr) i32
+extern fn sync_condition_wait "pthread_cond_wait"(condition: rawptr, lock: rawptr) i32
+extern fn sync_condition_signal "pthread_cond_signal"(condition: rawptr) i32
+extern fn sync_thread_create "pthread_create"(thread: *usize, attributes: rawptr, entry: *fn(rawptr) rawptr, state: rawptr) i32
+extern fn sync_thread_join "pthread_join"(thread: usize, result: rawptr) i32
+extern fn sync_clock "clock_gettime"(clock: i32, result: *NativeTimespec) i32
+sync_clock_lock: NativeMutex = NativeMutex{}
+sync_clock_start: u64 = 0
+pub fn dna_ticks() u64 {
+  _ = sync_mutex_lock(#cast(rawptr) &sync_clock_lock)
+  now: NativeTimespec = NativeTimespec{}
+  _ = sync_clock(1, &now)
+  milliseconds := #cast(u64) now.seconds * 1000 + #cast(u64) now.nanoseconds / 1000000
+  if sync_clock_start == 0 {
+    sync_clock_start = milliseconds
+  }
+  start := sync_clock_start
+  _ = sync_mutex_unlock(#cast(rawptr) &sync_clock_lock)
+  return milliseconds - start
+}
+pub fn dna_mutex_create() rawptr {
+  lock := #cast(rawptr) rec_malloc(#sizeof(NativeMutex))
+  if lock != nil && sync_mutex_init(lock, nil) != 0 {
+    rec_free(lock)
+    return nil
+  }
+  return lock
+}
+pub fn dna_mutex_destroy(lock: rawptr) {
+  if lock != nil {
+    _ = sync_mutex_destroy(lock)
+    rec_free(lock)
+  }
+}
+pub fn dna_mutex_lock(lock: rawptr) {
+  _ = sync_mutex_lock(lock)
+}
+pub fn dna_mutex_unlock(lock: rawptr) {
+  _ = sync_mutex_unlock(lock)
+}
+pub fn dna_condition_create() rawptr {
+  condition := #cast(rawptr) rec_malloc(#sizeof(NativeCondition))
+  if condition != nil && sync_condition_init(condition, nil) != 0 {
+    rec_free(condition)
+    return nil
+  }
+  return condition
+}
+pub fn dna_condition_destroy(condition: rawptr) {
+  if condition != nil {
+    _ = sync_condition_destroy(condition)
+    rec_free(condition)
+  }
+}
+pub fn dna_condition_wait(condition: rawptr, lock: rawptr) {
+  _ = sync_condition_wait(condition, lock)
+}
+pub fn dna_condition_signal(condition: rawptr) {
+  _ = sync_condition_signal(condition)
+}
+fn sync_run(pointer: rawptr) rawptr {
+  thread := #cast(*NativeThread) pointer
+  thread.result = thread.entry(thread.state)
+  return nil
+}
+pub fn dna_thread_create(entry: *fn(rawptr) i32, state: rawptr) rawptr {
+  thread := #cast(*NativeThread) rec_malloc(#sizeof(NativeThread))
+  if thread == nil {
+    return nil
+  }
+  thread.* = NativeThread{entry: entry, state: state}
+  if sync_thread_create(&thread.handle, nil, &sync_run, #cast(rawptr) thread) != 0 {
+    rec_free(#cast(rawptr) thread)
+    return nil
+  }
+  return #cast(rawptr) thread
+}
+pub fn dna_thread_join(pointer: rawptr, status: *i32) {
+  thread := #cast(*NativeThread) pointer
+  if thread == nil {
+    return
+  }
+  _ = sync_thread_join(thread.handle, nil)
+  if status != nil {
+    status.* = thread.result
+  }
+  rec_free(#cast(rawptr) thread)
+}
+
+// Dyn's current executable entry point does not run archive .init_array
+// constructors. Keep adapter globals zero-initialized and establish nonzero
+// defaults on first use, for both shared and static consumers of the same ABI.
+extern fn native_call_once "pthread_once"(once: *i32, initialize: *fn()) i32
+native_initialized: i32 = 0
+fn native_defaults() {
+  notify_queue = -1
+  notify_stop_fd = -1
+  tty_input = -1
+  tty_output = -1
+  tty_wake_descriptor = -1
+  terminal_callbacks = TermCallbacks{property: &terminal_property, pushline: &terminal_pushline}
+}
+fn native_initialize() {
+  _ = native_call_once(&native_initialized, &native_defaults)
+}

@@ -1,0 +1,303 @@
+// Bounded main-thread LSP framing. Bytes belong to this handle until take/close.
+struct RpcTransport {
+  child: OwnedProcess,
+  failed: bool,
+  error_eof: bool,
+  incoming: *u8,
+  queue: *u8,
+  log: [4096]u8,
+  used: usize,
+  capacity: usize,
+  sent: usize,
+  pending: usize,
+  header: usize,
+  body: usize,
+  log_length: usize,
+}
+
+pub fn dna_rpc_open(command: *const u8, directory: *const u8) *RpcTransport {
+  child := proc_open(command, directory, true)
+  if child.pid == 0 {
+    return nil
+  }
+  state := #cast(*RpcTransport) rec_alloc(1, #sizeof(RpcTransport))
+  if state == nil {
+    proc_close(&child)
+    return nil
+  }
+  state.child = proc_take(&child)
+  proc_watch(state.child.output, 0)
+  proc_watch(state.child.error, 0)
+  return state
+}
+pub fn dna_rpc_send(state: *RpcTransport, bytes: *const u8, length: usize) i32 {
+  if state == nil || state.failed || bytes == nil || length == 0 || length > 8388608 {
+    return 0
+  }
+  prefix: []const u8 = "Content-Length: "
+  suffix: []const u8 = "\r\n\r\n"
+  header: [64]u8 = []
+  _ = copy(&header[0], &prefix[0], #len(prefix))
+  used := #len(prefix)
+  digits: [20]u8 = []
+  count: usize = 0
+  number := length
+  for number > 0 {
+    digits[count] = #cast(u8) (number % 10) + 48
+    count += 1
+    number /= 10
+  }
+  for count > 0 {
+    count -= 1
+    header[used] = digits[count]
+    used += 1
+  }
+  _ = copy(&header[used], &suffix[0], 4)
+  used += 4
+  remaining := state.pending - state.sent
+  if remaining + length + used > 8396800 {
+    return 0
+  }
+  if remaining > 0 && state.sent > 0 {
+    _ = proc_move(state.queue, &state.queue[..state.pending][state.sent], remaining)
+  }
+  state.pending = remaining
+  state.sent = 0
+  queue := proc_realloc(state.queue, remaining + length + used)
+  if queue == nil {
+    return 0
+  }
+  state.queue = queue
+  capacity := remaining + length + used
+  _ = copy(&queue[..capacity][remaining], &header[0], used)
+  _ = copy(&queue[..capacity][remaining + used], bytes, length)
+  state.pending = capacity
+  proc_watch(state.child.input, 1)
+  return 1
+}
+fn rpc_parse(state: *RpcTransport) bool {
+  if state.body > 0 {
+    return state.used >= state.header + state.body
+  }
+  if state.used < 4 {
+    return false
+  }
+  text := state.incoming[..state.used]
+  header: usize = 0
+  at: usize = 0
+  for at + 3 < state.used && at < 8192 {
+    if text[at] == 13 && text[at + 1] == 10 && text[at + 2] == 13 && text[at + 3] == 10 {
+      header = at + 4
+      break
+    }
+    at += 1
+  }
+  if header == 0 {
+    if state.used > 8192 {
+      state.failed = true
+    }
+    return false
+  }
+  if header > 8192 {
+    state.failed = true
+    return false
+  }
+  state.header = header
+  at = 0
+  found: bool = false
+  name: []const u8 = "content-length:"
+  for at < header - 2 {
+    end := at
+    for end + 1 < header && !(text[end] == 13 && text[end + 1] == 10) {
+      end += 1
+    }
+    if end + 1 >= header {
+      state.failed = true
+      return false
+    }
+    matched := end - at >= 15
+    index: usize = 0
+    for matched && index < 15 {
+      character := text[at + index]
+      if character >= 65 && character <= 90 {
+        character += 32
+      }
+      if character != name[index] {
+        matched = false
+      }
+      index += 1
+    }
+    if matched {
+      if found {
+        state.failed = true
+        return false
+      }
+      found = true
+      index = at + 15
+      for index < end && (text[index] == 32 || text[index] == 9) {
+        index += 1
+      }
+      if index == end {
+        state.failed = true
+        return false
+      }
+      length: usize = 0
+      for index < end {
+        digit := text[index]
+        if digit < 48 || digit > 57 || length > 838860 {
+          state.failed = true
+          return false
+        }
+        length = length * 10 + #cast(usize) (digit - 48)
+        index += 1
+      }
+      if length == 0 || length > 8388608 {
+        state.failed = true
+        return false
+      }
+      state.body = length
+    }
+    at = end + 2
+  }
+  if !found {
+    state.failed = true
+    return false
+  }
+  return state.used >= state.header + state.body
+}
+fn rpc_flush(state: *RpcTransport) {
+  if state.pending <= state.sent {
+    return
+  }
+  amount := state.pending - state.sent
+  if amount > 65536 {
+    amount = 65536
+  }
+  written := proc_write(state.child.input, &state.queue[..state.pending][state.sent], amount)
+  if written > 0 {
+    state.sent += #cast(usize) written
+  }
+  else if written < 0 && written != -11 && written != -4 {
+    state.failed = true
+  }
+  if state.sent == state.pending {
+    rec_free(#cast(rawptr) state.queue)
+    state.queue = nil
+    state.sent = 0
+    state.pending = 0
+  }
+}
+fn rpc_drain_errors(state: *RpcTransport) {
+  bytes: [1024]u8 = []
+  attempt: usize = 0
+  for attempt < 4 && !state.error_eof {
+    received := proc_read(state.child.error, &bytes[0], 1024)
+    if received <= 0 {
+      if received == 0 {
+        state.error_eof = true
+      }
+      break
+    }
+    proc_log(state.log[..], &state.log_length, bytes[..#cast(usize) received])
+    attempt += 1
+  }
+}
+pub fn dna_rpc_size(state: *RpcTransport) isize {
+  if state == nil || state.failed {
+    return -1
+  }
+  rpc_flush(state)
+  rpc_drain_errors(state)
+  ready := rpc_parse(state)
+  attempt: usize = 0
+  for attempt < 4 && !ready && !state.failed {
+    need := state.used + 65536
+    if need > 8396800 {
+      need = 8396800
+    }
+    if need == state.used {
+      state.failed = true
+      break
+    }
+    if need > state.capacity {
+      bytes := proc_realloc(state.incoming, need)
+      if bytes == nil {
+        state.failed = true
+        break
+      }
+      state.incoming = bytes
+      state.capacity = need
+    }
+    received := proc_read(state.child.output, &state.incoming[..state.capacity][state.used], need - state.used)
+    if received > 0 {
+      state.used += #cast(usize) received
+      ready = rpc_parse(state)
+    }
+    else if received == -11 || received == -4 {
+      break
+    }
+    else {
+      state.failed = true
+      break
+    }
+    attempt += 1
+  }
+  if state.pending > state.sent {
+    proc_watch(state.child.input, 1)
+  } else {
+    proc_unwatch(state.child.input)
+  }
+  if state.error_eof {
+    proc_unwatch(state.child.error)
+  } else {
+    proc_watch(state.child.error, 0)
+  }
+  proc_watch(state.child.output, 0)
+  if state.failed {
+    return -1
+  }
+  if ready {
+    return #cast(isize) state.body
+  }
+  return 0
+}
+pub fn dna_rpc_take(state: *RpcTransport, output: *u8, capacity: usize) isize {
+  if state == nil || output == nil || state.body == 0 || state.used < state.header + state.body || capacity <= state.body {
+    return -1
+  }
+  length := state.body
+  total := state.header + length
+  _ = copy(output, &state.incoming[..state.capacity][state.header], length)
+  output[..capacity][length] = 0
+  if state.used > total {
+    _ = proc_move(state.incoming, &state.incoming[..state.capacity][total], state.used - total)
+  }
+  state.used -= total
+  state.header = 0
+  state.body = 0
+  if state.used > 0 {
+    rec_notify()
+  }
+  return #cast(isize) length
+}
+pub fn dna_rpc_log(state: *RpcTransport, output: *u8, capacity: usize) usize {
+  if state == nil || output == nil || capacity == 0 {
+    return 0
+  }
+  length := state.log_length
+  if length >= capacity {
+    length = capacity - 1
+  }
+  _ = copy(output, &state.log[0], length)
+  output[..capacity][length] = 0
+  return length
+}
+pub fn dna_rpc_close(state: *RpcTransport) {
+  if state == nil {
+    return
+  }
+  proc_close(&state.child)
+  rec_free(#cast(rawptr) state.queue)
+  rec_free(#cast(rawptr) state.incoming)
+  rec_free(#cast(rawptr) state)
+}

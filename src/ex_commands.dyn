@@ -1,0 +1,277 @@
+// Ex commands the palette lacks, in every keymap: :{line} and
+// :[range]s/pattern/text/[gi]. Ranges: none (current line), %, N,M, . and
+// '<,'> (the last visual area).
+
+fn vim_number(text: []const u8, at: *usize) usize {
+  value: usize = 0
+  for at.* < #len(text) && text[at.*] >= '0' && text[at.*] <= '9' && value < 100000000 {
+    value = value * 10 + #cast(usize) (text[at.*] - '0')
+    at.* += 1
+  }
+  return value
+}
+// A 1-based range line as a row; 0 counts as the first line. Lines past the
+// end stay past it, so the range is rejected as invalid.
+fn vim_range_row(number: usize) usize {
+  if number == 0 {
+    return 0
+  }
+  return number - 1
+}
+fn vim_ex_command(app: *App, text: []const u8) bool {
+  if #len(text) == 0 || app.documents.current == nil || terminal_target(app) != nil {
+    return false
+  }
+  doc := vim_doc(app)
+  at: usize = 0
+  last := vim_last_row(doc)
+  row := buffer.row_at(doc, buffer.head(doc))
+  first_row := row
+  last_row := row
+  if text[0] >= '0' && text[0] <= '9' {
+    number := vim_number(text, &at)
+    if at == #len(text) {
+      target := number
+      if target > 0 {
+        target -= 1
+      }
+      if target > last {
+        target = last
+      }
+      app.prompt_state.panel = Panel.None
+      buffer.checkpoint(doc)
+      if app.config.vim_keys {
+        vim_escape(app)
+        vim_place(app, vim_first_nonblank(doc, target))
+      }
+      else {
+        buffer.select_to(doc, vim_first_nonblank(doc, target), false)
+      }
+      return true
+    }
+    // Line 0 in a range means line 1, as in Vim.
+    first_row = vim_range_row(number)
+    last_row = first_row
+    if at < #len(text) && text[at] == ',' {
+      at += 1
+      last_row = vim_range_row(vim_number(text, &at))
+    }
+  }
+  else if text[0] == '%' {
+    first_row = 0
+    last_row = last
+    at = 1
+  }
+  else if text[0] == '.' {
+    at = 1
+  }
+  else if #len(text) >= 5 && buffer.equal(text[..5], "'<,'>") {
+    if !app.vim.last_valid {
+      return false
+    }
+    first_row = buffer.row_at(doc, app.vim.last_anchor)
+    last_row = buffer.row_at(doc, app.vim.last_head)
+    if first_row > last_row {
+      first_row = buffer.row_at(doc, app.vim.last_head)
+      last_row = buffer.row_at(doc, app.vim.last_anchor)
+    }
+    at = 5
+  }
+  if at + 1 >= #len(text) || text[at] != 's' {
+    return false
+  }
+  delimiter := text[at + 1]
+  if (delimiter >= 'a' && delimiter <= 'z') || (delimiter >= 'A' && delimiter <= 'Z') || (delimiter >= '0' && delimiter <= '9') || delimiter == ' ' {
+    return false
+  }
+  if first_row > last_row || last_row > last {
+    notice(app, "Substitute range is outside the document.")
+    return true
+  }
+  // Split pattern / replacement / flags on unescaped delimiters.
+  parts: [3]usize = [0, 0, 0]
+  ends: [3]usize = [0, 0, 0]
+  part: usize = 0
+  scan := at + 2
+  parts[0] = scan
+  for scan < #len(text) && part < 2 {
+    if text[scan] == '\\' && scan + 1 < #len(text) {
+      scan += 2
+      continue
+    }
+    if text[scan] == delimiter {
+      ends[part] = scan
+      part += 1
+      parts[part] = scan + 1
+    }
+    scan += 1
+  }
+  ends[part] = #len(text)
+  if part == 0 {
+    ends[0] = #len(text)
+    parts[1] = #len(text)
+    ends[1] = #len(text)
+  }
+  if part < 2 {
+    parts[2] = #len(text)
+    ends[2] = #len(text)
+  }
+  global := false
+  ignore_case := false
+  for flag in text[parts[2]..ends[2]] {
+    if flag == 'g' {
+      global = true
+    }
+    else if flag == 'i' {
+      ignore_case = true
+    }
+    else if flag != ' ' {
+      notice(app, "Substitute flags: g (every match) and i (ignore case).")
+      return true
+    }
+  }
+  // An empty pattern reuses the last search.
+  query: [4200]u8 = []
+  query_length: usize = 0
+  if ignore_case {
+    add_text(query[..], &query_length, "(?i)")
+  }
+  if ends[0] == parts[0] {
+    add_text(query[..], &query_length, app.search_history.text[..app.search_history.length])
+  }
+  else {
+    // \/ in the pattern is the delimiter itself.
+    source := text[parts[0]..ends[0]]
+    index: usize = 0
+    for index < #len(source) && query_length + 2 < #len(query) {
+      if source[index] == '\\' && index + 1 < #len(source) && source[index + 1] == delimiter {
+        index += 1
+      }
+      query[query_length] = source[index]
+      query_length += 1
+      index += 1
+    }
+  }
+  compiled := pattern.open(query[..query_length])
+  defer pattern.close(&compiled)
+  if !compiled.ok {
+    notice(app, "Invalid substitute pattern.")
+    return true
+  }
+  replacement := text[parts[1]..ends[1]]
+  range_low := buffer.row_start(doc, first_row)
+  range_high := vim_text_end(doc, buffer.row_start(doc, last_row))
+  reserved := buffer.reserve(buffer.Capacity + 1)
+  if !reserved.ok {
+    notice(app, "Cannot allocate the substitution.")
+    return true
+  }
+  defer _ = mem.arena_release(&reserved.arena)
+  output := reserved.arena.data
+  used: usize = 0
+  substitutions: usize = 0
+  last_changed := first_row
+  for line_row in first_row..=last_row {
+    line_low := buffer.row_start(doc, line_row)
+    line_high := vim_text_end(doc, line_low)
+    line := doc.bytes[line_low..line_high]
+    offset: usize = 0
+    for offset <= #len(line) {
+      found := pattern.find(&compiled, line, offset)
+      if found.error {
+        notice(app, "Substitute pattern exceeded its work limit.")
+        return true
+      }
+      if !found.found {
+        break
+      }
+      if !vim_append(output, &used, line[offset..found.start]) || !vim_expand(output, &used, replacement, line[found.start..found.end], delimiter) {
+        notice(app, "Substitution exceeds document capacity.")
+        return true
+      }
+      substitutions += 1
+      last_changed = line_row
+      offset = found.end
+      if found.end == found.start {
+        if offset < #len(line) && !vim_append(output, &used, line[offset..offset + 1]) {
+          return true
+        }
+        offset += 1
+      }
+      if !global {
+        break
+      }
+    }
+    if offset < #len(line) && !vim_append(output, &used, line[offset..]) {
+      notice(app, "Substitution exceeds document capacity.")
+      return true
+    }
+    if line_row < last_row && !vim_append(output, &used, doc.bytes[line_high..buffer.row_start(doc, line_row + 1)]) {
+      return true
+    }
+  }
+  app.prompt_state.panel = Panel.None
+  if substitutions == 0 {
+    notice(app, "Pattern not found.")
+    return true
+  }
+  buffer.checkpoint(doc)
+  vim_set_range(doc, range_low, range_high)
+  if !buffer.replace(doc, output[..used]) {
+    notice(app, "Substitution exceeds document capacity.")
+    return true
+  }
+  buffer.checkpoint(doc)
+  if app.config.vim_keys {
+    vim_escape(app)
+    vim_place(app, vim_first_nonblank(doc, last_changed))
+  }
+  else {
+    buffer.select_to(doc, vim_first_nonblank(doc, last_changed), false)
+  }
+  return true
+}
+fn vim_append(output: []u8, used: *usize, text: []const u8) bool {
+  if used.* + #len(text) > buffer.Capacity {
+    return false
+  }
+  if #len(text) > 0 {
+    _ = buffer.copy_bytes(&output[used.*], &text[0], #len(text))
+  }
+  used.* += #len(text)
+  return true
+}
+// Replacement text: & is the match, \r or \n a line break, \x a literal x.
+fn vim_expand(output: []u8, used: *usize, replacement: []const u8, matched: []const u8, delimiter: u8) bool {
+  index: usize = 0
+  for index < #len(replacement) {
+    byte := replacement[index]
+    if byte == '&' {
+      if !vim_append(output, used, matched) {
+        return false
+      }
+    }
+    else if byte == '\\' && index + 1 < #len(replacement) {
+      index += 1
+      escaped := replacement[index]
+      if escaped == 'r' || escaped == 'n' {
+        escaped = 10
+      }
+      else if escaped == 't' {
+        escaped = 9
+      }
+      single: [1]u8 = [escaped]
+      if !vim_append(output, used, single[..]) {
+        return false
+      }
+    }
+    else {
+      single_byte: [1]u8 = [byte]
+      if !vim_append(output, used, single_byte[..]) {
+        return false
+      }
+    }
+    index += 1
+  }
+  return true
+}

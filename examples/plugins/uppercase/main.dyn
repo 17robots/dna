@@ -1,0 +1,73 @@
+use "std/io"
+use "std/mem"
+use "std/encoding/json"
+use "std/strings"
+
+fn send(text: []const u8) {
+  _ = io.write_all(io.stdout(), text)
+}
+fn main() {
+  memory := mem.arena_create(2097152)
+  if !memory.ok {
+    return
+  }
+  defer _ = mem.arena_release(&memory.arena)
+  line: [524288]u8 = []
+  length: usize = 0
+  byte: [1]u8 = []
+  for true {
+    received := io.read(io.stdin(), byte[..])
+    if received.transferred == 0 {
+      return
+    }
+    if byte[0] != 10 {
+      if length == 524287 {
+        return
+      }
+      line[length] = byte[0]
+      length += 1
+      continue
+    }
+    mem.arena_reset(&memory.arena)
+    parsed := json.parse(&memory.arena, line[..length])
+    length = 0
+    if !parsed.ok {
+      return
+    }
+    kind := json.object_get(parsed.root, "type")
+    if !json.is_string(kind) {
+      return
+    }
+    if strings.equal(kind.text, "initialize") {
+      send("{\"type\":\"command\",\"name\":\"Uppercase buffer\"}\n{\"type\":\"ready\"}\n")
+    }
+    else if strings.equal(kind.text, "command") {
+      text := json.object_get(parsed.root, "text")
+      revision := json.object_get(parsed.root, "revision")
+      target := json.object_get(parsed.root, "buffer")
+      if !json.is_string(text) || !json.is_number(revision) || !json.is_number(target) {
+        return
+      }
+      result := json.make_object(&memory.arena)
+      _ = json.add_member(result, "type", json.make_string(&memory.arena, "replace"))
+      _ = json.add_member(result, "revision", json.make_number(&memory.arena, revision.text))
+      _ = json.add_member(result, "buffer", json.make_number(&memory.arena, target.text))
+      output: [65536]u8 = []
+      if #len(text.text) > 65535 {
+        return
+      }
+      index: usize = 0
+      for index < #len(text.text) {
+        character := text.text[index]
+        if character >= 97 && character <= 122 {
+          character -= 32
+        }
+        output[index] = character
+        index += 1
+      }
+      _ = json.add_member(result, "text", json.make_string(&memory.arena, output[..#len(text.text)]))
+      _ = json.write(io.stdout(), result)
+      send("\n{\"type\":\"done\"}\n")
+    }
+  }
+}

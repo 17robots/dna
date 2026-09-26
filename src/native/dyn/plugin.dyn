@@ -1,0 +1,129 @@
+// Plugins share process ownership, nonblocking IO and log handling with LSP.
+// Protocol and queue limits remain independent: newline JSON, 512 KiB maximum.
+pub fn dna_plugin_open(executable: *const u8, directory: *const u8) *RpcTransport {
+  child := proc_open(executable, directory, false)
+  if child.pid == 0 {
+    return nil
+  }
+  state := #cast(*RpcTransport) rec_alloc(1, #sizeof(RpcTransport))
+  if state == nil {
+    proc_close(&child)
+    return nil
+  }
+  state.child = proc_take(&child)
+  proc_watch(state.child.output, 0)
+  proc_watch(state.child.error, 0)
+  return state
+}
+pub fn dna_plugin_send(state: *RpcTransport, bytes: *const u8, length: usize) i32 {
+  if state == nil || state.failed || (length > 0 && bytes == nil) {
+    return 0
+  }
+  remaining := state.pending - state.sent
+  if length > #cast(usize) 524288 - remaining {
+    return 0
+  }
+  if length == 0 {
+    return 1
+  }
+  if remaining > 0 && state.sent > 0 {
+    _ = proc_move(state.queue, &state.queue[..state.pending][state.sent], remaining)
+  }
+  state.pending = remaining
+  state.sent = 0
+  queue := proc_realloc(state.queue, remaining + length)
+  if queue == nil {
+    return 0
+  }
+  state.queue = queue
+  _ = copy(&state.queue[..remaining + length][remaining], bytes, length)
+  state.pending += length
+  proc_watch(state.child.input, 1)
+  return 1
+}
+fn rpc_arm(state: *RpcTransport) {
+  if state.failed {
+    proc_unwatch(state.child.input)
+    proc_unwatch(state.child.output)
+    proc_unwatch(state.child.error)
+    return
+  }
+  if state.pending > state.sent {
+    proc_watch(state.child.input, 1)
+  } else {
+    proc_unwatch(state.child.input)
+  }
+  if state.error_eof {
+    proc_unwatch(state.child.error)
+  } else {
+    proc_watch(state.child.error, 0)
+  }
+  proc_watch(state.child.output, 0)
+}
+pub fn dna_plugin_read(state: *RpcTransport, output: *u8, capacity: usize) isize {
+  if state == nil || state.failed || output == nil || capacity == 0 {
+    return -1
+  }
+  defer rpc_arm(state)
+  rpc_drain_errors(state)
+  rpc_flush(state)
+  if state.failed {
+    return -1
+  }
+  for attempt in 0..4 {
+    at: usize = 0
+    for at < state.used {
+      if state.incoming[..state.capacity][at] == 10 {
+        if at == 0 || at >= capacity {
+          state.failed = true
+          return -1
+        }
+        _ = copy(output, state.incoming, at)
+        output[..capacity][at] = 0
+        remaining := state.used - at - 1
+        if remaining > 0 {
+          _ = proc_move(state.incoming, &state.incoming[..state.capacity][at + 1], remaining)
+        }
+        state.used = remaining
+        rec_notify()
+        return #cast(isize) at
+      }
+      at += 1
+    }
+    if state.used == 524288 {
+      state.failed = true
+      return -1
+    }
+    need := state.used + 65536
+    if need > 524288 {
+      need = 524288
+    }
+    if need > state.capacity {
+      bytes := proc_realloc(state.incoming, need)
+      if bytes == nil {
+        state.failed = true
+        return -1
+      }
+      state.incoming = bytes
+      state.capacity = need
+    }
+    received := proc_read(state.child.output, &state.incoming[..state.capacity][state.used], need - state.used)
+    if received > 0 {
+      state.used += #cast(usize) received
+    }
+    else if received == -11 || received == -4 {
+      break
+    }
+    else {
+      state.failed = true
+      return -1
+    }
+  }
+  return 0
+}
+pub fn dna_plugin_log(state: *RpcTransport, output: *u8, capacity: usize) usize {
+  return dna_rpc_log(state, output, capacity)
+}
+pub fn dna_plugin_close(state: *RpcTransport) {
+  dna_rpc_close(state)
+}

@@ -1,0 +1,157 @@
+struct ThemeState {
+  name: [4096]u8,
+  name_length: usize,
+}
+// Semantic colors live here so future themes do not touch rendering code.
+struct Rgb { red, green, blue: u8 }
+struct Theme {
+  diagnostic_error: Rgb,
+  diagnostic_warning: Rgb,
+  border: Rgb,
+  background: Rgb,
+  surface: Rgb,
+  line: Rgb,
+  text: Rgb,
+  muted: Rgb,
+  selection: Rgb,
+  cursor: Rgb,
+  syntax_comment: Rgb,
+  syntax_string: Rgb,
+  syntax_keyword: Rgb,
+  syntax_function: Rgb,
+  syntax_type: Rgb,
+  syntax_constant: Rgb,
+}
+
+extern fn theme_mode "dna_theme_mode"() i32
+extern fn theme_select "dna_theme_select"(light: bool)
+extern fn theme_override "dna_theme_override"(index: u32) u32
+extern fn theme_set_override "dna_theme_set_override"(index: u32, color: u32)
+
+fn default_theme() Theme {
+  if theme_mode() != 0 {
+    return Theme{diagnostic_error: Rgb{red: 180, green: 45, blue: 45}, diagnostic_warning: Rgb{red: 145, green: 95, blue: 10}, syntax_comment: Rgb{red: 90, green: 110, blue: 90}, syntax_string: Rgb{red: 65, green: 110, blue: 55}, syntax_keyword: Rgb{red: 115, green: 70, blue: 140}, syntax_function: Rgb{red: 45, green: 95, blue: 145}, syntax_type: Rgb{red: 115, green: 95, blue: 30}, syntax_constant: Rgb{red: 135, green: 80, blue: 50}, border: Rgb{red: 190, green: 190, blue: 190}, background: Rgb{red: 245, green: 245, blue: 245}, surface: Rgb{red: 235, green: 235, blue: 235}, line: Rgb{red: 229, green: 229, blue: 229}, text: Rgb{red: 38, green: 38, blue: 38}, muted: Rgb{red: 100, green: 100, blue: 100}, selection: Rgb{red: 187, green: 208, blue: 225}, cursor: Rgb{red: 80, green: 120, blue: 155}}
+  }
+
+  return Theme{diagnostic_error: Rgb{red: 230, green: 110, blue: 110}, diagnostic_warning: Rgb{red: 220, green: 180, blue: 95},
+    syntax_comment: Rgb{red: 132, green: 140, blue: 132}, syntax_string: Rgb{red: 165, green: 183, blue: 152}, syntax_keyword: Rgb{red: 174, green: 156, blue: 190}, syntax_function: Rgb{red: 151, green: 178, blue: 200}, syntax_type: Rgb{red: 183, green: 179, blue: 149}, syntax_constant: Rgb{red: 192, green: 164, blue: 140},
+    border: Rgb{red: 65, green: 65, blue: 65},
+    background: Rgb{red: 24, green: 24, blue: 24},
+    surface: Rgb{red: 32, green: 32, blue: 32},
+    line: Rgb{red: 29, green: 29, blue: 29},
+    text: Rgb{red: 212, green: 212, blue: 212},
+    muted: Rgb{red: 132, green: 132, blue: 132},
+    selection: Rgb{red: 53, green: 65, blue: 80},
+    cursor: Rgb{red: 139, green: 163, blue: 190},
+  }
+}
+fn paint(renderer: rawptr, color: Rgb) bool {
+  return sdl.color(renderer, color.red, color.green, color.blue, 255)
+}
+fn tint(text: rawptr, color: Rgb) bool {
+  return ttf.color(text, color.red, color.green, color.blue, 255)
+}
+fn theme_rgb(index: u32, fallback: Rgb) Rgb {
+  color := theme_override(index)
+  if color > 16777215 {
+    return fallback
+  }
+  return Rgb{red: #cast(u8) (color >> 16), green: #cast(u8) ((color >> 8) & 255), blue: #cast(u8) (color & 255)}
+}
+fn theme() Theme {
+  result := default_theme()
+  result.border = theme_rgb(0, result.border)
+  result.background = theme_rgb(1, result.background)
+  result.surface = theme_rgb(2, result.surface)
+  result.line = theme_rgb(3, result.line)
+  result.text = theme_rgb(4, result.text)
+  result.muted = theme_rgb(5, result.muted)
+  result.selection = theme_rgb(6, result.selection)
+  result.cursor = theme_rgb(7, result.cursor)
+  result.syntax_comment = theme_rgb(8, result.syntax_comment)
+  result.syntax_string = theme_rgb(9, result.syntax_string)
+  result.syntax_keyword = theme_rgb(10, result.syntax_keyword)
+  result.syntax_function = theme_rgb(11, result.syntax_function)
+  result.syntax_type = theme_rgb(12, result.syntax_type)
+  result.syntax_constant = theme_rgb(13, result.syntax_constant)
+  result.diagnostic_error = theme_rgb(30, result.diagnostic_error)
+  result.diagnostic_warning = theme_rgb(31, result.diagnostic_warning)
+  return result
+}
+fn theme_prepare(app: *App, name: []const u8, output: *settings.Palette) bool {
+  if settings.builtin_palette(name, output) {
+    return true
+  }
+  storage: [4096]u8 = []
+  path := expand_home(name, storage[..])
+  mark := mem.arena_mark(app.scratch)
+  defer mem.arena_rewind(app.scratch, mark)
+  read := fs.read_all(app.scratch, path, 16384)
+  if !read.ok {
+    notice(app, "Cannot read theme file; colours unchanged.")
+    return false
+  }
+  if !settings.parse_palette(read.data, output) {
+    message: [256]u8 = []
+    used: usize = 0
+    add_text(message[..], &used, "Invalid theme at line ")
+    add_number(message[..], &used, output.error_line)
+    add_text(message[..], &used, "; colours unchanged.")
+    notice(app, message[..used])
+    return false
+  }
+  return true
+}
+// Syntax styles drawn in italics (settings.Palette.italic); comments unless
+// the theme says otherwise.
+theme_italic: u8 = 1
+fn syntax_italic(style: u8) bool {
+  return style >= 1 && style <= 6 && (theme_italic & (#cast(u8) 1 << (style - 1))) != 0
+}
+fn theme_apply(app: *App, typography: *Typography, colors: *const settings.Palette) {
+  theme_select(colors.light)
+  theme_italic = 1
+  if colors.italic_set {
+    theme_italic = colors.italic
+  }
+  for index in 0..32 {
+    if (colors.mask & (#cast(u32) 1 << #cast(u32) index)) != 0 {
+      theme_set_override(#cast(u32) index, colors.colors[index])
+    }
+  }
+  _ = tint(typography.document, theme().text)
+  _ = tint(typography.palette, theme().text)
+  _ = tint(typography.directory_text, theme().text)
+  _ = tint(typography.preview_text, theme().text)
+  _ = tint(typography.caret_text, theme().text)
+  _ = tint(typography.chrome, theme().text)
+  app.view.revision += 1
+  app.prompt_state.panel = Panel.None
+}
+fn theme_switch(app: *App, typography: *Typography, name: []const u8) {
+  colors := settings.Palette{}
+  if !theme_prepare(app, name, &colors) {
+    return
+  }
+  theme_apply(app, typography, &colors)
+  app.theme_state.name_length = copy_text(app.theme_state.name[..], name)
+  quoted: [4200]u8 = []
+  _ = session_record(app, "theme", toml_value(name, quoted[..]), false)
+}
+fn rgb_value(color: Rgb) u32 {
+  return (#cast(u32) color.red << 16) | (#cast(u32) color.green << 8) | #cast(u32) color.blue
+}
+fn theme_current(app: *App) {
+  name: []const u8 = "charcoal"
+  if app.theme_state.name_length > 0 {
+    name = app.theme_state.name[..app.theme_state.name_length]
+  }
+  else if theme_mode() != 0 {
+    name = "light"
+  }
+  message: [8192]u8 = []
+  used: usize = 0
+  add_text(message[..], &used, "Theme: ")
+  add_text(message[..], &used, name)
+  notice(app, message[..used])
+}

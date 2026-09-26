@@ -1,22 +1,157 @@
-#link("SDL3_ttf")
+use "../platform" platform
+
+// In the terminal frontend, text objects are platform.tui text objects and
+// fonts are a placeholder handle; cells are the only glyphs.
+font_handle: u8 = 0
 // Direct SDL_ttf bindings. Text objects and their glyph atlas stay on the UI
 // thread and are destroyed before their font, engine, and SDL renderer.
-pub extern fn init "TTF_Init"() bool
-pub extern fn quit "TTF_Quit"()
-pub extern fn open "TTF_OpenFont"(path: *const u8, points: f32) rawptr
-pub extern fn close "TTF_CloseFont"(font: rawptr)
-pub extern fn font_size "TTF_SetFontSize"(font: rawptr, points: f32) bool
-pub extern fn line_skip "TTF_SetFontLineSkip"(font: rawptr, pixels: i32)
-pub extern fn measure "TTF_GetStringSize"(font: rawptr, text: *const u8, length: usize, width: *i32, height: *i32) bool
-pub extern fn engine "TTF_CreateRendererTextEngine"(renderer: rawptr) rawptr
-pub extern fn destroy_engine "TTF_DestroyRendererTextEngine"(engine: rawptr)
-pub extern fn create "TTF_CreateText"(engine: rawptr, font: rawptr, text: *const u8, length: usize) rawptr
-pub extern fn destroy "TTF_DestroyText"(text: rawptr)
-pub extern fn set "TTF_SetTextString"(text: rawptr, bytes: *const u8, length: usize) bool
-pub extern fn wrap "TTF_SetTextWrapWidth"(text: rawptr, pixels: i32) bool
-pub extern fn color "TTF_SetTextColor"(text: rawptr, red: u8, green: u8, blue: u8, alpha: u8) bool
-pub extern fn draw "TTF_DrawRendererText"(text: rawptr, x: f32, y: f32) bool
-pub extern fn size "TTF_GetTextSize"(text: rawptr, width: *i32, height: *i32) bool
-pub struct Substring { flags: u32, offset: i32, length: i32, line: i32, cluster: i32, x: i32, y: i32, width: i32, height: i32 }
-pub extern fn substring "TTF_GetTextSubString"(text: rawptr, offset: i32, output: *Substring) bool
-pub extern fn whitespace_visible "TTF_SetTextWrapWhitespaceVisible"(text: rawptr, visible: bool) bool
+pub fn open(path: *const u8, points: f32) rawptr {
+  if platform.tui_active() {
+    return #cast(rawptr) &font_handle
+  }
+  return ttf_open(path, points)
+}
+pub fn close(font: rawptr) {
+  if platform.tui_active() {
+    return
+  }
+  ttf_close(font)
+}
+pub fn font_size(font: rawptr, points: f32) bool {
+  if platform.tui_active() {
+    return true
+  }
+  return ttf_font_size(font, points)
+}
+pub fn line_skip(font: rawptr, pixels: i32) {
+  if platform.tui_active() {
+    return
+  }
+  ttf_line_skip(font, pixels)
+}
+pub fn measure(font: rawptr, text: *const u8, length: usize, width: *i32, height: *i32) bool {
+  if platform.tui_active() {
+    platform.tui_measure_string(text, length, width, height)
+    return true
+  }
+  return ttf_measure(font, text, length, width, height)
+}
+pub fn engine(renderer: rawptr) rawptr {
+  if platform.tui_active() {
+    return #cast(rawptr) &font_handle
+  }
+  return ttf_engine(renderer)
+}
+pub fn destroy_engine(engine: rawptr) {
+  if platform.tui_active() {
+    return
+  }
+  ttf_destroy_engine(engine)
+}
+pub fn create(engine: rawptr, font: rawptr, text: *const u8, length: usize) rawptr {
+  if platform.tui_active() {
+    handle := platform.tui_text_create()
+    if handle != nil && length > 0 {
+      _ = platform.tui_text_set(handle, text, length)
+    }
+    return handle
+  }
+  return ttf_create(engine, font, text, length)
+}
+pub fn destroy(text: rawptr) {
+  if platform.tui_active() {
+    platform.tui_text_destroy(text)
+    return
+  }
+  ttf_destroy(text)
+}
+pub fn set(text: rawptr, bytes: *const u8, length: usize) bool {
+  if platform.tui_active() {
+    return platform.tui_text_set(text, bytes, length)
+  }
+  return ttf_set(text, bytes, length)
+}
+pub fn wrap(text: rawptr, pixels: i32) bool {
+  if platform.tui_active() {
+    platform.tui_text_wrap(text, pixels)
+    return true
+  }
+  return ttf_wrap(text, pixels)
+}
+pub fn color(text: rawptr, red: u8, green: u8, blue: u8, alpha: u8) bool {
+  if platform.tui_active() {
+    platform.tui_text_color(text, red, green, blue)
+    return true
+  }
+  return ttf_color(text, red, green, blue, alpha)
+}
+// Italic for this text object. The terminal frontend draws it with SGR 3;
+// windows draw with a single font face and keep it upright.
+pub fn italic(text: rawptr, italic: bool) {
+  if platform.tui_active() {
+    platform.tui_text_italic(text, italic)
+  }
+}
+pub fn draw(text: rawptr, x: f32, y: f32) bool {
+  if platform.tui_active() {
+    platform.tui_text_draw(text, x, y)
+    return true
+  }
+  return ttf_draw(text, x, y)
+}
+pub fn size(text: rawptr, width: *i32, height: *i32) bool {
+  if platform.tui_active() {
+    platform.tui_text_size(text, width, height)
+    return true
+  }
+  return ttf_size(text, width, height)
+}
+pub struct Substring {
+  flags: u32,
+  offset: i32,
+  length: i32,
+  line: i32,
+  cluster: i32,
+  x: i32,
+  y: i32,
+  width: i32,
+  height: i32,
+}
+pub fn substring(text: rawptr, offset: i32, output: *Substring) bool {
+  if platform.tui_active() {
+    output.* = Substring{height: #cast(i32) platform.CellHeight}
+    return platform.tui_text_substring(text, offset, &output.x, &output.y, &output.width, &output.offset, &output.length, &output.line)
+  }
+  return ttf_substring(text, offset, output)
+}
+pub fn whitespace_visible(text: rawptr, visible: bool) bool {
+  if platform.tui_active() {
+    return true
+  }
+  return ttf_whitespace_visible(text, visible)
+}
+pub fn at_point(text: rawptr, x: i32, y: i32, output: *Substring) bool {
+  if platform.tui_active() {
+    found := platform.tui_text_at_point(text, x, y)
+    return platform.tui_text_substring(text, found, &output.x, &output.y, &output.width, &output.offset, &output.length, &output.line)
+  }
+  return ttf_at_point(text, x, y, output)
+}
+pub fn set_font(text: rawptr, font: rawptr) bool {
+  if platform.tui_active() {
+    return true
+  }
+  return ttf_set_font(text, font)
+}
+pub fn add_fallback(font: rawptr, fallback: rawptr) bool {
+  if platform.tui_active() {
+    return true
+  }
+  return ttf_add_fallback(font, fallback)
+}
+pub fn remove_fallback(font: rawptr, fallback: rawptr) {
+  if platform.tui_active() {
+    return
+  }
+  ttf_remove_fallback(font, fallback)
+}

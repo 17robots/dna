@@ -1,0 +1,752 @@
+// Tree explorer module: the project as a collapsible tree in a side panel.
+// It docks on the left by default ([place.explorer] moves or floats it) and
+// stays beside the panes while the editor has focus. It is for finding and
+// opening files; `e` hands the selected directory to the editable explorer
+// for file operations.
+const TreeCapacity: usize = 4096
+const TreeNameCapacity: usize = 262144
+const TreeDepthLimit: u16 = 48
+
+struct TreeNode { offset: u32, length: u16, depth: u16, directory: bool, expanded: bool }
+struct TreeState {
+  nodes: [4096]TreeNode,
+  names: [262144]u8,
+  root: [4096]u8,
+  root_length: usize,
+  names_used: usize,
+  count: usize,
+  selected: usize,
+  // Rows that fit, from the last draw; paging moves by this.
+  rows: usize,
+  open: bool,
+  loaded: bool,
+  stale: bool,
+  // The root was changed by hand; leave it when the project moves.
+  root_custom: bool,
+  limited: bool,
+  pointer_inside: bool,
+  rect: sdl.Rect,
+  // Selection and size at the last draw: the list follows the selection
+  // only when it moves, so the wheel can scroll freely.
+  drawn_selected: usize,
+  drawn_count: usize,
+  // inotify over the root and open folders; rebuilt when folds change.
+  watcher: rawptr,
+  watch_dirty: bool,
+}
+
+extern fn directory_watch_open "dna_directory_watch_open"() rawptr
+extern fn directory_watch_add "dna_directory_watch_add"(watch: rawptr, path: *const u8) i32
+extern fn directory_watch_clear "dna_directory_watch_clear"(watch: rawptr)
+extern fn directory_watch_poll "dna_directory_watch_poll"(watch: rawptr) i32
+extern fn directory_watch_close "dna_directory_watch_close"(watch: rawptr)
+
+fn tree_open(app: *const App) bool {
+  return app.config.explorer_style == 1 && app.tree.open
+}
+fn tree_docked(app: *const App) bool {
+  return tree_open(app) && place_of(app, SurfaceExplorer).mode == settings.PlaceDock
+}
+// The explorer's file operations changed the disk; reload on the next look.
+fn tree_invalidate(app: *App) {
+  app.tree.stale = true
+}
+fn tree_name(tree: *const TreeState, index: usize) []const u8 {
+  node := &tree.nodes[index]
+  return tree.names[#cast(usize) node.offset..#cast(usize) node.offset + #cast(usize) node.length]
+}
+// Path of a node below the root, "a/b/c"; empty for the root itself.
+fn tree_relative(tree: *const TreeState, index: usize, output: []u8) []const u8 {
+  chain: [48]usize = []
+  count: usize = 0
+  if index < tree.count {
+    chain[0] = index
+    count = 1
+    wanted := tree.nodes[index].depth
+    probe := index
+    for wanted > 0 && probe > 0 {
+      probe -= 1
+      if tree.nodes[probe].depth == wanted - 1 {
+        chain[count] = probe
+        count += 1
+        wanted -= 1
+      }
+    }
+  }
+  used: usize = 0
+  for count > 0 {
+    count -= 1
+    if used > 0 {
+      add_text(output, &used, "/")
+    }
+    add_text(output, &used, tree_name(tree, chain[count]))
+  }
+  return output[..used]
+}
+fn tree_path(tree: *const TreeState, index: usize, output: []u8) []const u8 {
+  used := copy_text(output, tree.root[..tree.root_length])
+  relative: [4096]u8 = []
+  below := tree_relative(tree, index, relative[..])
+  if #len(below) > 0 {
+    if used > 0 && output[used - 1] != '/' {
+      add_text(output, &used, "/")
+    }
+    add_text(output, &used, below)
+  }
+  return output[..used]
+}
+fn tree_before(tree: *const TreeState, a: *const TreeNode, b: *const TreeNode) bool {
+  if a.directory != b.directory {
+    return a.directory
+  }
+  left := tree.names[#cast(usize) a.offset..#cast(usize) a.offset + #cast(usize) a.length]
+  right := tree.names[#cast(usize) b.offset..#cast(usize) b.offset + #cast(usize) b.length]
+  index: usize = 0
+  for index < #len(left) && index < #len(right) {
+    if left[index] != right[index] {
+      return left[index] < right[index]
+    }
+    index += 1
+  }
+  return #len(left) < #len(right)
+}
+// List a directory's entries below `parent` (TreeCapacity for the root),
+// directories first, and insert them after it.
+fn tree_expand(app: *App, parent: usize) {
+  tree := &app.tree
+  depth: u16 = 0
+  path: [4096]u8 = []
+  directory: []const u8 = tree.root[..tree.root_length]
+  nested := parent < tree.count
+  if nested {
+    if !tree.nodes[parent].directory || tree.nodes[parent].expanded {
+      return
+    }
+    if tree.nodes[parent].depth + 1 >= TreeDepthLimit {
+      notice(app, "The tree stops this deep; open the directory with e instead.")
+      return
+    }
+    depth = tree.nodes[parent].depth + 1
+    directory = tree_path(tree, parent, path[..])
+  }
+  storage: [8192]u8 = []
+  opened := fs.open_directory(directory, storage[..])
+  if !opened.ok {
+    notice(app, "Cannot read that directory.")
+    return
+  }
+  defer _ = fs.close_directory(&opened.directory)
+  fresh: [2048]TreeNode = []
+  count: usize = 0
+  for {
+    entry := fs.directory_next(&opened.directory)
+    if !entry.ok {
+      break
+    }
+    name := entry.name
+    if buffer.equal(name, ".git") || #len(name) >= 512 || !valid_leaf(name) || !utf8.valid(name) {
+      continue
+    }
+    if count == #len(fresh) || tree.count + count >= TreeCapacity || tree.names_used + #len(name) > TreeNameCapacity {
+      tree.limited = true
+      break
+    }
+    is_directory := entry.kind == 4
+    // Symlinks and unknown kinds: ask the file itself.
+    if entry.kind == 10 || entry.kind == 0 {
+      child: [4096]u8 = []
+      used := copy_text(child[..], directory)
+      add_text(child[..], &used, "/")
+      add_text(child[..], &used, name)
+      info := files.metadata(child[..used])
+      is_directory = info.ok && (info.mode & 61440) == 16384
+    }
+    offset := tree.names_used
+    tree.names_used += copy_text(tree.names[offset..], name)
+    fresh[count] = TreeNode{offset: #cast(u32) offset, length: #cast(u16) #len(name), depth: depth, directory: is_directory}
+    count += 1
+  }
+  for index in 1..count {
+    moving := fresh[index]
+    position := index
+    for position > 0 && tree_before(tree, &moving, &fresh[position - 1]) {
+      fresh[position] = fresh[position - 1]
+      position -= 1
+    }
+    fresh[position] = moving
+  }
+  at: usize = 0
+  if nested {
+    at = parent + 1
+    tree.nodes[parent].expanded = true
+  }
+  index := tree.count
+  for index > at {
+    index -= 1
+    tree.nodes[index + count] = tree.nodes[index]
+  }
+  for item in 0..count {
+    tree.nodes[at + item] = fresh[item]
+  }
+  tree.watch_dirty = true
+  if nested && tree.selected >= at && tree.selected < tree.count {
+    tree.selected += count
+  }
+  tree.count += count
+}
+fn tree_subtree_end(tree: *const TreeState, index: usize) usize {
+  end := index + 1
+  for end < tree.count && tree.nodes[end].depth > tree.nodes[index].depth {
+    end += 1
+  }
+  return end
+}
+fn tree_collapse(tree: *TreeState, index: usize) {
+  end := tree_subtree_end(tree, index)
+  removed := end - index - 1
+  for at in end..tree.count {
+    tree.nodes[at - removed] = tree.nodes[at]
+  }
+  tree.count -= removed
+  tree.nodes[index].expanded = false
+  tree.watch_dirty = true
+  if tree.selected > index && tree.selected < end {
+    tree.selected = index
+  }
+  else if tree.selected >= end {
+    tree.selected -= removed
+  }
+}
+// Re-read the disk, keeping open directories open and the selection.
+fn tree_reload(app: *App) {
+  tree := &app.tree
+  mark := mem.arena_mark(app.scratch)
+  defer mem.arena_rewind(app.scratch, mark)
+  remembered := (#cast(*u8) mem.arena_push_uninit(app.scratch, 131072, 1))[..131072]
+  remembered_used: usize = 0
+  selected: [4096]u8 = []
+  selected_length: usize = 0
+  if tree.selected < tree.count {
+    selected_length = copy_text(selected[..], tree_relative(tree, tree.selected, selected[..]))
+  }
+  if tree.loaded {
+    for index in 0..tree.count {
+      if tree.nodes[index].expanded {
+        relative: [4096]u8 = []
+        path := tree_relative(tree, index, relative[..])
+        if remembered_used + #len(path) + 1 <= #len(remembered) {
+          remembered_used += copy_text(remembered[remembered_used..], path)
+          remembered[remembered_used] = 0
+          remembered_used += 1
+        }
+      }
+    }
+  }
+  tree.count = 0
+  tree.names_used = 0
+  tree.selected = 0
+  tree.limited = false
+  tree.loaded = true
+  tree.stale = false
+  tree_expand(app, TreeCapacity)
+  index: usize = 0
+  for index < tree.count {
+    if tree.nodes[index].directory {
+      relative: [4096]u8 = []
+      path := tree_relative(tree, index, relative[..])
+      at: usize = 0
+      for at < remembered_used {
+        end := at
+        for remembered[end] != 0 {
+          end += 1
+        }
+        if buffer.equal(remembered[at..end], path) {
+          tree_expand(app, index)
+          break
+        }
+        at = end + 1
+      }
+    }
+    index += 1
+  }
+  if selected_length > 0 {
+    _ = tree_reveal_relative(app, selected[..selected_length])
+  }
+}
+// Expand down to a path below the root and select it. False when absent.
+fn tree_reveal_relative(app: *App, relative: []const u8) bool {
+  tree := &app.tree
+  parent := TreeCapacity
+  start: usize = 0
+  found := false
+  for start < #len(relative) {
+    end := start
+    for end < #len(relative) && relative[end] != '/' {
+      end += 1
+    }
+    component := relative[start..end]
+    depth: u16 = 0
+    first: usize = 0
+    if parent < tree.count {
+      tree_expand(app, parent)
+      depth = tree.nodes[parent].depth + 1
+      first = parent + 1
+    }
+    found = false
+    index := first
+    for index < tree.count && (parent == TreeCapacity || tree.nodes[index].depth >= depth) {
+      if tree.nodes[index].depth == depth && buffer.equal(tree_name(tree, index), component) {
+        found = true
+        break
+      }
+      index += 1
+    }
+    if !found {
+      return false
+    }
+    parent = index
+    start = end + 1
+  }
+  if found {
+    tree.selected = parent
+  }
+  return found
+}
+// Select the active file when it lies under the root.
+fn tree_reveal_current(app: *App) {
+  name := files.name(&app.documents.slots[app.documents.active].file)
+  root := app.tree.root[..app.tree.root_length]
+  if #len(name) <= #len(root) + 1 || !buffer.equal(name[..#len(root)], root) || name[#len(root)] != '/' {
+    return
+  }
+  _ = tree_reveal_relative(app, name[#len(root) + 1..])
+}
+fn tree_set_root(app: *App, path: []const u8) {
+  app.tree.root_length = copy_text(app.tree.root[..], path)
+  for app.tree.root_length > 1 && app.tree.root[app.tree.root_length - 1] == '/' {
+    app.tree.root_length -= 1
+  }
+  app.tree.loaded = false
+  app.tree.selected = 0
+  tree_reload(app)
+}
+// Space e with the tree style: focus the tree, or hand focus back.
+fn tree_toggle(app: *App) {
+  tree := &app.tree
+  if app.prompt_state.panel == Panel.Tree {
+    tree_unfocus(app)
+    return
+  }
+  project := app.workspace.project[..app.workspace.project_length]
+  if !tree.root_custom && !buffer.equal(tree.root[..tree.root_length], project) {
+    tree_set_root(app, project)
+  }
+  else if !tree.loaded || tree.stale {
+    tree_reload(app)
+  }
+  tree.open = true
+  tree_reveal_current(app)
+  app.prompt_state.panel = Panel.Tree
+}
+// Escape: a docked tree stays in view; a floating one closes.
+fn tree_unfocus(app: *App) {
+  if !tree_docked(app) {
+    app.tree.open = false
+  }
+  app.prompt_state.panel = Panel.None
+}
+fn tree_close(app: *App) {
+  app.tree.open = false
+  if app.prompt_state.panel == Panel.Tree {
+    app.prompt_state.panel = Panel.None
+  }
+}
+// Enter on a node: directories fold and unfold, files open in the editor.
+fn tree_activate(app: *App, index: usize, toggle: bool) {
+  tree := &app.tree
+  if index >= tree.count {
+    return
+  }
+  tree.selected = index
+  if tree.nodes[index].directory {
+    if tree.nodes[index].expanded {
+      if toggle {
+        tree_collapse(tree, index)
+      }
+    }
+    else {
+      tree_expand(app, index)
+    }
+    return
+  }
+  path: [4096]u8 = []
+  full := tree_path(tree, index, path[..])
+  tree_unfocus(app)
+  open_file(app, full)
+}
+fn tree_parent_index(tree: *const TreeState, index: usize) usize {
+  if index >= tree.count || tree.nodes[index].depth == 0 {
+    return TreeCapacity
+  }
+  probe := index
+  for probe > 0 {
+    probe -= 1
+    if tree.nodes[probe].depth < tree.nodes[index].depth {
+      return probe
+    }
+  }
+  return TreeCapacity
+}
+fn tree_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
+  tree := &app.tree
+  shift := (modifiers & ModShift) != 0
+  control := (modifiers & ModCtrl) != 0
+  page := tree.rows
+  if page < 2 {
+    page = 2
+  }
+  if key == KeyEscape {
+    tree_unfocus(app)
+    return
+  }
+  if control {
+    if key == KeyD || key == KeyU {
+      half := page / 2
+      if key == KeyD {
+        tree.selected += half
+      }
+      else if tree.selected > half {
+        tree.selected -= half
+      }
+      else {
+        tree.selected = 0
+      }
+    }
+  }
+  else if key == KeyQ {
+    tree_close(app)
+  }
+  else if key == KeyJ || key == KeyDown {
+    tree.selected += 1
+  }
+  else if key == KeyK || key == KeyUp {
+    if tree.selected > 0 {
+      tree.selected -= 1
+    }
+  }
+  else if key == KeyPageDown {
+    tree.selected += page
+  }
+  else if key == KeyPageUp {
+    if tree.selected > page {
+      tree.selected -= page
+    }
+    else {
+      tree.selected = 0
+    }
+  }
+  else if (key == KeyG && shift) || key == KeyEnd {
+    tree.selected = tree.count
+  }
+  else if key == KeyG || key == KeyHome {
+    tree.selected = 0
+  }
+  else if key == KeyReturn {
+    tree_activate(app, tree.selected, true)
+    return
+  }
+  else if key == KeyL || key == KeyRight {
+    if tree.selected < tree.count && tree.nodes[tree.selected].directory && tree.nodes[tree.selected].expanded {
+      if tree.selected + 1 < tree.count && tree.nodes[tree.selected + 1].depth > tree.nodes[tree.selected].depth {
+        tree.selected += 1
+      }
+    }
+    else {
+      tree_activate(app, tree.selected, false)
+      return
+    }
+  }
+  else if key == KeyH || key == KeyLeft {
+    if tree.selected < tree.count && tree.nodes[tree.selected].directory && tree.nodes[tree.selected].expanded {
+      tree_collapse(tree, tree.selected)
+    }
+    else {
+      parent := tree_parent_index(tree, tree.selected)
+      if parent < tree.count {
+        tree.selected = parent
+      }
+    }
+  }
+  else if key == KeyBackspace || key == KeyMinus {
+    // Up a level: the old root stays open inside the new one.
+    root: [4096]u8 = []
+    length := copy_text(root[..], tree.root[..tree.root_length])
+    parent := explorer_parent_length(root[..length])
+    if parent < length {
+      leaf_start := parent
+      if leaf_start < length && root[leaf_start] == '/' {
+        leaf_start += 1
+      }
+      leaf: [512]u8 = []
+      leaf_length := copy_text(leaf[..], root[leaf_start..length])
+      tree.root_custom = true
+      tree_set_root(app, root[..parent])
+      _ = tree_reveal_relative(app, leaf[..leaf_length])
+      if tree.selected < tree.count {
+        tree_expand(app, tree.selected)
+      }
+    }
+  }
+  else if key == KeyPeriod {
+    if tree.selected < tree.count && tree.nodes[tree.selected].directory {
+      path: [4096]u8 = []
+      chosen := tree_path(tree, tree.selected, path[..])
+      tree.root_custom = true
+      tree_set_root(app, chosen)
+    }
+  }
+  else if key == KeyR {
+    tree_reload(app)
+    notice(app, "Tree reloaded.")
+  }
+  else if key == KeyE {
+    // File operations live in the editable explorer, opened on the
+    // selected directory (or the selected file's directory).
+    path: [4096]u8 = []
+    length: usize = 0
+    if tree.selected < tree.count {
+      target := tree.selected
+      if !tree.nodes[target].directory {
+        target = tree_parent_index(tree, target)
+      }
+      length = copy_text(path[..], tree_path(tree, target, path[..]))
+    }
+    else {
+      length = copy_text(path[..], tree.root[..tree.root_length])
+    }
+    app.directory_state.length = copy_text(app.directory_state.path[..], path[..length])
+    explorer_buffer_open(app)
+    return
+  }
+  else if key == KeyColon || (key == KeySemicolon && shift) {
+    panel(app, Panel.Commands)
+    return
+  }
+  else if key == KeySpace {
+    panel(app, Panel.Leader)
+    return
+  }
+  if tree.count == 0 {
+    tree.selected = 0
+  }
+  else if tree.selected >= tree.count {
+    tree.selected = tree.count - 1
+  }
+}
+fn draw_tree(renderer: rawptr, app: *App, typography: *Typography, width: i32, height: i32) {
+  tree := &app.tree
+  if !tree.loaded {
+    return
+  }
+  if tree.stale {
+    tree_reload(app)
+  }
+  ui := &app.ui
+  ui_panel_begin(ui, typography)
+  scale := typography.scale
+  line := typography.line
+  padding := 10.0 * scale
+  focused := app.prompt_state.panel == Panel.Tree
+  natural := sdl.Rect{x: #cast(f32) width * 0.04, y: #cast(f32) height * 0.1, width: #cast(f32) width * 0.32, height: #cast(f32) height * 0.8}
+  rect := place_rect(app, SurfaceExplorer, width, height, 0.0, scale, natural)
+  tree.rect = rect
+  rows: usize = 1
+  room := (rect.height - padding * 2.0 - line * 1.5) / line
+  if room > 1.0 {
+    rows = #cast(usize) room
+  }
+  tree.rows = rows
+  frame := ui_make(ui, ui_hash(0, "tree"), UiFloating | UiBackground | UiBorder | UiClip)
+  ui.boxes[frame].floating[0] = rect.x
+  ui.boxes[frame].floating[1] = rect.y
+  ui.boxes[frame].fill = theme().surface
+  ui.boxes[frame].padding[0] = padding
+  ui.boxes[frame].padding[1] = padding
+  ui_size(ui, frame, UiAxisX, UiSizeKind.Pixels, rect.width / scale, 1.0)
+  ui_size(ui, frame, UiAxisY, UiSizeKind.Pixels, rect.height / scale, 1.0)
+  ui_push(ui, frame)
+  root := tree.root[..tree.root_length]
+  leaf := #len(root)
+  for leaf > 0 && root[leaf - 1] != '/' {
+    leaf -= 1
+  }
+  title: [600]u8 = []
+  title_length := copy_text(title[..], root[leaf..])
+  if tree.limited {
+    add_text(title[..], &title_length, "  [limited]")
+  }
+  heading_flags: u32 = UiMuted
+  if focused {
+    heading_flags = 0
+  }
+  heading := ui_label(ui, "title", title[..title_length], heading_flags)
+  ui_size(ui, heading, UiAxisX, UiSizeKind.Percent, 1.0, 0.0)
+  gap := ui_make(ui, ui_key(ui, "gap"), 0)
+  ui_size(ui, gap, UiAxisY, UiSizeKind.Pixels, line * 0.5 / scale, 1.0)
+  list := ui_make(ui, ui_key(ui, "list"), UiClip | UiScroll)
+  ui_size(ui, list, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
+  ui_size(ui, list, UiAxisY, UiSizeKind.Pixels, line * #cast(f32) rows / scale, 1.0)
+  follow := tree.selected != tree.drawn_selected || tree.count != tree.drawn_count
+  tree.drawn_selected = tree.selected
+  tree.drawn_count = tree.count
+  ui_list_scroll(app, ui, list, tree.count, tree.selected, line * #cast(f32) rows, false, follow)
+  window := ui_list_window(ui, list, tree.count, line * #cast(f32) rows)
+  ui_push(ui, list)
+  ui_spacer(ui, "above", #cast(f32) window.first * line)
+  // Terminal cells cannot draw the icon shapes; the arrows mark folders.
+  icons := app.config.explorer_icons && !sdl.tui_active()
+  for row in window.first..window.last {
+    node := &tree.nodes[row]
+    label: [600]u8 = []
+    length: usize = 0
+    if node.directory && node.expanded {
+      add_text(label[..], &length, "▾ ")
+    }
+    else if node.directory {
+      add_text(label[..], &length, "▸ ")
+    }
+    else {
+      add_text(label[..], &length, "  ")
+    }
+    if icons {
+      add_text(label[..], &length, "   ")
+    }
+    add_text(label[..], &length, tree_name(tree, row))
+    if node.directory {
+      add_text(label[..], &length, "/")
+    }
+    relative: [4096]u8 = []
+    item := ui_make(ui, ui_hash(ui.boxes[list].key, tree_relative(tree, row, relative[..])), UiClickable | UiHover | UiText)
+    ui_text_set(ui, item, label[..length])
+    ui.boxes[item].value = row
+    ui.boxes[item].padding[0] = typography.cell * (1.0 + 2.0 * #cast(f32) node.depth)
+    ui_size(ui, item, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
+    ui_size(ui, item, UiAxisY, UiSizeKind.Pixels, line / scale, 1.0)
+    ui_animate(app, ui, item, row == tree.selected && focused)
+  }
+  ui_spacer(ui, "below", #cast(f32) (tree.count - window.last) * line)
+  if tree.count == 0 {
+    _ = ui_label(ui, "empty", "(empty or unreadable)", UiMuted)
+  }
+  ui_pop(ui)
+  ui_pop(ui)
+  ui_layout(ui)
+  ui_render(renderer, ui, typography, width, height)
+  if !icons {
+    return
+  }
+  area := ui.boxes[list].rect
+  clip := sdl.PixelRect{x: #cast(i32) area.x, y: #cast(i32) area.y, width: #cast(i32) area.width, height: #cast(i32) area.height}
+  if !sdl.clip(renderer, &clip) {
+    #panic("tree icon clip")
+  }
+  child := ui.boxes[list].first
+  for child != 0 {
+    item := &ui.boxes[child]
+    if (item.flags & UiClickable) != 0 && item.value < tree.count {
+      node := &tree.nodes[item.value]
+      explorer_icon(renderer, typography, tree_name(tree, item.value), node.directory, item.rect.x + item.padding[0] + typography.cell * 2.0, item.rect.y)
+    }
+    child = item.next
+  }
+  if !sdl.clip(renderer, nil) {
+    #panic("tree icon clip reset")
+  }
+}
+// Clicks inside the tree: select and focus; folders fold, files open.
+// Returns true when the tree took the event.
+fn tree_mouse(app: *App, typography: *Typography, x: f32, y: f32, pressed: bool, moved: bool, clicks: u8) bool {
+  tree := &app.tree
+  if !tree_open(app) || (app.prompt_state.panel != Panel.Tree && app.prompt_state.panel != Panel.None) {
+    tree.pointer_inside = false
+    return false
+  }
+  inside := ui_contains(tree.rect, x, y)
+  tree.pointer_inside = inside
+  if moved {
+    if inside && !app.pointer.dragging {
+      ui_pointer(&app.ui, x, y)
+      return true
+    }
+    return false
+  }
+  if !pressed {
+    return inside && !app.pointer.dragging
+  }
+  if !inside {
+    // Clicking the editor hands focus back to it.
+    if app.prompt_state.panel == Panel.Tree {
+      tree_unfocus(app)
+    }
+    return false
+  }
+  app.prompt_state.panel = Panel.Tree
+  hit := ui_hit(&app.ui, x, y)
+  if hit != 0 && app.ui.boxes[hit].value < tree.count {
+    tree_activate(app, app.ui.boxes[hit].value, true)
+  }
+  return true
+}
+// The wheel over the tree moves its list, focused or not.
+fn tree_wheel(app: *App, amount: f32) bool {
+  if !tree_open(app) || !app.tree.pointer_inside {
+    return false
+  }
+  app.ui.wheel += amount
+  return true
+}
+// Keep the tree in step with the disk while it is open: watch the root and
+// every open folder, and reload when one of them changes. True on a reload.
+fn tree_tick(app: *App) bool {
+  tree := &app.tree
+  if !tree_open(app) || !tree.loaded {
+    tree_release(app)
+    return false
+  }
+  if tree.watcher == nil {
+    tree.watcher = directory_watch_open()
+    tree.watch_dirty = true
+    if tree.watcher == nil {
+      return false
+    }
+  }
+  if tree.watch_dirty {
+    tree.watch_dirty = false
+    directory_watch_clear(tree.watcher)
+    path: [4096]u8 = []
+    length := copy_text(path[..4095], tree.root[..tree.root_length])
+    path[length] = 0
+    _ = directory_watch_add(tree.watcher, &path[0])
+    for index in 0..tree.count {
+      if tree.nodes[index].expanded {
+        full: [4096]u8 = []
+        used := copy_text(full[..4095], tree_path(tree, index, full[..4095]))
+        full[used] = 0
+        if directory_watch_add(tree.watcher, &full[0]) == 0 {
+          break
+        }
+      }
+    }
+  }
+  if directory_watch_poll(tree.watcher) == 0 {
+    return false
+  }
+  tree_reload(app)
+  return true
+}
+fn tree_release(app: *App) {
+  if app.tree.watcher != nil {
+    directory_watch_close(app.tree.watcher)
+    app.tree.watcher = nil
+  }
+}

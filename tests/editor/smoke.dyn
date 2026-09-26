@@ -1,0 +1,2821 @@
+// Run only when the test runner supplies an isolated fixture directory.
+fn workflow_smoke(app: *App, typography: *Typography) {
+  location: [4096]u8 = []
+  configured := process.environment("DNA_WORKFLOW_TEST", location[..])
+  if !configured.ok || !configured.found {
+    return
+  }
+  app.directory_state.length = copy_text(app.directory_state.path[..], configured.value)
+  path: [4096]u8 = []
+  initial := joined(app, "input.txt", path[..])
+  key_input(app, typography, 111, 64)
+  text_input(app, initial)
+  key_input(app, typography, 13, 0)
+  if app.prompt_state.panel != Panel.None || !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "first\nsecond\n") {
+    #panic("open workflow")
+  }
+  key_input(app, typography, 105, 0)
+  text_input(app, "edited ")
+  key_input(app, typography, 27, 0)
+  key_input(app, typography, 113, 64)
+  if app.prompt_state.panel != Panel.Quit {
+    #panic("dirty quit confirmation")
+  }
+  key_input(app, typography, 27, 0)
+  if !app.running || !buffer.dirty(app.documents.current) {
+    #panic("quit cancellation")
+  }
+  key_input(app, typography, 58, 0)
+  text_input(app, "write")
+  key_input(app, typography, 13, 0)
+  if app.prompt_state.panel != Panel.None || buffer.dirty(app.documents.current) {
+    #panic("save workflow")
+  }
+  key_input(app, typography, 47, 0)
+  text_input(app, "second")
+  key_input(app, typography, 13, 0)
+  if app.documents.current.anchor != 13 || app.documents.current.cursor != 19 {
+    #panic("search workflow")
+  }
+  key_input(app, typography, 112, 64)
+  text_input(app, "wide")
+  key_input(app, typography, 13, 0)
+  if app.view.popup_width != 0.86 || app.documents.current.anchor != 13 {
+    #panic("palette layout preserves selection")
+  }
+  action(app, typography, 8)
+  layout_storage: [4096]u8 = []
+  layout_path := joined(app, "test.dna-layout", layout_storage[..])
+  text_input(app, layout_path)
+  key_input(app, typography, 13, 0)
+  if app.prompt_state.panel != Panel.None || typography.points != 22.0 || app.view.popup_width != 0.8 || !app.view.reduced_motion {
+    #panic("layout file workflow")
+  }
+  key_input(app, typography, 101, 64)
+  action(app, typography, 18)
+  text_input(app, "created.txt")
+  key_input(app, typography, 13, 0)
+  if app.prompt_state.panel != Panel.Directory {
+    #panic("create workflow")
+  }
+  target: usize = 0
+  for target < app.directory_state.count && !buffer.equal(app.directory_state.entries[target].name[..app.directory_state.entries[target].length], "created.txt") {
+    target += 1
+  }
+  if target == app.directory_state.count {
+    #panic("created entry missing")
+  }
+  app.directory_state.selected = target
+  action(app, typography, 19)
+  text_input(app, "renamed.txt")
+  key_input(app, typography, 13, 0)
+  if app.prompt_state.panel != Panel.Directory {
+    #panic("rename workflow")
+  }
+  renamed: usize = 0
+  for renamed < app.directory_state.count && !buffer.equal(app.directory_state.entries[renamed].name[..app.directory_state.entries[renamed].length], "renamed.txt") {
+    renamed += 1
+  }
+  if renamed == app.directory_state.count {
+    #panic("renamed entry missing")
+  }
+  app.directory_state.selected = renamed
+  action(app, typography, 20)
+  if app.prompt_state.panel != Panel.Trash {
+    #panic("trash confirmation")
+  }
+  key_input(app, typography, 27, 0)
+  action(app, typography, 7)
+  app.directory_state.selected = renamed
+  action(app, typography, 20)
+  key_input(app, typography, 13, 0)
+  if app.prompt_state.panel != Panel.Directory {
+    #panic("trash workflow")
+  }
+  trash_storage: [4096]u8 = []
+  trashed := joined(app, ".dna-trash/renamed.txt", trash_storage[..])
+  if !files.metadata(trashed).ok {
+    #panic("recoverable trash missing")
+  }
+  app.prompt_state.panel = Panel.None
+  // Layout/zoom must produce real multiline font geometry.
+  if !ttf.set(typography.document, &app.documents.current.bytes[0], app.documents.current.length) {
+    #panic("smoke text")
+  }
+  width: i32 = 0
+  height: i32 = 0
+  if !ttf.size(typography.document, &width, &height) || #cast(f32) height < typography.line * 2.0 {
+    #panic("multiline geometry")
+  }
+  typography.points = 30.0
+  resize_font(typography)
+  larger: i32 = 0
+  if !ttf.size(typography.document, &width, &larger) || larger <= height {
+    #panic("font zoom")
+  }
+  typography.points = 20.0
+  resize_font(typography)
+}
+fn whitespace_smoke(app: *App, typography: *Typography) {
+  doc := app.documents.current
+  _ = buffer.load(doc, "a")
+  app.view.insert = true
+  buffer.move_to(doc, 1, false)
+  text_input(app, " ")
+  if !ttf.set(typography.document, &doc.bytes[0], doc.length) {
+    #panic("space text update")
+  }
+  first := ttf.Substring{}
+  if !ttf.substring(typography.document, #cast(i32) doc.cursor, &first) {
+    #panic("space cursor")
+  }
+  text_input(app, " ")
+  if !ttf.set(typography.document, &doc.bytes[0], doc.length) {
+    #panic("second space update")
+  }
+  second := ttf.Substring{}
+  if !ttf.substring(typography.document, #cast(i32) doc.cursor, &second) || second.x <= first.x {
+    #panic("trailing space must advance cursor")
+  }
+  text_input(app, "\n    ")
+  if !ttf.set(typography.document, &doc.bytes[0], doc.length) {
+    #panic("indent text update")
+  }
+  indent := ttf.Substring{}
+  space := ttf.Substring{}
+  if !ttf.substring(typography.document, #cast(i32) doc.cursor, &indent) || indent.x <= 0 || indent.y <= second.y {
+    #panic("indentation must advance cursor")
+  }
+  if !ttf.substring(typography.document, #cast(i32) doc.cursor - 1, &space) || space.width <= 0 {
+    #panic("selected trailing space must have width")
+  }
+  if !buffer.equal(doc.bytes[..doc.length], "a  \n    ") {
+    #panic("spaces must remain in document")
+  }
+  _ = buffer.load(doc, "")
+  app.view.insert = false
+}
+fn session_smoke(app: *App, typography: *Typography) {
+  original := app.documents.active
+  original_doc := app.documents.current
+  buffer.move_to(original_doc, 2, false)
+  app.view.scroll_y = 30.0
+  _ = buffer.replace(original_doc, "first edit")
+  buffer.checkpoint(original_doc)
+  key_input(app, typography, 58, 0)
+  text_input(app, "enew")
+  key_input(app, typography, 13, 0)
+  if app.documents.current == original_doc || app.documents.count != 2 {
+    #panic("new buffer must retain old document")
+  }
+  second := app.documents.active
+  _ = buffer.replace(app.documents.current, "second edit")
+  buffer.checkpoint(app.documents.current)
+  key_input(app, typography, 32, 0)
+  key_input(app, typography, 112, 0)
+  if app.documents.active != original || app.view.scroll_y != 30.0 || !buffer.dirty(app.documents.current) {
+    #panic("buffer view restoration")
+  }
+  buffer.undo(app.documents.current)
+  if buffer.dirty(app.documents.current) {
+    #panic("independent undo")
+  }
+  activate(app, second)
+  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "second edit") {
+    #panic("other buffer edits retained")
+  }
+  key_input(app, typography, 32, 0)
+  key_input(app, typography, 99, 0)
+  if app.prompt_state.panel != Panel.Quit || !app.documents.closing_one {
+    #panic("dirty close confirmation")
+  }
+  key_input(app, typography, 27, 0)
+  if app.documents.count != 2 {
+    #panic("close cancellation")
+  }
+  action(app, typography, 24)
+  key_input(app, typography, 100, 0)
+  if app.documents.count != 1 || app.documents.active != original {
+    #panic("close only selected buffer")
+  }
+  // Quit must discover edits in an inactive buffer.
+  _ = buffer.replace(app.documents.current, "unsaved")
+  _ = new_buffer(app)
+  request_quit(app)
+  if app.prompt_state.panel != Panel.Quit || app.documents.active != original || !app.running {
+    #panic("hidden dirty buffer quit")
+  }
+  key_input(app, typography, 27, 0)
+  _ = buffer.load(app.documents.current, app.documents.current.saved[..app.documents.current.saved_length])
+  next_buffer(app, false)
+  close_clean(app)
+  app.view.scroll_y = 0.0
+  app.view.insert = false
+  app.view.extend = false
+  // Palette toggles remain accessible without control modifiers.
+  key_input(app, typography, 59, 1)
+  text_input(app, "toggle status line")
+  key_input(app, typography, 13, 0)
+  if app.view.status_line {
+    #panic("status toggle")
+  }
+  action(app, typography, 26)
+}
+fn completion_smoke(app: *App, typography: *Typography) {
+  storage: [4096]u8 = []
+  directory := process.environment("DNA_WORKFLOW_TEST", storage[..])
+  if !directory.ok || !directory.found {
+    return
+  }
+  old := app.documents.active
+  before := app.documents.count
+  key_input(app, typography, 32, 0)
+  key_input(app, typography, 102, 0)
+  if app.prompt_state.panel != Panel.Open {
+    #panic("leader open")
+  }
+  text_input(app, directory.value)
+  text_input(app, "/sub")
+  if app.completion.count != 1 || app.completion.entries[0].directory || !buffer.equal(app.completion.entries[0].name[..app.completion.entries[0].length], "subdir/other.txt") {
+    #panic("flat file suggestions")
+  }
+  key_input(app, typography, 9, 0)
+  if !contains(app.prompt_state.text[..app.prompt_state.length], "subdir/other.txt") {
+    #panic("Tab file completion")
+  }
+  key_input(app, typography, 13, 0)
+  if app.prompt_state.panel != Panel.None || !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "other file\n") || app.documents.count != before + 1 {
+    #panic("file completion and new buffer")
+  }
+  open_file(app, files.name(app.documents.file))
+  if app.documents.count != before + 1 {
+    #panic("duplicate open buffer")
+  }
+  key_input(app, typography, 32, 0)
+  key_input(app, typography, 98, 0)
+  text_input(app, "input.txt")
+  key_input(app, typography, 13, 0)
+  if app.documents.active != old {
+    #panic("filtered buffer switcher")
+  }
+  next_buffer(app, false)
+  close_clean(app)
+  app.view.insert = false
+  app.prompt_state.panel = Panel.None
+  untouched := app.documents.current.length
+  original_cursor := app.documents.current.cursor
+  key_input(app, typography, 32, 0)
+  key_input(app, typography, 111, 0)
+  if app.prompt_state.panel != Panel.Leader || app.documents.current.length != untouched || app.documents.current.cursor != original_cursor {
+    #panic("Space o must be unbound")
+  }
+  key_input(app, typography, 27, 0)
+  // The goto menu is non-mutating until a destination is selected.
+  buffer.move_to(app.documents.current, 3, false)
+  app.view.insert = false
+  app.prompt_state.panel = Panel.None
+  key_input(app, typography, 103, 0)
+  if app.prompt_state.panel != Panel.Goto || app.documents.current.cursor != 3 {
+    #panic("goto menu must not jump immediately")
+  }
+  key_input(app, typography, 27, 0)
+  if app.prompt_state.panel != Panel.None || app.documents.current.cursor != 3 {
+    #panic("goto cancel")
+  }
+  key_input(app, typography, 103, 0)
+  key_input(app, typography, 103, 0)
+  if app.prompt_state.panel != Panel.None || app.documents.current.cursor != 0 {
+    #panic("gg first line")
+  }
+  key_input(app, typography, 103, 0)
+  key_input(app, typography, 101, 0)
+  if app.documents.current.cursor != app.documents.current.length {
+    #panic("ge end")
+  }
+  // Pickers live on Space b / Space f; g b and g f follow Helix (screen
+  // bottom, file under cursor).
+  key_input(app, typography, 32, 0)
+  key_input(app, typography, 98, 0)
+  if app.prompt_state.panel != Panel.Buffers {
+    #panic("space buffer picker")
+  }
+  text_input(app, "no-such-buffer")
+  key_input(app, typography, 13, 0)
+  if app.prompt_state.panel != Panel.Buffers {
+    #panic("empty buffer result")
+  }
+  key_input(app, typography, 27, 0)
+  key_input(app, typography, 32, 0)
+  key_input(app, typography, 102, 0)
+  if app.prompt_state.panel != Panel.Open {
+    #panic("space file picker")
+  }
+  text_input(app, directory.value)
+  text_input(app, "/oth")
+  if app.completion.count != 1 || app.completion.entries[0].directory {
+    #panic("recursive filename query")
+  }
+  visited := app.picker_state.index.visited
+  text_input(app, "r")
+  if app.completion.count != 1 || app.picker_state.index.visited != visited {
+    #panic("fuzzy picker query cache")
+  }
+  key_input(app, typography, 27, 0)
+  expanded: [4096]u8 = []
+  home: [4096]u8 = []
+  env := process.environment("HOME", home[..])
+  result := expand_home("~/", expanded[..])
+  if env.ok && env.found && (#len(result) != #len(env.value) + 1 || !buffer.equal(result[..#len(env.value)], env.value)) {
+    #panic("home expansion")
+  }
+}
+fn explorer_smoke(app: *App, typography: *Typography) {
+  configured_storage: [4096]u8 = []
+  configured := process.environment("DNA_WORKFLOW_TEST", configured_storage[..])
+  if !configured.ok || !configured.found {
+    return
+  }
+  root: [4096]u8 = []
+  root_length := copy_text(root[..], configured.value)
+  add_text(root[..], &root_length, "/explorer")
+  app.directory_state.length = copy_text(app.directory_state.path[..], root[..root_length])
+  app.prompt_state.panel = Panel.Directory
+  directory_refresh(app)
+  doc := app.explorer.document
+  if doc == nil {
+    #panic("editable explorer allocation")
+  }
+  app.config.explorer_columns = true
+  app.config.explorer_preview = true
+  app.config.explorer_icons = true
+  explorer_context_reset(app)
+  if !app.directory_state.entries[0].directory || app.explorer.context.parent_selected >= app.explorer.context.parent_count {
+    #panic("explorer directories first and parent context")
+  }
+  if !buffer.find(doc, "keep/", false) {
+    #panic("directory navigation fixture")
+  }
+  buffer.move_to(doc, buffer.start(doc), false)
+  explorer_context_preview(app)
+  if !app.explorer.context.preview_directory || app.explorer.context.child_count != 1 {
+    #panic("directory preview")
+  }
+  key_input(app, typography, 13, 0)
+  if !contains(app.directory_state.path[..app.directory_state.length], "/keep") {
+    #panic("explorer Enter directory")
+  }
+  key_input(app, typography, 8, 0)
+  if !buffer.equal(app.directory_state.path[..app.directory_state.length], root[..root_length]) || buffer.row_id(doc, doc.cursor) != app.directory_state.selected + 1 || !buffer.equal(app.directory_state.entries[app.directory_state.selected].name[..app.directory_state.entries[app.directory_state.selected].length], "keep") {
+    #panic("explorer parent restores selected child")
+  }
+  if !buffer.find(doc, "alpha.txt", false) {
+    #panic("file preview fixture")
+  }
+  buffer.move_to(doc, buffer.start(doc), false)
+  explorer_context_preview(app)
+  if app.explorer.context.preview_directory || !contains(app.explorer.context.preview[..app.explorer.context.preview_length], "alpha contents") {
+    #panic("file preview")
+  }
+  old_position := doc.cursor
+  key_input(app, typography, 108, 0)
+  key_input(app, typography, 108, 0)
+  if !buffer.equal(app.directory_state.path[..app.directory_state.length], root[..root_length]) || doc.cursor <= old_position {
+    #panic("Helix l must edit filenames")
+  }
+  key_input(app, typography, 104, 0)
+  if app.prompt_state.panel != Panel.Directory || !buffer.equal(app.directory_state.path[..app.directory_state.length], root[..root_length]) {
+    #panic("Helix h must not navigate parent")
+  }
+
+  opened_storage: [4096]u8 = []
+  opened_path := joined(app, "alpha.txt", opened_storage[..])
+  open_file(app, opened_path)
+  explorer_open(app)
+  original_length := doc.length
+  key_input(app, typography, 32, 0)
+  key_input(app, typography, 111, 0)
+  if app.prompt_state.panel != Panel.Leader || !app.input_state.leader_explorer || doc.length != original_length || buffer.dirty(doc) {
+    #panic("explorer Space o must not insert a line")
+  }
+  key_input(app, typography, 27, 0)
+  if app.prompt_state.panel != Panel.Directory {
+    #panic("explorer Space escape")
+  }
+  file_buffers := app.documents.count
+  file_document := app.documents.current
+  key_input(app, typography, 32, 0)
+  key_input(app, typography, 99, 0)
+  if app.prompt_state.panel != Panel.None || app.documents.count != file_buffers || app.documents.current != file_document {
+    #panic("explorer menu must not close the file underneath")
+  }
+  explorer_open(app)
+  selected_before := doc.cursor
+  key_input(app, typography, 103, 0)
+  if app.prompt_state.panel != Panel.Goto || !app.input_state.goto_explorer {
+    #panic("explorer goto menu")
+  }
+  key_input(app, typography, 27, 0)
+  if app.prompt_state.panel != Panel.Directory || doc.cursor != selected_before {
+    #panic("explorer goto cancel")
+  }
+  // Rename using the real insert-mode path; the row id remains unchanged.
+  if !buffer.find(doc, "alpha.txt", false) {
+    #panic("explorer fixture")
+  }
+  key_input(app, typography, 99, 0)
+  text_input(app, "renamed.txt")
+  key_input(app, typography, 27, 0)
+  if !explorer_dirty(app) || app.prompt_state.panel != Panel.Directory || app.explorer.insert {
+    #panic("explorer insert mode")
+  }
+  key_input(app, typography, 117, 0)
+  if explorer_dirty(app) {
+    #panic("explorer undo")
+  }
+  key_input(app, typography, 117, 1)
+  if !explorer_dirty(app) {
+    #panic("explorer redo")
+  }
+  // New rows create files; deleted existing rows go to trash.
+  buffer.move_to(doc, doc.length, false)
+  key_input(app, typography, 105, 0)
+  text_input(app, "created.txt\n")
+  key_input(app, typography, 27, 0)
+  if !buffer.find(doc, "delete.txt", false) {
+    #panic("trash fixture")
+  }
+  key_input(app, typography, 120, 0)
+  key_input(app, typography, 100, 0)
+  key_input(app, typography, 27, 0)
+  if app.prompt_state.panel != Panel.None || !explorer_dirty(app) {
+    #panic("dismiss keeps draft")
+  }
+  action(app, typography, 7)
+  if !explorer_dirty(app) || app.prompt_state.panel != Panel.Directory {
+    #panic("reopen keeps draft")
+  }
+  key_input(app, typography, 58, 0)
+  text_input(app, "write")
+  key_input(app, typography, 13, 0)
+  if app.prompt_state.panel != Panel.DirectoryApply || app.explorer.edit_count != 3 {
+    #panic("directory plan preview")
+  }
+  existing_storage: [4096]u8 = []
+  existing := joined(app, "alpha.txt", existing_storage[..])
+  created_storage: [4096]u8 = []
+  created := joined(app, "created.txt", created_storage[..])
+  if !files.metadata(existing).ok || files.metadata(created).ok {
+    #panic("preview mutated disk")
+  }
+  key_input(app, typography, 27, 0)
+  if app.prompt_state.panel != Panel.Directory || !explorer_dirty(app) {
+    #panic("cancel preview keeps edits")
+  }
+  explorer_preview(app)
+  key_input(app, typography, 13, 0)
+  if app.prompt_state.panel != Panel.Directory || explorer_dirty(app) || files.metadata(existing).ok || !files.metadata(created).ok {
+    #panic("apply staged explorer edits")
+  }
+  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "alpha contents") || !contains(files.name(app.documents.file), "/renamed.txt") {
+    #panic("rename must update open buffer path")
+  }
+  close_clean(app)
+  app.prompt_state.panel = Panel.Directory
+  // Directory deletion stages a recoverable move, including nonempty children.
+  child_storage: [4096]u8 = []
+  child_path := joined(app, "keep/child.txt", child_storage[..])
+  open_file(app, child_path)
+  buffer.checkpoint(app.documents.current)
+  _ = buffer.replace(app.documents.current, "unsaved")
+  buffer.checkpoint(app.documents.current)
+  app.prompt_state.panel = Panel.Directory
+  if !buffer.find(doc, "keep/", false) {
+    #panic("directory row fixture")
+  }
+  buffer.select_line(doc)
+  _ = buffer.replace(doc, "")
+  explorer_preview(app)
+  if app.prompt_state.panel != Panel.Message {
+    #panic("directory deletion must protect dirty child")
+  }
+  buffer.undo(app.documents.current)
+  explorer_preview(app)
+  if app.prompt_state.panel != Panel.DirectoryApply || !files.metadata(child_path).ok {
+    #panic("directory trash preview")
+  }
+  key_input(app, typography, 27, 0)
+  if !files.metadata(child_path).ok || !explorer_dirty(app) {
+    #panic("directory trash cancel")
+  }
+  explorer_preview(app)
+  key_input(app, typography, 13, 0)
+  if app.prompt_state.panel != Panel.Directory || files.metadata(child_path).ok || !contains(files.name(app.documents.file), "/.dna-trash/keep/child.txt") {
+    #panic("directory trash apply and child path")
+  }
+  close_clean(app)
+  app.prompt_state.panel = Panel.Directory
+  // Duplicate destinations fail; bracket-prefixed names are ordinary filenames.
+  buffer.move_to(doc, doc.length, false)
+  _ = buffer.replace(doc, "created.txt\n")
+  if #len(explorer_plan(app)) == 0 {
+    #panic("duplicate destination accepted")
+  }
+  explorer_load(app)
+  buffer.move_to(doc, doc.length, false)
+  _ = buffer.replace(doc, "[1] extra.txt\n")
+  if #len(explorer_plan(app)) != 0 || app.explorer.edit_count != 1 {
+    #panic("literal bracket filename rejected")
+  }
+  explorer_load(app)
+  // New trailing-slash rows stage directories, sharing the filename namespace.
+  buffer.move_to(doc, doc.length, false)
+  _ = buffer.replace(doc, "new-folder/\n")
+  explorer_preview(app)
+  if app.prompt_state.panel != Panel.DirectoryApply || app.explorer.edit_count != 1 || app.explorer.edits[0].kind != FileAction.CreateDirectory {
+    #panic("folder creation preview")
+  }
+  folder_storage: [4096]u8 = []
+  folder_path := joined(app, "new-folder", folder_storage[..])
+  if files.metadata(folder_path).ok {
+    #panic("folder created before confirmation")
+  }
+  key_input(app, typography, 27, 0)
+  if !explorer_dirty(app) || files.metadata(folder_path).ok {
+    #panic("folder preview cancellation")
+  }
+  explorer_preview(app)
+  explorer_apply(app)
+  folder_info := files.metadata(folder_path)
+  if !folder_info.ok || (folder_info.mode & 61440) != 16384 || explorer_dirty(app) {
+    #panic("folder creation apply")
+  }
+  buffer.move_to(doc, doc.length, false)
+  _ = buffer.replace(doc, "new-folder\n")
+  if #len(explorer_plan(app)) == 0 {
+    #panic("file folder duplicate accepted")
+  }
+  explorer_load(app)
+  buffer.move_to(doc, doc.length, false)
+  _ = buffer.replace(doc, "nested/child/\n")
+  if #len(explorer_plan(app)) == 0 {
+    #panic("nested folder path accepted")
+  }
+  explorer_load(app)
+  // External collision after preview is rechecked on Enter.
+  buffer.move_to(doc, doc.length, false)
+  _ = buffer.replace(doc, "collision.txt\n")
+  explorer_preview(app)
+  if app.prompt_state.panel != Panel.DirectoryApply {
+    #panic("collision preview")
+  }
+  collision_storage: [4096]u8 = []
+  collision := joined(app, "collision.txt", collision_storage[..])
+  if !fs.write_all(collision, "external").ok {
+    #panic("collision fixture write")
+  }
+  explorer_apply(app)
+  if app.prompt_state.panel != Panel.Message || !explorer_dirty(app) {
+    #panic("external collision not refused")
+  }
+  app.explorer.quit_after_discard = false
+  app.prompt_state.panel = Panel.DirectoryDiscard
+  key_input(app, typography, 100, 0)
+  // Source identity is rechecked after the preview, not just destination names.
+  if !buffer.find(doc, "renamed.txt", false) {
+    #panic("renamed row")
+  }
+  _ = buffer.replace(doc, "moved.txt")
+  explorer_preview(app)
+  if app.prompt_state.panel != Panel.DirectoryApply {
+    #panic("source change preview")
+  }
+  renamed_storage: [4096]u8 = []
+  renamed := joined(app, "renamed.txt", renamed_storage[..])
+  backup_storage: [4096]u8 = []
+  backup := joined(app, "external-backup.txt", backup_storage[..])
+  if !fs.rename(renamed, backup).ok || !fs.write_all(renamed, "external replacement").ok {
+    #panic("external replacement fixture")
+  }
+  explorer_apply(app)
+  if app.prompt_state.panel != Panel.Message {
+    #panic("changed source accepted")
+  }
+  if !fs.remove(renamed).ok || !fs.rename(backup, renamed).ok {
+    #panic("restore external fixture")
+  }
+  app.explorer.quit_after_discard = false
+  app.prompt_state.panel = Panel.DirectoryDiscard
+  key_input(app, typography, 100, 0)
+  // Unsaved affected documents, including a separately opened file, block apply.
+  open_file(app, renamed)
+  _ = buffer.replace(app.documents.current, "unsaved")
+  if !buffer.find(doc, "renamed.txt", false) {
+    #panic("dirty affected row")
+  }
+  _ = buffer.replace(doc, "moved.txt")
+  explorer_preview(app)
+  if app.prompt_state.panel != Panel.Message {
+    #panic("affected unsaved buffer accepted")
+  }
+  buffer.undo(app.documents.current)
+  close_clean(app)
+  app.explorer.quit_after_discard = false
+  app.prompt_state.panel = Panel.DirectoryDiscard
+  key_input(app, typography, 100, 0)
+  buffer.move_to(doc, doc.length, false)
+  key_input(app, typography, 13, 0)
+  if app.prompt_state.panel != Panel.Directory {
+    #panic("empty explorer row navigation")
+  }
+  // Directory write commands cannot accidentally save the file underneath.
+  if !buffer.find(doc, "created.txt", false) {
+    #panic("created row")
+  }
+  _ = buffer.replace(doc, "another.txt")
+  key_input(app, typography, 58, 0)
+  text_input(app, "w ")
+  text_input(app, configured.value)
+  text_input(app, "/accidental.txt")
+  key_input(app, typography, 13, 0)
+  if app.prompt_state.panel != Panel.Message {
+    #panic("explorer write path escaped context")
+  }
+  request_quit(app)
+  if app.prompt_state.panel != Panel.DirectoryDiscard || !app.running {
+    #panic("quit loses staged directory edits")
+  }
+  key_input(app, typography, 27, 0)
+  if !explorer_dirty(app) {
+    #panic("quit cancellation lost draft")
+  }
+  app.explorer.quit_after_discard = false
+  app.prompt_state.panel = Panel.DirectoryDiscard
+  key_input(app, typography, 100, 0)
+  app.prompt_state.panel = Panel.None
+}
+fn palette_smoke(app: *App) {
+  panel(app, Panel.Commands)
+  text_input(app, "write")
+  matches(app)
+  before := app.command_menu.filter_runs
+  matches(app)
+  matches(app)
+  if app.command_menu.filter_runs != before || app.prompt_state.match_count == 0 || app.prompt_state.matches[0] != 1 {
+    #panic("palette query cache or ranking")
+  }
+  text_input(app, " explorer")
+  matches(app)
+  // "write " starts path suggestions; the matching command still shows.
+  explorer_write := false
+  for index in 0..app.prompt_state.match_count {
+    explorer_write = explorer_write || app.prompt_state.matches[index] == 29
+  }
+  if app.command_menu.filter_runs != before + 1 || !explorer_write {
+    #panic("palette cache invalidation")
+  }
+  app.prompt_state.length = copy_text(app.prompt_state.text[..], "write")
+  app.explorer.commands = true
+  matches(app)
+  if app.prompt_state.match_count != 1 || app.prompt_state.matches[0] != 29 {
+    #panic("explorer command context")
+  }
+  app.explorer.commands = false
+  matches(app)
+  if app.prompt_state.matches[0] != 1 {
+    #panic("file command context restoration")
+  }
+  app.prompt_state.panel = Panel.None
+}
+
+fn viewport_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Typography) {
+  original := app.documents.active
+  if !new_buffer(app) {
+    #panic("viewport buffer")
+  }
+  text: [8192]u8 = []
+  used: usize = 0
+  row: usize = 0
+  for row < 200 {
+    add_text(text[..], &used, "aé中  \n")
+    row += 1
+  }
+  add_text(text[..], &used, "endé ")
+  doc := app.documents.current
+  _ = buffer.load(doc, text[..used])
+  // Selecting the entire document while at EOF only shapes/draws visible text.
+  doc.anchor = 0
+  doc.cursor = doc.length
+  app.view.extend = true
+  draw(renderer, window, app, typography)
+  if typography.document_start == 0 || typography.document_end != doc.length {
+    #panic("EOF viewport bounds")
+  }
+  caret := ttf.Substring{}
+  if !layout_substring(typography.layout, doc, doc.cursor, &caret) || caret.x <= 0 {
+    #panic("viewport UTF8 cursor")
+  }
+  // Shrinking and growing the window keeps the caret's line in view.
+  window_width: i32 = 0
+  window_height: i32 = 0
+  if !sdl.window_size(window, &window_width, &window_height) {
+    #panic("window size")
+  }
+  heights: [3]i32 = [window_height / 4, window_height * 2, window_height]
+  outputs: [3]i32 = []
+  for step in 0..3 {
+    wanted := heights[step]
+    if !sdl.set_window_size(window, window_width, wanted) {
+      #panic("window resize")
+    }
+    output_width: i32 = 0
+    output_height: i32 = 0
+    _ = sdl.size(renderer, &output_width, &output_height)
+    outputs[step] = output_height
+    draw(renderer, window, app, typography)
+    caret_top := #cast(f32) (line_at(doc, doc.cursor) - 1) * typography.line
+    if typography.document_end != doc.length || caret_top < app.view.scroll_y || caret_top + typography.line > app.view.scroll_y + #cast(f32) output_height {
+      #panic("resized window must keep the caret line visible")
+    }
+  }
+  if outputs[0] >= outputs[2] || outputs[1] <= outputs[2] {
+    #panic("window resize must change the drawable size")
+  }
+  // Zoom changes the viewport and must retain the end-of-line cursor geometry.
+  previous_points := typography.points
+  typography.points = 30.5
+  resize_font(typography)
+  draw(renderer, window, app, typography)
+  if typography.document_start > doc.cursor || typography.document_end != doc.length {
+    #panic("zoom viewport bounds")
+  }
+  typography.points = previous_points
+  resize_font(typography)
+  buffer.move_to(doc, 0, false)
+  app.view.extend = false
+  draw(renderer, window, app, typography)
+  if typography.document_start != 0 || typography.document_end >= doc.length || app.view.scroll_y != 0.0 {
+    #panic("return to first viewport")
+  }
+  // A newline at EOF and then an empty document must both keep a valid cursor.
+  _ = buffer.load(doc, "aé\n")
+  buffer.move_to(doc, doc.length, false)
+  draw(renderer, window, app, typography)
+  _ = buffer.load(doc, "")
+  draw(renderer, window, app, typography)
+  close_clean(app)
+  activate(app, original)
+}
+
+fn picker_render_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Typography) {
+  app.view.insert = false
+  app.prompt_state.panel = Panel.None
+  app.view.reduced_motion = true
+  key_input(app, typography, 32, 0)
+  draw(renderer, window, app, typography)
+  key_input(app, typography, 27, 0)
+  key_input(app, typography, 103, 0)
+  draw(renderer, window, app, typography)
+  key_input(app, typography, 102, 0)
+  text_input(app, "src")
+  draw(renderer, window, app, typography)
+  key_input(app, typography, 27, 0)
+  key_input(app, typography, 103, 0)
+  key_input(app, typography, 98, 0)
+  draw(renderer, window, app, typography)
+  key_input(app, typography, 27, 0)
+}
+
+fn editing_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Typography) {
+  original := app.documents.active
+  if !new_buffer(app) {
+    #panic("editing fixture")
+  }
+  doc := app.documents.current
+  _ = buffer.load(doc, "one two, aé中\nlast\n")
+  app.view.insert = false
+  app.view.extend = false
+  key_input(app, typography, 119, 0)
+  if doc.anchor != 0 || doc.cursor != 4 {
+    #panic("word selection")
+  }
+  key_input(app, typography, 59, 256)
+  if doc.cursor != 0 || doc.anchor != 4 {
+    #panic("swap selection ends")
+  }
+  key_input(app, typography, 59, 256)
+  key_input(app, typography, 118, 0)
+  key_input(app, typography, 101, 0)
+  if doc.anchor != 0 || doc.cursor != 7 {
+    #panic("extend word selection")
+  }
+  key_input(app, typography, 27, 0)
+  buffer.move_to(doc, 0, false)
+  key_input(app, typography, 51, 0)
+  key_input(app, typography, 119, 0)
+  if doc.anchor != 0 || doc.cursor != 9 {
+    #panic("counted words")
+  }
+  key_input(app, typography, 99, 0)
+  text_input(app, "new ")
+  key_input(app, typography, 27, 0)
+  if !buffer.equal(doc.bytes[..doc.length], "new aé中\nlast\n") {
+    #panic("change words")
+  }
+  key_input(app, typography, 117, 0)
+  if !buffer.equal(doc.bytes[..doc.length], "one two, aé中\nlast\n") {
+    #panic("word undo")
+  }
+  buffer.move_to(doc, 0, false)
+  key_input(app, typography, 32, 0)
+  key_input(app, typography, 119, 0)
+  if app.prompt_state.panel != Panel.Windows {
+    #panic("window menu")
+  }
+  draw(renderer, window, app, typography)
+  key_input(app, typography, 118, 0)
+  left := app.view.panes[0].first
+  right := app.view.focused
+  if !app.view.panes[0].branch || left == right || app.documents.current != doc {
+    #panic("vertical split")
+  }
+  buffer.move_to(doc, 9, false)
+  pane_store(app)
+  draw(renderer, window, app, typography)
+  if app.view.panes[left].rect.x != 0 || app.view.panes[right].rect.x <= 0 {
+    #panic("split geometry")
+  }
+  pane_direction(app, 104)
+  if app.view.focused != left || doc.cursor != 0 {
+    #panic("independent pane cursor")
+  }
+  key_input(app, typography, 105, 0)
+  text_input(app, "X")
+  key_input(app, typography, 27, 0)
+  pane_direction(app, 108)
+  if app.view.focused != right || doc.cursor != 10 || doc.bytes[0] != 88 {
+    #panic("shared edit tracks other cursor")
+  }
+  pane_direction(app, 104)
+  key_input(app, typography, 117, 0)
+  pane_direction(app, 108)
+  if doc.cursor != 9 || doc.bytes[0] != 111 {
+    #panic("undo tracks other pane cursor")
+  }
+  pane_direction(app, 104)
+  key_input(app, typography, 117, 1)
+  pane_direction(app, 108)
+  if doc.cursor != 10 || doc.bytes[0] != 88 {
+    #panic("redo tracks other pane cursor")
+  }
+  pane_split(app, false)
+  draw(renderer, window, app, typography)
+  cached_updates := typography.document_updates
+  draw(renderer, window, app, typography)
+  if typography.document_updates != cached_updates {
+    #panic("unchanged split layouts reshaped")
+  }
+  if app.view.panes[app.view.focused].rect.y <= 0 {
+    #panic("horizontal split")
+  }
+  pane_close(app)
+  pane_close(app)
+  if app.view.focused != 0 || app.view.panes[0].branch || !buffer.dirty(doc) {
+    #panic("close panes keeps dirty buffer")
+  }
+  // Mouse geometry uses the shaped text and preserves UTF-8 boundaries.
+  _ = buffer.load(doc, "aé中 words\nnext\n")
+  app.view.scroll_x = 0.0
+  app.view.scroll_y = 0.0
+  draw(renderer, window, app, typography)
+  origin := app.config.document_padding * typography.scale
+  if app.view.line_numbers {
+    origin += typography.cell * 7.0
+  }
+  mouse_select(app, typography, origin, app.config.document_padding * typography.scale + typography.line * 0.5, false, false, 1)
+  mouse_select(app, typography, origin + typography.cell * 4.0, app.config.document_padding * typography.scale + typography.line * 0.5, true, false, 1)
+  if doc.anchor != 0 || doc.cursor == 0 || buffer.boundary(doc, doc.cursor) != doc.cursor {
+    #panic("mouse UTF8 drag")
+  }
+  mouse_select(app, typography, origin + typography.cell, app.config.document_padding * typography.scale + typography.line * 0.5, false, false, 2)
+  if !buffer.equal(doc.bytes[buffer.start(doc)..buffer.end(doc)], "aé中") {
+    #panic("mouse word selection")
+  }
+  // Fill the bounded tree, reject a ninth view, then collapse safely.
+  splits: usize = 0
+  for splits < 7 {
+    pane_split(app, splits % 2 == 0)
+    splits += 1
+  }
+  draw(renderer, window, app, typography)
+  pane_split(app, true)
+  if app.prompt_state.panel != Panel.Message {
+    #panic("pane limit")
+  }
+  pane_only(app)
+  draw(renderer, window, app, typography)
+  released: usize = 1
+  for released < 15 {
+    if typography.pane_text[released].text != nil || typography.pane_text[released].caret != nil {
+      #panic("closed pane kept text layouts")
+    }
+    released += 1
+  }
+  if app.view.focused != 0 || app.view.panes[0].branch {
+    #panic("only window")
+  }
+  pane_split(app, true)
+  if !new_buffer(app) {
+    #panic("second pane buffer")
+  }
+  other := app.documents.active
+  _ = buffer.load(app.documents.current, "different buffer")
+  draw(renderer, window, app, typography)
+  pane_direction(app, 104)
+  if app.documents.current != doc {
+    #panic("picker-style activation isolated to pane")
+  }
+  close_clean(app)
+  draw(renderer, window, app, typography)
+  if app.documents.current == nil || app.documents.active != other {
+    #panic("buffer close rebinds views")
+  }
+  pane_only(app)
+  close_clean(app)
+  activate(app, original)
+}
+
+fn bindings_smoke(app: *App, typography: *Typography) {
+  original := app.documents.active
+  if !new_buffer(app) {
+    #panic("quit binding fixture")
+  }
+  hidden := app.documents.active
+  _ = buffer.replace(app.documents.current, "keep my unsaved work")
+  if !new_buffer(app) {
+    #panic("quit target fixture")
+  }
+  total := app.documents.count
+  key_input(app, typography, 58, 0)
+  text_input(app, "quit")
+  matches(app)
+  if app.prompt_state.match_count == 0 || app.prompt_state.matches[0] != 24 {
+    #panic("quit palette must describe buffer close")
+  }
+  key_input(app, typography, 13, 0)
+  if !app.running || app.documents.count != total - 1 || app.prompt_state.panel != Panel.None {
+    #panic("quit must close only current buffer")
+  }
+  activate(app, hidden)
+  key_input(app, typography, 58, 0)
+  text_input(app, "q")
+  key_input(app, typography, 13, 0)
+  if app.prompt_state.panel != Panel.Quit || !app.documents.closing_one {
+    #panic("quit must protect current dirty buffer")
+  }
+  key_input(app, typography, 27, 0)
+  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "keep my unsaved work") {
+    #panic("cancel quit keeps edits")
+  }
+  // Quitting one of two views must not discard their shared dirty document.
+  shared := app.documents.current
+  shared_slot := app.documents.active
+  shared_total := app.documents.count
+  buffer.move_to(shared, 3, false)
+  pane_split(app, true)
+  buffer.move_to(shared, 9, false)
+  key_input(app, typography, 58, 0)
+  text_input(app, "q")
+  key_input(app, typography, 13, 0)
+  if app.prompt_state.panel != Panel.None || app.view.focused != 0 || app.view.panes[0].branch {
+    #panic("q closes active split only")
+  }
+  if app.documents.current != shared || app.documents.active != shared_slot || app.documents.count != shared_total || shared.cursor != 3 || !buffer.dirty(shared) {
+    #panic("q preserves other view and shared edits")
+  }
+  doc := app.documents.current
+  _ = buffer.load(doc, "one two three\nnext")
+  key_input(app, typography, 118, 0)
+  key_input(app, typography, 108, 0)
+  if doc.anchor != 0 || doc.cursor != 2 {
+    #panic("visual mode must include initial and next character")
+  }
+  key_input(app, typography, 27, 0)
+  buffer.move_to(doc, 0, false)
+  key_input(app, typography, 102, 0)
+  text_input(app, "t")
+  if doc.anchor != 0 || doc.cursor != 5 {
+    #panic("find character binding")
+  }
+  key_input(app, typography, 114, 0)
+  text_input(app, "é")
+  if !buffer.equal(doc.bytes[..doc.length], "éééééwo three\nnext") {
+    #panic("replace character binding")
+  }
+  key_input(app, typography, 117, 0)
+  if !buffer.equal(doc.bytes[..doc.length], "one two three\nnext") {
+    #panic("replace undo")
+  }
+  close_clean(app)
+  activate(app, original)
+}
+
+fn multiple_selection_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Typography) {
+  original := app.documents.active
+  if !new_buffer(app) {
+    #panic("multicursor fixture")
+  }
+  doc := app.documents.current
+  _ = buffer.load(doc, "abc\ndef\nghi\n")
+  app.view.insert = false
+  app.view.extend = false
+  key_input(app, typography, 120, 0)
+  if !buffer.equal(doc.bytes[buffer.start(doc)..buffer.end(doc)], "abc\n") || buffer.head(doc) != 3 {
+    #panic("x excludes next line character")
+  }
+  draw(renderer, window, app, typography)
+  if app.view.animation.file.cursor_y.value != app.config.document_padding * typography.scale {
+    #panic("x caret must stay on selected line")
+  }
+  key_input(app, typography, 120, 0)
+  if !buffer.equal(doc.bytes[buffer.start(doc)..buffer.end(doc)], "abc\ndef\n") {
+    #panic("repeat x extends one line")
+  }
+  _ = buffer.load(doc, "abc\ndef\nghi\n")
+  key_input(app, typography, 118, 0)
+  key_input(app, typography, 108, 0)
+  if doc.anchor != 0 || doc.cursor != 2 {
+    #panic("visual selection inclusive")
+  }
+  key_input(app, typography, 104, 0)
+  key_input(app, typography, 104, 0)
+  if doc.anchor != 0 || doc.cursor != 1 {
+    #panic("visual clamps at BOF")
+  }
+  key_input(app, typography, 27, 0)
+  if app.view.extend || doc.anchor != 0 || doc.cursor != 1 {
+    #panic("escape keeps selection")
+  }
+  key_input(app, typography, 99, 1)
+  key_input(app, typography, 99, 1)
+  if doc.secondary.count != 2 || doc.anchor != 8 || doc.cursor != 9 {
+    #panic("C adds two cursors")
+  }
+  draw(renderer, window, app, typography)
+  key_input(app, typography, 99, 0)
+  text_input(app, "é")
+  key_input(app, typography, 27, 0)
+  if !buffer.equal(doc.bytes[..doc.length], "ébc\néef\néhi\n") || doc.secondary.count != 2 {
+    #panic("multicursor change")
+  }
+  key_input(app, typography, 117, 0)
+  if !buffer.equal(doc.bytes[..doc.length], "abc\ndef\nghi\n") || doc.secondary.count != 2 {
+    #panic("multicursor undo atomically")
+  }
+  key_input(app, typography, 117, 1)
+  if !buffer.equal(doc.bytes[..doc.length], "ébc\néef\néhi\n") || doc.secondary.count != 2 {
+    #panic("multicursor redo")
+  }
+  key_input(app, typography, 105, 0)
+  text_input(app, "!")
+  key_input(app, typography, 8, 0)
+  key_input(app, typography, 27, 0)
+  if !buffer.equal(doc.bytes[..doc.length], "ébc\néef\néhi\n") {
+    #panic("multicursor typing and backspace")
+  }
+  pane_split(app, true)
+  key_input(app, typography, 44, 0)
+  pane_store(app)
+  draw(renderer, window, app, typography)
+  pane_direction(app, 104)
+  if doc.secondary.count != 2 {
+    #panic("pane owns multiple selections")
+  }
+  pane_direction(app, 108)
+  if doc.secondary.count != 0 {
+    #panic("comma retains only primary in current pane")
+  }
+  pane_only(app)
+  close_clean(app)
+  activate(app, original)
+}
+
+fn visual_search_smoke(app: *App, typography: *Typography) {
+  original := app.documents.active
+  if !new_buffer(app) {
+    #panic("visual search fixture")
+  }
+  doc := app.documents.current
+  _ = buffer.load(doc, "alpha beta alpha\n")
+  app.view.insert = false
+  app.view.extend = false
+  key_input(app, typography, 118, 0)
+  key_input(app, typography, 47, 0)
+  text_input(app, "beta")
+  key_input(app, typography, 13, 0)
+  if !app.view.extend || doc.anchor != 0 || doc.cursor != 10 {
+    #panic("visual search must extend from original anchor")
+  }
+  key_input(app, typography, 37, 0)
+  key_input(app, typography, 115, 0)
+  if app.prompt_state.panel == Panel.None {
+    #panic("s must open selection search")
+  }
+  text_input(app, "alpha")
+  key_input(app, typography, 13, 0)
+  if doc.secondary.count != 1 {
+    #panic("s selects all matching text inside selection")
+  }
+  close_clean(app)
+  activate(app, original)
+}
+
+fn selection_search_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Typography) {
+  original := app.documents.active
+  if !new_buffer(app) {
+    #panic("selection search fixture")
+  }
+  doc := app.documents.current
+  _ = buffer.load(doc, "alpha beta alpha\noutside alpha")
+  app.view.insert = false
+  app.view.extend = false
+  key_input(app, typography, 120, 0)
+  key_input(app, typography, 115, 0)
+  text_input(app, "a(lpha)")
+  if app.prompt_state.panel != Panel.Select || app.search_state.status != 0 || doc.secondary.count != 1 || doc.anchor != 0 || doc.cursor != 5 || doc.secondary.ranges[0].anchor != 11 || doc.secondary.ranges[0].cursor != 16 {
+    #panic("s previews bounded regex matches")
+  }
+  draw(renderer, window, app, typography)
+  key_input(app, typography, 27, 0)
+  if doc.anchor != 0 || doc.cursor != 17 || doc.secondary.count != 0 {
+    #panic("cancel s restores selection")
+  }
+  key_input(app, typography, 115, 0)
+  text_input(app, "(")
+  if app.search_state.status != 2 || doc.cursor != 17 {
+    #panic("invalid regex keeps original selection")
+  }
+  key_input(app, typography, 13, 0)
+  if app.prompt_state.panel != Panel.Select {
+    #panic("invalid regex remains editable")
+  }
+  key_input(app, typography, 117, 64)
+  text_input(app, "alpha")
+  key_input(app, typography, 13, 0)
+  if app.prompt_state.panel != Panel.None || doc.secondary.count != 1 {
+    #panic("accept selection search")
+  }
+  key_input(app, typography, 99, 0)
+  text_input(app, "X")
+  key_input(app, typography, 27, 0)
+  if !buffer.equal(doc.bytes[..doc.length], "X beta X\noutside alpha") {
+    #panic("edit s matches without touching outside region")
+  }
+  key_input(app, typography, 117, 0)
+  if !buffer.equal(doc.bytes[..doc.length], "alpha beta alpha\noutside alpha") || doc.secondary.count != 1 {
+    #panic("undo selection-search edit")
+  }
+  // Restrict a second search to the two existing alpha selections.
+  key_input(app, typography, 115, 0)
+  text_input(app, "a")
+  key_input(app, typography, 13, 0)
+  if doc.secondary.count != 3 {
+    #panic("search each existing selection")
+  }
+  _ = buffer.load(doc, "é aé é\n")
+  doc.anchor = 0
+  doc.cursor = doc.length
+  key_input(app, typography, 115, 0)
+  text_input(app, "(?=é)")
+  key_input(app, typography, 13, 0)
+  if app.prompt_state.panel != Panel.None || doc.secondary.count != 2 {
+    #panic("zero-width matching terminates at UTF8 boundaries")
+  }
+  key_input(app, typography, 105, 0)
+  text_input(app, "_")
+  key_input(app, typography, 27, 0)
+  if !buffer.equal(doc.bytes[..doc.length], "_é a_é _é\n") {
+    #panic("zero-width cursors edit correctly")
+  }
+  _ = buffer.load(doc, "one  two\nthree")
+  doc.cursor = doc.length
+  key_input(app, typography, 115, 1)
+  text_input(app, "\\s+")
+  key_input(app, typography, 13, 0)
+  if doc.secondary.count != 2 || !buffer.equal(doc.bytes[buffer.start(doc)..buffer.end(doc)], "one") {
+    #panic("S splits selection")
+  }
+  _ = buffer.load(doc, "aaaa aaaa aaaa aaaa aaaa aaaa aaaa aaaa aaaa")
+  doc.cursor = doc.length
+  saved_end := doc.cursor
+  key_input(app, typography, 115, 0)
+  text_input(app, "a")
+  if app.search_state.status != 4 || doc.cursor != saved_end || doc.secondary.count != 0 {
+    #panic("selection limit rejects atomically")
+  }
+  key_input(app, typography, 27, 0)
+  _ = buffer.load(doc, "abc def")
+  doc.cursor = 3
+  key_input(app, typography, 115, 0)
+  text_input(app, "xyz")
+  if app.search_state.status != 1 || doc.anchor != 0 || doc.cursor != 3 {
+    #panic("no matches preserves selection")
+  }
+  key_input(app, typography, 27, 0)
+  close_clean(app)
+  activate(app, original)
+}
+
+fn match_menu_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Typography) {
+  original := app.documents.active
+  if !new_buffer(app) {
+    #panic("match menu fixture")
+  }
+  doc := app.documents.current
+  _ = buffer.load(doc, "one (two) three")
+  buffer.move_to(doc, 6, false)
+  app.view.insert = false
+  app.view.extend = false
+  key_input(app, typography, 109, 0)
+  if app.prompt_state.panel != Panel.Match {
+    #panic("m opens menu")
+  }
+  draw(renderer, window, app, typography)
+  key_input(app, typography, 105, 0)
+  draw(renderer, window, app, typography)
+  text_input(app, "(")
+  if app.prompt_state.panel != Panel.None || !buffer.equal(doc.bytes[buffer.start(doc)..buffer.end(doc)], "two") {
+    #panic("mi selects inside")
+  }
+  key_input(app, typography, 109, 0)
+  key_input(app, typography, 97, 0)
+  text_input(app, "(")
+  if !buffer.equal(doc.bytes[buffer.start(doc)..buffer.end(doc)], "(two)") {
+    #panic("ma selects around")
+  }
+  key_input(app, typography, 109, 0)
+  key_input(app, typography, 114, 0)
+  text_input(app, "(")
+  if !buffer.equal(doc.bytes[..doc.length], "one (two) three") || app.match_state.stage != 6 {
+    #panic("mr stages old delimiter")
+  }
+  draw(renderer, window, app, typography)
+  key_input(app, typography, 27, 0)
+  if app.prompt_state.panel != Panel.None || !buffer.equal(doc.bytes[..doc.length], "one (two) three") {
+    #panic("surround cancel")
+  }
+  key_input(app, typography, 109, 0)
+  key_input(app, typography, 114, 0)
+  text_input(app, "(")
+  text_input(app, "[")
+  if !buffer.equal(doc.bytes[..doc.length], "one [two] three") {
+    #panic("mr replaces delimiters")
+  }
+  key_input(app, typography, 109, 0)
+  key_input(app, typography, 100, 0)
+  text_input(app, "[")
+  if !buffer.equal(doc.bytes[..doc.length], "one two three") {
+    #panic("md removes delimiters")
+  }
+  key_input(app, typography, 109, 0)
+  key_input(app, typography, 115, 0)
+  text_input(app, "\"")
+  if !buffer.equal(doc.bytes[..doc.length], "one \"two\" three") {
+    #panic("ms adds quotes")
+  }
+  key_input(app, typography, 117, 0)
+  if !buffer.equal(doc.bytes[..doc.length], "one two three") {
+    #panic("surround undo")
+  }
+  key_input(app, typography, 118, 0)
+  key_input(app, typography, 109, 0)
+  key_input(app, typography, 105, 0)
+  text_input(app, "w")
+  if !app.view.extend || !buffer.equal(doc.bytes[buffer.start(doc)..buffer.end(doc)], "two") {
+    #panic("match works in select mode")
+  }
+  key_input(app, typography, 109, 0)
+  key_input(app, typography, 105, 0)
+  text_input(app, "f")
+  if !app.match_state.error || app.prompt_state.panel != Panel.Match {
+    #panic("syntax-only object unavailable")
+  }
+  key_input(app, typography, 27, 0)
+  close_clean(app)
+  activate(app, original)
+}
+
+fn empty_quit_smoke(app: *App, typography: *Typography) {
+  if app.documents.count != 1 || app.documents.file.length != 0 || app.documents.current.length != 0 {
+    return
+  }
+  pane_split(app, true)
+  key_input(app, typography, 58, 0)
+  text_input(app, "q")
+  key_input(app, typography, 13, 0)
+  if !app.running || app.view.focused != 0 || app.view.panes[0].branch {
+    #panic("empty split quit keeps final view")
+  }
+  key_input(app, typography, 58, 0)
+  text_input(app, "q")
+  key_input(app, typography, 13, 0)
+  if app.running {
+    #panic("empty final view quit exits editor")
+  }
+  app.running = true
+}
+
+fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Typography) {
+  settings_inspector_smoke(typography)
+  picker_mouse_smoke(renderer, typography)
+  font_identity_smoke(app, typography)
+  location: [4096]u8 = []
+  configured := process.environment("DNA_WORKFLOW_TEST", location[..])
+  if !configured.ok || !configured.found {
+    return
+  }
+  previous: [4096]u8 = []
+  previous_length := copy_text(previous[..], app.workspace.project[..app.workspace.project_length])
+  active := app.documents.active
+  doc := app.documents.current
+  project_cd(app, configured.value)
+  if !buffer.equal(app.workspace.project[..app.workspace.project_length], configured.value) || app.documents.active != active || app.documents.current != doc {
+    #panic("cd preserves active document")
+  }
+  project_cd(app, "subdir")
+  if !contains(app.workspace.project[..app.workspace.project_length], "/subdir") {
+    #panic("relative cd")
+  }
+  project_cd(app, "-")
+  if !buffer.equal(app.workspace.project[..app.workspace.project_length], configured.value) {
+    #panic("cd previous")
+  }
+  panel(app, Panel.Commands)
+  text_input(app, "cd sub")
+  palette_tab(app)
+  if !buffer.equal(app.prompt_state.text[..app.prompt_state.length], "cd subdir/") {
+    #panic("cd completion")
+  }
+  project_cd(app, "missing-directory")
+  if app.prompt_state.panel != Panel.Message || !buffer.equal(app.workspace.project[..app.workspace.project_length], configured.value) {
+    #panic("failed cd changed root")
+  }
+  config_storage: [4096]u8 = []
+  config_path := joined(app, "config.toml", config_storage[..])
+  saved_config: [4096]u8 = []
+  saved_length := copy_text(saved_config[..], app.configuration.path[..app.configuration.path_length])
+  app.configuration.path_length = copy_text(app.configuration.path[..], config_path)
+  if !fs.write_all(config_path, "font_size = 23\nline_height = 1.4\nindent_width = 2\n[keys.normal]\n\"f2\" = \"pwd\"\n").ok {
+    #panic("write config fixture")
+  }
+  config_reload(app, typography, false)
+  if typography.points != 23.0 || app.config.indent_width != 2 {
+    #panic("config reload")
+  }
+  app.prompt_state.panel = Panel.None
+  app.view.insert = false
+  app.view.extend = false
+  key_input(app, typography, 1073741883, 0)
+  if app.prompt_state.panel != Panel.Message || !buffer.equal(app.prompt_state.message[..app.prompt_state.message_length], app.workspace.project[..app.workspace.project_length]) {
+    #panic("configured binding")
+  }
+  if !fs.write_all(config_path, "font_size = 999\n").ok {
+    #panic("invalid config fixture")
+  }
+  config_reload(app, typography, false)
+  if typography.points != 23.0 || app.config.indent_width != 2 || active_file_config(app).indent_width != 2 || app.prompt_state.panel != Panel.Message {
+    #panic("invalid reload mutated config")
+  }
+  if !fs.write_all(config_path, "font_size = 20\n").ok {
+    #panic("restore config fixture")
+  }
+  app.configuration.watch_due = 0
+  app.prompt_state.panel = Panel.Commands
+  if !config_watch(app, typography) || typography.points != 20.0 || app.prompt_state.panel != Panel.Commands {
+    #panic("live config reload preserves panel")
+  }
+  app.configuration.path_length = copy_text(app.configuration.path[..], saved_config[..saved_length])
+  font_picker(app)
+  if app.completion.count == 0 {
+    #panic("system font picker")
+  }
+  draw(renderer, window, app, typography)
+  app.resource_state.fonts = false
+  app.prompt_state.panel = Panel.None
+  theme_storage: [4096]u8 = []
+  custom_theme := joined(app, "custom-theme.toml", theme_storage[..])
+  if !fs.write_all(custom_theme, "base = \"charcoal\"\nbackground = \"#102030\"\nsyntax_keyword = \"#123456\"\nterminal_red = \"#abcdef\"\n").ok {
+    #panic("theme fixture")
+  }
+  theme_switch(app, typography, custom_theme)
+  if theme().background.red != 16 || syntax_color(3).green != 52 || theme_override(15) != 11259375 {
+    #panic("theme shared palette")
+  }
+  smoke_command(app, typography, "theme")
+  if !contains(app.prompt_state.message[..app.prompt_state.message_length], custom_theme) {
+    #panic("theme command lost custom theme path")
+  }
+  theme_config: [8192]u8 = []
+  theme_config_length := copy_text(theme_config[..], "theme = \"")
+  add_text(theme_config[..], &theme_config_length, custom_theme)
+  add_text(theme_config[..], &theme_config_length, "\"\n")
+  if !fs.write_all(config_path, theme_config[..theme_config_length]).ok {
+    #panic("custom theme config fixture")
+  }
+  app.configuration.path_length = copy_text(app.configuration.path[..], config_path)
+  config_reload(app, typography, false)
+  app.configuration.path_length = copy_text(app.configuration.path[..], saved_config[..saved_length])
+  smoke_command(app, typography, "theme")
+  if !contains(app.prompt_state.message[..app.prompt_state.message_length], custom_theme) {
+    #panic("config reload lost selected theme")
+  }
+  if !fs.write_all(custom_theme, "background = \"broken\"\n").ok {
+    #panic("invalid theme fixture")
+  }
+  theme_switch(app, typography, custom_theme)
+  if app.prompt_state.panel != Panel.Message || theme().background.red != 16 || syntax_color(3).green != 52 {
+    #panic("invalid theme changed palette")
+  }
+  theme_switch(app, typography, "light")
+  if theme().background.red != 245 || syntax_color(3).red != 115 || theme_override(15) <= 16777215 {
+    #panic("theme switch resets overrides")
+  }
+  smoke_command(app, typography, "theme")
+  if !buffer.equal(app.prompt_state.message[..app.prompt_state.message_length], "Theme: light") {
+    #panic("theme query did not show light")
+  }
+  theme_switch(app, typography, "charcoal")
+  terminal_show(app, true, "printf 'DNA-terminal-test\\ninput.txt:2:1: error: example\\n'; pwd")
+  target := terminal_target(app)
+  if target == nil || !terminal_mode(app).input {
+    #panic("terminal popup")
+  }
+  deadline := sdl.ticks() + 2000
+  for terminal_alive(target) != 0 && sdl.ticks() < deadline {
+    _ = terminal_poll(target)
+  }
+  _ = terminal_poll(target)
+  output: [32768]u8 = []
+  length := terminal_snapshot(target, &output[0], 32768)
+  if !contains(output[..length], "DNA-terminal-test") || !contains(output[..length], configured.value) {
+    #panic("terminal command and project cwd")
+  }
+  task_next_error(app)
+  if !contains(files.name(app.documents.file), "/input.txt") || buffer.line_start(app.documents.current, app.documents.current.cursor) == 0 {
+    #panic("task diagnostic jump")
+  }
+  activate(app, active)
+  app.prompt_state.panel = Panel.Terminal
+  draw(renderer, window, app, typography)
+  key_input(app, typography, 92, 64)
+  if terminal_mode(app).input {
+    #panic("terminal navigation escape")
+  }
+  key_input(app, typography, 27, 0)
+  if app.prompt_state.panel != Panel.None || app.documents.current != doc {
+    #panic("terminal popup dismissal")
+  }
+  key_input(app, typography, 32, 0)
+  key_input(app, typography, 116, 0)
+  if app.prompt_state.panel != Panel.None || terminal_target(app) != target || terminal_mode(app).input || app.view.panes[app.view.panes[app.view.focused].parent].vertical {
+    #panic("Space t reopens terminal below")
+  }
+  key_input(app, typography, 92, 64)
+  key_input(app, typography, 27, 0)
+  terminal_promote(app)
+  draw(renderer, window, app, typography)
+  if app.documents.slots[app.documents.active].terminal.handle != target || !app.view.panes[0].branch {
+    #panic("terminal split")
+  }
+  pane_close(app)
+  close_slot(app, app.terminal_state.slot)
+  activate(app, active)
+  terminal_popup(app, true, "")
+  key_input(app, typography, 92, 64)
+  background := app.documents.active
+  popup_terminal := app.terminal_state.slot
+  key_input(app, typography, 58, 0)
+  text_input(app, "bd")
+  key_input(app, typography, 13, 0)
+  if app.prompt_state.panel != Panel.TerminalClose || app.documents.active != popup_terminal {
+    #panic("terminal popup close target")
+  }
+  key_input(app, typography, 27, 0)
+  if app.documents.slots[popup_terminal].terminal.handle == nil {
+    #panic("terminal close cancellation")
+  }
+  request_buffer_close(app)
+  key_input(app, typography, 13, 0)
+  if app.documents.slots[popup_terminal].terminal.handle != nil || app.documents.slots[background].document != doc {
+    #panic("terminal close preserves background file")
+  }
+  activate(app, active)
+  // An interactive shell exit closes its buffer and restores the background file.
+  terminal_show(app, true, "")
+  exited_slot := app.terminal_state.slot
+  exited := terminal_target(app)
+  if app.prompt_state.panel != Panel.None || app.documents.active != exited_slot || !app.view.panes[0].branch || app.view.panes[app.view.panes[app.view.focused].parent].vertical {
+    #panic("terminal must open below file")
+  }
+  draw(renderer, window, app, typography)
+  terminal_parent := app.view.panes[app.view.focused].parent
+  if app.view.panes[terminal_parent].split_fraction != 0.75 || app.view.panes[app.view.focused].rect.height > app.view.panes[terminal_parent].rect.height / 4 + 1 {
+    #panic("terminal default exceeds quarter height")
+  }
+  count_before_reopen := app.documents.count
+  focus_before_reopen := app.view.focused
+  terminal_show(app, false, "")
+  if app.documents.count != count_before_reopen || app.view.focused != focus_before_reopen {
+    #panic("reopening terminal duplicated split")
+  }
+  // Give review motions a deterministic first line, independent of shell prompts.
+  review_command := "printf '\\033[2J\\033[HDNA-review-ready\\n'\n"
+  terminal_text(exited, &review_command[0], #len(review_command))
+  review_deadline := sdl.ticks() + 2000
+  review_ready: bool = false
+  for !review_ready && sdl.ticks() < review_deadline {
+    _ = terminal_poll(exited)
+    review_screen: [32768]u8 = []
+    review_length := terminal_snapshot(exited, &review_screen[0], 32768)
+    review_ready = review_length >= 16 && buffer.equal(review_screen[..16], "DNA-review-ready")
+  }
+  if !review_ready {
+    #panic("terminal review fixture")
+  }
+  key_input(app, typography, 27, 0)
+  if !terminal_mode(app).input || !terminal_mode(app).escape_pending {
+    #panic("single Escape must stay in terminal input")
+  }
+  key_input(app, typography, 27, 0)
+  if terminal_mode(app).input || app.prompt_state.panel != Panel.None || terminal_target(app) != exited {
+    #panic("double Escape must enter terminal normal mode")
+  }
+  review_doc := app.documents.slots[exited_slot].document
+  buffer.move_to(review_doc, 0, false)
+  buffer.select_current(review_doc)
+  key_input(app, typography, 108, 0)
+  if buffer.head(review_doc) != 1 {
+    #panic("terminal normal right motion")
+  }
+  key_input(app, typography, 118, 0)
+  key_input(app, typography, 108, 0)
+  if !app.documents.slots[exited_slot].terminal.extend || buffer.start(review_doc) != 1 || buffer.end(review_doc) != 3 {
+    #panic("terminal extend selection")
+  }
+  terminal_session := workspace.State{}
+  if !session_capture(app, &terminal_session, false) || #len(terminal_session.buffers[exited_slot].text) != 0 || terminal_session.panes[app.view.focused].cursor != 0 {
+    #panic("terminal review leaked into session text")
+  }
+  review_revision := review_doc.revision
+  key_input(app, typography, 100, 0)
+  text_input(app, "blocked")
+  if review_doc.revision != review_revision {
+    #panic("terminal review must be read only")
+  }
+  key_input(app, typography, 120, 0)
+  if buffer.start(review_doc) != 0 || review_doc.bytes[buffer.end(review_doc) - 1] != 10 {
+    #panic("terminal line selection")
+  }
+  terminal_popup(app, true, "")
+  independent_terminal := app.terminal_state.slot
+  if !terminal_mode(app).input || app.documents.slots[exited_slot].terminal.input {
+    #panic("new terminal must not change another mode")
+  }
+  activate(app, exited_slot)
+  if terminal_mode(app).input {
+    #panic("switch must preserve terminal normal mode")
+  }
+  activate(app, independent_terminal)
+  if !terminal_mode(app).input {
+    #panic("switch must preserve terminal input mode")
+  }
+  close_slot(app, independent_terminal)
+  activate(app, exited_slot)
+  key_input(app, typography, 105, 0)
+  if !terminal_mode(app).input {
+    #panic("i must reenter terminal input")
+  }
+  // q and Q belong to the terminal program (htop, less), not macros.
+  key_input(app, typography, 113, 0)
+  key_input(app, typography, 113, 1)
+  if app.prompt_state.panel != Panel.None || app.macro_state.recording || !terminal_mode(app).input {
+    #panic("q in a terminal must reach the program, not macros")
+  }
+  // Input mode owns the keyboard: no editor shortcut may fire.
+  owned_keys: [11]u32 = [119, 112, 111, 115, 113, 102, 101, 120, 32, 58, 103]
+  owned_modifiers: [11]u16 = [64, 64, 64, 64, 64, 64, 64, 64, 64, 0, 0]
+  owned_index: usize = 0
+  running := app.running
+  for owned_index < 11 {
+    key_input(app, typography, owned_keys[owned_index], owned_modifiers[owned_index])
+    if app.prompt_state.panel != Panel.None || !terminal_mode(app).input || app.running != running {
+      #panic("terminal input mode let an editor shortcut through")
+    }
+    owned_index += 1
+  }
+  key_input(app, typography, 27, 0)
+  text_input(app, " ")
+  if terminal_mode(app).escape_pending {
+    #panic("text must interrupt Escape pair")
+  }
+  key_input(app, typography, 27, 0)
+  if !terminal_mode(app).input {
+    #panic("nonconsecutive Escapes must not exit input")
+  }
+  // Leaving with Escape Escape sends nothing: a stray ESC would turn the
+  // first key typed after returning into Alt+key (cat -v shows it as ^[).
+  terminal_mode(app).escape_pending = false
+  cat_command := "clear; cat -v\n"
+  terminal_text(exited, &cat_command[0], #len(cat_command))
+  cat_deadline := sdl.ticks() + 300
+  for sdl.ticks() < cat_deadline {
+    _ = terminal_poll(exited)
+  }
+  key_input(app, typography, 27, 0)
+  key_input(app, typography, 27, 0)
+  key_input(app, typography, 105, 0)
+  if !terminal_mode(app).input {
+    #panic("i returns to terminal input")
+  }
+  text_input(app, "Q")
+  key_input(app, typography, 13, 0)
+  echoed: bool = false
+  leaked: bool = false
+  echo_deadline := sdl.ticks() + 2000
+  for !echoed && sdl.ticks() < echo_deadline {
+    _ = terminal_poll(exited)
+    echo_screen: [32768]u8 = []
+    echo_length := terminal_snapshot(exited, &echo_screen[0], 32768)
+    for at in 0..echo_length {
+      if at + 1 < echo_length && echo_screen[at] == '^' && echo_screen[at + 1] == '[' {
+        leaked = true
+      }
+      if echo_screen[at] == 'Q' && at > 0 && echo_screen[at - 1] == 10 && at + 1 < echo_length && (echo_screen[at + 1] == ' ' || echo_screen[at + 1] == 10) {
+        echoed = true
+      }
+    }
+  }
+  if leaked || !echoed {
+    if leaked {
+      #panic("double Escape leaked ESC to the program")
+    }
+    #panic("double Escape must not send ESC to the program")
+  }
+  terminal_key(exited, 99, 64)
+  // Leave one Escape held, as the checks below expect.
+  key_input(app, typography, 27, 0)
+  key_input(app, typography, 27, 0)
+  key_input(app, typography, 119, 64)
+  if app.prompt_state.panel != Panel.Windows {
+    #panic("terminal normal window menu")
+  }
+  key_input(app, typography, 27, 0)
+  key_input(app, typography, 120, 64)
+  if app.prompt_state.panel != Panel.TerminalClose {
+    #panic("Ctrl-X must protect a running shell")
+  }
+  key_input(app, typography, 99, 0)
+  if app.documents.slots[exited_slot].terminal.handle != exited || app.documents.active != exited_slot {
+    #panic("cancel must retain running terminal")
+  }
+  terminal_key(exited, 99, 64)
+  exit_command: []const u8 = "exit\n"
+  terminal_text(exited, &exit_command[0], #len(exit_command))
+  exit_deadline := sdl.ticks() + 3000
+  for app.documents.slots[exited_slot].terminal.handle != nil && sdl.ticks() < exit_deadline {
+    _ = terminal_tick(app)
+  }
+  if app.documents.slots[exited_slot].terminal.handle != nil {
+    #panic("exited interactive terminal remains open")
+  }
+  if app.prompt_state.panel != Panel.None || app.documents.active != active || app.documents.current != doc {
+    #panic("shell exit did not restore file focus")
+  }
+  if app.view.panes[0].branch {
+    #panic("shell exit did not remove terminal pane")
+  }
+  // An exit in a hidden terminal must not dismiss an unrelated popup.
+  terminal_show(app, true, "")
+  hidden_slot := app.terminal_state.slot
+  hidden := terminal_target(app)
+  pane_close(app)
+  app.prompt_state.panel = Panel.Buffers
+  terminal_text(hidden, &exit_command[0], #len(exit_command))
+  hidden_deadline := sdl.ticks() + 3000
+  for app.documents.slots[hidden_slot].terminal.handle != nil && sdl.ticks() < hidden_deadline {
+    _ = terminal_tick(app)
+  }
+  if app.documents.slots[hidden_slot].terminal.handle != nil || app.prompt_state.panel != Panel.Buffers || app.documents.active != active {
+    #panic("hidden shell exit stole focus")
+  }
+  app.prompt_state.panel = Panel.None
+  // A shell promoted into a pane must leave every pane pointing at a live document.
+  terminal_show(app, true, "")
+  split_slot := app.terminal_state.slot
+  split_shell := terminal_target(app)
+  terminal_promote(app)
+  terminal_text(split_shell, &exit_command[0], #len(exit_command))
+  split_deadline := sdl.ticks() + 3000
+  for app.documents.slots[split_slot].terminal.handle != nil && sdl.ticks() < split_deadline {
+    _ = terminal_tick(app)
+  }
+  if app.documents.slots[split_slot].terminal.handle != nil || app.documents.current == nil {
+    #panic("split shell exit")
+  }
+  pane_index: usize = 0
+  for pane_index < 15 {
+    if app.view.panes[pane_index].used && !app.view.panes[pane_index].branch && app.documents.slots[app.view.panes[pane_index].slot].document == nil {
+      #panic("shell exit left dangling pane")
+    }
+    pane_index += 1
+  }
+  pane_only(app)
+  activate(app, active)
+  terminal_show(app, true, "")
+  killed_terminal := app.terminal_state.slot
+  // Input mode sends Ctrl-X to the program (nano, emacs); it closes nothing.
+  if !terminal_mode(app).input {
+    #panic("new terminal starts in input mode")
+  }
+  key_input(app, typography, 120, 64)
+  if app.prompt_state.panel == Panel.TerminalClose || !terminal_mode(app).input {
+    #panic("Ctrl-X in terminal input must reach the program")
+  }
+  // Esc Esc leaves input mode; now Ctrl-X closes, with confirmation.
+  key_input(app, typography, 27, 0)
+  key_input(app, typography, 27, 0)
+  if terminal_mode(app).input {
+    #panic("Esc Esc leaves terminal input")
+  }
+  key_input(app, typography, 120, 64)
+  if app.prompt_state.panel != Panel.TerminalClose {
+    #panic("bottom terminal close needs confirmation")
+  }
+  key_input(app, typography, 13, 0)
+  if app.documents.slots[killed_terminal].terminal.handle != nil || app.prompt_state.panel != Panel.None || app.documents.active != active || app.view.panes[0].branch {
+    #panic("confirmed terminal kill did not restore file view")
+  }
+  // Exercise the same installed-helper lookup and PTY launch as :languages.
+  key_input(app, typography, 58, 0)
+  text_input(app, "languages")
+  key_input(app, typography, 13, 0)
+  listing_terminal := terminal_target(app)
+  if listing_terminal == nil {
+    #panic("languages terminal launch")
+  }
+  listing_deadline := sdl.ticks() + 3000
+  for terminal_alive(listing_terminal) != 0 && sdl.ticks() < listing_deadline {
+    _ = terminal_poll(listing_terminal)
+  }
+  _ = terminal_tick(app)
+  if terminal_target(app) != listing_terminal || terminal_mode(app).input {
+    #panic("completed listing must stay readable in navigation mode")
+  }
+  listing: [32768]u8 = []
+  listing_length := terminal_log(listing_terminal, &listing[0], 32768)
+  if !contains(listing[..listing_length], "dyn:") || !contains(listing[..listing_length], "Installed languages:") || !contains(listing[..listing_length], "Available to install:") {
+    #panic("languages editor command failed")
+  }
+  activate(app, app.terminal_state.slot)
+  close_clean(app)
+  activate(app, active)
+  project_cd(app, previous[..previous_length])
+  app.prompt_state.panel = Panel.None
+}
+
+fn smoke_command(app: *App, typography: *Typography, command: []const u8) {
+  panel(app, Panel.Commands)
+  text_input(app, command)
+  key_input(app, typography, 13, 0)
+}
+fn editor_commands_smoke(app: *App, typography: *Typography) {
+  original := app.documents.active
+  doc := app.documents.current
+  count := app.documents.count
+  pane_only(app)
+  smoke_command(app, typography, "vnew")
+  vertical_slot := app.documents.active
+  if app.documents.active == original || app.documents.current == doc || app.documents.current.length != 0 || app.documents.file.length != 0 || !app.view.panes[0].vertical || app.documents.count != count + 1 {
+    #panic("vnew did not create independent vertical buffer")
+  }
+  _ = buffer.load(app.documents.current, "vertical")
+  smoke_command(app, typography, "hnew")
+  horizontal_slot := app.documents.active
+  if app.documents.active == vertical_slot || app.documents.current == app.documents.slots[vertical_slot].document || app.documents.current.length != 0 || app.view.panes[app.view.panes[app.view.focused].parent].vertical || app.documents.count != count + 2 {
+    #panic("hnew did not create independent horizontal buffer")
+  }
+  smoke_command(app, typography, "filetype python")
+  if !buffer.equal(filetype_name(&app.documents.slots[app.documents.active]), "python") || app.documents.slots[vertical_slot].filetype_length != 0 || app.documents.file.length != 0 {
+    #panic("buffer-local filetype")
+  }
+  smoke_command(app, typography, "ft")
+  if !contains(app.prompt_state.message[..app.prompt_state.message_length], "Filetype: python") {
+    #panic("filetype query")
+  }
+  smoke_command(app, typography, "filetype ../invalid")
+  if !buffer.equal(filetype_name(&app.documents.slots[app.documents.active]), "python") {
+    #panic("invalid filetype mutated buffer")
+  }
+  smoke_command(app, typography, "set-language text")
+  if !buffer.equal(filetype_name(&app.documents.slots[app.documents.active]), "text") || app.documents.slots[app.documents.active].syntax != nil {
+    #panic("text filetype did not disable syntax")
+  }
+  smoke_command(app, typography, "filetype auto")
+  if app.documents.slots[app.documents.active].filetype_length != 0 {
+    #panic("automatic filetype reset")
+  }
+  installed_storage: [4096]u8 = []
+  installed := process.environment("DNA_TEST_LANGUAGE_DIR", installed_storage[..4095])
+  if installed.ok && installed.found {
+    saved_root: [4096]u8 = []
+    saved_root_length := copy_text(saved_root[..], app.workspace.language_root[..app.workspace.language_root_length])
+    app.workspace.language_root_length = copy_text(app.workspace.language_root[..], installed.value)
+    _ = buffer.load(app.documents.current, "{\"n\":42}")
+    smoke_command(app, typography, "filetype json")
+    if app.documents.slots[app.documents.active].syntax == nil || !buffer.equal(filetype_name(&app.documents.slots[app.documents.active]), "json") {
+      #panic("unnamed buffer explicit grammar")
+    }
+    syntax_deadline := sdl.ticks() + 3000
+    for app.documents.slots[app.documents.active].syntax_revision != app.documents.current.revision && sdl.ticks() < syntax_deadline {
+      _ = syntax_tick(app)
+    }
+    if app.documents.slots[app.documents.active].colors[5] != 6 {
+      #panic("explicit filetype did not highlight unnamed buffer")
+    }
+    fixture_storage: [4096]u8 = []
+    fixture := process.environment("DNA_WORKFLOW_TEST", fixture_storage[..])
+    if !fixture.ok || !fixture.found {
+      #panic("filetype test requires isolated fixture directory")
+    }
+    save_storage: [4096]u8 = []
+    save_length := copy_text(save_storage[..], fixture.value)
+    add_text(save_storage[..], &save_length, "/filetype-test.py")
+    save_file(app, save_storage[..save_length])
+    _ = syntax_tick(app)
+    if app.documents.slots[app.documents.active].syntax == nil || !buffer.equal(filetype_name(&app.documents.slots[app.documents.active]), "json") {
+      #panic("save discarded explicit filetype")
+    }
+    smoke_command(app, typography, "filetype auto")
+    if app.documents.slots[app.documents.active].syntax == nil || !buffer.equal(filetype_name(&app.documents.slots[app.documents.active]), "python") {
+      #panic("auto did not restore extension detection")
+    }
+    smoke_command(app, typography, "filetype text")
+    if app.documents.slots[app.documents.active].syntax != nil || app.documents.current.length != 8 {
+      #panic("text filetype did not preserve document")
+    }
+    app.workspace.language_root_length = copy_text(app.workspace.language_root[..], saved_root[..saved_root_length])
+  }
+  // The pane limit must reject a new split without leaking an extra buffer.
+  pane_only(app)
+  split_count: usize = 0
+  for split_count < 7 {
+    pane_split(app, true)
+    split_count += 1
+  }
+  before_limit := app.documents.count
+  before_focus := app.view.focused
+  smoke_command(app, typography, "vnew")
+  if app.documents.count != before_limit || app.view.focused != before_focus || app.prompt_state.panel != Panel.Message {
+    #panic("vnew split limit changed buffers")
+  }
+  pane_only(app)
+  close_clean(app)
+  activate(app, vertical_slot)
+  close_clean(app)
+  activate(app, original)
+  pane_only(app)
+  if app.documents.count != count || app.documents.current != doc || app.documents.slots[horizontal_slot].document != nil {
+    #panic("new split cleanup")
+  }
+  smoke_command(app, typography, "theme")
+  if !buffer.equal(app.prompt_state.message[..app.prompt_state.message_length], "Theme: charcoal") {
+    #panic("theme query did not show charcoal")
+  }
+  app.prompt_state.panel = Panel.None
+}
+
+fn close_binding_smoke(app: *App, typography: *Typography) {
+  original := app.documents.active
+  original_doc := app.documents.current
+  before := app.documents.count
+  if !new_buffer(app) {
+    #panic("close binding fixture")
+  }
+  closing := app.documents.active
+  edited := app.documents.current
+  app.view.insert = true
+  _ = buffer.replace(edited, "unsaved edit")
+  revision := edited.revision
+  cursor := edited.cursor
+  key_input(app, typography, 120, 64)
+  if app.prompt_state.panel != Panel.Quit || !app.documents.closing_one {
+    #panic("Ctrl-X did not prompt for unsaved insert-mode buffer")
+  }
+  prompt: [8192]u8 = []
+  length := popup_text(app, prompt[..])
+  if !contains(prompt[..length], "Cancel") || !contains(prompt[..length], "keep buffer") {
+    #panic("close prompt lacks explicit cancel")
+  }
+  key_input(app, typography, 99, 0)
+  if app.prompt_state.panel != Panel.None || app.documents.current != edited || app.documents.active != closing || app.documents.count != before + 1 || edited.revision != revision || edited.cursor != cursor || !app.view.insert || !buffer.dirty(edited) {
+    #panic("Cancel changed dirty buffer")
+  }
+  key_input(app, typography, 120, 64)
+  key_input(app, typography, 27, 0)
+  if app.documents.current != edited || app.documents.closing_one || app.documents.quit_after_save {
+    #panic("Escape cancellation")
+  }
+  key_input(app, typography, 120, 64)
+  key_input(app, typography, 115, 0)
+  if app.prompt_state.panel != Panel.SaveAs || !app.documents.quit_after_save {
+    #panic("save-and-close unnamed buffer")
+  }
+  key_input(app, typography, 27, 0)
+  if app.documents.current != edited || app.documents.quit_after_save || app.documents.closing_one {
+    #panic("Save As cancellation lost buffer")
+  }
+  key_input(app, typography, 120, 64)
+  key_input(app, typography, 100, 0)
+  if app.documents.count != before || app.documents.current != original_doc || app.documents.active != original {
+    #panic("discard must close only active buffer")
+  }
+  if !new_buffer(app) {
+    #panic("clean buffer fixture")
+  }
+  key_input(app, typography, 120, 64)
+  if app.documents.count != before || app.documents.active != original || app.prompt_state.panel != Panel.None {
+    #panic("Ctrl-X clean buffer close")
+  }
+  fixture_storage: [4096]u8 = []
+  fixture := process.environment("DNA_WORKFLOW_TEST", fixture_storage[..])
+  if fixture.ok && fixture.found {
+    if !new_buffer(app) {
+      #panic("save-close buffer fixture")
+    }
+    _ = buffer.replace(app.documents.current, "saved on close")
+    key_input(app, typography, 120, 64)
+    key_input(app, typography, 115, 0)
+    path: [4096]u8 = []
+    used := copy_text(path[..], fixture.value)
+    add_text(path[..], &used, "/ctrl-x-save.txt")
+    text_input(app, path[..used])
+    key_input(app, typography, 13, 0)
+    if app.documents.count != before || app.documents.active != original || !files.metadata(path[..used]).ok {
+      #panic("Ctrl-X save did not save and close")
+    }
+  }
+  app.prompt_state.panel = Panel.None
+}
+
+fn picker_close_smoke(app: *App, typography: *Typography) {
+  original := app.documents.active
+  original_doc := app.documents.current
+  original_revision := app.documents.current.revision
+  before := app.documents.count
+  if !new_buffer(app) {
+    #panic("picker dirty fixture")
+  }
+  target := app.documents.active
+  target_doc := app.documents.current
+  _ = buffer.replace(target_doc, "keep these edits")
+  app.documents.file.length = copy_text(app.documents.file.path[..], "picker-selected.txt")
+  target_revision := target_doc.revision
+  activate(app, original)
+  panel(app, Panel.Buffers)
+  text_input(app, "picker-selected")
+  buffer_matches(app)
+  if app.prompt_state.match_count != 1 || app.prompt_state.matches[0] != target {
+    #panic("filtered picker fixture")
+  }
+  key_input(app, typography, 120, 64)
+  if app.prompt_state.panel != Panel.Quit || !app.picker_state.closing || app.documents.active != original || app.picker_state.close_target != target {
+    #panic("picker Ctrl-X targeted background buffer")
+  }
+  prompt: [8192]u8 = []
+  length := popup_text(app, prompt[..])
+  if !contains(prompt[..length], "picker-selected.txt") {
+    #panic("close confirmation names wrong buffer")
+  }
+  key_input(app, typography, 99, 0)
+  if app.prompt_state.panel != Panel.Buffers || app.documents.current != original_doc || app.documents.active != original || app.documents.slots[target].document != target_doc || target_doc.revision != target_revision || !buffer.dirty(target_doc) || !buffer.equal(app.prompt_state.text[..app.prompt_state.length], "picker-selected") || app.prompt_state.matches[app.prompt_state.selected] != target {
+    #panic("picker cancellation lost buffer, selection, filter or focus")
+  }
+  key_input(app, typography, 120, 64)
+  key_input(app, typography, 27, 0)
+  if app.prompt_state.panel != Panel.Buffers || app.picker_state.closing || app.documents.slots[target].document != target_doc {
+    #panic("picker Escape cancellation")
+  }
+  key_input(app, typography, 120, 64)
+  key_input(app, typography, 100, 0)
+  if app.prompt_state.panel != Panel.Buffers || app.documents.slots[target].document != nil || app.documents.active != original || app.documents.current != original_doc || app.documents.current.revision != original_revision || app.documents.count != before || app.prompt_state.match_count != 0 {
+    #panic("picker discard closed wrong buffer")
+  }
+  // An empty filtered list must not close the background buffer.
+  key_input(app, typography, 120, 64)
+  if app.documents.active != original || app.documents.current != original_doc || app.documents.count != before {
+    #panic("empty picker Ctrl-X closed background")
+  }
+  app.prompt_state.panel = Panel.None
+  if !new_buffer(app) {
+    #panic("picker clean fixture")
+  }
+  clean := app.documents.active
+  activate(app, original)
+  panel(app, Panel.Buffers)
+  buffer_matches(app)
+  row: usize = 0
+  for row < app.prompt_state.match_count && app.prompt_state.matches[row] != clean {
+    row += 1
+  }
+  app.prompt_state.selected = row
+  key_input(app, typography, 120, 64)
+  if app.documents.slots[clean].document != nil || app.prompt_state.panel != Panel.Buffers || app.documents.active != original {
+    #panic("picker clean selected row close")
+  }
+  // Cancelling Save As returns to the same picker, not the temporarily activated target.
+  app.prompt_state.panel = Panel.None
+  if !new_buffer(app) {
+    #panic("picker save fixture")
+  }
+  saving := app.documents.active
+  _ = buffer.replace(app.documents.current, "picker saved edits")
+  activate(app, original)
+  panel(app, Panel.Buffers)
+  buffer_matches(app)
+  row = 0
+  for row < app.prompt_state.match_count && app.prompt_state.matches[row] != saving {
+    row += 1
+  }
+  app.prompt_state.selected = row
+  key_input(app, typography, 120, 64)
+  key_input(app, typography, 115, 0)
+  if app.prompt_state.panel != Panel.SaveAs || app.documents.active != saving {
+    #panic("picker save target")
+  }
+  key_input(app, typography, 27, 0)
+  if app.prompt_state.panel != Panel.Buffers || app.documents.active != original || app.prompt_state.matches[app.prompt_state.selected] != saving || !buffer.dirty(app.documents.slots[saving].document) {
+    #panic("picker Save As cancellation")
+  }
+  fixture_storage: [4096]u8 = []
+  fixture := process.environment("DNA_WORKFLOW_TEST", fixture_storage[..])
+  if fixture.ok && fixture.found {
+    key_input(app, typography, 120, 64)
+    key_input(app, typography, 115, 0)
+    path: [4096]u8 = []
+    used := copy_text(path[..], fixture.value)
+    add_text(path[..], &used, "/picker-save.txt")
+    text_input(app, path[..used])
+    key_input(app, typography, 13, 0)
+    if app.prompt_state.panel != Panel.Buffers || app.documents.slots[saving].document != nil || app.documents.active != original || !files.metadata(path[..used]).ok {
+      #panic("picker save-and-close")
+    }
+  } else {
+    key_input(app, typography, 120, 64)
+    key_input(app, typography, 100, 0)
+  }
+  // Running terminal rows stay separate from the file behind the picker.
+  phase: usize = 0
+  for phase < 2 {
+    app.prompt_state.panel = Panel.None
+    terminal_show(app, true, "")
+    terminal_slot := app.terminal_state.slot
+    terminal := app.documents.slots[terminal_slot].terminal.handle
+    file_pane: usize = 0
+    for file_pane < 15 && !(app.view.panes[file_pane].used && !app.view.panes[file_pane].branch && app.view.panes[file_pane].slot == original) {
+      file_pane += 1
+    }
+    if file_pane == 15 {
+      #panic("terminal picker fixture lost file pane")
+    }
+    pane_focus(app, file_pane)
+    panel(app, Panel.Buffers)
+    text_input(app, "Terminal")
+    buffer_matches(app)
+    row = 0
+    for row < app.prompt_state.match_count && app.prompt_state.matches[row] != terminal_slot {
+      row += 1
+    }
+    app.prompt_state.selected = row
+    key_input(app, typography, 120, 64)
+    if app.prompt_state.panel != Panel.TerminalClose || app.documents.active != original {
+      #panic("picker terminal close changed background file")
+    }
+    key_input(app, typography, 99, 0)
+    if app.prompt_state.panel != Panel.Buffers || app.documents.active != original || app.documents.slots[terminal_slot].terminal.handle != terminal {
+      #panic("picker terminal cancellation")
+    }
+    key_input(app, typography, 120, 64)
+    if phase == 0 {
+      exit_text: []const u8 = "exit\n"
+      terminal_text(terminal, &exit_text[0], #len(exit_text))
+      deadline := sdl.ticks() + 3000
+      for app.documents.slots[terminal_slot].terminal.handle != nil && sdl.ticks() < deadline {
+        _ = terminal_tick(app)
+      }
+    } else {
+      key_input(app, typography, 13, 0)
+    }
+    if app.prompt_state.panel != Panel.Buffers || app.picker_state.closing || app.documents.active != original || app.documents.slots[terminal_slot].terminal.handle != nil || app.documents.current != original_doc {
+      #panic("picker terminal close did not preserve file and list")
+    }
+    phase += 1
+  }
+  app.prompt_state.panel = Panel.None
+}
+
+fn line_motion_smoke(app: *App, typography: *Typography) {
+  original := app.documents.active
+  if !new_buffer(app) {
+    #panic("line motion fixture")
+  }
+  doc := app.documents.current
+  _ = buffer.load(doc, "hello world")
+  app.view.insert = false
+  app.view.extend = false
+  buffer.select_to(doc, 0, false)
+  key_input(app, typography, 101, 0)
+  if !buffer.equal(doc.bytes[buffer.start(doc)..buffer.end(doc)], "hello") {
+    #panic("e omitted hovered first character through input handler")
+  }
+  buffer.select_to(doc, 0, false)
+  key_input(app, typography, 50, 0)
+  key_input(app, typography, 101, 0)
+  if !buffer.equal(doc.bytes[buffer.start(doc)..buffer.end(doc)], "hello world") {
+    #panic("counted e lost first character")
+  }
+  _ = buffer.load(doc, "one two\nsix ten")
+  buffer.select_to(doc, 0, false)
+  doc.secondary.count = 1
+  doc.secondary.ranges[0] = buffer.Selection{anchor: 8, cursor: 9}
+  key_input(app, typography, 50, 0)
+  key_input(app, typography, 101, 0)
+  if doc.anchor != 0 || doc.cursor != 7 || doc.secondary.ranges[0].anchor != 8 || doc.secondary.ranges[0].cursor != 15 {
+    #panic("counted multi-cursor e anchors")
+  }
+  _ = buffer.load(doc, "  alpha\n  beta\n")
+  buffer.select_line(doc)
+  key_input(app, typography, 97, 1)
+  if !app.view.insert || doc.cursor != 7 || doc.anchor != 7 {
+    #panic("A used following line of half-open selection")
+  }
+  text_input(app, "!")
+  key_input(app, typography, 27, 0)
+  if !buffer.equal(doc.bytes[..doc.length], "  alpha!\n  beta\n") {
+    #panic("A inserted on wrong line")
+  }
+  _ = buffer.load(doc, "  alpha\n  beta\n")
+  buffer.select_line(doc)
+  key_input(app, typography, 105, 1)
+  if !app.view.insert || doc.cursor != 2 {
+    #panic("I did not use first nonblank of visible line")
+  }
+  text_input(app, "!")
+  key_input(app, typography, 27, 0)
+  if !buffer.equal(doc.bytes[..doc.length], "  !alpha\n  beta\n") {
+    #panic("I inserted on wrong line")
+  }
+  _ = buffer.load(doc, "  alpha\n  beta\n")
+  buffer.select_line(doc)
+  key_input(app, typography, 103, 0)
+  key_input(app, typography, 115, 0)
+  if buffer.head(doc) != 2 || buffer.start(doc) != 2 || buffer.end(doc) != 3 {
+    #panic("gs did not select first nonblank of visible line")
+  }
+  key_input(app, typography, 103, 0)
+  key_input(app, typography, 108, 0)
+  if buffer.head(doc) != 6 || buffer.end(doc) != 7 {
+    #panic("gl must select last character, not newline")
+  }
+  key_input(app, typography, 103, 0)
+  key_input(app, typography, 104, 0)
+  if buffer.head(doc) != 0 {
+    #panic("gh must reach physical line start")
+  }
+  key_input(app, typography, 118, 0)
+  key_input(app, typography, 103, 0)
+  key_input(app, typography, 108, 0)
+  if doc.anchor != 0 || doc.cursor != 7 || !app.view.extend {
+    #panic("visual gl must include last character")
+  }
+  key_input(app, typography, 27, 0)
+  _ = buffer.load(doc, "  one\n\ttwo\n")
+  buffer.select_to(doc, 3, false)
+  doc.secondary.count = 1
+  doc.secondary.ranges[0] = buffer.Selection{anchor: 8, cursor: 9}
+  key_input(app, typography, 103, 0)
+  key_input(app, typography, 115, 0)
+  if buffer.head(doc) != 2 || doc.secondary.ranges[0].anchor != 7 || doc.secondary.ranges[0].cursor != 8 {
+    #panic("gs must move every cursor")
+  }
+  key_input(app, typography, 97, 1)
+  text_input(app, "!")
+  key_input(app, typography, 27, 0)
+  if !buffer.equal(doc.bytes[..doc.length], "  one!\n\ttwo!\n") {
+    #panic("A must insert at every cursor line end")
+  }
+  key_input(app, typography, 105, 1)
+  text_input(app, "?")
+  key_input(app, typography, 27, 0)
+  if !buffer.equal(doc.bytes[..doc.length], "  ?one!\n\t?two!\n") {
+    #panic("I must insert at every cursor line start")
+  }
+  _ = buffer.load(doc, "  \n\n")
+  buffer.select_to(doc, 1, false)
+  key_input(app, typography, 103, 0)
+  key_input(app, typography, 115, 0)
+  if buffer.head(doc) != 0 {
+    #panic("gs blank line fallback")
+  }
+  buffer.move_to(doc, 3, false)
+  key_input(app, typography, 103, 0)
+  key_input(app, typography, 108, 0)
+  if buffer.head(doc) != 3 {
+    #panic("gl empty line must not cross newline")
+  }
+  _ = buffer.load(doc, "one\ntwo")
+  buffer.select_line(doc)
+  key_input(app, typography, 1073741898, 0)
+  if buffer.head(doc) != 0 {
+    #panic("Home visible line start")
+  }
+  key_input(app, typography, 1073741901, 0)
+  if buffer.head(doc) != 2 || buffer.end(doc) != 3 {
+    #panic("End must exclude newline")
+  }
+  _ = buffer.load(doc, "é中\n")
+  buffer.select_line(doc)
+  key_input(app, typography, 103, 0)
+  key_input(app, typography, 108, 0)
+  if buffer.head(doc) != 2 || doc.cursor != 5 {
+    #panic("gl UTF-8 boundary")
+  }
+  _ = buffer.load(doc, "")
+  close_clean(app)
+  activate(app, original)
+}
+
+fn newline_smoke(app: *App, typography: *Typography) {
+  original := app.documents.active
+  if !new_buffer(app) {
+    #panic("newline fixture")
+  }
+  doc := app.documents.current
+  _ = buffer.load(doc, "one\ntwo")
+  buffer.select_line(doc)
+  key_input(app, typography, 111, 0)
+  if !app.view.insert || !buffer.equal(doc.bytes[..doc.length], "one\n\ntwo") || doc.cursor != 4 {
+    #panic("o must open below visible line, not selection endpoint")
+  }
+  key_input(app, typography, 27, 0)
+  if app.view.insert || buffer.head(doc) != 4 || line_at(doc, buffer.head(doc)) != 2 {
+    #panic("o Escape jumped above new line")
+  }
+  _ = buffer.load(doc, "one\ntwo")
+  buffer.select_line(doc)
+  key_input(app, typography, 111, 1)
+  key_input(app, typography, 27, 0)
+  if !buffer.equal(doc.bytes[..doc.length], "\none\ntwo") || buffer.head(doc) != 0 {
+    #panic("O Escape must stay on new line above visible line")
+  }
+  _ = buffer.load(doc, "one")
+  buffer.select_to(doc, 2, false)
+  key_input(app, typography, 111, 0)
+  key_input(app, typography, 27, 0)
+  if !buffer.equal(doc.bytes[..doc.length], "one\n") || buffer.head(doc) != 4 {
+    #panic("o Escape on last line")
+  }
+  _ = buffer.load(doc, "one")
+  key_input(app, typography, 97, 1)
+  key_input(app, typography, 13, 0)
+  key_input(app, typography, 27, 0)
+  if buffer.head(doc) != 4 || line_at(doc, buffer.head(doc)) != 2 {
+    #panic("Enter Escape on new final line")
+  }
+  _ = buffer.load(doc, "one\ntwo")
+  buffer.select_to(doc, 4, false)
+  key_input(app, typography, 105, 0)
+  key_input(app, typography, 27, 0)
+  if buffer.head(doc) != 4 {
+    #panic("i Escape must not cross previous newline")
+  }
+  _ = buffer.load(doc, "é中")
+  key_input(app, typography, 97, 1)
+  text_input(app, "!")
+  key_input(app, typography, 27, 0)
+  if buffer.head(doc) != 5 || !buffer.equal(doc.bytes[..doc.length], "é中!") {
+    #panic("Escape after typing still selects previous character")
+  }
+  _ = buffer.load(doc, "")
+  close_clean(app)
+  activate(app, original)
+}
+
+fn project_tools_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Typography) {
+  original_active := app.documents.active
+  environment: [4096]u8 = []
+  fixture := process.environment("DNA_WORKFLOW_TEST", environment[..])
+  if !fixture.ok || !fixture.found {
+    return
+  }
+  path: [4096]u8 = []
+  length := copy_text(path[..], fixture.value)
+  add_text(path[..], &length, "/project-search.txt")
+  if !fs.write_all(path[..length], "needle α needle\n").ok {
+    #panic("search fixture")
+  }
+  old_project: [4096]u8 = []
+  old_length := copy_text(old_project[..], app.workspace.project[..app.workspace.project_length])
+  app.workspace.project_length = copy_text(app.workspace.project[..], fixture.value)
+  project_search_open(app)
+  text_input(app, "needle")
+  deadline := sdl.ticks() + 5000
+  for app.project_find.status == 1 && sdl.ticks() < deadline {
+    _ = project_search_tick(app)
+  }
+  if app.project_find.status != 0 || app.project_find.count != 2 {
+    #panic("project search results")
+  }
+  draw(renderer, window, app, typography)
+  project_search_accept(app)
+  if app.prompt_state.panel != Panel.None || !buffer.equal(app.documents.current.bytes[buffer.start(app.documents.current)..buffer.end(app.documents.current)], "needle") {
+    #panic("search navigation")
+  }
+  app.replacement.text_length = copy_text(app.replacement.text[..], "new")
+  replace_prepare(app, "new")
+  if app.prompt_state.panel != Panel.ReplacePreview || app.replacement.plan.total != 2 {
+    #panic("replacement prepare")
+  }
+  draw(renderer, window, app, typography)
+  replace_apply(app)
+  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "new α new\n") {
+    #panic("replacement apply")
+  }
+  buffer.undo(app.documents.current)
+  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "needle α needle\n") {
+    #panic("replacement undo")
+  }
+  // Dirty targets veto the whole operation; cancelling a preview changes nothing.
+  replace_prepare(app, "changed")
+  if app.prompt_state.panel != Panel.ReplacePreview {
+    #panic("replace second preview")
+  }
+  buffer.move_to(app.documents.current, 0, false)
+  _ = buffer.replace(app.documents.current, "dirty ")
+  replace_apply(app)
+  if app.prompt_state.panel != Panel.Message || !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "dirty needle α needle\n") {
+    #panic("replace dirty veto")
+  }
+  buffer.undo(app.documents.current)
+  replace_release(app)
+  pane_split(app, false)
+  pane_resize(app, 25.0)
+  if app.view.panes[app.view.panes[app.view.focused].parent].split_fraction != 0.75 {
+    #panic("pane resize")
+  }
+  pane_equalize(app)
+  if app.view.panes[app.view.panes[app.view.focused].parent].split_fraction != 0.5 {
+    #panic("pane equalize")
+  }
+  pane_only(app)
+  // Splits share the width evenly: thirds, then quarters, also when nested.
+  app.view.panes[0].rect = sdl.PixelRect{x: 0, y: 0, width: 1200, height: 600}
+  pane_split(app, true)
+  pane_split(app, true)
+  if !pane_widths_even(app, 3) {
+    #panic("three vertical panes take thirds")
+  }
+  pane_split(app, true)
+  if !pane_widths_even(app, 4) {
+    #panic("four vertical panes take quarters")
+  }
+  // A stacked split inside one column keeps the column widths even.
+  pane_split(app, false)
+  if !pane_widths_even(app, 4) {
+    #panic("horizontal split inside a column")
+  }
+  pane_close(app)
+  pane_close(app)
+  if !pane_widths_even(app, 3) {
+    #panic("closing rebalances")
+  }
+  pane_resize(app, 70.0)
+  pane_equalize(app)
+  if !pane_widths_even(app, 3) {
+    #panic(":equalize restores thirds")
+  }
+  pane_only(app)
+  app.workspace.project_length = copy_text(app.workspace.project[..], old_project[..old_length])
+  activate(app, original_active)
+  app.prompt_state.panel = Panel.None
+}
+
+fn persistence_smoke() {
+  environment: [4096]u8 = []
+  fixture := process.environment("DNA_WORKFLOW_TEST", environment[..])
+  if !fixture.ok || !fixture.found {
+    return
+  }
+  owner := mem.arena_create(#sizeof(App) + 128)
+  temporary := mem.arena_create(2097152)
+  if !owner.ok || !temporary.ok {
+    #panic("session test allocation")
+  }
+  defer _ = mem.arena_release(&owner.arena)
+  defer _ = mem.arena_release(&temporary.arena)
+  test_app := #cast(*App) mem.arena_push(&owner.arena, #sizeof(App), #alignof(App))
+  test_app.scratch = &temporary.arena
+  test_app.config = settings.Settings{}
+  defer release_editor_state(test_app)
+  test_app.workspace.project_length = copy_text(test_app.workspace.project[..], fixture.value)
+  if !new_buffer(test_app) {
+    #panic("session new buffer")
+  }
+  _ = buffer.load(test_app.documents.current, "saved")
+  test_app.documents.current.cursor = 5
+  test_app.documents.current.anchor = 5
+  _ = buffer.replace(test_app.documents.current, " edits α")
+  test_app.documents.slots[0].filetype_length = copy_text(test_app.documents.slots[0].filetype[..], "dyn")
+  pane_split(test_app, true)
+  pane_resize(test_app, 30.0)
+  path: [4096]u8 = []
+  length := copy_text(path[..], fixture.value)
+  add_text(path[..], &length, "/test.session")
+  _ = session_save(test_app, path[..length])
+  if !files.metadata(path[..length]).ok {
+    #panic("session save")
+  }
+  buffer.mark_saved(test_app.documents.current)
+  _ = buffer.load(test_app.documents.current, "different")
+  _ = session_restore(test_app, path[..length])
+  if test_app.prompt_state.panel != Panel.None || !buffer.equal(test_app.documents.current.bytes[..test_app.documents.current.length], "saved edits α") || !buffer.dirty(test_app.documents.current) || !test_app.view.panes[0].branch || !buffer.equal(test_app.documents.slots[0].filetype[..test_app.documents.slots[0].filetype_length], "dyn") {
+    #panic("session restore")
+  }
+  if !buffer.equal(test_app.documents.current.saved[..test_app.documents.current.saved_length], "saved") {
+    #panic("session saved baseline")
+  }
+  buffer.mark_saved(test_app.documents.current)
+  pane_focus(test_app, test_app.view.panes[0].first)
+  pane_new(test_app, false)
+  arranged := layout.parse("tree=\"v70(f,h50(f,f))\"\n")
+  layout_apply_tree(test_app, &arranged)
+  if test_app.view.panes[1].slot != 0 || test_app.view.panes[3].slot != 1 || test_app.view.panes[4].slot != 0 {
+    #panic("layout keeps spatial buffer order")
+  }
+  layout_path: [4096]u8 = []
+  layout_length := copy_text(layout_path[..], fixture.value)
+  add_text(layout_path[..], &layout_length, "/saved-layout.toml")
+  layout_save(test_app, layout_path[..layout_length])
+  layout_read := fs.read_all(test_app.scratch, layout_path[..layout_length], 4096)
+  if !layout_read.ok || layout.parse(layout_read.data).node_count != 5 {
+    #panic("layout save roundtrip")
+  }
+  buffer.mark_saved(test_app.documents.current)
+}
+
+fn plugin_host_smoke(typography: *Typography) {
+  manifest_storage: [4096]u8 = []
+  manifest := process.environment("DNA_TEST_PLUGIN", manifest_storage[..])
+  if !manifest.ok || !manifest.found {
+    return
+  }
+  fixture_storage: [4096]u8 = []
+  fixture := process.environment("DNA_WORKFLOW_TEST", fixture_storage[..])
+  if !fixture.ok || !fixture.found {
+    return
+  }
+  owner := mem.arena_create(#sizeof(App) + 128)
+  temporary := mem.arena_create(2097152)
+  if !owner.ok || !temporary.ok {
+    #panic("plugin test allocation")
+  }
+  defer _ = mem.arena_release(&owner.arena)
+  defer _ = mem.arena_release(&temporary.arena)
+  test_app := #cast(*App) mem.arena_push(&owner.arena, #sizeof(App), #alignof(App))
+  test_app.scratch = &temporary.arena
+  test_app.config = settings.Settings{}
+  defer release_editor_state(test_app)
+  defer plugin_release(test_app)
+  test_app.configuration.path_length = copy_text(test_app.configuration.path[..], fixture.value)
+  add_text(test_app.configuration.path[..], &test_app.configuration.path_length, "/config.toml")
+  if !new_buffer(test_app) {
+    #panic("plugin test buffer")
+  }
+  _ = buffer.load(test_app.documents.current, "hello α\n")
+  plugin_prepare(test_app, manifest.value)
+  if test_app.prompt_state.panel != Panel.PluginGrant || !test_app.plugin_state.pending.read || !test_app.plugin_state.pending.write {
+    #panic("plugin grants")
+  }
+  key_input(test_app, typography, 13, 0)
+  deadline := sdl.ticks() + 3000
+  for (test_app.plugin_state.command_count == 0 || test_app.plugin_state.slots[0].deadline != 0) && sdl.ticks() < deadline {
+    _ = plugin_tick(test_app)
+  }
+  if test_app.plugin_state.command_count != 1 || test_app.plugin_state.slots[0].process == nil {
+    #panic("plugin registration")
+  }
+  matches(test_app)
+  if test_app.prompt_state.match_count < 68 {
+    #panic("plugin palette registration")
+  }
+  plugin_run_command(test_app, 0)
+  deadline = sdl.ticks() + 3000
+  for test_app.prompt_state.panel != Panel.PluginEdit && sdl.ticks() < deadline {
+    _ = plugin_tick(test_app)
+  }
+  if test_app.prompt_state.panel != Panel.PluginEdit || !buffer.equal(test_app.documents.current.bytes[..test_app.documents.current.length], "hello α\n") {
+    #panic("plugin preview")
+  }
+  key_input(test_app, typography, 27, 0)
+  if !buffer.equal(test_app.documents.current.bytes[..test_app.documents.current.length], "hello α\n") {
+    #panic("plugin cancel")
+  }
+  plugin_run_command(test_app, 0)
+  deadline = sdl.ticks() + 3000
+  for test_app.prompt_state.panel != Panel.PluginEdit && sdl.ticks() < deadline {
+    _ = plugin_tick(test_app)
+  }
+  key_input(test_app, typography, 13, 0)
+  if !buffer.equal(test_app.documents.current.bytes[..test_app.documents.current.length], "HELLO α\n") {
+    #panic("plugin apply")
+  }
+  buffer.undo(test_app.documents.current)
+  if !buffer.equal(test_app.documents.current.bytes[..test_app.documents.current.length], "hello α\n") {
+    #panic("plugin undo")
+  }
+  plugin_run_command(test_app, 0)
+  _ = buffer.replace(test_app.documents.current, "new")
+  deadline = sdl.ticks() + 3000
+  for test_app.plugin_state.slots[0].deadline != 0 && sdl.ticks() < deadline {
+    _ = plugin_tick(test_app)
+  }
+  if test_app.prompt_state.panel == Panel.PluginEdit || !contains(test_app.plugin_state.log[..test_app.plugin_state.log_length], "stale") {
+    #panic("plugin stale edit")
+  }
+  test_app.plugin_state.slots[0].write = false
+  plugin_message(test_app, 0, "{\"type\":\"replace\",\"buffer\":0,\"revision\":1,\"text\":\"bad\"}")
+  if test_app.plugin_state.slots[0].process != nil || test_app.plugin_state.commands[0].length != 0 {
+    #panic("plugin permission denial")
+  }
+  _ = plugin_install(test_app, manifest.value)
+  _ = plugin_install(test_app, manifest.value)
+  installed: [4096]u8 = []
+  installed_length := copy_text(installed[..], fixture.value)
+  add_text(installed[..], &installed_length, "/plugins/uppercase/plugin.json")
+  if !files.metadata(installed[..installed_length]).ok {
+    #panic("plugin local install/update")
+  }
+  plugin_update(test_app, "uppercase")
+  if test_app.prompt_state.panel != Panel.PluginGrant {
+    #panic("plugin update permission review")
+  }
+  key_input(test_app, typography, 27, 0)
+  if test_app.plugin_state.slots[0].process != nil {
+    #panic("plugin update cancel")
+  }
+  catalog_path: [4096]u8 = []
+  catalog_length := copy_text(catalog_path[..], fixture.value)
+  add_text(catalog_path[..], &catalog_length, "/plugin-catalog.json")
+  catalog_json: [16384]u8 = []
+  quoted_path: [12288]u8 = []
+  catalog_used := copy_text(catalog_json[..], "{\"uppercase\":")
+  add_text(catalog_json[..], &catalog_used, json.write_string(quoted_path[..], manifest.value))
+  add_text(catalog_json[..], &catalog_used, "}")
+  if !fs.write_all(catalog_path[..catalog_length], catalog_json[..catalog_used]).ok {
+    #panic("plugin catalog fixture")
+  }
+  plugin_remove(test_app, "uppercase")
+  if files.metadata(installed[..installed_length]).ok {
+    #panic("plugin removal")
+  }
+  plugin_install_named(test_app, "uppercase")
+  if !files.metadata(installed[..installed_length]).ok {
+    #panic("plugin catalog install")
+  }
+
+  buffer.mark_saved(test_app.documents.current)
+}
+
+fn batch_bindings_smoke(app: *App, typography: *Typography) {
+  original := app.documents.active
+  if !new_buffer(app) {
+    #panic("batch input fixture")
+  }
+  doc := app.documents.current
+  _ = buffer.load(doc, "aa\nbb")
+  doc.anchor = 0
+  doc.cursor = 2
+  doc.secondary.count = 1
+  doc.secondary.ranges[0] = buffer.Selection{anchor: 3, cursor: 5}
+  key_input(app, typography, 126, 0)
+  if !buffer.equal(doc.bytes[..doc.length], "AA\nBB") || app.prompt_state.panel != Panel.None {
+    #panic("batch case key")
+  }
+  key_input(app, typography, 117, 0)
+  file := active_file_config(app)
+  file.indent_explicit = true
+  file.indent_width = 2
+  file.insert_tabs = false
+  key_input(app, typography, 62, 0)
+  if !buffer.equal(doc.bytes[..doc.length], "  aa\n  bb") {
+    #panic("batch indent key")
+  }
+  key_input(app, typography, 117, 0)
+  key_input(app, typography, 48, 1)
+  if doc.anchor != 3 || doc.cursor != 5 {
+    #panic("shift zero rotates selection")
+  }
+  key_input(app, typography, 57, 769)
+  if !buffer.equal(doc.bytes[..doc.length], "bb\naa") {
+    #panic("alt shift nine rotates contents")
+  }
+  key_input(app, typography, 117, 0)
+  key_input(app, typography, 50, 0)
+  key_input(app, typography, 111, 0)
+  if !app.view.insert || !buffer.equal(doc.bytes[..doc.length], "aa\n\n\nbb\n\n") {
+    #panic("counted open key")
+  }
+  text_input(app, "x")
+  key_input(app, typography, 27, 0)
+  key_input(app, typography, 117, 0)
+  if !buffer.equal(doc.bytes[..doc.length], "aa\nbb") || doc.secondary.count != 1 {
+    #panic("batch input undo")
+  }
+  _ = buffer.load(doc, " a  b ")
+  doc.anchor = 3
+  doc.cursor = 0
+  doc.secondary.count = 1
+  doc.secondary.ranges[0] = buffer.Selection{anchor: 3, cursor: 6}
+  key_input(app, typography, 45, 1)
+  if doc.anchor != 2 || doc.cursor != 1 || doc.secondary.ranges[0].anchor != 4 || doc.secondary.ranges[0].cursor != 5 {
+    #panic("trim every selection")
+  }
+  key_input(app, typography, 59, 769)
+  if doc.anchor != 1 || doc.cursor != 2 || app.prompt_state.panel != Panel.None {
+    #panic("ensure forward binding")
+  }
+  key_input(app, typography, 45, 768)
+  if doc.anchor != 1 || doc.cursor != 5 || doc.secondary.count != 0 {
+    #panic("merge all binding")
+  }
+  _ = buffer.load(doc, "0123456789")
+  doc.anchor = 5
+  doc.cursor = 1
+  doc.secondary.count = 2
+  doc.secondary.ranges[0] = buffer.Selection{anchor: 4, cursor: 8}
+  doc.secondary.ranges[1] = buffer.Selection{anchor: 9, cursor: 10}
+  key_input(app, typography, 45, 769)
+  if doc.anchor != 8 || doc.cursor != 1 || doc.secondary.count != 1 || doc.secondary.ranges[0].anchor != 9 {
+    #panic("merge consecutive keeps primary direction and gaps")
+  }
+  _ = buffer.load(doc, "aa bb")
+  doc.anchor = 2
+  doc.cursor = 0
+  doc.secondary.count = 1
+  doc.secondary.ranges[0] = buffer.Selection{anchor: 3, cursor: 5}
+  key_input(app, typography, 107, 1)
+  text_input(app, "aa")
+  if app.prompt_state.panel != Panel.Keep || doc.secondary.count != 0 || doc.anchor != 2 || doc.cursor != 0 {
+    #panic("keep regex preserves reverse selection")
+  }
+  key_input(app, typography, 27, 0)
+  if doc.secondary.count != 1 {
+    #panic("filter cancel restores selections")
+  }
+  key_input(app, typography, 107, 769)
+  text_input(app, "aa")
+  key_input(app, typography, 13, 0)
+  if app.prompt_state.panel != Panel.None || doc.anchor != 3 || doc.cursor != 5 || doc.secondary.count != 0 {
+    #panic("remove regex selection")
+  }
+  _ = buffer.load(doc, "")
+  fill: usize = 0
+  for fill < 600000 {
+    doc.bytes[fill] = 97
+    fill += 1
+  }
+  doc.length = 600000
+  doc.anchor = 0
+  doc.cursor = doc.length
+  doc.secondary.count = 1
+  doc.secondary.ranges[0] = buffer.Selection{anchor: 0, cursor: doc.length}
+  // Registers are sized to the selections, so a yank beyond the old 1 MiB
+  // clipboard bound succeeds and the delete proceeds.
+  key_input(app, typography, 100, 0)
+  if doc.length != 0 || app.register_state.clipboard.count != 2 || #len(app.register_state.clipboard.text) != 1200001 {
+    #panic("large multi-selection yank and delete")
+  }
+  app.prompt_state.panel = Panel.None
+  _ = buffer.load(doc, "named")
+  doc.anchor = 0
+  doc.cursor = 5
+  key_input(app, typography, 39, 1)
+  text_input(app, "a")
+  key_input(app, typography, 121, 0)
+  if app.register_state.selected != 0 || !app.register_state.named[0].owned {
+    #panic("named register yank")
+  }
+  _ = buffer.load(doc, "x")
+  doc.anchor = 0
+  doc.cursor = 1
+  key_input(app, typography, 39, 1)
+  text_input(app, "a")
+  key_input(app, typography, 114, 1)
+  if !buffer.equal(doc.bytes[..doc.length], "named") {
+    #panic("named register replacement")
+  }
+  _ = buffer.load(doc, "")
+  key_input(app, typography, 113, 1)
+  key_input(app, typography, 105, 0)
+  text_input(app, "é")
+  key_input(app, typography, 27, 0)
+  if app.view.insert {
+    #panic("macro escape insert")
+  }
+  if app.prompt_state.panel != Panel.None {
+    #panic("macro escape panel")
+  }
+  key_input(app, typography, 113, 1)
+  if app.macro_state.recording {
+    #panic("macro still recording")
+  }
+  if app.macro_state.slots[0].count == 0 {
+    #panic("macro empty")
+  }
+  if app.macro_state.slots[0].count != 3 {
+    #panic("macro event count")
+  }
+  key_input(app, typography, 113, 0)
+  for app.macro_state.remaining > 0 {
+    _ = macro_tick(app, typography)
+  }
+  if !buffer.equal(doc.bytes[..doc.length], "éé") || app.view.insert {
+    #panic("macro replay")
+  }
+  key_input(app, typography, 117, 0)
+  if !buffer.equal(doc.bytes[..doc.length], "é") {
+    #panic("macro undo")
+  }
+  key_input(app, typography, 39, 1)
+  text_input(app, "b")
+  key_input(app, typography, 113, 1)
+  key_input(app, typography, 105, 0)
+  text_input(app, "Z")
+  key_input(app, typography, 27, 0)
+  key_input(app, typography, 113, 1)
+  if app.macro_state.slots[2].count != 3 {
+    #panic("named macro")
+  }
+  key_input(app, typography, 39, 1)
+  text_input(app, "b")
+  key_input(app, typography, 113, 0)
+  for app.macro_state.remaining > 0 {
+    _ = macro_tick(app, typography)
+  }
+  if !buffer.equal(doc.bytes[..doc.length], "ZZé") {
+    #panic("named macro playback")
+  }
+  app.input_state.repeat_count = 999
+  app.register_state.selected = 2
+  key_input(app, typography, 113, 0)
+  if app.macro_state.remaining == 0 {
+    #panic("macro replay must yield")
+  }
+  key_input(app, typography, 27, 0)
+  if app.macro_state.remaining != 0 {
+    #panic("macro cancellation")
+  }
+  key_input(app, typography, 113, 1)
+  event: usize = 0
+  for event < 1025 {
+    macro_key(app, 108, 0)
+    event += 1
+  }
+  if app.macro_state.recording || app.macro_state.slots[0].count != 0 {
+    #panic("macro overflow must discard")
+  }
+  app.prompt_state.panel = Panel.None
+  buffer.mark_saved(doc)
+  close_clean(app)
+  activate(app, original)
+}
+
+// Distinct pane widths across the top row are equal within rounding.
+fn pane_widths_even(app: *App, columns: usize) bool {
+  total: i32 = 0
+  count: usize = 0
+  smallest: i32 = 100000
+  largest: i32 = 0
+  for index in 0..15 {
+    pane := &app.view.panes[index]
+    if pane.used && !pane.branch && pane.rect.y == 0 {
+      total += pane.rect.width
+      count += 1
+      if pane.rect.width < smallest {
+        smallest = pane.rect.width
+      }
+      if pane.rect.width > largest {
+        largest = pane.rect.width
+      }
+    }
+  }
+  return count == columns && largest - smallest <= 2 && total == 1200
+}

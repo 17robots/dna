@@ -1,0 +1,232 @@
+// Completion list at the cursor, built with the immediate-mode UI. Rows show
+// the label with the server's detail (usually a type or signature) muted on
+// the right; clicking a row accepts it.
+fn draw_completion(renderer: rawptr, app: *App, typography: *Typography, width: i32, height: i32) {
+  state := &app.lsp.results
+  ui := &app.ui
+  ui_panel_begin(ui, typography)
+  scale := typography.scale
+  line := typography.line
+  padding := app.config.popup_padding * scale
+  count := state.count
+  selected := app.prompt_state.selected
+  shown := count
+  if shown > 8 {
+    shown = 8
+  }
+  if shown == 0 {
+    shown = 1
+  }
+  // Size to the widest visible label and detail, within the pane.
+  widest: f32 = 0.0
+  for measured in 0..count {
+    item := state.items[measured]
+    span := ui_text_width(ui, json_text(item, "label")) + typography.cell * 3.0
+    detail := json_text(item, "detail")
+    if #len(detail) > 0 {
+      span += ui_text_width(ui, detail) + typography.cell * 2.0
+    }
+    if span > widest {
+      widest = span
+    }
+  }
+  limit := 560.0 * scale
+  if widest > limit {
+    widest = limit
+  }
+  if widest < 160.0 * scale {
+    widest = 160.0 * scale
+  }
+  bounds := app.view.panes[app.view.focused].rect
+  place := place_rect(app, SurfaceCompletion, width, height, line, scale, language_popup_rect(bounds, app.view.animation.file.cursor_x.value, app.view.animation.file.cursor_y.value, widest + padding * 2.0, line * #cast(f32) shown + padding * 2.0, line, scale))
+  // Opening drops the list a few pixels as it fades in.
+  opening := app.view.animation.panel != Panel.LspResults
+  if opening {
+    motion.snap(&ui.completion_open, -6.0 * scale)
+  }
+  drop := animated_value(app, &ui.completion_open, 0.0, app.config.popup_animation_ms * 2.0, false)
+  frame := ui_make(ui, ui_hash(0, "completion"), UiFloating | UiBackground | UiBorder | UiClip)
+  ui.boxes[frame].floating[0] = place.x
+  ui.boxes[frame].floating[1] = place.y + drop
+  ui.boxes[frame].fill = theme().surface
+  ui.boxes[frame].padding[0] = padding
+  ui.boxes[frame].padding[1] = padding
+  ui_size(ui, frame, UiAxisX, UiSizeKind.Pixels, place.width / scale, 1.0)
+  ui_size(ui, frame, UiAxisY, UiSizeKind.Pixels, place.height / scale, 1.0)
+  ui_push(ui, frame)
+  list := ui_make(ui, ui_key(ui, "list"), UiClip | UiScroll)
+  ui_size(ui, list, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
+  ui_size(ui, list, UiAxisY, UiSizeKind.Percent, 1.0, 1.0)
+  ui_list_scroll(app, ui, list, count, selected, line * #cast(f32) shown, opening, opening || selected != ui.completion_selected || count != ui.completion_count)
+  window := ui_list_window(ui, list, count, line * #cast(f32) shown)
+  ui_push(ui, list)
+  ui_spacer(ui, "above", #cast(f32) window.first * line)
+  for row in window.first..window.last {
+    item := state.items[row]
+    label := json_text(item, "label")
+    entry := ui_make(ui, ui_hash(ui.boxes[list].key, label), UiClickable | UiHover)
+    ui.boxes[entry].axis = UiAxisX
+    ui.boxes[entry].value = row
+    ui.boxes[entry].padding[0] = typography.cell * 0.5
+    ui_size(ui, entry, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
+    ui_size(ui, entry, UiAxisY, UiSizeKind.Pixels, line / scale, 1.0)
+    ui_push(ui, entry)
+    _ = ui_label(ui, "label", label, UiClip)
+    fill := ui_make(ui, ui_key(ui, "fill"), 0)
+    ui_size(ui, fill, UiAxisX, UiSizeKind.Pixels, 16.0, 0.0)
+    detail := json_text(item, "detail")
+    if #len(detail) > 0 {
+      // Detail yields first: long signatures clip before the label does.
+      described := ui_label(ui, "detail", detail, UiMuted | UiClip | UiTextRight)
+      ui_size(ui, described, UiAxisX, UiSizeKind.Percent, 1.0, 0.0)
+    }
+    ui_pop(ui)
+    ui_animate(app, ui, entry, row == selected)
+  }
+  ui_spacer(ui, "below", #cast(f32) (count - window.last) * line)
+  ui_pop(ui)
+  ui_pop(ui)
+  ui.completion_selected = selected
+  ui.completion_count = count
+  ui_layout(ui)
+  ui_render(renderer, ui, typography, width, height)
+}
+// Click accepts a row. A click elsewhere closes the list and returns false so
+// the click still reaches the document.
+fn completion_mouse(app: *App, typography: *Typography, x: f32, y: f32, pressed: bool, moved: bool) bool {
+  ui := &app.ui
+  if moved {
+    ui_pointer(ui, x, y)
+    return true
+  }
+  if !pressed {
+    return true
+  }
+  hit := ui_hit(ui, x, y)
+  if hit == 0 {
+    frame := ui_make_lookup(ui, ui_hash(0, "completion"))
+    if frame != 0 && ui_contains(ui.boxes[frame].rect, x, y) {
+      return true
+    }
+    app.prompt_state.panel = Panel.None
+    lsp_results_release(app)
+    return false
+  }
+  row := ui.boxes[hit].value
+  if row >= app.lsp.results.count {
+    return true
+  }
+  app.prompt_state.selected = row
+  lsp_accept(app)
+  return true
+}
+// Hover documentation at the cursor. The UI owns the frame, fade, drop-in and
+// smooth scrolling; the wrapped text and its code highlighting draw inside
+// the content box. Arrow keys and the wheel both scroll by lines.
+fn draw_hover(renderer: rawptr, app: *App, typography: *Typography, width: i32, height: i32) {
+  ui := &app.ui
+  ui_panel_begin(ui, typography)
+  scale := typography.scale
+  line := typography.line
+  padding := app.config.popup_padding * scale
+  text := app.prompt_state.message[..app.prompt_state.message_length]
+  box_width := 480.0 * scale
+  available := #cast(f32) app.view.panes[app.view.focused].rect.width - 16.0 * scale
+  if box_width > available {
+    box_width = available
+  }
+  wrap := #cast(i32) (box_width - padding * 2.0)
+  if wrap < 1 {
+    wrap = 1
+  }
+  if !buffer.equal(text, typography.palette_bytes[..typography.palette_length]) {
+    if #len(text) > 0 && !ttf.set(typography.palette, &text[0], #len(text)) {
+      #panic("hover text update")
+    }
+    typography.palette_length = copy_text(typography.palette_bytes[..], text)
+    typography.palette_updates += 1
+  }
+  if typography.palette_wrap != wrap {
+    if !ttf.wrap(typography.palette, wrap) {
+      #panic("hover wrap")
+    }
+    typography.palette_wrap = wrap
+  }
+  text_width: i32 = 0
+  text_height: i32 = 0
+  if !ttf.size(typography.palette, &text_width, &text_height) {
+    #panic("hover measure")
+  }
+  bounds := app.view.panes[app.view.focused].rect
+  place := place_rect(app, SurfaceHover, width, height, line, scale, language_popup_rect(bounds, app.view.animation.file.cursor_x.value, app.view.animation.file.cursor_y.value, #cast(f32) text_width + padding * 2.0, #cast(f32) text_height + padding * 2.0, line, scale))
+  opening := app.view.animation.panel != Panel.Hover
+  if opening {
+    motion.snap(&ui.hover_open, -6.0 * scale)
+  }
+  drop := animated_value(app, &ui.hover_open, 0.0, app.config.popup_animation_ms * 2.0, false)
+  frame := ui_make(ui, ui_hash(0, "hover"), UiFloating | UiBackground | UiBorder | UiClip)
+  ui.boxes[frame].floating[0] = place.x
+  ui.boxes[frame].floating[1] = place.y + drop
+  ui.boxes[frame].fill = theme().surface
+  ui.boxes[frame].padding[0] = padding
+  ui.boxes[frame].padding[1] = padding
+  ui_size(ui, frame, UiAxisX, UiSizeKind.Pixels, place.width / scale, 1.0)
+  ui_size(ui, frame, UiAxisY, UiSizeKind.Pixels, place.height / scale, 1.0)
+  ui_push(ui, frame)
+  content := ui_make(ui, ui_key(ui, "content"), UiClip | UiScroll)
+  ui_size(ui, content, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
+  ui_size(ui, content, UiAxisY, UiSizeKind.Percent, 1.0, 1.0)
+  ui_pop(ui)
+  // Scroll in whole lines; selected is the first visible line.
+  view := place.height - padding * 2.0
+  maximum := #cast(f32) text_height - view
+  if maximum < 0.0 {
+    maximum = 0.0
+  }
+  if ui.wheel != 0.0 {
+    lines := #cast(i32) (-ui.wheel * 3.0)
+    if lines < 0 && #cast(usize) (-lines) > app.prompt_state.selected {
+      app.prompt_state.selected = 0
+    }
+    else if lines < 0 {
+      app.prompt_state.selected -= #cast(usize) (-lines)
+    }
+    else {
+      app.prompt_state.selected += #cast(usize) lines
+    }
+    ui.wheel = 0.0
+  }
+  target := #cast(f32) app.prompt_state.selected * line
+  if target > maximum {
+    target = maximum
+    app.prompt_state.selected = #cast(usize) (maximum / line + 0.999)
+  }
+  scrolled := &ui.boxes[content]
+  new_text := ui.hover_text != preview_hash("", text)
+  ui.hover_text = preview_hash("", text)
+  _ = animated_follow(app, &scrolled.scroll, target, app.config.scroll_animation_ms * 2.0, opening || new_text || !app.config.smooth_scroll)
+  scrolled.content = #cast(f32) text_height
+  ui_layout(ui)
+  ui_render(renderer, ui, typography, width, height)
+  area := scrolled.rect
+  clip := sdl.PixelRect{x: #cast(i32) area.x, y: #cast(i32) area.y, width: #cast(i32) area.width, height: #cast(i32) area.height}
+  if !sdl.clip(renderer, &clip) || !ttf.draw(typography.palette, area.x, area.y - scrolled.scroll.value) {
+    #panic("hover text draw")
+  }
+  hover_colors_draw(app, typography, area.x, area.y - scrolled.scroll.value)
+  if !sdl.clip(renderer, nil) {
+    #panic("hover clip reset")
+  }
+}
+// A click outside the hover closes it and still reaches the document.
+fn hover_mouse(app: *App, x: f32, y: f32, pressed: bool) bool {
+  if !pressed {
+    return true
+  }
+  frame := ui_make_lookup(&app.ui, ui_hash(0, "hover"))
+  if frame != 0 && ui_contains(app.ui.boxes[frame].rect, x, y) {
+    return true
+  }
+  app.prompt_state.panel = Panel.None
+  return false
+}

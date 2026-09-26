@@ -1,0 +1,757 @@
+// Tree-sitter worker. UI publishes coalesced snapshots; worker owns mutable
+// trees. Immutable copies allow navigation without waiting for parsing.
+struct SyntaxPoint { row, column: u32 }
+struct SyntaxEdit { start_byte, old_end_byte, new_end_byte: u32, start_point, old_end_point, new_end_point: SyntaxPoint }
+struct SyntaxSource { payload: rawptr, read: *fn(rawptr, u32, SyntaxPoint, *u32) *const u8, encoding: u32, decode: rawptr }
+struct SyntaxParseState { payload: rawptr, offset: u32, error: bool }
+struct SyntaxQueryState { payload: rawptr, offset: u32 }
+struct SyntaxParseOptions { payload: rawptr, progress: *fn(*SyntaxParseState) bool }
+struct SyntaxQueryOptions { payload: rawptr, progress: *fn(*SyntaxQueryState) bool }
+struct SyntaxRange { start, end, kind: u32 }
+struct SyntaxWorker {
+  name: [65]u8, library, parser, query, published, objects: rawptr,
+  query_predicates, object_predicates: *Predicates,
+  ranges: [1024]SyntaxRange, object_count: u32,
+  thread, mutex, wake: rawptr, stopping, pending, ready, retry: bool, indent: u32,
+  text: []u8, length: u32, revision, finished: u64,
+  colors: []u8, cancel: native_atomic.AtomicU32,
+}
+struct SyntaxInput { text: []u8, length: u32, revision: u64 }
+struct SyntaxDeadline { worker: *SyntaxWorker, end: u64 }
+struct SyntaxLibraryInfo { filename: *const u8, base: rawptr, symbol: *const u8, address: rawptr }
+extern fn syntax_allocator "ts_set_allocator"(allocate: *fn(usize) rawptr, zero: *fn(usize, usize) rawptr, resize: *fn(rawptr, usize) rawptr, release: *fn(rawptr))
+extern fn syntax_parser_new "ts_parser_new"() rawptr
+extern fn syntax_parser_delete "ts_parser_delete"(parser: rawptr)
+extern fn syntax_parser_reset "ts_parser_reset"(parser: rawptr)
+extern fn syntax_language "ts_parser_set_language"(parser: rawptr, language: rawptr) bool
+extern fn syntax_parse "ts_parser_parse_with_options"(parser: rawptr, retained: rawptr, source: SyntaxSource, options: SyntaxParseOptions) rawptr
+extern fn syntax_tree_delete "ts_tree_delete"(tree: rawptr)
+extern fn syntax_tree_copy "ts_tree_copy"(tree: rawptr) rawptr
+extern fn syntax_tree_edit "ts_tree_edit"(tree: rawptr, edit: *const SyntaxEdit)
+extern fn syntax_root "ts_tree_root_node"(tree: rawptr) TsNode
+extern fn syntax_query_new "ts_query_new"(language: rawptr, source: *const u8, length: u32, offset: *u32, error: *u32) rawptr
+extern fn syntax_query_delete "ts_query_delete"(query: rawptr)
+extern fn syntax_cursor_new "ts_query_cursor_new"() rawptr
+extern fn syntax_cursor_delete "ts_query_cursor_delete"(cursor: rawptr)
+extern fn syntax_cursor_limit "ts_query_cursor_set_match_limit"(cursor: rawptr, limit: u32)
+extern fn syntax_cursor_exec "ts_query_cursor_exec_with_options"(cursor: rawptr, query: rawptr, node: TsNode, options: *const SyntaxQueryOptions)
+extern fn syntax_cursor_next "ts_query_cursor_next_capture"(cursor: rawptr, match: *TsMatch, capture: *u32) bool
+extern fn syntax_capture_name "ts_query_capture_name_for_id"(query: rawptr, capture: u32, length: *u32) *const u8
+extern fn syntax_descendant "ts_node_named_descendant_for_byte_range"(node: TsNode, low: u32, high: u32) TsNode
+extern fn syntax_null "ts_node_is_null"(node: TsNode) bool
+extern fn syntax_parent "ts_node_parent"(node: TsNode) TsNode
+extern fn syntax_child "ts_node_named_child"(node: TsNode, index: u32) TsNode
+extern fn syntax_previous "ts_node_prev_named_sibling"(node: TsNode) TsNode
+extern fn syntax_next "ts_node_next_named_sibling"(node: TsNode) TsNode
+extern fn syntax_trylock "pthread_mutex_trylock"(lock: rawptr) i32
+extern fn syntax_fill "memset"(output: *u8, byte: i32, length: usize) rawptr
+extern fn syntax_dlopen "dlopen"(path: *const u8, flags: i32) rawptr
+extern fn syntax_dlclose "dlclose"(library: rawptr) i32
+extern fn syntax_dladdr "dladdr"(address: rawptr, info: *SyntaxLibraryInfo) i32
+extern fn syntax_realpath "realpath"(path: *const u8, output: *u8) *u8
+extern fn syntax_atoi "atoi"(text: *const u8) i32
+syntax_memory_once: i32 = 0
+syntax_retire_thread: rawptr = nil
+syntax_retiring: bool = false
+syntax_retired: native_atomic.AtomicU32 = native_atomic.AtomicU32{}
+fn syntax_tree_alloc(size: usize) rawptr {
+  return dna_memory_alloc(size, 4)
+}
+fn syntax_tree_calloc(count: usize, size: usize) rawptr {
+  return dna_memory_calloc(count, size, 4)
+}
+fn syntax_tree_realloc(pointer: rawptr, size: usize) rawptr {
+  return dna_memory_realloc(pointer, size, 4)
+}
+fn syntax_memory() {
+  syntax_allocator(&syntax_tree_alloc, &syntax_tree_calloc, &syntax_tree_realloc, &dna_memory_free)
+}
+// Capacity follows document size instead of reserving five 16 MiB buffers.
+// Keep one readable sentinel byte, including for empty input and EOF callbacks.
+fn syntax_reserve(bytes: *[]u8, length: usize) bool {
+  needed := length + 1
+  if #len(bytes.*) >= needed {
+    return true
+  }
+  capacity: usize = 4096
+  for capacity < needed {
+    capacity *= 2
+  }
+  old: rawptr = nil
+  if #len(bytes.*) != 0 {
+    old = #cast(rawptr) &bytes.*[0]
+  }
+  pointer := #cast(*u8) dna_memory_realloc(old, capacity, 0)
+  if pointer == nil {
+    return false
+  }
+  bytes.* = pointer[..capacity]
+  return true
+}
+fn syntax_buffer_free(bytes: []u8) {
+  if #len(bytes) != 0 {
+    dna_memory_free(#cast(rawptr) &bytes[0])
+  }
+}
+fn syntax_millis() u64 {
+  now := NativeTimespec{}
+  _ = sync_clock(1, &now)
+  return #cast(u64) now.seconds * 1000 + #cast(u64) now.nanoseconds / 1000000
+}
+fn syntax_progress(state: *SyntaxParseState) bool {
+  deadline := #cast(*SyntaxDeadline) state.payload
+  return native_atomic.load_u32(&deadline.worker.cancel) != 0 || syntax_millis() > deadline.end
+}
+fn syntax_query_progress(state: *SyntaxQueryState) bool {
+  deadline := #cast(*SyntaxDeadline) state.payload
+  return native_atomic.load_u32(&deadline.worker.cancel) != 0 || syntax_millis() > deadline.end
+}
+fn syntax_read(context: rawptr, byte: u32, position: SyntaxPoint, length: *u32) *const u8 {
+  _ = position
+  input := #cast(*SyntaxInput) context
+  length.* = 0
+  if byte < input.length {
+    length.* = input.length - byte
+  }
+  return &input.text[byte]
+}
+fn syntax_prefix(name: []const u8, prefix: []const u8) bool {
+  return #len(name) >= #len(prefix) && pred_compare(&name[0], &prefix[0], #len(prefix)) == 0
+}
+fn syntax_style(name: []const u8) i32 {
+  if syntax_prefix(name, "comment") {
+    return 1
+  }
+  if syntax_prefix(name, "string") {
+    return 2
+  }
+  if syntax_prefix(name, "keyword") {
+    return 3
+  }
+  if syntax_prefix(name, "function") {
+    return 4
+  }
+  if syntax_prefix(name, "type") || syntax_prefix(name, "tag") {
+    return 5
+  }
+  if syntax_prefix(name, "constant") || syntax_prefix(name, "number") || syntax_prefix(name, "boolean") || syntax_prefix(name, "float") {
+    return 6
+  }
+  if syntax_prefix(name, "character") || syntax_prefix(name, "markup.raw") || syntax_prefix(name, "text.literal") || syntax_prefix(name, "markup.link.url") || syntax_prefix(name, "text.uri") {
+    return 2
+  }
+  if syntax_prefix(name, "include") || syntax_prefix(name, "conditional") || syntax_prefix(name, "repeat") || syntax_prefix(name, "exception") || syntax_prefix(name, "markup.heading") || syntax_prefix(name, "text.title") {
+    return 3
+  }
+  if syntax_prefix(name, "method") || syntax_prefix(name, "constructor") {
+    return 4
+  }
+  if syntax_prefix(name, "module") || syntax_prefix(name, "namespace") || syntax_prefix(name, "attribute") {
+    return 5
+  }
+  return 0
+}
+fn syntax_point(point: *SyntaxPoint, bytes: []const u8) {
+  for byte in bytes {
+    if byte == 10 {
+      point.row += 1
+      point.column = 0
+    } else {
+      point.column += 1
+    }
+  }
+}
+fn syntax_worker(context: rawptr) i32 {
+  worker := #cast(*SyntaxWorker) context
+  input := #cast(*SyntaxInput) dna_memory_calloc(1, #sizeof(SyntaxInput), 0)
+  previous := #cast(*SyntaxInput) dna_memory_calloc(1, #sizeof(SyntaxInput), 0)
+  scratch_empty: [0]u8 = []
+  scratch_colors: []u8 = scratch_empty[..]
+  retained: rawptr = nil
+  if input == nil || previous == nil {
+    dna_memory_free(#cast(rawptr) input)
+    dna_memory_free(#cast(rawptr) previous)
+    return 0
+  }
+  for {
+    rec_lock(worker.mutex)
+    for !worker.pending && !worker.stopping {
+      rec_wait(worker.wake, worker.mutex)
+    }
+    if worker.stopping {
+      rec_unlock(worker.mutex)
+      break
+    }
+    if !syntax_reserve(&input.text, #cast(usize) worker.length) || !syntax_reserve(&previous.text, #cast(usize) worker.length) || !syntax_reserve(&scratch_colors, #cast(usize) worker.length) {
+      worker.pending = false
+      // The UI resubmits unfinished revisions; transient OOM must not suppress
+      // that retry merely because this revision was already accepted.
+      worker.retry = true
+      rec_unlock(worker.mutex)
+      continue
+    }
+    input.length = worker.length
+    input.revision = worker.revision
+    _ = copy(&input.text[0], &worker.text[0], #cast(usize) worker.length)
+    worker.pending = false
+    native_atomic.store_u32(&worker.cancel, 0)
+    rec_unlock(worker.mutex)
+    _ = syntax_fill(&scratch_colors[0], 0, #cast(usize) input.length)
+    if retained != nil {
+      prefix: u32 = 0
+      old_end := previous.length
+      new_end := input.length
+      for prefix < old_end && prefix < new_end && previous.text[prefix] == input.text[prefix] {
+        prefix += 1
+      }
+      for prefix > 0 && prefix < input.length && (input.text[prefix] & 192) == 128 {
+        prefix -= 1
+      }
+      for old_end > prefix && new_end > prefix && previous.text[old_end - 1] == input.text[new_end - 1] {
+        old_end -= 1
+        new_end -= 1
+      }
+      for new_end < input.length && (input.text[new_end] & 192) == 128 {
+        old_end += 1
+        new_end += 1
+      }
+      edit := SyntaxEdit{start_byte: prefix, old_end_byte: old_end, new_end_byte: new_end}
+      syntax_point(&edit.start_point, input.text[..prefix])
+      edit.old_end_point = edit.start_point
+      edit.new_end_point = edit.start_point
+      syntax_point(&edit.old_end_point, previous.text[prefix..old_end])
+      syntax_point(&edit.new_end_point, input.text[prefix..new_end])
+      syntax_tree_edit(retained, &edit)
+    }
+    deadline := SyntaxDeadline{worker: worker, end: syntax_millis() + 100}
+    source := SyntaxSource{payload: #cast(rawptr) input, read: &syntax_read}
+    options := SyntaxParseOptions{payload: #cast(rawptr) &deadline, progress: &syntax_progress}
+    tree := syntax_parse(worker.parser, retained, source, options)
+    syntax_tree_delete(retained)
+    retained = tree
+    if tree != nil {
+      previous.length = input.length
+      _ = copy(&previous.text[0], &input.text[0], #cast(usize) input.length)
+      cursor := syntax_cursor_new()
+      if cursor != nil {
+        syntax_cursor_limit(cursor, 4096)
+        query_options := SyntaxQueryOptions{payload: #cast(rawptr) &deadline, progress: &syntax_query_progress}
+        syntax_cursor_exec(cursor, worker.query, syntax_root(tree), &query_options)
+        match := TsMatch{}
+        capture: u32 = 0
+        visits: u32 = 0
+        for syntax_cursor_next(cursor, &match, &capture) && visits < 32768 && syntax_millis() < deadline.end {
+          visits += 1
+          if !predicates_pass(worker.query_predicates, &match, &input.text[0], input.length) {
+            continue
+          }
+          entry := match.captures[..match.capture_count][capture]
+          size: u32 = 0
+          name := syntax_capture_name(worker.query, entry.index, &size)
+          color := syntax_style(name[..size])
+          start := pred_start(entry.node)
+          end := pred_end(entry.node)
+          if end > input.length {
+            end = input.length
+          }
+          if color != 0 && start < end {
+            _ = syntax_fill(&scratch_colors[start], color, #cast(usize) (end - start))
+          }
+        }
+        syntax_cursor_delete(cursor)
+      }
+    } else {
+      syntax_parser_reset(worker.parser)
+    }
+    ranges: [1024]SyntaxRange = []
+    object_count: u32 = 0
+    if tree != nil && worker.objects != nil {
+      cursor := syntax_cursor_new()
+      if cursor != nil {
+        syntax_cursor_limit(cursor, 4096)
+        query_options := SyntaxQueryOptions{payload: #cast(rawptr) &deadline, progress: &syntax_query_progress}
+        syntax_cursor_exec(cursor, worker.objects, syntax_root(tree), &query_options)
+        match := TsMatch{}
+        capture: u32 = 0
+        visits: u32 = 0
+        names: [8][]const u8 = ["function.inside", "function.around", "class.inside", "class.around", "parameter.inside", "parameter.around", "comment.inside", "comment.around"]
+        for object_count < 1024 && visits < 32768 && syntax_millis() < deadline.end && syntax_cursor_next(cursor, &match, &capture) {
+          visits += 1
+          if !predicates_pass(worker.object_predicates, &match, &input.text[0], input.length) {
+            continue
+          }
+          entry := match.captures[..match.capture_count][capture]
+          size: u32 = 0
+          name := syntax_capture_name(worker.objects, entry.index, &size)
+          for kind in 0..8 {
+            if pred_equal(names[kind], name[..size]) {
+              ranges[object_count] = SyntaxRange{start: pred_start(entry.node), end: pred_end(entry.node), kind: #cast(u32) kind}
+              object_count += 1
+              break
+            }
+          }
+        }
+        syntax_cursor_delete(cursor)
+      }
+    }
+    rec_lock(worker.mutex)
+    if worker.revision == input.revision {
+      worker.object_count = object_count
+      _ = copy(#cast(*u8) &worker.ranges[0], #cast(*const u8) &ranges[0], #cast(usize) object_count * #sizeof(SyntaxRange))
+      _ = copy(&worker.colors[0], &scratch_colors[0], #cast(usize) input.length)
+      syntax_tree_delete(worker.published)
+      worker.published = nil
+      if tree != nil {
+        worker.published = syntax_tree_copy(tree)
+      }
+      worker.finished = input.revision
+      worker.ready = true
+      rec_notify()
+    }
+    rec_unlock(worker.mutex)
+  }
+  syntax_tree_delete(retained)
+  syntax_buffer_free(previous.text)
+  syntax_buffer_free(input.text)
+  syntax_buffer_free(scratch_colors)
+  dna_memory_free(#cast(rawptr) previous)
+  dna_memory_free(#cast(rawptr) input)
+  return 0
+}
+fn syntax_readfile(path: *const u8, output: *u8, capacity: usize) i32 {
+  fd := rec_open(path, 0, 0)
+  if fd < 0 {
+    return -1
+  }
+  used: usize = 0
+  for used < capacity - 1 {
+    amount := proc_read_raw(fd, &output[..capacity][used], capacity - 1 - used)
+    if amount < 0 && rec_errno().* == 4 {
+      continue
+    }
+    if amount <= 0 {
+      break
+    }
+    used += #cast(usize) amount
+  }
+  _ = rec_close(fd)
+  output[..capacity][used] = 0
+  if used == capacity - 1 {
+    return -1
+  }
+  return #cast(i32) used
+}
+fn syntax_put(output: []u8, used: *usize, text: []const u8) bool {
+  if used.* >= #len(output) || #len(text) >= #len(output) - used.* {
+    return false
+  }
+  if #len(text) > 0 {
+    _ = copy(&output[used.*], &text[0], #len(text))
+  }
+  used.* += #len(text)
+  return true
+}
+fn syntax_path(output: []u8, root: *const u8, name: *const u8, leaf: []const u8) bool {
+  used: usize = 0
+  if !syntax_put(output, &used, root[..string_length(root)]) || !syntax_put(output, &used, "/") || !syntax_put(output, &used, name[..string_length(name)]) || !syntax_put(output, &used, "/") || !syntax_put(output, &used, leaf) {
+    return false
+  }
+  output[used] = 0
+  return true
+}
+fn syntax_list_matches(bytes: []const u8, name: []const u8) bool {
+  start: usize = 0
+  for i in 0..=#len(bytes) {
+    if i == #len(bytes) || bytes[i] == 32 || bytes[i] == 10 || bytes[i] == 13 {
+      if i > start && pred_equal(bytes[start..i], name) {
+        return true
+      }
+      start = i + 1
+    }
+  }
+  return false
+}
+fn syntax_release(worker: *SyntaxWorker) {
+  predicates_free(worker.object_predicates)
+  predicates_free(worker.query_predicates)
+  syntax_query_delete(worker.objects)
+  syntax_query_delete(worker.query)
+  syntax_parser_delete(worker.parser)
+  _ = syntax_dlclose(worker.library)
+  if worker.mutex != nil {
+    rec_mutex_free(worker.mutex)
+  }
+  if worker.wake != nil {
+    rec_condition_free(worker.wake)
+  }
+  syntax_buffer_free(worker.text)
+  syntax_buffer_free(worker.colors)
+  dna_memory_free(#cast(rawptr) worker)
+}
+fn syntax_open(root: *const u8, filename: *const u8, selected: *const u8) *SyntaxWorker {
+  _ = native_call_once(&syntax_memory_once, &syntax_memory)
+  file := filename[..string_length(filename)]
+  base: usize = 0
+  for i in 0..#len(file) {
+    if file[i] == 47 {
+      base = i + 1
+    }
+  }
+  extension: usize = #len(file) + 1
+  for i in base..#len(file) {
+    if file[i] == 46 {
+      extension = i + 1
+    }
+  }
+  fd := rec_open(root, 589824, 0)
+  if fd < 0 {
+    return nil
+  }
+  directory := install_fdopendir(fd)
+  if directory == nil {
+    _ = rec_close(fd)
+    return nil
+  }
+  result: *SyntaxWorker = nil
+  for {
+    entry := install_readdir(directory)
+    if entry == nil {
+      break
+    }
+    if entry.name[0] == 46 {
+      continue
+    }
+    path: [4096]u8 = []
+    extensions: [1024]u8 = []
+    name := &entry.name[0]
+    if selected != nil {
+      if search_compare(name, selected) != 0 {
+        continue
+      }
+    } else {
+      matches := false
+      if syntax_path(path[..], root, name, "filenames") {
+        length := syntax_readfile(&path[0], &extensions[0], 1024)
+        if length >= 0 {
+          matches = syntax_list_matches(extensions[..#cast(usize) length], file[base..])
+        }
+      }
+      if !matches && extension <= #len(file) && syntax_path(path[..], root, name, "extensions") {
+        length := syntax_readfile(&path[0], &extensions[0], 1024)
+        if length >= 0 {
+          matches = syntax_list_matches(extensions[..#cast(usize) length], file[extension..])
+        }
+      }
+      if !matches {
+        continue
+      }
+    }
+    if !syntax_path(path[..], root, name, "parser.so") {
+      continue
+    }
+    library := syntax_dlopen(&path[0], 2)
+    if library == nil {
+      continue
+    }
+    symbol: [300]u8 = []
+    used: usize = 0
+    _ = syntax_put(symbol[..], &used, "tree_sitter_")
+    _ = syntax_put(symbol[..], &used, name[..string_length(name)])
+    symbol[used] = 0
+    language := #cast(*fn() rawptr) proc_symbol(library, &symbol[0])
+    if language == nil {
+      _ = syntax_dlclose(library)
+      continue
+    }
+    worker := #cast(*SyntaxWorker) dna_memory_calloc(1, #sizeof(SyntaxWorker), 0)
+    if worker == nil {
+      _ = syntax_dlclose(library)
+      break
+    }
+    name_length := string_length(name)
+    if name_length > 64 {
+      name_length = 64
+    }
+    _ = copy(&worker.name[0], name, name_length)
+    worker.library = library
+    worker.parser = syntax_parser_new()
+    query := #cast(*u8) dna_memory_alloc(262144, 0)
+    length: i32 = -1
+    if query != nil && syntax_path(path[..], root, name, "highlights.scm") {
+      length = syntax_readfile(&path[0], query, 262144)
+    }
+    offset: u32 = 0
+    error: u32 = 0
+    if length >= 0 && worker.parser != nil && syntax_language(worker.parser, language()) {
+      worker.query = syntax_query_new(language(), query, #cast(u32) length, &offset, &error)
+    }
+    object_length: i32 = -1
+    if query != nil && syntax_path(path[..], root, name, "textobjects.scm") {
+      object_length = syntax_readfile(&path[0], query, 262144)
+    }
+    if object_length > 0 {
+      worker.objects = syntax_query_new(language(), query, #cast(u32) object_length, &offset, &error)
+    }
+    dna_memory_free(#cast(rawptr) query)
+    if worker.objects != nil {
+      worker.object_predicates = predicates_compile(worker.objects)
+      if worker.object_predicates == nil {
+        syntax_query_delete(worker.objects)
+        worker.objects = nil
+      }
+    }
+    if worker.query != nil {
+      worker.query_predicates = predicates_compile(worker.query)
+      if worker.query_predicates == nil {
+        syntax_query_delete(worker.query)
+        worker.query = nil
+      }
+    }
+    if worker.query == nil {
+      syntax_release(worker)
+      continue
+    }
+    indentation: [16]u8 = []
+    worker.indent = 4
+    if syntax_path(path[..], root, name, "indent") && syntax_readfile(&path[0], &indentation[0], 16) > 0 {
+      width := syntax_atoi(&indentation[0])
+      if width >= 1 && width <= 16 {
+        worker.indent = #cast(u32) width
+      }
+    }
+    worker.mutex = rec_mutex()
+    worker.wake = rec_condition()
+    if worker.mutex != nil && worker.wake != nil {
+      worker.thread = rec_thread(&syntax_worker, #cast(rawptr) worker)
+    }
+    if worker.thread == nil {
+      syntax_release(worker)
+    } else {
+      result = worker
+    }
+    break
+  }
+  _ = install_closedir(directory)
+  return result
+}
+pub fn dna_syntax_open(root: *const u8, filename: *const u8) *SyntaxWorker {
+  return syntax_open(root, filename, nil)
+}
+pub fn dna_syntax_open_named(root: *const u8, name: *const u8) *SyntaxWorker {
+  if name == nil || name.* == 0 || string_length(name) > 64 {
+    return nil
+  }
+  for byte in name[..string_length(name)] {
+    if !((byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 95) {
+      return nil
+    }
+  }
+  empty: []const u8 = "\0"
+  return syntax_open(root, &empty[0], name)
+}
+pub fn dna_syntax_name(worker: *SyntaxWorker) *const u8 {
+  return &worker.name[0]
+}
+pub fn dna_syntax_update(worker: *SyntaxWorker, text: *const u8, length: u32, revision: u64) {
+  if length >= 16777216 {
+    return
+  }
+  rec_lock(worker.mutex)
+  if worker.revision != revision || worker.retry || (!worker.ready && !worker.pending && worker.revision == 0) {
+    if !syntax_reserve(&worker.text, #cast(usize) length) || !syntax_reserve(&worker.colors, #cast(usize) length) {
+      rec_unlock(worker.mutex)
+      return
+    }
+    _ = copy(&worker.text[0], text, #cast(usize) length)
+    worker.length = length
+    worker.revision = revision
+    worker.pending = true
+    worker.retry = false
+    worker.ready = false
+    native_atomic.store_u32(&worker.cancel, 1)
+    rec_signal(worker.wake)
+  }
+  rec_unlock(worker.mutex)
+}
+pub fn dna_syntax_colors(worker: *SyntaxWorker, output: *u8, length: u32, revision: u64) i32 {
+  if syntax_trylock(worker.mutex) != 0 {
+    return 0
+  }
+  ready := worker.ready && worker.finished == revision && length <= worker.length
+  if ready {
+    _ = copy(output, &worker.colors[0], #cast(usize) length)
+  }
+  rec_unlock(worker.mutex)
+  if ready {
+    return 1
+  }
+  return 0
+}
+pub fn dna_syntax_close(worker: *SyntaxWorker) {
+  if worker == nil {
+    return
+  }
+  rec_lock(worker.mutex)
+  worker.stopping = true
+  native_atomic.store_u32(&worker.cancel, 1)
+  rec_signal(worker.wake)
+  rec_unlock(worker.mutex)
+  rec_join(worker.thread, nil)
+  syntax_tree_delete(worker.published)
+  syntax_release(worker)
+}
+fn syntax_dispose(context: rawptr) i32 {
+  // Keep the public close seam interposable for lifecycle/fault probes.
+  symbol: []const u8 = "dna_syntax_close\0"
+  close := #cast(*fn(rawptr)) proc_symbol(nil, &symbol[0])
+  if close != nil {
+    close(context)
+  } else {
+    dna_syntax_close(#cast(*SyntaxWorker) context)
+  }
+  native_atomic.store_u32(&syntax_retired, 1)
+  rec_notify()
+  return 0
+}
+pub fn dna_syntax_collect(wait: i32) {
+  if syntax_retiring && (wait != 0 || native_atomic.load_u32(&syntax_retired) != 0) {
+    rec_join(syntax_retire_thread, nil)
+    syntax_retiring = false
+  }
+}
+pub fn dna_syntax_retire(worker: *SyntaxWorker) i32 {
+  dna_syntax_collect(0)
+  if syntax_retiring {
+    return 0
+  }
+  native_atomic.store_u32(&syntax_retired, 0)
+  syntax_retire_thread = rec_thread(&syntax_dispose, #cast(rawptr) worker)
+  if syntax_retire_thread == nil {
+    return 0
+  }
+  syntax_retiring = true
+  return 1
+}
+fn syntax_installed_path(relative: []const u8, output: *u8, capacity: usize) i32 {
+  info := SyntaxLibraryInfo{}
+  if syntax_dladdr(#cast(rawptr) &dna_syntax_open, &info) == 0 {
+    return 0
+  }
+  path: [4096]u8 = []
+  if syntax_realpath(info.filename, &path[0]) == nil {
+    return 0
+  }
+  slash: usize = 0
+  found := false
+  for i in 0..string_length(&path[0]) {
+    if path[i] == 47 {
+      slash = i
+      found = true
+    }
+  }
+  if !found {
+    return 0
+  }
+  used: usize = 0
+  if !syntax_put(output[..capacity], &used, path[..slash]) || !syntax_put(output[..capacity], &used, "/../") || !syntax_put(output[..capacity], &used, relative) {
+    return 0
+  }
+  output[..capacity][used] = 0
+  return 1
+}
+pub fn dna_language_helper(output: *u8, capacity: usize) i32 {
+  return syntax_installed_path("bin/dna-language", output, capacity)
+}
+pub fn dna_language_registry(output: *u8, capacity: usize) i32 {
+  return syntax_installed_path("share/dna/languages.toml", output, capacity)
+}
+pub fn dna_syntax_indent(worker: *SyntaxWorker) u32 {
+  return worker.indent
+}
+pub fn dna_syntax_select(worker: *SyntaxWorker, revision: u64, low: u32, high: u32, mode: u32, start: *u32, end: *u32) i32 {
+  if worker == nil || start == nil || end == nil || low > high || mode > 3 {
+    return 0
+  }
+  if syntax_trylock(worker.mutex) != 0 {
+    return 0
+  }
+  tree: rawptr = nil
+  if worker.ready && worker.finished == revision && high <= worker.length && worker.published != nil {
+    tree = syntax_tree_copy(worker.published)
+  }
+  rec_unlock(worker.mutex)
+  if tree == nil {
+    return 0
+  }
+  node := syntax_descendant(syntax_root(tree), low, high)
+  if mode == 0 {
+    for !syntax_null(node) && pred_start(node) == low && pred_end(node) == high {
+      node = syntax_parent(node)
+    }
+  } else if mode == 1 {
+    node = syntax_child(node, 0)
+  }
+  else if mode == 2 {
+    node = syntax_previous(node)
+  }
+  else {
+    node = syntax_next(node)
+  }
+  found := !syntax_null(node)
+  if found {
+    start.* = pred_start(node)
+    end.* = pred_end(node)
+  }
+  syntax_tree_delete(tree)
+  if found {
+    return 1
+  }
+  return 0
+}
+pub fn dna_syntax_object(worker: *SyntaxWorker, revision: u64, low: u32, high: u32, kind: u32, count: u32, start: *u32, end: *u32) i32 {
+  if worker == nil || start == nil || end == nil || kind >= 8 || low > high || count == 0 || count > 1024 {
+    return 0
+  }
+  if syntax_trylock(worker.mutex) != 0 {
+    return 0
+  }
+  ok := worker.ready && worker.finished == revision && high <= worker.length
+  previous_start: u32 = 0
+  previous_end: u32 = 0
+  current_low := low
+  current_high := high
+  for step in 0..count {
+    if !ok {
+      break
+    }
+    found: i32 = -1
+    width: u32 = 4294967295
+    for i in 0..worker.object_count {
+      range := worker.ranges[i]
+      if range.kind != kind || range.start > current_low || range.end < current_high || (step > 0 && range.start == previous_start && range.end == previous_end) {
+        continue
+      }
+      if range.end - range.start < width {
+        width = range.end - range.start
+        found = #cast(i32) i
+      }
+    }
+    if found < 0 {
+      ok = false
+      break
+    }
+    current_low = worker.ranges[#cast(usize) found].start
+    previous_start = current_low
+    current_high = worker.ranges[#cast(usize) found].end
+    previous_end = current_high
+  }
+  if ok {
+    start.* = current_low
+    end.* = current_high
+  }
+  rec_unlock(worker.mutex)
+  if ok {
+    return 1
+  }
+  return 0
+}

@@ -1,0 +1,47 @@
+use "std/sync"
+use "std/process"
+use "std/mem"
+#link("dna_native")
+extern fn idle_open "dna_disk_open"() rawptr
+extern fn idle_watch "dna_disk_watch"(disk: rawptr, index: u32, identity: u64, path: *const u8, text: *const u8, length: usize)
+extern fn idle_pending "dna_disk_pending"(disk: rawptr, index: u32, identity: u64) isize
+extern fn idle_close "dna_disk_close"(disk: rawptr)
+extern fn idle_sleep "usleep"(microseconds: u32) i32
+calls: sync.AtomicU32 = sync.AtomicU32{}
+pub fn lstat(path: *const u8, output: rawptr) i32 {
+  next := #cast(*fn(*const u8, rawptr) i32) probe_next("lstat\0")
+  _ = sync.fetch_add_u32(&calls, 1)
+  return next(path, output)
+}
+fn main() {
+  arena := mem.arena_create(65536)
+  probe_check(arena.ok, "argument arena")
+  defer _ = mem.arena_release(&arena.arena)
+  arguments := process.arguments(&arena.arena)
+  probe_check(arguments.ok && #len(arguments.values) == 2, "path argument")
+  path: [4096]u8 = []
+  input := arguments.values[1]
+  probe_check(#len(input) < 4096, "path length")
+  for index in 0..#len(input) {
+    path[index] = input[index]
+  }
+  disk := idle_open()
+  probe_check(disk != nil, "disk open")
+  text: []const u8 = "idle"
+  idle_watch(disk, 0, 1, &path[0], &text[0], 4)
+  attempts := 0
+  for attempts < 300 && idle_pending(disk, 0, 1) == 0 {
+    _ = idle_sleep(10000)
+    attempts += 1
+  }
+  probe_check(idle_pending(disk, 0, 1) != 0, "initial disk result")
+  _ = idle_sleep(100000)
+  sync.store_u32(&calls, 0)
+  _ = idle_sleep(1100000)
+  count := sync.load_u32(&calls)
+  idle_close(disk)
+  probe_log("idle disk stat calls: ")
+  probe_number(#cast(u64) count)
+  probe_log("\n")
+  probe_check(count == 0, "disk idle polling")
+}

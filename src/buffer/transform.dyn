@@ -1,0 +1,60 @@
+// External whole-document transformations retain view positions by line and
+// byte column, clamped to a grapheme boundary on the resulting line. This is
+// exact for trailing-whitespace cleanup; formatters that reorder lines retain
+// coordinates, not semantic token identity.
+struct TextPosition { row, column: usize }
+
+fn text_position(document: *const Document, offset: usize) TextPosition {
+  point := offset
+  if point > document.length {
+    point = document.length
+  }
+  row := row_at(document, point)
+  return TextPosition{row: row, column: point - row_start(document, row)}
+}
+fn position_offset(document: *const Document, position: TextPosition) usize {
+  beginning := row_start(document, position.row)
+  ending := line_end(document, beginning)
+  point := beginning + position.column
+  if point > ending {
+    point = ending
+  }
+  return boundary(document, point)
+}
+pub fn transform(document: *Document, text: []const u8) bool {
+  if #len(text) > Capacity || !valid(text) {
+    return false
+  }
+  if equal(document.bytes[..document.length], text) {
+    return true
+  }
+  positions: [1056]TextPosition = []
+  positions[0] = text_position(document, document.cursor)
+  positions[1] = text_position(document, document.anchor)
+  count := document.secondary.count
+  for index in 0..count {
+    positions[2 + index * 2] = text_position(document, document.secondary.ranges[index].cursor)
+    positions[3 + index * 2] = text_position(document, document.secondary.ranges[index].anchor)
+  }
+  for index in 0..992 {
+    positions[64 + index] = text_position(document, document.marks[index])
+  }
+  checkpoint(document)
+  document.anchor = 0
+  document.cursor = document.length
+  if !replace(document, text) {
+    #panic("validated document transformation")
+  }
+  document.cursor = position_offset(document, positions[0])
+  document.anchor = position_offset(document, positions[1])
+  for index in 0..count {
+    document.secondary.ranges[index].cursor = position_offset(document, positions[2 + index * 2])
+    document.secondary.ranges[index].anchor = position_offset(document, positions[3 + index * 2])
+  }
+  for index in 0..992 {
+    document.marks[index] = position_offset(document, positions[64 + index])
+  }
+  checkpoint(document)
+  document.history[document.history_at].line_positions = true
+  return true
+}

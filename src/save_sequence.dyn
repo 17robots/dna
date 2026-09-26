@@ -1,0 +1,83 @@
+struct SaveSequence {
+  active, waiting, close_all: bool,
+  next, return_slot: usize,
+  return_identity: u64,
+}
+fn save_cancel(app: *App) {
+  app.documents.saving.active = false
+  app.documents.saving.waiting = false
+  app.documents.quit_after_save = false
+}
+fn save_close(app: *App) {
+  if app.formatting.process != nil || app.documents.saving.active {
+    notice(app, "A save or formatter is already running.")
+    return
+  }
+  if app.documents.slots[app.documents.active].terminal.handle != nil {
+    notice(app, "Terminal buffers cannot be saved.")
+    return
+  }
+  app.documents.closing_one = true
+  app.documents.quit_after_save = true
+  if app.documents.file.length == 0 {
+    panel(app, Panel.SaveAs)
+  }
+  else {
+    save_file(app, files.name(app.documents.file))
+  }
+}
+fn save_all(app: *App, close_all: bool) {
+  if app.formatting.process != nil || app.documents.saving.active {
+    notice(app, "A save or formatter is already running.")
+    return
+  }
+  if explorer_dirty(app) {
+    notice(app, "Preview and write staged explorer changes first.")
+    return
+  }
+  app.documents.quit_after_save = false
+  state := &app.documents.saving
+  state.active = true
+  state.waiting = false
+  state.close_all = close_all
+  state.next = 0
+  state.return_slot = app.documents.active
+  state.return_identity = app.documents.slots[app.documents.active].identity
+  app.prompt_state.panel = Panel.None
+  save_sequence_tick(app)
+}
+fn save_sequence_tick(app: *App) {
+  state := &app.documents.saving
+  if !state.active || state.waiting {
+    return
+  }
+  render_request(app, RenderExplicit)
+  for state.next < 16 {
+    index := state.next
+    state.next += 1
+    slot := &app.documents.slots[index]
+    if slot.document == nil || slot.terminal.handle != nil || !buffer.dirty_cached(slot.document) {
+      continue
+    }
+    activate(app, index)
+    state.waiting = true
+    if slot.file.length == 0 {
+      panel(app, Panel.SaveAs)
+    }
+    else {
+      save_file(app, files.name(&slot.file))
+    }
+    return
+  }
+  state.active = false
+  previous := &app.documents.slots[state.return_slot]
+  if previous.document != nil && previous.identity == state.return_identity {
+    activate(app, state.return_slot)
+  }
+  if state.close_all {
+    request_quit(app)
+  }
+  else {
+    notice(app, "All buffers saved.")
+  }
+}

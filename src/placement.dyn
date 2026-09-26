@@ -1,0 +1,543 @@
+// Placement: where palette, picker, menus, dialogs, explorer, terminal,
+// completion and hover show. Each surface computes its natural rectangle
+// as before; place_rect moves or resizes it per [place.NAME] or :place.
+// Docked surfaces take their strip from the editor panes while visible.
+const SurfacePalette: usize = 0
+const SurfacePicker: usize = 1
+const SurfaceMenu: usize = 2
+const SurfaceDialog: usize = 3
+const SurfaceExplorer: usize = 4
+const SurfaceTerminal: usize = 5
+const SurfaceCompletion: usize = 6
+const SurfaceHover: usize = 7
+
+fn place_length(amount: f32, whole: f32, scale: f32, fallback: f32) f32 {
+  if amount <= 0.0 {
+    return fallback
+  }
+  if amount <= 1.0 {
+    return whole * amount
+  }
+  return amount * scale
+}
+// Whether a surface is on screen now (docks only reserve space then).
+// A surface's placement as configured, or the default of the active variant:
+// the tree explorer docks on the left unless placed otherwise.
+fn place_of(app: *const App, surface: usize) settings.Placement {
+  place := app.config.places[surface]
+  if surface == SurfaceExplorer && place.mode == settings.PlaceDefault && app.config.explorer_style == 1 {
+    place.mode = settings.PlaceDock
+    place.side = 0
+    place.size = 0.22
+  }
+  return place
+}
+fn surface_visible(app: *const App, surface: usize) bool {
+  panel := app.prompt_state.panel
+  if surface == SurfaceExplorer {
+    // A docked tree stays beside the panes while the editor has focus.
+    return panel == Panel.Directory || panel == Panel.Tree || (tree_open(app) && place_of(app, surface).mode == settings.PlaceDock)
+  }
+  if surface == SurfaceTerminal {
+    return panel == Panel.Terminal
+  }
+  if surface == SurfacePicker {
+    return panel == Panel.Open || panel == Panel.Buffers
+  }
+  if surface == SurfacePalette {
+    return panel == Panel.Commands
+  }
+  if surface == SurfaceMenu {
+    return key_menu_is(panel)
+  }
+  return false
+}
+// The strip a docked surface occupies, given the window and earlier docks.
+fn dock_strip(place: *const settings.Placement, area: *sdl.Rect, scale: f32) sdl.Rect {
+  horizontal := place.side == 0 || place.side == 1
+  whole := area.height
+  if horizontal {
+    whole = area.width
+  }
+  fallback := whole * 0.3
+  size := place_length(place.size, whole, scale, fallback)
+  if size > whole * 0.8 {
+    size = whole * 0.8
+  }
+  strip := area.*
+  if place.side == 0 {
+    strip.width = size
+    area.x += size
+    area.width -= size
+  }
+  else if place.side == 1 {
+    strip.x = area.x + area.width - size
+    strip.width = size
+    area.width -= size
+  }
+  else if place.side == 2 {
+    strip.height = size
+    area.y += size
+    area.height -= size
+  }
+  else {
+    strip.y = area.y + area.height - size
+    strip.height = size
+    area.height -= size
+  }
+  return strip
+}
+// Editor panes fill what the visible docks leave, in surface order.
+fn editor_area(app: *const App, width: i32, height: i32, scale: f32) sdl.PixelRect {
+  area := sdl.Rect{width: #cast(f32) width, height: #cast(f32) height}
+  for surface in 0..settings.PlaceSurfaces {
+    place := place_of(app, surface)
+    if place.mode == settings.PlaceDock && surface_visible(app, surface) {
+      _ = dock_strip(&place, &area, scale)
+    }
+  }
+  return sdl.PixelRect{x: #cast(i32) area.x, y: #cast(i32) area.y, width: #cast(i32) area.width, height: #cast(i32) area.height}
+}
+// Where a surface draws: its natural rectangle unless configured otherwise.
+// Where each surface drew last frame, so the mouse can grab it, and the
+// grab in progress.
+struct PlaceDrag { surface: usize, dock: bool, grab_x, grab_y, x, y: f32 }
+placed_rects: [8]sdl.Rect = []
+placed_frames: [8]u64 = []
+place_drag: PlaceDrag = PlaceDrag{}
+
+fn place_rect(app: *const App, surface: usize, width: i32, height: i32, status: f32, scale: f32, natural: sdl.Rect) sdl.Rect {
+  rect := place_rect_for(app, surface, width, height, status, scale, natural)
+  // A floating surface being dragged follows the pointer until released.
+  if place_drag.surface == surface + 1 && !place_drag.dock {
+    rect.x += place_drag.x - place_drag.grab_x
+    rect.y += place_drag.y - place_drag.grab_y
+  }
+  if surface < settings.PlaceSurfaces {
+    placed_rects[surface] = rect
+    placed_frames[surface] = app.ui.frame
+  }
+  return rect
+}
+fn place_rect_for(app: *const App, surface: usize, width: i32, height: i32, status: f32, scale: f32, natural: sdl.Rect) sdl.Rect {
+  effective := place_of(app, surface)
+  place := &effective
+  if place.mode == settings.PlaceDefault {
+    return natural
+  }
+  window := sdl.Rect{width: #cast(f32) width, height: #cast(f32) height - status}
+  if place.mode == settings.PlaceDock {
+    area := window
+    for earlier in 0..surface {
+      other := place_of(app, earlier)
+      if other.mode == settings.PlaceDock && surface_visible(app, earlier) {
+        _ = dock_strip(&other, &area, scale)
+      }
+    }
+    return dock_strip(place, &area, scale)
+  }
+  result := natural
+  result.width = place_length(place.width, window.width, scale, natural.width)
+  result.height = place_length(place.height, window.height, scale, natural.height)
+  if result.width > window.width {
+    result.width = window.width
+  }
+  if result.height > window.height {
+    result.height = window.height
+  }
+  if place.mode == settings.PlaceCursor {
+    // Below the caret, flipping above when it would leave the window.
+    caret_x := app.view.animation.file.cursor_x.value
+    caret_y := app.view.animation.file.cursor_y.value
+    pane := app.view.panes[app.view.focused].rect
+    result.x = #cast(f32) pane.x + caret_x
+    result.y = #cast(f32) pane.y + caret_y + app.view.animation.line
+    if result.x + result.width > window.width {
+      result.x = window.width - result.width
+    }
+    if result.y + result.height > window.height {
+      result.y = #cast(f32) pane.y + caret_y - result.height
+    }
+    if result.x < 0.0 {
+      result.x = 0.0
+    }
+    if result.y < 0.0 {
+      result.y = 0.0
+    }
+    return result
+  }
+  margin := place_length(place.margin, window.width, scale, 12.0 * scale)
+  column := place.anchor % 3
+  row := place.anchor / 3
+  result.x = margin
+  if column == 1 {
+    result.x = (window.width - result.width) / 2.0
+  }
+  else if column == 2 {
+    result.x = window.width - result.width - margin
+  }
+  result.y = margin
+  if row == 1 {
+    result.y = (window.height - result.height) / 2.0
+  }
+  else if row == 2 {
+    result.y = window.height - result.height - margin
+  }
+  return result
+}
+// :place SURFACE float ANCHOR [WIDTH [HEIGHT]] | dock SIDE [SIZE] | cursor | default
+fn place_command(app: *App, argument: []const u8) {
+  words: [6][]const u8 = []
+  count: usize = 0
+  at: usize = 0
+  for at < #len(argument) && count < 6 {
+    for at < #len(argument) && argument[at] == ' ' {
+      at += 1
+    }
+    start := at
+    for at < #len(argument) && argument[at] != ' ' {
+      at += 1
+    }
+    if at > start {
+      words[count] = argument[start..at]
+      count += 1
+    }
+  }
+  surface := settings.PlaceSurfaces
+  if count > 0 {
+    surface = settings.place_surface(words[0])
+  }
+  if surface == settings.PlaceSurfaces || count < 2 {
+    notice(app, "Usage: :place SURFACE float ANCHOR [W [H]] | dock SIDE [SIZE] | cursor | default. Surfaces: palette picker menu dialog explorer terminal completion hover.")
+    return
+  }
+  section: [32]u8 = []
+  section_length := copy_text(section[..], "place.")
+  add_text(section[..], &section_length, words[0])
+  if config_locked(app, "place") || config_locked(app, section[..section_length]) {
+    notice(app, "That surface's placement is locked in the global config.")
+    return
+  }
+  place := settings.Placement{}
+  mode := words[1]
+  if buffer.equal(mode, "float") || settings.place_anchor(mode) != 255 {
+    // :place picker top-right is short for float top-right.
+    anchor_word := mode
+    next: usize = 2
+    if buffer.equal(mode, "float") {
+      if count < 3 {
+        notice(app, "Anchors: top-left top top-right left center right bottom-left bottom bottom-right.")
+        return
+      }
+      anchor_word = words[2]
+      next = 3
+    }
+    place.mode = settings.PlaceFloat
+    place.anchor = settings.place_anchor(anchor_word)
+    if place.anchor == 255 {
+      notice(app, "Anchors: top-left top top-right left center right bottom-left bottom bottom-right.")
+      return
+    }
+    if count > next {
+      place.width = settings.number(words[next])
+    }
+    if count > next + 1 {
+      place.height = settings.number(words[next + 1])
+    }
+  }
+  else if buffer.equal(mode, "dock") {
+    if count < 3 || settings.place_side(words[2]) == 255 {
+      notice(app, "Dock sides: left right top bottom.")
+      return
+    }
+    place.mode = settings.PlaceDock
+    place.side = settings.place_side(words[2])
+    if count > 3 {
+      place.size = settings.number(words[3])
+    }
+  }
+  else if buffer.equal(mode, "cursor") {
+    place.mode = settings.PlaceCursor
+  }
+  else if !buffer.equal(mode, "default") {
+    notice(app, "Modes: float, dock, cursor, default.")
+    return
+  }
+  if place.width < 0.0 || place.height < 0.0 || place.size < 0.0 {
+    notice(app, "Sizes are fractions (0.3) or logical pixels (320).")
+    return
+  }
+  app.config.places[surface] = place
+  place_record(app, surface)
+  app.view.revision += 1
+  notice(app, "Placement changed for this session; set [place.NAME] in config to keep it.")
+}
+// A placement as a whole decimal or with four places: 0.45, 312.5.
+fn add_amount(output: []u8, used: *usize, amount: f32) {
+  scaled := #cast(usize) (amount * 10000.0 + 0.5)
+  add_number(output, used, scaled / 10000)
+  fraction := scaled % 10000
+  if fraction == 0 {
+    return
+  }
+  add_text(output, used, ".")
+  divisor: usize = 1000
+  for divisor > 0 && fraction > 0 {
+    add_number(output, used, fraction / divisor)
+    fraction = fraction % divisor
+    divisor = divisor / 10
+  }
+}
+// Keeps a session placement as a [place.NAME] section that replaces the
+// files' one, so it survives :config-reload and a frontend switch.
+fn place_record(app: *App, surface: usize) {
+  names: [8][]const u8 = ["palette", "picker", "menu", "dialog", "explorer", "terminal", "completion", "hover"]
+  anchors: [9][]const u8 = ["top-left", "top", "top-right", "left", "center", "right", "bottom-left", "bottom", "bottom-right"]
+  sides: [4][]const u8 = ["left", "right", "top", "bottom"]
+  place := app.config.places[surface]
+  header: [32]u8 = []
+  header_length := copy_text(header[..], "[place.")
+  add_text(header[..], &header_length, names[surface])
+  add_text(header[..], &header_length, "]")
+  section: [512]u8 = []
+  used := copy_text(section[..], header[..header_length])
+  add_text(section[..], &used, "\nmode = \"default\"\n")
+  if place.mode == settings.PlaceFloat && place.anchor < 9 {
+    add_text(section[..], &used, "anchor = \"")
+    add_text(section[..], &used, anchors[place.anchor])
+    add_text(section[..], &used, "\"\n")
+    if place.width > 0.0 {
+      add_text(section[..], &used, "width = ")
+      add_amount(section[..], &used, place.width)
+      add_text(section[..], &used, "\n")
+    }
+    if place.height > 0.0 {
+      add_text(section[..], &used, "height = ")
+      add_amount(section[..], &used, place.height)
+      add_text(section[..], &used, "\n")
+    }
+  }
+  else if place.mode == settings.PlaceDock && place.side < 4 {
+    add_text(section[..], &used, "side = \"")
+    add_text(section[..], &used, sides[place.side])
+    add_text(section[..], &used, "\"\n")
+    if place.size > 0.0 {
+      add_text(section[..], &used, "size = ")
+      add_amount(section[..], &used, place.size)
+      add_text(section[..], &used, "\n")
+    }
+  }
+  else if place.mode == settings.PlaceCursor {
+    add_text(section[..], &used, "mode = \"cursor\"\n")
+  }
+  if place.margin > 0.0 {
+    add_text(section[..], &used, "margin = ")
+    add_amount(section[..], &used, place.margin)
+    add_text(section[..], &used, "\n")
+  }
+  // Drop this surface's earlier section: its header up to the next one.
+  block := app.configuration.place_overrides[..]
+  length := &app.configuration.place_overrides_length
+  at: usize = 0
+  for at < length.* {
+    end := at
+    for end < length.* && block[end] != 10 {
+      end += 1
+    }
+    if buffer.equal(block[at..end], header[..header_length]) {
+      next := end + 1
+      for next < length.* && block[next] != '[' {
+        for next < length.* && block[next] != 10 {
+          next += 1
+        }
+        next += 1
+      }
+      if next > length.* {
+        next = length.*
+      }
+      removed := next - at
+      for index in next..length.* {
+        block[index - removed] = block[index]
+      }
+      length.* -= removed
+      break
+    }
+    at = end + 1
+  }
+  if length.* + used > #len(block) {
+    notice(app, "Too many placement changes this session.")
+    return
+  }
+  add_text(block, length, section[..used])
+}
+
+fn place_locked(app: *const App, surface: usize) bool {
+  names: [8][]const u8 = ["palette", "picker", "menu", "dialog", "explorer", "terminal", "completion", "hover"]
+  section: [32]u8 = []
+  section_length := copy_text(section[..], "place.")
+  add_text(section[..], &section_length, names[surface])
+  return config_locked(app, "place") || config_locked(app, section[..section_length])
+}
+// Mouse placement for this session, like :place. Dragging a dock's inner
+// edge resizes it; dragging a floating panel by its header moves it, and on
+// release it settles at the nearest of the nine anchors. Returns true while
+// a drag owns the pointer.
+fn place_drag_mouse(app: *App, x: f32, y: f32, width: i32, height: i32, pressed: bool, held: bool, released: bool) bool {
+  drag := &place_drag
+  if drag.surface != 0 {
+    surface := drag.surface - 1
+    if held {
+      drag.x = x
+      drag.y = y
+      if drag.dock {
+        place_dock_resize(app, surface, x, y)
+      }
+      app.ui.redraw = true
+      return true
+    }
+    if !drag.dock {
+      place_float_settle(app, surface, width, height)
+    }
+    drag.surface = 0
+    app.ui.redraw = true
+    return true
+  }
+  if !pressed {
+    return false
+  }
+  grab := place_grab_at(app, x, y)
+  if grab.surface == 0 {
+    return false
+  }
+  place_drag = PlaceDrag{surface: grab.surface, dock: grab.dock, grab_x: x, grab_y: y, x: x, y: y}
+  return true
+}
+// What the pointer would grab here: a dock's inner edge or a floating
+// panel's top band. surface is 0 when nothing.
+struct PlaceGrab { surface: usize, dock: bool, horizontal: bool }
+fn place_grab_at(app: *const App, x: f32, y: f32) PlaceGrab {
+  grip := 5.0 * app.ui.scale
+  if sdl.tui_active() {
+    grip = app.ui.cell
+  }
+  surface := settings.PlaceSurfaces
+  for surface > 0 {
+    surface -= 1
+    if placed_frames[surface] + 1 < app.ui.frame || !surface_visible(app, surface) || place_locked(app, surface) {
+      continue
+    }
+    rect := placed_rects[surface]
+    place := place_of(app, surface)
+    if place.mode == settings.PlaceDock {
+      across := y >= rect.y && y < rect.y + rect.height
+      edge := rect.x + rect.width
+      along := x
+      if place.side == 1 {
+        edge = rect.x
+      }
+      else if place.side == 2 || place.side == 3 {
+        across = x >= rect.x && x < rect.x + rect.width
+        along = y
+        edge = rect.y + rect.height
+        if place.side == 3 {
+          edge = rect.y
+        }
+      }
+      if across && along > edge - grip && along < edge + grip {
+        return PlaceGrab{surface: surface + 1, dock: true, horizontal: place.side < 2}
+      }
+      continue
+    }
+    // Floating: the band above the first row is the handle; rows and
+    // buttons inside keep their clicks.
+    inside := x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+    if inside && y < rect.y + app.ui.line && ui_hit(&app.ui, x, y) == 0 {
+      return PlaceGrab{surface: surface + 1}
+    }
+    if inside {
+      return PlaceGrab{}
+    }
+  }
+  return PlaceGrab{}
+}
+// Pointer shape over placement handles: resize arrows on dock edges, the
+// move cursor on floating headers. 0 when none applies.
+fn place_cursor(app: *const App) u32 {
+  if place_drag.surface != 0 {
+    if !place_drag.dock {
+      return UiCursorMove
+    }
+    side := place_of(app, place_drag.surface - 1).side
+    if side < 2 {
+      return UiCursorResizeX
+    }
+    return UiCursorResizeY
+  }
+  if !app.ui.mouse_seen {
+    return 0
+  }
+  grab := place_grab_at(app, app.ui.mouse_x, app.ui.mouse_y)
+  if grab.surface == 0 {
+    return 0
+  }
+  if !grab.dock {
+    return UiCursorMove
+  }
+  if grab.horizontal {
+    return UiCursorResizeX
+  }
+  return UiCursorResizeY
+}
+fn place_dock_resize(app: *App, surface: usize, x: f32, y: f32) {
+  place := place_of(app, surface)
+  rect := placed_rects[surface]
+  size := x - rect.x
+  if place.side == 1 {
+    size = rect.x + rect.width - x
+  }
+  else if place.side == 2 {
+    size = y - rect.y
+  }
+  else if place.side == 3 {
+    size = rect.y + rect.height - y
+  }
+  minimum := 8.0 * app.ui.line
+  if size < minimum {
+    size = minimum
+  }
+  // Logical pixels, so the strip keeps its size as the window changes.
+  place.size = size / app.ui.scale
+  app.config.places[surface] = place
+  place_record(app, surface)
+}
+fn place_float_settle(app: *App, surface: usize, width: i32, height: i32) {
+  rect := placed_rects[surface]
+  centre_x := rect.x + rect.width * 0.5
+  centre_y := rect.y + rect.height * 0.5
+  column: u8 = 1
+  if centre_x < #cast(f32) width / 3.0 {
+    column = 0
+  }
+  else if centre_x > #cast(f32) width * 2.0 / 3.0 {
+    column = 2
+  }
+  row: u8 = 1
+  if centre_y < #cast(f32) height / 3.0 {
+    row = 0
+  }
+  else if centre_y > #cast(f32) height * 2.0 / 3.0 {
+    row = 2
+  }
+  place := place_of(app, surface)
+  place.mode = settings.PlaceFloat
+  place.anchor = row * 3 + column
+  // Keep the size it had on screen.
+  if place.width <= 0.0 {
+    place.width = rect.width / app.ui.scale
+  }
+  if place.height <= 0.0 {
+    place.height = rect.height / app.ui.scale
+  }
+  app.config.places[surface] = place
+  place_record(app, surface)
+}

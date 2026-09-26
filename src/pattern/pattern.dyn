@@ -1,0 +1,77 @@
+#link("pcre2-8")
+// Opaque PCRE2 handles; no native structures escape this module.
+extern fn compile "pcre2_compile_8"(bytes: *const u8, length: usize, options: u32, error: *i32, offset: *usize, context: rawptr) rawptr
+extern fn code_free "pcre2_code_free_8"(code: rawptr)
+extern fn data_create "pcre2_match_data_create_from_pattern_8"(code: rawptr, context: rawptr) rawptr
+extern fn data_free "pcre2_match_data_free_8"(data: rawptr)
+extern fn context_create "pcre2_match_context_create_8"(general: rawptr) rawptr
+extern fn context_free "pcre2_match_context_free_8"(context: rawptr)
+extern fn match_limit "pcre2_set_match_limit_8"(context: rawptr, limit: u32) i32
+extern fn depth_limit "pcre2_set_depth_limit_8"(context: rawptr, limit: u32) i32
+extern fn heap_limit "pcre2_set_heap_limit_8"(context: rawptr, limit: u32) i32
+extern fn match "pcre2_match_8"(code: rawptr, bytes: *const u8, length: usize, offset: usize, options: u32, data: rawptr, context: rawptr) i32
+extern fn offsets "pcre2_get_ovector_pointer_8"(data: rawptr) *usize
+
+pub struct Pattern { code, data, context: rawptr, ok: bool, error: i32, error_offset: usize }
+pub struct Match { found, error: bool, start, end: usize }
+
+pub fn open(text: []const u8) Pattern {
+  return open_options(text, 0x001a0000)
+}
+pub fn open_lines(text: []const u8) Pattern {
+  return open_options(text, 0x001a0400)
+}
+fn open_options(text: []const u8, options: u32) Pattern {
+  result := Pattern{}
+  if #len(text) == 0 {
+    return result
+  }
+  result.code = compile(&text[0], #len(text), options, &result.error, &result.error_offset, nil)
+  if result.code == nil {
+    return result
+  }
+  result.data = data_create(result.code, nil)
+  result.context = context_create(nil)
+  if result.data == nil || result.context == nil {
+    return result
+  }
+  if match_limit(result.context, 10000) != 0 || depth_limit(result.context, 128) != 0 || heap_limit(result.context, 4096) != 0 {
+    return result
+  }
+  result.ok = true
+  return result
+}
+pub fn close(pattern: *Pattern) {
+  if pattern.data != nil {
+    data_free(pattern.data)
+  }
+  if pattern.context != nil {
+    context_free(pattern.context)
+  }
+  if pattern.code != nil {
+    code_free(pattern.code)
+  }
+  pattern.data = nil
+  pattern.context = nil
+  pattern.code = nil
+  pattern.ok = false
+}
+pub fn find(pattern: *Pattern, text: []const u8, offset: usize) Match {
+  if !pattern.ok || offset > #len(text) {
+    return Match{error: true}
+  }
+  empty: [1]u8 = [0]
+  bytes: *const u8 = &empty[0]
+  if #len(text) > 0 {
+    bytes = &text[0]
+  }
+  result := match(pattern.code, bytes, #len(text), offset, 0, pattern.data, pattern.context)
+  if result == -1 {
+    return Match{}
+  }
+  if result < 0 {
+    return Match{error: true}
+  }
+  vector := offsets(pattern.data)[..2]
+  return Match{found: true, start: vector[0], end: vector[1]}
+}

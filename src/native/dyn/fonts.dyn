@@ -1,0 +1,105 @@
+#link("fontconfig")
+
+const spacing: []const u8 = "spacing\0"
+const file_key: []const u8 = "file\0"
+const family_key: []const u8 = "family\0"
+const mono: []const u8 = "monospace\0"
+
+struct FontSet { count, capacity: i32, fonts: *rawptr }
+
+extern fn initialize "FcInit"() i32
+extern fn pattern_create "FcPatternCreate"() rawptr
+extern fn pattern_destroy "FcPatternDestroy"(pattern: rawptr)
+extern fn add_integer "FcPatternAddInteger"(pattern: rawptr, name: *const u8, value: i32) i32
+extern fn add_string "FcPatternAddString"(pattern: rawptr, name: *const u8, value: *const u8) i32
+extern fn object_create "FcObjectSetCreate"() rawptr
+extern fn object_add "FcObjectSetAdd"(objects: rawptr, name: *const u8) i32
+extern fn object_destroy "FcObjectSetDestroy"(objects: rawptr)
+extern fn font_list "FcFontList"(config: rawptr, pattern: rawptr, objects: rawptr) *FontSet
+extern fn font_set_destroy "FcFontSetDestroy"(fonts: *FontSet)
+extern fn get_string "FcPatternGetString"(pattern: rawptr, name: *const u8, index: i32, output: **u8) i32
+extern fn substitute "FcConfigSubstitute"(config: rawptr, pattern: rawptr, kind: i32) i32
+extern fn default_substitute "FcDefaultSubstitute"(pattern: rawptr)
+extern fn font_match "FcFontMatch"(config: rawptr, pattern: rawptr, result: *i32) rawptr
+pub fn dna_fonts(output: *u8, capacity: usize) usize {
+  if output == nil || capacity == 0 {
+    return 0
+  }
+  output.* = 0
+  if initialize() == 0 {
+    return 0
+  }
+  pattern := pattern_create()
+  if pattern == nil {
+    return 0
+  }
+  defer pattern_destroy(pattern)
+  if add_integer(pattern, &spacing[0], 100) == 0 {
+    return 0
+  }
+  objects := object_create()
+  if objects == nil {
+    return 0
+  }
+  defer object_destroy(objects)
+  if object_add(objects, &file_key[0]) == 0 {
+    return 0
+  }
+  fonts := font_list(nil, pattern, objects)
+  if fonts == nil {
+    return 0
+  }
+  defer font_set_destroy(fonts)
+  used: usize = 0
+  for index in 0..fonts.count {
+    path: *u8 = nil
+    if get_string(fonts.fonts[..#cast(usize) fonts.count][#cast(usize) index], &file_key[0], 0, &path) == 0 && path != nil {
+      length := string_length(path)
+      if capacity - used < 2 || length > capacity - used - 2 {
+        break
+      }
+      _ = copy(&output[..capacity][used], path, length)
+      used += length
+      output[..capacity][used] = 10
+      used += 1
+    }
+  }
+  output[..capacity][used] = 0
+  return used
+}
+pub fn dna_default_font(output: *u8, capacity: usize) i32 {
+  return dna_match_font(&mono[0], output, capacity)
+}
+pub fn dna_match_font(family: *const u8, output: *u8, capacity: usize) i32 {
+  if family == nil || family.* == 0 || output == nil || capacity < 2 || initialize() == 0 {
+    return 0
+  }
+  pattern := pattern_create()
+  if pattern == nil {
+    return 0
+  }
+  defer pattern_destroy(pattern)
+  if add_string(pattern, &family_key[0], family) == 0 || add_integer(pattern, &spacing[0], 100) == 0 {
+    return 0
+  }
+  if substitute(nil, pattern, 0) == 0 {
+    return 0
+  }
+  default_substitute(pattern)
+  result: i32 = 0
+  matched := font_match(nil, pattern, &result)
+  if matched == nil {
+    return 0
+  }
+  defer pattern_destroy(matched)
+  path: *u8 = nil
+  if get_string(matched, &file_key[0], 0, &path) != 0 || path == nil {
+    return 0
+  }
+  length := string_length(path)
+  if length >= capacity {
+    return 0
+  }
+  _ = copy(output, path, length + 1)
+  return 1
+}

@@ -1,0 +1,205 @@
+struct TaskLocation { path: []const u8, line: usize, column: usize = 1, ok: bool }
+
+extern fn terminal_log "dna_terminal_log"(terminal: rawptr, output: *u8, capacity: usize) usize
+
+fn run_task(app: *App, command: []const u8) {
+  if #len(command) == 0 {
+    notice(app, "Configure build_command, test_command, or run_command, or use :run <shell command>.")
+    return
+  }
+  terminal_show(app, true, command)
+}
+fn task_next_error(app: *App) {
+  slot := &app.documents.slots[app.terminal_state.slot]
+
+  if slot.terminal.handle == nil {
+    notice(app, "No terminal output to inspect.")
+    return
+  }
+
+  output: [65536]u8 = []
+  length := terminal_log(slot.terminal.handle, &output[0], 65536)
+  at := app.terminal_state.task_error_offset
+  if at >= length {
+    at = 0
+  }
+  for at < length {
+    end := at
+    for end < length && output[end] != 10 {
+      end += 1
+    }
+    line := settings.trim(output[at..end])
+    at = end + 1
+    colon: usize = 0
+    for colon < #len(line) && line[colon] != 58 {
+      colon += 1
+    }
+    digits := colon + 1
+    for digits < #len(line) && line[digits] >= 48 && line[digits] <= 57 {
+      digits += 1
+    }
+    if colon == 0 || digits <= colon + 1 || digits >= #len(line) || line[digits] != 58 {
+      continue
+    }
+    number := settings.number(line[colon + 1..digits])
+    if number < 1.0 {
+      continue
+    }
+    path: [4096]u8 = []
+    used: usize = 0
+    if line[0] != '/' {
+      add_text(path[..], &used, slot.terminal.directory[..slot.terminal.directory_length])
+      add_text(path[..], &used, "/")
+    }
+    add_text(path[..], &used, line[..colon])
+
+    if !files.metadata(path[..used]).ok {
+      continue
+    }
+
+    app.terminal_state.task_error_offset = at
+    open_file(app, path[..used])
+    if app.prompt_state.panel == Panel.Message {
+      return
+    }
+    task_open_location(app, task_location(line))
+    return
+  }
+  app.terminal_state.task_error_offset = 0
+  notice(app, "No further path:line: diagnostics in captured terminal output.")
+}
+
+fn task_location(text: []const u8) TaskLocation {
+  line := settings.trim(text)
+  colon: usize = 0
+  for colon < #len(line) && line[colon] != ':' {
+    colon += 1
+  }
+  if colon == 0 || colon == #len(line) {
+    return TaskLocation{}
+  }
+  end := colon + 1
+  for end < #len(line) && line[end] >= 48 && line[end] <= 57 {
+    end += 1
+  }
+  if end == colon + 1 || end >= #len(line) || line[end] != ':' {
+    return TaskLocation{}
+  }
+  row := settings.number(line[colon + 1..end])
+  if row < 1.0 {
+    return TaskLocation{}
+  }
+  next := end + 1
+  for next < #len(line) && line[next] >= 48 && line[next] <= 57 {
+    next += 1
+  }
+  column: usize = 1
+  if next > end + 1 {
+    parsed := settings.number(line[end + 1..next])
+    if parsed >= 1.0 {
+      column = #cast(usize) parsed
+    }
+  }
+  return TaskLocation{path: line[..colon], line: #cast(usize) row, column: column, ok: true}
+}
+fn task_open_location(app: *App, location: TaskLocation) {
+  if !location.ok {
+    return
+  }
+  path: [4096]u8 = []
+  used: usize = 0
+  if location.path[0] != '/' {
+    slot := &app.documents.slots[app.terminal_state.slot]
+    add_text(path[..], &used, slot.terminal.directory[..slot.terminal.directory_length])
+    add_text(path[..], &used, "/")
+  }
+  if used + #len(location.path) >= 4096 {
+    notice(app, "Diagnostic path is too long.")
+    return
+  }
+  add_text(path[..], &used, location.path)
+  open_file(app, path[..used])
+  if app.prompt_state.panel == Panel.Message {
+    return
+  }
+  row: usize = 1
+  position: usize = 0
+  for row < location.line && position < app.documents.current.length {
+    position = buffer.line_end(app.documents.current, position)
+    if position < app.documents.current.length {
+      position += 1
+    }
+    row += 1
+  }
+  column: usize = 1
+  for column < location.column && position < app.documents.current.length && app.documents.current.bytes[position] != 10 {
+    position = buffer.next(app.documents.current, position)
+    column += 1
+  }
+  buffer.select_to(app.documents.current, position, false)
+}
+fn task_picker(app: *App) {
+  slot := &app.documents.slots[app.terminal_state.slot]
+  if slot.terminal.handle == nil {
+    notice(app, "No build/test output to inspect.")
+    return
+  }
+  app.resource_state.font_list_length = terminal_log(slot.terminal.handle, &app.resource_state.font_list[0], 65536)
+  app.resource_state.kind = 5
+  app.resource_state.fonts = false
+  panel(app, Panel.Open)
+}
+fn task_refresh(app: *App) {
+  app.completion.count = 0
+  app.completion.selected = 0
+  app.completion.chosen = false
+  app.completion.prefix_length = 0
+  at: usize = 0
+  for at < app.resource_state.font_list_length && app.completion.count < 128 {
+    end := at
+    for end < app.resource_state.font_list_length && app.resource_state.font_list[end] != 10 {
+      end += 1
+    }
+    line := app.resource_state.font_list[at..end]
+    at = end + 1
+    if #len(line) < 512 && task_location(line).ok && contains(line, app.prompt_state.text[..app.prompt_state.length]) {
+      entry := &app.completion.entries[app.completion.count]
+      entry.length = copy_text(entry.name[..], line)
+      app.completion.count += 1
+    }
+  }
+}
+fn task_previous_error(app: *App) {
+  slot := &app.documents.slots[app.terminal_state.slot]
+  if slot.terminal.handle == nil {
+    notice(app, "No terminal output to inspect.")
+    return
+  }
+  output: [65536]u8 = []
+  length := terminal_log(slot.terminal.handle, &output[0], 65536)
+  at: usize = 0
+  previous: usize = 0
+  previous_end: usize = 0
+  found := false
+  for at < length {
+    end := at
+    for end < length && output[end] != 10 {
+      end += 1
+    }
+    if end + 1 >= app.terminal_state.task_error_offset && app.terminal_state.task_error_offset > 0 {
+      break
+    }
+    if task_location(output[at..end]).ok {
+      previous = at
+      previous_end = end
+      found = true
+    }
+    at = end + 1
+  }
+  if !found {
+    notice(app, "No earlier diagnostic in captured task output.")
+    return
+  }
+  app.terminal_state.task_error_offset = previous_end + 1
+  task_open_location(app, task_location(output[previous..previous_end]))
+}

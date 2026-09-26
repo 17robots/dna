@@ -1,0 +1,98 @@
+// [project."PATH"] sections in the global config: personal settings for one
+// project (a theme to tell it apart, a font size). They live in your own
+// file, so unlike a repository's dna.toml they may set personal keys and need
+// no :trust. Only top-level keys are allowed inside one.
+
+pub struct SectionPath { ok: bool, path: []const u8 }
+pub fn project_section_path(section: []const u8) SectionPath {
+  if #len(section) < 11 || !buffer.equal(section[..9], "project.\"") || section[#len(section) - 1] != 34 {
+    return SectionPath{}
+  }
+  path := section[9..#len(section) - 1]
+  for byte in path {
+    if byte == 34 {
+      return SectionPath{}
+    }
+  }
+  return SectionPath{ok: true, path: path}
+}
+// True when `location` is the section's directory or inside it. PATH may
+// start with ~ for `home`.
+fn project_path_contains(path: []const u8, home: []const u8, location: []const u8) bool {
+  expanded: [4096]u8 = []
+  used: usize = 0
+  rest := path
+  if #len(path) > 0 && path[0] == '~' && (#len(path) == 1 || path[1] == '/') {
+    if #len(home) == 0 || #len(home) >= 4000 {
+      return false
+    }
+    for byte in home {
+      expanded[used] = byte
+      used += 1
+    }
+    rest = path[1..]
+  }
+  if used + #len(rest) >= #len(expanded) {
+    return false
+  }
+  for byte in rest {
+    expanded[used] = byte
+    used += 1
+  }
+  for used > 1 && expanded[used - 1] == '/' {
+    used -= 1
+  }
+  if used == 0 || #len(location) < used || !buffer.equal(location[..used], expanded[..used]) {
+    return false
+  }
+  return #len(location) == used || location[used] == '/' || expanded[used - 1] == '/'
+}
+// Finds the next [project."PATH"] section, from byte `at.*`, whose PATH
+// holds `location`. Writes `source` to `output` with every other line
+// emptied, so parse errors keep the file's line numbers, and returns true.
+pub fn project_section_next(source: []const u8, location: []const u8, home: []const u8, at: *usize, output: []u8) bool {
+  if #len(output) < #len(source) {
+    return false
+  }
+  for at.* < #len(source) {
+    end := at.*
+    for end < #len(source) && source[end] != 10 {
+      end += 1
+    }
+    line := trim(source[at.*..end])
+    at.* = end + 1
+    if #len(line) < 2 || line[0] != 91 || line[#len(line) - 1] != 93 {
+      continue
+    }
+    section := project_section_path(line[1..#len(line) - 1])
+    if !section.ok || !project_path_contains(section.path, home, location) {
+      continue
+    }
+    // Keep this section's lines up to the next header; blank the rest.
+    body_start := at.*
+    body_end := body_start
+    for body_end < #len(source) {
+      line_end := body_end
+      for line_end < #len(source) && source[line_end] != 10 {
+        line_end += 1
+      }
+      body_line := trim(source[body_end..line_end])
+      if #len(body_line) > 0 && body_line[0] == 91 {
+        break
+      }
+      body_end = line_end + 1
+    }
+    if body_end > #len(source) {
+      body_end = #len(source)
+    }
+    for index in 0..#len(source) {
+      byte := source[index]
+      if byte != 10 && (index < body_start || index >= body_end) {
+        byte = 32
+      }
+      output[index] = byte
+    }
+    return true
+  }
+  return false
+}

@@ -1,0 +1,63 @@
+use "../../src/workspace" workspace
+use "../../src/buffer" buffer
+fn main() {
+  state := workspace.State{project: "/tmp"}
+  state.buffers[0] = workspace.SavedBuffer{used: true, path: "/tmp/a", text: "new\nα", saved: "old", cursor: 4, anchor: 0, filetype: "dyn"}
+  state.panes[0] = workspace.SavedPane{used: true, percent: 50}
+  state.buffers[0].secondary.count = 1
+  state.buffers[0].secondary.ranges[0] = buffer.Selection{cursor: 6, anchor: 4}
+  state.panes[0].secondary = state.buffers[0].secondary
+  bytes: [8192]u8 = []
+  length := workspace.encode(&state, bytes[..])
+  if length == 0 {
+    #panic("encode")
+  }
+  if length != workspace.encoded_size(&state) {
+    #panic("session sizing")
+  }
+  // Large files in recovery snapshots are stored by path and reloaded.
+  reload := workspace.State{project: "/tmp"}
+  reload.buffers[0] = workspace.SavedBuffer{used: true, reload: true, path: "/tmp/big.log", filetype: "log", cursor: 900, anchor: 12}
+  reload.panes[0] = workspace.SavedPane{used: true, percent: 50, slot: 0, cursor: 900, anchor: 12}
+  reload_bytes: [8192]u8 = []
+  reload_length := workspace.encode(&reload, reload_bytes[..])
+  reloaded := workspace.State{}
+  if reload_length == 0 || reload_length != workspace.encoded_size(&reload) || !workspace.decode(reload_bytes[..reload_length], &reloaded) {
+    #panic("reload entry roundtrip")
+  }
+  if !reloaded.buffers[0].reload || !buffer.equal(reloaded.buffers[0].path, "/tmp/big.log") || !buffer.equal(reloaded.buffers[0].filetype, "log") || reloaded.buffers[0].cursor != 900 || reloaded.buffers[0].anchor != 12 || #len(reloaded.buffers[0].text) != 0 {
+    #panic("reload entry fields")
+  }
+  reload.buffers[0].path = "relative.log"
+  reload_length = workspace.encode(&reload, reload_bytes[..])
+  if workspace.decode(reload_bytes[..reload_length], &reloaded) {
+    #panic("relative reload path accepted")
+  }
+  decoded := workspace.State{}
+  if !workspace.decode(bytes[..length], &decoded) || !buffer.equal(decoded.buffers[0].text, "new\nα") || !buffer.equal(decoded.buffers[0].saved, "old") {
+    #panic("roundtrip")
+  }
+  if decoded.buffers[0].secondary.count != 1 || decoded.panes[0].secondary.ranges[0].cursor != 6 {
+    #panic("session selections")
+  }
+  size: usize = 0
+  for size < length {
+    if workspace.decode(bytes[..size], &decoded) {
+      #panic("truncation accepted")
+    }
+    size += 1
+  }
+  state.panes[0].branch = true
+  state.panes[0].first = 0
+  state.panes[0].second = 0
+  length = workspace.encode(&state, bytes[..])
+  if workspace.decode(bytes[..length], &decoded) {
+    #panic("cycle accepted")
+  }
+  state.panes[0].branch = false
+  state.panes[0].slot = 16
+  length = workspace.encode(&state, bytes[..])
+  if workspace.decode(bytes[..length], &decoded) {
+    #panic("invalid slot accepted")
+  }
+}

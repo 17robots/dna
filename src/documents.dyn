@@ -1,0 +1,109 @@
+struct Documents {
+  slots: [16]Slot,
+  active: usize,
+  count: usize,
+  next_identity: u64,
+  current: *buffer.Document,
+  file: *files.State,
+  saving: SaveSequence,
+  closing_one: bool,
+  quit_after_save: bool,
+  // Previously active slot, for ga (goto alternate buffer).
+  previous: usize,
+}
+// Documents own their storage; switching views never copies text or undo history.
+struct TerminalState {
+  handle: rawptr,
+  input: bool,
+  review: bool,
+  extend: bool,
+  cursor_x: motion.Tween,
+  cursor_y: motion.Tween,
+  keep_output: bool,
+  directory: [4096]u8,
+  directory_length: usize,
+  goto_pending: bool,
+  escape_pending: bool,
+  escape_time: u64,
+  escape_target: rawptr,
+}
+struct Slot {
+  inferred_filetype: bool,
+  disk_changed: bool,
+  diagnostics: Diagnostics,
+  terminal: TerminalState,
+  identity: u64,
+  arena_born: u64,
+  filetype: [65]u8,
+  filetype_length: usize,
+  syntax: rawptr,
+  syntax_checked: bool,
+  syntax_revision: u64,
+  syntax_used: u64,
+  colors: []u8,
+  arena: mem.Arena,
+  document: *buffer.Document,
+  file: files.State,
+  scroll_x: f32,
+  scroll_y: f32,
+  insert: bool,
+  extend: bool,
+  file_config: FileConfig,
+}
+
+fn new_buffer(app: *App) bool {
+  index: usize = 0
+  for index < 16 && app.documents.slots[index].document != nil {
+    index += 1
+  }
+  if index == 16 {
+    notice(app, "Buffer limit reached (16). Close a buffer first.")
+    return false
+  }
+  allocated := buffer.reserve(#sizeof(buffer.Document) + buffer.Capacity + 129)
+  if !allocated.ok {
+    notice(app, "Cannot allocate document.")
+    return false
+  }
+  slot := &app.documents.slots[index]
+  slot.arena = allocated.arena
+  app.documents.next_identity += 1
+  slot.identity = app.documents.next_identity
+  if app.render_trace.enabled {
+    slot.arena_born = render_clock()
+  }
+  allocation_record(app, "document", #sizeof(buffer.Document) + buffer.Capacity + 129, slot.arena_born, false)
+  slot.file_config = FileConfig{}
+  slot.terminal = TerminalState{}
+  mem.zero((#cast(*u8) &slot.diagnostics)[..#sizeof(Diagnostics)])
+  slot.disk_changed = false
+  slot.document = buffer.allocate(&slot.arena)
+  slot.colors = (#cast(*u8) mem.arena_push_uninit(&slot.arena, buffer.Capacity + 1, 1))[..buffer.Capacity + 1]
+  _ = buffer.load(slot.document, "")
+  app.documents.count += 1
+  activate(app, index)
+  return true
+}
+fn documents_release(app: *App) {
+  for index in 0..16 {
+    slot := &app.documents.slots[index]
+    if slot.document != nil {
+      if !buffer.dirty_cached(slot.document) {
+        files.discard_recovery(&slot.file)
+      }
+      document_release(app, slot)
+    }
+  }
+}
+
+// One owner handles document arena accounting and invalidates borrowed pointers.
+fn document_release(app: *App, slot: *Slot) {
+  if slot.document == nil {
+    return
+  }
+  _ = mem.arena_release(&slot.arena)
+  allocation_record(app, "document", #sizeof(buffer.Document) + buffer.Capacity + 129, slot.arena_born, true)
+  slot.document = nil
+  slot.colors = slot.colors[..0]
+  slot.arena_born = 0
+}

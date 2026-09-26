@@ -1,0 +1,240 @@
+struct ProjectReplaceState {
+  plan: ReplacePlan,
+  text: [4096]u8,
+  text_length: usize,
+}
+
+struct ReplaceFile { path: [4096]u8, length: usize, before, after: []u8, count, slot: usize }
+struct ReplacePlan { arena: mem.Arena, files: []ReplaceFile, count, total: usize }
+
+fn replace_release(app: *App) {
+  if #len(app.replacement.plan.files) != 0 {
+    _ = mem.arena_release(&app.replacement.plan.arena)
+    app.replacement.plan.files = app.replacement.plan.files[..0]
+  }
+  app.replacement.plan.count = 0
+}
+fn replace_prepare(app: *App, replacement: []const u8) {
+  replace_release(app)
+  _ = project_search_tick(app)
+  if app.project_find.status != 0 || app.project_find.count == 0 {
+    notice(app, "Run a complete global search first. Replacement refuses partial or pending results.")
+    return
+  }
+  // Each of up to 16 files keeps its text before and after; reserved, so
+  // only the bytes read and built occupy memory.
+  allocated := buffer.reserve((buffer.Capacity + 1) * 32 + 65536)
+  if !allocated.ok {
+    notice(app, "Cannot allocate replacement preview.")
+    return
+  }
+  plan := &app.replacement.plan
+  plan.arena = allocated.arena
+  plan.total = 0
+  plan.files = (#cast(*ReplaceFile) mem.arena_push(&plan.arena, #sizeof(ReplaceFile) * 16, #alignof(ReplaceFile)))[..16]
+  compiled := pattern.open_lines(app.project_find.query[..app.project_find.query_length])
+  defer pattern.close(&compiled)
+  for index in 0..app.project_find.count {
+    hit := ProjectHit{}
+    if project_search_row(app.project_find.worker, index, &hit) == 0 {
+      notice(app, "Search results changed. Search again.")
+      return
+    }
+    full: [4096]u8 = []
+    length := copy_text(full[..], app.project_find.root[..app.project_find.root_length])
+    leaf_length := c.string_length(&hit.path[0], 4096)
+    if length + leaf_length + 1 >= 4096 {
+      notice(app, "Result path is too long.")
+      return
+    }
+    add_text(full[..], &length, "/")
+    add_text(full[..], &length, hit.path[..leaf_length])
+    file_index: usize = 0
+    for file_index < plan.count && !buffer.equal(plan.files[file_index].path[..plan.files[file_index].length], full[..length]) {
+      file_index += 1
+    }
+    if file_index == plan.count {
+      if plan.count == 16 {
+        notice(app, "Replacement spans more than 16 files; narrow the search.")
+        return
+      }
+      new_item := &plan.files[file_index]
+      new_item.length = copy_text(new_item.path[..], full[..length])
+      new_item.slot = 16
+      info := files.metadata(full[..length])
+      if !info.ok || (info.mode & 61440) != 32768 {
+        notice(app, "A result is no longer a regular file. Search again.")
+        return
+      }
+      read := fs.read_all(&plan.arena, full[..length], buffer.Capacity)
+      if !read.ok || !buffer.valid(read.data) {
+        notice(app, "A result file cannot be read as editable text.")
+        return
+      }
+      new_item.before = read.data
+      new_item.after = (#cast(*u8) mem.arena_push_uninit(&plan.arena, buffer.Capacity + 1, 1))[..buffer.Capacity + 1]
+      plan.count += 1
+    }
+    item := &plan.files[file_index]
+    verified := pattern.find(&compiled, item.before, hit.start)
+    if !verified.found || verified.start != hit.start || verified.end != hit.end {
+      notice(app, "A file changed since search. Search again before replacement.")
+      return
+    }
+    item.count += 1
+    plan.total += 1
+  }
+  // Build final bytes from fresh validated snapshots; replacements are literal.
+  build_index: usize = 0
+  for build_index < plan.count {
+    built := &plan.files[build_index]
+    source: usize = 0
+    used: usize = 0
+    output := built.after
+    for matched in 0..built.count {
+      match := pattern.find(&compiled, built.before, source)
+      if !match.found || match.end == match.start {
+        notice(app, "Project replacement currently requires nonempty matches.")
+        return
+      }
+      if used + match.start - source + #len(replacement) > buffer.Capacity {
+        notice(app, "Replacement exceeds file capacity.")
+        return
+      }
+      add_text(output, &used, built.before[source..match.start])
+      add_text(output, &used, replacement)
+      source = match.end
+    }
+    remaining_match := pattern.find(&compiled, built.before, source)
+    if remaining_match.found || remaining_match.error {
+      notice(app, "Match set changed since search. Search again before replacement.")
+      return
+    }
+    if used + #len(built.before) - source > buffer.Capacity {
+      notice(app, "Replacement exceeds file capacity.")
+      return
+    }
+    add_text(output, &used, built.before[source..])
+    built.after = output[..used]
+    build_index += 1
+  }
+  app.prompt_state.panel = Panel.ReplacePreview
+  app.prompt_state.selected = 0
+}
+fn replace_apply(app: *App) {
+  plan := &app.replacement.plan
+  if #len(plan.files) == 0 || plan.count == 0 {
+    return
+  }
+  required: usize = 0
+  index: usize = 0
+  // Check every file and open document before changing any text.
+  for index < plan.count {
+    item := &plan.files[index]
+    item.slot = 16
+    current_info := files.metadata(item.path[..item.length])
+    if !current_info.ok || (current_info.mode & 61440) != 32768 {
+      notice(app, "A target is no longer a regular file. Nothing applied.")
+      return
+    }
+    read := files.read_text(item.path[..item.length])
+    unchanged := read.ok && buffer.equal(read.data, item.before)
+    files.release_text(&read)
+    if !unchanged {
+      notice(app, "File changed after preview. Nothing applied; search again.")
+      return
+    }
+    for slot_index in 0..16 {
+      slot := &app.documents.slots[slot_index]
+      if slot.document != nil && buffer.equal(files.name(&slot.file), item.path[..item.length]) {
+        if buffer.dirty_cached(slot.document) || !buffer.equal(slot.document.bytes[..slot.document.length], item.before) {
+          notice(app, "An affected buffer has edits or is stale. Nothing applied.")
+          return
+        }
+        item.slot = slot_index
+        break
+      }
+    }
+    if item.slot == 16 {
+      required += 1
+    }
+    index += 1
+  }
+  if app.documents.count + required > 16 {
+    notice(app, "Not enough free buffers. Close buffers before applying.")
+    return
+  }
+  // Allocate missing buffers before the first edit. Failure leaves text intact.
+  original := app.documents.active
+  index = 0
+  for index < plan.count {
+    missing := &plan.files[index]
+    if missing.slot == 16 {
+      if !new_buffer(app) {
+        return
+      }
+      missing.slot = app.documents.active
+      _ = buffer.load(app.documents.current, missing.before)
+      _ = files.set_name(app.documents.file, missing.path[..missing.length])
+    }
+    index += 1
+  }
+  index = 0
+  for index < plan.count {
+    edit := &plan.files[index]
+    doc := app.documents.slots[edit.slot].document
+    buffer.checkpoint(doc)
+    doc.secondary.count = 0
+    doc.anchor = 0
+    doc.cursor = doc.length
+    if !buffer.replace(doc, edit.after) {
+      #panic("validated replacement")
+    }
+    buffer.checkpoint(doc)
+    index += 1
+  }
+  activate(app, original)
+  replace_release(app)
+  notice(app, "Replacements applied to buffers. Review them, undo with u, and :write each file when ready. Disk files are unchanged.")
+}
+// Arrows scroll the file list; selected is the first visible file.
+fn draw_replace_preview(renderer: rawptr, app: *App, typography: *Typography, width: i32, height: i32, status: f32) {
+  ui := &app.ui
+  ui_panel_begin(ui, typography)
+  line := typography.line
+  plan := &app.replacement.plan
+  title: [8192]u8 = []
+  used: usize = 0
+  add_text(title[..], &used, "Literal replacement preview: ")
+  add_text(title[..], &used, app.project_find.query[..app.project_find.query_length])
+  add_text(title[..], &used, " -> ")
+  add_text(title[..], &used, app.replacement.text[..app.replacement.text_length])
+  rows := ui_sheet_rows(typography, height, status)
+  opening := app.view.animation.panel != Panel.ReplacePreview
+  list := ui_sheet_begin(app, ui, typography, "replace preview", width, height, status, title[..used])
+  scrolled := &ui.boxes[list]
+  scrolled.scroll_target = #cast(f32) app.prompt_state.selected * line
+  ui_list_scroll(app, ui, list, plan.count, 0, line * #cast(f32) rows, opening, false)
+  app.prompt_state.selected = #cast(usize) (scrolled.scroll_target / line + 0.5)
+  window := ui_list_window(ui, list, plan.count, line * #cast(f32) rows)
+  ui_push(ui, list)
+  ui_spacer(ui, "above", #cast(f32) window.first * line)
+  for index in window.first..window.last {
+    item := &plan.files[index]
+    label: [8192]u8 = []
+    length: usize = 0
+    add_number(label[..], &length, item.count)
+    add_text(label[..], &length, " matches  ")
+    add_text(label[..], &length, item.path[..item.length])
+    row := ui_make(ui, ui_hash_number(ui.boxes[list].key, index), UiText | UiHover)
+    ui_text_set(ui, row, label[..length])
+    ui_size(ui, row, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
+    ui_size(ui, row, UiAxisY, UiSizeKind.Pixels, line / typography.scale, 1.0)
+    ui_animate(app, ui, row, false)
+  }
+  ui_spacer(ui, "below", #cast(f32) (plan.count - window.last) * line)
+  ui_pop(ui)
+  ui_sheet_end(ui, "enter applies to buffers (not disk) • esc cancels • arrows or wheel scroll")
+  ui_layout(ui)
+  ui_render(renderer, ui, typography, width, height)
+}

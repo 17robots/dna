@@ -1,0 +1,330 @@
+use "std/mem"
+use "../buffer"
+use "std/unicode/utf8"
+
+pub struct SavedBuffer {
+  secondary: buffer.SelectionSet,
+  path: []const u8,
+  text: []const u8,
+  saved: []const u8,
+  filetype: []const u8,
+  cursor: usize,
+  anchor: usize,
+  used: bool,
+  // Restore from the file on disk; text and saved are not stored.
+  reload: bool,
+}
+pub struct SavedPane {
+  secondary: buffer.SelectionSet,
+  used: bool,
+  branch: bool,
+  vertical: bool,
+  parent: usize,
+  first: usize,
+  second: usize,
+  slot: usize,
+  cursor: usize,
+  anchor: usize,
+  scroll_x: usize,
+  scroll_y: usize,
+  percent: usize = 50,
+}
+pub struct State {
+  project: []const u8,
+  buffers: [16]SavedBuffer,
+  panes: [15]SavedPane,
+  active: usize,
+  focused: usize,
+}
+struct Reader { bytes: []const u8, at: usize, ok: bool = true }
+struct Writer { bytes: []u8, at: usize, ok: bool = true }
+
+fn flag(value: bool) usize {
+  if value {
+    return 1
+  }
+  return 0
+}
+fn number(out: *Writer, value: usize) {
+  if #len(out.bytes) - out.at < 8 {
+    out.ok = false
+    return
+  }
+  for offset in 0..8 {
+    out.bytes[out.at + offset] = #cast(u8) ((value >> (offset * 8)) & 255)
+  }
+  out.at += 8
+}
+fn text(out: *Writer, value: []const u8) {
+  number(out, #len(value))
+  if #len(value) > #len(out.bytes) - out.at {
+    out.ok = false
+    return
+  }
+  for byte in value {
+    out.bytes[out.at] = byte
+    out.at += 1
+  }
+}
+fn get_number(input: *Reader) usize {
+  if #len(input.bytes) - input.at < 8 {
+    input.ok = false
+    return 0
+  }
+  value: usize = 0
+  for offset in 0..8 {
+    value = value | (#cast(usize) input.bytes[input.at + offset] << (offset * 8))
+  }
+  input.at += 8
+  return value
+}
+fn get_text(input: *Reader, limit: usize) []const u8 {
+  length := get_number(input)
+  if length > limit || length > #len(input.bytes) - input.at {
+    input.ok = false
+    return ""
+  }
+  result := input.bytes[input.at..input.at + length]
+  input.at += length
+  if !utf8.valid(result) {
+    input.ok = false
+  }
+  for byte in result {
+    if byte == 0 {
+      input.ok = false
+    }
+  }
+  return result
+}
+pub fn encode(state: *const State, output: []u8) usize {
+  writer := Writer{bytes: output}
+  text(&writer, "DNA session 2")
+  text(&writer, state.project)
+  number(&writer, state.active)
+  number(&writer, state.focused)
+  for index in 0..16 {
+    item := &state.buffers[index]
+    if item.used && item.reload {
+      // Flag 2: the path and position only.
+      number(&writer, 2)
+      text(&writer, item.path)
+      text(&writer, item.filetype)
+      number(&writer, item.cursor)
+      number(&writer, item.anchor)
+      continue
+    }
+    number(&writer, flag(item.used))
+    if item.used {
+      text(&writer, item.path)
+      text(&writer, item.text)
+      text(&writer, item.saved)
+      text(&writer, item.filetype)
+      number(&writer, item.cursor)
+      number(&writer, item.anchor)
+      selections(&writer, &item.secondary)
+    }
+  }
+  for index in 0..15 {
+    pane := &state.panes[index]
+    number(&writer, flag(pane.used))
+    if pane.used {
+      number(&writer, flag(pane.branch))
+      number(&writer, flag(pane.vertical))
+      number(&writer, pane.parent)
+      number(&writer, pane.first)
+      number(&writer, pane.second)
+      number(&writer, pane.slot)
+      number(&writer, pane.cursor)
+      number(&writer, pane.anchor)
+      number(&writer, pane.percent)
+      number(&writer, pane.scroll_x)
+      number(&writer, pane.scroll_y)
+      selections(&writer, &pane.secondary)
+    }
+  }
+  if !writer.ok {
+    return 0
+  }
+  return writer.at
+}
+fn tree(state: *const State, index: usize, parent: usize, seen: *u32) bool {
+  if index >= 15 || (seen.* & (#cast(u32) 1 << #cast(u32) index)) != 0 {
+    return false
+  }
+  seen.* = seen.* | (#cast(u32) 1 << #cast(u32) index)
+  pane := &state.panes[index]
+  if !pane.used || pane.parent != parent || pane.percent < 10 || pane.percent > 90 {
+    return false
+  }
+  if pane.branch {
+    return tree(state, pane.first, index, seen) && tree(state, pane.second, index, seen)
+  }
+  if pane.slot >= 16 || !state.buffers[pane.slot].used {
+    return false
+  }
+  item := &state.buffers[pane.slot]
+  // Reloaded text is unknown here; positions are clamped after the reload.
+  if item.reload {
+    return pane.scroll_x <= 100000000 && pane.scroll_y <= 100000000
+  }
+  for selected in 0..pane.secondary.count {
+    selection := pane.secondary.ranges[selected]
+    if selection.cursor > #len(item.text) || selection.anchor > #len(item.text) {
+      return false
+    }
+  }
+  return pane.cursor <= #len(item.text) && pane.anchor <= #len(item.text) && pane.scroll_x <= 100000000 && pane.scroll_y <= 100000000
+}
+pub fn decode(source: []const u8, state: *State) bool {
+  mem.zero((#cast(*u8) state)[..#sizeof(State)])
+  reader := Reader{bytes: source}
+  version := get_text(&reader, 32)
+  newer := buffer.equal(version, "DNA session 2")
+  if !newer && !buffer.equal(version, "DNA session 1") {
+    return false
+  }
+  state.project = get_text(&reader, 4095)
+  state.active = get_number(&reader)
+  state.focused = get_number(&reader)
+  for index in 0..16 {
+    item := &state.buffers[index]
+    used := get_number(&reader)
+    if used > 2 || (used == 2 && !newer) {
+      return false
+    }
+    if used == 2 {
+      item.used = true
+      item.reload = true
+      item.path = get_text(&reader, 3999)
+      item.filetype = get_text(&reader, 64)
+      item.cursor = get_number(&reader)
+      item.anchor = get_number(&reader)
+      if #len(item.path) == 0 || item.path[0] != '/' {
+        return false
+      }
+      for byte in item.path {
+        if byte == 10 || byte == 13 {
+          return false
+        }
+      }
+      continue
+    }
+    item.used = used == 1
+    if item.used {
+      item.path = get_text(&reader, 3999)
+      item.text = get_text(&reader, buffer.Capacity)
+      item.saved = get_text(&reader, buffer.Capacity)
+      item.filetype = get_text(&reader, 64)
+      item.cursor = get_number(&reader)
+      item.anchor = get_number(&reader)
+      if newer && !get_selections(&reader, &item.secondary, #len(item.text)) {
+        return false
+      }
+      if item.cursor > #len(item.text) || item.anchor > #len(item.text) {
+        return false
+      }
+      if #len(item.path) > 0 && item.path[0] != '/' {
+        return false
+      }
+      for byte in item.path {
+        if byte == 10 || byte == 13 {
+          return false
+        }
+      }
+      for previous in 0..index {
+        if #len(item.path) > 0 && state.buffers[previous].used && buffer.equal(state.buffers[previous].path, item.path) {
+          return false
+        }
+      }
+    }
+  }
+  for index in 0..15 {
+    pane := &state.panes[index]
+    present := get_number(&reader)
+    if present > 1 {
+      return false
+    }
+    pane.used = present == 1
+    if pane.used {
+      branch := get_number(&reader)
+      vertical := get_number(&reader)
+      if branch > 1 || vertical > 1 {
+        return false
+      }
+      pane.branch = branch == 1
+      pane.vertical = vertical == 1
+      pane.parent = get_number(&reader)
+      pane.first = get_number(&reader)
+      pane.second = get_number(&reader)
+      pane.slot = get_number(&reader)
+      pane.cursor = get_number(&reader)
+      pane.anchor = get_number(&reader)
+      pane.percent = get_number(&reader)
+      pane.scroll_x = get_number(&reader)
+      pane.scroll_y = get_number(&reader)
+      if newer && !get_selections(&reader, &pane.secondary, buffer.Capacity) {
+        return false
+      }
+    }
+  }
+  if !reader.ok || reader.at != #len(source) || state.active >= 16 || state.focused >= 15 || !state.buffers[state.active].used || !state.panes[state.focused].used || state.panes[state.focused].branch || state.panes[state.focused].slot != state.active {
+    return false
+  }
+  seen: u32 = 0
+  if !tree(state, 0, 0, &seen) {
+    return false
+  }
+  for index in 0..15 {
+    if state.panes[index].used && (seen & (#cast(u32) 1 << #cast(u32) index)) == 0 {
+      return false
+    }
+  }
+  return #len(state.project) > 0 && state.project[0] == '/'
+}
+
+pub fn encoded_size(state: *const State) usize {
+  size: usize = 8 + 13 + 8 + #len(state.project) + 16 + 16 * 8 + 15 * 8
+  for index in 0..16 {
+    item := &state.buffers[index]
+    if item.used && item.reload {
+      size += 32 + #len(item.path) + #len(item.filetype)
+    }
+    else if item.used {
+      size += 56 + item.secondary.count * 16 + #len(item.path) + #len(item.text) + #len(item.saved) + #len(item.filetype)
+    }
+  }
+  for index in 0..15 {
+    if state.panes[index].used {
+      size += 96 + state.panes[index].secondary.count * 16
+    }
+  }
+  return size
+}
+fn selections(out: *Writer, set: *const buffer.SelectionSet) {
+  if set.count > 31 {
+    out.ok = false
+    return
+  }
+  number(out, set.count)
+  for index in 0..set.count {
+    number(out, set.ranges[index].cursor)
+    number(out, set.ranges[index].anchor)
+  }
+}
+fn get_selections(input: *Reader, set: *buffer.SelectionSet, limit: usize) bool {
+  set.count = get_number(input)
+  if set.count > 31 {
+    return false
+  }
+  index: usize = 0
+  for index < set.count {
+    cursor := get_number(input)
+    anchor := get_number(input)
+    if cursor > limit || anchor > limit {
+      return false
+    }
+    set.ranges[index] = buffer.Selection{cursor: cursor, anchor: anchor}
+    index += 1
+  }
+  return input.ok
+}

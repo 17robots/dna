@@ -1,0 +1,432 @@
+// One worker owns traversal/regex state
+// Generation changes cancel stale work.
+#link("pcre2-8")
+
+struct SearchRow { path: [4096]u8, text: [256]u8, start, end, line, column: usize }
+struct SearchWorker {
+  thread, lock, wake: rawptr,
+  generation: native_atomic.AtomicU64,
+  stop: native_atomic.AtomicU32,
+  root, query: [4096]u8,
+  rows: [1024]SearchRow,
+  count: usize,
+  status: i32,
+}
+struct SearchScan {
+  owner: *SearchWorker,
+  generation: u64,
+  visited: usize,
+  code, data, context: rawptr,
+  deadline: NativeTimespec,
+  partial: bool,
+}
+fn search_alloc(size: usize, kind: i32) *u8 {
+  return #cast(*u8) dna_memory_alloc(size, #cast(u32) kind)
+}
+fn search_calloc(count: usize, size: usize, kind: i32) rawptr {
+  return dna_memory_calloc(count, size, #cast(u32) kind)
+}
+fn search_free(value: rawptr) {
+  dna_memory_free(value)
+}
+extern fn search_dirfd "dirfd"(directory: rawptr) i32
+extern fn search_compare "strcmp"(a: *const u8, b: *const u8) i32
+extern fn search_compile "pcre2_compile_8"(pattern: *const u8, length: usize, options: u32, error: *i32, offset: *usize, context: rawptr) rawptr
+extern fn search_data "pcre2_match_data_create_from_pattern_8"(code: rawptr, context: rawptr) rawptr
+extern fn search_context "pcre2_match_context_create_8"(context: rawptr) rawptr
+extern fn search_match_limit "pcre2_set_match_limit_8"(context: rawptr, limit: u32) i32
+extern fn search_depth_limit "pcre2_set_depth_limit_8"(context: rawptr, limit: u32) i32
+extern fn search_heap_limit "pcre2_set_heap_limit_8"(context: rawptr, limit: u32) i32
+extern fn search_set_callout "pcre2_set_callout_8"(context: rawptr, callback: *fn(rawptr, rawptr) i32, data: rawptr) i32
+extern fn search_match "pcre2_match_8"(code: rawptr, bytes: *const u8, length: usize, offset: usize, options: u32, data: rawptr, context: rawptr) i32
+extern fn search_range "pcre2_get_ovector_pointer_8"(data: rawptr) *usize
+extern fn search_context_free "pcre2_match_context_free_8"(context: rawptr)
+extern fn search_data_free "pcre2_match_data_free_8"(data: rawptr)
+extern fn search_code_free "pcre2_code_free_8"(code: rawptr)
+
+fn search_cancelled(scan: *SearchScan) bool {
+  now := NativeTimespec{}
+  _ = sync_clock(1, &now)
+  if now.seconds > scan.deadline.seconds || (now.seconds == scan.deadline.seconds && now.nanoseconds >= scan.deadline.nanoseconds) {
+    scan.partial = true
+    return true
+  }
+  return native_atomic.load_u32(&scan.owner.stop) != 0 || native_atomic.load_u64(&scan.owner.generation) != scan.generation
+}
+fn search_callout(block: rawptr, data: rawptr) i32 {
+  if search_cancelled(#cast(*SearchScan) data) {
+    return -37
+  }
+  return 0
+}
+fn search_copy_text(output: []u8, input: *const u8) {
+  length := string_length(input)
+  if length >= #len(output) {
+    length = #len(output) - 1
+  }
+  _ = copy(&output[0], input, length)
+  output[length] = 0
+}
+fn search_file(scan: *SearchScan, parent: i32, leaf: *const u8, path: *const u8) {
+  fd := install_openat(parent, leaf, 655360 | 2048, 0)
+  if fd < 0 {
+    scan.partial = true
+return
+  }
+  stat := InstallStat{}
+  if install_fstat(fd, &stat) != 0 || (stat.mode & 61440) != 32768 || stat.size > 268435455 {
+    _ = rec_close(fd)
+    scan.partial = true
+    return
+  }
+  room := #cast(usize) stat.size + 1
+  bytes := search_alloc(room, 1)
+  if bytes == nil {
+    scan.partial = true
+_ = rec_close(fd)
+return
+  }
+  defer search_free(#cast(rawptr) bytes)
+  length: usize = 0
+  for length < room {
+    count := proc_read_raw(fd, &bytes[..room][length], room - length)
+    if count < 0 {
+      scan.partial = true
+_ = rec_close(fd)
+return
+    }
+    if count == 0 {
+      break
+    }
+    length += #cast(usize) count
+  }
+  _ = rec_close(fd)
+  if length > 268435455 || length == room {
+    scan.partial = true
+return
+  }
+  for i in 0..length {
+    if bytes[..room][i] == 0 {
+      return
+    }
+  }
+  at: usize = 0
+  previous: usize = 0
+  line: usize = 1
+  line_start: usize = 0
+  for at <= length && !search_cancelled(scan) {
+    result := search_match(scan.code, bytes, length, at, 0, scan.data, scan.context)
+    if result == -1 {
+      break
+    }
+    if result < 0 {
+      scan.partial = true
+break
+    }
+    range := search_range(scan.data)[..2]
+    for previous < range[0] {
+      if bytes[..room][previous] == 10 {
+        line += 1
+line_start = previous + 1
+      }
+      previous += 1
+    }
+    row := SearchRow{start: range[0], end: range[1], line: line, column: range[0] - line_start + 1}
+    search_copy_text(row.path[..], path)
+    end := line_start
+    for end < length && bytes[..room][end] != 10 && end - line_start < 255 {
+      end += 1
+    }
+    for end < length && end > line_start && (bytes[..room][end] & 192) == 128 {
+      end -= 1
+    }
+    _ = copy(&row.text[0], &bytes[..room][line_start], end - line_start)
+    for i in 0..end - line_start {
+      if row.text[i] < 32 {
+        row.text[i] = 32
+      }
+    }
+    rec_lock(scan.owner.lock)
+    full := scan.owner.count == 1024
+    if native_atomic.load_u64(&scan.owner.generation) == scan.generation && !full {
+      scan.owner.rows[scan.owner.count] = row
+      scan.owner.count += 1
+    }
+    rec_unlock(scan.owner.lock)
+    if full {
+      scan.partial = true
+break
+    }
+    at = range[1]
+    if range[0] == range[1] {
+      if at == length {
+        break
+      }
+      at += 1
+      for at < length && (bytes[..room][at] & 192) == 128 {
+        at += 1
+      }
+    }
+  }
+}
+fn search_valid_name(name: *const u8) bool {
+  length := string_length(name)
+  i: usize = 0
+  for i < length {
+    first := name[..length][i]
+    i += 1
+    if first < 32 || first == 127 {
+      return false
+    }
+    if first < 128 {
+      continue
+    }
+    count: usize = 0
+    value: u32 = 0
+    if first >= 194 && first <= 223 {
+      count = 1
+value = #cast(u32) (first & 31)
+    }
+    else if first >= 224 && first <= 239 {
+      count = 2
+value = #cast(u32) (first & 15)
+    }
+    else if first >= 240 && first <= 244 {
+      count = 3
+value = #cast(u32) (first & 7)
+    }
+    else {
+      return false
+    }
+    if length - i < count {
+      return false
+    }
+    for n in 0..count {
+      byte := name[..length][i]
+      i += 1
+      if (byte & 192) != 128 {
+        return false
+      }
+      value = (value << 6) | #cast(u32) (byte & 63)
+    }
+    if (count == 2 && value < 2048) || (count == 3 && value < 65536) || value > 1114111 || (value >= 55296 && value <= 57343) {
+      return false
+    }
+  }
+  return true
+}
+fn search_walk(scan: *SearchScan, fd: i32, prefix: *const u8, depth: usize) {
+  skip_build: []const u8 = "build\0"
+  skip_target: []const u8 = "target\0"
+  skip_modules: []const u8 = "node_modules\0"
+  directory := install_fdopendir(fd)
+  if directory == nil {
+    _ = rec_close(fd)
+scan.partial = true
+return
+  }
+  defer {
+    _ = install_closedir(directory)
+  }
+  for !search_cancelled(scan) {
+    entry := install_readdir(directory)
+    if entry == nil {
+      break
+    }
+    scan.visited += 1
+    if scan.visited > 20000 {
+      scan.partial = true
+break
+    }
+    name := &entry.name[0]
+    if !search_valid_name(name) {
+      scan.partial = true
+continue
+    }
+    if name.* == 46 || search_compare(name, &skip_build[0]) == 0 || search_compare(name, &skip_target[0]) == 0 || search_compare(name, &skip_modules[0]) == 0 {
+      continue
+    }
+    path: [4096]u8 = []
+    length := string_length(prefix)
+    name_length := string_length(name)
+    separator: usize = 0
+    if length > 0 {
+      separator = 1
+    }
+    if length + separator + name_length >= 4096 {
+      scan.partial = true
+continue
+    }
+    _ = copy(&path[0], prefix, length)
+    if separator > 0 {
+      path[length] = 47
+    }
+    _ = copy(&path[length + separator], name, name_length + 1)
+    stat := InstallStat{}
+    parent := search_dirfd(directory)
+    if install_fstatat(parent, name, &stat, 256) != 0 {
+      scan.partial = true
+continue
+    }
+    if (stat.mode & 61440) == 16384 {
+      if depth == 16 {
+        scan.partial = true
+continue
+      }
+      child := install_openat(parent, name, 720896, 0)
+      if child >= 0 {
+        search_walk(scan, child, &path[0], depth + 1)
+      }
+      else {
+        scan.partial = true
+      }
+    } else if (stat.mode & 61440) == 32768 {
+      search_file(scan, parent, name, &path[0])
+    }
+    rec_lock(scan.owner.lock)
+    full := scan.owner.count == 1024
+    rec_unlock(scan.owner.lock)
+    if full || scan.visited > 20000 {
+      scan.partial = true
+break
+    }
+  }
+}
+fn search_worker(opaque: rawptr) i32 {
+  search := #cast(*SearchWorker) opaque
+  completed: u64 = 0
+  for native_atomic.load_u32(&search.stop) == 0 {
+    rec_lock(search.lock)
+    for native_atomic.load_u32(&search.stop) == 0 && completed == native_atomic.load_u64(&search.generation) {
+      rec_wait(search.wake, search.lock)
+    }
+    if native_atomic.load_u32(&search.stop) != 0 {
+      rec_unlock(search.lock)
+break
+    }
+    completed = native_atomic.load_u64(&search.generation)
+    root := search.root
+    query := search.query
+    rec_unlock(search.lock)
+    scan := SearchScan{owner: search, generation: completed}
+    error: i32 = 0
+    offset: usize = 0
+    _ = sync_clock(1, &scan.deadline)
+    scan.deadline.seconds += 5
+    scan.code = search_compile(&query[0], #cast(usize) -1, 1704964, &error, &offset, nil)
+    status: i32 = 0
+    if query[0] != 0 && scan.code == nil {
+      status = 2
+    }
+    if query[0] != 0 && scan.code != nil {
+      scan.data = search_data(scan.code, nil)
+      scan.context = search_context(nil)
+      if scan.data != nil && scan.context != nil {
+        _ = search_match_limit(scan.context, 10000)
+        _ = search_depth_limit(scan.context, 128)
+        _ = search_heap_limit(scan.context, 4096)
+        _ = search_set_callout(scan.context, &search_callout, #cast(rawptr) &scan)
+        empty: []const u8 = "\0"
+        fd := rec_open(&root[0], 589824, 0)
+        if fd >= 0 {
+          search_walk(&scan, fd, &empty[0], 0)
+        }
+        else {
+          scan.partial = true
+        }
+      } else {
+        scan.partial = true
+      }
+      if scan.partial {
+        status = 3
+      }
+    }
+    search_context_free(scan.context)
+    search_data_free(scan.data)
+    search_code_free(scan.code)
+    rec_lock(search.lock)
+    if completed == native_atomic.load_u64(&search.generation) {
+      search.status = status
+    }
+    rec_unlock(search.lock)
+    rec_notify()
+  }
+  return 0
+}
+fn search_release(search: *SearchWorker) {
+  if search.wake != nil {
+    rec_condition_free(search.wake)
+  }
+  if search.lock != nil {
+    rec_mutex_free(search.lock)
+  }
+  search_free(#cast(rawptr) search)
+}
+pub fn dna_search_open() *SearchWorker {
+  search := #cast(*SearchWorker) search_calloc(1, #sizeof(SearchWorker), 1)
+  if search == nil {
+    return nil
+  }
+  search.lock = rec_mutex()
+  search.wake = rec_condition()
+  if search.lock == nil || search.wake == nil {
+    search_release(search)
+return nil
+  }
+  search.thread = rec_thread(&search_worker, #cast(rawptr) search)
+  if search.thread == nil {
+    search_release(search)
+return nil
+  }
+  return search
+}
+pub fn dna_search_submit(search: *SearchWorker, root: *const u8, query: *const u8) {
+  if search == nil {
+    return
+  }
+  rec_lock(search.lock)
+  search_copy_text(search.root[..], root)
+  search_copy_text(search.query[..], query)
+  search.count = 0
+  search.status = 1
+  _ = native_atomic.fetch_add_u64(&search.generation, 1)
+  rec_signal(search.wake)
+  rec_unlock(search.lock)
+}
+pub fn dna_search_count(search: *SearchWorker, status: *i32) usize {
+  if search == nil {
+    status.* = 0
+return 0
+  }
+  rec_lock(search.lock)
+  count := search.count
+  status.* = search.status
+  rec_unlock(search.lock)
+  return count
+}
+pub fn dna_search_row(search: *SearchWorker, index: usize, row: *SearchRow) i32 {
+  if search == nil {
+    return 0
+  }
+  rec_lock(search.lock)
+  ok := index < search.count
+  if ok {
+    row.* = search.rows[index]
+  }
+  rec_unlock(search.lock)
+  if ok {
+    return 1
+  }
+  return 0
+}
+pub fn dna_search_close(search: *SearchWorker) {
+  if search == nil {
+    return
+  }
+  rec_lock(search.lock)
+  native_atomic.store_u32(&search.stop, 1)
+  rec_signal(search.wake)
+  rec_unlock(search.lock)
+  rec_join(search.thread, nil)
+  search_release(search)
+}

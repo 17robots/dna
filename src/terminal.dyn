@@ -1,0 +1,592 @@
+#link("dna_native")
+
+struct TerminalUiState {
+  task_error_offset: usize,
+  commands: bool,
+  slot: usize,
+  quit_confirmed: bool,
+  closing_all: bool,
+}
+
+extern fn terminal_open "dna_terminal_open"(cwd: *const u8, shell: *const u8, command: *const u8) rawptr
+extern fn terminal_poll "dna_terminal_poll"(terminal: rawptr) i32
+extern fn terminal_alive "dna_terminal_alive"(terminal: rawptr) i32
+extern fn terminal_needs_poll "dna_terminal_needs_poll"(terminal: rawptr) i32
+extern fn terminal_close "dna_terminal_close"(terminal: rawptr)
+extern fn terminal_text "dna_terminal_text"(terminal: rawptr, text: *const u8, length: usize)
+extern fn terminal_key "dna_terminal_key"(terminal: rawptr, key: u32, modifiers: u16)
+extern fn terminal_scroll "dna_terminal_scroll"(terminal: rawptr, amount: i32)
+extern fn terminal_copy "dna_terminal_copy"(terminal: rawptr, text: *u8, capacity: usize) usize
+extern fn terminal_cells "dna_terminal_cells"(terminal: rawptr, cells: *u32, capacity: i32, width: f32, height: f32, cell: f32, line: f32, focused: i32, cursor_column: *i32, cursor_row: *i32) i32
+// Cell triples for the terminal frontend, up to 512 x 256 cells.
+terminal_cell_storage: [393216]u32 = []
+extern fn terminal_draw "dna_terminal_draw"(terminal: rawptr, renderer: rawptr, font: rawptr, x: f32, y: f32, width: f32, height: f32, cell: f32, line: f32, focused: i32)
+extern fn terminal_mouse "dna_terminal_mouse"(terminal: rawptr, x: f32, y: f32, dragging: i32)
+extern fn terminal_paste "dna_terminal_paste"(terminal: rawptr, text: *const u8, length: usize)
+extern fn terminal_snapshot "dna_terminal_snapshot"(terminal: rawptr, text: *u8, capacity: usize) usize
+extern fn terminal_invalidate_font "dna_terminal_invalidate_font"(terminal: rawptr)
+extern fn terminal_theme "dna_terminal_theme"(terminal: rawptr, foreground: u32, background: u32, selection: u32, cursor: u32)
+extern fn terminal_application_mouse "dna_terminal_application_mouse"(terminal: rawptr, x: f32, y: f32, event: i32, modifiers: u32) i32
+extern fn terminal_review "dna_terminal_review"(terminal: rawptr, text: *u8, capacity: usize) usize
+extern fn terminal_review_end "dna_terminal_review_end"(terminal: rawptr)
+extern fn terminal_review_head "dna_terminal_review_head"(terminal: rawptr) usize
+extern fn terminal_review_select "dna_terminal_review_select"(terminal: rawptr, low: usize, high: usize, head: usize)
+extern fn terminal_cursor "dna_terminal_cursor"(terminal: rawptr, column: *i32, row: *i32)
+extern fn terminal_cursor_rect "dna_terminal_cursor_rect"(terminal: rawptr, x: f32, y: f32, width: f32, height: f32)
+extern fn terminal_review_point "dna_terminal_review_point"(terminal: rawptr, x: f32, y: f32) usize
+extern fn terminal_resize "dna_terminal_resize"(terminal: rawptr, width: f32, height: f32, cell: f32, line: f32) i32
+
+fn terminal_target(app: *App) rawptr {
+  if app.prompt_state.panel == Panel.Terminal {
+    return app.documents.slots[app.terminal_state.slot].terminal.handle
+  }
+  if app.prompt_state.panel == Panel.None {
+    return app.documents.slots[app.documents.active].terminal.handle
+  }
+  return nil
+}
+fn release_terminals(app: *App) {
+  for index in 0..16 {
+    slot := &app.documents.slots[index]
+    if slot.terminal.handle != nil {
+      terminal_close(slot.terminal.handle)
+      slot.terminal.handle = nil
+    }
+  }
+}
+fn terminal_tick(app: *App) bool {
+  changed: bool = false
+  for index in 0..16 {
+    slot := &app.documents.slots[index]
+    if slot.terminal.handle != nil {
+      if terminal_poll(slot.terminal.handle) != 0 && !slot.terminal.review && slot_visible(app, index) {
+        changed = true
+      }
+      if terminal_alive(slot.terminal.handle) == 0 && slot.terminal.keep_output && slot.terminal.input {
+        slot.terminal.input = false
+        if slot_visible(app, index) || app.prompt_state.panel == Panel.Buffers {
+          changed = true
+        }
+      }
+      if terminal_alive(slot.terminal.handle) == 0 && !slot.terminal.keep_output {
+        if app.prompt_state.panel == Panel.Terminal && app.terminal_state.slot == index {
+          slot.terminal.input = false
+          app.prompt_state.panel = Panel.None
+        }
+        picker_finished := app.picker_state.closing && app.picker_state.close_target == index
+        close_finished := app.prompt_state.panel == Panel.TerminalClose && !app.terminal_state.closing_all && app.documents.active == index
+        close_slot(app, index)
+        if picker_finished {
+          finish_picker_close(app)
+        } else if close_finished {
+          cancel_buffer_close(app)
+        }
+        changed = true
+      }
+    }
+  }
+  return changed
+}
+fn terminals_running(app: *App) bool {
+  for index in 0..16 {
+    if app.documents.slots[index].terminal.handle != nil && terminal_alive(app.documents.slots[index].terminal.handle) != 0 {
+      return true
+    }
+  }
+  return false
+}
+fn terminals_waiting_for_exit(app: *App) bool {
+  for index in 0..16 {
+    handle := app.documents.slots[index].terminal.handle
+    if handle != nil && terminal_needs_poll(handle) != 0 {
+      return true
+    }
+  }
+  return false
+}
+fn terminal_popup(app: *App, fresh: bool, command: []const u8) {
+  terminal_escape_flush(app)
+
+  if !fresh && app.documents.slots[app.terminal_state.slot].terminal.handle != nil {
+    app.prompt_state.panel = Panel.Terminal
+    return
+  }
+
+  previous := app.documents.active
+  if !new_buffer(app) {
+    return
+  }
+  shell: [4096]u8 = []
+  shell_length: usize = 0
+  if app.config.shell_length > 0 {
+    shell_length = copy_text(shell[..], app.config.shell[..app.config.shell_length])
+  } else {
+    configured := process.environment("SHELL", shell[..4095])
+    if configured.ok && configured.found {
+      shell_length = #len(configured.value)
+      shell[shell_length] = 0
+    }
+  }
+  if shell_length == 0 {
+    shell_length = copy_text(shell[..], "/bin/sh")
+  }
+  command_storage: [4096]u8 = []
+  _ = copy_text(command_storage[..], command)
+  created := terminal_open(&app.workspace.project[0], &shell[0], &command_storage[0])
+
+  if created == nil {
+    close_clean(app)
+    activate(app, previous)
+    notice(app, "Cannot create terminal process.")
+    return
+  }
+  app.terminal_state.slot = app.documents.active
+  app.documents.slots[app.documents.active].terminal.handle = created
+  app.documents.slots[app.documents.active].terminal.keep_output = #len(command) > 0
+  app.documents.slots[app.documents.active].terminal.directory_length = copy_text(app.documents.slots[app.documents.active].terminal.directory[..], app.workspace.project[..app.workspace.project_length])
+  app.terminal_state.task_error_offset = 0
+  activate(app, previous)
+  app.prompt_state.panel = Panel.Terminal
+  terminal_mode(app).input = true
+  app.terminal_state.quit_confirmed = false
+}
+fn terminal_place(app: *App, vertical: bool) {
+  pane_init(app)
+  for index in 0..15 {
+    if app.view.panes[index].used && !app.view.panes[index].branch && app.view.panes[index].slot == app.terminal_state.slot {
+      pane_focus(app, index)
+      return
+    }
+  }
+  previous := app.view.focused
+  pane_split(app, vertical)
+  if app.view.focused == previous {
+    return
+  }
+
+  if !vertical {
+    parent := app.view.panes[app.view.focused].parent
+    app.view.panes[parent].split_fraction = 1.0 - app.config.terminal_height
+    pane_layout(app, parent, app.view.panes[parent].rect)
+  }
+  activate(app, app.terminal_state.slot)
+}
+fn terminal_show(app: *App, fresh: bool, command: []const u8) {
+  terminal_escape_flush(app)
+  if #len(command) > 0 {
+    terminal_popup(app, fresh, command)
+    return
+  }
+  if !fresh && app.documents.slots[app.terminal_state.slot].terminal.handle != nil {
+    terminal_place(app, false)
+    return
+  }
+  pane_init(app)
+  free: usize = 0
+
+  for index in 0..15 {
+    if !app.view.panes[index].used {
+      free += 1
+    }
+  }
+  if free < 2 {
+    notice(app, "Window limit reached (8). Close a window before opening a terminal.")
+    return
+  }
+
+  terminal_popup(app, true, "")
+
+  if app.prompt_state.panel == Panel.Terminal {
+    terminal_place(app, false)
+  }
+}
+fn terminal_promote(app: *App) {
+  if app.documents.slots[app.terminal_state.slot].terminal.handle == nil {
+    terminal_popup(app, true, "")
+  }
+  if app.documents.slots[app.terminal_state.slot].terminal.handle == nil {
+    return
+  }
+
+  terminal_place(app, true)
+}
+fn terminal_input_key(app: *App, key: u32, modifiers: u16) bool {
+  target := terminal_target(app)
+  if target == nil {
+    return false
+  }
+
+  if terminal_mode(app).input && key == KeyEscape && (modifiers & ModShiftCtrlAlt) == 0 {
+    now := sdl.ticks()
+    if terminal_mode(app).escape_pending && terminal_mode(app).escape_target == target && now - terminal_mode(app).escape_time <= 500 {
+      terminal_mode(app).escape_pending = false
+      terminal_mode(app).input = false
+      terminal_capture(app, target)
+      return true
+    }
+    // Hold the first Escape: sent to the program now, a quick second Escape
+    // would leave a stray ESC that shells read as Alt on the next key.
+    terminal_escape_flush(app)
+    terminal_mode(app).escape_pending = true
+    terminal_mode(app).escape_time = now
+    terminal_mode(app).escape_target = target
+    return true
+  }
+  terminal_escape_flush(app)
+  if key == app.config.terminal_escape && (modifiers & app.config.terminal_modifiers) != 0 {
+    terminal_mode(app).input = false
+    terminal_capture(app, target)
+    return true
+  }
+  if terminal_mode(app).input {
+    if (modifiers & ModCtrl) != 0 && (modifiers & ModShift) != 0 && key == KeyC {
+      // The screen or selection: four bytes per cell, each row newline, and NUL.
+      mark := mem.arena_mark(app.scratch)
+      defer mem.arena_rewind(app.scratch, mark)
+      capacity: usize = 100 * (240 * 4 + 1) + 1
+      text := #cast(*u8) mem.arena_push_uninit(app.scratch, capacity, 1)
+      _ = terminal_copy(target, text, capacity)
+      _ = sdl.clipboard_set(text)
+      return true
+    }
+    if (modifiers & ModCtrl) != 0 && (modifiers & ModShift) != 0 && key == KeyV {
+      clipboard := sdl.clipboard_get()
+      if clipboard != nil {
+        length := c.string_length(clipboard, 32768)
+        if length < 32768 {
+          terminal_paste(target, clipboard, length)
+        }
+        sdl.free(#cast(rawptr) clipboard)
+      }
+      return true
+    }
+    if (modifiers & ModShift) != 0 && key == KeyPageUp {
+      terminal_scroll(target, 12)
+      return true
+    }
+    if (modifiers & ModShift) != 0 && key == KeyPageDown {
+      terminal_scroll(target, -12)
+      return true
+    }
+    terminal_key(target, key, modifiers)
+    return true
+  }
+  if key == KeyW && (modifiers & ModCtrl) != 0 {
+    panel(app, Panel.Windows)
+    return true
+  }
+  if key == KeyI {
+    terminal_review_end(target)
+    review_slot := terminal_review_slot(app, target)
+    if review_slot != nil {
+      review_slot.terminal.review = false
+    }
+    terminal_scroll(target, -2000)
+    terminal_mode(app).input = terminal_alive(target) != 0
+    return true
+  }
+
+  if key == KeyPageUp || key == KeyPageDown || ((modifiers & ModCtrl) != 0 && (key == KeyB || key == KeyF || key == KeyU || key == KeyD)) {
+    page_slot := terminal_review_slot(app, target)
+    if !page_slot.terminal.review {
+      terminal_capture(app, target)
+    }
+    down := key == KeyPageDown || key == KeyF || key == KeyD
+    count: usize = 20
+    if key == KeyU || key == KeyD {
+      count = 10
+    }
+    for moved in 0..count {
+      buffer.select_vertical(page_slot.document, down, page_slot.terminal.extend)
+    }
+    return true
+  }
+  if terminal_mode(app).goto_pending {
+    terminal_mode(app).goto_pending = false
+    if key == KeyG || key == KeyE {
+      jump_slot := terminal_review_slot(app, target)
+      if !jump_slot.terminal.review {
+        terminal_capture(app, target)
+      }
+      goto_motion(jump_slot.document, key, 0, jump_slot.terminal.extend)
+      return true
+    }
+    if key == KeyH || key == KeyL || key == KeyS {
+      goto_slot := terminal_review_slot(app, target)
+      if goto_slot != nil {
+        goto_motion(goto_slot.document, key, 0, goto_slot.terminal.extend)
+      }
+      return true
+    }
+  }
+  if key == KeyG {
+    terminal_mode(app).goto_pending = true
+    return true
+  }
+  if app.prompt_state.panel == Panel.Terminal && key == KeyEscape {
+    app.prompt_state.panel = Panel.None
+    return true
+  }
+  if (modifiers & ModCtrlAlt) == 0 && terminal_review_motion(app, target, key, modifiers) {
+    return true
+  }
+  if app.prompt_state.panel == Panel.Terminal && (key == KeyEscape || key == KeyQ) {
+    app.prompt_state.panel = Panel.None
+    return true
+  }
+  if key == KeyColon || (key == KeySemicolon && (modifiers & ModShift) != 0) {
+    app.terminal_state.commands = app.prompt_state.panel == Panel.Terminal
+    panel(app, Panel.Commands)
+    return true
+  }
+  if key == KeySpace {
+    panel(app, Panel.Leader)
+    return true
+  }
+  return true
+}
+fn draw_terminal(renderer: rawptr, app: *App, typography: *Typography, width: i32, height: i32, popup: bool, focused: bool) {
+  target := app.documents.slots[app.documents.active].terminal.handle
+  x: f32 = 8.0
+  y: f32 = 8.0
+  w := #cast(f32) width - 16.0
+  h := #cast(f32) height - 16.0
+
+  if popup {
+    target = app.documents.slots[app.terminal_state.slot].terminal.handle
+    placed := place_rect(app, SurfaceTerminal, width, height, 0.0, typography.scale, sdl.Rect{x: #cast(f32) width * 0.05, y: #cast(f32) height * 0.08, width: #cast(f32) width * 0.9, height: #cast(f32) height * 0.84})
+    x = placed.x
+    y = placed.y
+    w = placed.width
+    h = placed.height
+    ui_box(renderer, sdl.Rect{x: x, y: y, width: w, height: h}, typography.scale)
+    x += 8.0
+    y += 8.0
+    w -= 16.0
+    h -= 16.0
+  }
+
+  if target == nil {
+    return
+  }
+
+  slot := terminal_review_slot(app, target)
+  owner := terminal_size_owner(app, typography, target, popup, focused)
+
+  if owner && terminal_resize(target, w, h - typography.line, typography.cell, typography.line) != 0 {
+    slot.terminal.cursor_x.ready = false
+    slot.terminal.cursor_y.ready = false
+  }
+  if slot.terminal.input && slot.terminal.review {
+    terminal_review_end(target)
+    slot.terminal.review = false
+  }
+  if !slot.terminal.input && !slot.terminal.review {
+    terminal_capture(app, target)
+  }
+  if slot.terminal.review {
+    terminal_review_select(target, buffer.start(slot.document), buffer.end(slot.document), buffer.head(slot.document))
+  }
+
+  column: i32 = 0
+  row: i32 = 0
+  terminal_cursor(target, &column, &row)
+  terminal_snap := app.view.animation.reset || !app.config.smooth_cursor || cursor_step_snaps(&slot.terminal.cursor_x, &slot.terminal.cursor_y, #cast(f32) column * typography.cell, #cast(f32) row * typography.line, typography.cell, typography.line)
+  cursor_x := animated_follow(app, &slot.terminal.cursor_x, #cast(f32) column * typography.cell, app.config.cursor_animation_ms, terminal_snap)
+  cursor_y := animated_follow(app, &slot.terminal.cursor_y, #cast(f32) row * typography.line, app.config.cursor_animation_ms, terminal_snap)
+  cursor_width := typography.cell
+
+  if slot.terminal.input {
+    cursor_width = app.config.cursor_thickness * typography.scale
+  }
+
+  terminal_cursor_rect(target, cursor_x, cursor_y, cursor_width, typography.points * typography.scale + 5.0 * typography.scale)
+
+  focus: i32 = 0
+  if focused {
+    focus = 1
+  }
+  if !owner {
+    focus = focus | 2
+  }
+
+  colors := theme()
+  terminal_theme(target, rgb_value(colors.text), rgb_value(colors.background), rgb_value(colors.selection), rgb_value(colors.cursor))
+  if sdl.tui_active() {
+    // The terminal frontend copies cells; there is no renderer to draw with.
+    cursor_column: i32 = -1
+    cursor_row: i32 = -1
+    shape := terminal_cells(target, &terminal_cell_storage[0], #cast(i32) #len(terminal_cell_storage), w, h - typography.line, typography.cell, typography.line, focus, &cursor_column, &cursor_row)
+    if shape != 0 {
+      sdl.tui_cells(&terminal_cell_storage[0], shape & 65535, shape >> 16, x, y, cursor_column, cursor_row)
+    }
+  }
+  else {
+    terminal_draw(target, renderer, typography.font, x, y, w, h - typography.line, typography.cell, typography.line, focus)
+  }
+  label: []const u8 = "TERMINAL NORMAL  hjkl move / v select / y copy / i input / PageUp scroll"
+
+  if slot.terminal.input {
+    label = "TERMINAL INPUT  Esc Esc normal / Ctrl+\\ normal / Shift+PageUp scrollback"
+  }
+  if terminal_alive(target) == 0 {
+    label = "COMMAND FINISHED  hjkl move / v select / y copy / PageUp scroll / :bd close"
+  }
+  if !ttf.set(typography.chrome, &label[0], #len(label)) || !tint(typography.chrome, theme().muted) || !ttf.draw(typography.chrome, x, y + h - typography.line) {
+    #panic("terminal footer")
+  }
+}
+fn terminal_fonts_changed(app: *App) {
+  for index in 0..16 {
+    if app.documents.slots[index].terminal.handle != nil {
+      terminal_invalidate_font(app.documents.slots[index].terminal.handle)
+    }
+  }
+}
+fn terminal_review_slot(app: *App, target: rawptr) *Slot {
+  for index in 0..16 {
+    if app.documents.slots[index].terminal.handle == target {
+      return &app.documents.slots[index]
+    }
+  }
+  return nil
+}
+fn terminal_capture(app: *App, target: rawptr) {
+  slot := terminal_review_slot(app, target)
+  if slot == nil {
+    return
+  }
+
+  bytes: [262144]u8 = []
+  length := terminal_review(target, &bytes[0], 262144)
+
+  if length == 0 {
+    notice(app, "Terminal screen exceeds review capacity.")
+    return
+  }
+
+  _ = buffer.load(slot.document, bytes[..length])
+  buffer.move_to(slot.document, terminal_review_head(target), false)
+  buffer.select_current(slot.document)
+  slot.terminal.review = true
+  slot.terminal.extend = false
+  slot.terminal.cursor_x.ready = false
+  slot.terminal.cursor_y.ready = false
+}
+fn terminal_review_motion(app: *App, target: rawptr, key: u32, modifiers: u16) bool {
+  slot := terminal_review_slot(app, target)
+  if slot == nil {
+    return false
+  }
+  if !slot.terminal.review {
+    terminal_capture(app, target)
+  }
+
+  if key == KeyEscape {
+    slot.terminal.extend = false
+    buffer.select_current(slot.document)
+    return true
+  }
+  if key == KeyY {
+    bytes: [262144]u8 = []
+    length := copy_text(bytes[..], slot.document.bytes[buffer.start(slot.document)..buffer.end(slot.document)])
+
+    if length > 0 {
+      _ = sdl.clipboard_set(&bytes[0])
+    }
+
+    return true
+  }
+  // Reuse editor motions, but never dispatch commands that mutate output.
+  allowed := key == KeyH || key == KeyJ || key == KeyK || key == KeyL || key == KeyW || key == KeyB || key == KeyE || key == KeyV || key == KeyX || key == Key0 || key == KeyDollar || key == KeySemicolon || key == KeyPercent || (key >= KeyHome && key <= KeyUp)
+  if !allowed || (key == KeyJ && (modifiers & ModShift) != 0) {
+    return false
+  }
+
+  saved_doc := app.documents.current
+  saved_insert := app.view.insert
+  saved_extend := app.view.extend
+  app.documents.current = slot.document
+  app.view.insert = false
+  app.view.extend = slot.terminal.extend
+  edit_key(app, key, modifiers)
+  slot.terminal.extend = app.view.extend
+  app.documents.current = saved_doc
+  app.view.insert = saved_insert
+  app.view.extend = saved_extend
+  return true
+}
+// A held Escape (see terminal_input_key) goes to its terminal before any
+// other input, or alone once the double-Escape window has passed.
+fn terminal_escape_send(app: *App, state: *TerminalState) {
+  if !state.escape_pending {
+    return
+  }
+  state.escape_pending = false
+  for index in 0..16 {
+    if app.documents.slots[index].document != nil && app.documents.slots[index].terminal.handle == state.escape_target && state.escape_target != nil {
+      terminal_key(state.escape_target, KeyEscape, 0)
+      return
+    }
+  }
+}
+fn terminal_escape_flush(app: *App) {
+  terminal_escape_send(app, terminal_mode(app))
+}
+fn terminal_escape_tick(app: *App) bool {
+  now := sdl.ticks()
+  sent := false
+  for index in 0..16 {
+    state := &app.documents.slots[index].terminal
+    if state.escape_pending && now - state.escape_time > 500 {
+      terminal_escape_send(app, state)
+      sent = true
+    }
+  }
+  return sent
+}
+fn terminal_escape_due(app: *const App) u64 {
+  due: u64 = 0
+  for index in 0..16 {
+    state := &app.documents.slots[index].terminal
+    if state.escape_pending && (due == 0 || state.escape_time + 501 < due) {
+      due = state.escape_time + 501
+    }
+  }
+  return due
+}
+fn terminal_mode(app: *App) *TerminalState {
+  if app.prompt_state.panel == Panel.Terminal {
+    return &app.documents.slots[app.terminal_state.slot].terminal
+  }
+  return &app.documents.slots[app.documents.active].terminal
+}
+// One terminal can be visible in several panes and the popup at once. Only one
+// view sets its size: the popup, else the focused pane, else the first pane.
+// Letting every view resize makes them fight and redraw forever.
+fn terminal_size_owner(app: *App, typography: *const Typography, target: rawptr, popup: bool, focused: bool) bool {
+  if popup {
+    return true
+  }
+  if app.prompt_state.panel == Panel.Terminal && app.documents.slots[app.terminal_state.slot].terminal.handle == target {
+    return false
+  }
+  if focused {
+    return true
+  }
+  focused_pane := &app.view.panes[app.view.focused]
+  if focused_pane.used && !focused_pane.branch && app.documents.slots[focused_pane.slot].terminal.handle == target {
+    return false
+  }
+  for index in 0..15 {
+    pane := &app.view.panes[index]
+    if pane.used && !pane.branch && app.documents.slots[pane.slot].terminal.handle == target {
+      return index == typography.current_pane
+    }
+  }
+  return true
+}
+// True while a terminal receives every key (its input mode).
+fn terminal_typing(app: *App) bool {
+  return terminal_target(app) != nil && terminal_mode(app).input
+}

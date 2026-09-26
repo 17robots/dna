@@ -1,0 +1,87 @@
+use "std/testing"
+#link("dna_native")
+#link("dl")
+#link("c")
+extern fn syntax_open "dna_syntax_open_named"(root: *const u8, name: *const u8) rawptr
+extern fn syntax_update "dna_syntax_update"(state: rawptr, text: *const u8, length: u32, revision: u64)
+extern fn snapshot "dna_memory_snapshot"(category: u32, totals: *u64)
+extern fn mutex_create "dna_mutex_create"() rawptr
+extern fn mutex_destroy "dna_mutex_destroy"(lock: rawptr)
+extern fn lock "dna_mutex_lock"(lock: rawptr)
+extern fn unlock "dna_mutex_unlock"(lock: rawptr)
+extern fn condition_create "dna_condition_create"() rawptr
+extern fn condition_destroy "dna_condition_destroy"(wake: rawptr)
+extern fn wait "dna_condition_wait"(wake: rawptr, lock: rawptr)
+extern fn signal "dna_condition_signal"(wake: rawptr)
+extern fn symbol "dlsym"(handle: rawptr, name: *const u8) rawptr
+extern fn setenv "setenv"(name, value: *const u8, overwrite: i32) i32
+extern fn flush "fflush"(stream: rawptr) i32
+extern fn puts "puts"(text: *const u8) i32
+mutex: rawptr = nil
+wake: rawptr = nil
+entered: bool = false
+released: bool = false
+// Shared-library interposition keeps disposal blocked independently of parser size.
+pub fn dna_syntax_close(state: rawptr) {
+  lock(mutex)
+  entered = true
+  signal(wake)
+  for !released {
+    wait(wake, mutex)
+  }
+  unlock(mutex)
+  name: []const u8 = "dna_syntax_close\0"
+  close_real := #cast(*fn(rawptr)) symbol(#cast(rawptr) (#cast(usize) -1), &name[0])
+  testing.expect(close_real != nil, "real syntax close")
+  close_real(state)
+}
+pub fn dna_test_syntax_retire(root: *const u8) {
+  variable: []const u8 = "DNA_RENDER_TRACE\0"
+  value: []const u8 = "syntax-retire-test\0"
+  _ = setenv(&variable[0], &value[0], 1)
+  mutex = mutex_create()
+  wake = condition_create()
+  testing.expect(mutex != nil && wake != nil, "test synchronization")
+  defer mutex_destroy(mutex)
+  defer condition_destroy(wake)
+  close_name: []const u8 = "dna_syntax_close\0"
+  testing.expect(symbol(nil, &close_name[0]) == #cast(rawptr) &dna_syntax_close, "retirement callback is exported for interposition")
+  retire_name: []const u8 = "dna_syntax_retire\0"
+  collect_name: []const u8 = "dna_syntax_collect\0"
+  retire := #cast(*fn(rawptr) i32) symbol(nil, &retire_name[0])
+  collect := #cast(*fn(i32)) symbol(nil, &collect_name[0])
+  testing.expect(retire != nil && collect != nil, "nonblocking bounded syntax disposal available")
+  json: []const u8 = "json\0"
+  a := syntax_open(root, &json[0])
+  b := syntax_open(root, &json[0])
+  testing.expect(a != nil && b != nil, "open syntax workers")
+  first: []const u8 = "[1,2]"
+  second: []const u8 = "[3,4]"
+  syntax_update(a, &first[0], 5, 1)
+  testing.expect(retire(a) != 0, "first retirement accepted")
+  lock(mutex)
+  for !entered {
+    wait(wake, mutex)
+  }
+  unlock(mutex)
+  collect(0)
+  testing.expect(retire(b) == 0, "queue saturation retains caller ownership")
+  syntax_update(b, &second[0], 5, 2)
+  lock(mutex)
+  released = true
+  signal(wake)
+  unlock(mutex)
+  collect(1)
+  testing.expect(retire(b) != 0, "second retirement accepted after collection")
+  collect(1)
+  collect(1)
+  categories: [2]u32 = [0, 4]
+  for category in categories {
+    totals: [7]u64 = []
+    snapshot(category, &totals[0])
+    testing.expect(totals[0] == totals[1] && totals[2] == 0 && totals[6] == 0, "syntax allocations balanced")
+  }
+  message: []const u8 = "PASS syntax retirement: nonblocking, bounded, ownership, shutdown balance\0"
+  _ = puts(&message[0])
+  _ = flush(nil)
+}

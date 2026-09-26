@@ -1,290 +1,957 @@
-enum FileAction { Create, Rename, Trash }
-struct FileEdit { kind: FileAction, original: usize, name: [512]u8, length: usize }
-struct Explorer {
-  arena: mem.Arena, document: *buffer.Document, insert: bool, extend: bool,
-  path: [4096]u8, path_length: usize, root_inode: u64, root_device: u64,
-  scroll_x: f32, scroll_y: f32, commands: bool, stale: bool, quit_after_discard: bool,
-  edits: [256]FileEdit, edit_count: usize, plan_revision: u64, preview_row: usize,
+struct DirectoryState {
+  path: [4096]u8,
+  length: usize,
+  entries: [256]Entry,
+  count: usize,
+  selected: usize,
 }
-fn explorer_dirty(app: *const App) bool { return app.explorer.document != nil && buffer.dirty(app.explorer.document) }
+
+enum FileAction { Create, CreateDirectory, Rename, Trash }
+
+struct FileEdit { kind: FileAction, name: [512]u8, original, length: usize }
+struct Explorer {
+  arena: mem.Arena,
+  path: [4096]u8,
+  context: ExplorerContext,
+  document: *buffer.Document,
+  insert: bool,
+  extend: bool,
+  commands: bool,
+  stale: bool,
+  quit_after_discard: bool,
+  scroll_x: f32,
+  scroll_y: f32,
+  edits: [256]FileEdit,
+  root_inode: u64,
+  plan_revision: u64,
+  root_device: u64,
+  path_length: usize,
+  edit_count: usize,
+  preview_row: usize,
+}
+
+fn explorer_dirty(app: *const App) bool {
+  return app.explorer.document != nil && buffer.dirty_cached(app.explorer.document)
+}
+// Space e: the tree when that explorer style is chosen, else this one.
 fn explorer_open(app: *App) {
+  if app.config.explorer_style == 1 {
+    tree_toggle(app)
+    return
+  }
+  explorer_buffer_open(app)
+}
+fn explorer_buffer_open(app: *App) {
   if explorer_dirty(app) {
-    app.directory_length = copy_text(app.directory[..], app.explorer.path[..app.explorer.path_length])
-    app.panel = Panel.Directory return
+    app.directory_state.length = copy_text(app.directory_state.path[..], app.explorer.path[..app.explorer.path_length])
+    app.prompt_state.panel = Panel.Directory
+    return
   }
-  if app.explorer.document != nil && buffer.equal(app.directory[..app.directory_length], app.explorer.path[..app.explorer.path_length]) && !app.explorer.stale {
-    app.panel = Panel.Directory return
+  if app.explorer.document != nil && buffer.equal(app.directory_state.path[..app.directory_state.length], app.explorer.path[..app.explorer.path_length]) && !app.explorer.stale {
+    app.prompt_state.panel = Panel.Directory
+    return
   }
-  app.panel = Panel.Directory directory_refresh(app)
+  app.prompt_state.panel = Panel.Directory
+  directory_refresh(app)
 }
 fn explorer_load(app: *App) {
   if app.explorer.document == nil {
-    allocated := mem.arena_create(#sizeof(buffer.Document))
-    if !allocated.ok { notice(app, "Cannot allocate explorer buffer.") return }
+    allocated := buffer.reserve(#sizeof(buffer.Document))
+    if !allocated.ok {
+      notice(app, "Cannot allocate explorer buffer.")
+      return
+    }
     app.explorer.arena = allocated.arena
-    app.explorer.document = #cast(*buffer.Document) mem.arena_push(&app.explorer.arena, #sizeof(buffer.Document), #alignof(buffer.Document))
+    app.explorer.document = buffer.allocate(&app.explorer.arena)
     _ = buffer.load(app.explorer.document, "")
   }
-  listing: [65536]u8 = [] used: usize = 0 index: usize = 0 selected_cursor: usize = 0
-  for index < app.entry_count {
-    entry := &app.entries[index]
-    storage: [4096]u8 = [] path := joined(app, entry.name[..entry.length], storage[..]) info := files.metadata(path)
-    entry.inode = info.inode entry.device = info.device entry.mode = info.mode
-    if info.ok { entry.directory = (info.mode & 61440) == 16384 }
-    if used + entry.length + 16 >= 65536 { app.explorer.stale = true notice(app, "Directory listing exceeds the editable buffer capacity.") return }
-    add_text(listing[..], &used, "[") add_number(listing[..], &used, index + 1) add_text(listing[..], &used, "] ")
-    if index == app.entry_selected { selected_cursor = used }
+  listing: [65536]u8 = []
+  used: usize = 0
+  index: usize = 0
+  selected_cursor: usize = 0
+  for index < app.directory_state.count {
+    entry := &app.directory_state.entries[index]
+    if !valid_leaf(entry.name[..entry.length]) {
+      app.explorer.stale = true
+      notice(app, "Directory contains a filename that cannot be edited safely.")
+      return
+    }
+    storage: [4096]u8 = []
+    path := joined(app, entry.name[..entry.length], storage[..])
+    info := files.metadata(path)
+    entry.inode = info.inode
+    entry.device = info.device
+    entry.mode = info.mode
+    if info.ok {
+      entry.directory = (info.mode & 61440) == 16384
+    }
+    if used + entry.length + 16 >= 65536 {
+      app.explorer.stale = true
+      notice(app, "Directory listing exceeds the editable buffer capacity.")
+      return
+    }
+    if index == app.directory_state.selected {
+      selected_cursor = used
+    }
     add_text(listing[..], &used, entry.name[..entry.length])
-    if entry.directory { add_text(listing[..], &used, "/") }
+    if entry.directory {
+      add_text(listing[..], &used, "/")
+    }
     add_text(listing[..], &used, "\n")
     index += 1
   }
-  root := files.metadata(app.directory[..app.directory_length])
-  app.explorer.root_inode = root.inode app.explorer.root_device = root.device
+  root := files.metadata(app.directory_state.path[..app.directory_state.length])
+  app.explorer.root_inode = root.inode
+  app.explorer.root_device = root.device
   _ = buffer.load(app.explorer.document, listing[..used])
+  buffer.track_rows(app.explorer.document, app.directory_state.count)
   buffer.move_to(app.explorer.document, selected_cursor, false)
-  app.explorer.path_length = copy_text(app.explorer.path[..], app.directory[..app.directory_length])
-  app.explorer.scroll_x = 0.0 app.explorer.scroll_y = 0.0 app.explorer.insert = false app.explorer.extend = false
-  app.explorer.stale = false app.explorer.edit_count = 0
-}
-struct DirectoryLine { id: usize, name: []const u8, ok: bool }
-fn directory_line(line: []const u8) DirectoryLine {
-  if #len(line) == 0 { return DirectoryLine{ok: true} }
-  if line[0] != '[' { return DirectoryLine{name: line, ok: true} }
-  index: usize = 1 id: usize = 0
-  for index < #len(line) && line[index] >= '0' && line[index] <= '9' {
-    id = id * 10 + #cast(usize) (line[index] - '0') if id > 256 { return DirectoryLine{} } index += 1
-  }
-  if index == 1 || id == 0 || index + 2 >= #len(line) || line[index] != ']' || line[index + 1] != ' ' { return DirectoryLine{} }
-  return DirectoryLine{id: id, name: line[index + 2..], ok: true}
+  app.explorer.path_length = copy_text(app.explorer.path[..], app.directory_state.path[..app.directory_state.length])
+  app.explorer.scroll_x = 0.0
+  app.explorer.scroll_y = 0.0
+  app.explorer.insert = false
+  app.explorer.extend = false
+  app.explorer.stale = false
+  app.explorer.edit_count = 0
+  explorer_context_reset(app)
 }
 fn explorer_selected(app: *App) {
-  doc := app.explorer.document if doc == nil { return }
-  row := directory_line(doc.bytes[buffer.line_start(doc, doc.cursor)..buffer.line_end(doc, doc.cursor)])
-  if row.ok && row.id > 0 && row.id <= app.entry_count { app.entry_selected = row.id - 1 }
-  else { app.entry_selected = app.entry_count }
+  doc := app.explorer.document
+  if doc == nil {
+    return
+  }
+  id := buffer.row_id(doc, doc.cursor)
+  if id > 0 && id <= app.directory_state.count {
+    app.directory_state.selected = id - 1
+  }
+  else {
+    app.directory_state.selected = app.directory_state.count
+  }
 }
 fn explorer_add_edit(app: *App, kind: FileAction, original: usize, name: []const u8) bool {
-  if app.explorer.edit_count == 256 { return false }
+  if app.explorer.edit_count == 256 {
+    return false
+  }
   edit := &app.explorer.edits[app.explorer.edit_count]
-  edit.kind = kind edit.original = original edit.length = copy_text(edit.name[..], name)
-  app.explorer.edit_count += 1 return true
+  edit.kind = kind
+  edit.original = original
+  edit.length = copy_text(edit.name[..], name)
+  app.explorer.edit_count += 1
+  return true
 }
 fn explorer_plan(app: *App) []const u8 {
-  state := &app.explorer doc := state.document
+  state := &app.explorer
+  doc := state.document
   state.edit_count = 0
-  if doc == nil { return "Open the explorer first." }
-  if state.stale { return "Explorer listing is stale. Discard the draft and refresh before applying more changes." }
+  if doc == nil {
+    return "Open the explorer first."
+  }
+  if state.stale {
+    return "Explorer listing is stale. Discard the draft and refresh before applying more changes."
+  }
   // Slices borrow the stable draft only during this function; plans own names.
-  names: [256][]const u8 = [] seen: [256]bool = [] count: usize = 0 at: usize = 0
+  names: [256][]const u8 = []
+  seen: [256]bool = []
+  count: usize = 0
+  at: usize = 0
   for at < doc.length {
-    end := buffer.line_end(doc, at) row := directory_line(doc.bytes[at..end]) at = end + 1
-    if !row.ok { return "Keep each existing [id] unchanged. New files use a filename without an id." }
-    if #len(row.name) == 0 { continue }
-    if count == 256 { return "Explorer supports at most 256 rows." }
-    name := row.name is_directory: bool = false
-    if row.id > 0 {
-      if row.id > app.entry_count || seen[row.id - 1] { return "Unknown or duplicate row id. Undo the id edit." }
-      seen[row.id - 1] = true original := &app.entries[row.id - 1]
+    end := buffer.line_end(doc, at)
+    id := buffer.row_id(doc, at)
+    name := doc.bytes[at..end]
+    at = end + 1
+    if id == 257 {
+      return "Two existing rows were joined. Undo the join before applying changes."
+    }
+    if #len(name) == 0 {
+      continue
+    }
+    if count == 256 {
+      return "Explorer supports at most 256 rows."
+    }
+    is_directory: bool = false
+    if id > 0 {
+      if id > app.directory_state.count || seen[id - 1] {
+        return "Ambiguous row identity. Undo the edit before applying changes."
+      }
+      seen[id - 1] = true
+      original := &app.directory_state.entries[id - 1]
       is_directory = original.directory
       if is_directory {
-        if name[#len(name) - 1] != '/' { return "Keep directory rows unchanged, including their trailing slash." }
+        if name[#len(name) - 1] != '/' {
+          return "Keep directory rows unchanged, including their trailing slash."
+        }
         name = name[..#len(name) - 1]
-        if !buffer.equal(name, original.name[..original.length]) { return "Directory renames are not supported yet; keep that row unchanged." }
+        if !buffer.equal(name, original.name[..original.length]) {
+          return "Directory renames are not supported yet; keep that row unchanged."
+        }
       }
-      if !valid_leaf(name) { return "Each row must contain one filename without slashes or control characters." }
+      if !valid_leaf(name) {
+        return "Each row must contain one filename without slashes or control characters."
+      }
       if !is_directory && !buffer.equal(name, original.name[..original.length]) {
-        if !explorer_add_edit(app, FileAction.Rename, row.id, name) { return "Too many filesystem operations." }
+        if !explorer_add_edit(app, FileAction.Rename, id, name) {
+          return "Too many filesystem operations."
+        }
       }
     } else {
-      if !valid_leaf(name) || name[0] == '[' { return "New rows need a filename without slashes or a leading [id]." }
-      if !explorer_add_edit(app, FileAction.Create, 0, name) { return "Too many filesystem operations." }
+      creation := FileAction.Create
+      if name[#len(name) - 1] == '/' {
+        creation = FileAction.CreateDirectory
+        name = name[..#len(name) - 1]
+      }
+      if !valid_leaf(name) {
+        return "New rows need one filename, or folder name ending in /; nested paths and control characters are not allowed."
+      }
+      if !explorer_add_edit(app, creation, 0, name) {
+        return "Too many filesystem operations."
+      }
     }
-    duplicate: usize = 0 for duplicate < count { if buffer.equal(names[duplicate], name) { return "Two rows name the same destination. Nothing has been applied." } duplicate += 1 }
-    names[count] = name count += 1
+    for duplicate in 0..count {
+      if buffer.equal(names[duplicate], name) {
+        return "Two rows name the same destination. Nothing has been applied."
+      }
+    }
+    names[count] = name
+    count += 1
   }
-  missing: usize = 0 for missing < app.entry_count {
+  missing: usize = 0
+  for missing < app.directory_state.count {
     if !seen[missing] {
-      original_entry := &app.entries[missing]
-      if original_entry.directory { return "Directory removal is not supported yet; restore the directory row." }
-      if !explorer_add_edit(app, FileAction.Trash, missing + 1, original_entry.name[..original_entry.length]) { return "Too many filesystem operations." }
+      original_entry := &app.directory_state.entries[missing]
+      if buffer.equal(original_entry.name[..original_entry.length], ".dna-trash") {
+        return "The trash directory cannot be moved into itself; restore its row."
+      }
+      trash_name: [512]u8 = []
+      trash_length := trash_leaf(app, original_entry.name[..original_entry.length], trash_name[..])
+      if trash_length == 0 {
+        return "Cannot choose a free name inside .dna-trash."
+      }
+      if !explorer_add_edit(app, FileAction.Trash, missing + 1, trash_name[..trash_length]) {
+        return "Too many filesystem operations."
+      }
     }
     missing += 1
   }
-  state.plan_revision = doc.revision return ""
+  state.plan_revision = doc.revision
+  return ""
 }
 fn edit_paths(app: *App, edit: *const FileEdit, source: []u8, destination: []u8) bool {
   if edit.original > 0 {
-    entry := &app.entries[edit.original - 1]
-    if #len(joined(app, entry.name[..entry.length], source)) == 0 { return false }
+    entry := &app.directory_state.entries[edit.original - 1]
+    if #len(joined(app, entry.name[..entry.length], source)) == 0 {
+      return false
+    }
   }
   if edit.kind == FileAction.Trash {
-    leaf: [1024]u8 = [] used: usize = 0 add_text(leaf[..], &used, ".dna-trash/") add_text(leaf[..], &used, edit.name[..edit.length])
+    leaf: [1024]u8 = []
+    used: usize = 0
+    add_text(leaf[..], &used, ".dna-trash/")
+    add_text(leaf[..], &used, edit.name[..edit.length])
     return #len(joined(app, leaf[..used], destination)) > 0
   }
   return #len(joined(app, edit.name[..edit.length], destination)) > 0
 }
+fn explorer_affected(path: []const u8, source: []const u8, directory: bool) bool {
+  if buffer.equal(path, source) {
+    return true
+  }
+  return directory && #len(path) > #len(source) && path[#len(source)] == '/' && buffer.equal(path[..#len(source)], source)
+}
 fn explorer_validate(app: *App) []const u8 {
   state := &app.explorer
-  if state.document == nil || state.document.revision != state.plan_revision { return "Draft changed after preview. Run :write again." }
-  root := files.metadata(app.directory[..app.directory_length])
-  if !root.ok || root.inode != state.root_inode || root.device != state.root_device { return "Directory changed externally; refresh before applying." }
-  trash_storage: [4096]u8 = [] trash_path := joined(app, ".dna-trash", trash_storage[..]) trash := files.metadata(trash_path)
-  index: usize = 0 for index < state.edit_count {
-    edit := &state.edits[index] source: [4096]u8 = [] destination: [4096]u8 = []
-    if !edit_paths(app, edit, source[..], destination[..]) { return "A filesystem path is too long." }
-    source_length := c.string_length(&source[0], 4096) destination_length := c.string_length(&destination[0], 4096)
+  if state.document == nil || state.document.revision != state.plan_revision {
+    return "Draft changed after preview. Run :write again."
+  }
+  root := files.metadata(app.directory_state.path[..app.directory_state.length])
+  if !root.ok || root.inode != state.root_inode || root.device != state.root_device {
+    return "Directory changed externally; refresh before applying."
+  }
+  trash_storage: [4096]u8 = []
+  trash_path := joined(app, ".dna-trash", trash_storage[..])
+  trash := files.metadata(trash_path)
+  index: usize = 0
+  for index < state.edit_count {
+    edit := &state.edits[index]
+    source: [4096]u8 = []
+    destination: [4096]u8 = []
+    if !edit_paths(app, edit, source[..], destination[..]) {
+      return "A filesystem path is too long."
+    }
+    source_length := c.string_length(&source[0], 4096)
+    destination_length := c.string_length(&destination[0], 4096)
     if edit.original > 0 {
-      original := &app.entries[edit.original - 1] info := files.metadata(source[..source_length])
-      if !info.ok || info.inode != original.inode || info.device != original.device || info.mode != original.mode { return "A source entry changed externally. Nothing further will be applied." }
-      slot_index: usize = 0 for slot_index < 16 {
-        slot := &app.slots[slot_index]
-        if slot.document != nil && buffer.equal(files.name(&slot.file), source[..source_length]) && buffer.dirty(slot.document) { return "An affected file has unsaved edits in an open buffer. Save it first." }
-        slot_index += 1
+      original := &app.directory_state.entries[edit.original - 1]
+      info := files.metadata(source[..source_length])
+      if !info.ok || info.inode != original.inode || info.device != original.device || info.mode != original.mode {
+        return "A source entry changed externally. Nothing further will be applied."
+      }
+      for slot_index in 0..16 {
+        slot := &app.documents.slots[slot_index]
+        if slot.document != nil && explorer_affected(files.name(&slot.file), source[..source_length], original.directory) {
+          if buffer.dirty_cached(slot.document) {
+            return "An affected file has unsaved edits in an open buffer. Save it first."
+          }
+          if destination_length + slot.file.length - source_length >= 4000 {
+            return "An affected open file path would be too long."
+          }
+        }
       }
     }
-    if edit.kind == FileAction.Trash && trash.ok && (trash.mode & 61440) != 16384 { return ".dna-trash must be a real directory, not a symlink or file." }
-    if files.metadata(destination[..destination_length]).ok { return "A destination already exists. Renames cannot overwrite files or swap names in one batch." }
+    if edit.kind == FileAction.Trash && trash.ok && (trash.mode & 61440) != 16384 {
+      return ".dna-trash must be a real directory, not a symlink or file."
+    }
+    if files.metadata(destination[..destination_length]).ok {
+      return "A destination already exists. Renames cannot overwrite files or swap names in one batch."
+    }
     index += 1
   }
   return ""
 }
 fn explorer_preview(app: *App) {
   app.explorer.commands = false
-  if app.explorer.document == nil { notice(app, "Open the explorer first.") return }
-  app.directory_length = copy_text(app.directory[..], app.explorer.path[..app.explorer.path_length])
+  if app.explorer.document == nil {
+    notice(app, "Open the explorer first.")
+    return
+  }
+  app.directory_state.length = copy_text(app.directory_state.path[..], app.explorer.path[..app.explorer.path_length])
   buffer.checkpoint(app.explorer.document)
-  error := explorer_plan(app) if #len(error) == 0 { error = explorer_validate(app) }
-  if #len(error) > 0 { notice(app, error) return }
-  if app.explorer.edit_count == 0 { app.panel = Panel.Directory return }
-  app.explorer.preview_row = 0 app.panel = Panel.DirectoryApply
+  error := explorer_plan(app)
+  if #len(error) == 0 {
+    error = explorer_validate(app)
+  }
+  if #len(error) > 0 {
+    notice(app, error)
+    return
+  }
+  if app.explorer.edit_count == 0 {
+    app.prompt_state.panel = Panel.Directory
+    return
+  }
+  app.explorer.preview_row = 0
+  app.prompt_state.panel = Panel.DirectoryApply
 }
 fn explorer_plan_text(app: *App, output: []u8) usize {
-  used: usize = 0 add_text(output, &used, "Apply ") add_number(output, &used, app.explorer.edit_count) add_text(output, &used, " filesystem changes?\n")
-  add_text(output, &used, app.explorer.path[..app.explorer.path_length]) add_text(output, &used, "\n\n")
-  at := app.explorer.preview_row for at < app.explorer.edit_count && at < app.explorer.preview_row + 7 {
+  used: usize = 0
+  add_text(output, &used, "Apply ")
+  add_number(output, &used, app.explorer.edit_count)
+  add_text(output, &used, " filesystem changes?\n")
+  add_text(output, &used, app.explorer.path[..app.explorer.path_length])
+  add_text(output, &used, "\n\n")
+  at := app.explorer.preview_row
+  for at < app.explorer.edit_count && at < app.explorer.preview_row + 7 {
     edit := &app.explorer.edits[at]
-    if edit.kind == FileAction.Create { add_text(output, &used, "+ create  ") }
-    else if edit.kind == FileAction.Trash { add_text(output, &used, "- trash   ") }
-    else { entry := &app.entries[edit.original - 1] add_text(output, &used, "~ rename  ") add_text(output, &used, entry.name[..entry.length]) add_text(output, &used, " -> ") }
-    add_text(output, &used, edit.name[..edit.length]) add_text(output, &used, "\n") at += 1
+    if edit.kind == FileAction.Create {
+      add_text(output, &used, "+ create  ")
+    }
+    else if edit.kind == FileAction.CreateDirectory {
+      add_text(output, &used, "+ folder  ")
+    }
+    else if edit.kind == FileAction.Trash {
+      add_text(output, &used, "- trash   ")
+      trashed := &app.directory_state.entries[edit.original - 1]
+      if !buffer.equal(trashed.name[..trashed.length], edit.name[..edit.length]) {
+        add_text(output, &used, trashed.name[..trashed.length])
+        add_text(output, &used, " as ")
+      }
+    }
+    else {
+      entry := &app.directory_state.entries[edit.original - 1]
+      add_text(output, &used, "~ rename  ")
+      add_text(output, &used, entry.name[..entry.length])
+      add_text(output, &used, " -> ")
+    }
+    add_text(output, &used, edit.name[..edit.length])
+    if edit.kind == FileAction.CreateDirectory || (edit.original > 0 && app.directory_state.entries[edit.original - 1].directory) {
+      add_text(output, &used, "/")
+    }
+    add_text(output, &used, "\n")
+    at += 1
   }
   add_text(output, &used, "\nArrows scroll / Enter applies / Escape keeps draft\nDeleted rows move to .dna-trash. Filesystem changes are not text undo.")
   return used
 }
 fn explorer_apply(app: *App) {
-  error := explorer_validate(app) if #len(error) > 0 { notice(app, error) return }
-  completed: usize = 0 failed: bool = false
+  error := explorer_validate(app)
+  if #len(error) > 0 {
+    notice(app, error)
+    return
+  }
+  completed: usize = 0
+  failed: bool = false
   for completed < app.explorer.edit_count {
-    edit := &app.explorer.edits[completed] source: [4096]u8 = [] destination: [4096]u8 = []
-    if !edit_paths(app, edit, source[..], destination[..]) { failed = true break }
-    source_length := c.string_length(&source[0], 4096) destination_length := c.string_length(&destination[0], 4096)
-    if edit.kind == FileAction.Create {
-      created := fs.create_exclusive(destination[..destination_length])
-      if !created.ok { failed = true break }
-      if !fs.close(&created.file).ok { completed += 1 failed = true break }
-    } else {
-      original := &app.entries[edit.original - 1] current := files.metadata(source[..source_length])
-      if !current.ok || current.inode != original.inode || current.device != original.device { failed = true break }
-      if edit.kind == FileAction.Trash {
-        trash_storage: [4096]u8 = [] trash_path := joined(app, ".dna-trash", trash_storage[..]) info := files.metadata(trash_path)
-        if !info.ok { if !fs.make_directory(trash_path, 448).ok { failed = true break } }
-        else if (info.mode & 61440) != 16384 { failed = true break }
+    edit := &app.explorer.edits[completed]
+    source: [4096]u8 = []
+    destination: [4096]u8 = []
+    if !edit_paths(app, edit, source[..], destination[..]) {
+      failed = true
+      break
+    }
+    source_length := c.string_length(&source[0], 4096)
+    destination_length := c.string_length(&destination[0], 4096)
+    if edit.kind == FileAction.CreateDirectory {
+      if !fs.make_directory(destination[..destination_length], 493).ok {
+        failed = true
+        break
       }
-      if #syscall(316, -100, &source[0], -100, &destination[0], 1) != 0 { failed = true break }
-      slot_index: usize = 0 for slot_index < 16 {
-        slot := &app.slots[slot_index]
-        if slot.document != nil && buffer.equal(files.name(&slot.file), source[..source_length]) {
-          files.discard_recovery(&slot.file) _ = files.set_name(&slot.file, destination[..destination_length])
+    } else if edit.kind == FileAction.Create {
+      created := fs.create_exclusive(destination[..destination_length])
+      if !created.ok {
+        failed = true
+        break
+      }
+      if !fs.close(&created.file).ok {
+        completed += 1
+        failed = true
+        break
+      }
+    } else {
+      original := &app.directory_state.entries[edit.original - 1]
+      current := files.metadata(source[..source_length])
+      if !current.ok || current.inode != original.inode || current.device != original.device {
+        failed = true
+        break
+      }
+      if edit.kind == FileAction.Trash {
+        trash_storage: [4096]u8 = []
+        trash_path := joined(app, ".dna-trash", trash_storage[..])
+        info := files.metadata(trash_path)
+        if !info.ok {
+          if !fs.make_directory(trash_path, 448).ok {
+            failed = true
+            break
+          }
         }
-        slot_index += 1
+        else if (info.mode & 61440) != 16384 {
+          failed = true
+          break
+        }
+      }
+      if #syscall(316, -100, &source[0], -100, &destination[0], 1) != 0 {
+        failed = true
+        break
+      }
+      for slot_index in 0..16 {
+        slot := &app.documents.slots[slot_index]
+        if slot.document != nil && explorer_affected(files.name(&slot.file), source[..source_length], original.directory) {
+          moved: [4096]u8 = []
+          moved_length: usize = 0
+          add_text(moved[..], &moved_length, destination[..destination_length])
+          add_text(moved[..], &moved_length, files.name(&slot.file)[source_length..])
+          files.discard_recovery(&slot.file)
+          _ = files.set_name(&slot.file, moved[..moved_length])
+        }
       }
     }
     completed += 1
   }
+  tree_invalidate(app)
   if failed {
     app.explorer.stale = true
-    message: [512]u8 = [] used: usize = 0 add_number(message[..], &used, completed) add_text(message[..], &used, " of ") add_number(message[..], &used, app.explorer.edit_count)
+    message: [512]u8 = []
+    used: usize = 0
+    add_number(message[..], &used, completed)
+    add_text(message[..], &used, " of ")
+    add_number(message[..], &used, app.explorer.edit_count)
     add_text(message[..], &used, " changes completed before a filesystem error. No rollback was attempted. The draft is kept for reference; discard and refresh before retrying.")
-    notice(app, message[..used]) return
-  }
-  buffer.mark_saved(app.explorer.document) app.panel = Panel.Directory directory_refresh(app)
-}
-fn explorer_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
-  doc := app.explorer.document if doc == nil { app.panel = Panel.None return }
-  shift := (modifiers & 3) != 0 control := (modifiers & 192) != 0
-  if key == 27 {
-    buffer.checkpoint(doc)
-    if app.explorer.insert || app.explorer.extend { app.explorer.insert = false app.explorer.extend = false doc.anchor = doc.cursor }
-    else { app.panel = Panel.None }
+    notice(app, message[..used])
     return
   }
-  if !app.explorer.insert && (key == 58 || (key == 59 && shift)) {
-    buffer.checkpoint(doc) panel(app, Panel.Commands) app.explorer.commands = true return
+  buffer.mark_saved(app.explorer.document)
+  app.prompt_state.panel = Panel.Directory
+  directory_refresh(app)
+}
+fn explorer_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
+  doc := app.explorer.document
+  if doc == nil {
+    app.prompt_state.panel = Panel.None
+    return
   }
-  if control && key == 115 { explorer_preview(app) return }
-  if !app.explorer.insert && key == 13 { submit(app, typography) return }
-  if !app.explorer.insert && key == 8 {
-    if explorer_dirty(app) { notice(app, "Apply or discard staged edits before changing directory.") return }
-    length := app.directory_length
-    for length > 1 && app.directory[length - 1] == '/' { length -= 1 }
-    for length > 1 && app.directory[length - 1] != '/' { length -= 1 }
-    app.directory_length = length app.directory[length] = 0 directory_refresh(app) return
+  shift := (modifiers & ModShift) != 0
+  control := (modifiers & ModCtrl) != 0
+  if key == KeyEscape {
+    app.input_state.pending = 0
+    app.input_state.repeat_count = 0
+    buffer.checkpoint(doc)
+    if app.explorer.insert || app.explorer.extend {
+      if app.explorer.insert {
+        buffer.leave_insert(doc)
+      }
+      app.explorer.insert = false
+      app.explorer.extend = false
+    }
+    else {
+      app.prompt_state.panel = Panel.None
+    }
+    return
+  }
+  if !app.explorer.insert && (modifiers & ModAlt) == 0 && (key == KeyColon || (key == KeySemicolon && shift)) {
+    buffer.checkpoint(doc)
+    panel(app, Panel.Commands)
+    app.explorer.commands = true
+    return
+  }
+  if !app.explorer.insert && !control && key == KeyM {
+    match_open(app, true)
+    return
+  }
+  if !app.explorer.insert && !control && key == KeySpace {
+    app.input_state.leader_explorer = true
+    panel(app, Panel.Leader)
+    return
+  }
+  if !app.explorer.insert && !control && !shift && key == KeyG {
+    app.input_state.goto_count = app.input_state.repeat_count
+    app.input_state.goto_explorer = true
+    panel(app, Panel.Goto)
+    return
+  }
+  if !app.explorer.insert && !control && shift && key == KeyK {
+    filter_kind := Panel.Keep
+    if (modifiers & ModAlt) != 0 {
+      filter_kind = Panel.Remove
+    }
+    search_open(app, filter_kind, true)
+    return
+  }
+  if !app.explorer.insert && !control && (key == KeyS || key == KeySlash || key == KeyQuestion) {
+    kind := Panel.Select
+    if key == KeyS && shift {
+      kind = Panel.Split
+    } else if key != KeyS {
+      kind = Panel.Search
+      app.input_state.search_backwards = shift || key == KeyQuestion
+    }
+    search_open(app, kind, true)
+    return
+  }
+  if !app.explorer.insert && !control && key == KeyN {
+    search_repeat(app, shift, true)
+    return
+  }
+  if control && key == KeyS {
+    explorer_preview(app)
+    return
+  }
+  if !app.explorer.insert && key == KeyReturn {
+    submit(app, typography)
+    return
+  }
+  if !app.explorer.insert && key == KeyBackspace {
+    explorer_parent(app)
+    return
   }
   // Borrow the same editing engine without changing the active file/view.
-  saved_doc := app.document saved_insert := app.insert saved_extend := app.extend
-  app.document = doc app.insert = app.explorer.insert app.extend = app.explorer.extend
+  saved_doc := app.documents.current
+  saved_insert := app.view.insert
+  saved_extend := app.view.extend
+  app.documents.current = doc
+  app.view.insert = app.explorer.insert
+  app.view.extend = app.explorer.extend
   if control {
-    if key == 122 { if shift { buffer.redo(doc) } else { buffer.undo(doc) } }
-    else if key == 121 { buffer.redo(doc) }
-    else if key == 97 { doc.anchor = 0 doc.cursor = doc.length }
-    else if key == 99 { clipboard_copy(app) }
-    else if key == 118 { clipboard_paste(app) }
-  } else { edit_key(app, key, modifiers) }
-  app.explorer.insert = app.insert app.explorer.extend = app.extend
-  app.document = saved_doc app.insert = saved_insert app.extend = saved_extend
+    if key == KeyZ {
+      if shift {
+        buffer.redo(doc)
+      } else {
+        buffer.undo(doc)
+      }
+    }
+    else if key == KeyY {
+      buffer.redo(doc)
+    }
+    else if key == KeyA {
+      doc.anchor = 0
+      doc.cursor = doc.length
+    }
+    else if key == KeyC {
+      _ = clipboard_copy(app)
+    }
+    else if key == KeyV {
+      clipboard_paste(app)
+    }
+  } else {
+    edit_key(app, key, modifiers)
+  }
+  app.explorer.insert = app.view.insert
+  app.explorer.extend = app.view.extend
+  app.documents.current = saved_doc
+  app.view.insert = saved_insert
+  app.view.extend = saved_extend
   explorer_selected(app)
 }
+// Side column of directory entries (parent or contents). Rows are clickable;
+// the selected entry keeps a highlight. Returns nothing: icons draw after
+// layout from the recorded rows.
+fn explorer_column(ui: *UiState, app: *App, typography: *Typography, name: []const u8, title: []const u8, entries: []Entry, selected: usize, width: f32, kind: usize) {
+  scale := typography.scale
+  column := ui_make(ui, ui_key(ui, name), UiBackground | UiBorder | UiClip)
+  ui.boxes[column].fill = theme().surface
+  ui.boxes[column].padding[0] = 10.0 * scale
+  ui.boxes[column].padding[1] = 10.0 * scale
+  ui_size(ui, column, UiAxisX, UiSizeKind.Pixels, width / scale, 1.0)
+  ui_size(ui, column, UiAxisY, UiSizeKind.Percent, 1.0, 1.0)
+  ui_push(ui, column)
+  heading := ui_label(ui, "title", title, UiMuted)
+  ui_size(ui, heading, UiAxisX, UiSizeKind.Percent, 1.0, 0.0)
+  previous := ui.boxes[column].rect.height
+  rows: usize = 8
+  if previous > typography.line * 3.0 {
+    rows = #cast(usize) ((previous - 20.0 * scale) / typography.line) - 1
+  }
+  first: usize = 0
+  if rows > 2 && selected < #len(entries) && selected >= rows - 2 {
+    first = selected - (rows - 2) / 2
+  }
+  index := first
+  for index < #len(entries) && index < first + rows {
+    entry := &entries[index]
+    flags := UiClickable | UiHover | UiText
+    if index != selected {
+      flags = flags | UiMuted
+    }
+    row := ui_make(ui, ui_hash(ui.boxes[column].key, entry.name[..entry.length]), flags)
+    ui_text_set(ui, row, entry.name[..entry.length])
+    ui.boxes[row].value = kind * 65536 + index
+    if app.config.explorer_icons {
+      ui.boxes[row].padding[0] = typography.cell * 2.0
+    }
+    ui_size(ui, row, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
+    ui_size(ui, row, UiAxisY, UiSizeKind.Pixels, typography.line / scale, 1.0)
+    ui_animate(app, ui, row, index == selected)
+    index += 1
+  }
+  if #len(entries) == 0 {
+    _ = ui_label(ui, "empty", "(empty or unreadable)", UiMuted)
+  }
+  if #len(entries) == 64 {
+    _ = ui_label(ui, "limit", "First 64 entries", UiMuted)
+  }
+  ui_pop(ui)
+}
+// Draw file and folder icons into the text padding of recorded rows.
+fn explorer_column_icons(renderer: rawptr, ui: *UiState, typography: *Typography, name: []const u8, entries: []Entry) {
+  column := ui_make_lookup(ui, ui_child_key("explorer", name))
+  if column == 0 {
+    return
+  }
+  clip := sdl.PixelRect{x: #cast(i32) ui.boxes[column].rect.x, y: #cast(i32) ui.boxes[column].rect.y, width: #cast(i32) ui.boxes[column].rect.width, height: #cast(i32) ui.boxes[column].rect.height}
+  if !sdl.clip(renderer, &clip) {
+    #panic("explorer icon clip")
+  }
+  row := ui.boxes[column].first
+  for row != 0 {
+    item := &ui.boxes[row]
+    if (item.flags & UiClickable) != 0 {
+      index := item.value % 65536
+      if index < #len(entries) {
+        entry := &entries[index]
+        explorer_icon(renderer, typography, entry.name[..entry.length], entry.directory, item.rect.x, item.rect.y)
+      }
+    }
+    row = item.next
+  }
+  if !sdl.clip(renderer, nil) {
+    #panic("explorer icon clip reset")
+  }
+}
 fn draw_explorer(renderer: rawptr, app: *App, typography: *Typography, width: i32, height: i32) {
-  doc := app.explorer.document if doc == nil { return }
-  padding := 14.0 * typography.scale
-  rect := sdl.Rect{x: #cast(f32) width * 0.08, y: #cast(f32) height * 0.1, width: #cast(f32) width * 0.84, height: #cast(f32) height * 0.8}
-  if !sdl.color(renderer, 30, 37, 44, 255) || !sdl.fill(renderer, &rect) { #panic("explorer background") }
+  doc := app.explorer.document
+  if doc == nil {
+    return
+  }
+  ui := &app.ui
+  ui_panel_begin(ui, typography)
+  scale := typography.scale
+  padding := 14.0 * scale
+  rect := place_rect(app, SurfaceExplorer, width, height, 0.0, typography.scale, sdl.Rect{x: #cast(f32) width * 0.04, y: #cast(f32) height * 0.1, width: #cast(f32) width * 0.92, height: #cast(f32) height * 0.8})
+  desired_height := typography.line * #cast(f32) (doc.line_count + 3) + padding * 2.0
+  minimum_height := typography.line * 9.0 + padding * 2.0
+  if desired_height < minimum_height {
+    desired_height = minimum_height
+  }
+  // A floating explorer fits its listing; a docked one fills its strip.
+  if desired_height < rect.height && place_of(app, SurfaceExplorer).mode != settings.PlaceDock {
+    rect.height = desired_height
+  }
+  // Overlays redraw the explorer each frame too; only a real reopening slides.
+  if ui.explorer_seen + 1 < ui.frame {
+    motion.snap(&ui.explorer_open, -12.0 * scale)
+  }
+  ui.explorer_seen = ui.frame
+  slide := animated_value(app, &ui.explorer_open, 0.0, app.config.popup_animation_ms * 2.0, false)
+  columns := app.config.explorer_columns && rect.width > typography.cell * 78.0
+  side_width := rect.width * 0.25
+  gap := 8.0 * scale
+  context := &app.explorer.context
+  if columns && app.config.explorer_preview {
+    explorer_context_preview(app)
+  }
+  root := ui_make(ui, ui_hash(0, "explorer"), UiFloating)
+  ui.boxes[root].axis = UiAxisX
+  ui.boxes[root].floating[0] = rect.x
+  ui.boxes[root].floating[1] = rect.y + slide
+  ui_size(ui, root, UiAxisX, UiSizeKind.Pixels, rect.width / scale, 1.0)
+  ui_size(ui, root, UiAxisY, UiSizeKind.Pixels, rect.height / scale, 1.0)
+  ui_push(ui, root)
+  if columns {
+    explorer_column(ui, app, typography, "parent", "Parent", context.parent[..context.parent_count], context.parent_selected, side_width, 1)
+    space := ui_make(ui, ui_key(ui, "left gap"), 0)
+    ui_size(ui, space, UiAxisX, UiSizeKind.Pixels, gap / scale, 1.0)
+  }
+  main := ui_make(ui, ui_key(ui, "main"), UiBackground | UiBorder | UiClip)
+  ui.boxes[main].fill = theme().surface
+  ui_size(ui, main, UiAxisX, UiSizeKind.Percent, 1.0, 0.0)
+  ui_size(ui, main, UiAxisY, UiSizeKind.Percent, 1.0, 1.0)
+  preview_body: usize = 0
+  if columns && app.config.explorer_preview {
+    space_right := ui_make(ui, ui_key(ui, "right gap"), 0)
+    ui_size(ui, space_right, UiAxisX, UiSizeKind.Pixels, gap / scale, 1.0)
+    if context.preview_directory {
+      explorer_column(ui, app, typography, "contents", "Contents", context.children[..context.child_count], 64, side_width, 2)
+    }
+    else {
+      pane := ui_make(ui, ui_key(ui, "preview"), UiBackground | UiBorder | UiClip)
+      ui.boxes[pane].fill = theme().surface
+      ui.boxes[pane].padding[0] = padding
+      ui.boxes[pane].padding[1] = padding
+      ui_size(ui, pane, UiAxisX, UiSizeKind.Pixels, side_width / scale, 1.0)
+      ui_size(ui, pane, UiAxisY, UiSizeKind.Percent, 1.0, 1.0)
+      ui_push(ui, pane)
+      _ = ui_label(ui, "title", "Preview", UiMuted)
+      preview_body = ui_make(ui, ui_key(ui, "body"), UiClip)
+      ui_size(ui, preview_body, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
+      ui_size(ui, preview_body, UiAxisY, UiSizeKind.Percent, 1.0, 0.0)
+      ui_pop(ui)
+    }
+  }
+  ui_pop(ui)
+  ui_layout(ui)
+  ui_render(renderer, ui, typography, width, height)
+  if app.config.explorer_icons {
+    explorer_column_icons(renderer, ui, typography, "parent", context.parent[..context.parent_count])
+    explorer_column_icons(renderer, ui, typography, "contents", context.children[..context.child_count])
+  }
+  if preview_body != 0 {
+    area := ui.boxes[preview_body].rect
+    preview_clip := sdl.PixelRect{x: #cast(i32) area.x, y: #cast(i32) area.y, width: #cast(i32) area.width, height: #cast(i32) area.height}
+    if !sdl.clip(renderer, &preview_clip) {
+      #panic("file preview clip")
+    }
+    explorer_preview_text(app, typography, context.preview[..context.preview_length], context.preview_path[..context.preview_path_length], area.x, area.y, area.height)
+    if !sdl.clip(renderer, nil) {
+      #panic("file preview reset")
+    }
+  }
+  rect = ui.boxes[main].rect
   outer_clip := sdl.PixelRect{x: #cast(i32) rect.x, y: #cast(i32) rect.y, width: #cast(i32) rect.width, height: #cast(i32) rect.height}
-  if !sdl.clip(renderer, &outer_clip) { #panic("explorer header clip") }
-  header: [8192]u8 = [] used: usize = 0
-  if app.explorer.insert { add_text(header[..], &used, "INSERT  ") } else if app.explorer.extend { add_text(header[..], &used, "SELECT  ") } else { add_text(header[..], &used, "NORMAL  ") }
+  if !sdl.clip(renderer, &outer_clip) {
+    #panic("explorer header clip")
+  }
+  header: [8192]u8 = []
+  used: usize = 0
+  if app.explorer.insert {
+    add_text(header[..], &used, "INSERT  ")
+  } else if app.explorer.extend {
+    add_text(header[..], &used, "SELECT  ")
+  } else {
+    add_text(header[..], &used, "NORMAL  ")
+  }
   add_text(header[..], &used, app.explorer.path[..app.explorer.path_length])
-  if buffer.dirty(doc) { add_text(header[..], &used, " [+]") }
+  if buffer.dirty_cached(doc) {
+    add_text(header[..], &used, " [+]")
+  }
   chrome_text(typography, header[..used], rect.x + padding, rect.y + padding, true)
-  hint: []const u8 = "i edit / :write preview / Enter open / Backspace parent"
+  hint: []const u8 = "i edit | :write | Enter / Backspace"
   chrome_text(typography, hint, rect.x + padding, rect.y + padding + typography.line, false)
-  top := rect.y + padding + typography.line * 2.0 body_height := rect.height - padding * 2.0 - typography.line * 2.0
-  if body_height < typography.line { body_height = typography.line }
-  if typography.directory_revision != doc.revision {
-    if !ttf.set(typography.directory_text, &doc.bytes[0], doc.length) { #panic("explorer update") }
+  top := rect.y + padding + typography.line * 2.0
+  body_height := rect.height - padding * 2.0 - typography.line * 2.0
+  if body_height < typography.line {
+    body_height = typography.line
+  }
+  _ = text_viewport(doc, typography.line, body_height, &app.explorer.scroll_y)
+  head := doc.cursor
+  if !app.explorer.insert {
+    head = buffer.head(doc)
+  }
+  caret := measure_position(doc, typography, head)
+  x := #cast(f32) caret.x
+  y := #cast(f32) (line_at(doc, head) - 1) * typography.line
+  if x < app.explorer.scroll_x {
+    app.explorer.scroll_x = x
+  }
+  gutter: f32 = 0.0
+  if app.view.line_numbers {
+    gutter = 7.0 * typography.cell
+  }
+  icon_width: f32 = 0.0
+  if app.config.explorer_icons {
+    icon_width = typography.cell * 2.0
+  }
+  origin := rect.x + padding + gutter + icon_width
+  available := rect.width - padding * 2.0 - gutter - icon_width
+  if available < typography.cell {
+    available = typography.cell
+  }
+  if x + typography.cell > app.explorer.scroll_x + available {
+    app.explorer.scroll_x = x + typography.cell - available
+  }
+  visual := &app.view.animation.directory
+  reset := app.view.animation.reset || app.view.animation.panel != Panel.Directory
+  animated_scroll(app, visual, app.explorer.scroll_x, app.explorer.scroll_y, body_height, reset)
+  scroll_x := visual.x.value
+  scroll_y := visual.y.value
+  ui.explorer_top = top
+  ui.explorer_scroll = scroll_y
+  ui.explorer_body = sdl.Rect{x: rect.x, y: top, width: rect.width, height: body_height}
+  viewport := visible_viewport(doc, typography.line, body_height, scroll_y)
+  _ = line_layout_update(typography, &typography.directory_layout, doc, 0, viewport)
+  if typography.directory_revision != doc.revision || typography.directory_start != viewport.start || typography.directory_end != viewport.end {
     typography.directory_revision = doc.revision
+    typography.directory_start = viewport.start
+    typography.directory_end = viewport.end
   }
-  caret := ttf.Substring{}
-  if !ttf.substring(typography.directory_text, #cast(i32) doc.cursor, &caret) { #panic("explorer cursor") }
-  x := #cast(f32) caret.x y := #cast(f32) caret.y
-  if y < app.explorer.scroll_y { app.explorer.scroll_y = y }
-  if y + typography.line > app.explorer.scroll_y + body_height { app.explorer.scroll_y = y + typography.line - body_height }
-  if x < app.explorer.scroll_x { app.explorer.scroll_x = x }
-  available := rect.width - padding * 2.0
-  if x + typography.cell > app.explorer.scroll_x + available { app.explorer.scroll_x = x + typography.cell - available }
-  clip := sdl.PixelRect{x: #cast(i32) (rect.x + padding), y: #cast(i32) top, width: #cast(i32) available, height: #cast(i32) body_height}
-  if clip.width < 1 { clip.width = 1 } if clip.height < 1 { clip.height = 1 }
-  if !sdl.clip(renderer, &clip) { #panic("explorer clip") }
-  at := buffer.start(doc) for at < buffer.end(doc) {
-    part := ttf.Substring{} if !ttf.substring(typography.directory_text, #cast(i32) at, &part) { break }
-    selected := sdl.Rect{x: rect.x + padding + #cast(f32) part.x - app.explorer.scroll_x, y: top + #cast(f32) part.y - app.explorer.scroll_y, width: #cast(f32) part.width, height: typography.line}
-    if selected.width < 1.0 { selected.width = typography.cell }
-    if !sdl.color(renderer, 53, 76, 84, 255) || !sdl.fill(renderer, &selected) { #panic("explorer selection") }
-    at = buffer.next(doc, at)
+  gutter_clip := sdl.PixelRect{x: #cast(i32) (rect.x + padding), y: #cast(i32) top, width: #cast(i32) gutter, height: #cast(i32) body_height}
+  if app.view.line_numbers {
+    if !sdl.clip(renderer, &gutter_clip) {
+      #panic("explorer gutter clip")
+    }
+    draw_gutter(doc, typography, origin - icon_width, top, top + body_height, scroll_y, app.view.relative_numbers, head)
   }
-  cursor_width := typography.cell if app.explorer.insert { cursor_width = 2.0 * typography.scale }
-  cursor := sdl.Rect{x: rect.x + padding + x - app.explorer.scroll_x, y: top + y - app.explorer.scroll_y, width: cursor_width, height: typography.points * typography.scale + 5.0 * typography.scale}
-  if !sdl.color(renderer, 143, 185, 166, 255) || !sdl.fill(renderer, &cursor) || !ttf.draw(typography.directory_text, rect.x + padding - app.explorer.scroll_x, top - app.explorer.scroll_y) { #panic("explorer draw") }
-  if !sdl.clip(renderer, nil) { #panic("explorer clip reset") }
+  if app.config.explorer_icons {
+    icon_clip := sdl.PixelRect{x: #cast(i32) (origin - icon_width), y: #cast(i32) top, width: #cast(i32) icon_width, height: #cast(i32) body_height}
+    if !sdl.clip(renderer, &icon_clip) {
+      #panic("icon clip")
+    }
+    row := buffer.row_at(doc, viewport.start)
+    at := viewport.start
+    for at < viewport.end {
+      ending := buffer.line_end(doc, at)
+      name := doc.bytes[at..ending]
+      directory := #len(name) > 0 && name[#len(name) - 1] == 47
+      if #len(name) > 0 {
+        explorer_icon(renderer, typography, name, directory, origin - icon_width, top + #cast(f32) row * typography.line - scroll_y)
+      }
+      at = ending + 1
+      row += 1
+    }
+  }
+  clip := sdl.PixelRect{x: #cast(i32) origin, y: #cast(i32) top, width: #cast(i32) available, height: #cast(i32) body_height}
+  if clip.width < 1 {
+    clip.width = 1
+  }
+  if clip.height < 1 {
+    clip.height = 1
+  }
+  if !sdl.clip(renderer, &clip) {
+    #panic("explorer clip")
+  }
+  draw_selection(renderer, doc, &typography.directory_layout, viewport, typography, origin, top, scroll_x, scroll_y, origin + available)
+  draw_extra_cursors(renderer, doc, &typography.directory_layout, viewport, typography, origin, top, scroll_x, scroll_y, app.explorer.insert)
+  cursor_width := typography.cell
+  if app.explorer.insert {
+    cursor_width = app.config.cursor_thickness * typography.scale
+  }
+  cursor_snap := reset || !app.config.smooth_cursor || cursor_step_snaps(&visual.cursor_x, &visual.cursor_y, origin + x - scroll_x, top + y - scroll_y, typography.cell, typography.line)
+  cursor_x := animated_follow(app, &visual.cursor_x, origin + x - scroll_x, app.config.cursor_animation_ms, cursor_snap)
+  cursor_y := animated_follow(app, &visual.cursor_y, top + y - scroll_y, app.config.cursor_animation_ms, cursor_snap)
+  cursor := sdl.Rect{x: cursor_x, y: cursor_y, width: cursor_width, height: typography.points * typography.scale + 5.0 * typography.scale}
+  if !paint(renderer, theme().cursor) || !sdl.fill(renderer, &cursor) {
+    #panic("explorer draw")
+  }
+  line_layout_draw(&typography.directory_layout, theme().text, origin - scroll_x, top + viewport.y - scroll_y)
+  if !sdl.clip(renderer, nil) {
+    #panic("explorer clip reset")
+  }
+}
+
+fn explorer_release(app: *App) {
+  if app.explorer.document != nil {
+    _ = mem.arena_release(&app.explorer.arena)
+    app.explorer.document = nil
+  }
+}
+// Mouse in the explorer: click a row to select it, double-click to open;
+// side columns open their entries; the wheel moves the selection.
+fn explorer_mouse(app: *App, typography: *Typography, x: f32, y: f32, pressed: bool, moved: bool, clicks: u8) {
+  ui := &app.ui
+  doc := app.explorer.document
+  if doc == nil {
+    return
+  }
+  if moved {
+    ui_pointer(ui, x, y)
+    return
+  }
+  if !pressed {
+    return
+  }
+  if ui_contains(ui.explorer_body, x, y) {
+    row := #cast(usize) ((y - ui.explorer_top + ui.explorer_scroll) / typography.line)
+    if row >= doc.line_count {
+      return
+    }
+    position := buffer.row_start(doc, row)
+    buffer.checkpoint(doc)
+    if app.explorer.insert {
+      buffer.move_to(doc, position, false)
+    }
+    else {
+      buffer.select_to(doc, position, false)
+      app.explorer.extend = false
+    }
+    explorer_selected(app)
+    if clicks >= 2 && !app.explorer.insert {
+      explorer_key(app, typography, KeyReturn, 0)
+    }
+    return
+  }
+  hit := ui_hit(ui, x, y)
+  if hit != 0 {
+    kind := ui.boxes[hit].value / 65536
+    index := ui.boxes[hit].value % 65536
+    explorer_open_entry(app, kind, index)
+    return
+  }
+  root := ui_make_lookup(ui, ui_hash(0, "explorer"))
+  if (root == 0 || !ui_contains(ui.boxes[root].rect, x, y)) && !app.explorer.insert {
+    explorer_key(app, typography, KeyEscape, 0)
+  }
+}
+// Open an entry from a side column: 1 = parent directory listing,
+// 2 = contents of the selected directory. Directories are browsed; files open.
+fn explorer_open_entry(app: *App, kind: usize, index: usize) {
+  context := &app.explorer.context
+  base: [4096]u8 = []
+  base_length := copy_text(base[..], app.explorer.path[..app.explorer.path_length])
+  entry: *Entry = nil
+  if kind == 1 && index < context.parent_count {
+    base_length = explorer_parent_length(base[..base_length])
+    entry = &context.parent[index]
+  }
+  else if kind == 2 && index < context.child_count && app.directory_state.selected < app.directory_state.count {
+    selected := &app.directory_state.entries[app.directory_state.selected]
+    if base_length > 0 && base[base_length - 1] != '/' {
+      add_text(base[..], &base_length, "/")
+    }
+    add_text(base[..], &base_length, selected.name[..selected.length])
+    entry = &context.children[index]
+  }
+  if entry == nil {
+    return
+  }
+  path: [4096]u8 = []
+  length := copy_text(path[..], base[..base_length])
+  if length > 0 && path[length - 1] != '/' {
+    add_text(path[..], &length, "/")
+  }
+  add_text(path[..], &length, entry.name[..entry.length])
+  if !entry.directory {
+    open_file(app, path[..length])
+    return
+  }
+  if explorer_dirty(app) {
+    notice(app, "Apply or discard staged edits before changing directory.")
+    return
+  }
+  app.directory_state.length = copy_text(app.directory_state.path[..], path[..length])
+  directory_refresh(app)
 }

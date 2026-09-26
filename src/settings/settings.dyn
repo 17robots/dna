@@ -1,0 +1,791 @@
+use "std/mem"
+use "../buffer"
+
+pub struct Binding { key: u32, modifiers: u16, scope: u8, from_project: bool, command: []const u8 }
+// Where a surface shows: float at one of nine anchors, docked to a side
+// (taking space from the editor panes), or next to the cursor. Sizes at or
+// below 1 are fractions of the window; above 1, logical pixels.
+pub const PlaceDefault: u8 = 0
+pub const PlaceFloat: u8 = 1
+pub const PlaceDock: u8 = 2
+pub const PlaceCursor: u8 = 3
+pub const PlaceSurfaces: usize = 8
+pub struct Placement { mode, anchor, side: u8, width, height, size, margin: f32 }
+pub fn place_surface(name: []const u8) usize {
+  names: [8][]const u8 = ["palette", "picker", "menu", "dialog", "explorer", "terminal", "completion", "hover"]
+  for index in 0..8 {
+    if buffer.equal(names[index], name) {
+      return index
+    }
+  }
+  return 8
+}
+// Anchors: 0 top-left, 1 top, 2 top-right, 3 left, 4 center, 5 right,
+// 6 bottom-left, 7 bottom, 8 bottom-right. Sides: 0 left, 1 right, 2 top, 3 bottom.
+pub fn place_anchor(name: []const u8) u8 {
+  names: [9][]const u8 = ["top-left", "top", "top-right", "left", "center", "right", "bottom-left", "bottom", "bottom-right"]
+  for index in 0..9 {
+    if buffer.equal(names[index], name) {
+      return #cast(u8) index
+    }
+  }
+  return 255
+}
+pub fn place_side(name: []const u8) u8 {
+  names: [4][]const u8 = ["left", "right", "top", "bottom"]
+  for index in 0..4 {
+    if buffer.equal(names[index], name) {
+      return #cast(u8) index
+    }
+  }
+  return 255
+}
+fn place_apply(place: *Placement, key: []const u8, value: []const u8) bool {
+  if buffer.equal(key, "mode") || buffer.equal(key, "anchor") || buffer.equal(key, "side") {
+    if #len(value) < 3 || value[0] != 34 || value[#len(value) - 1] != 34 {
+      return false
+    }
+    text := value[1..#len(value) - 1]
+    if buffer.equal(key, "mode") {
+      if buffer.equal(text, "float") {
+        place.mode = PlaceFloat
+      }
+      else if buffer.equal(text, "dock") {
+        place.mode = PlaceDock
+      }
+      else if buffer.equal(text, "cursor") {
+        place.mode = PlaceCursor
+      }
+      else if buffer.equal(text, "default") {
+        // The surface's usual place; later keys in the section still apply.
+        place.* = Placement{}
+      }
+      else {
+        return false
+      }
+      return true
+    }
+    choice := place_anchor(text)
+    if buffer.equal(key, "side") {
+      choice = place_side(text)
+      if choice == 255 {
+        return false
+      }
+      place.side = choice
+      if place.mode == PlaceDefault {
+        place.mode = PlaceDock
+      }
+      return true
+    }
+    if choice == 255 {
+      return false
+    }
+    place.anchor = choice
+    if place.mode == PlaceDefault {
+      place.mode = PlaceFloat
+    }
+    return true
+  }
+  amount := number(value)
+  if amount < 0.0 || amount > 4000.0 {
+    return false
+  }
+  if buffer.equal(key, "width") {
+    place.width = amount
+  }
+  else if buffer.equal(key, "height") {
+    place.height = amount
+  }
+  else if buffer.equal(key, "size") {
+    place.size = amount
+  }
+  else if buffer.equal(key, "margin") {
+    place.margin = amount
+  }
+  else {
+    return false
+  }
+  return true
+}
+pub struct Settings {
+  languages: [16]Language,
+  places: [8]Placement,
+  bindings: [16]Binding,
+  completion_delay_ms: f32 = 25.0,
+  document_padding: f32 = 18.0,
+  scroll_margin: f32 = 3.0,
+  horizontal_scroll_margin: f32 = 2.0,
+  cursor_animation_ms: f32 = 50.0,
+  scroll_animation_ms: f32 = 50.0,
+  popup_animation_ms: f32 = 50.0,
+  cursor_thickness: f32 = 2.0,
+  cursor_trail_size: f32 = 1.0,
+  terminal_height: f32 = 0.25,
+  split_ratio: f32 = 0.5,
+  picker_width: f32 = 0.9,
+  picker_height: f32 = 0.88,
+  popup_width: f32 = 0.64,
+  popup_height: f32 = 0.56,
+  popup_padding: f32 = 10.0,
+  recovery_interval_ms: f32 = 500.0,
+  lsp_timeout_ms: f32 = 10000.0,
+  lsp_change_delay_ms: f32 = 50.0,
+  plugin_timeout_ms: f32 = 5000.0,
+  frame_interval_ms: f32 = 4.0,
+  font_size: f32 = 16.0,
+  line_height: f32 = 1.25,
+  font_family, font, shell, build_command, test_command, run_command, fallback, theme_path: []const u8,
+  terminal_modifiers: u16 = 192,
+  explicit_legacy: u32,
+  terminal_escape: u32 = 92,
+  explicit_extra: u64,
+  error_line, language_count, font_length, binding_count, shell_length: usize,
+  indent_width: usize = 4,
+  light_theme, ok, reduced_motion: bool,
+  automatic_completion: bool = true,
+  vim_keys: bool = false,
+  // [modules]: 0 is the default module of each slot. frontend: auto, gui,
+  // tui; explorer: buffer, tree; picker: full, compact, dropdown.
+  frontend, explorer_style, picker_style: u8,
+  reload_config: bool = true,
+  line_numbers: bool = true,
+  relative_numbers: bool = true,
+  status_line: bool = true,
+  highlight_line: bool = true,
+  trim_trailing_whitespace: bool = false,
+  smooth_cursor: bool = true,
+  equalize_splits: bool = true,
+  default_servers: bool = true,
+  smooth_scroll: bool = true,
+  popup_transitions: bool = true,
+  mouse_enabled: bool = true,
+  picker_preview: bool = true,
+  syntax_enabled: bool = true,
+  recovery_enabled: bool = true,
+  reload_clean_buffers: bool = true,
+  explorer_icons: bool = true,
+  explorer_columns: bool = true,
+  explorer_preview: bool = true,
+  insert_tabs: bool = false,
+  final_newline: bool = false,
+}
+
+pub fn defaults(result: *Settings) {
+  mem.zero((#cast(*u8) result)[..#sizeof(Settings)])
+  result.automatic_completion = true
+  result.vim_keys = false
+  result.reload_config = true
+  result.completion_delay_ms = 25.0
+  result.document_padding = 18.0
+  result.scroll_margin = 3.0
+  result.horizontal_scroll_margin = 2.0
+  result.cursor_animation_ms = 50.0
+  result.scroll_animation_ms = 50.0
+  result.popup_animation_ms = 50.0
+  result.cursor_thickness = 2.0
+  result.cursor_trail_size = 1.0
+  result.terminal_height = 0.25
+  result.split_ratio = 0.5
+  result.picker_width = 0.9
+  result.picker_height = 0.88
+  result.popup_width = 0.64
+  result.popup_height = 0.56
+  result.popup_padding = 10.0
+  result.recovery_interval_ms = 500.0
+  result.lsp_timeout_ms = 10000.0
+  result.lsp_change_delay_ms = 50.0
+  result.plugin_timeout_ms = 5000.0
+  result.frame_interval_ms = 4.0
+  result.smooth_cursor = true
+  result.equalize_splits = true
+  result.default_servers = true
+  result.smooth_scroll = true
+  result.popup_transitions = true
+  result.mouse_enabled = true
+  result.picker_preview = true
+  result.syntax_enabled = true
+  result.recovery_enabled = true
+  result.reload_clean_buffers = true
+  result.insert_tabs = false
+  result.final_newline = false
+  result.trim_trailing_whitespace = false
+  result.explorer_icons = true
+  result.explorer_columns = true
+  result.explorer_preview = true
+  result.terminal_escape = 92
+  result.terminal_modifiers = 192
+  result.font_size = 16.0
+  result.line_height = 1.25
+  result.indent_width = 4
+  result.line_numbers = true
+  result.relative_numbers = true
+  result.status_line = true
+  result.highlight_line = true
+}
+pub fn trim(text: []const u8) []const u8 {
+  first: usize = 0
+  last := #len(text)
+  for first < last && (text[first] == 32 || text[first] == 9 || text[first] == 13) {
+    first += 1
+  }
+  for last > first && (text[last - 1] == 32 || text[last - 1] == 9 || text[last - 1] == 13) {
+    last -= 1
+  }
+  return text[first..last]
+}
+pub fn number(text: []const u8) f32 {
+  value: f32 = 0.0
+  divisor: f32 = 1.0
+  decimal: bool = false
+  digits: usize = 0
+  if #len(text) > 8 {
+    return -1.0
+  }
+  for byte in text {
+    if byte == 46 && !decimal {
+      decimal = true
+      continue
+    }
+    if byte < 48 || byte > 57 {
+      return -1.0
+    }
+    digits += 1
+    value = value * 10.0 + #cast(f32) (byte - 48)
+    if decimal {
+      divisor *= 10.0
+    }
+  }
+  if digits == 0 {
+    return -1.0
+  }
+  return value / divisor
+}
+// Layered configuration: the global file, then a project dna.toml over it.
+// A project layer never sets locked or personal keys, and sets keys that run
+// programs or load files only once trusted; each skip is recorded.
+pub const SkipLocked: u8 = 1
+pub const SkipPersonal: u8 = 2
+pub const SkipUntrusted: u8 = 3
+pub struct Layer {
+  project: bool,
+  trusted: bool,
+  // :set for this session: applies over the files like a project layer, but
+  // may set personal keys. Locks still hold.
+  session: bool,
+  locks: [32][]const u8,
+  lock_count: usize,
+  applied: [64][]const u8,
+  applied_count: usize,
+  skipped: [32][]const u8,
+  skip_reasons: [32]u8,
+  skipped_count: usize,
+}
+// Index of a module name within its slot, or 255 when unknown.
+pub fn module_choice(slot: []const u8, value: []const u8) u8 {
+  names: []const u8 = ""
+  if buffer.equal(slot, "keymap") {
+    names = "helix vim"
+  }
+  else if buffer.equal(slot, "frontend") {
+    names = "auto gui tui"
+  }
+  else if buffer.equal(slot, "explorer_style") {
+    names = "buffer tree"
+  }
+  else if buffer.equal(slot, "picker_style") {
+    names = "full compact dropdown"
+  }
+  if #len(value) < 3 || value[0] != 34 || value[#len(value) - 1] != 34 {
+    return 255
+  }
+  wanted := value[1..#len(value) - 1]
+  index: u8 = 0
+  at: usize = 0
+  for at < #len(names) {
+    end := at
+    for end < #len(names) && names[end] != ' ' {
+      end += 1
+    }
+    if buffer.equal(names[at..end], wanted) {
+      return index
+    }
+    index += 1
+    at = end + 1
+  }
+  return 255
+}
+pub fn parse(source: []const u8, result: *Settings) bool {
+  layer := Layer{}
+  return parse_layer(source, result, &layer)
+}
+pub fn lock_matches(lock: []const u8, section: []const u8, key: []const u8, canonical: []const u8) bool {
+  if buffer.equal(lock, canonical) || buffer.equal(lock, key) && #len(section) == 0 {
+    return true
+  }
+  if #len(section) == 0 {
+    return false
+  }
+  // A section name locks everything in it; section.key locks one entry.
+  if buffer.equal(lock, section) || (#len(section) > 5 && buffer.equal(section[..5], "keys.") && buffer.equal(lock, "keys")) || (#len(section) > 10 && buffer.equal(section[..10], "languages.") && buffer.equal(lock, "languages")) || (#len(section) > 6 && buffer.equal(section[..6], "place.") && buffer.equal(lock, "place")) {
+    return true
+  }
+  return #len(lock) == #len(section) + 1 + #len(key) && buffer.equal(lock[..#len(section)], section) && lock[#len(section)] == '.' && buffer.equal(lock[#len(section) + 1..], key)
+}
+// Keymap and frontend are the user's own; projects never choose them.
+// How you like to work, rather than what a project needs: a dna.toml never
+// sets these. [project."PATH"] sections in the global file can.
+fn personal_key(canonical: []const u8) bool {
+  return buffer.equal(canonical, "vim_keys") || buffer.equal(canonical, "keymap") || buffer.equal(canonical, "frontend") ||
+    buffer.equal(canonical, "theme") || buffer.equal(canonical, "font") || buffer.equal(canonical, "font_family") ||
+    buffer.equal(canonical, "fallback_font") || buffer.equal(canonical, "font_size") || buffer.equal(canonical, "line_height")
+}
+// Keys that run programs or make DNA load files from the project.
+fn trust_needed(section: []const u8, key: []const u8, canonical: []const u8) bool {
+  if #len(section) > 5 && buffer.equal(section[..5], "keys.") {
+    return true
+  }
+  if #len(section) > 10 && buffer.equal(section[..10], "languages.") {
+    return buffer.equal(key, "server") || buffer.equal(key, "language_server") || buffer.equal(key, "formatter") || buffer.equal(key, "auto_start") || buffer.equal(key, "format_on_save")
+  }
+  return buffer.equal(canonical, "shell") || buffer.equal(canonical, "build_command") || buffer.equal(canonical, "test_command") || buffer.equal(canonical, "run_command") || buffer.equal(canonical, "font") || buffer.equal(canonical, "fallback_font") || buffer.equal(canonical, "theme")
+}
+// Zero when the layer may apply the key, else the reason it is skipped.
+fn layer_skip(layer: *Layer, section: []const u8, key: []const u8, canonical: []const u8) u8 {
+  if !layer.project {
+    return 0
+  }
+  reason: u8 = 0
+  for index in 0..layer.lock_count {
+    if lock_matches(layer.locks[index], section, key, canonical) {
+      reason = SkipLocked
+    }
+  }
+  if reason == 0 && personal_key(canonical) && !layer.session {
+    reason = SkipPersonal
+  }
+  if reason == 0 && !layer.trusted && trust_needed(section, key, canonical) {
+    reason = SkipUntrusted
+  }
+  if reason != 0 && layer.skipped_count < 32 {
+    layer.skipped[layer.skipped_count] = canonical
+    layer.skip_reasons[layer.skipped_count] = reason
+    layer.skipped_count += 1
+  }
+  return reason
+}
+fn layer_applied(layer: *Layer, canonical: []const u8) {
+  if layer.applied_count < 64 {
+    layer.applied[layer.applied_count] = canonical
+    layer.applied_count += 1
+  }
+}
+// lock = ["vim_keys", "theme", "languages"]: only in the global file.
+fn parse_locks(layer: *Layer, value: []const u8) bool {
+  if layer.project || #len(value) < 2 || value[0] != 91 || value[#len(value) - 1] != 93 {
+    return false
+  }
+  at: usize = 1
+  for at < #len(value) - 1 {
+    for at < #len(value) - 1 && (value[at] == 32 || value[at] == 44) {
+      at += 1
+    }
+    if at == #len(value) - 1 {
+      break
+    }
+    if value[at] != 34 || layer.lock_count == 32 {
+      return false
+    }
+    at += 1
+    start := at
+    for at < #len(value) && value[at] != 34 {
+      byte := value[at]
+      if !((byte >= 'a' && byte <= 'z') || (byte >= '0' && byte <= '9') || byte == '_' || byte == '.') {
+        return false
+      }
+      at += 1
+    }
+    if at == #len(value) || at == start {
+      return false
+    }
+    layer.locks[layer.lock_count] = value[start..at]
+    layer.lock_count += 1
+    at += 1
+  }
+  return true
+}
+// Apply one file. The first (global) layer starts from defaults; a project
+// layer applies over the result and may repeat keys the global file set.
+pub fn parse_layer(source: []const u8, result: *Settings, layer: *Layer) bool {
+  if layer.project {
+    result.error_line = 0
+    for language in 0..result.language_count {
+      result.languages[language].seen = 0
+    }
+  }
+  else {
+    defaults(result)
+  }
+  at: usize = 0
+  seen: u32 = 0
+  extra_seen: u64 = 0
+  scope: u8 = 0
+  language_index: usize = 16
+  place_index: usize = PlaceSurfaces
+  // keymap and vim_keys name the same choice; a file setting both must agree.
+  keymap_value: u8 = 255
+  vim_value: u8 = 255
+  section: []const u8 = ""
+  for at < #len(source) {
+    result.error_line += 1
+    end := at
+    for end < #len(source) && source[end] != 10 {
+      end += 1
+    }
+    line := trim(source[at..end])
+    at = end + 1
+    if #len(line) == 0 || line[0] == 35 {
+      continue
+    }
+    if buffer.equal(line, "[keys.normal]") {
+      scope = 1
+      continue
+    }
+    if buffer.equal(line, "[keys.space]") {
+      scope = 2
+      continue
+    }
+    if line[0] == 91 {
+      if #len(line) < 3 || line[#len(line) - 1] != 93 {
+        return false
+      }
+      section = line[1..#len(line) - 1]
+      scope = 0
+      // [project."PATH"] applies separately, through project_sections.
+      if project_section_path(section).ok {
+        if layer.project {
+          return false
+        }
+        scope = 5
+        continue
+      }
+      if #len(section) > 6 && buffer.equal(section[..6], "place.") {
+        place_index = place_surface(section[6..])
+        if place_index == PlaceSurfaces {
+          return false
+        }
+        scope = 4
+        continue
+      }
+      if #len(section) > 10 && buffer.equal(section[..10], "languages.") {
+        language_index = language_section(result, section)
+        if language_index == 16 {
+          return false
+        }
+        scope = 3
+        continue
+      }
+      if !known_section(section) {
+        return false
+      }
+      continue
+    }
+    if scope == 5 {
+      continue
+    }
+    split: usize = 0
+    for split < #len(line) && line[split] != 61 {
+      split += 1
+    }
+    if split == #len(line) {
+      return false
+    }
+    key := trim(line[..split])
+    value := trim(line[split + 1..])
+    bit: u32 = 0
+    if scope == 3 {
+      if layer_skip(layer, section, key, key) != 0 {
+        continue
+      }
+      if !language_apply(&result.languages[language_index], key, value) {
+        return false
+      }
+      layer_applied(layer, section)
+      continue
+    }
+    if scope == 4 {
+      if layer_skip(layer, section, key, section) != 0 {
+        continue
+      }
+      if !place_apply(&result.places[place_index], key, value) {
+        return false
+      }
+      layer_applied(layer, section)
+      continue
+    }
+    if scope == 0 && buffer.equal(key, "lock") {
+      if !parse_locks(layer, value) {
+        return false
+      }
+      continue
+    }
+    if scope != 0 && layer_skip(layer, section, key, section) != 0 {
+      continue
+    }
+    if scope != 0 {
+      if #len(key) < 3 || key[0] != 34 || key[#len(key) - 1] != 34 || #len(value) < 3 || #len(value) > 129 || value[0] != 34 || value[#len(value) - 1] != 34 || result.binding_count == 16 {
+        return false
+      }
+      binding := parse_key(key[1..#len(key) - 1])
+      if binding.key == 0 {
+        return false
+      }
+      binding.scope = scope
+      binding.command = value[1..#len(value) - 1]
+      replaced := false
+      for previous in 0..result.binding_count {
+        existing := &result.bindings[previous]
+        if existing.scope == scope && existing.key == binding.key && existing.modifiers == binding.modifiers {
+          // A project binding overrides the global one; within a file it is a duplicate.
+          if !layer.project || existing.from_project {
+            return false
+          }
+          binding.from_project = true
+          existing.* = binding
+          replaced = true
+        }
+      }
+      if !replaced {
+        binding.from_project = layer.project
+        result.bindings[result.binding_count] = binding
+        result.binding_count += 1
+      }
+      layer_applied(layer, section)
+      continue
+    }
+    canonical := section_key(section, key)
+    if layer_skip(layer, section, key, canonical) != 0 {
+      continue
+    }
+    layer_applied(layer, canonical)
+    extra_index := extra_find(canonical)
+    if extra_index < ExtraCount {
+      extra_bit := #cast(u64) 1 << extra_index
+      if (extra_seen & extra_bit) != 0 || !extra_apply(result, extra_index, value) {
+        return false
+      }
+      if buffer.equal(canonical, "vim_keys") {
+        vim_value = 0
+        if result.vim_keys {
+          vim_value = 1
+        }
+        if keymap_value != 255 && keymap_value != vim_value {
+          return false
+        }
+      }
+      extra_seen = extra_seen | extra_bit
+      result.explicit_extra = result.explicit_extra | extra_seen
+      continue
+    }
+    key = canonical
+    if buffer.equal(key, "build_command") || buffer.equal(key, "test_command") || buffer.equal(key, "run_command") {
+      if #len(value) < 3 || #len(value) > 1025 || value[0] != 34 || value[#len(value) - 1] != 34 {
+        return false
+      }
+      task := value[1..#len(value) - 1]
+      if buffer.equal(key, "build_command") {
+        bit = 8192
+        result.build_command = task
+      }
+      else if buffer.equal(key, "test_command") {
+        bit = 16384
+        result.test_command = task
+      }
+      else {
+        bit = 32768
+        result.run_command = task
+      }
+    } else if buffer.equal(key, "theme") {
+      bit = 2048
+      if buffer.equal(value, "\"light\"") {
+        result.light_theme = true
+      }
+      else if !buffer.equal(value, "\"charcoal\"") {
+        if #len(value) < 3 || #len(value) > 4097 || value[0] != 34 || value[#len(value) - 1] != 34 {
+          return false
+        }
+        result.theme_path = value[1..#len(value) - 1]
+      }
+    } else if buffer.equal(key, "keymap") || buffer.equal(key, "frontend") || buffer.equal(key, "explorer_style") || buffer.equal(key, "picker_style") {
+      choice := module_choice(key, value)
+      if choice == 255 {
+        return false
+      }
+      if buffer.equal(key, "keymap") {
+        bit = 1048576
+        keymap_value = choice
+        if vim_value != 255 && vim_value != choice {
+          return false
+        }
+        result.vim_keys = choice == 1
+      }
+      else if buffer.equal(key, "frontend") {
+        bit = 2097152
+        result.frontend = choice
+      }
+      else if buffer.equal(key, "explorer_style") {
+        bit = 4194304
+        result.explorer_style = choice
+      }
+      else {
+        bit = 8388608
+        result.picker_style = choice
+      }
+    } else if buffer.equal(key, "fallback_font") {
+      bit = 4096
+      if #len(value) < 3 || #len(value) > 4097 || value[0] != 34 || value[#len(value) - 1] != 34 {
+        return false
+      }
+      result.fallback = value[1..#len(value) - 1]
+    } else if buffer.equal(key, "terminal_escape") {
+      bit = 1024
+      if #len(value) < 3 || value[0] != 34 || value[#len(value) - 1] != 34 {
+        return false
+      }
+      escape := parse_key(value[1..#len(value) - 1])
+      if escape.key == 0 || escape.modifiers == 0 {
+        return false
+      }
+      result.terminal_escape = escape.key
+      result.terminal_modifiers = escape.modifiers
+    } else if buffer.equal(key, "font_family") {
+      bit = 524288
+      if #len(value) < 3 || #len(value) > 257 || value[0] != 34 || value[#len(value) - 1] != 34 {
+        return false
+      }
+      result.font_family = value[1..#len(value) - 1]
+    } else if buffer.equal(key, "font") || buffer.equal(key, "shell") {
+      if #len(value) < 2 || value[0] != 34 || value[#len(value) - 1] != 34 || #len(value) > 4097 {
+        return false
+      }
+      text := value[1..#len(value) - 1]
+      for byte in text {
+        if byte < 32 || byte == 34 || byte == 92 {
+          return false
+        }
+      }
+      if buffer.equal(key, "font") {
+        bit = 1
+        result.font_length = #len(text)
+        result.font = text
+      }
+      else {
+        bit = 2
+        result.shell_length = #len(text)
+        result.shell = text
+      }
+    } else if buffer.equal(key, "font_size") {
+      bit = 4
+      result.font_size = number(value)
+      if result.font_size < 8.0 || result.font_size > 72.0 {
+        return false
+      }
+    }
+    else if buffer.equal(key, "line_height") {
+      bit = 8
+      result.line_height = number(value)
+      if result.line_height < 1.0 || result.line_height > 3.0 {
+        return false
+      }
+    }
+    else if buffer.equal(key, "indent_width") {
+      bit = 16
+      width := number(value)
+      if width < 1.0 || width > 16.0 || #cast(f32) (#cast(usize) width) != width {
+        return false
+      }
+      result.indent_width = #cast(usize) width
+    }
+    else {
+      flag := buffer.equal(value, "true")
+      if !flag && !buffer.equal(value, "false") {
+        return false
+      }
+      if buffer.equal(key, "explorer_icons") {
+        bit = 65536
+        result.explorer_icons = flag
+      }
+      else if buffer.equal(key, "explorer_columns") {
+        bit = 131072
+        result.explorer_columns = flag
+      }
+      else if buffer.equal(key, "explorer_preview") {
+        bit = 262144
+        result.explorer_preview = flag
+      }
+      else if buffer.equal(key, "reduced_motion") {
+        bit = 32
+        result.reduced_motion = flag
+      }
+      else if buffer.equal(key, "line_numbers") {
+        bit = 64
+        result.line_numbers = flag
+      }
+      else if buffer.equal(key, "relative_numbers") {
+        bit = 128
+        result.relative_numbers = flag
+      }
+      else if buffer.equal(key, "status_line") {
+        bit = 256
+        result.status_line = flag
+      }
+      else if buffer.equal(key, "highlight_line") {
+        bit = 512
+        result.highlight_line = flag
+      }
+      else {
+        return false
+      }
+    }
+    if (seen & bit) != 0 {
+      return false
+    }
+    seen = seen | bit
+    result.explicit_legacy = result.explicit_legacy | seen
+  }
+  result.ok = true
+  result.error_line = 0
+  return true
+}
+
+pub fn parse_key(text: []const u8) Binding {
+  result := Binding{}
+  remaining := text
+  if #len(remaining) > 5 && buffer.equal(remaining[..5], "ctrl-") {
+    result.modifiers = 192
+    remaining = remaining[5..]
+  }
+  else if #len(remaining) > 4 && buffer.equal(remaining[..4], "alt-") {
+    result.modifiers = 768
+    remaining = remaining[4..]
+  }
+  else if #len(remaining) > 6 && buffer.equal(remaining[..6], "shift-") {
+    result.modifiers = 3
+    remaining = remaining[6..]
+  }
+  if #len(remaining) == 1 {
+    result.key = #cast(u32) remaining[0]
+  }
+  else if buffer.equal(remaining, "backslash") {
+    result.key = 92
+  }
+  else if buffer.equal(remaining, "space") {
+    result.key = 32
+  }
+  else if #len(remaining) >= 2 && remaining[0] == 102 {
+    n := number(remaining[1..])
+    if n >= 1.0 && n <= 12.0 && #cast(f32) (#cast(u32) n) == n {
+      result.key = #cast(u32) 1073741881 + #cast(u32) n
+    }
+  }
+  return result
+}

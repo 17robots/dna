@@ -1,0 +1,192 @@
+use "std/process"
+use "std/mem" mem
+use "std/fs" fs
+use "std/io" io
+use "std/c"
+
+#link("c")
+#link("dna_native")
+extern fn system "system"(command: *const u8) i32
+extern fn temporary "mkdtemp"(path: *u8) *u8
+extern fn registry_path "dna_language_registry"(output: *u8, capacity: usize) i32
+extern fn syntax_open "dna_syntax_open"(root: *const u8, filename: *const u8) rawptr
+extern fn syntax_close "dna_syntax_close"(syntax: rawptr)
+struct Language { name: []const u8, url: []const u8, checksum: []const u8, subdirectory: []const u8 = ".", query: []const u8, bundled_query: []const u8, extensions: []const u8, filenames: []const u8, root_query: bool, indent: []const u8 = "4" }
+struct Registry { entries: [64]Language, count: usize }
+fn equal(a: []const u8, b: []const u8) bool { if #len(a) != #len(b) { return false } index: usize = 0 for index < #len(a) { if a[index] != b[index] { return false } index += 1 } return true }
+fn add(output: []u8, used: *usize, text: []const u8) { if used.* + #len(text) >= #len(output) { #panic("installer path/command capacity") } for byte in text { output[used.*] = byte used.* += 1 } output[used.*] = 0 }
+fn quote(output: []u8, used: *usize, text: []const u8) { add(output, used, "'") for byte in text { if byte == 39 { add(output, used, "'\\''") } else { one: [1]u8 = [byte] add(output, used, one[..]) } } add(output, used, "'") }
+fn trim(text: []const u8) []const u8 { first: usize = 0 last := #len(text) for first < last && (text[first] == 32 || text[first] == 9 || text[first] == 13) { first += 1 } for last > first && (text[last - 1] == 32 || text[last - 1] == 9 || text[last - 1] == 13) { last -= 1 } return text[first..last] }
+fn string(value: []const u8) []const u8 { if #len(value) < 2 || value[0] != 34 || value[#len(value) - 1] != 34 { #panic("registry strings need double quotes") } text := value[1..#len(value) - 1] for byte in text { if byte < 32 || byte == 34 || byte == 92 { #panic("registry string escapes/control bytes unsupported") } } return text }
+fn identifier(text: []const u8) bool { if #len(text) == 0 || #len(text) > 64 { return false } for byte in text { if !((byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 95) { return false } } return true }
+fn relative(path: []const u8) bool { if #len(path) == 0 || path[0] == '/' { return false } at: usize = 0 for at < #len(path) { end := at for end < #len(path) && path[end] != '/' { end += 1 } if equal(path[at..end], "..") { return false } at = end + 1 } return true }
+fn load_registry(registry: *Registry, text: []const u8) {
+  at: usize = 0 current: usize = 64 seen: u32 = 0
+  for at < #len(text) {
+    end := at for end < #len(text) && text[end] != 10 { end += 1 } line := trim(text[at..end]) at = end + 1
+    if #len(line) == 0 || line[0] == 35 { continue }
+    if line[0] == 91 && line[#len(line) - 1] == 93 {
+      name := line[1..#len(line) - 1] if !identifier(name) { #panic("invalid registry language name") }
+      current = 0 for current < registry.count && !equal(registry.entries[current].name, name) { current += 1 }
+      if current == 64 { #panic("registry supports 64 languages") }
+      if current == registry.count { registry.count += 1 }
+      registry.entries[current] = Language{name: name} seen = 0 continue
+    }
+    if current == 64 { #panic("registry settings require [language] section") }
+    split: usize = 0 for split < #len(line) && line[split] != 61 { split += 1 }
+    if split == #len(line) { #panic("invalid registry assignment") }
+    key := trim(line[..split]) value := trim(line[split + 1..]) item := &registry.entries[current] bit: u32 = 0
+    if equal(key, "url") { bit = 1 item.url = string(value) }
+    else if equal(key, "sha256") { bit = 2 item.checksum = string(value) }
+    else if equal(key, "subdirectory") { bit = 4 item.subdirectory = string(value) }
+    else if equal(key, "highlights") { bit = 8 item.query = string(value) }
+    // A query stored at the archive root, outside the grammar's subdirectory.
+    else if equal(key, "highlights_root") { bit = 8 item.query = string(value) item.root_query = true }
+    // Exact file names such as Dockerfile or CMakeLists.txt.
+    else if equal(key, "filenames") { bit = 256 item.filenames = value }
+    else if equal(key, "bundled_highlights") { bit = 128 item.bundled_query = string(value) }
+    else if equal(key, "extensions") { bit = 16 item.extensions = value }
+    else if equal(key, "indent_width") { bit = 32 item.indent = value }
+    else if equal(key, "revision") { bit = 64 _ = string(value) }
+    else { #panic("unknown registry setting") }
+    if (seen & bit) != 0 { #panic("duplicate registry setting") } seen = seen | bit
+  }
+}
+fn run(command: []const u8) { storage: [32768]u8 = [] encoded := c.string_from_bytes(storage[..], command) if !encoded.ok || system(encoded.value) != 0 { #panic("language tool command failed; see output above") } }
+fn cleanup(path: []const u8) { command: [8192]u8 = [] used: usize = 0 add(command[..], &used, "rm -rf -- ") quote(command[..], &used, path) _ = system(&command[0]) }
+fn append_path(output: []u8, parent: []const u8, leaf: []const u8) []u8 { used: usize = 0 add(output, &used, parent) add(output, &used, "/") add(output, &used, leaf) return output[..used] }
+fn file_name(text: []const u8) bool { if #len(text) == 0 || #len(text) > 64 || text[0] == 46 { return false } for byte in text { if !((byte >= 97 && byte <= 122) || (byte >= 65 && byte <= 90) || (byte >= 48 && byte <= 57) || byte == 95 || byte == 45 || byte == 46 || byte == 43) { return false } } return true }
+fn filenames(item: *const Language, output: []u8) usize {
+  text := item.filenames if #len(text) == 0 { return 0 }
+  if #len(text) < 3 || text[0] != 91 || text[#len(text) - 1] != 93 { #panic("filenames must be an array of strings") }
+  at: usize = 1 used: usize = 0
+  for at < #len(text) - 1 {
+    for at < #len(text) - 1 && (text[at] == 32 || text[at] == 44) { at += 1 }
+    if at == #len(text) - 1 { break }
+    if text[at] != 34 { #panic("file name needs quotes") } at += 1 start := at
+    for at < #len(text) && text[at] != 34 { at += 1 }
+    if at == #len(text) || !file_name(text[start..at]) { #panic("invalid file name") }
+    add(output, &used, text[start..at]) add(output, &used, "\n") at += 1
+  }
+  return used
+}
+fn extensions(item: *const Language, output: []u8) usize {
+  text := item.extensions if #len(text) < 3 || text[0] != 91 || text[#len(text) - 1] != 93 { #panic("extensions must be an array of strings") }
+  at: usize = 1 used: usize = 0
+  for at < #len(text) - 1 {
+    for at < #len(text) - 1 && (text[at] == 32 || text[at] == 44) { at += 1 }
+    if at == #len(text) - 1 { break }
+    if text[at] != 34 { #panic("extension needs quotes") } at += 1 start := at
+    for at < #len(text) && text[at] != 34 { at += 1 }
+    if at == #len(text) || !identifier(text[start..at]) { #panic("invalid extension") }
+    add(output, &used, text[start..at]) add(output, &used, "\n") at += 1
+  }
+  if used == 0 { #panic("language needs an extension") } return used
+}
+fn install(arena: *mem.Arena, root: []const u8, item: *const Language) {
+  if #len(item.url) < 8 || !equal(item.url[..8], "https://") || #len(item.checksum) != 64 || !relative(item.subdirectory) || (#len(item.bundled_query) == 0 && !relative(item.query)) || (#len(item.bundled_query) > 0 && (!relative(item.bundled_query) || #len(item.query) > 0)) { #panic("language needs HTTPS URL, SHA-256, relative source/query paths") }
+  for digit in item.checksum { if !((digit >= 48 && digit <= 57) || (digit >= 97 && digit <= 102)) { #panic("invalid SHA-256") } }
+  if !(equal(item.indent, "1") || equal(item.indent, "2") || equal(item.indent, "3") || equal(item.indent, "4") || equal(item.indent, "5") || equal(item.indent, "6") || equal(item.indent, "7") || equal(item.indent, "8") || equal(item.indent, "9") || equal(item.indent, "10") || equal(item.indent, "11") || equal(item.indent, "12") || equal(item.indent, "13") || equal(item.indent, "14") || equal(item.indent, "15") || equal(item.indent, "16")) { #panic("indent_width must be 1..16") }
+  query_source: [4096]u8 = [] query_length: usize = 0
+  if #len(item.bundled_query) > 0 {
+    if registry_path(&query_source[0], 4096) == 0 { #panic("bundled query path unavailable") }
+    query_length = c.string_length(&query_source[0], 4096)
+    for query_length > 0 && query_source[query_length - 1] != '/' { query_length -= 1 }
+    add(query_source[..], &query_length, "queries/") add(query_source[..], &query_length, item.bundled_query)
+  } else {
+    // The copy runs inside the subdirectory; climb out for root queries.
+    if item.root_query && !equal(item.subdirectory, ".") {
+      add(query_source[..], &query_length, "../")
+      for byte in item.subdirectory { if byte == '/' { add(query_source[..], &query_length, "../") } }
+    }
+    add(query_source[..], &query_length, item.query)
+  }
+  names_storage: [1024]u8 = [] names_length := filenames(item, names_storage[..])
+  extension_storage: [1024]u8 = [] extension_length := extensions(item, extension_storage[..])
+  command: [32768]u8 = [] used: usize = 0 add(command[..], &used, "mkdir -p -- ") quote(command[..], &used, root) run(command[..used])
+  temp_storage: [4096]u8 = [] _ = append_path(temp_storage[..], root, ".install-XXXXXX")
+  if temporary(&temp_storage[0]) == nil { #panic("cannot create installer staging directory") }
+  temp := temp_storage[..c.string_length(&temp_storage[0], 4096)] defer cleanup(temp)
+  _ = io.println(io.stdout(), "Downloading and compiling {}", item.name)
+  used = 0 add(command[..], &used, "set -eu\ncd ") quote(command[..], &used, temp)
+  add(command[..], &used, "\ncurl --fail --location --proto '=https' --proto-redir '=https' --max-time 60 --max-filesize 67108864 --output source.tar.gz -- ") quote(command[..], &used, item.url)
+  add(command[..], &used, "\nprintf '%s  source.tar.gz\\n' ") quote(command[..], &used, item.checksum)
+  add(command[..], &used, " | sha256sum --check --status\ntar -tzvf source.tar.gz | awk 'substr($1,1,1) != \"-\" && substr($1,1,1) != \"d\" {exit 1} {n++; total += $3; if(n>10000 || total>268435456) exit 1}'\nmkdir source package\ntar -xzf source.tar.gz --strip-components=1 --no-same-owner --no-same-permissions -C source\ncd source/" ) quote(command[..], &used, item.subdirectory)
+  add(command[..], &used, "\nif test -f src/scanner.cc; then echo 'C++ scanners are unsupported'; exit 1; fi\nset -- src/parser.c\nif test -f src/scanner.c; then set -- \"$@\" src/scanner.c; fi\ntimeout 120 cc -shared -fPIC -O2 -Isrc \"$@\" -o ")
+  package_storage: [4096]u8 = [] package := append_path(package_storage[..], temp, "package")
+  parser_storage: [4096]u8 = [] parser := append_path(parser_storage[..], package, "parser.so") quote(command[..], &used, parser)
+  add(command[..], &used, "\ncp -- ") quote(command[..], &used, query_source[..query_length]) add(command[..], &used, " ")
+  query_storage: [4096]u8 = [] query := append_path(query_storage[..], package, "highlights.scm") quote(command[..], &used, query)
+  object_source: [4096]u8 = [] object_length: usize = 0
+  if registry_path(&object_source[0], 4096) != 0 {
+    object_length = c.string_length(&object_source[0], 4096)
+    for object_length > 0 && object_source[object_length - 1] != '/' { object_length -= 1 }
+    add(object_source[..], &object_length, "queries/") add(object_source[..], &object_length, item.name) add(object_source[..], &object_length, ".textobjects.scm")
+    add(command[..], &used, "\nif test -f ") quote(command[..], &used, object_source[..object_length])
+    add(command[..], &used, "; then cp -- ") quote(command[..], &used, object_source[..object_length]) add(command[..], &used, " ")
+    object_target: [4096]u8 = [] quote(command[..], &used, append_path(object_target[..], package, "textobjects.scm")) add(command[..], &used, "; fi")
+  }
+  run(command[..used])
+  output_storage: [4096]u8 = []
+  if !fs.write_all(append_path(output_storage[..], package, "extensions"), extension_storage[..extension_length]).ok || !fs.write_all(append_path(output_storage[..], package, "indent"), item.indent).ok { #panic("cannot write package metadata") }
+  if names_length > 0 && !fs.write_all(append_path(output_storage[..], package, "filenames"), names_storage[..names_length]).ok { #panic("cannot write package metadata") }
+  named_storage: [4096]u8 = [] named := append_path(named_storage[..], temp, item.name)
+  if !fs.rename(package, named).ok { #panic("cannot stage language package") }
+  first: usize = 0 for first < extension_length && extension_storage[first] != 10 { first += 1 }
+  filename: [128]u8 = [] filename_length: usize = 0 add(filename[..], &filename_length, "test.") add(filename[..], &filename_length, extension_storage[..first])
+  handle := syntax_open(&temp_storage[0], &filename[0]) if handle == nil { #panic("unsupported grammar ABI or highlight query; active language unchanged") } syntax_close(handle)
+  // Keep a unique immutable version; switching the symlink is the only publish step.
+  version_storage: [4096]u8 = [] version_length: usize = 0 add(version_storage[..], &version_length, root) add(version_storage[..], &version_length, "/.") add(version_storage[..], &version_length, item.name) add(version_storage[..], &version_length, "-") add(version_storage[..], &version_length, temp[#len(temp) - 6..])
+  if !fs.rename(named, version_storage[..version_length]).ok { #panic("cannot publish language version") }
+  link_storage: [4096]u8 = [] link := append_path(link_storage[..], temp, "active")
+  destination_storage: [4096]u8 = [] destination := append_path(destination_storage[..], root, item.name)
+  if !fs.symbolic_link(version_storage[..version_length], link).ok || !fs.rename(link, destination).ok { #panic("cannot activate language version") }
+  _ = io.println(io.stdout(), "Installed {}. Use :language-reload in DNA.", item.name)
+  _ = arena
+}
+fn main() {
+  allocated := mem.arena_create(4194304) if !allocated.ok { #panic("installer allocation") } defer _ = mem.arena_release(&allocated.arena)
+  arena := &allocated.arena args := process.arguments(arena) if !args.ok { #panic("arguments unavailable") }
+  path: [4096]u8 = [] if registry_path(&path[0], 4096) == 0 { #panic("registry path unavailable") }
+  registry := Registry{} read := fs.read_all(arena, path[..c.string_length(&path[0], 4096)], 65536) if !read.ok { #panic("cannot read bundled registry") } load_registry(&registry, read.data)
+  home_storage: [4096]u8 = [] home := process.environment("HOME", home_storage[..])
+  config_storage: [4096]u8 = [] config := process.environment("XDG_CONFIG_HOME", config_storage[..])
+  config_path: [4096]u8 = [] config_length: usize = 0
+  if config.ok && config.found { add(config_path[..], &config_length, config.value) } else if home.ok && home.found { add(config_path[..], &config_length, home.value) add(config_path[..], &config_length, "/.config") }
+  add(config_path[..], &config_length, "/dna/languages.toml")
+  custom := fs.read_all(arena, config_path[..config_length], 65536) if custom.ok { load_registry(&registry, custom.data) }
+  root_storage: [4096]u8 = [] root_length: usize = 0 env_storage: [4096]u8 = [] configured := process.environment("DNA_LANGUAGE_DIR", env_storage[..])
+  if configured.ok && configured.found { add(root_storage[..], &root_length, configured.value) }
+  else { data_storage: [4096]u8 = [] data := process.environment("XDG_DATA_HOME", data_storage[..]) if data.ok && data.found { add(root_storage[..], &root_length, data.value) } else { if !home.ok || !home.found { #panic("HOME unavailable") } add(root_storage[..], &root_length, home.value) add(root_storage[..], &root_length, "/.local/share") } add(root_storage[..], &root_length, "/dna/languages") }
+  if root_length == 0 { #panic("language data directory is empty") }
+  if root_storage[0] != '/' {
+    relative_root: [4096]u8 = [] relative_length: usize = 0 add(relative_root[..], &relative_length, root_storage[..root_length])
+    cwd := #syscall(79, &root_storage[0], 4096) if cwd <= 0 { #panic("working directory unavailable") }
+    root_length = #cast(usize) cwd - 1 add(root_storage[..], &root_length, "/") add(root_storage[..], &root_length, relative_root[..relative_length])
+  }
+  if #len(args.values) == 3 && server_command(root_storage[..root_length], args.values[1], args.values[2]) { return }
+  if #len(args.values) < 2 || equal(args.values[1], "list") {
+    installed: [64]bool = [] index: usize = 0
+    for index < registry.count {
+      item := &registry.entries[index] package_storage: [4096]u8 = [] file_storage: [4096]u8 = []
+      package := append_path(package_storage[..], root_storage[..root_length], item.name)
+      parser := fs.metadata(append_path(file_storage[..], package, "parser.so"))
+      query := fs.metadata(append_path(file_storage[..], package, "highlights.scm"))
+      metadata := fs.metadata(append_path(file_storage[..], package, "extensions"))
+      installed[index] = parser.ok && query.ok && metadata.ok && (parser.mode & 61440) == 32768 && (query.mode & 61440) == 32768 && (metadata.mode & 61440) == 32768 && parser.size > 0 && query.size > 0 && metadata.size > 0
+      index += 1
+    }
+    _ = io.println(io.stdout(), "Installed languages:") count: usize = 0 index = 0
+    for index < registry.count { if installed[index] { _ = io.println(io.stdout(), "  {}: {}", registry.entries[index].name, registry.entries[index].extensions) count += 1 } index += 1 }
+    if count == 0 { _ = io.println(io.stdout(), "  (none)") }
+    _ = io.println(io.stdout(), "\nAvailable to install:") count = 0 index = 0
+    for index < registry.count { if !installed[index] { _ = io.println(io.stdout(), "  {}: {}", registry.entries[index].name, registry.entries[index].extensions) count += 1 } index += 1 }
+    if count == 0 { _ = io.println(io.stdout(), "  (none; all catalogue languages are installed)") }
+    _ = io.println(io.stdout(), "\nInstall: :language-install NAME\nActivate: :language-reload\nThese are syntax-highlighting packages, not language servers.")
+    server_list(root_storage[..root_length])
+    return
+  }
+  if #len(args.values) != 3 || !equal(args.values[1], "install") { #panic("usage: dna-language list | install NAME") }
+  selected: usize = 0 for selected < registry.count { if equal(registry.entries[selected].name, args.values[2]) { install(arena, root_storage[..root_length], &registry.entries[selected]) return } selected += 1 }
+  #panic("unknown language; use :languages or add it to ~/.config/dna/languages.toml")
+}

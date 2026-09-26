@@ -1,0 +1,105 @@
+// Resolve two repositories without changing the editor's working project.
+fn file_config_smoke() {
+  storage: [4096]u8 = []
+  fixture := process.environment("DNA_WORKFLOW_TEST", storage[..])
+  if !fixture.ok || !fixture.found {
+    return
+  }
+  owned := mem.arena_create(#sizeof(App) + 128)
+  scratch := mem.arena_create(2097152)
+  if !owned.ok || !scratch.ok {
+    #panic("file config test memory")
+  }
+  defer _ = mem.arena_release(&owned.arena)
+  defer _ = mem.arena_release(&scratch.arena)
+  app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
+  app.scratch = &scratch.arena
+  defer release_editor_state(app)
+  defer format_release(app)
+  settings.defaults(&app.config)
+  base: [4096]u8 = []
+  length := copy_text(base[..], fixture.value)
+  add_text(base[..], &length, "/file-config")
+  if config_directories(&base[0]) == 0 {
+    #panic("file config directory")
+  }
+  path: [4096]u8 = []
+  used := copy_text(path[..], base[..length])
+  add_text(path[..], &used, "/global.toml")
+  app.configuration.path_length = copy_text(app.configuration.path[..], path[..used])
+  project_config_write(path[..used], "indent_width = 6\n[languages.text]\nformatter = \"cat rules.txt\"\n")
+  used = copy_text(path[..], base[..length])
+  add_text(path[..], &used, "/.editorconfig")
+  project_config_write(path[..used], "root = true\n[*]\nindent_size = 2\ninsert_final_newline = true\n")
+  used = copy_text(path[..], base[..length])
+  add_text(path[..], &used, "/dna.toml")
+  project_config_write(path[..used], "insert_tabs = true\n[languages.text]\nformatter = \"false\"\n")
+  used = copy_text(path[..], base[..length])
+  add_text(path[..], &used, "/rules.txt")
+  project_config_write(path[..used], "formatted from file project")
+  used = copy_text(path[..], base[..length])
+  add_text(path[..], &used, "/input.txt")
+  project_config_write(path[..used], "original")
+  if !new_buffer(app) {
+    #panic("file config buffer")
+  }
+  slot := &app.documents.slots[app.documents.active]
+  slot.file.length = copy_text(slot.file.path[..], path[..used])
+  slot.filetype_length = copy_text(slot.filetype[..], "text")
+  _ = buffer.load(slot.document, "original")
+  app.directory_state.length = copy_text(app.directory_state.path[..], "/tmp")
+  app.workspace.project_length = copy_text(app.workspace.project[..], "/tmp")
+  config := active_file_config(app)
+  if config.indent_width != 2 || !config.insert_tabs || !config.final_newline || !buffer.equal(config.language.formatter[..config.language.formatter_length], "cat rules.txt") {
+    #panic("per-file layers and untrusted formatter")
+  }
+  // The command is global/trusted, but its working directory follows the file.
+  format_start(app, false, "")
+  formatting_wait(app)
+  if !buffer.equal(slot.document.bytes[..slot.document.length], "formatted from file project") {
+    #panic("formatter uses file project directory")
+  }
+  // Global locks beat EditorConfig, project keys and old session overrides.
+  project_config_write(app.configuration.path[..app.configuration.path_length], "lock = [\"indent_width\", \"insert_tabs\"]\nindent_width = 6\ninsert_tabs = false\n")
+  app.configuration.overrides_length = copy_text(app.configuration.overrides[..], "indent_width = 9\ninsert_tabs = true\n")
+  file_config_invalidate(app)
+  config = active_file_config(app)
+  if config.indent_width != 6 || config.insert_tabs || !config.indent_explicit {
+    #panic("global locks apply to every file layer")
+  }
+  // Personal project sections override file rules; session values win last.
+  source: [8192]u8 = []
+  source_length := copy_text(source[..], "[project.\"")
+  add_text(source[..], &source_length, base[..length])
+  add_text(source[..], &source_length, "\"]\nindent_width = 3\n")
+  project_config_write(app.configuration.path[..app.configuration.path_length], source[..source_length])
+  app.configuration.overrides_length = 0
+  file_config_invalidate(app)
+  if indent_width(app) != 3 {
+    #panic("personal project indent")
+  }
+  app.configuration.overrides_length = copy_text(app.configuration.overrides[..], "indent_width = 5\n")
+  file_config_invalidate(app)
+  if indent_width(app) != 5 {
+    #panic("session indent wins")
+  }
+  // Many matching sections must not consume one Settings allocation each.
+  source_length = 0
+  for index in 0..199 {
+    add_text(source[..], &source_length, "[project.\"/\"]\nindent_width = 2\n")
+  }
+  add_text(source[..], &source_length, "[project.\"/\"]\nindent_width = 3\n")
+  project_config_write(app.configuration.path[..app.configuration.path_length], source[..source_length])
+  app.configuration.overrides_length = 0
+  before := mem.arena_mark(app.scratch)
+  file_config_invalidate(app)
+  if indent_width(app) != 3 || !active_file_config(app).ready || mem.arena_mark(app.scratch) != before {
+    #panic("many project sections retain last override and release scratch")
+  }
+  app.configuration.overrides_length = copy_text(app.configuration.overrides[..], "indent_width = 7\n")
+  file_config_invalidate(app)
+  if indent_width(app) != 7 || mem.arena_mark(app.scratch) != before {
+    #panic("session wins after many project sections")
+  }
+
+}

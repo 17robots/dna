@@ -1,0 +1,78 @@
+// Line and column helpers shared by the Vim keymap and the ex commands.
+// Normal-mode cursors rest on a character; a final newline ends the last
+// line rather than starting a new one, as in Vim.
+
+fn vim_doc(app: *App) *buffer.Document {
+  return app.documents.current
+}
+// Vim's last line: a final newline ends the last line, it does not start one.
+fn vim_last_row(doc: *const buffer.Document) usize {
+  if doc.line_count > 1 && doc.length > 0 && doc.bytes[doc.length - 1] == 10 {
+    return doc.line_count - 2
+  }
+  return doc.line_count - 1
+}
+// End of a line's text: the newline (or CR before it), or the document end.
+fn vim_text_end(doc: *const buffer.Document, position: usize) usize {
+  ending := buffer.line_end(doc, position)
+  beginning := buffer.line_start(doc, position)
+  if ending > beginning && doc.bytes[ending - 1] == 13 && ending < doc.length {
+    ending -= 1
+  }
+  return ending
+}
+fn vim_line_empty(doc: *const buffer.Document, position: usize) bool {
+  return vim_text_end(doc, position) == buffer.line_start(doc, position)
+}
+// Normal-mode cursors rest on a character, never past a line's text
+// (an empty line's cursor sits on its newline).
+fn vim_clamp(doc: *const buffer.Document, position: usize) usize {
+  if doc.length == 0 {
+    return 0
+  }
+  at := position
+  if at > doc.length {
+    at = doc.length
+  }
+  if at == doc.length && doc.bytes[doc.length - 1] == 10 {
+    at = doc.length - 1
+  }
+  at = buffer.boundary(doc, at)
+  beginning := buffer.line_start(doc, at)
+  ending := vim_text_end(doc, at)
+  if at >= ending && ending > beginning {
+    return buffer.previous(doc, ending)
+  }
+  if at > ending {
+    return ending
+  }
+  return at
+}
+fn vim_column(doc: *const buffer.Document, position: usize) usize {
+  at := buffer.line_start(doc, position)
+  column: usize = 0
+  for at < position {
+    at = buffer.next(doc, at)
+    column += 1
+  }
+  return column
+}
+// Position at a column of a row; past the text it stops at the text end.
+fn vim_at_column(doc: *const buffer.Document, row: usize, column: usize) usize {
+  at := buffer.row_start(doc, row)
+  ending := vim_text_end(doc, at)
+  moved: usize = 0
+  for moved < column && at < ending {
+    at = buffer.next(doc, at)
+    moved += 1
+  }
+  return at
+}
+fn vim_first_nonblank(doc: *const buffer.Document, row: usize) usize {
+  return buffer.line_nonblank(doc, buffer.row_start(doc, row))
+}
+fn vim_set_range(doc: *buffer.Document, low: usize, high: usize) {
+  doc.secondary.count = 0
+  doc.anchor = low
+  doc.cursor = high
+}

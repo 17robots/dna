@@ -1,0 +1,246 @@
+// Exercise production ownership, invalidation, and deadlines through their callers.
+fn operations_smoke() {
+  owner := mem.arena_create(#sizeof(App) + 128)
+  scratch := mem.arena_create(2097152)
+  if !owner.ok || !scratch.ok {
+    #panic("operation fixture allocation")
+  }
+  defer _ = mem.arena_release(&owner.arena)
+  defer _ = mem.arena_release(&scratch.arena)
+  app := #cast(*App) mem.arena_push(&owner.arena, #sizeof(App), #alignof(App))
+  app.scratch = &scratch.arena
+  settings.defaults(&app.config)
+  app.workspace.project_length = copy_text(app.workspace.project[..], "/tmp")
+  defer operations_release(app)
+  defer release_editor_state(app)
+  defer release_terminals(app)
+  defer lsp_release(app)
+  if !new_buffer(app) {
+    #panic("operation buffer")
+  }
+  pane_init(app)
+  if !files.set_name(app.documents.file, "/tmp/dna-operation.dyn") {
+    #panic("operation path")
+  }
+  app.lsp.servers[0].documents[0].revision = app.documents.current.revision
+  work := &app.operations.lsp_receive
+  log: []const u8 = "{\"jsonrpc\":\"2.0\",\"method\":\"window/logMessage\",\"params\":{\"message\":\"background\"}}"
+  baseline_allocations := app.operations.allocations
+  index: usize = 0
+  for index < 100 {
+    if !work_acquire(app, work, 131072, "lsp_receive") {
+      #panic("receive pool")
+    }
+    retained := lsp_handle(app, 0, log, &work.arena)
+    lsp_receive_finish(app, work, retained)
+    if retained || app.render_trace.pending != 0 {
+      #panic("log-only message repainted")
+    }
+    index += 1
+  }
+  if app.operations.allocations != baseline_allocations + 1 || app.operations.reused != 99 {
+    #panic("receive arena not reused")
+  }
+  diagnostic: []const u8 = "{\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"file:///tmp/dna-operation.dyn\",\"diagnostics\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"severity\":1,\"message\":\"error\"}]}}"
+  _ = work_acquire(app, work, 131072, "lsp_receive")
+  _ = lsp_handle(app, 0, diagnostic, &work.arena)
+  work_finish(app, work, "lsp_receive")
+  if (app.render_trace.pending & RenderLsp) == 0 {
+    #panic("visible diagnostics did not repaint")
+  }
+  app.render_trace.pending = 0
+  _ = work_acquire(app, work, 131072, "lsp_receive")
+  _ = lsp_handle(app, 0, diagnostic, &work.arena)
+  work_finish(app, work, "lsp_receive")
+  if app.render_trace.pending != 0 {
+    #panic("duplicate diagnostics repainted")
+  }
+  if !new_buffer(app) {
+    #panic("hidden diagnostics buffer")
+  }
+  app.documents.slots[0].diagnostics.count = 0
+  _ = work_acquire(app, work, 131072, "lsp_receive")
+  _ = lsp_handle(app, 0, diagnostic, &work.arena)
+  work_finish(app, work, "lsp_receive")
+  if app.documents.slots[0].diagnostics.count != 1 || app.render_trace.pending != 0 {
+    #panic("hidden diagnostics update")
+  }
+  activate(app, 0)
+  app.lsp.pending = 9
+  app.lsp.server = 0
+  app.lsp.kind = 1
+  app.lsp.slot = 0
+  app.lsp.identity = app.documents.slots[0].identity
+  app.lsp.revision = app.documents.current.revision
+  app.lsp.position = app.documents.current.cursor
+  app.lsp.insert = app.view.insert
+  reply: []const u8 = "{\"id\":9,\"result\":[{\"label\":\"retained\"}]}"
+  _ = work_acquire(app, work, 131072, "lsp_receive")
+  kept := lsp_handle(app, 0, reply, &work.arena)
+  lsp_receive_finish(app, work, kept)
+  if !kept || work.capacity != 0 || app.lsp.results.count != 1 {
+    #panic("result ownership transfer")
+  }
+  _ = work_acquire(app, work, 131072, "lsp_receive")
+  _ = lsp_handle(app, 0, log, &work.arena)
+  work_finish(app, work, "lsp_receive")
+  if !buffer.equal(json_text(app.lsp.results.items[0], "label"), "retained") {
+    #panic("pooled message corrupted retained result")
+  }
+  lsp_results_release(app)
+  if !work_acquire(app, work, 3145728, "lsp_receive") {
+    #panic("large receive")
+  }
+  work_finish(app, work, "lsp_receive")
+  if work.capacity != 0 || app.operations.reserved != app.documents.count * (#sizeof(buffer.Document) + buffer.Capacity + 129) {
+    #panic("large arena kept resident")
+  }
+  app.prompt_state.panel = Panel.None
+  app.render_trace.pending = 0
+  app.config.reload_config = false
+  app.config.recovery_enabled = false
+  if editor_wait_ms(app, true) != 2147483647 {
+    #panic("idle deadline polls")
+  }
+  app.pointer.hover_due = sdl.ticks() + 200
+  if editor_wait_ms(app, true) > 200 {
+    #panic("hover deadline ignored")
+  }
+  app.pointer.hover_due = 0
+  app.lsp.pending = 10
+  app.lsp.deadline = sdl.ticks() + 75
+  if editor_wait_ms(app, true) > 75 {
+    #panic("LSP timeout deadline ignored")
+  }
+  app.lsp.pending = 0
+  // A hidden command still drains output, then repaints when made visible.
+  terminal_popup(app, true, "printf first; sleep 0.2; printf second; sleep 1")
+  handle := app.documents.slots[app.terminal_state.slot].terminal.handle
+  if handle == nil {
+    #panic("hidden terminal fixture")
+  }
+  app.prompt_state.panel = Panel.None
+  output: [1024]u8 = []
+  deadline := sdl.ticks() + 2000
+  seen: bool = false
+  for sdl.ticks() < deadline && !seen {
+    if terminal_tick(app) {
+      #panic("hidden terminal output repainted")
+    }
+    length := terminal_snapshot(handle, &output[0], 1024)
+    seen = contains(output[..length], "first")
+    language_test_delay(1)
+  }
+  if !seen {
+    #panic("hidden terminal was not drained")
+  }
+  app.prompt_state.panel = Panel.Terminal
+  visible: bool = false
+  seen = false
+  for sdl.ticks() < deadline && !seen {
+    if terminal_tick(app) {
+      visible = true
+    }
+    size := terminal_snapshot(handle, &output[0], 1024)
+    seen = contains(output[..size], "second")
+    language_test_delay(1)
+  }
+  if !seen || !visible {
+    #panic("visible terminal did not repaint")
+  }
+}
+
+fn dirty_cache_smoke(app: *App) {
+  doc := app.documents.current
+  _ = buffer.load(doc, "unchanged")
+  if buffer.dirty_cached(doc) {
+    #panic("fresh document dirty")
+  }
+  before := doc.dirty_scans
+  count: usize = 0
+  for count < 1000 {
+    if buffer.dirty_cached(doc) {
+      #panic("cached clean changed")
+    }
+    count += 1
+  }
+  if doc.dirty_scans != before {
+    #panic("unchanged dirty check rescanned")
+  }
+  buffer.move_to(doc, doc.length, false)
+  _ = buffer.replace(doc, "x")
+  if !buffer.dirty_cached(doc) {
+    #panic("edit did not invalidate dirty cache")
+  }
+  buffer.checkpoint(doc)
+  buffer.undo(doc)
+  if buffer.dirty_cached(doc) {
+    #panic("undo did not restore clean state")
+  }
+  doc.rows.count = 1
+  doc.rows.offsets[0] = 0
+  if !buffer.dirty_cached(doc) {
+    #panic("explorer row identity ignored")
+  }
+  buffer.mark_saved(doc)
+  if buffer.dirty_cached(doc) {
+    #panic("save did not invalidate dirty cache")
+  }
+  _ = buffer.load(doc, "")
+}
+
+fn syntax_budget_smoke() {
+  root: [4096]u8 = []
+  configured := process.environment("DNA_TEST_LANGUAGE_DIR", root[..4095])
+  if !configured.ok || !configured.found {
+    return
+  }
+  owned := mem.arena_create(#sizeof(App) + 128)
+  if !owned.ok {
+    #panic("syntax budget fixture")
+  }
+  defer _ = mem.arena_release(&owned.arena)
+  app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
+  defer release_editor_state(app)
+  defer syntax_release(app)
+  name: [5]u8 = [106, 115, 111, 110, 0]
+  index: usize = 0
+  for index < 5 {
+    if !new_buffer(app) {
+      #panic("syntax budget document")
+    }
+    slot := &app.documents.slots[app.documents.active]
+    slot.syntax = syntax_open_named(&root[0], &name[0])
+    if slot.syntax == nil {
+      #panic("syntax budget parser")
+    }
+    slot.syntax_used = #cast(u64) index + 1
+    _ = buffer.load(slot.document, "{}")
+    buffer.move_to(slot.document, 2, false)
+    _ = buffer.replace(slot.document, " ")
+    buffer.checkpoint(slot.document)
+    index += 1
+  }
+  pane_init(app)
+  syntax_trim(app)
+  // Eviction is asynchronous and bounded to one retiring parser. Drain that
+  // slot before asking for the next eviction; document ownership stays live.
+  syntax_collect(1)
+  syntax_trim(app)
+  syntax_collect(1)
+  if app.documents.slots[0].syntax != nil || app.documents.slots[1].syntax != nil || app.documents.slots[2].syntax == nil || app.documents.slots[3].syntax == nil || app.documents.slots[4].syntax == nil {
+    #panic("inactive syntax budget")
+  }
+  index = 0
+  for index < 5 {
+    doc := app.documents.slots[index].document
+    if !buffer.equal(doc.bytes[..doc.length], "{} ") {
+      #panic("syntax eviction lost text")
+    }
+    buffer.undo(doc)
+    if !buffer.equal(doc.bytes[..doc.length], "{}") {
+      #panic("syntax eviction lost undo")
+    }
+    index += 1
+  }
+}

@@ -1,0 +1,127 @@
+// Tracked heap allocations keep malloc's 16-byte alignment. Each returned
+// pointer has one owner
+// a failed realloc leaves the old allocation intact.
+struct MemoryHeader { size: usize, born: u64, category: u32, padding: [3]u32 }
+memory_lock: NativeMutex = NativeMutex{}
+memory_configured: bool = false
+memory_enabled: bool = false
+memory_totals: [42]u64 = []
+extern fn memory_environment "getenv"(name: *const u8) *u8
+fn memory_active() bool {
+  _ = sync_mutex_lock(#cast(rawptr) &memory_lock)
+  if !memory_configured {
+    name: []const u8 = "DNA_RENDER_TRACE\0"
+    value := memory_environment(&name[0])
+    memory_enabled = value != nil && value.* != 0
+    memory_configured = true
+  }
+  result := memory_enabled
+  _ = sync_mutex_unlock(#cast(rawptr) &memory_lock)
+  return result
+}
+fn memory_now() u64 {
+  time: NativeTimespec = NativeTimespec{}
+  _ = sync_clock(1, &time)
+  return #cast(u64) time.seconds * 1000000000 + #cast(u64) time.nanoseconds
+}
+fn memory_record(category: u32, size: usize, lifetime: u64, release: bool) {
+  if category >= 6 {
+    return
+  }
+  _ = sync_mutex_lock(#cast(rawptr) &memory_lock)
+  offset := #cast(usize) category * 7
+  if release {
+    memory_totals[offset+1] += 1
+    memory_totals[offset+2] -= #cast(u64) size
+    memory_totals[offset+6] -= 1
+    if lifetime > memory_totals[offset+5] {
+      memory_totals[offset+5] = lifetime
+    }
+  } else {
+    memory_totals[offset] += 1
+    memory_totals[offset+2] += #cast(u64) size
+    memory_totals[offset+4] += #cast(u64) size
+    memory_totals[offset+6] += 1
+    if memory_totals[offset+2] > memory_totals[offset+3] {
+      memory_totals[offset+3] = memory_totals[offset+2]
+    }
+  }
+  _ = sync_mutex_unlock(#cast(rawptr) &memory_lock)
+}
+pub fn dna_memory_alloc(size: usize, category: u32) rawptr {
+  if !memory_active() {
+    return #cast(rawptr) rec_malloc(size)
+  }
+  if size > 18446744073709551615 - #sizeof(MemoryHeader) {
+    return nil
+  }
+  header := #cast(*MemoryHeader) rec_malloc(#sizeof(MemoryHeader) + size)
+  if header == nil {
+    return nil
+  }
+  header.* = MemoryHeader{size: size, born: memory_now(), category: category}
+  memory_record(category, size, 0, false)
+  return #cast(rawptr) (#cast(usize) header + #sizeof(MemoryHeader))
+}
+pub fn dna_memory_calloc(count: usize, size: usize, category: u32) rawptr {
+  if size != 0 && count > 18446744073709551615 / size {
+    return nil
+  }
+  if !memory_active() {
+    return rec_alloc(count, size)
+  }
+  total := count * size
+  if total > 18446744073709551615 - #sizeof(MemoryHeader) {
+    return nil
+  }
+  header := #cast(*MemoryHeader) rec_alloc(1, #sizeof(MemoryHeader) + total)
+  if header == nil {
+    return nil
+  }
+  header.* = MemoryHeader{size: total, born: memory_now(), category: category}
+  memory_record(category, total, 0, false)
+  return #cast(rawptr) (#cast(usize) header + #sizeof(MemoryHeader))
+}
+pub fn dna_memory_free(pointer: rawptr) {
+  if pointer == nil {
+    return
+  }
+  if !memory_active() {
+    rec_free(pointer)
+    return
+  }
+  header := #cast(*MemoryHeader) (#cast(usize) pointer - #sizeof(MemoryHeader))
+  memory_record(header.category, header.size, memory_now() - header.born, true)
+  rec_free(#cast(rawptr) header)
+}
+pub fn dna_memory_realloc(pointer: rawptr, size: usize, category: u32) rawptr {
+  if !memory_active() {
+    return #cast(rawptr) proc_realloc(#cast(*u8) pointer, size)
+  }
+  if pointer == nil {
+    return dna_memory_alloc(size, category)
+  }
+  if size == 0 {
+    dna_memory_free(pointer)
+    return nil
+  }
+  header := #cast(*MemoryHeader) (#cast(usize) pointer - #sizeof(MemoryHeader))
+  next := dna_memory_alloc(size, category)
+  if next != nil {
+    length := size
+    if header.size < length {
+      length = header.size
+    }
+    _ = copy(#cast(*u8) next, #cast(*const u8) pointer, length)
+    dna_memory_free(pointer)
+  }
+  return next
+}
+pub fn dna_memory_snapshot(category: u32, output: *u64) {
+  if category >= 6 {
+    return
+  }
+  _ = sync_mutex_lock(#cast(rawptr) &memory_lock)
+  _ = copy(#cast(*u8) output, #cast(*const u8) &memory_totals[#cast(usize) category * 7], 56)
+  _ = sync_mutex_unlock(#cast(rawptr) &memory_lock)
+}

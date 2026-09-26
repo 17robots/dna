@@ -1,0 +1,274 @@
+// Snippet state owns only bounded offsets, never server response memory.
+struct SnippetSession {
+  parsed: lsp.Snippet,
+  identity, revision: u64,
+  current: usize,
+  active: bool,
+}
+fn snippet_valid(app: *App) bool {
+  state := &app.lsp.snippet
+  slot := &app.documents.slots[app.documents.active]
+  if state.active && (!app.view.insert || slot.identity != state.identity || slot.document.revision != state.revision) {
+    state.active = false
+  }
+  return state.active
+}
+fn snippet_select(app: *App, number: usize) {
+  state := &app.lsp.snippet
+  doc := app.documents.current
+  doc.secondary.count = 0
+  found: bool = false
+  for stop in state.parsed.stops[..state.parsed.count] {
+    if stop.live && stop.number == number {
+      if !found {
+        doc.anchor = stop.start
+        doc.cursor = stop.end
+        found = true
+      } else {
+        doc.secondary.ranges[doc.secondary.count] = buffer.Selection{anchor: stop.start, cursor: stop.end}
+        doc.secondary.count += 1
+      }
+    }
+  }
+  state.current = number
+  if number == 0 {
+    state.active = false
+    doc.secondary.count = 0
+  }
+}
+fn snippet_begin(app: *App, parsed: lsp.Snippet, beginning: usize) {
+  state := &app.lsp.snippet
+  state.parsed = parsed
+  state.active = true
+  state.identity = app.documents.slots[app.documents.active].identity
+  state.revision = app.documents.current.revision
+  smallest: usize = 10000001
+  final: bool = false
+  index: usize = 0
+  for index < state.parsed.count {
+    stop := &state.parsed.stops[index]
+    stop.start += beginning
+    stop.end += beginning
+    if stop.number > 0 && stop.number < smallest {
+      smallest = stop.number
+    }
+    if stop.number == 0 {
+      final = true
+    }
+    index += 1
+  }
+  if !final && state.parsed.count < 32 {
+    state.parsed.stops[state.parsed.count] = lsp.SnippetStop{number: 0, parent: 32, start: beginning + parsed.length, end: beginning + parsed.length, live: true}
+    state.parsed.count += 1
+  }
+  if smallest == 10000001 {
+    smallest = 0
+  }
+  app.view.insert = true
+  snippet_select(app, smallest)
+}
+fn snippet_jump(app: *App, backwards: bool) bool {
+  if !snippet_valid(app) {
+    return false
+  }
+  state := &app.lsp.snippet
+  chosen: usize = 0
+  if !backwards {
+    chosen = 10000001
+  }
+  for stop in state.parsed.stops[..state.parsed.count] {
+    if stop.live && stop.number > 0 {
+      if backwards && stop.number < state.current && stop.number > chosen {
+        chosen = stop.number
+      }
+      if !backwards && stop.number > state.current && stop.number < chosen {
+        chosen = stop.number
+      }
+    }
+  }
+  if backwards && chosen == 0 {
+    return true
+  }
+  if chosen == 10000001 {
+    chosen = 0
+  }
+  snippet_select(app, chosen)
+  return true
+}
+fn snippet_replace(app: *App, text: []const u8) bool {
+  if !snippet_valid(app) {
+    return false
+  }
+  if !buffer.valid(text) {
+    notice(app, "Snippet input must be valid UTF-8 without NUL bytes.")
+    return true
+  }
+  state := &app.lsp.snippet
+  doc := app.documents.current
+  low := buffer.start(doc)
+  high := buffer.end(doc)
+  primary: usize = 32
+  index: usize = 0
+  for index < state.parsed.count {
+    candidate := &state.parsed.stops[index]
+    if candidate.live && candidate.number == state.current && low >= candidate.start && high <= candidate.end {
+      primary = index
+      break
+    }
+    index += 1
+  }
+  if primary == 32 {
+    state.active = false
+    return false
+  }
+  relative_low := low - state.parsed.stops[primary].start
+  relative_high := high - state.parsed.stops[primary].start
+  // Apply mirrors from right to left, keeping every remaining range up to date.
+  matches: [32]usize = []
+  count: usize = 0
+  index = 0
+  for index < state.parsed.count {
+    if state.parsed.stops[index].live && state.parsed.stops[index].number == state.current {
+      matches[count] = index
+      count += 1
+    }
+    index += 1
+  }
+  if #len(text) > high - low && (#len(text) - (high - low)) > (buffer.Capacity - doc.length) / count {
+    notice(app, "Snippet edit exceeds document capacity.")
+    return true
+  }
+  for order in 0..count {
+    for next in order + 1..count {
+      if state.parsed.stops[matches[next]].start > state.parsed.stops[matches[order]].start {
+        swap := matches[order]
+        matches[order] = matches[next]
+        matches[next] = swap
+      }
+    }
+  }
+  doc.secondary.count = 0
+  for order in 0..count {
+    target := &state.parsed.stops[matches[order]]
+    from := target.start + relative_low
+    to := target.start + relative_high
+    doc.anchor = from
+    doc.cursor = to
+    if !buffer.replace(doc, text) {
+      state.active = false
+      return true
+    }
+    index = 0
+    for index < state.parsed.count {
+      stop := &state.parsed.stops[index]
+      if stop.live {
+        if index == matches[order] || snippet_ancestor(&state.parsed, index, matches[order]) {
+          stop.end = stop.end - (to - from) + #len(text)
+        } else if snippet_ancestor(&state.parsed, matches[order], index) && from < to && stop.start >= from && stop.end <= to {
+          stop.live = false
+        } else if stop.start >= to {
+          stop.start = stop.start - (to - from) + #len(text)
+          stop.end = stop.end - (to - from) + #len(text)
+        } else if stop.end > from {
+          stop.live = false
+        }
+      }
+      index += 1
+    }
+  }
+  state.revision = doc.revision
+  position := state.parsed.stops[primary].start + relative_low + #len(text)
+  doc.anchor = position
+  doc.cursor = position
+  return true
+}
+// The common completion path needs one range replacement, not a whole-document
+// workspace-edit preview, JSON re-encoding, and a 24 MiB temporary arena.
+fn lsp_completion_direct(app: *App, item: *const json.Value) {
+  result := &app.lsp.results
+  doc := app.documents.current
+  content := json_text(item, "insertText")
+  if #len(content) == 0 {
+    content = json_text(item, "label")
+  }
+  edit := json.object_get(item, "textEdit")
+  low := result.position
+  high := result.position
+  if json.is_object(edit) {
+    content = json_text(edit, "newText")
+    range := json.object_get(edit, "range")
+    if range == nil {
+      range = json.object_get(edit, "replace")
+    }
+    start := lsp.json_offset(doc.bytes[..doc.length], json.object_get(range, "start"))
+    end := lsp.json_offset(doc.bytes[..doc.length], json.object_get(range, "end"))
+    if !start.ok || !end.ok || start.value > end.value {
+      notice(app, "Invalid completion range.")
+      return
+    }
+    low = start.value
+    high = completion_shift(result, end.value)
+  } else {
+    for low > 0 {
+      previous := buffer.previous(doc, low)
+      byte := doc.bytes[previous]
+      if !((byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 95 || byte >= 128) {
+        break
+      }
+      low = previous
+    }
+    if low > 0 && #len(content) > 0 && content[0] == '#' && doc.bytes[low - 1] == '#' {
+      low -= 1
+    }
+  }
+  mark := mem.arena_mark(app.scratch)
+  defer mem.arena_rewind(app.scratch, mark)
+  parsed := lsp.Snippet{}
+  format := lsp.number(json.object_get(item, "insertTextFormat"))
+  if format.value == 2 {
+    size := #len(content) * 32 + 1
+    if size > buffer.Capacity + 1 {
+      size = buffer.Capacity + 1
+    }
+    if size > mem.arena_remaining(app.scratch) {
+      notice(app, "Snippet exceeds temporary text capacity.")
+      return
+    }
+    output := mem.arena_push_uninit(app.scratch, size, 1)[..size]
+    parsed = lsp.parse_snippet(content, output)
+    if !parsed.ok {
+      notice(app, "Unsupported or oversized snippet; buffer unchanged.")
+      return
+    }
+    content = output[..parsed.length]
+  }
+  if !buffer.valid(content) || #len(content) > buffer.Capacity - (doc.length - (high - low)) {
+    notice(app, "Completion exceeds document capacity or contains invalid text.")
+    return
+  }
+  buffer.checkpoint(doc)
+  doc.secondary.count = 0
+  doc.anchor = low
+  doc.cursor = high
+  _ = buffer.replace(doc, content)
+  buffer.checkpoint(doc)
+  app.lsp.snippet.active = false
+  app.prompt_state.panel = Panel.None
+  app.view.insert = result.insert
+  if parsed.ok {
+    snippet_begin(app, parsed, low)
+  }
+  lsp_results_release(app)
+}
+fn snippet_ancestor(parsed: *const lsp.Snippet, ancestor: usize, child: usize) bool {
+  parent := parsed.stops[child].parent
+  depth: usize = 0
+  for parent < parsed.count && depth < 32 {
+    if parent == ancestor {
+      return true
+    }
+    parent = parsed.stops[parent].parent
+    depth += 1
+  }
+  return false
+}

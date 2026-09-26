@@ -1,31 +1,356 @@
-#link("SDL3")
-// SDL3 ABI declarations, checked against SDL3 headers. No C runtime shim.
+// SDL3 ABI declarations. Drawing, event and window calls go through wrappers
+// that route to the terminal backend (tui.dyn) while it is active.
+extern fn string_length "strlen"(text: *const u8) usize
+// Dummy non-nil handle for windows, renderers and textures in the terminal.
+tui_handle: u8 = 0
+// SDL3 ABI declarations. Field order and padding must match SDL headers.
+// Do not regroup fields by type: SDL writes these events directly into memory.
 pub struct Event { words: [16]u64 }
-pub struct KeyEvent { kind: u32, reserved: u32, timestamp: u64, window: u32, device: u32, scancode: u32, key: u32, modifiers: u16, raw: u16, down: bool, repeated: bool }
-pub struct TextEvent { kind: u32, reserved: u32, timestamp: u64, window: u32, text: *const u8 }
-pub struct Rect { x: f32, y: f32, width: f32, height: f32 }
-pub extern fn init "SDL_Init"(flags: u32) bool
-pub extern fn quit "SDL_Quit"()
-pub extern fn create_window "SDL_CreateWindow"(title: *const u8, width: i32, height: i32, flags: u64) rawptr
-pub extern fn destroy_window "SDL_DestroyWindow"(window: rawptr)
-pub extern fn create_renderer "SDL_CreateRenderer"(window: rawptr, name: *const u8) rawptr
-pub extern fn destroy_renderer "SDL_DestroyRenderer"(renderer: rawptr)
-pub extern fn color "SDL_SetRenderDrawColor"(renderer: rawptr, r: u8, g: u8, b: u8, a: u8) bool
-pub extern fn clear "SDL_RenderClear"(renderer: rawptr) bool
-pub extern fn present "SDL_RenderPresent"(renderer: rawptr) bool
-pub extern fn scale "SDL_SetRenderScale"(renderer: rawptr, x: f32, y: f32) bool
-pub extern fn fill "SDL_RenderFillRect"(renderer: rawptr, rectangle: *const Rect) bool
-pub extern fn size "SDL_GetRenderOutputSize"(renderer: rawptr, width: *i32, height: *i32) bool
-pub extern fn wait "SDL_WaitEvent"(event: *Event) bool
-pub extern fn start_text "SDL_StartTextInput"(window: rawptr) bool
-pub extern fn stop_text "SDL_StopTextInput"(window: rawptr) bool
-pub extern fn push "SDL_PushEvent"(event: *Event) bool
-pub extern fn display_scale "SDL_GetWindowDisplayScale"(window: rawptr) f32
-pub extern fn wait_timeout "SDL_WaitEventTimeout"(event: *Event, milliseconds: i32) bool
-pub extern fn title "SDL_SetWindowTitle"(window: rawptr, title: *const u8) bool
-pub extern fn clipboard_set "SDL_SetClipboardText"(text: *const u8) bool
-pub extern fn clipboard_get "SDL_GetClipboardText"() *const u8
-pub extern fn free "SDL_free"(pointer: rawptr)
-pub struct PixelRect { x: i32, y: i32, width: i32, height: i32 }
-pub extern fn clip "SDL_SetRenderClipRect"(renderer: rawptr, rectangle: *const PixelRect) bool
-pub extern fn poll "SDL_PollEvent"(event: *Event) bool
+pub struct KeyEvent {
+  kind: u32,
+  reserved: u32,
+  timestamp: u64,
+  window: u32,
+  device: u32,
+  scancode: u32,
+  key: u32,
+  modifiers: u16,
+  raw: u16,
+  down: bool,
+  repeated: bool,
+}
+pub struct TextEvent { kind, reserved: u32, timestamp: u64, window: u32, text: *const u8 }
+pub struct Rect { x, y, width, height: f32 }
+pub struct PixelRect { x, y, width, height: i32 }
+// SDL_Vertex: position, float color, texture coordinate.
+pub struct Vertex { x, y, red, green, blue, alpha, u, v: f32 }
+pub struct MouseButton {
+  kind: u32,
+  reserved: u32,
+  timestamp: u64,
+  window: u32,
+  device: u32,
+  button: u8,
+  down: bool,
+  clicks: u8,
+  padding: u8,
+  x: f32,
+  y: f32,
+}
+pub struct MouseMotion {
+  kind: u32,
+  reserved: u32,
+  timestamp: u64,
+  window: u32,
+  device: u32,
+  state: u32,
+  x: f32,
+  y: f32,
+  xrel: f32,
+  yrel: f32,
+}
+pub fn system_cursor(id: u32) rawptr {
+  if tui_active() {
+    return #cast(rawptr) &tui_handle
+  }
+  return sdl_system_cursor(id)
+}
+pub fn set_cursor(cursor: rawptr) bool {
+  if tui_active() {
+    return true
+  }
+  return sdl_set_cursor(cursor)
+}
+pub fn destroy_cursor(cursor: rawptr) {
+  if tui_active() {
+    return
+  }
+  sdl_destroy_cursor(cursor)
+}
+pub struct DisplayMode {
+  display: u32,
+  format: u32,
+  width: i32,
+  height: i32,
+  density: f32,
+  refresh: f32,
+  numerator: i32,
+  denominator: i32,
+  internal: rawptr,
+}
+pub fn render_vsync(renderer: rawptr, vsync: i32) bool {
+  if tui_active() {
+    return false
+  }
+  return sdl_render_vsync(renderer, vsync)
+}
+// The keycode a scancode produces with modifiers applied (Shift+4 is $ on a
+// US layout); key events themselves carry the unmodified key.
+pub fn key_from_scancode(scancode: u32, modifiers: u16, key_event: bool) u32 {
+  if tui_active() {
+    return tui_last_character()
+  }
+  return sdl_key_from_scancode(scancode, modifiers, key_event)
+}
+pub fn window_display(window: rawptr) u32 {
+  if tui_active() {
+    return 0
+  }
+  return sdl_window_display(window)
+}
+pub fn display_mode(display: u32) *const DisplayMode {
+  if tui_active() {
+    return nil
+  }
+  return sdl_display_mode(display)
+}
+pub struct MouseWheel {
+  kind: u32,
+  reserved: u32,
+  timestamp: u64,
+  window: u32,
+  device: u32,
+  x: f32,
+  y: f32,
+  direction: u32,
+  mouse_x: f32,
+  mouse_y: f32,
+}
+pub struct EditingEvent {
+  kind: u32,
+  reserved: u32,
+  timestamp: u64,
+  window: u32,
+  text: *const u8,
+  start: i32,
+  length: i32,
+}
+
+pub fn create_window(title: *const u8, width: i32, height: i32, flags: u64) rawptr {
+  if tui_active() {
+    return #cast(rawptr) &tui_handle
+  }
+  return sdl_create_window(title, width, height, flags)
+}
+pub fn destroy_window(window: rawptr) {
+  if tui_active() {
+    return
+  }
+  sdl_destroy_window(window)
+}
+pub fn create_renderer(window: rawptr, name: *const u8) rawptr {
+  if tui_active() {
+    return #cast(rawptr) &tui_handle
+  }
+  return sdl_create_renderer(window, name)
+}
+pub fn destroy_renderer(renderer: rawptr) {
+  if tui_active() {
+    return
+  }
+  sdl_destroy_renderer(renderer)
+}
+pub fn color(renderer: rawptr, r: u8, g: u8, b: u8, a: u8) bool {
+  if tui_active() {
+    tui_color(r, g, b)
+    return true
+  }
+  return sdl_color(renderer, r, g, b, a)
+}
+pub fn clear(renderer: rawptr) bool {
+  if tui_active() {
+    tui_clear()
+    return true
+  }
+  return sdl_clear(renderer)
+}
+pub fn present(renderer: rawptr) bool {
+  if tui_active() {
+    tui_present()
+    return true
+  }
+  return sdl_present(renderer)
+}
+pub fn scale(renderer: rawptr, x: f32, y: f32) bool {
+  if tui_active() {
+    return true
+  }
+  return sdl_scale(renderer, x, y)
+}
+pub fn fill(renderer: rawptr, rectangle: *const Rect) bool {
+  if tui_active() {
+    tui_fill(rectangle)
+    return true
+  }
+  return sdl_fill(renderer, rectangle)
+}
+pub fn geometry(renderer: rawptr, texture: rawptr, vertices: *const Vertex, count: i32, indices: *const i32, index_count: i32) bool {
+  if tui_active() {
+    return true
+  }
+  return sdl_geometry(renderer, texture, vertices, count, indices, index_count)
+}
+pub fn size(renderer: rawptr, width: *i32, height: *i32) bool {
+  if tui_active() {
+    tui_size(width, height)
+    return true
+  }
+  return sdl_size(renderer, width, height)
+}
+pub fn wait(event: *Event) bool {
+  if tui_active() {
+    return tui_wait(event, -1)
+  }
+  return sdl_wait(event)
+}
+pub fn start_text(window: rawptr) bool {
+  if tui_active() {
+    tui_text_input(true)
+    return true
+  }
+  return sdl_start_text(window)
+}
+pub fn stop_text(window: rawptr) bool {
+  if tui_active() {
+    tui_text_input(false)
+    return true
+  }
+  return sdl_stop_text(window)
+}
+pub fn push(event: *Event) bool {
+  if tui_active() {
+    tui_push(event)
+    return true
+  }
+  return sdl_push(event)
+}
+pub fn display_scale(window: rawptr) f32 {
+  if tui_active() {
+    return 1.0
+  }
+  return sdl_display_scale(window)
+}
+pub fn wait_timeout(event: *Event, milliseconds: i32) bool {
+  if tui_active() {
+    return tui_wait(event, milliseconds)
+  }
+  return sdl_wait_timeout(event, milliseconds)
+}
+pub fn title(window: rawptr, title: *const u8) bool {
+  if tui_active() {
+    tui_title(title, string_length(title))
+    return true
+  }
+  return sdl_title(window, title)
+}
+pub fn clipboard_set(text: *const u8) bool {
+  if tui_active() {
+    tui_clipboard_set(text, string_length(text))
+    return true
+  }
+  return sdl_clipboard_set(text)
+}
+pub fn clipboard_get() *const u8 {
+  if tui_active() {
+    return tui_clipboard_get()
+  }
+  return sdl_clipboard_get()
+}
+pub fn free(pointer: rawptr) {
+  if tui_active() {
+    tui_free(pointer)
+    return
+  }
+  sdl_free(pointer)
+}
+pub fn clip(renderer: rawptr, rectangle: *const PixelRect) bool {
+  if tui_active() {
+    tui_clip(rectangle)
+    return true
+  }
+  return sdl_clip(renderer, rectangle)
+}
+pub fn poll(event: *Event) bool {
+  if tui_active() {
+    return tui_poll(event)
+  }
+  return sdl_poll(event)
+}
+// Milliseconds since startup; native, so terminal-only builds need no SDL.
+pub extern fn ticks "dna_ticks"() u64
+pub fn create_texture(renderer: rawptr, format: u32, access: i32, width: i32, height: i32) rawptr {
+  if tui_active() {
+    return #cast(rawptr) &tui_handle
+  }
+  return sdl_create_texture(renderer, format, access, width, height)
+}
+pub fn destroy_texture(texture: rawptr) {
+  if tui_active() {
+    return
+  }
+  sdl_destroy_texture(texture)
+}
+pub fn texture_blend(texture: rawptr, mode: u32) bool {
+  if tui_active() {
+    return true
+  }
+  return sdl_texture_blend(texture, mode)
+}
+pub fn texture_alpha(texture: rawptr, alpha: u8) bool {
+  if tui_active() {
+    return true
+  }
+  return sdl_texture_alpha(texture, alpha)
+}
+pub fn target(renderer: rawptr, texture: rawptr) bool {
+  if tui_active() {
+    tui_target(texture != nil)
+    return true
+  }
+  return sdl_target(renderer, texture)
+}
+pub fn render_texture(renderer: rawptr, texture: rawptr, source: *const Rect, destination: *const Rect) bool {
+  if tui_active() {
+    return true
+  }
+  return sdl_render_texture(renderer, texture, source, destination)
+}
+pub fn viewport(renderer: rawptr, rectangle: *const PixelRect) bool {
+  if tui_active() {
+    tui_viewport(rectangle)
+    return true
+  }
+  return sdl_viewport(renderer, rectangle)
+}
+pub fn window_size(window: rawptr, width: *i32, height: *i32) bool {
+  if tui_active() {
+    tui_size(width, height)
+    return true
+  }
+  return sdl_window_size(window, width, height)
+}
+pub fn clear_composition(window: rawptr) bool {
+  if tui_active() {
+    return true
+  }
+  return sdl_clear_composition(window)
+}
+pub fn text_area(window: rawptr, area: *const PixelRect, cursor: i32) bool {
+  if tui_active() {
+    return true
+  }
+  return sdl_text_area(window, area, cursor)
+}
+pub fn modifiers() u16 {
+  if tui_active() {
+    return tui_modifiers()
+  }
+  return sdl_modifiers()
+}
+// Resize the window and wait until the system has applied it.
+pub fn set_window_size(window: rawptr, width: i32, height: i32) bool {
+  if tui_active() {
+    return false
+  }
+  return sdl_set_window_size(window, width, height) && sdl_sync_window(window)
+}

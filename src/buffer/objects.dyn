@@ -1,0 +1,418 @@
+pub struct ObjectSpan { found: bool, low, high: usize }
+struct Delimiter { position: usize, byte: u8 }
+
+fn opening(byte: u8) u8 {
+  if byte == 41 {
+    return 40
+  }
+  if byte == 93 {
+    return 91
+  }
+  if byte == 125 {
+    return 123
+  }
+  if byte == 62 {
+    return 60
+  }
+  return byte
+}
+fn closing(byte: u8) u8 {
+  if byte == 40 {
+    return 41
+  }
+  if byte == 91 {
+    return 93
+  }
+  if byte == 123 {
+    return 125
+  }
+  if byte == 60 {
+    return 62
+  }
+  return byte
+}
+fn escaped(document: *const Document, at: usize) bool {
+  preceding := at
+  count: usize = 0
+  for preceding > 0 && document.bytes[preceding - 1] == 92 {
+    preceding -= 1
+    count += 1
+  }
+  return count % 2 != 0
+}
+// Lexical pairs, not language syntax: quoted strings shield brackets, escaped
+// quotes do not close strings, and mismatched brackets invalidate the stack.
+pub fn surrounding(document: *const Document, selection: Selection, key: u8, count: usize) ObjectSpan {
+  low := selection.anchor
+  high := selection.cursor
+  if low > high {
+    swap := low
+    low = high
+    high = swap
+  }
+  wanted := opening(key)
+  stack: [256]Delimiter = []
+  depth: usize = 0
+  candidates: [256]ObjectSpan = []
+  found: usize = 0
+  at: usize = 0
+  quote: u8 = 0
+  quote_at: usize = 0
+  for at < document.length {
+    byte := document.bytes[at]
+    pair := ObjectSpan{}
+    pair_key: u8 = 0
+    if quote != 0 {
+      if byte == quote && !escaped(document, at) {
+        pair = ObjectSpan{found: true, low: quote_at, high: at + 1}
+        pair_key = quote
+        quote = 0
+      }
+    } else if (byte == 34 || byte == 39 || byte == 96 || (key != 109 && wanted == closing(wanted) && byte == wanted)) && !escaped(document, at) {
+      quote = byte
+      quote_at = at
+    }
+    else if byte == 40 || byte == 91 || byte == 123 || (wanted == 60 && byte == 60) {
+      if depth == 256 {
+        return ObjectSpan{}
+      }
+      stack[depth] = Delimiter{position: at, byte: byte}
+      depth += 1
+    } else if byte == 41 || byte == 93 || byte == 125 || (wanted == 60 && byte == 62) {
+      if depth > 0 && closing(stack[depth - 1].byte) == byte {
+        depth -= 1
+        pair = ObjectSpan{found: true, low: stack[depth].position, high: at + 1}
+        pair_key = stack[depth].byte
+      }
+      else {
+        depth = 0
+      }
+    }
+    if pair.found && (key == 109 || wanted == pair_key) && low >= pair.low && high <= pair.high && low < pair.high {
+      if found == 256 {
+        return ObjectSpan{}
+      }
+      candidates[found] = pair
+      found += 1
+    }
+    at = next(document, at)
+  }
+  // Nested pairs close from inside out, already ordered by containment.
+  if count == 0 || count > found {
+    return ObjectSpan{}
+  }
+  return candidates[count - 1]
+}
+fn blank_line(document: *const Document, position: usize) bool {
+  ending := line_end(document, position)
+  for at in position..ending {
+    byte := document.bytes[at]
+    if byte != 32 && byte != 9 && byte != 13 {
+      return false
+    }
+  }
+  return true
+}
+pub fn text_object(document: *const Document, selection: Selection, key: u8, around: bool, count: usize) ObjectSpan {
+  position := selection.cursor
+  if position > selection.anchor {
+    position = previous(document, position)
+  }
+  if key != 119 && key != 87 && key != 112 {
+    pair := surrounding(document, selection, key, count)
+    if pair.found && !around {
+      pair.low += 1
+      pair.high -= 1
+    }
+    return pair
+  }
+  if position >= document.length {
+    if document.length == 0 {
+      return ObjectSpan{}
+    }
+    position = previous(document, position)
+  }
+  low := position
+  high := position
+  if key == 112 {
+    low = line_start(document, position)
+    high = line_end(document, position)
+    if blank_line(document, low) {
+      return ObjectSpan{}
+    }
+    for low > 0 {
+      before := line_start(document, low - 1)
+      if blank_line(document, before) {
+        break
+      }
+      low = before
+    }
+    paragraphs: usize = 1
+    for high < document.length {
+      following := high + 1
+      ending := line_end(document, following)
+      if blank_line(document, following) {
+        if paragraphs >= count {
+          break
+        }
+        paragraphs += 1
+        for following < document.length && blank_line(document, following) {
+          following = line_end(document, following)
+          if following < document.length {
+            following += 1
+          }
+        }
+        ending = line_end(document, following)
+      }
+      high = ending
+    }
+    if high < document.length {
+      high += 1
+    }
+    if around {
+      for high < document.length && blank_line(document, high) {
+        high = line_end(document, high)
+        if high < document.length {
+          high += 1
+        }
+      }
+    }
+  } else {
+    big := key == 87
+    kind := word_class(document, position, big)
+    for low > 0 && word_class(document, previous(document, low), big) == kind {
+      low = previous(document, low)
+    }
+    for high < document.length && word_class(document, high, big) == kind {
+      high = next(document, high)
+    }
+    words: usize = 1
+    for words < count && high < document.length {
+      for high < document.length && word_class(document, high, big) == 0 {
+        high = next(document, high)
+      }
+      next_kind := word_class(document, high, big)
+      for high < document.length && word_class(document, high, big) == next_kind {
+        high = next(document, high)
+      }
+      words += 1
+    }
+    if around {
+      after := high
+      for high < document.length && word_class(document, high, big) == 0 {
+        high = next(document, high)
+      }
+      if high == after {
+        for low > 0 && word_class(document, previous(document, low), big) == 0 {
+          low = previous(document, low)
+        }
+      }
+    }
+  }
+  return ObjectSpan{found: true, low: low, high: high}
+}
+pub fn select_objects(document: *Document, key: u8, around: bool, count: usize, jump: bool, extend: bool) bool {
+  originals: [32]Selection = []
+  originals[0] = Selection{cursor: document.cursor, anchor: document.anchor}
+  output: [32]Selection = []
+
+  for index in 0..document.secondary.count {
+    originals[index + 1] = document.secondary.ranges[index]
+  }
+
+  for index in 0..=document.secondary.count {
+    original := originals[index]
+    span := text_object(document, original, key, around, count)
+    if !span.found {
+      return false
+    }
+    if jump {
+      position := original.cursor
+      if position > original.anchor {
+        position = previous(document, position)
+      }
+      destination := span.high - 1
+      if position == destination {
+        destination = span.low
+      }
+      fixed := destination
+      if extend {
+        fixed = original.anchor
+        if original.cursor < original.anchor {
+          fixed = previous(document, fixed)
+        }
+      }
+      if destination < fixed {
+        output[index] = Selection{cursor: destination, anchor: next(document, fixed)}
+      }
+      else {
+        output[index] = Selection{anchor: fixed, cursor: next(document, destination)}
+      }
+    } else if original.cursor < original.anchor {
+      output[index] = Selection{cursor: span.low, anchor: span.high}
+    }
+    else {
+      output[index] = Selection{anchor: span.low, cursor: span.high}
+    }
+  }
+
+  document.cursor = output[0].cursor
+  document.anchor = output[0].anchor
+
+  for index in 0..document.secondary.count {
+    document.secondary.ranges[index] = output[index + 1]
+    index += 1
+  }
+  return true
+}
+struct SurroundEdit { at: usize, remove: usize, byte: u8, insert: bool, order: u8, result: usize }
+fn surround_edit(edits: []SurroundEdit, count: *usize, edit: SurroundEdit) bool {
+  for index in 0..count.* {
+    existing := edits[index]
+    if existing.at == edit.at && existing.remove == edit.remove && existing.byte == edit.byte && existing.insert == edit.insert && existing.order == edit.order {
+      return true
+    }
+    if existing.at == edit.at && (existing.remove != 0 || edit.remove != 0) {
+      return false
+    }
+    index += 1
+  }
+
+  if count.* == #len(edits) {
+    return false
+  }
+
+  edits[count.*] = edit
+  count.* += 1
+  return true
+}
+// One validated batch and one undo group, including multiple selections. Only
+// delimiter bytes change; row identities and other panes' tracked positions survive.
+pub fn surround(document: *Document, mode: u8, from: u8, to: u8, count: usize) bool {
+  originals: [32]Selection = []
+  originals[0] = Selection{cursor: document.cursor, anchor: document.anchor}
+  for index in 0..document.secondary.count {
+    originals[index + 1] = document.secondary.ranges[index]
+  }
+  spans: [32]ObjectSpan = []
+  edits: [64]SurroundEdit = []
+  edit_count: usize = 0
+  ranges := document.secondary.count + 1
+  for index in 0..ranges {
+    selection := originals[index]
+    low := selection.anchor
+    high := selection.cursor
+    if low > high {
+      swap := low
+      low = high
+      high = swap
+    }
+    if mode != 0 {
+      pair := surrounding(document, selection, from, count)
+      if !pair.found {
+        return false
+      }
+      low = pair.low
+      high = pair.high - 1
+    }
+    if mode == 0 {
+      for prior in 0..index {
+        existing_span := spans[prior]
+        if (low < existing_span.low && high > existing_span.low && high < existing_span.high) || (existing_span.low < low && existing_span.high > low && existing_span.high < high) {
+          return false
+        }
+      }
+    }
+    spans[index] = ObjectSpan{found: true, low: low, high: high}
+    remove: usize = 0
+    if mode != 0 {
+      remove = 1
+    }
+    left_order: u8 = 2
+    if low == high {
+      left_order = 0
+    }
+    if !surround_edit(edits[..], &edit_count, SurroundEdit{at: low, remove: remove, byte: opening(to), insert: mode != 1, order: left_order}) {
+      return false
+    }
+    if !surround_edit(edits[..], &edit_count, SurroundEdit{at: high, remove: remove, byte: closing(opening(to)), insert: mode != 1, order: 1}) {
+      return false
+    }
+    index += 1
+  }
+  for index in 1..edit_count {
+    moving := edits[index]
+    at := index
+    for at > 0 && (edits[at - 1].at > moving.at || (edits[at - 1].at == moving.at && edits[at - 1].order > moving.order)) {
+      edits[at] = edits[at - 1]
+      at -= 1
+    }
+    edits[at] = moving
+  }
+  added: usize = 0
+  removed: usize = 0
+  for index in 0..edit_count {
+    edit := &edits[index]
+    edit.result = edit.at - removed + added
+    removed += edit.remove
+    if edit.insert {
+      added += 1
+    }
+  }
+  if added > Capacity - (document.length - removed) {
+    return false
+  }
+  checkpoint(document)
+  document.secondary.count = 0
+  index := edit_count
+  for index > 0 {
+    index -= 1
+    applying := edits[index]
+    document.anchor = applying.at
+    document.cursor = applying.at + applying.remove
+    text: [1]u8 = [applying.byte]
+    length: usize = 0
+    if applying.insert {
+      length = 1
+    }
+    _ = replace(document, text[..length])
+  }
+  index = 0
+  for index < ranges {
+    span := spans[index]
+    low_result: usize = 0
+    high_result: usize = 0
+    left_order_result: u8 = 2
+    if span.low == span.high {
+      left_order_result = 0
+    }
+    for scan in 0..edit_count {
+      edit_result := edits[scan]
+      if edit_result.at == span.low && edit_result.order == left_order_result {
+        low_result = edit_result.result
+      }
+      if edit_result.at == span.high && edit_result.order == 1 {
+        high_result = edit_result.result
+        if edit_result.insert {
+          high_result += 1
+        }
+      }
+    }
+    result := Selection{anchor: low_result, cursor: high_result}
+    if originals[index].cursor < originals[index].anchor {
+      result.anchor = high_result
+      result.cursor = low_result
+    }
+    if index == 0 {
+      document.cursor = result.cursor
+      document.anchor = result.anchor
+    }
+    else {
+      document.secondary.ranges[document.secondary.count] = result
+      document.secondary.count += 1
+    }
+    index += 1
+  }
+  checkpoint(document)
+  return true
+}

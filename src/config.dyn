@@ -1,0 +1,491 @@
+struct ConfigurationState {
+  watcher: rawptr,
+  notifications: bool,
+  stamp: [6]u64,
+  stamp_ready: bool,
+  watch_due: u64,
+  theme: [4096]u8,
+  fallback: [4096]u8,
+  font_family: [257]u8,
+  font_path: [4096]u8,
+  shell_path: [4096]u8,
+  path: [4096]u8,
+  path_length: usize,
+  binding_commands: [2048]u8,
+  task_commands: [3072]u8,
+  setting_key: [128]u8,
+  setting_key_length: usize,
+  // :set values for this session, as config lines layered over the files:
+  // top-level keys, then [modules] keys, then [place.NAME] sections. :theme,
+  // :keymap, :module and placement changes record here too, so they survive
+  // :config-reload and move with the session to the other frontend.
+  overrides: [4096]u8,
+  overrides_length: usize,
+  module_overrides: [1024]u8,
+  module_overrides_length: usize,
+  place_overrides: [2048]u8,
+  place_overrides_length: usize,
+  // Bumped by every reload; per-file settings resolve again after it.
+  file_generation: u64,
+  // Last accepted global source; invalid disk edits must not change file rules.
+  global_source: [16384]u8,
+  global_source_length: usize,
+  global_source_ready: bool,
+}
+
+struct FontState {
+  active_font_path: [4096]u8,
+  active_font_length: usize,
+  original_font_path: [4096]u8,
+  original_font_length: usize,
+  active_fallback_path: [4096]u8,
+  active_fallback_length: usize,
+}
+
+extern fn path_watch_open "dna_path_watch_open"(path: *const u8) rawptr
+extern fn path_watch_poll "dna_path_watch_poll"(watcher: rawptr) i32
+extern fn path_watch_close "dna_path_watch_close"(watcher: rawptr)
+fn configuration_release(app: *App) {
+  if app.configuration.watcher != nil {
+    path_watch_close(app.configuration.watcher)
+    app.configuration.watcher = nil
+  }
+}
+extern fn default_system_font "dna_default_font"(output: *u8, capacity: usize) i32
+extern fn match_system_font "dna_match_font"(family: *const u8, output: *u8, capacity: usize) i32
+extern fn file_stamp "dna_file_stamp"(path: *const u8, output: *u64) i32
+extern fn system_fonts "dna_fonts"(output: *u8, capacity: usize) usize
+
+fn config_location(app: *App) {
+  settings.defaults(&app.config)
+  storage: [4096]u8 = []
+  configured := process.environment("DNA_CONFIG", storage[..])
+  if configured.ok && configured.found {
+    app.configuration.path_length = copy_text(app.configuration.path[..], configured.value)
+    return
+  }
+  base := process.environment("XDG_CONFIG_HOME", storage[..])
+  if base.ok && base.found && #len(base.value) > 0 {
+    app.configuration.path_length = copy_text(app.configuration.path[..], base.value)
+  }
+  else {
+    home := process.environment("HOME", storage[..])
+    if !home.ok || !home.found {
+      return
+    }
+    app.configuration.path_length = copy_text(app.configuration.path[..], home.value)
+    add_text(app.configuration.path[..], &app.configuration.path_length, "/.config")
+  }
+  add_text(app.configuration.path[..], &app.configuration.path_length, "/dna/config.toml")
+}
+fn release_config_font(typography: *Typography) {
+  if typography.fallback_font != nil {
+    ttf.remove_fallback(typography.font, typography.fallback_font)
+    ttf.close(typography.fallback_font)
+    typography.fallback_font = nil
+  }
+  if typography.configured_font != nil {
+    ttf.close(typography.configured_font)
+    typography.configured_font = nil
+  }
+}
+fn config_reload(app: *App, typography: *Typography, startup: bool) {
+  file_config_invalidate(app)
+  if app.configuration.path_length == 0 {
+    if !startup {
+      notice(app, "No config path: set DNA_CONFIG or HOME.")
+    }
+    return
+  }
+  path := app.configuration.path[..app.configuration.path_length]
+  mark := mem.arena_mark(app.scratch)
+  defer mem.arena_rewind(app.scratch, mark)
+  // Without a global file the defaults stand in, and a dna.toml still applies.
+  read := fs.ReadAllResult{ok: true}
+  if files.metadata(path).ok {
+    read = fs.read_all(app.scratch, path, 16384)
+  }
+  else if startup {
+    project_config_find(app)
+    if app.project_config.path_length == 0 {
+      app.configuration.stamp_ready = true
+      return
+    }
+  }
+  if !read.ok {
+    notice(app, "Cannot read config (maximum 16 KiB).")
+    return
+  }
+  parsed := settings.Settings{}
+  global_layer := settings.Layer{}
+  if !settings.parse_layer(read.data, &parsed, &global_layer) {
+    message: [256]u8 = []
+    used: usize = 0
+    add_text(message[..], &used, "Invalid config at line ")
+    add_number(message[..], &used, parsed.error_line)
+    add_text(message[..], &used, ". Settings unchanged; check config.example.toml.")
+    notice(app, message[..used])
+    return
+  }
+  project_config_find(app)
+  if !project_config_apply(app, &parsed, &global_layer) {
+    // An invalid dna.toml leaves the global settings alone.
+    parsed = settings.Settings{}
+    retry_layer := settings.Layer{}
+    _ = settings.parse_layer(read.data, &parsed, &retry_layer)
+  }
+  if app.project_config.path_length > 0 {
+    app.project_config.stamp_ready = file_stamp(&app.project_config.path[0], &app.project_config.stamp[0]) != 0
+  }
+  project_sections_apply(app, &parsed, &global_layer, read.data)
+  // :set values for this session apply last; locks still hold.
+  if app.configuration.overrides_length > 0 || app.configuration.module_overrides_length > 0 || app.configuration.place_overrides_length > 0 {
+    overrides := (#cast(*u8) mem.arena_push_uninit(app.scratch, 8192, 1))[..8192]
+    session_layer := settings.Layer{project: true, trusted: true, session: true}
+    session_layer.locks = global_layer.locks
+    session_layer.lock_count = global_layer.lock_count
+    if !settings.parse_layer(overrides_text(app, overrides), &parsed, &session_layer) {
+      // A value that no longer applies (say, after a config change) is dropped.
+      app.configuration.overrides_length = 0
+      app.configuration.module_overrides_length = 0
+      app.configuration.place_overrides_length = 0
+      notice(app, ":set values for this session no longer apply and were cleared.")
+      config_reload(app, typography, startup)
+      return
+    }
+  }
+  colors := settings.Palette{light: parsed.light_theme}
+  if #len(parsed.theme_path) > 0 && !theme_prepare(app, parsed.theme_path, &colors) {
+    return
+  }
+  chosen_theme: []const u8 = "charcoal"
+  if parsed.light_theme {
+    chosen_theme = "light"
+  }
+  if #len(parsed.theme_path) > 0 {
+    chosen_theme = parsed.theme_path
+  }
+  parsed.theme_path = ""
+  replacement: rawptr = nil
+  resolved_font: [4096]u8 = []
+  resolved_font_length: usize = 0
+  resolved_fallback: [4096]u8 = []
+  resolved_fallback_length: usize = 0
+  if parsed.font_length > 0 {
+    font_storage: [4096]u8 = []
+    font_path := expand_home(parsed.font[..parsed.font_length], font_storage[..])
+    if #len(font_path) == 0 {
+      notice(app, "Invalid font path; settings unchanged.")
+      return
+    }
+    resolved_font_length = copy_text(resolved_font[..], font_path)
+    replacement = ttf.open(&font_storage[0], parsed.font_size * typography.scale)
+    if replacement == nil {
+      notice(app, "Cannot load configured font; settings unchanged.")
+      return
+    }
+  }
+  if parsed.font_length == 0 && #len(parsed.font_family) > 0 {
+    family: [257]u8 = []
+    resolved_family: [4096]u8 = []
+    _ = copy_text(family[..], parsed.font_family)
+    if match_system_font(&family[0], &resolved_family[0], 4096) == 0 {
+      notice(app, "Cannot resolve configured font family. Settings unchanged.")
+      return
+    }
+    resolved_font_length = copy_text(resolved_font[..], resolved_family[..c.string_length(&resolved_family[0], 4096)])
+    replacement = ttf.open(&resolved_family[0], parsed.font_size * typography.scale)
+    if replacement == nil {
+      notice(app, "Cannot open configured font family. Settings unchanged.")
+      return
+    }
+  }
+  fallback: rawptr = nil
+  if #len(parsed.fallback) > 0 {
+    fallback_storage: [4096]u8 = []
+    fallback_path := expand_home(parsed.fallback, fallback_storage[..])
+    resolved_fallback_length = copy_text(resolved_fallback[..], fallback_path)
+    if #len(fallback_path) > 0 {
+      fallback = ttf.open(&fallback_storage[0], parsed.font_size * typography.scale)
+    }
+    if fallback == nil {
+      if replacement != nil {
+        ttf.close(replacement)
+      }
+      notice(app, "Cannot load fallback font; settings unchanged.")
+      return
+    }
+  }
+  if replacement == nil && typography.configured_font != nil {
+    replacement = typography.original_font
+  }
+  if replacement != nil {
+    terminal_fonts_changed(app)
+    pane_text_font(typography, replacement)
+    if !ttf.set_font(typography.document, replacement) || !ttf.set_font(typography.palette, replacement) || !ttf.set_font(typography.chrome, replacement) || !ttf.set_font(typography.directory_text, replacement) || !ttf.set_font(typography.caret_text, replacement) || !ttf.set_font(typography.preview_text, replacement) || !ttf.set_font(typography.syntax_text, replacement) {
+      #panic("font replacement failed")
+    }
+    release_config_font(typography)
+    typography.configured_font = replacement
+    typography.font = replacement
+    if replacement == typography.original_font {
+      typography.configured_font = nil
+      app.fonts.active_font_length = copy_text(app.fonts.active_font_path[..], app.fonts.original_font_path[..app.fonts.original_font_length])
+    }
+    else {
+      app.fonts.active_font_length = copy_text(app.fonts.active_font_path[..], resolved_font[..resolved_font_length])
+    }
+  }
+  if typography.fallback_font != nil {
+    ttf.remove_fallback(typography.font, typography.fallback_font)
+    ttf.close(typography.fallback_font)
+    typography.fallback_font = nil
+  }
+  if fallback != nil {
+    if !ttf.add_fallback(typography.font, fallback) {
+      ttf.close(fallback)
+      notice(app, "Cannot attach fallback font.")
+      return
+    }
+    typography.fallback_font = fallback
+  }
+  app.fonts.active_fallback_length = copy_text(app.fonts.active_fallback_path[..], resolved_fallback[..resolved_fallback_length])
+  theme_apply(app, typography, &colors)
+  app.theme_state.name_length = copy_text(app.theme_state.name[..], chosen_theme)
+  fallback_length := copy_text(app.configuration.fallback[..], parsed.fallback)
+  parsed.fallback = app.configuration.fallback[..fallback_length]
+  _ = copy_text(app.configuration.theme[..], chosen_theme)
+  _ = copy_text(app.configuration.font_path[..], parsed.font)
+  _ = copy_text(app.configuration.shell_path[..], parsed.shell)
+  family_length := copy_text(app.configuration.font_family[..], parsed.font_family)
+  parsed.font_family = app.configuration.font_family[..family_length]
+  app.lsp.auto_started = 0
+  app.lsp.default_started = 0
+  for configured_slot in 0..16 {
+    reset_slot := &app.documents.slots[configured_slot]
+    if reset_slot.inferred_filetype {
+      reset_slot.filetype_length = 0
+      reset_slot.inferred_filetype = false
+      syntax_reset(reset_slot)
+    }
+  }
+  // Terminal rows are whole cells: no fractional document padding.
+  if sdl.tui_active() {
+    parsed.document_padding = 0.0
+  }
+  // Copy settings, then rebind borrowed strings to App-owned storage.
+  app.configuration.global_source_length = copy_text(app.configuration.global_source[..], read.data)
+  app.configuration.global_source_ready = true
+  app.config = parsed
+  modules_validate(app)
+  app.config.font = app.configuration.font_path[..parsed.font_length]
+  app.config.shell = app.configuration.shell_path[..parsed.shell_length]
+  if app.explorer.document != nil {
+    explorer_context_reset(app)
+  }
+  binding_index: usize = 0
+  for binding_index < app.config.binding_count {
+    bound := &app.config.bindings[binding_index]
+    start := binding_index * 128
+    length := copy_text(app.configuration.binding_commands[start..start + 128], bound.command)
+    bound.command = app.configuration.binding_commands[start..start + length]
+    binding_index += 1
+  }
+  _ = copy_text(app.configuration.task_commands[..1024], parsed.build_command)
+  app.config.build_command = app.configuration.task_commands[..#len(parsed.build_command)]
+  _ = copy_text(app.configuration.task_commands[1024..2048], parsed.test_command)
+  app.config.test_command = app.configuration.task_commands[1024..1024 + #len(parsed.test_command)]
+  _ = copy_text(app.configuration.task_commands[2048..3072], parsed.run_command)
+  app.config.run_command = app.configuration.task_commands[2048..2048 + #len(parsed.run_command)]
+  _ = tint(typography.document, theme().text)
+  _ = tint(typography.directory_text, theme().text)
+  _ = tint(typography.palette, theme().text)
+  typography.points = parsed.font_size
+  typography.line_height = parsed.line_height
+  app.view.reduced_motion = parsed.reduced_motion || sdl.tui_active()
+  app.view.line_numbers = parsed.line_numbers
+  app.view.relative_numbers = parsed.relative_numbers
+  app.view.status_line = parsed.status_line
+  app.view.highlight_line = parsed.highlight_line
+  app.view.popup_width = parsed.popup_width
+  app.view.popup_height = parsed.popup_height
+  resize_font(typography)
+  app.view.revision += 1
+  app.prompt_state.panel = Panel.None
+  // A missing global file is a known state (zero stamps) until it appears.
+  app.configuration.stamp_ready = file_stamp(&app.configuration.path[0], &app.configuration.stamp[0]) != 0 || !files.metadata(path).ok
+}
+fn font_refresh(app: *App) {
+  app.completion.count = 0
+  app.completion.selected = 0
+  app.completion.chosen = false
+  app.completion.prefix_length = 0
+  at: usize = 0
+  for at < app.resource_state.font_list_length && app.completion.count < 128 {
+    end := at
+    for end < app.resource_state.font_list_length && app.resource_state.font_list[end] != 10 {
+      end += 1
+    }
+    path := app.resource_state.font_list[at..end]
+    at = end + 1
+    if #len(path) < 512 && contains(path, app.prompt_state.text[..app.prompt_state.length]) {
+      entry := &app.completion.entries[app.completion.count]
+      entry.length = copy_text(entry.name[..], path)
+      app.completion.count += 1
+    }
+  }
+}
+fn font_picker(app: *App) {
+  app.resource_state.font_list_length = system_fonts(&app.resource_state.font_list[0], 65536)
+  app.resource_state.kind = 0
+  app.resource_state.fonts = true
+  panel(app, Panel.Open)
+}
+fn font_select(app: *App, typography: *Typography, path: []const u8) {
+  storage: [4096]u8 = []
+  expanded := expand_home(path, storage[..])
+  if #len(expanded) == 0 {
+    notice(app, "Invalid font path.")
+    return
+  }
+  replacement := ttf.open(&storage[0], typography.points * typography.scale)
+  if replacement == nil {
+    notice(app, "Cannot open selected font.")
+    return
+  }
+  terminal_fonts_changed(app)
+  pane_text_font(typography, replacement)
+  if !ttf.set_font(typography.document, replacement) || !ttf.set_font(typography.palette, replacement) || !ttf.set_font(typography.chrome, replacement) || !ttf.set_font(typography.directory_text, replacement) || !ttf.set_font(typography.caret_text, replacement) || !ttf.set_font(typography.preview_text, replacement) || !ttf.set_font(typography.syntax_text, replacement) {
+    #panic("font replacement failed")
+  }
+  release_config_font(typography)
+  typography.configured_font = replacement
+  typography.font = replacement
+  app.fonts.active_font_length = copy_text(app.fonts.active_font_path[..], expanded)
+  app.fonts.active_fallback_length = 0
+  app.resource_state.fonts = false
+  app.prompt_state.panel = Panel.None
+  resize_font(typography)
+  app.view.revision += 1
+}
+fn configured_key(app: *App, typography: *Typography, key: u32, modifiers: u16) bool {
+  scope: u8 = 0
+  if app.prompt_state.panel == Panel.None && !app.view.insert && !app.view.extend && app.documents.slots[app.documents.active].terminal.handle == nil {
+    scope = 1
+  }
+  else if app.prompt_state.panel == Panel.Leader && !app.input_state.leader_explorer {
+    scope = 2
+  }
+  if scope == 0 {
+    return false
+  }
+  index: usize = 0
+  for index < app.config.binding_count {
+    binding := &app.config.bindings[index]
+    normalized: u16 = 0
+    if (modifiers & ModShift) != 0 {
+      normalized = normalized | 3
+    }
+    if (modifiers & ModCtrl) != 0 {
+      normalized = normalized | 192
+    }
+    if (modifiers & ModAlt) != 0 {
+      normalized = normalized | 768
+    }
+    if binding.scope == scope && binding.key == key && binding.modifiers == normalized {
+      app.prompt_state.panel = Panel.Commands
+      app.prompt_state.length = copy_text(app.prompt_state.text[..], binding.command)
+      app.prompt_state.selected = 0
+      command_execute(app, typography)
+      return true
+    }
+    index += 1
+  }
+  return false
+}
+fn cleanup_config_fonts(typography: *Typography) {
+  release_pane_text(typography)
+  if typography.configured_font != nil {
+    _ = ttf.set_font(typography.document, typography.original_font)
+    _ = ttf.set_font(typography.palette, typography.original_font)
+    _ = ttf.set_font(typography.chrome, typography.original_font)
+    _ = ttf.set_font(typography.directory_text, typography.original_font)
+    _ = ttf.set_font(typography.caret_text, typography.original_font)
+    _ = ttf.set_font(typography.preview_text, typography.original_font)
+    _ = ttf.set_font(typography.syntax_text, typography.original_font)
+  }
+  release_config_font(typography)
+}
+fn config_watch(app: *App, typography: *Typography) bool {
+  if !app.config.reload_config || app.configuration.path_length == 0 {
+    configuration_release(app)
+    return false
+  }
+  now := sdl.ticks()
+  if app.configuration.watcher == nil && now >= app.configuration.watch_due {
+    app.configuration.watcher = path_watch_open(&app.configuration.path[0])
+  }
+  changed_path: i32 = 0
+  if app.configuration.watcher != nil {
+    changed_path = path_watch_poll(app.configuration.watcher)
+  }
+  if changed_path < 0 {
+    configuration_release(app)
+  }
+  if changed_path == 0 && now < app.configuration.watch_due {
+    return false
+  }
+  interval: u64 = 1000
+  if app.configuration.watcher != nil && app.configuration.notifications {
+    interval = 30000
+  }
+  app.configuration.watch_due = now + interval
+  current: [6]u64 = []
+  _ = file_stamp(&app.configuration.path[0], &current[0])
+  // A new project directory, or an edited dna.toml, reloads as well.
+  project := &app.project_config
+  changed: bool = false
+  if !buffer.equal(project.root[..project.root_length], app.workspace.project[..app.workspace.project_length]) {
+    // Personal project sections also change when neither directory has dna.toml.
+    project_config_find(app)
+    changed = true
+    project.stamp_ready = false
+  }
+  else if project.path_length > 0 {
+    project_now: [6]u64 = []
+    if file_stamp(&project.path[0], &project_now[0]) == 0 || !project.stamp_ready {
+      changed = true
+    }
+    for project_index in 0..6 {
+      if project_now[project_index] != project.stamp[project_index] {
+        changed = true
+      }
+    }
+  }
+  else if project.root_length > 0 {
+    // A dna.toml created in the project directory after startup.
+    created: [4200]u8 = []
+    created_length := copy_text(created[..], project.root[..project.root_length])
+    add_text(created[..], &created_length, "/dna.toml")
+    created_stamp: [6]u64 = []
+    if file_stamp(&created[0], &created_stamp[0]) != 0 {
+      changed = true
+    }
+  }
+  for index in 0..6 {
+    if current[index] != app.configuration.stamp[index] {
+      changed = true
+    }
+  }
+  if !changed && app.configuration.stamp_ready {
+    return false
+  }
+  app.configuration.stamp = current
+  app.configuration.stamp_ready = true
+  previous_panel := app.prompt_state.panel
+  config_reload(app, typography, false)
+  if app.prompt_state.panel == Panel.None {
+    app.prompt_state.panel = previous_panel
+  }
+  return true
+}

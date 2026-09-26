@@ -1,0 +1,132 @@
+fn snippet_fixture(app: *App, response: []const u8) {
+  _ = buffer.load(app.documents.current, "sn")
+  app.view.insert = true
+  app.prompt_state.panel = Panel.None
+  buffer.move_to(app.documents.current, 2, false)
+  app.lsp.pending = 9
+  app.lsp.kind = 1
+  app.lsp.server = 0
+  app.lsp.slot = app.documents.active
+  app.lsp.identity = app.documents.slots[app.documents.active].identity
+  app.lsp.revision = app.documents.current.revision
+  app.lsp.position = 2
+  app.lsp.insert = true
+  app.lsp.servers[0].documents[app.documents.active].identity = app.lsp.identity
+  app.lsp.servers[0].documents[app.documents.active].revision = app.lsp.revision
+  allocated := mem.arena_create(65536)
+  if !allocated.ok {
+    #panic("snippet response arena")
+  }
+  if !lsp_handle(app, 0, response, &allocated.arena) {
+    _ = mem.arena_release(&allocated.arena)
+    #panic("snippet response")
+  }
+  key_input(app, nil, 9, 0)
+}
+fn snippet_smoke() {
+  owned := mem.arena_create(#sizeof(App) + 128)
+  scratch := mem.arena_create(2097152)
+  if !owned.ok || !scratch.ok {
+    #panic("snippet test memory")
+  }
+  defer _ = mem.arena_release(&owned.arena)
+  defer _ = mem.arena_release(&scratch.arena)
+  app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
+  app.scratch = &scratch.arena
+  app.config = settings.Settings{}
+  defer release_editor_state(app)
+  defer lsp_release(app)
+  if !new_buffer(app) {
+    #panic("snippet buffer")
+  }
+  _ = files.set_name(app.documents.file, "/tmp/dna-snippet-fixture.dyn")
+  doc := app.documents.current
+  snippet_fixture(app, "{\"id\":9,\"result\":[{\"filterText\":\"sn\",\"label\":\"fn\",\"insertText\":\"fn ${1:name}(${2:arg}) {\\n $0\\n}\",\"insertTextFormat\":2}]}")
+  if !snippet_valid(app) || !buffer.equal(doc.bytes[buffer.start(doc)..buffer.end(doc)], "name") {
+    #panic("snippet first placeholder")
+  }
+  text_input(app, "hello")
+  key_input(app, nil, 9, 0)
+  if !buffer.equal(doc.bytes[buffer.start(doc)..buffer.end(doc)], "arg") {
+    #panic("snippet next placeholder shifted")
+  }
+  key_input(app, nil, 9, 1)
+  if !buffer.equal(doc.bytes[buffer.start(doc)..buffer.end(doc)], "hello") {
+    #panic("snippet backwards")
+  }
+  key_input(app, nil, 9, 0)
+  text_input(app, "é😀")
+  key_input(app, nil, 8, 0)
+  if !contains(doc.bytes[..doc.length], "hello(é)") {
+    #panic("snippet unicode backspace")
+  }
+  key_input(app, nil, 9, 0)
+  if snippet_valid(app) || doc.cursor != 16 || doc.anchor != doc.cursor {
+    #panic("snippet final cursor")
+  }
+  snippet_fixture(app, "{\"id\":9,\"result\":[{\"filterText\":\"sn\",\"label\":\"linked\",\"insertText\":\"${1:name} = $1; ${2:value}$0\",\"insertTextFormat\":2}]}")
+  text_input(app, "é")
+  text_input(app, "x")
+  if !buffer.equal(doc.bytes[..doc.length], "éx = éx; value") {
+    #panic("snippet linked edits")
+  }
+  key_input(app, nil, 9, 0)
+  if !buffer.equal(doc.bytes[buffer.start(doc)..buffer.end(doc)], "value") {
+    #panic("snippet mirror offsets")
+  }
+  key_input(app, nil, 27, 0)
+  if app.lsp.snippet.active || app.view.insert {
+    #panic("snippet escape")
+  }
+  snippet_fixture(app, "{\"id\":9,\"result\":[{\"filterText\":\"sn\",\"label\":\"nested\",\"insertText\":\"${1:outer ${2:inner}} $3\",\"insertTextFormat\":2}]}")
+  text_input(app, "replacement")
+  key_input(app, nil, 9, 0)
+  if app.lsp.snippet.current != 3 {
+    #panic("replaced nested placeholder must disappear")
+  }
+  buffer.undo(doc)
+  if snippet_valid(app) {
+    #panic("undo must invalidate snippet")
+  }
+  snippet_fixture(app, "{\"id\":9,\"result\":[{\"filterText\":\"sn\",\"label\":\"bad\",\"insertText\":\"${1/a/b/}\",\"insertTextFormat\":2}]}")
+  if !buffer.equal(doc.bytes[..doc.length], "sn") {
+    #panic("unsupported snippet mutated document")
+  }
+  snippet_fixture(app, "{\"id\":9,\"result\":[{\"filterText\":\"sn\",\"label\":\"empty mirrors\",\"insertText\":\"$1$1$2$0\",\"insertTextFormat\":2}]}")
+  text_input(app, "x")
+  text_input(app, "y")
+  key_input(app, nil, 9, 0)
+  text_input(app, "z")
+  if !buffer.equal(doc.bytes[..doc.length], "xyxyz") {
+    #panic("adjacent empty snippet ranges")
+  }
+  key_input(app, nil, 9, 1)
+  if !buffer.equal(doc.bytes[buffer.start(doc)..buffer.end(doc)], "xy") {
+    #panic("adjacent range boundaries")
+  }
+  key_input(app, nil, 27, 0)
+  response: [16384]u8 = []
+  used := copy_text(response[..], "{\"id\":9,\"result\":[")
+  index: usize = 0
+  for index < 140 {
+    add_text(response[..], &used, "{\"label\":\"unrelated\"},")
+    index += 1
+  }
+  add_text(response[..], &used, "{\"label\":\"snappy\",\"insertText\":\"${1:ok}$0\",\"insertTextFormat\":2}]}")
+  snippet_fixture(app, response[..used])
+  if !snippet_valid(app) || !buffer.equal(doc.bytes[..doc.length], "ok") {
+    #panic("matching snippet beyond first 128 results")
+  }
+  key_input(app, nil, 27, 0)
+  snippet_fixture(app, "{\"id\":9,\"result\":[{\"filterText\":\"sn\",\"label\":\"extra\",\"textEdit\":{\"range\":{\"start\":{\"line\":0,\"character\":1},\"end\":{\"line\":0,\"character\":2}},\"newText\":\"${1:name}$0\"},\"insertTextFormat\":2,\"additionalTextEdits\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"newText\":\"pre \"}]}]}")
+  if app.prompt_state.panel != Panel.LspEdit || !buffer.equal(doc.bytes[..doc.length], "sn") {
+    #panic("snippet additional edits must preview")
+  }
+  key_input(app, nil, 13, 0)
+  if !snippet_valid(app) || !buffer.equal(doc.bytes[..doc.length], "pre sname") || !buffer.equal(doc.bytes[buffer.start(doc)..buffer.end(doc)], "name") {
+    #panic("snippet ranges after additional edits")
+  }
+  if scratch.arena.offset != 0 {
+    #panic("snippet scratch retained")
+  }
+}

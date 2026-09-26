@@ -1,0 +1,436 @@
+use "./workspace"
+
+struct RecoveryState {
+  checked, disabled: bool,
+  project: [4096]u8,
+  worker: rawptr,
+  versions: [16]u64,
+  identities: [16]u64,
+  active: usize,
+  project_length: usize,
+  time: u64,
+  view: u64,
+  ready: bool,
+  // Size of the last snapshot; larger workspaces snapshot less often.
+  last_size: usize,
+}
+// Snapshot interval: recovery_interval_ms for small workspaces, one more
+// interval per 256 KiB of snapshot, at most ten intervals. Limits disk writes
+// while typing in large files; a crash loses at most a few seconds.
+fn recovery_delay(app: *const App) u64 {
+  base := #cast(u64) app.config.recovery_interval_ms
+  steps := app.recovery.last_size / 262144 + 1
+  if steps > 10 {
+    steps = 10
+  }
+  return base * #cast(u64) steps
+}
+struct RestoredDocument { arena: mem.Arena, document: *buffer.Document }
+
+extern fn recovery_open "dna_recovery_open"(directory: *const u8) rawptr
+extern fn recovery_submit "dna_recovery_submit"(recovery: rawptr, bytes: *const u8, length: usize) i32
+extern fn recovery_error "dna_recovery_error"(recovery: rawptr) i32
+extern fn recovery_close "dna_recovery_close"(recovery: rawptr)
+
+fn session_path(app: *App, argument: []const u8, output: []u8) []const u8 {
+  if #len(argument) > 0 {
+    return expand_home(argument, output)
+  }
+  length := copy_text(output, app.configuration.path[..app.configuration.path_length])
+  add_text(output, &length, ".session")
+  return output[..length]
+}
+// Recovery snapshots record large files (buffer.LargeFile and up) by path, to
+// be reloaded from disk; rewriting them every few seconds would cost hundreds
+// of megabytes of writes. Explicit session saves keep all text.
+fn session_capture(app: *App, state: *workspace.State, recovery: bool) bool {
+  pane_init(app)
+  pane_store(app)
+  mem.zero((#cast(*u8) state)[..#sizeof(workspace.State)])
+  state.project = app.workspace.project[..app.workspace.project_length]
+  state.active = app.documents.active
+  state.focused = app.view.focused
+  for index in 0..16 {
+    slot := &app.documents.slots[index]
+    if slot.document != nil {
+      doc := slot.document
+      state.buffers[index] = workspace.SavedBuffer{used: true, path: files.name(&slot.file), text: doc.bytes[..doc.length], saved: doc.saved[..doc.saved_length], filetype: slot.filetype[..slot.filetype_length], cursor: doc.cursor, anchor: doc.anchor, secondary: doc.secondary}
+      if slot.inferred_filetype {
+        state.buffers[index].filetype = ""
+      }
+      if slot.terminal.handle != nil {
+        state.buffers[index] = workspace.SavedBuffer{used: true}
+      }
+      else if recovery && doc.length >= buffer.LargeFile && slot.file.length > 0 {
+        state.buffers[index] = workspace.SavedBuffer{used: true, reload: true, path: files.name(&slot.file), filetype: state.buffers[index].filetype, cursor: doc.cursor, anchor: doc.anchor}
+      }
+    }
+  }
+  for index in 0..15 {
+    pane := &app.view.panes[index]
+    if pane.used {
+      cursor: usize = 0
+      anchor: usize = 0
+      if !pane.branch && app.documents.slots[pane.slot].terminal.handle == nil {
+        doc_view := app.documents.slots[pane.slot].document
+        cursor = doc_view.marks[index * 2]
+        anchor = doc_view.marks[index * 2 + 1]
+      }
+      percent: usize = 50
+      if pane.branch {
+        percent = #cast(usize) (pane.split_fraction * 100.0)
+      }
+      state.panes[index] = workspace.SavedPane{used: true, branch: pane.branch, vertical: pane.vertical, parent: pane.parent, first: pane.first, second: pane.second, slot: pane.slot, cursor: cursor, anchor: anchor, percent: percent, scroll_x: #cast(usize) pane.scroll_x, scroll_y: #cast(usize) pane.scroll_y}
+      if !pane.branch && app.documents.slots[pane.slot].terminal.handle == nil {
+        state.panes[index].secondary.count = pane.secondary_count
+        for selected in 0..pane.secondary_count {
+          offset := #cast(usize) 32 + index * 64 + selected * 2
+          target_doc := app.documents.slots[pane.slot].document
+          state.panes[index].secondary.ranges[selected] = buffer.Selection{cursor: target_doc.marks[offset], anchor: target_doc.marks[offset + 1]}
+        }
+      }
+    }
+  }
+  return true
+}
+fn session_save(app: *App, argument: []const u8) bool {
+  path_storage: [4096]u8 = []
+  path := session_path(app, argument, path_storage[..])
+  if #len(path) == 0 || #len(path) > 3980 {
+    notice(app, "Invalid session path.")
+    return false
+  }
+  state := workspace.State{}
+  if !session_capture(app, &state, false) {
+    return false
+  }
+  snapshot_size := workspace.encoded_size(&state)
+  allocated := mem.arena_create(snapshot_size)
+  if !allocated.ok {
+    notice(app, "Cannot allocate session snapshot.")
+    return false
+  }
+  defer _ = mem.arena_release(&allocated.arena)
+  bytes := (#cast(*u8) mem.arena_push_uninit(&allocated.arena, snapshot_size, 1))[..snapshot_size]
+  length := workspace.encode(&state, bytes)
+  if length == 0 {
+    notice(app, "Session exceeds snapshot capacity.")
+    return false
+  }
+  temporary: [4096]u8 = []
+  used := copy_text(temporary[..], path)
+  add_text(temporary[..], &used, ".tmp")
+  tx := fs.atomic_begin(path, temporary[..used])
+  if !tx.ok {
+    notice(app, "Cannot create session snapshot. Ensure its parent directory exists and no .tmp file remains.")
+    return false
+  }
+  defer {
+    if tx.transaction.active {
+      _ = fs.atomic_abort(&tx.transaction)
+    }
+  }
+  if #syscall(91, tx.transaction.file.descriptor, 384) != 0 || !fs.write(&tx.transaction.file, bytes[..length]).ok || !fs.atomic_commit(&tx.transaction).ok {
+    notice(app, "Session write failed.")
+    return false
+  }
+  notice(app, "Session saved, including unsaved text, filetypes, splits, and cursor positions.")
+  return true
+}
+fn session_restore(app: *App, argument: []const u8) bool {
+  if explorer_dirty(app) {
+    notice(app, "Apply or discard explorer edits before restoring a session.")
+    return false
+  }
+  for slot_index in 0..16 {
+    if app.documents.slots[slot_index].document != nil && (buffer.dirty_cached(app.documents.slots[slot_index].document) || app.documents.slots[slot_index].terminal.handle != nil) {
+      notice(app, "Save/discard edits and close terminals before restoring a session.")
+      return false
+    }
+  }
+  path_storage: [4096]u8 = []
+  path := session_path(app, argument, path_storage[..])
+  // Up to 16 documents with their saved text, plus layout and history metadata.
+  session_limit: usize = (buffer.Capacity + 1) * 32 + 1048576
+  allocated := buffer.reserve(session_limit)
+  if !allocated.ok {
+    notice(app, "Cannot allocate session reader.")
+    return false
+  }
+  defer _ = mem.arena_release(&allocated.arena)
+  info := files.metadata(path)
+  if !info.ok || (info.mode & 61440) != 32768 {
+    notice(app, "Session must be a regular file.")
+    return false
+  }
+  read := fs.read_all(&allocated.arena, path, session_limit)
+  state := workspace.State{}
+  if !read.ok || !workspace.decode(read.data, &state) {
+    notice(app, "Invalid, truncated, or unsupported session. Workspace unchanged.")
+    return false
+  }
+  restored: [16]RestoredDocument = []
+  committed := false
+  defer {
+    if !committed {
+      cleanup_restored(restored[..])
+    }
+  }
+  for index in 0..16 {
+    saved := &state.buffers[index]
+    if saved.used {
+      memory := buffer.reserve(#sizeof(buffer.Document) + buffer.Capacity + 129)
+      if !memory.ok {
+        notice(app, "Cannot allocate restored buffers. Workspace unchanged.")
+        return false
+      }
+      restored[index].arena = memory.arena
+      restored[index].document = buffer.allocate(&restored[index].arena)
+      doc := restored[index].document
+      if saved.reload {
+        disk := files.read_text(saved.path)
+        loaded := disk.ok && buffer.load(doc, disk.data)
+        files.release_text(&disk)
+        if !loaded {
+          notice(app, "A large file in the session can no longer be read. Workspace unchanged.")
+          return false
+        }
+      }
+      else {
+        _ = buffer.load(doc, saved.saved)
+      }
+      if !saved.reload && !buffer.equal(saved.text, saved.saved) {
+        doc.anchor = 0
+        doc.cursor = doc.length
+        _ = buffer.replace(doc, saved.text)
+        buffer.checkpoint(doc)
+      }
+      doc.secondary = saved.secondary
+      selected: usize = 0
+      for selected < doc.secondary.count {
+        selection := &doc.secondary.ranges[selected]
+        selection.cursor = buffer.boundary(doc, selection.cursor)
+        selection.anchor = buffer.boundary(doc, selection.anchor)
+        selected += 1
+      }
+      doc.cursor = buffer.boundary(doc, saved.cursor)
+      doc.anchor = buffer.boundary(doc, saved.anchor)
+    }
+  }
+  directory: [4096]u8 = []
+  _ = copy_text(directory[..], state.project)
+  if #syscall(80, &directory[0]) != 0 {
+    notice(app, "Session project directory is unavailable. Workspace unchanged.")
+    return false
+  }
+  // All parsing/allocation completed before releasing the current buffers.
+  syntax_release(app)
+  app.view.pane_ready = false
+  app.documents.current = nil
+  app.documents.file = nil
+  app.documents.count = 0
+  for index in 0..16 {
+    current := &app.documents.slots[index]
+    if current.document != nil {
+      files.discard_recovery(&current.file)
+      document_release(app, current)
+    }
+    current.document = restored[index].document
+    current.arena = restored[index].arena
+    current.file.length = 0
+    current.file.recovery_owned = false
+    current.file.path[0] = 0
+    current.scroll_x = 0.0
+    current.scroll_y = 0.0
+    current.insert = false
+    current.extend = false
+    current.syntax_checked = false
+    current.syntax_revision = 0
+    current.filetype_length = 0
+    current.inferred_filetype = false
+    if current.document != nil {
+      current.arena_born = 0
+      if app.render_trace.enabled {
+        current.arena_born = render_clock()
+      }
+      allocation_record(app, "document", #sizeof(buffer.Document) + buffer.Capacity + 129, current.arena_born, false)
+      current.colors = (#cast(*u8) mem.arena_push_uninit(&current.arena, buffer.Capacity + 1, 1))[..buffer.Capacity + 1]
+      current.disk_changed = false
+      current.diagnostics.count = 0
+      app.documents.next_identity += 1
+      current.identity = app.documents.next_identity
+      record := &state.buffers[index]
+      if #len(record.path) > 0 {
+        _ = files.set_name(&current.file, record.path)
+      }
+      current.filetype_length = copy_text(current.filetype[..], record.filetype)
+      app.documents.count += 1
+    }
+  }
+  app.workspace.project_length = copy_text(app.workspace.project[..], state.project)
+  app.directory_state.length = copy_text(app.directory_state.path[..], state.project)
+  app.workspace.previous_project_length = 0
+  if app.picker_state.index != nil {
+    app.picker_state.index.root_length = 0
+  }
+  for index in 0..15 {
+    source := &state.panes[index]
+    pane := &app.view.panes[index]
+    pane.* = Pane{}
+    if source.used {
+      pane.used = true
+      pane.branch = source.branch
+      pane.vertical = source.vertical
+      pane.parent = source.parent
+      pane.first = source.first
+      pane.second = source.second
+      pane.slot = source.slot
+      pane.split_fraction = #cast(f32) source.percent / 100.0
+      pane.scroll_x = #cast(f32) source.scroll_x
+      pane.scroll_y = #cast(f32) source.scroll_y
+      if !pane.branch {
+        pane.secondary_count = source.secondary.count
+        for extra in 0..source.secondary.count {
+          offset := #cast(usize) 32 + index * 64 + extra * 2
+          extra_doc := app.documents.slots[pane.slot].document
+          extra_doc.marks[offset] = buffer.boundary(extra_doc, source.secondary.ranges[extra].cursor)
+          extra_doc.marks[offset + 1] = buffer.boundary(extra_doc, source.secondary.ranges[extra].anchor)
+        }
+        target := app.documents.slots[pane.slot].document
+        target.marks[index * 2] = buffer.boundary(target, source.cursor)
+        target.marks[index * 2 + 1] = buffer.boundary(target, source.anchor)
+      }
+    }
+  }
+  app.view.pane_ready = true
+  app.view.focused = state.focused
+  pane_load(app, app.view.focused)
+  app.view.revision += 1
+  app.picker_state.preview.ready = false
+  app.prompt_state.panel = Panel.None
+  committed = true
+  return true
+}
+fn cleanup_restored(documents: []RestoredDocument) {
+  index: usize = 0
+  for index < #len(documents) {
+    if documents[index].document != nil {
+      _ = mem.arena_release(&documents[index].arena)
+    }
+    index += 1
+  }
+}
+
+fn recovery_release(app: *App) {
+  if app.recovery.worker != nil {
+    recovery_close(app.recovery.worker)
+    app.recovery.worker = nil
+  }
+}
+fn recovery_tick(app: *App) {
+  if !app.config.recovery_enabled {
+    return
+  }
+  now := sdl.ticks()
+  if now - app.recovery.time < recovery_delay(app) {
+    return
+  }
+  app.recovery.time = now
+  if !recovery_allowed(app) {
+    return
+  }
+  if recovery_error(app.recovery.worker) != 0 {
+    app.recovery.ready = false
+    plugin_log(app, "Session recovery write failed. Save important edits explicitly.")
+  }
+  changed := recovery_needed(app)
+  if !changed {
+    return
+  }
+  if app.recovery.worker == nil {
+    path: [4096]u8 = []
+    parent := app.configuration.path_length
+    for parent > 0 && app.configuration.path[parent - 1] != '/' {
+      parent -= 1
+    }
+    length := copy_text(path[..], app.configuration.path[..parent])
+    add_text(path[..], &length, "recovery")
+    app.recovery.worker = recovery_open(&path[0])
+    if app.recovery.worker == nil {
+      plugin_log(app, "Cannot create session recovery directory.")
+      return
+    }
+  }
+  state := workspace.State{}
+  if !session_capture(app, &state, true) {
+    return
+  }
+  snapshot_size := workspace.encoded_size(&state)
+  work := &app.operations.recovery_encode
+  if !work_acquire(app, work, snapshot_size, "recovery_encode") {
+    return
+  }
+  defer work_finish(app, work, "recovery_encode")
+  bytes := (#cast(*u8) mem.arena_push_uninit(&work.arena, snapshot_size, 1))[..snapshot_size]
+  encode_started := operation_begin(app)
+  encoded_length := workspace.encode(&state, bytes)
+  app.recovery.last_size = encoded_length
+  operation_end(app, "recovery_encode", encode_started)
+  copy_started := operation_begin(app)
+  submitted: i32 = 0
+  if encoded_length > 0 {
+    submitted = recovery_submit(app.recovery.worker, &bytes[0], encoded_length)
+  }
+  operation_end(app, "recovery_submit", copy_started)
+  if submitted != 0 {
+    operation_bytes(app, "recovery_worker_copy", encoded_length)
+  }
+  if encoded_length > 0 && submitted != 0 {
+    app.recovery.ready = true
+    app.recovery.view = app.view.revision
+    app.recovery.active = app.documents.active
+    app.recovery.project_length = copy_text(app.recovery.project[..], app.workspace.project[..app.workspace.project_length])
+    for index in 0..16 {
+      saved_slot := &app.documents.slots[index]
+      app.recovery.versions[index] = 0
+      app.recovery.identities[index] = 0
+      if saved_slot.document != nil {
+        app.recovery.versions[index] = saved_slot.document.revision
+        app.recovery.identities[index] = saved_slot.identity
+      }
+    }
+  }
+}
+
+fn recovery_allowed(app: *App) bool {
+  if !app.config.recovery_enabled {
+    return false
+  }
+  if !app.recovery.checked {
+    env: [32]u8 = []
+    disabled := process.environment("DNA_RECOVERY", env[..])
+    app.recovery.disabled = disabled.ok && disabled.found && buffer.equal(disabled.value, "0")
+    smoke := process.environment("DYN_EDITOR_SMOKE", env[..])
+    if smoke.found {
+      app.recovery.disabled = true
+    }
+    app.recovery.checked = true
+  }
+  return !app.recovery.disabled
+}
+fn recovery_needed(app: *const App) bool {
+  changed := !app.recovery.ready || app.documents.active != app.recovery.active || app.view.revision != app.recovery.view || !buffer.equal(app.workspace.project[..app.workspace.project_length], app.recovery.project[..app.recovery.project_length])
+  for index in 0..16 {
+    slot := &app.documents.slots[index]
+    revision: u64 = 0
+    identity: u64 = 0
+    if slot.document != nil {
+      revision = slot.document.revision
+      identity = slot.identity
+    }
+    if revision != app.recovery.versions[index] || identity != app.recovery.identities[index] {
+      changed = true
+    }
+  }
+  return changed
+}

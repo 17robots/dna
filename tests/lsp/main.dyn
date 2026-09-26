@@ -1,0 +1,173 @@
+use "../../src/lsp" lsp
+use "../../src/buffer" buffer
+use "std/mem" mem
+use "std/encoding/json" json
+fn main() {
+  snippet_output: [256]u8 = []
+  snippet := lsp.plain_snippet("helper(${1:value}, ${2:${3:other}})$0", snippet_output[..])
+  if !snippet.ok || !buffer.equal(snippet_output[..snippet.value], "helper(value, other)") {
+    #panic("plain snippet defaults")
+  }
+  escaped_snippet := lsp.plain_snippet("\\$x \\} \\\\ $1 ${2}", snippet_output[..])
+  if !escaped_snippet.ok || !buffer.equal(snippet_output[..escaped_snippet.value], "$x } \\  ") {
+    #panic("plain snippet escapes and tabstops")
+  }
+  unsupported: [5][]const u8 = ["${1|one,two|}", "$TM_FILENAME", "${1/a/b/}", "${1:missing", "${name}"]
+  for item in unsupported {
+    if lsp.plain_snippet(item, snippet_output[..]).ok {
+      #panic("unsupported snippet accepted")
+    }
+  }
+  if lsp.plain_snippet("long", snippet_output[..2]).ok {
+    #panic("snippet output bound")
+  }
+
+  interactive := lsp.parse_snippet("${1:name}=$1; ${2:${3:value}}$0", snippet_output[..])
+  if !interactive.ok || interactive.count != 5 || !buffer.equal(snippet_output[..interactive.length], "name=name; value") {
+    #panic("interactive snippet expansion")
+  }
+  if interactive.stops[0].start != 0 || interactive.stops[0].end != 4 || interactive.stops[1].start != 5 || interactive.stops[3].number != 3 {
+    #panic("interactive snippet ranges")
+  }
+  for unsupported_item in unsupported {
+    if lsp.parse_snippet(unsupported_item, snippet_output[..]).ok {
+      #panic("interactive snippet syntax guard")
+    }
+  }
+  if lsp.parse_snippet("${1:recursive $1}", snippet_output[..]).ok || lsp.parse_snippet("${1:long}", snippet_output[..2]).ok {
+    #panic("interactive snippet bounds")
+  }
+
+  text := "aé😀\r\nz中"
+  position := lsp.position(text, 7)
+  if position.line != 0 || position.character != 4 {
+    #panic("UTF16 encoding")
+  }
+  if lsp.offset(text, position).value != 7 || lsp.offset(text, lsp.Position{character: 3}).ok {
+    #panic("surrogate boundary")
+  }
+  if lsp.offset(text, lsp.Position{line: 1, character: 2}).value != #len(text) || lsp.offset(text, lsp.Position{line: 8}).ok {
+    #panic("line bounds")
+  }
+  uri: [256]u8 = []
+  path: [256]u8 = []
+  encoded := lsp.uri("/tmp/a #é.dyn", uri[..])
+  if !buffer.equal(encoded, "file:///tmp/a%20%23%C3%A9.dyn") || !buffer.equal(lsp.path(encoded, path[..]), "/tmp/a #é.dyn") || #len(lsp.path("file:///tmp/%00x", path[..])) != 0 || #len(lsp.path("file://host/path", path[..])) != 0 {
+    #panic("URI validation")
+  }
+  owner := mem.arena_create(65536)
+  if !owner.ok {
+    #panic("arena")
+  }
+  defer _ = mem.arena_release(&owner.arena)
+  parsed := json.parse(&owner.arena, "[{\"range\":{\"start\":{\"line\":0,\"character\":2},\"end\":{\"line\":0,\"character\":4}},\"newText\":\"X\"},{\"range\":{\"start\":{\"line\":1,\"character\":0},\"end\":{\"line\":1,\"character\":1}},\"newText\":\"last\"}]")
+  output: [256]u8 = []
+  result := lsp.edits(text, parsed.root, output[..])
+  if !result.ok || !buffer.equal(output[..result.value], "aéX\r\nlast中") {
+    #panic("Unicode edit")
+  }
+  bad := json.parse(&owner.arena, "[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":4}},\"newText\":\"x\"},{\"range\":{\"start\":{\"line\":0,\"character\":1},\"end\":{\"line\":0,\"character\":2}},\"newText\":\"y\"}]")
+  if lsp.edits(text, bad.root, output[..]).ok {
+    #panic("overlap accepted")
+  }
+  many_edits()
+}
+// 1000 edits sent in reverse order: sorted, resolved in one pass, all applied.
+fn many_edits() {
+  owner := mem.arena_create(4194304)
+  if !owner.ok {
+    #panic("arena")
+  }
+  defer _ = mem.arena_release(&owner.arena)
+  source := (#cast(*u8) mem.arena_push_uninit(&owner.arena, 4000, 1))[..4000]
+  index: usize = 0
+  for index < 1000 {
+    source[index * 4] = 'a'
+    source[index * 4 + 1] = 'b'
+    source[index * 4 + 2] = 'c'
+    source[index * 4 + 3] = 10
+    index += 1
+  }
+  request := (#cast(*u8) mem.arena_push_uninit(&owner.arena, 131072, 1))[..131072]
+  used: usize = 0
+  request[used] = '['
+  used += 1
+  line := 1000
+  for line > 0 {
+    line -= 1
+    item: [128]u8 = []
+    length: usize = 0
+    for first_part in "{\"range\":{\"start\":{\"line\":" {
+      item[length] = first_part
+      length += 1
+    }
+    digits: [8]u8 = []
+    count: usize = 0
+    value := line
+    for true {
+      digits[count] = #cast(u8) (48 + value % 10)
+      count += 1
+      value /= 10
+      if value == 0 {
+        break
+      }
+    }
+    for count > 0 {
+      count -= 1
+      item[length] = digits[count]
+      length += 1
+    }
+    for middle_part in ",\"character\":1},\"end\":{\"line\":" {
+      item[length] = middle_part
+      length += 1
+    }
+    count = 0
+    value = line
+    for true {
+      digits[count] = #cast(u8) (48 + value % 10)
+      count += 1
+      value /= 10
+      if value == 0 {
+        break
+      }
+    }
+    for count > 0 {
+      count -= 1
+      item[length] = digits[count]
+      length += 1
+    }
+    for last_part in ",\"character\":2}},\"newText\":\"X\"}" {
+      item[length] = last_part
+      length += 1
+    }
+    for copied in item[..length] {
+      request[used] = copied
+      used += 1
+    }
+    if line > 0 {
+      request[used] = ','
+      used += 1
+    }
+  }
+  request[used] = ']'
+  used += 1
+  parsed := json.parse(&owner.arena, request[..used])
+  output := (#cast(*u8) mem.arena_push_uninit(&owner.arena, 1048577, 1))[..1048577]
+  result := lsp.edits(source, parsed.root, output)
+  if !parsed.ok {
+    #panic("many edits request")
+  }
+  if !result.ok {
+    #panic("many reversed edits")
+  }
+  if result.value != 4000 {
+    #panic("many edits length")
+  }
+  index = 0
+  for index < 1000 {
+    if output[index * 4] != 'a' || output[index * 4 + 1] != 'X' || output[index * 4 + 2] != 'c' {
+      #panic("many edit contents")
+    }
+    index += 1
+  }
+}

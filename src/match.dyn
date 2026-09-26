@@ -1,0 +1,188 @@
+struct MatchState { stage, from: u8, count: usize, explorer, error, syntax_error: bool }
+
+fn match_open(app: *App, explorer: bool) {
+  count := app.input_state.repeat_count
+  if count == 0 {
+    count = 1
+  }
+  app.match_state = MatchState{explorer: explorer, count: count}
+  panel(app, Panel.Match)
+}
+fn match_close(app: *App) {
+  app.prompt_state.panel = Panel.None
+  if app.match_state.explorer {
+    app.prompt_state.panel = Panel.Directory
+  }
+  app.match_state.stage = 0
+}
+fn match_key(app: *App, key: u32) {
+  state := &app.match_state
+  if state.stage != 0 {
+    return
+  }
+  state.error = false
+  if key == KeyI {
+    state.stage = 1
+  }
+  else if key == KeyA {
+    state.stage = 2
+  }
+  else if key == KeyS {
+    state.stage = 3
+  }
+  else if key == KeyD {
+    state.stage = 4
+  }
+  else if key == KeyR {
+    state.stage = 5
+  }
+  else if key == KeyM {
+    doc := app.documents.current
+    extending := app.view.extend
+    if state.explorer {
+      doc = app.explorer.document
+      extending = app.explorer.extend
+    }
+    if buffer.select_objects(doc, 109, true, state.count, true, extending) {
+      match_close(app)
+    } else {
+      state.error = true
+    }
+  }
+}
+fn match_character(app: *App, text: []const u8) {
+  state := &app.match_state
+  if state.stage == 0 || #len(text) == 0 {
+    return
+  }
+  if #len(text) != 1 || text[0] < 32 || text[0] > 126 {
+    state.error = true
+    return
+  }
+  state.syntax_error = false
+  key := text[0]
+  doc := app.documents.current
+  if state.explorer {
+    doc = app.explorer.document
+  }
+  ok: bool = false
+  if state.stage == 1 || state.stage == 2 {
+    if key == 102 || key == 116 || key == 97 || key == 99 {
+      if !state.explorer && syntax_textobject(app, key, state.stage == 2, state.count) {
+        match_close(app)
+      }
+      else {
+        state.error = true
+        state.syntax_error = true
+      }
+      return
+    }
+    if key == 84 || key == 103 {
+      state.error = true
+      state.syntax_error = true
+      return
+    }
+    ok = buffer.select_objects(doc, key, state.stage == 2, state.count, false, false)
+  } else if state.stage == 3 {
+    ok = buffer.surround(doc, 0, 0, key, 1)
+  }
+  else if state.stage == 4 {
+    ok = buffer.surround(doc, 1, key, 0, state.count)
+  }
+  else if state.stage == 5 {
+    state.from = key
+    state.stage = 6
+    state.error = false
+    return
+  }
+  else if state.stage == 6 {
+    ok = buffer.surround(doc, 2, state.from, key, state.count)
+  }
+  if ok {
+    match_close(app)
+  } else {
+    state.error = true
+  }
+}
+fn match_title(app: *const App) []const u8 {
+  stage := app.match_state.stage
+  if stage == 1 {
+    return "select inside (mi)"
+  }
+  if stage == 2 {
+    return "select around (ma)"
+  }
+  if stage == 3 {
+    return "add surround (ms): delimiter"
+  }
+  if stage == 4 {
+    return "delete surround (md): delimiter"
+  }
+  if stage == 5 {
+    return "replace surround (mr): old delimiter"
+  }
+  if stage == 6 {
+    return "replace surround: new delimiter"
+  }
+  return "match (m)"
+}
+fn match_hint(stage: u8, index: usize) KeyHint {
+  if stage == 0 {
+    if index == 0 {
+      return KeyHint{key: "m", label: "matching bracket"}
+    }
+    if index == 1 {
+      return KeyHint{key: "i", label: "select inside..."}
+    }
+    if index == 2 {
+      return KeyHint{key: "a", label: "select around..."}
+    }
+    if index == 3 {
+      return KeyHint{key: "s", label: "add surround..."}
+    }
+    if index == 4 {
+      return KeyHint{key: "r", label: "replace surround..."}
+    }
+    return KeyHint{key: "d", label: "delete surround..."}
+  }
+  if index == 0 {
+    return KeyHint{key: "w", label: "word"}
+  }
+  if index == 1 {
+    return KeyHint{key: "W", label: "WORD"}
+  }
+  if index == 2 {
+    return KeyHint{key: "p", label: "paragraph"}
+  }
+  if index == 3 {
+    return KeyHint{key: "m", label: "nearest pair"}
+  }
+  if index == 4 {
+    return KeyHint{key: "()", label: "parentheses"}
+  }
+  if index == 5 {
+    return KeyHint{key: "[]", label: "square brackets"}
+  }
+  if index == 6 {
+    return KeyHint{key: "{}", label: "braces"}
+  }
+  if index == 7 {
+    return KeyHint{key: "\"", label: "double quotes"}
+  }
+  if index == 8 {
+    return KeyHint{key: "'", label: "single quotes"}
+  }
+  if index == 9 {
+    return KeyHint{key: "`", label: "backticks"}
+  }
+  if index == 10 {
+    return KeyHint{key: "f", label: "function (syntax)"}
+  }
+  if index == 11 {
+    return KeyHint{key: "t", label: "type (syntax)"}
+  }
+  if index == 12 {
+    return KeyHint{key: "a", label: "parameter (syntax)"}
+  }
+  return KeyHint{key: "c", label: "comment (syntax)"}
+}

@@ -1,0 +1,54 @@
+frames: u32 = 0
+before: u32 = 0
+injected: bool = false
+delivered: bool = false
+pub fn dna_disk_pending(disk: rawptr, index: u32, identity: u64) isize {
+  _ = disk
+  _ = index
+  if !injected && identity != 0 {
+    before = frames
+    injected = true
+    probe_key(1073741903)
+    return -1
+  }
+  return 0
+}
+pub fn dna_disk_take(disk: rawptr, index: u32, identity: u64, bytes: rawptr, capacity: usize) i32 {
+  _ = disk
+  _ = index
+  _ = identity
+  _ = bytes
+  _ = capacity
+  return 2
+}
+fn observe(event: rawptr, ready: bool) {
+  if ready && probe_kind(event).* == 768 && probe_u32(event, 28).* == 1073741903 {
+    delivered = true
+  }
+}
+pub fn SDL_PollEvent(event: rawptr) bool {
+  next := #cast(*fn(rawptr) bool) probe_next("SDL_PollEvent\0")
+  ready := next(event)
+  observe(event, ready)
+  return ready
+}
+pub fn SDL_WaitEventTimeout(event: rawptr, milliseconds: i32) bool {
+  if delivered {
+    probe_log("worker + input: ")
+    probe_number(#cast(u64) (frames-before))
+    probe_log(" frames\n")
+    probe_check(frames-before == 1, "worker/input coalescing")
+    probe_clear(event)
+    probe_kind(event).* = 256
+    return true
+  }
+  next := #cast(*fn(rawptr, i32) bool) probe_next("SDL_WaitEventTimeout\0")
+  ready := next(event, milliseconds)
+  observe(event, ready)
+  return ready
+}
+pub fn SDL_RenderPresent(renderer: rawptr) bool {
+  frames += 1
+  next := #cast(*fn(rawptr) bool) probe_next("SDL_RenderPresent\0")
+  return next(renderer)
+}

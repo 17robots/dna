@@ -1,0 +1,212 @@
+// Linux/glibc process transport. Layouts are checked against system headers by
+// tests/native_abi.py. The leader is not reaped until close, preventing PID reuse
+// while its process group is still owned. take transfers; close invalidates.
+#link("dl")
+
+struct OwnedProcess { pid: i32, input: i32 = -1, output: i32 = -1, error: i32 = -1 }
+struct PollDescriptor { fd: i32, events, returned: i16 }
+
+extern fn proc_symbol "dlsym"(library: rawptr, name: *const u8) rawptr
+extern fn proc_pipe "pipe2"(fds: *i32, flags: i32) i32
+extern fn proc_fcntl "fcntl"(fd: i32, operation: i32, value: i32) i32
+extern fn proc_actions_init "posix_spawn_file_actions_init"(actions: rawptr) i32
+extern fn proc_actions_destroy "posix_spawn_file_actions_destroy"(actions: rawptr) i32
+extern fn proc_dup_action "posix_spawn_file_actions_adddup2"(actions: rawptr, fd: i32, target: i32) i32
+extern fn proc_chdir_action "posix_spawn_file_actions_addchdir_np"(actions: rawptr, path: *const u8) i32
+extern fn proc_attributes_init "posix_spawnattr_init"(attributes: rawptr) i32
+extern fn proc_attributes_destroy "posix_spawnattr_destroy"(attributes: rawptr) i32
+extern fn proc_flags "posix_spawnattr_setflags"(attributes: rawptr, flags: i16) i32
+extern fn proc_group "posix_spawnattr_setpgroup"(attributes: rawptr, group: i32) i32
+extern fn proc_spawn "posix_spawn"(pid: *i32, path: *const u8, actions: rawptr, attributes: rawptr, arguments: rawptr, environment: rawptr) i32
+extern fn proc_kill "kill"(pid: i32, signal: i32) i32
+extern fn proc_wait "waitpid"(pid: i32, status: *i32, flags: i32) i32
+extern fn proc_wait_info "waitid"(kind: i32, pid: u32, info: rawptr, flags: i32) i32
+extern fn proc_poll "poll"(fds: *PollDescriptor, count: usize, timeout: i32) i32
+extern fn proc_read_raw "read"(fd: i32, bytes: *u8, length: usize) isize
+extern fn proc_sigempty "sigemptyset"(set: rawptr) i32
+extern fn proc_sigadd "sigaddset"(set: rawptr, signal: i32) i32
+extern fn proc_sigmember "sigismember"(set: rawptr, signal: i32) i32
+extern fn proc_sigmask "pthread_sigmask"(how: i32, set: rawptr, old: rawptr) i32
+extern fn proc_sigpending "sigpending"(set: rawptr) i32
+extern fn proc_sigwait "sigtimedwait"(set: rawptr, info: rawptr, timeout: rawptr) i32
+fn proc_watch(fd: i32, writing: i32) {
+  dna_watch(fd, writing)
+}
+fn proc_unwatch(fd: i32) {
+  dna_unwatch(fd)
+}
+extern fn proc_realloc "realloc"(bytes: *u8, length: usize) *u8
+extern fn proc_move "memmove"(output: *u8, source: *const u8, length: usize) rawptr
+fn proc_ticks() u64 {
+  return dna_ticks()
+}
+
+fn proc_nonblocking(fd: i32) bool {
+  flags := proc_fcntl(fd, 3, 0)
+  return flags >= 0 && proc_fcntl(fd, 4, flags | 2048) == 0
+}
+fn proc_take(child: *OwnedProcess) OwnedProcess {
+  owned := child.*
+  child.* = OwnedProcess{}
+  return owned
+}
+fn proc_close(child: *OwnedProcess) {
+  owned := proc_take(child)
+  proc_unwatch(owned.input)
+  proc_unwatch(owned.output)
+  proc_unwatch(owned.error)
+  if owned.pid > 0 {
+    _ = proc_kill(-owned.pid, 9)
+  }
+  if owned.input >= 0 {
+    _ = rec_close(owned.input)
+  }
+  if owned.output >= 0 {
+    _ = rec_close(owned.output)
+  }
+  if owned.error >= 0 {
+    _ = rec_close(owned.error)
+  }
+  if owned.pid > 0 {
+    for proc_wait(owned.pid, nil, 0) < 0 && rec_errno().* == 4 {}
+  }
+}
+fn proc_open(command: *const u8, directory: *const u8, shell: bool) OwnedProcess {
+  empty := OwnedProcess{}
+  if command == nil || command.* == 0 || directory == nil || directory.* != 47 || (!shell && command.* != 47) {
+    return empty
+  }
+  descriptors: [6]i32 = [-1, -1, -1, -1, -1, -1]
+  defer proc_close_fds(descriptors[..])
+  if proc_pipe(&descriptors[0], 524288) != 0 || proc_pipe(&descriptors[2], 524288) != 0 || proc_pipe(&descriptors[4], 524288) != 0 {
+    return empty
+  }
+  // Lift descriptors out of stdio slots before dup2; this also handles closed stdin.
+  for index in 0..6 {
+    if descriptors[index] < 3 {
+      lifted := proc_fcntl(descriptors[index], 1030, 3)
+      if lifted < 0 {
+        return empty
+      }
+      _ = rec_close(descriptors[index])
+      descriptors[index] = lifted
+    }
+  }
+  actions: [10]u64 = []
+  attributes: [42]u64 = []
+  act := #cast(rawptr) &actions[0]
+  attr := #cast(rawptr) &attributes[0]
+  if proc_actions_init(act) != 0 {
+    return empty
+  }
+  defer _ = proc_actions_destroy(act)
+  if proc_attributes_init(attr) != 0 {
+    return empty
+  }
+  defer _ = proc_attributes_destroy(attr)
+  if proc_dup_action(act, descriptors[0], 0) != 0 || proc_dup_action(act, descriptors[3], 1) != 0 || proc_dup_action(act, descriptors[5], 2) != 0 || proc_chdir_action(act, directory) != 0 || proc_flags(attr, 2) != 0 || proc_group(attr, 0) != 0 {
+    return empty
+  }
+  shell_path: []const u8 = "/bin/sh\0"
+  shell_arg: []const u8 = "-c\0"
+  env_name: []const u8 = "environ\0"
+  environment := #cast(*rawptr) proc_symbol(nil, &env_name[0])
+  if environment == nil {
+    return empty
+  }
+  arguments: [4]*const u8 = [command, nil, nil, nil]
+  executable := command
+  if shell {
+    executable = &shell_path[0]
+    arguments[0] = executable
+    arguments[1] = &shell_arg[0]
+    arguments[2] = command
+  }
+  pid: i32 = 0
+  if proc_spawn(&pid, executable, act, attr, #cast(rawptr) &arguments[0], environment.*) != 0 {
+    return empty
+  }
+  child := OwnedProcess{pid: pid, input: descriptors[1], output: descriptors[2], error: descriptors[4]}
+  descriptors[1] = -1
+  descriptors[2] = -1
+  descriptors[4] = -1
+  if !proc_nonblocking(child.input) || !proc_nonblocking(child.output) || !proc_nonblocking(child.error) {
+    proc_close(&child)
+    return empty
+  }
+  return child
+}
+fn proc_read(fd: i32, bytes: *u8, length: usize) isize {
+  value := proc_read_raw(fd, bytes, length)
+  if value < 0 {
+    return -#cast(isize) rec_errno().*
+  }
+  return value
+}
+// Suppress only the SIGPIPE generated by this write; preserve masks and pending signals.
+fn proc_write(fd: i32, bytes: *const u8, length: usize) isize {
+  set: [16]u64 = []
+  old: [16]u64 = []
+  pending: [16]u64 = []
+  zero: [2]i64 = []
+  _ = proc_sigempty(#cast(rawptr) &set[0])
+  _ = proc_sigadd(#cast(rawptr) &set[0], 13)
+  error := proc_sigmask(0, #cast(rawptr) &set[0], #cast(rawptr) &old[0])
+  if error != 0 {
+    return -#cast(isize) error
+  }
+  _ = proc_sigpending(#cast(rawptr) &pending[0])
+  value := rec_write(fd, bytes, length)
+  saved := rec_errno().*
+  if value < 0 && saved == 32 && proc_sigmember(#cast(rawptr) &pending[0], 13) == 0 {
+    _ = proc_sigwait(#cast(rawptr) &set[0], nil, #cast(rawptr) &zero[0])
+  }
+  _ = proc_sigmask(2, #cast(rawptr) &old[0], nil)
+  if value < 0 {
+    return -#cast(isize) saved
+  }
+  return value
+}
+// 0 running, 1 successful exit, 2 failed exit, -1 wait failure; do not reap.
+fn proc_peek(child: *const OwnedProcess) i32 {
+  info: [32]i32 = []
+  if proc_wait_info(1, #cast(u32) child.pid, #cast(rawptr) &info[0], 16777221) != 0 {
+    if rec_errno().* == 4 {
+      return 0
+    }
+    return -1
+  }
+  if info[4] != child.pid {
+    return 0
+  }
+  if info[2] == 1 && info[6] == 0 {
+    return 1
+  }
+  return 2
+}
+fn proc_log(log: []u8, used: *usize, bytes: []const u8) {
+  amount := #len(bytes)
+  if amount >= #len(log) {
+    amount = #len(log) - 1
+  }
+  keep := used.*
+  if keep > #len(log) - 1 - amount {
+    keep = #len(log) - 1 - amount
+  }
+  if keep > 0 {
+    _ = proc_move(&log[0], &log[used.* - keep], keep)
+  }
+  if amount > 0 {
+    _ = copy(&log[keep], &bytes[#len(bytes) - amount], amount)
+  }
+  used.* = keep + amount
+  log[used.*] = 0
+}
+
+fn proc_close_fds(fds: []i32) {
+  for fd in fds {
+    if fd >= 0 {
+      _ = rec_close(fd)
+    }
+  }
+}

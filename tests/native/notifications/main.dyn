@@ -1,0 +1,113 @@
+use "std/testing"
+#link("dna_native")
+#link("SDL3")
+#link("c")
+extern fn init "SDL_Init"(flags: u32) bool
+extern fn quit "SDL_Quit"()
+extern fn wait_event "SDL_WaitEventTimeout"(event: rawptr, timeout: i32) bool
+extern fn ticks "SDL_GetTicks"() u64
+extern fn delay "SDL_Delay"(milliseconds: u32)
+extern fn notify_start "dna_notify_start"() i32
+extern fn notify_stop "dna_notify_stop"()
+extern fn watch "dna_watch"(fd: i32, writing: i32)
+extern fn unwatch "dna_unwatch"(fd: i32)
+extern fn pipe "pipe"(fds: *i32) i32
+extern fn read "read"(fd: i32, output: *u8, length: usize) isize
+extern fn write "write"(fd: i32, input: *const u8, length: usize) isize
+extern fn close "close"(fd: i32) i32
+extern fn flush "fflush"(stream: rawptr) i32
+extern fn puts "puts"(text: *const u8) i32
+extern fn contains "strstr"(text: *const u8, needle: *const u8) *const u8
+extern fn terminal_open "dna_terminal_open"(directory: *const u8, shell: *const u8, command: *const u8) rawptr
+extern fn terminal_poll "dna_terminal_poll"(terminal: rawptr) i32
+extern fn terminal_alive "dna_terminal_alive"(terminal: rawptr) i32
+extern fn terminal_close "dna_terminal_close"(terminal: rawptr)
+extern fn terminal_review "dna_terminal_review"(terminal: rawptr, output: *u8, capacity: usize) usize
+extern fn terminal_review_end "dna_terminal_review_end"(terminal: rawptr)
+extern fn terminal_resize "dna_terminal_resize"(terminal: rawptr, width, height, cell_width, cell_height: f32) i32
+extern fn terminal_review_select "dna_terminal_review_select"(terminal: rawptr, start, end, head: usize)
+extern fn terminal_cursor "dna_terminal_cursor"(terminal: rawptr, column, row: *i32)
+fn wake(timeout: i32) bool {
+  event: [16]u64 = []
+  for wait_event(#cast(rawptr) &event[0], timeout) {
+    if (#cast(*u32) &event[0]).* == 32768 {
+      return true
+    }
+  }
+  return false
+}
+fn main() {
+  testing.expect(init(16384), "SDL events init")
+  testing.expect(notify_start() != 0, "notification worker start")
+  fds: [2]i32 = []
+  testing.expect(pipe(&fds[0]) == 0, "pipe")
+  watch(fds[0], 0)
+  a: []const u8 = "a"
+  b: []const u8 = "b"
+  testing.expect(write(fds[1], &a[0], 1) == 1, "first pipe write")
+  testing.expect(wake(1000), "first readiness")
+  testing.expect(!wake(80), "undrained readiness must not repeat")
+  byte: u8 = 0
+  testing.expect(read(fds[0], &byte, 1) == 1, "drain first readiness")
+  watch(fds[0], 0)
+  testing.expect(!wake(80), "rearmed empty pipe remains asleep")
+  testing.expect(write(fds[1], &b[0], 1) == 1, "second pipe write")
+  testing.expect(wake(1000), "rearmed readiness")
+  unwatch(fds[0])
+  _ = close(fds[0])
+  _ = close(fds[1])
+  directory: []const u8 = "/tmp\0"
+  shell: []const u8 = "/bin/sh\0"
+  command: []const u8 = "sleep .1; printf 'alpha beta\\n'; sleep .2\0"
+  term := terminal_open(&directory[0], &shell[0], &command[0])
+  testing.expect(term != nil, "terminal open")
+  _ = terminal_poll(term)
+  testing.expect(wake(1000), "PTY output readiness")
+  _ = terminal_poll(term)
+  output: [262144]u8 = []
+  needle: []const u8 = "alpha beta\0"
+  size := terminal_review(term, &output[0], 262144)
+  testing.expect(size > 0 && contains(&output[0], &needle[0]) != nil, "terminal review output")
+  terminal_review_select(term, 0, 5, 4)
+  column: i32 = 0
+  row: i32 = 0
+  terminal_cursor(term, &column, &row)
+  testing.expect(column == 4 && row == 0, "review selection cursor")
+  testing.expect(terminal_resize(term, #cast(f32) 320, #cast(f32) 160, #cast(f32) 8, #cast(f32) 16) != 0, "terminal resize")
+  size = terminal_review(term, &output[0], 262144)
+  testing.expect(size > 0, "review after resize")
+  terminal_review_select(term, 0, 1, 0)
+  terminal_cursor(term, &column, &row)
+  testing.expect(column == 0 && row == 0, "resized review cursor")
+  testing.expect(wake(1000), "PTY exit readiness")
+  deadline := ticks() + 1000
+  for terminal_alive(term) != 0 && ticks() < deadline {
+    _ = terminal_poll(term)
+    delay(1)
+  }
+  testing.expect(terminal_alive(term) == 0, "PTY exits")
+  terminal_review_end(term)
+  terminal_close(term)
+  for wake(10) {}
+  testing.expect(!wake(100), "no continuous background wakeups")
+  // PTY hangup can precede child exit. No timer polling may rescue this test:
+  // the editor needs a second readiness event after the process really exits.
+  early_close: []const u8 = "exec 0<&- 1>&- 2>&-; sleep .15; exit\0"
+  term = terminal_open(&directory[0], &shell[0], &early_close[0])
+  testing.expect(term != nil, "early-close terminal open")
+  _ = terminal_poll(term)
+  deadline = ticks() + 2000
+  for terminal_alive(term) != 0 && ticks() < deadline {
+    testing.expect(wake(1000), "child exit must wake after PTY hangup")
+    _ = terminal_poll(term)
+  }
+  testing.expect(terminal_alive(term) == 0, "early-close child reaped")
+  terminal_close(term)
+  for wake(10) {}
+  testing.expect(!wake(100), "closed child does not continuously wake editor")
+  notify_stop()
+  quit()
+  message: []const u8 = "PASS one-shot readiness, rearming, idle sleep, PTY output/exit, terminal review cursor\0"
+  _ = puts(&message[0])
+  _ = flush(nil)
+}

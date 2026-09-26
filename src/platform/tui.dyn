@@ -1,0 +1,1710 @@
+#link("dna_native")
+#link("c")
+// Terminal backend behind the platform and text APIs. DNA keeps laying out in
+// "pixels": every terminal cell is CellWidth x CellHeight of them, so the
+// editor's UI code runs unchanged. Fills paint cell backgrounds; thin
+// rectangles become box-drawing lines or underlines; text writes characters.
+// Each present diffs the grid against what the terminal shows.
+
+pub const CellWidth: f32 = 8.0
+pub const CellHeight: f32 = 16.0
+const MaxColumns: usize = 512
+const MaxRows: usize = 256
+
+extern fn tty_enter "dna_tty_enter"() i32
+extern fn tty_leave "dna_tty_leave"()
+extern fn tty_size "dna_tty_size"(columns: *i32, rows: *i32) i32
+extern fn tty_resized "dna_tty_resized"() i32
+extern fn tty_read "dna_tty_read"(buffer: *u8, capacity: i32, timeout: i32) i32
+extern fn tty_write "dna_tty_write"(bytes: *const u8, length: usize)
+extern fn heap_alloc "dna_tui_alloc"(size: usize) rawptr
+extern fn heap_free "dna_tui_free"(pointer: rawptr)
+
+// Line bits for box drawing: which neighbours a cell's line reaches.
+const LineLeft: u8 = 1
+const LineRight: u8 = 2
+const LineUp: u8 = 4
+const LineDown: u8 = 8
+const Underline: u8 = 16
+// Italic text (theme `italic`), and a curly underline for diagnostics.
+const Italic: u8 = 32
+const Curl: u8 = 64
+// Bold, from applications in terminal panes.
+const Bold: u8 = 128
+
+struct Cell { character: u32, foreground: u32, background: u32, underline: u32, flags: u8 }
+
+struct Tui {
+  active: bool,
+  // The previous fill, to recognise border-then-inset frames.
+  last_fill: Rect,
+  last_color: u32,
+  last_valid: bool,
+  columns: i32,
+  rows: i32,
+  color: u32,
+  clip: PixelRect,
+  clipping: bool,
+  origin_x: i32,
+  origin_y: i32,
+  // Drawing into a popup texture goes straight to the grid; only clears skip.
+  texture_target: bool,
+  text_input: bool,
+  // Insert-mode bar cursor drawn this frame, or -1; block for terminal panes.
+  bar_column: i32,
+  bar_row: i32,
+  bar_block: bool,
+  // Modifiers held during the last mouse report, for Shift-click and friends.
+  mouse_modifiers: u16,
+  // A bracketed paste in progress and the text gathered so far; finished,
+  // it becomes one PasteEvent for DNA to take whole.
+  pasting: bool,
+  // When paste bytes last arrived: a paste whose end marker never comes
+  // ends after a second of quiet instead of eating every later key.
+  paste_since: u64,
+  paste: rawptr,
+  paste_length: usize,
+  paste_capacity: usize,
+  // 24-bit color; otherwise the nearest of the xterm 256.
+  truecolor: bool,
+  // Colored curly underlines (SGR 4:3 and 58); otherwise plain underlines.
+  undercurl: bool,
+  full_redraw: bool,
+  // Pending input bytes and parsed events.
+  input: [4096]u8,
+  input_used: usize,
+  escape_since: u64,
+  events: [64]Event,
+  event_head: usize,
+  event_count: usize,
+  texts: [64][256]u8,
+  text_next: usize,
+  last_character: u32,
+  last_click_time: u64,
+  last_click_button: u8,
+  last_click_column: i32,
+  last_click_row: i32,
+  clicks: u8,
+  buttons: u32,
+  clipboard: rawptr,
+}
+state: Tui = Tui{}
+grid: [131072]Cell = []
+shown: [131072]Cell = []
+output: [1048576]u8 = []
+output_used: usize = 0
+
+pub fn tui_active() bool {
+  return state.active
+}
+// Take over the terminal. Returns false when stdin/stdout is not a terminal.
+pub fn tui_start() bool {
+  if tty_enter() == 0 {
+    return false
+  }
+  state.active = true
+  state.color = 0
+  state.truecolor = truecolor_supported()
+  state.undercurl = undercurl_supported()
+  state.bar_column = -1
+  state.full_redraw = true
+  tui_measure()
+  return true
+}
+extern fn environment_value "getenv"(name: *const u8) *const u8
+fn environment_is(name: []const u8, wanted: []const u8) bool {
+  value := environment_value(&name[0])
+  if value == nil {
+    return false
+  }
+  length := string_length(value)
+  return length == #len(wanted) && buffer_equal(value[..length], wanted)
+}
+fn environment_contains(name: []const u8, part: []const u8) bool {
+  value := environment_value(&name[0])
+  if value == nil {
+    return false
+  }
+  length := string_length(value)
+  return find(value[..length], part, 0) < length
+}
+// 24-bit color when the terminal says so (COLORTERM, a -direct TERM) or is
+// known to; DNA_TRUECOLOR=1 or 0 overrides either way.
+fn truecolor_supported() bool {
+  if environment_is("DNA_TRUECOLOR\0", "1") {
+    return true
+  }
+  if environment_is("DNA_TRUECOLOR\0", "0") {
+    return false
+  }
+  if environment_is("COLORTERM\0", "truecolor") || environment_is("COLORTERM\0", "24bit") || environment_contains("TERM\0", "-direct") {
+    return true
+  }
+  known: [6][]const u8 = ["kitty", "alacritty", "foot", "wezterm", "ghostty", "contour"]
+  for name in known {
+    if environment_contains("TERM\0", name) {
+      return true
+    }
+  }
+  return false
+}
+// Curly, colored underlines where the terminal is known to draw them;
+// DNA_UNDERCURL=1 or 0 overrides. Others get a plain underline.
+fn undercurl_supported() bool {
+  if environment_is("DNA_UNDERCURL\0", "1") {
+    return true
+  }
+  if environment_is("DNA_UNDERCURL\0", "0") {
+    return false
+  }
+  vte: []const u8 = "VTE_VERSION\0"
+  if environment_value(&vte[0]) != nil {
+    return true
+  }
+  known: [5][]const u8 = ["kitty", "wezterm", "foot", "ghostty", "contour"]
+  for name in known {
+    if environment_contains("TERM\0", name) {
+      return true
+    }
+  }
+  return false
+}
+pub fn tui_stop() {
+  if state.active {
+    tty_leave()
+    state.active = false
+  }
+}
+fn tui_measure() {
+  columns: i32 = 80
+  rows: i32 = 24
+  _ = tty_size(&columns, &rows)
+  if columns > #cast(i32) MaxColumns {
+    columns = #cast(i32) MaxColumns
+  }
+  if rows > #cast(i32) MaxRows {
+    rows = #cast(i32) MaxRows
+  }
+  state.columns = columns
+  state.rows = rows
+}
+pub fn tui_size(width: *i32, height: *i32) {
+  width.* = state.columns * #cast(i32) CellWidth
+  height.* = state.rows * #cast(i32) CellHeight
+}
+
+// ---------------------------------------------------------------------------
+// Drawing
+
+pub fn tui_color(red: u8, green: u8, blue: u8) {
+  state.color = (#cast(u32) red << 16) | (#cast(u32) green << 8) | #cast(u32) blue
+}
+fn cell_at(column: i32, row: i32) *Cell {
+  return &grid[#cast(usize) row * MaxColumns + #cast(usize) column]
+}
+pub fn tui_clear() {
+  state.last_valid = false
+  if state.texture_target {
+    return
+  }
+  for row in 0..state.rows {
+    for column in 0..state.columns {
+      cell_at(column, row).* = Cell{character: 32, foreground: 13948116, background: state.color}
+    }
+  }
+  state.bar_column = -1
+  state.bar_block = false
+}
+// An embedded terminal's cells (codepoint, foreground, background triples)
+// at a pixel origin; its cursor becomes the real terminal cursor.
+pub fn tui_cells(cells: *const u32, columns: i32, rows: i32, x: f32, y: f32, cursor_column: i32, cursor_row: i32) {
+  origin_column := floor_cell(x + #cast(f32) state.origin_x + CellWidth * 0.5, CellWidth)
+  origin_row := floor_cell(y + #cast(f32) state.origin_y + CellHeight * 0.5, CellHeight)
+  values := cells[..#cast(usize) (columns * rows * 3)]
+  for row in 0..rows {
+    for column in 0..columns {
+      index := #cast(usize) ((row * columns + column) * 3)
+      target_column := origin_column + column
+      target_row := origin_row + row
+      if cell_visible(target_column, target_row) {
+        packed := values[index]
+        flags: u8 = 0
+        if (packed & 16777216) != 0 {
+          flags = flags | Bold
+        }
+        if (packed & 33554432) != 0 {
+          flags = flags | Italic
+        }
+        if (packed & 67108864) != 0 {
+          flags = flags | Underline
+          if (packed & 134217728) != 0 && state.undercurl {
+            flags = flags | Curl
+          }
+        }
+        foreground := values[index + 1]
+        cell_at(target_column, target_row).* = Cell{character: packed & 16777215, foreground: foreground, background: values[index + 2], underline: foreground, flags: flags}
+      }
+    }
+  }
+  if cursor_column >= 0 && cell_visible(origin_column + cursor_column, origin_row + cursor_row) {
+    state.bar_column = origin_column + cursor_column
+    state.bar_row = origin_row + cursor_row
+    state.bar_block = true
+  }
+}
+pub fn tui_viewport(rectangle: *const PixelRect) {
+  if rectangle == nil {
+    state.origin_x = 0
+    state.origin_y = 0
+    return
+  }
+  state.origin_x = rectangle.x
+  state.origin_y = rectangle.y
+}
+pub fn tui_clip(rectangle: *const PixelRect) {
+  if rectangle == nil {
+    state.clipping = false
+    return
+  }
+  state.clipping = true
+  state.clip = PixelRect{x: rectangle.x + state.origin_x, y: rectangle.y + state.origin_y, width: rectangle.width, height: rectangle.height}
+}
+pub fn tui_target(texture: bool) {
+  state.texture_target = texture
+}
+// Whether the cell's centre is inside the clip and on screen.
+fn cell_visible(column: i32, row: i32) bool {
+  if column < 0 || row < 0 || column >= state.columns || row >= state.rows {
+    return false
+  }
+  if !state.clipping {
+    return true
+  }
+  x := #cast(f32) column * CellWidth + CellWidth * 0.5
+  y := #cast(f32) row * CellHeight + CellHeight * 0.5
+  return x >= #cast(f32) state.clip.x && x < #cast(f32) (state.clip.x + state.clip.width) && y >= #cast(f32) state.clip.y && y < #cast(f32) (state.clip.y + state.clip.height)
+}
+fn to_column(x: f32) i32 {
+  return #cast(i32) ((x + CellWidth * 0.5) / CellWidth)
+}
+fn to_row(y: f32) i32 {
+  return #cast(i32) ((y + CellHeight * 0.5) / CellHeight)
+}
+fn floor_cell(value: f32, size: f32) i32 {
+  if value < 0.0 {
+    return -1
+  }
+  return #cast(i32) (value / size)
+}
+pub fn tui_fill(rectangle: *const Rect) {
+  x := rectangle.x + #cast(f32) state.origin_x
+  y := rectangle.y + #cast(f32) state.origin_y
+  width := rectangle.width
+  height := rectangle.height
+  if width <= 0.0 || height <= 0.0 {
+    return
+  }
+  // A border is a fill in the border color followed by a fill inset by a
+  // pixel or two: draw a box-drawing frame instead of losing it.
+  previous := state.last_fill
+  framed := state.last_valid && x > previous.x && y > previous.y && x - previous.x <= 2.5 && y - previous.y <= 2.5 && previous.x + previous.width - (x + width) > 0.0 && previous.x + previous.width - (x + width) <= 2.5 && previous.y + previous.height - (y + height) > 0.0 && previous.y + previous.height - (y + height) <= 2.5
+  state.last_fill = Rect{x: x, y: y, width: width, height: height}
+  state.last_valid = true
+  border_color := state.last_color
+  state.last_color = state.color
+  if framed {
+    tui_frame(previous, border_color)
+    return
+  }
+  thin_width := width < CellWidth * 0.5
+  thin_height := height < CellHeight * 0.4
+  if thin_width && thin_height {
+    return
+  }
+  if thin_height {
+    row := floor_cell(y, CellHeight)
+    first := to_column(x)
+    last := to_column(x + width) - 1
+    // Low in its cell: an underline (diagnostics). Otherwise a border line.
+    underline := y - #cast(f32) row * CellHeight > CellHeight * 0.6
+    for column in first..=last {
+      if !cell_visible(column, row) {
+        continue
+      }
+      cell := cell_at(column, row)
+      if underline {
+        cell.flags = cell.flags | Underline
+        if state.undercurl {
+          cell.flags = cell.flags | Curl
+        }
+        cell.underline = state.color
+        continue
+      }
+      bits: u8 = LineLeft | LineRight
+      if column == first {
+        bits = LineRight
+      }
+      if column == last {
+        bits = bits & ~LineRight
+        if column != first {
+          bits = LineLeft
+        }
+      }
+      if first == last {
+        bits = LineLeft | LineRight
+      }
+      cell.flags = cell.flags | bits
+      cell.foreground = state.color
+    }
+    return
+  }
+  if thin_width {
+    column := floor_cell(x, CellWidth)
+    first_row := floor_cell(y + CellHeight * 0.25, CellHeight)
+    last_row := floor_cell(y + height - CellHeight * 0.25, CellHeight)
+    // One row tall: the insert-mode bar cursor.
+    if first_row == last_row {
+      if cell_visible(column, first_row) {
+        state.bar_column = column
+        state.bar_row = first_row
+      }
+      return
+    }
+    for row in first_row..=last_row {
+      if !cell_visible(column, row) {
+        continue
+      }
+      cell := cell_at(column, row)
+      bits: u8 = LineUp | LineDown
+      if row == first_row {
+        bits = LineDown
+      }
+      else if row == last_row {
+        bits = LineUp
+      }
+      cell.flags = cell.flags | bits
+      cell.foreground = state.color
+    }
+    return
+  }
+  first_column := to_column(x)
+  last_column := to_column(x + width) - 1
+  first_row := to_row(y)
+  last_row := to_row(y + height) - 1
+  if last_column < first_column {
+    last_column = first_column
+  }
+  if last_row < first_row {
+    last_row = first_row
+  }
+  for row in first_row..=last_row {
+    for column in first_column..=last_column {
+      if cell_visible(column, row) {
+        cell_at(column, row).* = Cell{character: 32, foreground: cell_at(column, row).foreground, background: state.color}
+      }
+    }
+  }
+}
+// Frame: border lines around the outer cells, the current color inside.
+// Panels pad their content by less than a cell vertically, so the top and
+// bottom lines go one row outside the rectangle (when that row exists).
+fn tui_frame(outer: Rect, border: u32) {
+  first_column := to_column(outer.x)
+  last_column := to_column(outer.x + outer.width) - 1
+  first_row := to_row(outer.y)
+  last_row := to_row(outer.y + outer.height) - 1
+  if last_column - first_column < 1 || last_row - first_row < 1 {
+    return
+  }
+  if first_row > 0 {
+    first_row -= 1
+  }
+  if last_row + 1 < state.rows {
+    last_row += 1
+  }
+  for row in first_row..=last_row {
+    for column in first_column..=last_column {
+      if !cell_visible(column, row) {
+        continue
+      }
+      bits: u8 = 0
+      if row == first_row || row == last_row {
+        if column > first_column {
+          bits = bits | LineLeft
+        }
+        if column < last_column {
+          bits = bits | LineRight
+        }
+      }
+      if column == first_column || column == last_column {
+        if row > first_row {
+          bits = bits | LineUp
+        }
+        if row < last_row {
+          bits = bits | LineDown
+        }
+      }
+      cell_at(column, row).* = Cell{character: 32, foreground: border, background: state.color, flags: bits}
+    }
+  }
+}
+fn put_character(column: i32, row: i32, character: u32, foreground: u32, italic: bool) {
+  if !cell_visible(column, row) {
+    return
+  }
+  cell := cell_at(column, row)
+  cell.character = character
+  cell.foreground = foreground
+  cell.flags = cell.flags & (Underline | Curl)
+  if italic {
+    cell.flags = cell.flags | Italic
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Text objects: UTF-8 laid out in whole cells (monospace terminals).
+
+pub struct TuiText { bytes: rawptr, length: usize, capacity: usize, color: u32, wrap: i32, alive: bool, italic: bool }
+texts: [4096]TuiText = []
+
+pub fn tui_text_create() rawptr {
+  for index in 0..4096 {
+    if !texts[index].alive {
+      texts[index] = TuiText{alive: true, color: 16777215}
+      return #cast(rawptr) &texts[index]
+    }
+  }
+  return nil
+}
+pub fn tui_text_destroy(handle: rawptr) {
+  text := #cast(*TuiText) handle
+  if text.bytes != nil {
+    heap_free(text.bytes)
+  }
+  text.* = TuiText{}
+}
+pub fn tui_text_set(handle: rawptr, bytes: *const u8, length: usize) bool {
+  text := #cast(*TuiText) handle
+  if length + 1 > text.capacity {
+    if text.bytes != nil {
+      heap_free(text.bytes)
+    }
+    capacity := length + 64
+    text.bytes = heap_alloc(capacity)
+    if text.bytes == nil {
+      text.capacity = 0
+      text.length = 0
+      return false
+    }
+    text.capacity = capacity
+  }
+  storage := (#cast(*u8) text.bytes)[..text.capacity]
+  source := bytes[..length]
+  for index in 0..length {
+    storage[index] = source[index]
+  }
+  text.length = length
+  return true
+}
+pub fn tui_text_color(handle: rawptr, red: u8, green: u8, blue: u8) {
+  text := #cast(*TuiText) handle
+  text.color = (#cast(u32) red << 16) | (#cast(u32) green << 8) | #cast(u32) blue
+}
+pub fn tui_text_italic(handle: rawptr, italic: bool) {
+  (#cast(*TuiText) handle).italic = italic
+}
+pub fn tui_text_wrap(handle: rawptr, pixels: i32) {
+  (#cast(*TuiText) handle).wrap = pixels
+}
+fn text_bytes(text: *const TuiText) []const u8 {
+  if text.bytes == nil {
+    return ""
+  }
+  return (#cast(*const u8) text.bytes)[..text.length]
+}
+// Decode one UTF-8 codepoint; invalid bytes read as themselves.
+fn decode(bytes: []const u8, at: usize, width: *usize) u32 {
+  first := bytes[at]
+  if first < 128 || at + 1 >= #len(bytes) {
+    width.* = 1
+    return #cast(u32) first
+  }
+  if first >= 240 && at + 3 < #len(bytes) {
+    width.* = 4
+    return ((#cast(u32) first & 7) << 18) | ((#cast(u32) bytes[at + 1] & 63) << 12) | ((#cast(u32) bytes[at + 2] & 63) << 6) | (#cast(u32) bytes[at + 3] & 63)
+  }
+  if first >= 224 && at + 2 < #len(bytes) {
+    width.* = 3
+    return ((#cast(u32) first & 15) << 12) | ((#cast(u32) bytes[at + 1] & 63) << 6) | (#cast(u32) bytes[at + 2] & 63)
+  }
+  if first >= 192 {
+    width.* = 2
+    return ((#cast(u32) first & 31) << 6) | (#cast(u32) bytes[at + 1] & 63)
+  }
+  width.* = 1
+  return #cast(u32) first
+}
+// Terminal columns a codepoint takes: wide CJK and emoji 2, combining 0.
+fn display_width(character: u32) i32 {
+  if character == 0 || (character >= 768 && character < 880) || (character >= 8203 && character <= 8207) || (character >= 65024 && character <= 65039) {
+    return 0
+  }
+  if (character >= 4352 && character <= 4447) || (character >= 11904 && character <= 42191) || (character >= 44032 && character <= 55203) || (character >= 63744 && character <= 64255) || (character >= 65072 && character <= 65103) || (character >= 65280 && character <= 65376) || (character >= 65504 && character <= 65510) || (character >= 127744 && character <= 129791) || (character >= 131072 && character <= 262141) {
+    return 2
+  }
+  return 1
+}
+// Walk a text's layout. visit is called per codepoint with its byte offset,
+// column, row and width; it returns false to stop.
+struct LayoutStep { offset: usize, bytes: usize, character: u32, column: i32, row: i32, width: i32 }
+fn layout_next(text: *const TuiText, step: *LayoutStep) bool {
+  bytes := text_bytes(text)
+  if step.offset >= #len(bytes) {
+    return false
+  }
+  // Advance past the previous codepoint.
+  if step.bytes > 0 {
+    step.offset += step.bytes
+    if step.character == 10 {
+      step.column = 0
+      step.row += 1
+    }
+    else if step.character == 9 {
+      step.column = (step.column / 4 + 1) * 4
+    }
+    else {
+      step.column += step.width
+    }
+    if step.offset >= #len(bytes) {
+      return false
+    }
+  }
+  width: usize = 1
+  step.character = decode(bytes, step.offset, &width)
+  step.bytes = width
+  step.width = display_width(step.character)
+  if step.character == 9 || step.character == 10 || step.character == 13 {
+    step.width = 1
+  }
+  wrap_columns := text.wrap / #cast(i32) CellWidth
+  if wrap_columns > 0 && step.column > 0 && step.column + step.width > wrap_columns && step.character != 10 {
+    step.column = 0
+    step.row += 1
+  }
+  return true
+}
+pub fn tui_text_draw(handle: rawptr, x: f32, y: f32) {
+  text := #cast(*TuiText) handle
+  // Round to the nearest cell, matching cell_visible's centre test: a text
+  // starting at a clip edge always keeps its first column.
+  origin_column := floor_cell(x + #cast(f32) state.origin_x + CellWidth * 0.5, CellWidth)
+  origin_row := floor_cell(y + #cast(f32) state.origin_y + CellHeight * 0.5, CellHeight)
+  step := LayoutStep{}
+  for layout_next(text, &step) {
+    // Spaces paint nothing, as in the GUI: they never erase what lies beneath.
+    if step.character == 10 || step.character == 13 || step.character == 9 || step.character == 32 || step.width == 0 {
+      continue
+    }
+    column := origin_column + step.column
+    row := origin_row + step.row
+    put_character(column, row, step.character, text.color, text.italic)
+    if step.width == 2 {
+      put_character(column + 1, row, 0, text.color, text.italic)
+    }
+  }
+}
+pub fn tui_text_size(handle: rawptr, width: *i32, height: *i32) {
+  text := #cast(*TuiText) handle
+  step := LayoutStep{}
+  widest: i32 = 0
+  rows: i32 = 1
+  for layout_next(text, &step) {
+    end := step.column + step.width
+    if step.character == 10 {
+      end = step.column
+    }
+    if end > widest {
+      widest = end
+    }
+    if step.row + 1 > rows {
+      rows = step.row + 1
+    }
+  }
+  bytes := text_bytes(text)
+  if #len(bytes) > 0 && bytes[#len(bytes) - 1] == 10 {
+    rows += 1
+  }
+  width.* = widest * #cast(i32) CellWidth
+  height.* = rows * #cast(i32) CellHeight
+}
+// Geometry of the codepoint at a byte offset, like TTF_GetTextSubString.
+pub fn tui_text_substring(handle: rawptr, offset: i32, x: *i32, y: *i32, width: *i32, start: *i32, length: *i32, line: *i32) bool {
+  text := #cast(*TuiText) handle
+  step := LayoutStep{}
+  last_column: i32 = 0
+  last_row: i32 = 0
+  for layout_next(text, &step) {
+    if #cast(i32) step.offset >= offset {
+      x.* = step.column * #cast(i32) CellWidth
+      y.* = step.row * #cast(i32) CellHeight
+      width.* = step.width * #cast(i32) CellWidth
+      start.* = #cast(i32) step.offset
+      length.* = #cast(i32) step.bytes
+      line.* = step.row
+      return true
+    }
+    last_column = step.column + step.width
+    last_row = step.row
+    if step.character == 10 {
+      last_column = 0
+      last_row = step.row + 1
+    }
+  }
+  // At the end: just after the last codepoint.
+  x.* = last_column * #cast(i32) CellWidth
+  y.* = last_row * #cast(i32) CellHeight
+  width.* = 0
+  start.* = #cast(i32) text.length
+  length.* = 0
+  line.* = last_row
+  return true
+}
+pub fn tui_text_at_point(handle: rawptr, x: i32, y: i32) i32 {
+  text := #cast(*TuiText) handle
+  column := x / #cast(i32) CellWidth
+  row := y / #cast(i32) CellHeight
+  step := LayoutStep{}
+  for layout_next(text, &step) {
+    if step.row == row && (column < step.column + step.width || step.character == 10) {
+      return #cast(i32) step.offset
+    }
+    if step.row > row {
+      return #cast(i32) step.offset
+    }
+  }
+  return #cast(i32) text.length
+}
+pub fn tui_measure_string(bytes: *const u8, length: usize, width: *i32, height: *i32) {
+  text := TuiText{bytes: #cast(rawptr) bytes, length: length}
+  step := LayoutStep{}
+  widest: i32 = 0
+  for layout_next(&text, &step) {
+    if step.column + step.width > widest {
+      widest = step.column + step.width
+    }
+  }
+  width.* = widest * #cast(i32) CellWidth
+  height.* = #cast(i32) CellHeight
+}
+
+// ---------------------------------------------------------------------------
+// Present: write what changed since the last frame.
+
+fn emit(bytes: []const u8) {
+  if output_used + #len(bytes) > #len(output) {
+    tty_write(&output[0], output_used)
+    output_used = 0
+  }
+  for byte in bytes {
+    output[output_used] = byte
+    output_used += 1
+  }
+}
+fn emit_number(value: u32) {
+  digits: [12]u8 = []
+  count: usize = 0
+  remaining := value
+  for {
+    digits[11 - count] = #cast(u8) (remaining % 10) + '0'
+    count += 1
+    remaining /= 10
+    if remaining == 0 {
+      break
+    }
+  }
+  emit(digits[12 - count..])
+}
+fn emit_character(character: u32) {
+  encoded: [4]u8 = []
+  if character < 128 {
+    encoded[0] = #cast(u8) character
+    emit(encoded[..1])
+  }
+  else if character < 2048 {
+    encoded[0] = #cast(u8) ((character >> 6) | 192)
+    encoded[1] = #cast(u8) ((character & 63) | 128)
+    emit(encoded[..2])
+  }
+  else if character < 65536 {
+    encoded[0] = #cast(u8) ((character >> 12) | 224)
+    encoded[1] = #cast(u8) (((character >> 6) & 63) | 128)
+    encoded[2] = #cast(u8) ((character & 63) | 128)
+    emit(encoded[..3])
+  }
+  else {
+    encoded[0] = #cast(u8) ((character >> 18) | 240)
+    encoded[1] = #cast(u8) (((character >> 12) & 63) | 128)
+    encoded[2] = #cast(u8) (((character >> 6) & 63) | 128)
+    encoded[3] = #cast(u8) ((character & 63) | 128)
+    emit(encoded[..4])
+  }
+}
+fn emit_color(background: bool, color: u32) {
+  if background {
+    emit("\x1b[48;")
+  }
+  else {
+    emit("\x1b[38;")
+  }
+  if !state.truecolor {
+    emit("5;")
+    emit_number(nearest_256(color))
+    emit("m")
+    return
+  }
+  emit("2;")
+  emit_number(color >> 16)
+  emit(";")
+  emit_number((color >> 8) & 255)
+  emit(";")
+  emit_number(color & 255)
+  emit("m")
+}
+// SGR 58: the underline's own color, colon form as terminals expect.
+fn emit_underline_color(color: u32) {
+  if !state.truecolor {
+    emit("\x1b[58:5:")
+    emit_number(nearest_256(color))
+    emit("m")
+    return
+  }
+  emit("\x1b[58:2::")
+  emit_number(color >> 16)
+  emit(":")
+  emit_number((color >> 8) & 255)
+  emit(":")
+  emit_number(color & 255)
+  emit("m")
+}
+// The closest xterm-256 color: the 6x6x6 cube (16-231) or the gray ramp
+// (232-255), whichever is nearer.
+fn cube_level(value: u32) u32 {
+  if value < 48 {
+    return 0
+  }
+  if value < 115 {
+    return 1
+  }
+  return (value - 35) / 40
+}
+fn cube_value(level: u32) u32 {
+  if level == 0 {
+    return 0
+  }
+  return level * 40 + 55
+}
+fn distance(red: u32, green: u32, blue: u32, other_red: u32, other_green: u32, other_blue: u32) u32 {
+  dr := #cast(i32) red - #cast(i32) other_red
+  dg := #cast(i32) green - #cast(i32) other_green
+  db := #cast(i32) blue - #cast(i32) other_blue
+  return #cast(u32) (dr * dr + dg * dg + db * db)
+}
+fn nearest_256(color: u32) u32 {
+  red := color >> 16
+  green := (color >> 8) & 255
+  blue := color & 255
+  r := cube_level(red)
+  g := cube_level(green)
+  b := cube_level(blue)
+  cube := distance(red, green, blue, cube_value(r), cube_value(g), cube_value(b))
+  average := (red + green + blue) / 3
+  step: u32 = 0
+  if average > 8 {
+    step = (average - 8) / 10
+  }
+  if step > 23 {
+    step = 23
+  }
+  gray_value := step * 10 + 8
+  gray := distance(red, green, blue, gray_value, gray_value, gray_value)
+  if gray < cube {
+    return step + 232
+  }
+  return r * 36 + g * 6 + b + 16
+}
+fn box_character(flags: u8) u32 {
+  horizontal := (flags & (LineLeft | LineRight)) != 0
+  vertical := (flags & (LineUp | LineDown)) != 0
+  if horizontal && vertical {
+    // Corners from the sides each line reaches.
+    if (flags & LineRight) != 0 && (flags & LineDown) != 0 && (flags & LineLeft) == 0 && (flags & LineUp) == 0 {
+      return 9484
+    }
+    if (flags & LineLeft) != 0 && (flags & LineDown) != 0 && (flags & LineRight) == 0 && (flags & LineUp) == 0 {
+      return 9488
+    }
+    if (flags & LineRight) != 0 && (flags & LineUp) != 0 && (flags & LineLeft) == 0 && (flags & LineDown) == 0 {
+      return 9492
+    }
+    if (flags & LineLeft) != 0 && (flags & LineUp) != 0 && (flags & LineRight) == 0 && (flags & LineDown) == 0 {
+      return 9496
+    }
+    return 9532
+  }
+  if horizontal {
+    return 9472
+  }
+  return 9474
+}
+pub fn tui_present() {
+  if tty_resized() != 0 {
+    tui_measure()
+    state.full_redraw = true
+  }
+  output_used = 0
+  emit("\x1b[?25l")
+  // Start every frame from plain attributes so none leak from the last one.
+  emit("\x1b[0m")
+  if state.full_redraw {
+    emit("\x1b[2J")
+  }
+  current_foreground: u32 = 4294967295
+  current_background: u32 = 4294967295
+  current_underline: u8 = 0
+  current_underline_color: u32 = 4294967295
+  current_italic := false
+  current_bold := false
+  cursor_column: i32 = -1
+  cursor_row: i32 = -1
+  for row in 0..state.rows {
+    for column in 0..state.columns {
+      index := #cast(usize) row * MaxColumns + #cast(usize) column
+      cell := grid[index]
+      character := cell.character
+      if character == 32 && (cell.flags & 15) != 0 {
+        character = box_character(cell.flags)
+      }
+      if character == 0 {
+        // The right half of a wide character draws nothing.
+        shown[index] = cell
+        continue
+      }
+      before := shown[index]
+      if !state.full_redraw && before.character == cell.character && before.foreground == cell.foreground && before.background == cell.background && before.flags == cell.flags && before.underline == cell.underline {
+        continue
+      }
+      shown[index] = cell
+      if cursor_row != row || cursor_column != column {
+        emit("\x1b[")
+        emit_number(#cast(u32) row + 1)
+        emit(";")
+        emit_number(#cast(u32) column + 1)
+        emit("H")
+      }
+      if cell.background != current_background {
+        emit_color(true, cell.background)
+        current_background = cell.background
+      }
+      if cell.foreground != current_foreground {
+        emit_color(false, cell.foreground)
+        current_foreground = cell.foreground
+      }
+      underline: u8 = 0
+      if (cell.flags & Curl) != 0 {
+        underline = 2
+      }
+      else if (cell.flags & Underline) != 0 {
+        underline = 1
+      }
+      if underline != current_underline {
+        if underline == 2 {
+          emit("\x1b[4:3m")
+        }
+        else if underline == 1 {
+          emit("\x1b[4m")
+        }
+        else {
+          emit("\x1b[24m")
+        }
+        current_underline = underline
+      }
+      if underline == 2 && cell.underline != current_underline_color {
+        emit_underline_color(cell.underline)
+        current_underline_color = cell.underline
+      }
+      bold := (cell.flags & Bold) != 0
+      if bold != current_bold {
+        if bold {
+          emit("\x1b[1m")
+        }
+        else {
+          emit("\x1b[22m")
+        }
+        current_bold = bold
+      }
+      italic := (cell.flags & Italic) != 0
+      if italic != current_italic {
+        if italic {
+          emit("\x1b[3m")
+        }
+        else {
+          emit("\x1b[23m")
+        }
+        current_italic = italic
+      }
+      if character < 32 {
+        character = 32
+      }
+      emit_character(character)
+      cursor_column = column + display_width(character)
+      cursor_row = row
+    }
+  }
+  state.full_redraw = false
+  // The insert-mode bar is the terminal's own cursor; block cursors are cells.
+  if state.bar_column >= 0 {
+    emit("\x1b[")
+    emit_number(#cast(u32) state.bar_row + 1)
+    emit(";")
+    emit_number(#cast(u32) state.bar_column + 1)
+    if state.bar_block {
+      emit("H\x1b[2 q\x1b[?25h")
+    }
+    else {
+      emit("H\x1b[6 q\x1b[?25h")
+    }
+  }
+  if output_used > 0 {
+    tty_write(&output[0], output_used)
+  }
+  output_used = 0
+}
+pub fn tui_title(title: *const u8, length: usize) {
+  output_used = 0
+  emit("\x1b]2;")
+  emit(title[..length])
+  emit("\x1b\\")
+  tty_write(&output[0], output_used)
+  output_used = 0
+}
+// OSC 52 copies to the terminal's clipboard; DNA keeps its own copy to read.
+pub fn tui_clipboard_set(text: *const u8, length: usize) {
+  if state.clipboard != nil {
+    heap_free(state.clipboard)
+  }
+  state.clipboard = heap_alloc(length + 1)
+  if state.clipboard != nil {
+    copy := (#cast(*u8) state.clipboard)[..length + 1]
+    source := text[..length]
+    for index in 0..length {
+      copy[index] = source[index]
+    }
+    copy[length] = 0
+  }
+  alphabet: []const u8 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  output_used = 0
+  emit("\x1b]52;c;")
+  bytes := text[..length]
+  at: usize = 0
+  for at < length {
+    a := #cast(u32) bytes[at]
+    b: u32 = 0
+    c: u32 = 0
+    if at + 1 < length {
+      b = #cast(u32) bytes[at + 1]
+    }
+    if at + 2 < length {
+      c = #cast(u32) bytes[at + 2]
+    }
+    group := (a << 16) | (b << 8) | c
+    quad: [4]u8 = [alphabet[#cast(usize) ((group >> 18) & 63)], alphabet[#cast(usize) ((group >> 12) & 63)], alphabet[#cast(usize) ((group >> 6) & 63)], alphabet[#cast(usize) (group & 63)]]
+    if at + 1 >= length {
+      quad[2] = '='
+    }
+    if at + 2 >= length {
+      quad[3] = '='
+    }
+    emit(quad[..])
+    at += 3
+  }
+  emit("\x07")
+  tty_write(&output[0], output_used)
+  output_used = 0
+}
+// A heap copy, released through the platform free like SDL's.
+pub fn tui_clipboard_get() *const u8 {
+  length: usize = 0
+  if state.clipboard != nil {
+    for (#cast(*const u8) state.clipboard)[..length + 1][length] != 0 {
+      length += 1
+    }
+  }
+  copy := heap_alloc(length + 1)
+  if copy == nil {
+    return nil
+  }
+  target := (#cast(*u8) copy)[..length + 1]
+  if length > 0 {
+    source := (#cast(*const u8) state.clipboard)[..length]
+    for index in 0..length {
+      target[index] = source[index]
+    }
+  }
+  target[length] = 0
+  return #cast(*const u8) copy
+}
+pub fn tui_free(pointer: rawptr) {
+  heap_free(pointer)
+}
+pub fn tui_text_input(active: bool) {
+  state.text_input = active
+}
+pub fn tui_last_character() u32 {
+  return state.last_character
+}
+
+// ---------------------------------------------------------------------------
+// Input: terminal bytes to SDL-shaped events.
+
+const ModShift: u16 = 3
+const ModAlt: u16 = 768
+const ModCtrl: u16 = 192
+
+fn queue(event: Event) {
+  if state.event_count == 64 {
+    return
+  }
+  state.events[(state.event_head + state.event_count) % 64] = event
+  state.event_count += 1
+}
+fn queue_key(key: u32, modifiers: u16, character: u32) {
+  event := Event{}
+  key_event := #cast(*KeyEvent) &event
+  key_event.kind = 768
+  key_event.key = key
+  key_event.modifiers = modifiers
+  key_event.down = true
+  key_event.scancode = character
+  queue(event)
+}
+fn queue_text(bytes: []const u8) {
+  if !state.text_input || #len(bytes) == 0 || #len(bytes) >= 256 {
+    return
+  }
+  slot_index := state.text_next
+  state.text_next = (state.text_next + 1) % 64
+  for index in 0..#len(bytes) {
+    state.texts[slot_index][index] = bytes[index]
+  }
+  state.texts[slot_index][#len(bytes)] = 0
+  event := Event{}
+  text := #cast(*TextEvent) &event
+  text.kind = 771
+  text.text = &state.texts[slot_index][0]
+  queue(event)
+}
+// A typed character: a key event, then text while text input is on.
+fn queue_character(character: u32, modifiers: u16, bytes: []const u8) {
+  key := character
+  extra := modifiers
+  if character >= 'A' && character <= 'Z' {
+    key = character + 32
+    extra = extra | ModShift
+  }
+  queue_key(key, extra, character)
+  if (modifiers & (ModCtrl | ModAlt)) == 0 {
+    queue_text(bytes)
+  }
+}
+fn kitty_modifiers(value: u32) u16 {
+  // 1 + bit flags; 0 is malformed and means none.
+  if value == 0 {
+    return 0
+  }
+  bits := value - 1
+  modifiers: u16 = 0
+  if (bits & 1) != 0 {
+    modifiers = modifiers | ModShift
+  }
+  if (bits & 2) != 0 {
+    modifiers = modifiers | ModAlt
+  }
+  if (bits & 4) != 0 {
+    modifiers = modifiers | ModCtrl
+  }
+  return modifiers
+}
+// SDL keycodes for special keys (scancode | 1 << 30).
+fn special_key(final: u8, number: u32) u32 {
+  if final == 'A' {
+    return 1073741906
+  }
+  if final == 'B' {
+    return 1073741905
+  }
+  if final == 'C' {
+    return 1073741903
+  }
+  if final == 'D' {
+    return 1073741904
+  }
+  if final == 'H' {
+    return 1073741898
+  }
+  if final == 'F' {
+    return 1073741901
+  }
+  if final == 'P' {
+    return 1073741882
+  }
+  if final == '~' {
+    if number == 1 || number == 7 {
+      return 1073741898
+    }
+    if number == 4 || number == 8 {
+      return 1073741901
+    }
+    if number == 5 {
+      return 1073741899
+    }
+    if number == 6 {
+      return 1073741902
+    }
+    if number == 3 {
+      return 127
+    }
+    if number == 2 {
+      return 1073741897
+    }
+    if number >= 11 && number <= 15 {
+      return 1073741882 + (number - 11)
+    }
+    if number >= 17 && number <= 21 {
+      return 1073741887 + (number - 17)
+    }
+    if number == 23 || number == 24 {
+      return 1073741892 + (number - 23)
+    }
+  }
+  return 0
+}
+fn mouse_event(kind: u32, button: u8, column: i32, row: i32, down: bool) {
+  event := Event{}
+  x := #cast(f32) column * CellWidth + CellWidth * 0.5
+  y := #cast(f32) row * CellHeight + CellHeight * 0.5
+  if kind == 1024 {
+    motion := #cast(*MouseMotion) &event
+    motion.kind = 1024
+    motion.state = state.buttons
+    motion.x = x
+    motion.y = y
+  }
+  else if kind == 1027 {
+    wheel := #cast(*MouseWheel) &event
+    wheel.kind = 1027
+    wheel.y = 1.0
+    if button == 1 {
+      wheel.y = -1.0
+    }
+    wheel.mouse_x = x
+    wheel.mouse_y = y
+  }
+  else {
+    press := #cast(*MouseButton) &event
+    press.kind = kind
+    press.button = button
+    press.down = down
+    press.x = x
+    press.y = y
+    press.clicks = 1
+    if down {
+      now := ticks()
+      if button == state.last_click_button && column == state.last_click_column && row == state.last_click_row && now - state.last_click_time < 400 {
+        state.clicks += 1
+      }
+      else {
+        state.clicks = 1
+      }
+      state.last_click_time = now
+      state.last_click_button = button
+      state.last_click_column = column
+      state.last_click_row = row
+    }
+    press.clicks = state.clicks
+  }
+  queue(event)
+}
+// Pastes past this size keep their first 64 MiB.
+const PasteLimit: usize = 67108864
+pub const PasteEvent: u32 = 32769
+fn paste_append(bytes: []const u8) {
+  if #len(bytes) == 0 || state.paste_length + #len(bytes) > PasteLimit {
+    return
+  }
+  if state.paste_length + #len(bytes) > state.paste_capacity {
+    capacity := state.paste_capacity * 2
+    if capacity < 65536 {
+      capacity = 65536
+    }
+    for capacity < state.paste_length + #len(bytes) {
+      capacity *= 2
+    }
+    grown := heap_alloc(capacity)
+    if grown == nil {
+      return
+    }
+    if state.paste != nil {
+      old := (#cast(*u8) state.paste)[..state.paste_length]
+      target := (#cast(*u8) grown)[..state.paste_length]
+      for index in 0..state.paste_length {
+        target[index] = old[index]
+      }
+      heap_free(state.paste)
+    }
+    state.paste = grown
+    state.paste_capacity = capacity
+  }
+  target := (#cast(*u8) state.paste)[state.paste_length..state.paste_length + #len(bytes)]
+  for index in 0..#len(bytes) {
+    target[index] = bytes[index]
+  }
+  state.paste_length += #len(bytes)
+}
+// Inside a paste: everything up to ESC [201~ is text, never keys, however
+// many reads it spans. Holds back a possible partial terminator.
+fn paste_finish() {
+  state.pasting = false
+  event := Event{}
+  event.words[0] = #cast(u64) PasteEvent
+  queue(event)
+}
+fn paste_continue() usize {
+  bytes := state.input[..state.input_used]
+  terminator := find(bytes, "\x1b[201~", 0)
+  if terminator < #len(bytes) {
+    paste_append(bytes[..terminator])
+    paste_finish()
+    return terminator + 6
+  }
+  if #len(bytes) <= 5 {
+    return 0
+  }
+  keep := #len(bytes) - 5
+  paste_append(bytes[..keep])
+  return keep
+}
+// The finished paste, valid until tui_paste_clear.
+pub fn tui_paste() []const u8 {
+  if state.paste == nil {
+    return ""
+  }
+  return (#cast(*const u8) state.paste)[..state.paste_length]
+}
+pub fn tui_paste_clear() {
+  state.paste_length = 0
+  if state.paste_capacity > 1048576 {
+    heap_free(state.paste)
+    state.paste = nil
+    state.paste_capacity = 0
+  }
+}
+// Parse one sequence from the front of the input. Returns bytes consumed, or
+// 0 when the sequence is incomplete.
+fn parse_one(force_escape: bool) usize {
+  if state.pasting {
+    return paste_continue()
+  }
+  bytes := state.input[..state.input_used]
+  first := bytes[0]
+  if first != 27 {
+    if first == 13 || first == 10 {
+      queue_key(13, 0, 0)
+      return 1
+    }
+    if first == 9 {
+      queue_key(9, 0, 0)
+      return 1
+    }
+    if first == 127 || first == 8 {
+      queue_key(8, 0, 0)
+      return 1
+    }
+    if first == 0 {
+      queue_key(32, ModCtrl, 0)
+      return 1
+    }
+    if first < 27 {
+      queue_key(#cast(u32) first + 96, ModCtrl, 0)
+      return 1
+    }
+    if first < 32 {
+      // Ctrl-\ ] ^ _
+      queue_key(#cast(u32) first + 64, ModCtrl, 0)
+      return 1
+    }
+    width: usize = 1
+    if first >= 192 {
+      width = 2
+      if first >= 224 {
+        width = 3
+      }
+      if first >= 240 {
+        width = 4
+      }
+      if #len(bytes) < width {
+        return 0
+      }
+    }
+    decoded_width: usize = 1
+    character := decode(bytes, 0, &decoded_width)
+    queue_character(character, 0, bytes[..width])
+    return width
+  }
+  if #len(bytes) == 1 {
+    if !force_escape {
+      return 0
+    }
+    queue_key(27, 0, 0)
+    return 1
+  }
+  second := bytes[1]
+  if second != '[' && second != 'O' {
+    // Alt plus a key.
+    if second == 27 {
+      queue_key(27, 0, 0)
+      return 1
+    }
+    if second < 27 && second != 13 && second != 9 {
+      queue_key(#cast(u32) second + 96, ModCtrl | ModAlt, 0)
+      return 2
+    }
+    if second == 13 {
+      queue_key(13, ModAlt, 0)
+      return 2
+    }
+    if second < 128 {
+      character := #cast(u32) second
+      modifiers := ModAlt
+      if character >= 'A' && character <= 'Z' {
+        character += 32
+        modifiers = modifiers | ModShift
+      }
+      queue_key(character, modifiers, #cast(u32) second)
+      return 2
+    }
+    queue_key(27, 0, 0)
+    return 1
+  }
+  // CSI / SS3: parameters, then a final byte in 64..126.
+  end: usize = 2
+  for end < #len(bytes) && (bytes[end] < 64 || bytes[end] > 126) {
+    end += 1
+  }
+  if end == #len(bytes) {
+    if #len(bytes) > 64 || force_escape {
+      // Unterminated: drop it.
+      return #len(bytes)
+    }
+    return 0
+  }
+  final := bytes[end]
+  parameters := bytes[2..end]
+  // Bracketed paste: gathered by paste_continue until ESC [201~.
+  if final == '~' && buffer_equal(parameters, "200") {
+    state.pasting = true
+    state.paste_length = 0
+    state.paste_since = ticks()
+    return end + 1
+  }
+  // SGR mouse: ESC [ < b ; x ; y M|m
+  if #len(parameters) > 0 && parameters[0] == '<' && (final == 'M' || final == 'm') {
+    values: [3]u32 = []
+    count := numbers(parameters[1..], values[..])
+    if count == 3 {
+      button := values[0]
+      column := #cast(i32) values[1] - 1
+      row := #cast(i32) values[2] - 1
+      // Held modifiers ride along in the button code: 4 Shift, 8 Alt, 16 Ctrl.
+      held: u16 = 0
+      if (button & 4) != 0 {
+        held = held | ModShift
+      }
+      if (button & 8) != 0 {
+        held = held | ModAlt
+      }
+      if (button & 16) != 0 {
+        held = held | ModCtrl
+      }
+      state.mouse_modifiers = held
+      if (button & 64) != 0 {
+        mouse_event(1027, #cast(u8) (button & 1), column, row, true)
+      }
+      else if (button & 32) != 0 {
+        mouse_event(1024, 0, column, row, true)
+      }
+      else {
+        sdl_button: u8 = 1
+        if (button & 3) == 1 {
+          sdl_button = 2
+        }
+        else if (button & 3) == 2 {
+          sdl_button = 3
+        }
+        bit := #cast(u32) 1 << (#cast(u32) sdl_button - 1)
+        if final == 'M' {
+          state.buttons = state.buttons | bit
+          mouse_event(1025, sdl_button, column, row, true)
+        }
+        else {
+          state.buttons = state.buttons & ~bit
+          mouse_event(1026, sdl_button, column, row, false)
+        }
+      }
+    }
+    return end + 1
+  }
+  values: [3]u32 = [1, 1, 0]
+  count := numbers(parameters, values[..])
+  modifiers: u16 = 0
+  if count >= 2 {
+    modifiers = kitty_modifiers(values[1])
+  }
+  // kitty keyboard: ESC [ code ; modifiers u
+  if final == 'u' {
+    code := values[0]
+    if code == 27 || code == 13 || code == 9 || code == 127 || code == 8 {
+      key := code
+      if code == 127 {
+        key = 8
+      }
+      queue_key(key, modifiers, 0)
+    }
+    else if code < 1114112 {
+      character := code
+      if (modifiers & ModShift) != 0 && code >= 'a' && code <= 'z' && (modifiers & (ModCtrl | ModAlt)) == 0 {
+        character = code - 32
+      }
+      queue_key(code, modifiers, character)
+      if (modifiers & (ModCtrl | ModAlt)) == 0 && code >= 32 {
+        encoded: [4]u8 = []
+        queue_text(encoded[..encode(character, encoded[..])])
+      }
+    }
+    return end + 1
+  }
+  if final == 'Z' {
+    queue_key(9, ModShift, 0)
+    return end + 1
+  }
+  key := special_key(final, values[0])
+  if key != 0 {
+    queue_key(key, modifiers, 0)
+  }
+  return end + 1
+}
+fn encode(character: u32, encoded: []u8) usize {
+  if character < 128 {
+    encoded[0] = #cast(u8) character
+    return 1
+  }
+  if character < 2048 {
+    encoded[0] = #cast(u8) ((character >> 6) | 192)
+    encoded[1] = #cast(u8) ((character & 63) | 128)
+    return 2
+  }
+  if character < 65536 {
+    encoded[0] = #cast(u8) ((character >> 12) | 224)
+    encoded[1] = #cast(u8) (((character >> 6) & 63) | 128)
+    encoded[2] = #cast(u8) ((character & 63) | 128)
+    return 3
+  }
+  encoded[0] = #cast(u8) ((character >> 18) | 240)
+  encoded[1] = #cast(u8) (((character >> 12) & 63) | 128)
+  encoded[2] = #cast(u8) (((character >> 6) & 63) | 128)
+  encoded[3] = #cast(u8) ((character & 63) | 128)
+  return 4
+}
+fn buffer_equal(a: []const u8, b: []const u8) bool {
+  if #len(a) != #len(b) {
+    return false
+  }
+  for index in 0..#len(a) {
+    if a[index] != b[index] {
+      return false
+    }
+  }
+  return true
+}
+fn find(bytes: []const u8, pattern: []const u8, from: usize) usize {
+  at := from
+  for at + #len(pattern) <= #len(bytes) {
+    if buffer_equal(bytes[at..at + #len(pattern)], pattern) {
+      return at
+    }
+    at += 1
+  }
+  return #len(bytes)
+}
+fn numbers(text: []const u8, values: []u32) usize {
+  count: usize = 0
+  value: u32 = 0
+  digits := false
+  for byte in text {
+    if byte >= '0' && byte <= '9' {
+      if value < 100000000 {
+        value = value * 10 + #cast(u32) (byte - '0')
+      }
+      digits = true
+    }
+    else if byte == ';' || byte == ':' {
+      if count < #len(values) && digits {
+        values[count] = value
+      }
+      count += 1
+      value = 0
+      digits = false
+    }
+  }
+  if digits && count < #len(values) {
+    values[count] = value
+    count += 1
+  }
+  return count
+}
+fn parse_input(force_escape: bool) {
+  // A character queues a key and a text event; stop while the queue lacks
+  // room and leave the rest of the bytes for after it drains.
+  for state.input_used > 0 && state.event_count + 4 <= 64 {
+    used := parse_one(force_escape)
+    if used == 0 {
+      return
+    }
+    remaining := state.input_used - used
+    for index in 0..remaining {
+      state.input[index] = state.input[used + index]
+    }
+    state.input_used = remaining
+  }
+}
+fn read_input(timeout: i32) i32 {
+  if state.input_used >= #len(state.input) {
+    return 0
+  }
+  count := tty_read(&state.input[state.input_used], #cast(i32) (#len(state.input) - state.input_used), timeout)
+  if count > 0 {
+    state.input_used += #cast(usize) count
+    if state.pasting {
+      state.paste_since = ticks()
+    }
+    if state.input_used > 0 && state.input[0] == 27 {
+      state.escape_since = ticks()
+    }
+  }
+  return count
+}
+fn take(event: *Event) bool {
+  if state.event_count == 0 {
+    return false
+  }
+  event.* = state.events[state.event_head]
+  state.event_head = (state.event_head + 1) % 64
+  state.event_count -= 1
+  if (event.words[0] & 4294967295) == 768 {
+    key := #cast(*KeyEvent) event
+    if key.scancode != 0 {
+      state.last_character = key.scancode
+    }
+    else {
+      state.last_character = 0
+    }
+    key.scancode = 0
+  }
+  return true
+}
+// Wait up to milliseconds (-1 forever) for an event, like SDL_WaitEventTimeout.
+pub fn tui_wait(event: *Event, milliseconds: i32) bool {
+  // Thread wake-ups and pushed events still arrive through SDL's queue.
+  if sdl_poll(event) {
+    return true
+  }
+  if take(event) {
+    return true
+  }
+  // Bytes left over when the queue filled come before any new read.
+  if state.input_used > 0 {
+    parse_input(false)
+    if take(event) {
+      return true
+    }
+  }
+  if tty_resized() != 0 {
+    tui_measure()
+    state.full_redraw = true
+    resize := Event{}
+    resize.words[0] = 518
+    event.* = resize
+    return true
+  }
+  // A lone Escape becomes a key after a short pause; anything else waits.
+  wait := milliseconds
+  escape_pending := state.input_used > 0 && !state.pasting
+  if escape_pending && (wait < 0 || wait > 25) {
+    wait = 25
+  }
+  if state.pasting {
+    if ticks() - state.paste_since > 1000 {
+      // The end marker never came: keep what arrived and end the paste.
+      paste_append(state.input[..state.input_used])
+      state.input_used = 0
+      paste_finish()
+      return take(event)
+    }
+    if wait < 0 || wait > 200 {
+      wait = 200
+    }
+  }
+  count := read_input(wait)
+  // Woken by a worker thread: an SDL build may have its event queued; a
+  // build without SDL gets a plain user event so the loop runs its ticks.
+  if count == -2 {
+    if sdl_poll(event) {
+      return true
+    }
+    wake := Event{}
+    wake.words[0] = 32768
+    event.* = wake
+    return true
+  }
+  if count < 0 {
+    quit := Event{}
+    quit.words[0] = 256
+    event.* = quit
+    return true
+  }
+  parse_input(count == 0 && escape_pending)
+  if take(event) {
+    return true
+  }
+  return sdl_poll(event)
+}
+pub fn tui_poll(event: *Event) bool {
+  return tui_wait(event, 0)
+}
+pub fn tui_push(event: *const Event) {
+  queue(event.*)
+}
+// Keyboard modifiers as SDL_GetModState reports them. Terminals only say
+// what was held with a mouse report, so that is what this answers.
+pub fn tui_modifiers() u16 {
+  return state.mouse_modifiers
+}
+extern fn tty_suspend "dna_tty_suspend"() i32
+// Stop DNA as a shell job; on `fg`, redraw everything at the current size.
+pub fn tui_suspend() bool {
+  if !state.active || tty_suspend() == 0 {
+    return false
+  }
+  tui_measure()
+  state.full_redraw = true
+  return true
+}

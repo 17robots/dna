@@ -1,0 +1,36 @@
+phase: i32 = 0
+presents: u64 = 0
+extern fn config_open "fopen"(path: *const u8, mode: *const u8) rawptr
+extern fn config_put "fputs"(text: *const u8, file: rawptr) i32
+extern fn config_close "fclose"(file: rawptr) i32
+pub fn SDL_RenderPresent(renderer: rawptr) bool {
+  next := #cast(*fn(rawptr) bool) probe_next("SDL_RenderPresent\0")
+  result := next(renderer)
+  presents += 1
+  if phase == 1 {
+    phase = 2
+  }
+  return result
+}
+pub fn SDL_WaitEventTimeout(event: rawptr, milliseconds: i32) bool {
+  next := #cast(*fn(rawptr, i32) bool) probe_next("SDL_WaitEventTimeout\0")
+  if phase == 0 && milliseconds >= 100 {
+    probe_check(milliseconds >= 10000, "configuration still polls")
+    mode: []const u8 = "w\0"
+    file := config_open(probe_env("DNA_CONFIG\0"), &mode[0])
+    probe_check(file != nil, "configuration open")
+    text: []const u8 = "font_size = 19\nreduced_motion = true\n\0"
+    _ = config_put(&text[0], file)
+    _ = config_close(file)
+    phase = 1
+  } else if phase == 2 {
+    probe_clear(event)
+    probe_kind(event).* = 256
+    probe_log("PASS config notification wake and redraw: ")
+    probe_number(presents)
+    probe_log(" presents\n")
+    phase = 3
+    return true
+  }
+  return next(event, milliseconds)
+}

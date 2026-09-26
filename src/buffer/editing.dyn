@@ -1,0 +1,412 @@
+// These operations preserve the half-open UTF-8 selection representation.
+pub fn find_character(document: *Document, text: []const u8, backwards: bool, till: bool, count: usize, extend: bool) bool {
+  origin := document.cursor
+  at := origin
+  found: usize = 0
+  if backwards {
+    if at == 0 {
+      return false
+    }
+    at = previous(document, at)
+    if document.anchor < origin {
+      if at == 0 {
+        return false
+      }
+      at = previous(document, at)
+    }
+  } else if document.anchor == origin {
+    at = next(document, at)
+  }
+  for true {
+    if at + #len(text) <= document.length && equal(document.bytes[at..at + #len(text)], text) {
+      found += 1
+      if found == count {
+        destination := at
+        if backwards {
+          if till {
+            destination = next(document, at)
+          }
+        }
+        else if !till {
+          destination = next(document, at)
+        }
+        if !extend {
+          document.anchor = origin
+        }
+        document.cursor = destination
+        return true
+      }
+    }
+    if backwards {
+      if at == 0 {
+        break
+      }
+      at = previous(document, at)
+    }
+    else {
+      if at >= document.length {
+        break
+      }
+      at = next(document, at)
+    }
+  }
+  return false
+}
+pub fn line_bounds(document: *Document) {
+  low := line_start(document, start(document))
+  high := end(document)
+  if high == low || high == 0 || document.bytes[high - 1] != 10 {
+    high = line_end(document, high)
+    if high < document.length {
+      high += 1
+    }
+  }
+  document.anchor = low
+  document.cursor = high
+}
+pub fn trim_selection(document: *Document) {
+  low := start(document)
+  high := end(document)
+  for low < high && (document.bytes[low] == 32 || document.bytes[low] == 9 || document.bytes[low] == 10 || document.bytes[low] == 13) {
+    low += 1
+  }
+  for high > low && (document.bytes[high - 1] == 32 || document.bytes[high - 1] == 9 || document.bytes[high - 1] == 10 || document.bytes[high - 1] == 13) {
+    high -= 1
+  }
+  if document.cursor < document.anchor {
+    document.cursor = low
+    document.anchor = high
+  } else {
+    document.anchor = low
+    document.cursor = high
+  }
+}
+fn change_case_one(document: *Document, mode: u8) {
+  low := start(document)
+  high := end(document)
+  if low == high {
+    high = next(document, high)
+  }
+  checkpoint(document)
+  changed: bool = false
+  // ASCII case changes preserve byte lengths, line indexes and tracked marks.
+  // Edit in place instead of clearing a 1 MiB temporary for every selection.
+  for at in low..high {
+    byte := document.bytes[at]
+    if byte >= 65 && byte <= 90 && mode != 2 {
+      byte += 32
+    }
+    else if byte >= 97 && byte <= 122 && mode != 1 {
+      byte -= 32
+    }
+    if byte != document.bytes[at] {
+      if !changed {
+        before_change(document)
+      }
+      document.bytes[at] = byte
+      changed = true
+    }
+  }
+  if changed {
+    document.revision += 1
+  }
+  document.anchor = low
+  document.cursor = high
+  checkpoint(document)
+}
+// One indentation level is a tab, or `width` spaces.
+fn indent_lines_one(document: *Document, unindent: bool, count: usize, width: usize, tabs: bool) bool {
+  low := line_start(document, start(document))
+  last := end(document)
+  if last > low && document.bytes[last - 1] == 10 {
+    last -= 1
+  }
+  last = line_start(document, last)
+  rows: usize = 1
+  scan := low
+  for scan < last {
+    scan = line_end(document, scan) + 1
+    rows += 1
+  }
+  if count == 0 || count > 999 || width == 0 || width > 16 {
+    return false
+  }
+  spaces := count * width
+  if tabs {
+    spaces = count
+  }
+  if !unindent && (spaces > Capacity || rows > (Capacity - document.length) / spaces) {
+    return false
+  }
+  checkpoint(document)
+  at := last
+  result_end := line_end(document, last)
+  for true {
+    remove: usize = 0
+    if unindent {
+      // Each level is a tab or up to `width` spaces, whichever the line has.
+      for level in 0..count {
+        if at + remove < document.length && document.bytes[at + remove] == 9 {
+          remove += 1
+          continue
+        }
+        removed: usize = 0
+        for at + remove < document.length && removed < width && document.bytes[at + remove] == 32 {
+          remove += 1
+          removed += 1
+        }
+        if removed == 0 {
+          break
+        }
+      }
+    }
+    document.anchor = at
+    document.cursor = at + remove
+    if unindent {
+      _ = replace(document, "")
+      result_end -= remove
+    }
+    else {
+      padding: [16000]u8 = []
+      fill: u8 = 32
+      if tabs {
+        fill = 9
+      }
+      for index in 0..spaces {
+        padding[index] = fill
+      }
+      _ = replace(document, padding[..spaces])
+      result_end += spaces
+    }
+    if at == low {
+      break
+    }
+    at = line_start(document, at - 1)
+  }
+  document.anchor = low
+  document.cursor = result_end
+  checkpoint(document)
+  return true
+}
+fn join_lines_one(document: *Document) {
+  low := start(document)
+  high := end(document)
+  at := line_end(document, low)
+  if high <= at {
+    high = at
+    if high < document.length {
+      high = line_end(document, high + 1)
+    }
+  }
+  checkpoint(document)
+  for at < high && at < document.length {
+    if document.bytes[at] != 10 {
+      at = next(document, at)
+      continue
+    }
+    after := at + 1
+    for after < document.length && (document.bytes[after] == 32 || document.bytes[after] == 9) {
+      after += 1
+    }
+    document.anchor = at
+    document.cursor = after
+    _ = replace(document, " ")
+    if after - at - 1 <= high - at {
+      high -= after - at - 1
+    } else {
+      high = at + 1
+    }
+    at += 1
+  }
+  document.anchor = low
+  document.cursor = high
+  checkpoint(document)
+}
+pub fn line_position(document: *const Document, number: usize) usize {
+  row: usize = 1
+  at: usize = 0
+  for row < number && at < document.length {
+    at = line_end(document, at)
+    if at < document.length {
+      at += 1
+    }
+    row += 1
+  }
+  return at
+}
+
+// Plan ranges in the original document before any mutation. Overlapping edits
+// run once; completed ranges track shifts from later, lower-address edits.
+pub fn change_case(document: *Document, mode: u8) {
+  _ = batch_lines(document, 0, mode, 1, 4, false)
+}
+// Shift lines by `count` levels of four spaces.
+pub fn indent_lines(document: *Document, unindent: bool, count: usize) bool {
+  return indent_lines_by(document, unindent, count, 4, false)
+}
+// Shift lines by `count` levels of a tab or `width` spaces.
+pub fn indent_lines_by(document: *Document, unindent: bool, count: usize, width: usize, tabs: bool) bool {
+  mode: u8 = 0
+  if unindent {
+    mode = 1
+  }
+  return batch_lines(document, 1, mode, count, width, tabs)
+}
+pub fn join_lines(document: *Document) {
+  _ = batch_lines(document, 2, 0, 1, 4, false)
+}
+fn batch_lines(document: *Document, operation: u8, mode: u8, repeats: usize, width: usize, tabs: bool) bool {
+  ranges: [32]EditRange = []
+  count := document.secondary.count + 1
+  ranges[0] = EditRange{low: start(document), high: end(document), primary: true, reversed: document.cursor < document.anchor}
+  for index in 1..count {
+    selected := document.secondary.ranges[index - 1]
+    low := selected.anchor
+    high := selected.cursor
+    if low > high {
+      swap := low
+      low = high
+      high = swap
+    }
+    ranges[index] = EditRange{low: low, high: high, reversed: selected.cursor < selected.anchor}
+  }
+
+  for index in 0..count {
+    entry := &ranges[index]
+    if operation == 0 && entry.low == entry.high {
+      entry.high = next(document, entry.high)
+    }
+    if operation == 1 {
+      entry.low = line_start(document, entry.low)
+      if entry.high > entry.low && document.bytes[entry.high - 1] == 10 {
+        entry.high -= 1
+      }
+      entry.high = line_end(document, entry.high)
+    }
+    if operation == 2 {
+      ending := line_end(document, entry.low)
+      if entry.high <= ending {
+        entry.high = ending
+        if ending < document.length {
+          entry.high = line_end(document, ending + 1)
+        }
+      }
+    }
+  }
+
+  for index in 1..count {
+    moving := ranges[index]
+    at := index
+    for at > 0 && ranges[at - 1].low > moving.low {
+      ranges[at] = ranges[at - 1]
+      at -= 1
+    }
+    ranges[at] = moving
+    index += 1
+  }
+
+  merged: usize = 0
+
+  for index in 0..count {
+    merging := ranges[index]
+    if merged > 0 && (merging.low < ranges[merged - 1].high || merging.low == ranges[merged - 1].low) {
+      if merging.high > ranges[merged - 1].high {
+        ranges[merged - 1].high = merging.high
+      }
+      if merging.primary {
+        ranges[merged - 1].reversed = merging.reversed
+      }
+      ranges[merged - 1].primary = ranges[merged - 1].primary || merging.primary
+    } else {
+      ranges[merged] = merging
+      merged += 1
+    }
+  }
+  if operation == 1 {
+    if repeats == 0 || repeats > 999 || width == 0 || width > 16 {
+      return false
+    }
+    level := width
+    if tabs {
+      level = 1
+    }
+    if mode == 0 {
+      rows: usize = 0
+      for index in 0..merged {
+        row_point := ranges[index].low
+        rows += 1
+        for row_point < ranges[index].high {
+          row_point = line_end(document, row_point)
+          if row_point >= ranges[index].high {
+            break
+          }
+          row_point += 1
+          rows += 1
+        }
+      }
+      if rows > (Capacity - document.length) / (repeats * level) {
+        return false
+      }
+    }
+  }
+  checkpoint(document)
+  before_revision := document.revision
+  document.batching = true
+  document.secondary.count = 0
+  index := merged
+  for index > 0 {
+    index -= 1
+    editing := ranges[index]
+    old_length := document.length
+    document.anchor = editing.low
+    document.cursor = editing.high
+    if operation == 0 {
+      change_case_one(document, mode)
+    }
+    else if operation == 1 {
+      _ = indent_lines_one(document, mode != 0, repeats, width, tabs)
+    }
+    else {
+      join_lines_one(document)
+    }
+    ranges[index].low = start(document)
+    ranges[index].high = end(document)
+    for later in index + 1..merged {
+      if document.length >= old_length {
+        added := document.length - old_length
+        ranges[later].low += added
+        ranges[later].high += added
+      }
+      else {
+        removed := old_length - document.length
+        ranges[later].low -= removed
+        ranges[later].high -= removed
+      }
+    }
+  }
+  index = 0
+  for index < merged {
+    finished := ranges[index]
+    final_anchor := finished.low
+    final_cursor := finished.high
+    if finished.reversed {
+      final_anchor = finished.high
+      final_cursor = finished.low
+    }
+    if finished.primary {
+      document.anchor = final_anchor
+      document.cursor = final_cursor
+    }
+    else {
+      document.secondary.ranges[document.secondary.count] = Selection{anchor: final_anchor, cursor: final_cursor}
+      document.secondary.count += 1
+    }
+    index += 1
+  }
+  document.batching = false
+  checkpoint(document)
+  if operation == 0 && document.revision != before_revision {
+    document.history[document.history_at].line_positions = true
+  }
+  return true
+}

@@ -1,0 +1,117 @@
+// Finite, interruptible visual transitions. Time comes from the caller so tests
+// do not sleep and input/document state never depends on animation progress.
+pub struct Tween { value, from, target, started: f32, ready, active: bool, velocity, sampled: f32 }
+
+pub fn snap(tween: *Tween, value: f32) {
+  tween.velocity = 0.0
+  tween.value = value
+  tween.from = value
+  tween.target = value
+  tween.ready = true
+  tween.active = false
+}
+pub fn sample(tween: *Tween, now: f32, duration: f32) {
+  if !tween.active {
+    return
+  }
+  progress := (now - tween.started) / duration
+  if progress >= 1.0 {
+    snap(tween, tween.target)
+    return
+  }
+  if progress < 0.0 {
+    progress = 0.0
+  }
+  remaining := 1.0 - progress
+  tween.value = tween.from + (tween.target - tween.from) * (1.0 - remaining * remaining * remaining)
+}
+pub fn move(tween: *Tween, target: f32, now: f32, duration: f32, immediate: bool) f32 {
+  if !tween.ready || immediate {
+    snap(tween, target)
+    return target
+  }
+  sample(tween, now, duration)
+  if target != tween.target {
+    tween.from = tween.value
+    tween.target = target
+    tween.started = now
+    tween.active = true
+  }
+  return tween.value
+}
+
+// Critically damped spring toward target, for scrolling and cursor motion.
+// Retargeting keeps the current velocity, so held keys glide instead of
+// restarting a curve. Reaches 99% of a jump within duration milliseconds and
+// is exact for any frame timing (closed-form step, not integration).
+pub fn follow(tween: *Tween, target: f32, now: f32, duration: f32, immediate: bool) f32 {
+  if !tween.ready || immediate || duration <= 0.0 {
+    snap(tween, target)
+    tween.velocity = 0.0
+    tween.sampled = now
+    return target
+  }
+  tween.target = target
+  // A spring at rest starts from one short frame ago: motion begins on this
+  // frame, and a stale timestamp cannot skip the whole animation.
+  if !tween.active {
+    tween.sampled = now - 8.0
+  }
+  elapsed := (now - tween.sampled) / 1000.0
+  tween.sampled = now
+  if elapsed > 0.0 {
+    if elapsed > 0.25 {
+      elapsed = 0.25
+    }
+    omega := 6.6 / (duration / 1000.0)
+    offset := tween.value - target
+    decay := exponential(-omega * elapsed)
+    carried := tween.velocity + omega * offset
+    tween.value = target + (offset + carried * elapsed) * decay
+    tween.velocity = (tween.velocity - omega * carried * elapsed) * decay
+  }
+  remaining := tween.value - target
+  if remaining < 0.0 {
+    remaining = -remaining
+  }
+  speed := tween.velocity
+  if speed < 0.0 {
+    speed = -speed
+  }
+  // Settled below half a pixel and nearly at rest.
+  if remaining < 0.5 && speed < 20.0 {
+    tween.value = target
+    tween.from = target
+    tween.velocity = 0.0
+    tween.active = false
+  }
+  else {
+    tween.active = true
+  }
+  return tween.value
+}
+// e^x for the spring step; x <= 0 here. Range reduction keeps it accurate.
+fn exponential(x: f32) f32 {
+  if x < -30.0 {
+    return 0.0
+  }
+  halvings: u32 = 0
+  reduced := x
+  for reduced < -0.5 {
+    reduced = reduced * 0.5
+    halvings += 1
+  }
+  term: f32 = 1.0
+  sum: f32 = 1.0
+  index: f32 = 1.0
+  for index < 9.0 {
+    term = term * reduced / index
+    sum += term
+    index += 1.0
+  }
+  for halvings > 0 {
+    sum = sum * sum
+    halvings -= 1
+  }
+  return sum
+}

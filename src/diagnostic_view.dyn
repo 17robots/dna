@@ -1,0 +1,187 @@
+// Resolve UTF-16 columns within the indexed line, not by rescanning the file.
+fn diagnostic_offset(doc: *const buffer.Document, row: usize, column: usize) lsp.Offset {
+  if row >= doc.line_count {
+    return lsp.Offset{}
+  }
+  beginning := buffer.row_start(doc, row)
+  ending := buffer.line_end(doc, beginning)
+  result := lsp.offset(doc.bytes[beginning..ending], lsp.Position{character: column})
+  if result.ok {
+    result.value += beginning
+  }
+  return result
+}
+fn draw_diagnostics(renderer: rawptr, app: *App, typography: *Typography, viewport: TextViewport, x: f32, y: f32) usize {
+  slot := &app.documents.slots[app.documents.active]
+  doc := slot.document
+  diagnostics := &slot.diagnostics
+  focused := typography.current_pane == app.view.focused
+  if focused {
+    app.pointer.hover_index = 128
+  }
+  if diagnostics.revision != doc.revision || diagnostics.count == 0 {
+    return 0
+  }
+  drawn: usize = 0
+  index: usize = 0
+  first_row := buffer.row_at(doc, viewport.start)
+  last_row := buffer.row_at(doc, viewport.end)
+  for index < diagnostics.count {
+    item := &diagnostics.items[index]
+    index += 1
+    if item.end_line < item.line || item.end_line < first_row || item.line > last_row {
+      continue
+    }
+    row := item.line
+    if row < first_row {
+      row = first_row
+    }
+    stop := item.end_line
+    if stop > last_row {
+      stop = last_row
+    }
+    for row <= stop {
+      beginning := buffer.row_start(doc, row)
+      ending := buffer.line_end(doc, beginning)
+      low := beginning
+      high := ending
+      if row == item.line {
+        start := diagnostic_offset(doc, row, item.character)
+        if !start.ok {
+          break
+        }
+        low = start.value
+      }
+      if row == item.end_line {
+        finish := diagnostic_offset(doc, row, item.end_character)
+        if !finish.ok {
+          break
+        }
+        high = finish.value
+      }
+      // LSP ranges are half-open; an end at the next line start adds no mark.
+      if row > item.line && high == beginning {
+        break
+      }
+      if low < viewport.start || high > viewport.end || high < low {
+        break
+      }
+      first := ttf.Substring{}
+      last := ttf.Substring{}
+      if !layout_substring(typography.layout, doc, low, &first) {
+        break
+      }
+      left := #cast(f32) first.x
+      right := left + typography.cell
+      if high > low && layout_substring(typography.layout, doc, high, &last) {
+        right = #cast(f32) last.x
+      }
+      if right < left {
+        swap := right
+        right = left
+        left = swap
+      }
+      if right - left < typography.cell * 0.5 {
+        right = left + typography.cell * 0.5
+      }
+      color := theme().diagnostic_error
+      if item.severity == 2 {
+        color = theme().diagnostic_warning
+      } else if item.severity > 2 {
+        color = theme().muted
+      }
+      underline := sdl.Rect{x: x + left, y: y + #cast(f32) (row + 1) * typography.line - 2.0 * typography.scale, width: right - left, height: 2.0 * typography.scale}
+      if !paint(renderer, color) || !sdl.fill(renderer, &underline) {
+        #panic("diagnostic underline")
+      }
+      pane := app.view.panes[typography.current_pane].rect
+      local_x := app.pointer.x - #cast(f32) pane.x
+      local_y := app.pointer.y - #cast(f32) pane.y
+      if focused && app.config.mouse_enabled && app.pointer.seen && app.pointer.hover_due == 0 && app.prompt_state.panel == Panel.None && local_x >= underline.x && local_x <= underline.x + underline.width && local_y >= underline.y - typography.line + underline.height && local_y <= underline.y + underline.height {
+        app.pointer.hover_index = index - 1
+      }
+      drawn += 1
+      row += 1
+    }
+  }
+  return drawn
+}
+
+fn diagnostic_cursor_hover(app: *App) bool {
+  doc := app.documents.current
+  diagnostics := &app.documents.slots[app.documents.active].diagnostics
+  if diagnostics.revision != doc.revision {
+    return false
+  }
+  position := doc.cursor
+  if !app.view.insert {
+    position = buffer.head(doc)
+  }
+  index: usize = 0
+  for index < diagnostics.count {
+    item := &diagnostics.items[index]
+    first := diagnostic_offset(doc, item.line, item.character)
+    last := diagnostic_offset(doc, item.end_line, item.end_character)
+    if first.ok && last.ok && position >= first.value && (position < last.value || (first.value == last.value && position == first.value)) {
+      hover_notice(app, item.text[..item.length])
+      return true
+    }
+    index += 1
+  }
+  return false
+}
+fn draw_diagnostic_hover(renderer: rawptr, app: *App, typography: *Typography, width: i32, height: i32) {
+  diagnostics := &app.documents.slots[app.documents.active].diagnostics
+  if app.prompt_state.panel != Panel.None || app.pointer.hover_index >= diagnostics.count || diagnostics.revision != app.documents.current.revision || !app.pointer.seen || !app.config.mouse_enabled {
+    return
+  }
+  item := &diagnostics.items[app.pointer.hover_index]
+  padding := 8.0 * typography.scale
+  maximum := #cast(f32) width - padding * 4.0
+  if maximum > 480.0 * typography.scale {
+    maximum = 480.0 * typography.scale
+  }
+  if maximum < typography.cell {
+    return
+  }
+  if !ttf.set(typography.chrome, &item.text[0], item.length) || !ttf.wrap(typography.chrome, #cast(i32) maximum) {
+    #panic("diagnostic hover text")
+  }
+  defer _ = ttf.wrap(typography.chrome, 0)
+  text_width: i32 = 0
+  text_height: i32 = 0
+  if !ttf.size(typography.chrome, &text_width, &text_height) {
+    return
+  }
+  pane := app.view.panes[typography.current_pane].rect
+  box := sdl.Rect{x: app.pointer.x - #cast(f32) pane.x + padding, y: app.pointer.y - #cast(f32) pane.y + typography.line, width: #cast(f32) text_width + padding * 2.0, height: #cast(f32) text_height + padding * 2.0}
+  if box.x + box.width > #cast(f32) width {
+    box.x = #cast(f32) width - box.width
+  }
+  if box.y + box.height > #cast(f32) height - typography.line {
+    box.y = app.pointer.y - #cast(f32) pane.y - box.height - padding
+  }
+  if box.x < 0.0 {
+    box.x = 0.0
+  }
+  if box.y < 0.0 {
+    box.y = 0.0
+  }
+  clip := sdl.PixelRect{x: #cast(i32) box.x, y: #cast(i32) box.y, width: #cast(i32) box.width, height: #cast(i32) box.height}
+  if !sdl.clip(renderer, &clip) {
+    #panic("diagnostic hover clip")
+  }
+  ui_box(renderer, box, typography.scale)
+  if !tint(typography.chrome, theme().text) || !ttf.draw(typography.chrome, box.x + padding, box.y + padding) {
+    #panic("diagnostic hover draw")
+  }
+  if !sdl.clip(renderer, nil) {
+    #panic("diagnostic hover reset")
+  }
+}
+
+// A seen pointer is not necessarily a visible tooltip.
+fn diagnostic_hover_visible(app: *const App) bool {
+  diagnostics := &app.documents.slots[app.documents.active].diagnostics
+  return app.prompt_state.panel == Panel.None && app.pointer.seen && app.config.mouse_enabled && app.pointer.hover_due == 0 && app.pointer.hover_index < diagnostics.count && diagnostics.revision == app.documents.current.revision
+}

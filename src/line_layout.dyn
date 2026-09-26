@@ -1,0 +1,149 @@
+// Document text laid out one line per text object. Each pane keeps a pool
+// keyed by line content, so an edit re-shapes only the changed line and a
+// scroll shapes only lines newly on screen, instead of the whole viewport.
+const LineSlots: usize = 256
+
+struct LineText { text: rawptr, hash: u64, length: usize, used: bool }
+struct LineLayout {
+  lines: [256]LineText,
+  // Pool slot drawn on each visible row.
+  rows: [256]usize,
+  first_row: usize,
+  count: usize,
+  line: f32,
+  // What the layout was built from, to skip unchanged frames.
+  document: *const buffer.Document,
+  identity: u64,
+  revision: u64,
+  start: usize,
+  end: usize,
+}
+
+// Polynomial hash modulo a prime below 2^56: Dyn arithmetic is checked, so
+// every intermediate stays under 2^64. Matches also compare lengths.
+fn line_hash(bytes: []const u8) u64 {
+  hash: u64 = 1
+  for byte in bytes {
+    hash = (hash * 251 + #cast(u64) byte + 1) % 72057594037927931
+  }
+  return hash
+}
+fn line_bytes(doc: *const buffer.Document, row: usize) []const u8 {
+  low := buffer.row_start(doc, row)
+  high := doc.length
+  if row + 1 < doc.line_count {
+    high = buffer.row_start(doc, row + 1)
+  }
+  return doc.bytes[low..high]
+}
+// Bring the visible rows up to date. Returns the number of lines shaped.
+fn line_layout_update(typography: *Typography, layout: *LineLayout, doc: *const buffer.Document, identity: u64, viewport: TextViewport) usize {
+  if layout.document == doc && layout.identity == identity && layout.revision == doc.revision && layout.start == viewport.start && layout.end == viewport.end && layout.line == typography.line {
+    return 0
+  }
+  first := buffer.row_at(doc, viewport.start)
+  count: usize = 0
+  for count < LineSlots && first + count < doc.line_count && (count == 0 || buffer.row_start(doc, first + count) < viewport.end) {
+    count += 1
+  }
+  for slot in 0..LineSlots {
+    layout.lines[slot].used = false
+  }
+  hashes: [256]u64 = []
+  // Lines already shaped keep their text objects wherever they moved.
+  for index in 0..count {
+    bytes := line_bytes(doc, first + index)
+    hashes[index] = line_hash(bytes)
+    layout.rows[index] = LineSlots
+    for slot in 0..LineSlots {
+      candidate := &layout.lines[slot]
+      if candidate.text != nil && !candidate.used && candidate.hash == hashes[index] && candidate.length == #len(bytes) {
+        candidate.used = true
+        layout.rows[index] = slot
+        break
+      }
+    }
+  }
+  shaped: usize = 0
+  free_slot: usize = 0
+  for index in 0..count {
+    if layout.rows[index] != LineSlots {
+      continue
+    }
+    for free_slot < LineSlots && layout.lines[free_slot].used {
+      free_slot += 1
+    }
+    entry := &layout.lines[free_slot]
+    entry.used = true
+    layout.rows[index] = free_slot
+    if entry.text == nil {
+      blank: [1]u8 = [0]
+      entry.text = ttf.create(typography.engine, typography.font, &blank[0], 0)
+      if entry.text == nil || !ttf.whitespace_visible(entry.text, true) || !ttf.wrap(entry.text, 0) {
+        #panic("line text allocation")
+      }
+    }
+    bytes := line_bytes(doc, first + index)
+    // SDL_ttf reads length 0 as a C string; give empty lines a real one.
+    empty: [1]u8 = [0]
+    source: *const u8 = &empty[0]
+    if #len(bytes) > 0 {
+      source = &bytes[0]
+    }
+    if !ttf.set(entry.text, source, #len(bytes)) {
+      #panic("line text update")
+    }
+    entry.hash = hashes[index]
+    entry.length = #len(bytes)
+    shaped += 1
+  }
+  layout.first_row = first
+  layout.count = count
+  layout.line = typography.line
+  layout.document = doc
+  layout.identity = identity
+  layout.revision = doc.revision
+  layout.start = viewport.start
+  layout.end = viewport.end
+  return shaped
+}
+fn line_layout_draw(layout: *LineLayout, color: Rgb, x: f32, y: f32) {
+  for index in 0..layout.count {
+    text := layout.lines[layout.rows[index]].text
+    if !tint(text, color) || !ttf.draw(text, x, y + #cast(f32) index * layout.line) {
+      #panic("text draw failed")
+    }
+  }
+}
+// Geometry of a document position, relative to the first visible row, like
+// TTF_GetTextSubString on the old whole-viewport text object.
+fn layout_substring(layout: *const LineLayout, doc: *const buffer.Document, position: usize, output: *ttf.Substring) bool {
+  row := buffer.row_at(doc, position)
+  if row < layout.first_row || row >= layout.first_row + layout.count {
+    return false
+  }
+  index := row - layout.first_row
+  if !ttf.substring(layout.lines[layout.rows[index]].text, #cast(i32) (position - buffer.row_start(doc, row)), output) {
+    return false
+  }
+  output.y += #cast(i32) (#cast(f32) index * layout.line)
+  return true
+}
+fn line_layout_font(layout: *LineLayout, font: rawptr) {
+  for slot in 0..LineSlots {
+    if layout.lines[slot].text != nil {
+      _ = ttf.set_font(layout.lines[slot].text, font)
+      layout.lines[slot].hash = 0
+      layout.lines[slot].length = 0
+    }
+  }
+  layout.document = nil
+}
+fn line_layout_release(layout: *LineLayout) {
+  for slot in 0..LineSlots {
+    if layout.lines[slot].text != nil {
+      ttf.destroy(layout.lines[slot].text)
+    }
+  }
+  layout.* = LineLayout{}
+}

@@ -1,0 +1,103 @@
+extern fn config_directories "dna_make_directories"(path: *const u8) i32
+
+fn setting_decimal(out: []u8, used: *usize, value: f32) {
+  scaled := #cast(usize) (value * 1000.0 + 0.5)
+  add_number(out, used, scaled / 1000)
+  fraction := scaled % 1000
+  if fraction == 0 {
+    return
+  }
+  add_text(out, used, ".")
+  digits: [3]u8 = [#cast(u8) (#cast(usize) 48 + fraction / 100), #cast(u8) (#cast(usize) 48 + (fraction / 10) % 10), #cast(u8) (#cast(usize) 48 + fraction % 10)]
+  length: usize = 3
+  for length > 0 && digits[length - 1] == 48 {
+    length -= 1
+  }
+  add_text(out, used, digits[..length])
+}
+fn setting_inspect(app: *App, typography: *Typography, key: []const u8) bool {
+  if setting_group(app, key) {
+    return true
+  }
+  index: usize = 0
+  for index < settings.ExtraCount && !buffer.equal(settings.option(index).key, key) {
+    index += 1
+  }
+  if index == settings.ExtraCount {
+    return setting_legacy(app, typography, key)
+  }
+  spec := settings.option(index)
+  value := settings.option_value(&app.config, index)
+  app.configuration.setting_key_length = copy_text(app.configuration.setting_key[..], key)
+  app.prompt_state.message_length = copy_text(app.prompt_state.message[..], spec.key)
+  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\n\n")
+  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, spec.description)
+  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\n\nConfigured value: ")
+  if spec.flag {
+    if value != 0.0 {
+      add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "true")
+    } else {
+      add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "false")
+    }
+  } else {
+    setting_decimal(app.prompt_state.message[..], &app.prompt_state.message_length, value)
+  }
+  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\nDefault: ")
+  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, spec.default_value)
+  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\nSource: ")
+  if (app.config.explicit_extra & (#cast(u64) 1 << index)) != 0 {
+    add_text(app.prompt_state.message[..], &app.prompt_state.message_length, app.configuration.path[..app.configuration.path_length])
+  } else {
+    add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "built-in default")
+  }
+  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\n\nSection form: [")
+  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, spec.section)
+  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "] ")
+  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, spec.local)
+  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\nEnter opens config / Escape closes. Save and :config-reload to apply.")
+  app.prompt_state.panel = Panel.Setting
+  return true
+}
+fn setting_edit(app: *App) {
+  key := app.configuration.setting_key[..app.configuration.setting_key_length]
+  if !files.metadata(app.configuration.path[..app.configuration.path_length]).ok {
+    parent: [4096]u8 = []
+    length := app.configuration.path_length
+    for length > 0 && app.configuration.path[length - 1] != '/' {
+      length -= 1
+    }
+    if length == 0 {
+      notice(app, "Configuration needs an absolute path.")
+      return
+    }
+    _ = copy_text(parent[..], app.configuration.path[..length])
+    if config_directories(&parent[0]) == 0 {
+      notice(app, "Cannot create configuration directory.")
+      return
+    }
+    if !new_buffer(app) {
+      return
+    }
+    if !files.set_name(app.documents.file, app.configuration.path[..app.configuration.path_length]) {
+      notice(app, "Invalid configuration path.")
+      return
+    }
+    _ = buffer.replace(app.documents.current, "# DNA configuration. Use :settings to discover options.\n")
+    buffer.checkpoint(app.documents.current)
+  } else {
+    open_file(app, app.configuration.path[..app.configuration.path_length])
+    if app.prompt_state.panel == Panel.Message {
+      return
+    }
+  }
+  for index in 0..settings.ExtraCount {
+    spec := settings.option(index)
+    if buffer.equal(spec.key, key) {
+      if !buffer.find(app.documents.current, key, false) {
+        _ = buffer.find(app.documents.current, spec.local, false)
+      }
+      return
+    }
+  }
+  _ = buffer.find(app.documents.current, key, false)
+}

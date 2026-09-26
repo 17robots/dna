@@ -1,0 +1,86 @@
+stage: u32 = 0
+frames: u32 = 0
+animation_waits: u32 = 0
+fades: u32 = 0
+reduced: bool = false
+typed_during_fade: bool = false
+received_during_fade: bool = false
+pub fn SDL_WaitEventTimeout(event: rawptr, milliseconds: i32) bool {
+  reduced = probe_env("DNA_REDUCED_MOTION\0") != nil
+  if milliseconds < 500 {
+    animation_waits += 1
+    if stage == 3 && fades != 0 && !typed_during_fade {
+      input := ProbeEvent{}
+      pointer := #cast(rawptr) &input
+      probe_kind(pointer).* = 771
+      text: []const u8 = "write\0"
+      (#cast(**const u8) (#cast(usize) pointer + 24)).* = &text[0]
+      probe_check(probe_push(pointer), "text push failed")
+      typed_during_fade = true
+    }
+    probe_check(!reduced && animation_waits <= 250, "FAIL: animation never idles or reduced motion animates")
+  } else {
+    if stage == 0 {
+      probe_key(1073741903)
+    }
+    else if stage == 1 {
+      probe_key(1073741902)
+      probe_key(1073741902)
+      probe_key(1073741902)
+    }
+    else if stage == 2 {
+      probe_key(58)
+    }
+    else if stage == 3 {
+      probe_key(27)
+    }
+    else {
+      probe_check(!((!reduced && (animation_waits == 0 || fades == 0 || !received_during_fade)) || (reduced && fades != 0)), "FAIL: animation wait/fade/input verdict")
+      probe_log("animations ")
+      if reduced {
+        probe_log("off")
+      } else {
+        probe_log("on")
+      }
+      probe_log(": ")
+      probe_number(#cast(u64) frames)
+      probe_log(" frames, ")
+      probe_number(#cast(u64) animation_waits)
+      probe_log(" timed waits, ")
+      probe_number(#cast(u64) fades)
+      probe_log(" fade frames; returned to idle\n")
+      probe_exit(0)
+    }
+    stage += 1
+  }
+  next := #cast(*fn(rawptr, i32) bool) probe_next("SDL_WaitEventTimeout\0")
+  return next(event, milliseconds)
+}
+pub fn SDL_SetTextureAlphaMod(texture: rawptr, alpha: u8) bool {
+  if alpha > 0 && alpha < 255 {
+    fades += 1
+  }
+  next := #cast(*fn(rawptr, u8) bool) probe_next("SDL_SetTextureAlphaMod\0")
+  return next(texture, alpha)
+}
+pub fn SDL_RenderPresent(renderer: rawptr) bool {
+  frames += 1
+  next := #cast(*fn(rawptr) bool) probe_next("SDL_RenderPresent\0")
+  return next(renderer)
+}
+pub fn TTF_SetTextString(text: rawptr, string: *const u8, length: usize) bool {
+  expected: []const u8 = "> write"
+  if typed_during_fade && stage == 3 && length >= 7 {
+    equal := true
+    for i in 0..7 {
+      if string[..length][i] != expected[i] {
+        equal = false
+      }
+    }
+    if equal {
+      received_during_fade = true
+    }
+  }
+  next := #cast(*fn(rawptr, *const u8, usize) bool) probe_next("TTF_SetTextString\0")
+  return next(text, string, length)
+}

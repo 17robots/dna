@@ -1,0 +1,151 @@
+fn character_input(app: *App, text: []const u8) {
+  if #len(text) == 0 {
+    return
+  }
+  decoded := utf8.decode(text, 0)
+  character := text[..decoded.width]
+  doc := app.documents.current
+  if app.prompt_state.panel == Panel.Directory {
+    doc = app.explorer.document
+  }
+  pending := app.input_state.pending
+  app.input_state.pending = 0
+  if pending == 5 {
+    if !buffer.replace_characters(doc, character) {
+      notice(app, "Replacement exceeds document capacity.")
+    }
+  } else {
+    extending := app.view.extend
+    if app.prompt_state.panel == Panel.Directory {
+      extending = app.explorer.extend
+    }
+    _ = buffer.find_character(doc, character, pending == 2 || pending == 4, pending == 3 || pending == 4, app.input_state.pending_count, extending)
+    primary := buffer.Selection{cursor: doc.cursor, anchor: doc.anchor}
+    index: usize = 0
+    for index < doc.secondary.count {
+      selection := doc.secondary.ranges[index]
+      doc.cursor = selection.cursor
+      doc.anchor = selection.anchor
+      _ = buffer.find_character(doc, character, pending == 2 || pending == 4, pending == 3 || pending == 4, app.input_state.pending_count, extending)
+      doc.secondary.ranges[index] = buffer.Selection{cursor: doc.cursor, anchor: doc.anchor}
+      index += 1
+    }
+    doc.cursor = primary.cursor
+    doc.anchor = primary.anchor
+  }
+}
+fn paste_selection(app: *App, before: bool, replace: bool) {
+  if app.register_state.selected > 0 {
+    retained := selected_clipboard(app)
+    if !retained.owned {
+      notice(app, "Register is empty.")
+      return
+    }
+    paste_text(app, retained.text, before, replace)
+    app.register_state.selected = 0
+    return
+  }
+  incoming := sdl.clipboard_get()
+  if incoming == nil {
+    notice(app, "Clipboard unavailable.")
+    return
+  }
+  defer sdl.free(#cast(rawptr) incoming)
+  length := c.string_length(incoming, buffer.Capacity + 1)
+  if length > buffer.Capacity {
+    notice(app, "Clipboard exceeds document capacity.")
+    return
+  }
+  paste_text(app, incoming[..length], before, replace)
+}
+fn paste_text(app: *App, incoming: []const u8, before: bool, replace: bool) {
+  length := #len(incoming)
+  doc := app.documents.current
+  if doc.secondary.count > 0 {
+    buffer.checkpoint(doc)
+    saved := buffer.Selection{cursor: doc.cursor, anchor: doc.anchor}
+    saved_secondary := doc.secondary
+    if !replace {
+      buffer.insert_positions(doc, !before)
+    }
+    if !clipboard_replace(app, doc, incoming[..length]) {
+      doc.cursor = saved.cursor
+      doc.anchor = saved.anchor
+      doc.secondary = saved_secondary
+      notice(app, "Paste exceeds capacity or is not valid text.")
+      return
+    }
+    buffer.checkpoint(doc)
+    return
+  }
+  low := buffer.start(doc)
+  high := buffer.end(doc)
+  insertion := high
+  if before {
+    insertion = low
+  }
+  // Linewise yanks paste as complete lines, not in the middle of a filename.
+  linewise := length > 0 && incoming[..length][length - 1] == 10
+  prefix: usize = 0
+  if !replace && linewise {
+    if before {
+      insertion = buffer.line_start(doc, low)
+    }
+    else {
+      end := high
+      if high > low && doc.bytes[high - 1] == 10 {
+        end -= 1
+      }
+      insertion = buffer.line_end(doc, end)
+      if insertion < doc.length {
+        insertion += 1
+      } else {
+        prefix = 1
+      }
+    }
+  }
+  removed: usize = 0
+  if replace {
+    removed = high - low
+    insertion = low
+  }
+  if !buffer.valid(incoming[..length]) || length + prefix > buffer.Capacity - (doc.length - removed) {
+    notice(app, "Paste exceeds capacity or is not valid text.")
+    return
+  }
+  buffer.checkpoint(doc)
+  if !replace {
+    buffer.move_to(doc, insertion, false)
+  }
+  if prefix != 0 {
+    _ = buffer.replace(doc, "\n")
+    insertion += 1
+  }
+  _ = buffer.replace(doc, incoming[..length])
+  doc.anchor = insertion
+  buffer.checkpoint(doc)
+}
+fn page_motion(app: *App, typography: *Typography, down: bool, half: bool) {
+  pane_init(app)
+  height := #cast(f32) app.view.panes[app.view.focused].rect.height
+  rows: usize = 20
+  available := height - 56.0 * typography.scale - typography.line
+  if available > typography.line {
+    rows = #cast(usize) (available / typography.line)
+  }
+  if half {
+    rows /= 2
+  }
+  if rows == 0 {
+    rows = 1
+  }
+  count := app.input_state.repeat_count
+  if count == 0 {
+    count = 1
+  }
+  app.input_state.repeat_count = 0
+  buffer.checkpoint(app.documents.current)
+  for step in 0..rows * count {
+    buffer.vertical(app.documents.current, down, app.view.extend)
+  }
+}

@@ -1,0 +1,107 @@
+rectangle_count: u32 = 0
+#link("dna_native")
+#link("SDL3_ttf")
+extern fn terminal_init "SDL_Init"(flags: u32) bool
+extern fn terminal_quit "SDL_Quit"()
+extern fn terminal_window "SDL_CreateWindow"(title: *const u8, width: i32, height: i32, flags: u64) rawptr
+extern fn terminal_renderer "SDL_CreateRenderer"(window: rawptr, name: *const u8) rawptr
+extern fn terminal_renderer_close "SDL_DestroyRenderer"(renderer: rawptr)
+extern fn terminal_window_close "SDL_DestroyWindow"(window: rawptr)
+extern fn terminal_ttf "TTF_Init"() bool
+extern fn terminal_ttf_quit "TTF_Quit"()
+extern fn terminal_font "TTF_OpenFont"(path: *const u8, size: f32) rawptr
+extern fn terminal_font_close "TTF_CloseFont"(font: rawptr)
+extern fn terminal_default_font "dna_default_font"(path: *u8, capacity: usize) i32
+extern fn terminal_open "dna_terminal_open"(directory: *const u8, shell: *const u8, command: *const u8) rawptr
+extern fn terminal_poll "dna_terminal_poll"(terminal: rawptr) i32
+extern fn terminal_alive "dna_terminal_alive"(terminal: rawptr) i32
+extern fn terminal_close "dna_terminal_close"(terminal: rawptr)
+extern fn terminal_draw "dna_terminal_draw"(terminal: rawptr, renderer: rawptr, font: rawptr, x: f32, y: f32, width: f32, height: f32, cell_width: f32, cell_height: f32, focused: i32)
+extern fn terminal_ticks "SDL_GetTicks"() u64
+use "std/mem"
+use "std/process"
+struct TerminalRect { x, y, width, height: f32 }
+extern fn terminal_resize "dna_terminal_resize"(terminal: rawptr, width: f32, height: f32, cell_width: f32, cell_height: f32) i32
+extern fn terminal_color "SDL_SetRenderDrawColor"(renderer: rawptr, r: u8, g: u8, b: u8, a: u8) bool
+extern fn terminal_clear "SDL_RenderClear"(renderer: rawptr) bool
+extern fn terminal_pixels "SDL_RenderReadPixels"(renderer: rawptr, rect: rawptr) rawptr
+extern fn terminal_pixel "SDL_ReadSurfacePixel"(surface: rawptr, x: i32, y: i32, r: *u8, g: *u8, b: *u8, a: *u8) bool
+extern fn terminal_save "SDL_SaveBMP"(surface: rawptr, path: *const u8) bool
+extern fn terminal_surface_close "SDL_DestroySurface"(surface: rawptr)
+pub fn SDL_RenderFillRect(renderer: rawptr, rect: *const TerminalRect) bool {
+  rectangle_count += 1
+  next := #cast(*fn(rawptr, *const TerminalRect) bool) probe_next("SDL_RenderFillRect\0")
+  return next(renderer, rect)
+}
+fn main() {
+  probe_check(terminal_init(32) && terminal_ttf(), "SDL and TTF initialization")
+  title: []const u8 = "terminal render\0"
+  window := terminal_window(&title[0], 640, 320, 0)
+  probe_check(window != nil, "window")
+  renderer := terminal_renderer(window, nil)
+  probe_check(renderer != nil, "renderer")
+  path: [4096]u8 = []
+  probe_check(terminal_default_font(&path[0], 4096) != 0, "default font")
+  font := terminal_font(&path[0], 16.0)
+  probe_check(font != nil, "font")
+  directory: []const u8 = "/tmp\0"
+  shell: []const u8 = "/bin/sh\0"
+  command: []const u8 = "printf '\\033[41m red background \\033[44m blue background \\033[0m normal\\nsecond line \\303\\251\\344\\270\\255\\n'\0"
+  terminal := terminal_open(&directory[0], &shell[0], &command[0])
+  probe_check(terminal != nil, "terminal")
+  deadline := terminal_ticks() + 3000
+  for terminal_alive(terminal) != 0 && terminal_ticks() < deadline {
+    _ = terminal_poll(terminal)
+    probe_delay(1)
+  }
+  _ = terminal_poll(terminal)
+  probe_check(terminal_alive(terminal) == 0, "application exited")
+  _ = terminal_color(renderer, 0, 0, 0, 255)
+  _ = terminal_clear(renderer)
+  terminal_draw(terminal, renderer, font, 0.0, 0.0, 640.0, 320.0, 8.0, 16.0, 0)
+  rectangle_count = 0
+  terminal_draw(terminal, renderer, font, 0.0, 0.0, 640.0, 320.0, 8.0, 16.0, 0)
+  // Secondary view of a smaller pane must not resize the terminal.
+  terminal_draw(terminal, renderer, font, 0.0, 0.0, 320.0, 160.0, 8.0, 16.0, 2)
+  probe_check(terminal_resize(terminal, 640.0, 320.0, 8.0, 16.0) == 0, "secondary view preserves size")
+  terminal_draw(terminal, renderer, font, 0.0, 0.0, 640.0, 320.0, 8.0, 16.0, 0)
+  rectangle_count = 0
+  terminal_draw(terminal, renderer, font, 0.0, 0.0, 640.0, 320.0, 8.0, 16.0, 0)
+  surface := terminal_pixels(renderer, nil)
+  probe_check(surface != nil, "render pixels")
+  red_r: u8 = 0
+  red_g: u8 = 0
+  red_b: u8 = 0
+  blue_r: u8 = 0
+  blue_g: u8 = 0
+  blue_b: u8 = 0
+  alpha: u8 = 0
+  probe_check(terminal_pixel(surface, 4, 1, &red_r, &red_g, &red_b, &alpha), "red background pixel")
+  probe_check(terminal_pixel(surface, 132, 1, &blue_r, &blue_g, &blue_b, &alpha), "blue background pixel")
+  probe_check(red_r > red_g && red_r > red_b && blue_b > blue_r && blue_b > blue_g, "terminal background colors")
+  arena := mem.arena_create(65536)
+  probe_check(arena.ok, "argument arena")
+  arguments := process.arguments(&arena.arena)
+  probe_check(arguments.ok, "arguments")
+  if #len(arguments.values) > 1 {
+    filename := arguments.values[1]
+    probe_check(#len(filename) < 4096, "screenshot path length")
+    for i in 0..#len(filename) {
+      path[i] = filename[i]
+    }
+    path[#len(filename)] = 0
+    probe_check(terminal_save(surface, &path[0]), "save screenshot")
+  }
+  _ = mem.arena_release(&arena.arena)
+  terminal_surface_close(surface)
+  probe_log("terminal background rectangles: ")
+  probe_number(#cast(u64) rectangle_count)
+  probe_log("\n")
+  terminal_close(terminal)
+  terminal_font_close(font)
+  terminal_renderer_close(renderer)
+  terminal_window_close(window)
+  terminal_ttf_quit()
+  terminal_quit()
+  probe_check(rectangle_count <= 100, "background rectangle coalescing")
+}

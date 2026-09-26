@@ -1,0 +1,1329 @@
+use "./lsp"
+
+extern fn rpc_open "dna_rpc_open"(command: *const u8, directory: *const u8) rawptr
+extern fn rpc_send "dna_rpc_send"(rpc: rawptr, bytes: *const u8, length: usize) i32
+extern fn rpc_size "dna_rpc_size"(rpc: rawptr) isize
+extern fn rpc_take "dna_rpc_take"(rpc: rawptr, bytes: *u8, capacity: usize) isize
+extern fn rpc_log "dna_rpc_log"(rpc: rawptr, bytes: *u8, capacity: usize) usize
+extern fn rpc_close "dna_rpc_close"(rpc: rawptr)
+
+struct LspDocument {
+  end: lsp.Position,
+  saved_epoch: u64,
+  identity: u64,
+  revision: u64,
+  observed: u64,
+  changed: u64,
+  path: [4096]u8,
+  version: usize,
+  length: usize,
+}
+// Last text sent to an incremental-sync server, so a change sends only the
+// edited region. Created lazily; freed on close, restart and shutdown.
+struct LspShadow {
+  arena: mem.Arena,
+  bytes: []u8,
+  length: usize,
+  owned, ready: bool,
+}
+struct LanguageServer {
+  documents: [16]LspDocument,
+  process: rawptr,
+  command: [4096]u8,
+  root: [4096]u8,
+  language: [65]u8,
+  root_length: usize,
+  length: usize,
+  sync: usize,
+  deadline: u64,
+  ready: bool,
+  save_text: bool,
+  save: bool,
+}
+struct LspResults {
+  tracked_capacity: usize,
+  tracked_born: u64,
+  arena: mem.Arena,
+  resolved: bool,
+  owned: bool,
+  insert: bool,
+  items: [128]*const json.Value,
+  scores: [128]i32,
+  // Completion keeps the whole response so typing can refilter locally.
+  source: *const json.Value,
+  origin: usize,
+  count: usize,
+  kind: usize,
+  server: usize,
+  slot: usize,
+  position: usize,
+  identity: u64,
+  revision: u64,
+}
+struct LspEditFile {
+  path: [4096]u8,
+  before: []const u8,
+  after: []const u8,
+  length: usize,
+  slot: usize,
+  identity: u64,
+  revision: u64,
+}
+struct LspEditPlan {
+  snippet: lsp.Snippet,
+  snippet_start, snippet_slot: usize,
+  reply: [512]u8,
+  files: [16]LspEditFile,
+  reply_length: usize,
+  server: usize,
+  count: usize,
+  command: *const json.Value,
+  arena: mem.Arena,
+  owned: bool,
+}
+struct LspState {
+  snippet: SnippetSession,
+  log: [8192]u8,
+  edits: LspEditPlan,
+  failed: bool,
+  automatic: bool,
+  insert: bool,
+  completion_identity: u64,
+  completion_revision: u64,
+  completion_due: u64,
+  request_started, response_elapsed: u64,
+  response_received: bool,
+  identity: u64,
+  revision: u64,
+  deadline: u64,
+  completion_position: usize,
+  completion_typed, completion_retry: bool,
+  serial: usize,
+  pending: usize,
+  kind: usize,
+  server: usize,
+  slot: usize,
+  position: usize,
+  log_length: usize,
+  auto_started: u32,
+  // Default servers tried this session, by index in default_server.
+  default_started: u64,
+  servers: [8]LanguageServer,
+  shadows: [128]LspShadow,
+  results: LspResults,
+}
+struct Diagnostic {
+  text: [512]u8,
+  end_line: usize,
+  end_character: usize,
+  line: usize,
+  character: usize,
+  severity: usize,
+  length: usize,
+}
+struct Diagnostics { items: [128]Diagnostic, count: usize, revision: u64 }
+
+fn lsp_note(app: *App, text: []const u8) {
+  app.lsp.log_length = copy_text(app.lsp.log[..], text)
+}
+fn lsp_results_release(app: *App) {
+  if app.lsp.results.owned {
+    _ = mem.arena_release(&app.lsp.results.arena)
+    if app.lsp.results.tracked_capacity != 0 {
+      allocation_record(app, "lsp_results", app.lsp.results.tracked_capacity, app.lsp.results.tracked_born, true)
+    }
+  }
+  mem.zero((#cast(*u8) &app.lsp.results)[..#sizeof(LspResults)])
+}
+fn lsp_edits_release(app: *App) {
+  lsp_edit_reply(app, false)
+  if app.lsp.edits.owned {
+    _ = mem.arena_release(&app.lsp.edits.arena)
+  }
+  mem.zero((#cast(*u8) &app.lsp.edits)[..#sizeof(LspEditPlan)])
+}
+fn lsp_shadow_release(app: *App, index: usize, slot: usize) {
+  shadow := &app.lsp.shadows[index * 16 + slot]
+  if shadow.owned {
+    _ = mem.arena_release(&shadow.arena)
+  }
+  shadow.* = LspShadow{}
+}
+fn lsp_shadows_release(app: *App, index: usize) {
+  for slot in 0..16 {
+    lsp_shadow_release(app, index, slot)
+  }
+}
+fn lsp_stop(app: *App, index: usize) {
+  lsp_shadows_release(app, index)
+  server := &app.lsp.servers[index]
+  if server.process != nil {
+    rpc_close(server.process)
+  }
+  server.process = nil
+  server.ready = false
+  if app.lsp.server == index {
+    app.lsp.pending = 0
+  }
+}
+fn lsp_release(app: *App) {
+  for index in 0..8 {
+    lsp_stop(app, index)
+  }
+  lsp_results_release(app)
+  lsp_edits_release(app)
+}
+fn lsp_send(app: *App, index: usize, message: []const u8) bool {
+  if #len(message) == 0 || rpc_send(app.lsp.servers[index].process, &message[0], #len(message)) == 0 {
+    lsp_note(app, "Language server queue full or disconnected. Use :lsp-restart.")
+    lsp_stop(app, index)
+    return false
+  }
+  return true
+}
+fn lsp_header(out: []u8, used: *usize, method: []const u8, id: usize) {
+  add_text(out, used, "{\"jsonrpc\":\"2.0\",")
+  if id > 0 {
+    add_text(out, used, "\"id\":")
+    add_number(out, used, id)
+    add_text(out, used, ",")
+  }
+  add_text(out, used, "\"method\":\"")
+  add_text(out, used, method)
+  add_text(out, used, "\",\"params\":")
+}
+fn lsp_start(app: *App, language: []const u8, command: []const u8) {
+  if #len(language) == 0 || #len(language) > 64 || #len(command) == 0 || #len(command) >= 4096 {
+    notice(app, "Use :lsp-start <filetype> <server command>, e.g. :lsp-start dyn dyn lsp")
+    return
+  }
+  index: usize = 0
+  for index < 8 && !buffer.equal(app.lsp.servers[index].language[..app.lsp.servers[index].length], language) {
+    index += 1
+  }
+  if index == 8 {
+    index = 0
+    for index < 8 && app.lsp.servers[index].process != nil {
+      index += 1
+    }
+  }
+  if index == 8 {
+    notice(app, "Language server limit reached (8).")
+    return
+  }
+  lsp_stop(app, index)
+  server := &app.lsp.servers[index]
+  lsp_shadows_release(app, index)
+  mem.zero((#cast(*u8) server)[..#sizeof(LanguageServer)])
+  server.length = copy_text(server.language[..], language)
+  _ = copy_text(server.command[..], command)
+  server.root_length = copy_text(server.root[..], app.workspace.project[..app.workspace.project_length])
+  server.process = rpc_open(&server.command[0], &server.root[0])
+  if server.process == nil {
+    notice(app, "Could not start language server.")
+    return
+  }
+  server.deadline = sdl.ticks() + #cast(u64) app.config.lsp_timeout_ms
+  uri: [12288]u8 = []
+  encoded: [32768]u8 = []
+  message: [65536]u8 = []
+  used: usize = 0
+  lsp_header(message[..], &used, "initialize", 1)
+  add_text(message[..], &used, "{\"processId\":null,\"rootUri\":")
+  add_text(message[..], &used, json.write_string(encoded[..], lsp.uri(server.root[..server.root_length], uri[..])))
+  add_text(message[..], &used, ",\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-16\"]},\"textDocument\":{\"synchronization\":{\"dynamicRegistration\":false},\"completion\":{\"completionItem\":{\"snippetSupport\":true}},\"publishDiagnostics\":{\"versionSupport\":true},\"codeAction\":{\"dataSupport\":true,\"resolveSupport\":{\"properties\":[\"edit\",\"command\"]},\"codeActionLiteralSupport\":{\"codeActionKind\":{\"valueSet\":[\"quickfix\",\"refactor\",\"source\"]}}}},\"workspace\":{\"applyEdit\":true,\"workspaceEdit\":{\"documentChanges\":true,\"resourceOperations\":[]}}},\"clientInfo\":{\"name\":\"DNA\",\"version\":\"preview\"}}}")
+  _ = lsp_send(app, index, message[..used])
+  lsp_note(app, "Language server initializing.")
+  app.prompt_state.panel = Panel.None
+}
+fn lsp_for(app: *App) usize {
+  language := filetype_name(&app.documents.slots[app.documents.active])
+  for index in 0..8 {
+    server := &app.lsp.servers[index]
+    if server.process != nil && buffer.equal(server.language[..server.length], language) {
+      return index
+    }
+  }
+  return 8
+}
+fn lsp_document_uri(out: []u8, used: *usize, path: []const u8) {
+  uri: [12288]u8 = []
+  encoded: [32768]u8 = []
+  add_text(out, used, json.write_string(encoded[..], lsp.uri(path, uri[..])))
+}
+fn lsp_sync(app: *App, index: usize, force: bool) {
+  server := &app.lsp.servers[index]
+  if !server.ready {
+    return
+  }
+  slot_index: usize = 0
+  for slot_index < 16 {
+    slot := &app.documents.slots[slot_index]
+    tracked := &server.documents[slot_index]
+    matches: bool = false
+    // Large files are not sent to language servers (closed if they grow).
+    if slot.document != nil && slot.terminal.handle == nil && slot.file.length > 0 && slot.document.length < buffer.LargeFile {
+      matches = buffer.equal(filetype_name(slot), server.language[..server.length])
+    }
+    if tracked.identity != 0 && (!matches || tracked.identity != slot.identity || !buffer.equal(tracked.path[..tracked.length], files.name(&slot.file))) {
+      close_message: [32768]u8 = []
+      close_used: usize = 0
+      lsp_header(close_message[..], &close_used, "textDocument/didClose", 0)
+      add_text(close_message[..], &close_used, "{\"textDocument\":{\"uri\":")
+      lsp_document_uri(close_message[..], &close_used, tracked.path[..tracked.length])
+      add_text(close_message[..], &close_used, "}}}")
+      if !lsp_send(app, index, close_message[..close_used]) {
+        return
+      }
+      tracked.* = LspDocument{}
+      lsp_shadow_release(app, index, slot_index)
+    }
+    if !matches {
+      slot_index += 1
+      continue
+    }
+    doc := slot.document
+    if tracked.identity == slot.identity && tracked.saved_epoch != doc.saved_epoch && !buffer.dirty_cached(doc) {
+      lsp_saved(app, index, slot_index)
+    }
+    if tracked.identity == slot.identity && tracked.revision == doc.revision {
+      slot_index += 1
+      continue
+    }
+    if tracked.observed != doc.revision {
+      tracked.observed = doc.revision
+      tracked.changed = sdl.ticks()
+    }
+    if !force && tracked.identity != 0 && sdl.ticks() - tracked.changed < #cast(u64) app.config.lsp_change_delay_ms {
+      slot_index += 1
+      continue
+    }
+    work := &app.operations.lsp_send
+    capacity := doc.length * 6 + 65536
+    if !work_acquire(app, work, capacity * 2 + 64, "lsp_send") {
+      return
+    }
+    message := (#cast(*u8) mem.arena_push_uninit(&work.arena, capacity, 1))[..capacity]
+    escaped := (#cast(*u8) mem.arena_push_uninit(&work.arena, capacity, 1))[..capacity]
+    used: usize = 0
+    opening := tracked.identity == 0
+    if opening {
+      lsp_header(message, &used, "textDocument/didOpen", 0)
+    } else {
+      lsp_header(message, &used, "textDocument/didChange", 0)
+    }
+    tracked.version += 1
+    add_text(message, &used, "{\"textDocument\":{\"uri\":")
+    lsp_document_uri(message, &used, files.name(&slot.file))
+    add_text(message, &used, ",\"version\":")
+    add_number(message, &used, tracked.version)
+    if opening {
+      add_text(message, &used, ",\"languageId\":")
+      add_text(message, &used, json.write_string(escaped, protocol_language(server.language[..server.length])))
+      add_text(message, &used, ",\"text\":")
+    }
+    sent: []const u8 = doc.bytes[..doc.length]
+    shadow := &app.lsp.shadows[index * 16 + slot_index]
+    if !opening {
+      add_text(message, &used, "},\"contentChanges\":[{")
+      // Full-sync servers get a range-less replacement. Incremental servers get
+      // only the edited region: the span between the common prefix and suffix
+      // of the last text sent and the current text.
+      if server.sync == 2 && shadow.ready {
+        before := shadow.bytes[..shadow.length]
+        prefix: usize = 0
+        for prefix < #len(before) && prefix < #len(sent) && before[prefix] == sent[prefix] {
+          prefix += 1
+        }
+        for prefix > 0 && prefix < #len(before) && (before[prefix] & 192) == 128 {
+          prefix -= 1
+        }
+        suffix: usize = 0
+        for suffix < #len(before) - prefix && suffix < #len(sent) - prefix && before[#len(before) - 1 - suffix] == sent[#len(sent) - 1 - suffix] {
+          suffix += 1
+        }
+        for suffix > 0 && (before[#len(before) - suffix] & 192) == 128 {
+          suffix -= 1
+        }
+        add_text(message, &used, "\"range\":{\"start\":")
+        lsp_position(message, &used, lsp.position(before, prefix))
+        add_text(message, &used, ",\"end\":")
+        lsp_position(message, &used, lsp.position(before, #len(before) - suffix))
+        add_text(message, &used, "},")
+        sent = sent[prefix..#len(sent) - suffix]
+      }
+      else if server.sync == 2 {
+        old_end := tracked.end
+        add_text(message, &used, "\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":")
+        lsp_position(message, &used, old_end)
+        add_text(message, &used, "},")
+      }
+      add_text(message, &used, "\"text\":")
+    }
+    quoted := json.write_string(escaped, sent)
+    if #len(quoted) == 0 {
+      work_finish(app, work, "lsp_send")
+      lsp_note(app, "Cannot encode document for language server.")
+      return
+    }
+    add_text(message, &used, quoted)
+    if opening {
+      add_text(message, &used, "}}}")
+    } else {
+      add_text(message, &used, "}]}")
+      add_text(message, &used, "}")
+    }
+    delivered := lsp_send(app, index, message[..used])
+    work_finish(app, work, "lsp_send")
+    if !delivered {
+      return
+    }
+    if opening {
+      tracked.saved_epoch = doc.saved_epoch
+    }
+    if server.sync == 2 {
+      if !shadow.owned {
+        created := buffer.reserve(buffer.Capacity + 1)
+        if created.ok {
+          shadow.arena = created.arena
+          shadow.owned = true
+          shadow.bytes = (#cast(*u8) mem.arena_push_uninit(&shadow.arena, buffer.Capacity + 1, 1))[..buffer.Capacity + 1]
+        }
+      }
+      shadow.ready = shadow.owned
+      if shadow.owned {
+        if doc.length > 0 {
+          _ = buffer.copy_bytes(&shadow.bytes[0], &doc.bytes[0], doc.length)
+        }
+        shadow.length = doc.length
+      }
+    }
+    tracked.identity = slot.identity
+    tracked.revision = doc.revision
+    tracked.end = lsp.position(doc.bytes[..doc.length], doc.length)
+    tracked.length = copy_text(tracked.path[..], files.name(&slot.file))
+    slot_index += 1
+  }
+}
+fn lsp_position(out: []u8, used: *usize, position: lsp.Position) {
+  add_text(out, used, "{\"line\":")
+  add_number(out, used, position.line)
+  add_text(out, used, ",\"character\":")
+  add_number(out, used, position.character)
+  add_text(out, used, "}")
+}
+fn lsp_request(app: *App, kind: usize, argument: []const u8) {
+  app.lsp.automatic = false
+  if kind == 2 && diagnostic_cursor_hover(app) {
+    return
+  }
+  index := lsp_for(app)
+  if index == 8 {
+    notice(app, "No server for this filetype. Use :lsp-start <filetype> <command> or :lsp-config.")
+    return
+  }
+  server := &app.lsp.servers[index]
+  if !server.ready {
+    notice(app, "Language server is initializing. Try again shortly; :lsp-log shows failures.")
+    return
+  }
+  if app.documents.file.length == 0 {
+    notice(app, "Save the buffer before requesting language features.")
+    return
+  }
+  lsp_sync(app, index, true)
+  if server.process == nil {
+    return
+  }
+  lsp_cancel_request(app)
+  if server.process == nil {
+    return
+  }
+  doc := app.documents.current
+  position := doc.cursor
+  if !app.view.insert {
+    position = buffer.head(doc)
+  }
+  method: []const u8 = "textDocument/completion"
+  if kind == 2 {
+    method = "textDocument/hover"
+  } else if kind == 3 {
+    method = "textDocument/definition"
+  } else if kind == 4 {
+    method = "textDocument/references"
+  } else if kind == 5 {
+    method = "textDocument/rename"
+  } else if kind == 6 {
+    method = "textDocument/codeAction"
+  } else if kind == 9 {
+    method = "textDocument/signatureHelp"
+  } else if kind == 10 {
+    method = "textDocument/formatting"
+  } else if kind == 11 {
+    method = "textDocument/typeDefinition"
+  } else if kind == 12 {
+    method = "textDocument/implementation"
+  }
+  app.lsp.serial += 1
+  if app.lsp.serial < 2 {
+    app.lsp.serial = 2
+  }
+  app.lsp.request_started = sdl.ticks()
+  app.lsp.pending = app.lsp.serial
+  app.lsp.kind = kind
+  app.lsp.server = index
+  app.lsp.slot = app.documents.active
+  app.lsp.identity = app.documents.slots[app.documents.active].identity
+  app.lsp.revision = doc.revision
+  app.lsp.position = position
+  app.lsp.insert = app.view.insert
+  app.lsp.deadline = sdl.ticks() + #cast(u64) app.config.lsp_timeout_ms
+  message: [65536]u8 = []
+  escaped: [32768]u8 = []
+  used: usize = 0
+  lsp_header(message[..], &used, method, app.lsp.pending)
+  add_text(message[..], &used, "{\"textDocument\":{\"uri\":")
+  lsp_document_uri(message[..], &used, files.name(app.documents.file))
+  add_text(message[..], &used, "},")
+  if kind == 10 {
+    add_text(message[..], &used, "\"options\":{\"tabSize\":")
+    add_number(message[..], &used, indent_width(app))
+    add_text(message[..], &used, ",\"insertSpaces\":")
+    if use_tabs(app) {
+      add_text(message[..], &used, "false}")
+    } else {
+      add_text(message[..], &used, "true}")
+    }
+  }
+  else if kind == 6 {
+    add_text(message[..], &used, "\"range\":{\"start\":")
+    lsp_position(message[..], &used, lsp.position(doc.bytes[..doc.length], buffer.start(doc)))
+    add_text(message[..], &used, ",\"end\":")
+    lsp_position(message[..], &used, lsp.position(doc.bytes[..doc.length], buffer.end(doc)))
+    add_text(message[..], &used, "},\"context\":{\"diagnostics\":[]}")
+  }
+  else {
+    add_text(message[..], &used, "\"position\":")
+    lsp_position(message[..], &used, lsp.position(doc.bytes[..doc.length], position))
+  }
+  if kind == 4 {
+    add_text(message[..], &used, ",\"context\":{\"includeDeclaration\":true}")
+  }
+  if kind == 5 {
+    if #len(argument) == 0 {
+      app.lsp.pending = 0
+      notice(app, "Use :rename-symbol <new name>")
+      return
+    }
+    add_text(message[..], &used, ",\"newName\":")
+    add_text(message[..], &used, json.write_string(escaped[..], argument))
+  }
+  add_text(message[..], &used, "}}")
+  _ = lsp_send(app, index, message[..used])
+  app.prompt_state.panel = Panel.None
+  lsp_note(app, "Language request pending…")
+}
+fn lsp_diagnostics(app: *App, index: usize, params: *const json.Value) {
+  storage: [4096]u8 = []
+  path := lsp.path(json_text(params, "uri"), storage[..])
+  for slot_index in 0..16 {
+    slot := &app.documents.slots[slot_index]
+    tracked := &app.lsp.servers[index].documents[slot_index]
+    if slot.document != nil && #len(path) > 0 && buffer.equal(files.name(&slot.file), path) && tracked.revision == slot.document.revision {
+      version := lsp.number(json.object_get(params, "version"))
+      if version.ok && version.value != tracked.version {
+        return
+      }
+      diagnostics := &slot.diagnostics
+      old_count := diagnostics.count
+      changed := diagnostics.revision != slot.document.revision
+      diagnostics.count = 0
+      diagnostics.revision = slot.document.revision
+      values := json.object_get(params, "diagnostics")
+      if !json.is_array(values) {
+        if old_count != 0 && slot_visible(app, slot_index) {
+          render_request(app, RenderLsp)
+        }
+        return
+      }
+      item := values.first
+      for item != nil && diagnostics.count < 128 {
+        position := json.object_get(json.object_get(item, "range"), "start")
+        line := lsp.number(json.object_get(position, "line"))
+        character := lsp.number(json.object_get(position, "character"))
+        text := json_text(item, "message")
+        severity := lsp.number(json.object_get(item, "severity"))
+        if line.ok && character.ok && #len(text) > 0 {
+          diagnostic := &diagnostics.items[diagnostics.count]
+          previous := diagnostic.*
+          diagnostic.line = line.value
+          diagnostic.character = character.value
+          diagnostic.severity = severity.value
+          ending := json.object_get(json.object_get(item, "range"), "end")
+          end_line := lsp.number(json.object_get(ending, "line"))
+          end_character := lsp.number(json.object_get(ending, "character"))
+          diagnostic.end_line = line.value
+          diagnostic.end_character = character.value
+          if end_line.ok && end_character.ok {
+            diagnostic.end_line = end_line.value
+            diagnostic.end_character = end_character.value
+          }
+          length := #len(text)
+          if length > 511 {
+            length = 511
+            for length > 0 && (text[length] & 192) == 128 {
+              length -= 1
+            }
+          }
+                    if diagnostics.count >= old_count || previous.line != diagnostic.line || previous.character != diagnostic.character || previous.end_line != diagnostic.end_line || previous.end_character != diagnostic.end_character || previous.severity != diagnostic.severity || !buffer.equal(previous.text[..previous.length], text[..length]) {
+                      changed = true
+                    }
+          diagnostic.length = copy_text(diagnostic.text[..], text[..length])
+          diagnostics.count += 1
+        }
+        item = item.next
+      }
+      if (changed || old_count != diagnostics.count) && slot_visible(app, slot_index) {
+        render_request(app, RenderLsp)
+      }
+      return
+    }
+  }
+}
+fn lsp_markup(out: []u8, used: *usize, value: *const json.Value) {
+  if json.is_string(value) {
+    add_text(out, used, value.text)
+  }
+  else if json.is_object(value) {
+    add_text(out, used, json_text(value, "value"))
+  }
+  else if json.is_array(value) {
+    item := value.first
+    for item != nil {
+      if json.is_string(item) {
+        add_text(out, used, item.text)
+      } else {
+        add_text(out, used, json_text(item, "value"))
+      }
+      add_text(out, used, "\n")
+      item = item.next
+    }
+  }
+}
+fn lsp_handle(app: *App, index: usize, source: []const u8, arena: *mem.Arena) bool {
+  parsed := json.parse(arena, source)
+  if !parsed.ok || !json.is_object(parsed.root) {
+    lsp_note(app, "Malformed JSON from language server; stopped.")
+    lsp_stop(app, index)
+    return false
+  }
+  root := parsed.root
+  method := json_text(root, "method")
+  id := lsp.number(json.object_get(root, "id"))
+  if #len(method) > 0 {
+    params := json.object_get(root, "params")
+    if buffer.equal(method, "textDocument/publishDiagnostics") {
+      lsp_diagnostics(app, index, params)
+    }
+    else if buffer.equal(method, "window/logMessage") || buffer.equal(method, "window/showMessage") {
+      lsp_note(app, json_text(params, "message"))
+    }
+    if buffer.equal(method, "workspace/applyEdit") && json.object_get(root, "id") != nil && app.lsp.kind == 8 && app.lsp.server == index && app.lsp.pending != 0 && app.prompt_state.panel == Panel.None {
+      lsp_prepare_edit(app, json.object_get(params, "edit"))
+      if app.prompt_state.panel != Panel.None {
+        render_request(app, RenderLsp)
+      }
+      if app.prompt_state.panel == Panel.LspEdit {
+        reply: [512]u8 = []
+        encoded_reply := json.encode(reply[..], json.object_get(root, "id"))
+        if #len(encoded_reply) > 0 {
+          app.lsp.edits.reply_length = copy_text(app.lsp.edits.reply[..], encoded_reply)
+          app.lsp.edits.server = index
+          return false
+        }
+        lsp_edits_release(app)
+      }
+    }
+    if json.object_get(root, "id") != nil {
+      response: [65536]u8 = []
+      encoded: [16384]u8 = []
+      used := copy_text(response[..], "{\"jsonrpc\":\"2.0\",\"id\":")
+      encoded_id := json.encode(encoded[..], json.object_get(root, "id"))
+      if #len(encoded_id) == 0 {
+        return false
+      }
+      add_text(response[..], &used, encoded_id)
+      if buffer.equal(method, "workspace/configuration") {
+        add_text(response[..], &used, ",\"result\":[")
+        count := json.array_length(json.object_get(params, "items"))
+        if count > 128 {
+          count = 128
+        }
+        for item_index in 0..count {
+          if item_index > 0 {
+            add_text(response[..], &used, ",")
+          }
+          add_text(response[..], &used, "null")
+        }
+        add_text(response[..], &used, "]}")
+      } else if buffer.equal(method, "window/workDoneProgress/create") {
+        add_text(response[..], &used, ",\"result\":null}")
+      }
+      else if buffer.equal(method, "workspace/applyEdit") {
+        add_text(response[..], &used, ",\"result\":{\"applied\":false,\"failureReason\":\"Use an explicit previewed code action\"}}")
+      }
+      else {
+        add_text(response[..], &used, ",\"error\":{\"code\":-32601,\"message\":\"Client method not supported\"}}")
+      }
+      _ = lsp_send(app, index, response[..used])
+    }
+    return false
+  }
+  if !id.ok {
+    return false
+  }
+  server := &app.lsp.servers[index]
+  result := json.object_get(root, "result")
+  if id.value == 1 && !server.ready {
+    if json.object_get(root, "error") != nil || !json.is_object(result) {
+      lsp_failure(app, "Language server initialization failed.")
+      lsp_stop(app, index)
+      return false
+    }
+    caps := json.object_get(result, "capabilities")
+    encoding := json_text(caps, "positionEncoding")
+    if #len(encoding) > 0 && !buffer.equal(encoding, "utf-16") {
+      lsp_failure(app, "Server did not negotiate UTF-16 positions.")
+      lsp_stop(app, index)
+      return false
+    }
+    sync := json.object_get(caps, "textDocumentSync")
+    change := lsp.number(sync)
+    if json.is_object(sync) {
+      change = lsp.number(json.object_get(sync, "change"))
+    }
+    save := json.object_get(sync, "save")
+    server.save = json.is_object(save) || (json.is_bool(save) && save.boolean)
+    include := json.object_get(save, "includeText")
+    server.save_text = json.is_bool(include) && include.boolean
+    if app.lsp.failed {
+      render_request(app, RenderLsp)
+    }
+    app.lsp.failed = false
+    server.sync = change.value
+    server.ready = true
+    server.deadline = 0
+    _ = lsp_send(app, index, "{\"jsonrpc\":\"2.0\",\"method\":\"initialized\",\"params\":{}}")
+    lsp_note(app, "Language server ready.")
+    lsp_sync(app, index, true)
+    return false
+  }
+  if id.value != app.lsp.pending || index != app.lsp.server {
+    return false
+  }
+  app.lsp.response_elapsed = sdl.ticks() - app.lsp.request_started
+  app.lsp.response_received = true
+  app.lsp.pending = 0
+  if json.object_get(root, "error") != nil {
+    lsp_note(app, json_text(json.object_get(root, "error"), "message"))
+    if app.prompt_state.panel == Panel.None && !app.lsp.automatic {
+      notice(app, app.lsp.log[..app.lsp.log_length])
+      render_request(app, RenderLsp)
+    }
+    return false
+  }
+  if app.lsp.kind == 8 {
+    lsp_note(app, "Language command completed.")
+    return false
+  }
+  slot := &app.documents.slots[app.lsp.slot]
+  stale: []const u8 = ""
+  if slot.document == nil || slot.identity != app.lsp.identity {
+    stale = "buffer replaced or closed"
+  }
+  else if app.documents.active != app.lsp.slot {
+    stale = "active buffer changed"
+  }
+  else if slot.document.revision != app.lsp.revision {
+    stale = "document changed"
+  }
+  else if (app.lsp.kind == 1 || app.lsp.kind == 2 || app.lsp.kind == 9) && app.view.insert != app.lsp.insert {
+    stale = "editing mode changed"
+  }
+  else if (app.lsp.kind == 1 || app.lsp.kind == 2 || app.lsp.kind == 9) && language_cursor(slot.document, app.view.insert) != app.lsp.position {
+    stale = "cursor moved"
+  }
+  else if app.prompt_state.panel != Panel.None && !(app.lsp.kind == 1 && completion_visible(app)) {
+    stale = "another panel is open"
+  }
+  if #len(stale) > 0 {
+    stale_status: [256]u8 = []
+    stale_length: usize = 0
+    if app.lsp.automatic && app.lsp.kind == 1 {
+      // Never apply stale edits. Let the scheduler request the current position.
+      app.lsp.completion_identity = 0
+      app.lsp.completion_retry = true
+      add_text(stale_status[..], &stale_length, "Automatic completion discarded: ")
+    } else {
+      add_text(stale_status[..], &stale_length, "Language response discarded: ")
+    }
+    add_text(stale_status[..], &stale_length, stale)
+    add_text(stale_status[..], &stale_length, ".")
+    lsp_note(app, stale_status[..stale_length])
+    return false
+  }
+  render_request(app, RenderLsp)
+  if app.lsp.kind == 9 {
+    lsp_signature(app, result)
+    return false
+  }
+  if app.lsp.kind == 2 {
+    text: [8192]u8 = []
+    length: usize = 0
+    lsp_markup(text[..], &length, json.object_get(result, "contents"))
+    if length == 0 {
+      hover_notice(app, "No hover information.")
+    } else {
+      hover_markdown(app, text[..length], json.object_get(result, "contents"))
+    }
+    return false
+  }
+  lsp_results_release(app)
+  state := &app.lsp.results
+  state.arena = arena.*
+  state.owned = true
+  state.kind = app.lsp.kind
+  state.server = index
+  state.slot = app.lsp.slot
+  state.identity = app.lsp.identity
+  state.revision = app.lsp.revision
+  state.position = app.lsp.position
+  state.insert = app.lsp.insert
+  if state.kind == 10 {
+    lsp_prepare_format(app, result)
+    return true
+  }
+  if state.kind == 5 {
+    lsp_prepare_edit(app, result)
+    return true
+  }
+  if state.kind == 7 {
+    state.kind = 6
+    state.resolved = true
+  }
+  items := result
+  if state.kind == 1 && json.is_object(result) {
+    items = json.object_get(result, "items")
+  }
+  if state.kind == 1 {
+    if json.is_array(items) {
+      state.source = items.first
+      state.origin = state.position
+      completion_collect(state, slot.document)
+    }
+  }
+  else if json.is_array(items) {
+    item := items.first
+    for item != nil && state.count < 128 {
+      state.items[state.count] = item
+      state.count += 1
+      item = item.next
+    }
+  }
+  else if json.is_object(items) {
+    state.items[0] = items
+    state.count = 1
+  }
+  if state.count == 0 {
+    if app.prompt_state.panel == Panel.LspResults {
+      app.prompt_state.panel = Panel.None
+    }
+    if !app.lsp.automatic {
+      notice(app, "No language results.")
+    }
+  } else {
+    app.prompt_state.selected = 0
+    app.prompt_state.panel = Panel.LspResults
+  }
+  if state.kind == 1 {
+    status: [256]u8 = []
+    status_length: usize = 0
+    if app.lsp.automatic {
+      add_text(status[..], &status_length, "Automatic completion: ")
+    }
+    else {
+      add_text(status[..], &status_length, "Manual completion: ")
+    }
+    add_number(status[..], &status_length, state.count)
+    if state.count == 0 {
+      add_text(status[..], &status_length, " results returned.")
+    }
+    else {
+      add_text(status[..], &status_length, " results; popup opened.")
+    }
+    lsp_note(app, status[..status_length])
+  }
+  return true
+}
+fn lsp_tick(app: *App) bool {
+  changed: bool = false
+  index: usize = 0
+  for index < 8 {
+    server := &app.lsp.servers[index]
+    if server.process != nil {
+      if server.deadline > 0 && sdl.ticks() >= server.deadline {
+        lsp_failure(app, "Language server initialization timed out.")
+        changed = true
+        lsp_stop(app, index)
+        index += 1
+        continue
+      }
+      lsp_sync(app, index, false)
+      count: usize = 0
+      for count < 16 && server.process != nil {
+        length := rpc_size(server.process)
+        if length == 0 {
+          break
+        }
+        if length < 0 {
+          app.lsp.log_length = rpc_log(server.process, &app.lsp.log[0], 8192)
+          if app.lsp.log_length == 0 {
+            lsp_note(app, "Language server exited or sent an invalid frame. Use :lsp-restart.")
+          }
+          app.lsp.failed = true
+          if app.prompt_state.panel == Panel.None {
+            notice(app, app.lsp.log[..app.lsp.log_length])
+          }
+          changed = true
+          lsp_stop(app, index)
+          break
+        }
+        size := #cast(usize) length
+        work := &app.operations.lsp_receive
+        if !work_acquire(app, work, size * 16 + 65536, "lsp_receive") {
+          lsp_stop(app, index)
+          break
+        }
+        bytes := (#cast(*u8) mem.arena_push_uninit(&work.arena, size + 1, 1))[..size + 1]
+        taken := rpc_take(server.process, &bytes[0], size + 1)
+        retained: bool = false
+        if taken > 0 {
+          retained = lsp_handle(app, index, bytes[..size], &work.arena)
+        }
+        lsp_receive_finish(app, work, retained)
+        count += 1
+      }
+    }
+    index += 1
+  }
+  if app.lsp.pending != 0 && sdl.ticks() >= app.lsp.deadline {
+    app.lsp.pending = 0
+    lsp_note(app, "Language request timed out. Editing remains available.")
+  }
+  return changed || (app.render_trace.pending & RenderLsp) != 0
+}
+fn lsp_result_label(app: *App, item: *const json.Value, output: []u8) usize {
+  if app.lsp.results.kind == 1 {
+    return copy_text(output, json_text(item, "label"))
+  }
+  if app.lsp.results.kind == 6 {
+    return copy_text(output, json_text(item, "title"))
+  }
+  uri := json_text(item, "uri")
+  if #len(uri) == 0 {
+    uri = json_text(item, "targetUri")
+  }
+  path: [4096]u8 = []
+  used := copy_text(output, lsp.path(uri, path[..]))
+  range := json.object_get(item, "range")
+  if range == nil {
+    range = json.object_get(item, "targetSelectionRange")
+  }
+  line := lsp.number(json.object_get(json.object_get(range, "start"), "line"))
+  add_text(output, &used, ":")
+  add_number(output, &used, line.value + 1)
+  return used
+}
+fn lsp_popup(app: *App, output: []u8) usize {
+  used := copy_text(output, "Language results — arrows choose; Enter accepts; Escape cancels\n\n")
+  state := &app.lsp.results
+  rows: usize = 16
+  if state.kind == 1 {
+    used = 0
+    rows = 8
+  }
+  first: usize = 0
+  if app.prompt_state.selected >= rows {
+    first = app.prompt_state.selected - rows + 1
+  }
+  index := first
+  for index < state.count && index < first + rows {
+    if index == app.prompt_state.selected {
+      add_text(output, &used, "> ")
+    } else {
+      add_text(output, &used, "  ")
+    }
+    label: [4096]u8 = []
+    length := lsp_result_label(app, state.items[index], label[..])
+    add_text(output, &used, label[..length])
+    add_text(output, &used, "\n")
+    index += 1
+  }
+  return used
+}
+fn lsp_config(app: *App) {
+  configured_count: usize = 0
+  configured_index: usize = 0
+  for configured_index < app.config.language_count {
+    configured := &app.config.languages[configured_index]
+    if configured.server_length > 0 {
+      configured_count += 1
+      lsp_start(app, configured.name[..configured.name_length], configured.server[..configured.server_length])
+    }
+    configured_index += 1
+  }
+  path: [4096]u8 = []
+  parent := app.configuration.path_length
+  for parent > 0 && app.configuration.path[parent - 1] != 47 {
+    parent -= 1
+  }
+  length := copy_text(path[..], app.configuration.path[..parent])
+  add_text(path[..], &length, "lsp.json")
+  allocated := mem.arena_create(262144)
+  if !allocated.ok {
+    return
+  }
+  defer _ = mem.arena_release(&allocated.arena)
+  read := fs.read_all(&allocated.arena, path[..length], 32768)
+  if !read.ok && configured_count > 0 {
+    return
+  }
+  if !read.ok {
+    notice(app, "Create lsp.json beside config.toml, e.g. {\"dyn\":\"dyn lsp\",\"python\":\"pyright-langserver --stdio\"}. Commands run only when you use :lsp-config.")
+    return
+  }
+  parsed := json.parse(&allocated.arena, read.data)
+  if !parsed.ok || !json.is_object(parsed.root) {
+    notice(app, "lsp.json must map filetypes to trusted server command strings.")
+    return
+  }
+  item := parsed.root.first
+  count: usize = 0
+  for item != nil {
+    if !json.is_string(item) || #len(item.key) == 0 || #len(item.key) > 64 || #len(item.text) == 0 || #len(item.text) >= 4096 || count == 8 {
+      notice(app, "Invalid lsp.json: at most eight filetype/command pairs.")
+      return
+    }
+    count += 1
+    item = item.next
+  }
+  item = parsed.root.first
+  for item != nil {
+    lsp_start(app, item.key, item.text)
+    item = item.next
+  }
+}
+fn lsp_command(app: *App, verb: []const u8, argument: []const u8) bool {
+  if buffer.equal(verb, "lsp-start") {
+    split: usize = 0
+    for split < #len(argument) && argument[split] != 32 {
+      split += 1
+    }
+    rest := split
+    for rest < #len(argument) && argument[rest] == 32 {
+      rest += 1
+    }
+    lsp_start(app, argument[..split], argument[rest..])
+    return true
+  }
+  if buffer.equal(verb, "lsp-config") {
+    lsp_config(app)
+    return true
+  }
+  if buffer.equal(verb, "lsp-stop") {
+    lsp_release(app)
+    app.prompt_state.panel = Panel.None
+    return true
+  }
+  if buffer.equal(verb, "lsp-restart") {
+    index: usize = 0
+    current_language := filetype_name(&app.documents.slots[app.documents.active])
+    for index < 8 && !buffer.equal(app.lsp.servers[index].language[..app.lsp.servers[index].length], current_language) {
+      index += 1
+    }
+    if index < 8 {
+      language: [65]u8 = []
+      command: [4096]u8 = []
+      server := &app.lsp.servers[index]
+      name_length := copy_text(language[..], server.language[..server.length])
+      command_length := copy_text(command[..], server.command[..c.string_length(&server.command[0], 4096)])
+      lsp_start(app, language[..name_length], command[..command_length])
+    } else {
+      lsp_config(app)
+    }
+    return true
+  }
+  if buffer.equal(verb, "lsp-log") {
+    lsp_status(app)
+    return true
+  }
+  if buffer.equal(verb, "complete") {
+    lsp_request(app, 1, "")
+    return true
+  }
+  if buffer.equal(verb, "hover") {
+    lsp_request(app, 2, "")
+    return true
+  }
+  if buffer.equal(verb, "definition") {
+    lsp_request(app, 3, "")
+    return true
+  }
+  if buffer.equal(verb, "type-definition") {
+    lsp_request(app, 11, "")
+    return true
+  }
+  if buffer.equal(verb, "implementation") {
+    lsp_request(app, 12, "")
+    return true
+  }
+  if buffer.equal(verb, "references") {
+    lsp_request(app, 4, "")
+    return true
+  }
+  if buffer.equal(verb, "rename-symbol") {
+    lsp_request(app, 5, argument)
+    return true
+  }
+  if buffer.equal(verb, "code-actions") {
+    lsp_request(app, 6, "")
+    return true
+  }
+  if buffer.equal(verb, "signature-help") {
+    lsp_request(app, 9, "")
+    return true
+  }
+  if buffer.equal(verb, "lsp-format") {
+    lsp_request(app, 10, "")
+    return true
+  }
+  if buffer.equal(verb, "diagnostic-next") {
+    diagnostic_jump(app, false)
+    return true
+  }
+  if buffer.equal(verb, "diagnostic-prev") {
+    diagnostic_jump(app, true)
+    return true
+  }
+  if buffer.equal(verb, "diagnostics") {
+    diagnostics_show(app)
+    return true
+  }
+  return false
+}
+fn diagnostics_show(app: *App) {
+  diagnostics := &app.documents.slots[app.documents.active].diagnostics
+  if diagnostics.revision != app.documents.current.revision || diagnostics.count == 0 {
+    notice(app, "No current diagnostics.")
+    return
+  }
+  app.prompt_state.panel = Panel.Diagnostics
+  app.prompt_state.selected = 0
+}
+fn diagnostics_popup(app: *App, output: []u8) usize {
+  diagnostics := &app.documents.slots[app.documents.active].diagnostics
+  used := copy_text(output, "Diagnostics — arrows choose; Enter jumps; Escape closes\n\n")
+  index: usize = 0
+  if app.prompt_state.selected > 8 {
+    index = app.prompt_state.selected - 8
+  }
+  end := index + 16
+  for index < diagnostics.count && index < end {
+    item := &diagnostics.items[index]
+    if index == app.prompt_state.selected {
+      add_text(output, &used, "> ")
+    } else {
+      add_text(output, &used, "  ")
+    }
+    add_number(output, &used, item.line + 1)
+    add_text(output, &used, ":")
+    add_number(output, &used, item.character + 1)
+    add_text(output, &used, " ")
+    add_text(output, &used, item.text[..item.length])
+    add_text(output, &used, "\n")
+    index += 1
+  }
+  return used
+}
+
+fn lsp_saved(app: *App, index: usize, slot_index: usize) {
+  server := &app.lsp.servers[index]
+  slot := &app.documents.slots[slot_index]
+  tracked := &server.documents[slot_index]
+  if !server.save {
+    tracked.saved_epoch = slot.document.saved_epoch
+    return
+  }
+  // Synchronize the saved revision before notifying servers which reread disk.
+  if tracked.revision != slot.document.revision {
+    return
+  }
+  capacity := slot.document.length * 6 + 65536
+  allocated := mem.arena_create(capacity * 2 + 64)
+  if !allocated.ok {
+    return
+  }
+  defer _ = mem.arena_release(&allocated.arena)
+  message := (#cast(*u8) mem.arena_push_uninit(&allocated.arena, capacity, 1))[..capacity]
+  escaped := (#cast(*u8) mem.arena_push_uninit(&allocated.arena, capacity, 1))[..capacity]
+  used: usize = 0
+  lsp_header(message, &used, "textDocument/didSave", 0)
+  add_text(message, &used, "{\"textDocument\":{\"uri\":")
+  lsp_document_uri(message, &used, files.name(&slot.file))
+  add_text(message, &used, "}")
+  if server.save_text {
+    add_text(message, &used, ",\"text\":")
+    add_text(message, &used, json.write_string(escaped, slot.document.bytes[..slot.document.length]))
+  }
+  add_text(message, &used, "}}")
+  if lsp_send(app, index, message[..used]) {
+    tracked.saved_epoch = slot.document.saved_epoch
+  }
+}
+
+fn lsp_wait_ms(app: *App, fallback: i32) i32 {
+  delay := fallback
+  now := sdl.ticks()
+  for index in 0..8 {
+    server := &app.lsp.servers[index]
+    if server.ready {
+      for slot_index in 0..16 {
+        tracked := &server.documents[slot_index]
+        slot := &app.documents.slots[slot_index]
+        if tracked.identity != 0 && slot.document != nil && tracked.identity == slot.identity && tracked.revision != slot.document.revision {
+          remaining: u64 = 0
+          if tracked.changed + #cast(u64) app.config.lsp_change_delay_ms > now {
+            remaining = tracked.changed + #cast(u64) app.config.lsp_change_delay_ms - now
+          }
+          if remaining < #cast(u64) delay {
+            delay = #cast(i32) remaining
+          }
+        }
+      }
+    }
+  }
+  return delay
+}
+
+fn lsp_auto_start(app: *App) {
+  if app.prompt_state.panel != Panel.None {
+    return
+  }
+  name := filetype_name(&app.documents.slots[app.documents.active])
+  index: usize = 0
+  // Dyn ships its server in the compiler. Reserve bit 16 after the 16 user
+  // language slots so a missing executable only produces one startup failure.
+  configured_dyn := settings.language(&app.config, "dyn")
+  builtin_dyn := buffer.equal(name, "dyn") && (configured_dyn == nil || (configured_dyn.seen & 16) == 0)
+  if builtin_dyn && (configured_dyn == nil || (configured_dyn.seen & 8) == 0 || configured_dyn.auto_start) {
+    if (app.lsp.auto_started & 65536) == 0 {
+      app.lsp.auto_started = app.lsp.auto_started | 65536
+      if lsp_for(app) == 8 {
+        command_storage: [4096]u8 = []
+        override := process.environment("DNA_DYN_LSP", command_storage[..])
+        if override.ok && override.found && #len(override.value) > 0 {
+          lsp_start(app, "dyn", override.value)
+        }
+        else {
+          lsp_start(app, "dyn", "dyn lsp")
+        }
+      }
+    }
+    return
+  }
+  for index < app.config.language_count {
+    configured := &app.config.languages[index]
+    bit := #cast(u32) 1 << index
+    if configured.auto_start && configured.server_length > 0 && (app.lsp.auto_started & bit) == 0 && buffer.equal(name, configured.name[..configured.name_length]) {
+      app.lsp.auto_started = app.lsp.auto_started | bit
+      if lsp_for(app) == 8 {
+        lsp_start(app, name, configured.server[..configured.server_length])
+      }
+      return
+    }
+    index += 1
+  }
+  lsp_default_start(app, name)
+}
+
+fn lsp_failure(app: *App, text: []const u8) {
+  render_request(app, RenderLsp)
+  app.lsp.failed = true
+  lsp_note(app, text)
+  if app.prompt_state.panel == Panel.None {
+    notice(app, text)
+  }
+}
+
+fn lsp_receive_finish(app: *App, work: *WorkArena, retained: bool) {
+  if retained {
+    // Results now own the arena; never reset or reuse their JSON backing storage.
+    app.lsp.results.tracked_capacity = work.capacity
+    app.lsp.results.tracked_born = work.born
+    work.arena = mem.Arena{}
+    work.capacity = 0
+    work.born = 0
+  } else {
+    work_finish(app, work, "lsp_receive")
+  }
+}
+
+fn lsp_status(app: *App) {
+  text: [8192]u8 = []
+  used: usize = 0
+  index := lsp_for(app)
+  add_text(text[..], &used, "Server: ")
+  if index < 8 {
+    server := &app.lsp.servers[index]
+    add_text(text[..], &used, server.command[..c.string_length(&server.command[0], 4096)])
+    if !server.ready {
+      add_text(text[..], &used, " (initializing)")
+    }
+  } else {
+    add_text(text[..], &used, "none for this filetype")
+  }
+  add_text(text[..], &used, "\nCompletion delay: ")
+  add_number(text[..], &used, #cast(usize) app.config.completion_delay_ms)
+  add_text(text[..], &used, " ms; document sync: ")
+  add_number(text[..], &used, #cast(usize) app.config.lsp_change_delay_ms)
+  add_text(text[..], &used, " ms; popup animation: ")
+  add_number(text[..], &used, #cast(usize) app.config.popup_animation_ms)
+  add_text(text[..], &used, " ms\n")
+  if app.lsp.pending != 0 {
+    add_text(text[..], &used, "Pending request: ")
+    add_number(text[..], &used, #cast(usize) (sdl.ticks() - app.lsp.request_started))
+    add_text(text[..], &used, " ms\n")
+  }
+  else if app.lsp.response_received {
+    add_text(text[..], &used, "Last response: ")
+    add_number(text[..], &used, #cast(usize) app.lsp.response_elapsed)
+    add_text(text[..], &used, " ms (request to receipt)\n")
+  }
+  add_text(text[..], &used, "\n")
+  add_text(text[..], &used, app.lsp.log[..app.lsp.log_length])
+  notice(app, text[..used])
+}
+
+fn lsp_cancel_request(app: *App) {
+  if app.lsp.pending == 0 {
+    return
+  }
+  cancel: [256]u8 = []
+  used: usize = 0
+  lsp_header(cancel[..], &used, "$/cancelRequest", 0)
+  add_text(cancel[..], &used, "{\"id\":")
+  add_number(cancel[..], &used, app.lsp.pending)
+  add_text(cancel[..], &used, "}}")
+  _ = lsp_send(app, app.lsp.server, cancel[..used])
+  app.lsp.pending = 0
+}

@@ -1,0 +1,148 @@
+struct MacroState {
+  slots: [27]Macro,
+  recording: bool,
+  replaying: bool,
+  slot: usize,
+  play_slot: usize,
+  index: usize,
+  remaining: usize,
+}
+
+// Lazy storage: at most 1024 events per register, with bounded text payloads.
+struct MacroEvent { key: u32, modifiers: u16, character: u32, text_length: usize, text: [64]u8 }
+struct Macro { arena: mem.Arena, owned: bool, events: []MacroEvent, count: usize }
+
+fn macro_toggle(app: *App) {
+  if app.macro_state.replaying {
+    return
+  }
+  if app.macro_state.recording {
+    app.macro_state.recording = false
+    app.register_state.selected = 0
+    return
+  }
+  slot := &app.macro_state.slots[app.register_state.selected]
+  if !slot.owned {
+    allocated := mem.arena_create(1024 * #sizeof(MacroEvent))
+    if !allocated.ok {
+      notice(app, "Cannot allocate macro.")
+      return
+    }
+    slot.arena = allocated.arena
+    slot.owned = true
+    slot.events = (#cast(*MacroEvent) mem.arena_push_uninit(&slot.arena, 1024 * #sizeof(MacroEvent), #alignof(MacroEvent)))[..1024]
+  }
+  slot.count = 0
+  app.macro_state.slot = app.register_state.selected
+  app.register_state.selected = 0
+  app.macro_state.recording = true
+}
+fn macro_event(app: *App) *MacroEvent {
+  if !app.macro_state.recording || app.macro_state.replaying {
+    return nil
+  }
+  slot := &app.macro_state.slots[app.macro_state.slot]
+  if slot.count == 1024 {
+    app.macro_state.recording = false
+    slot.count = 0
+    notice(app, "Macro exceeded 1024 events; recording discarded.")
+    return nil
+  }
+  event := &slot.events[slot.count]
+  slot.count += 1
+  event.key = 0
+  event.modifiers = 0
+  event.text_length = 0
+  return event
+}
+fn macro_key(app: *App, key: u32, modifiers: u16) {
+  event := macro_event(app)
+  if event == nil {
+    return
+  }
+  event.key = key
+  event.modifiers = modifiers
+  event.character = app.input_state.character
+}
+fn macro_text(app: *App, text: []const u8) {
+  if !app.macro_state.recording || app.macro_state.replaying {
+    return
+  }
+  if #len(text) > 64 {
+    app.macro_state.recording = false
+    app.macro_state.slots[app.macro_state.slot].count = 0
+    notice(app, "Macro text event exceeded 64 bytes; recording discarded.")
+    return
+  }
+  event := macro_event(app)
+  if event == nil {
+    return
+  }
+  event.text_length = #len(text)
+  for index in 0..#len(text) {
+    event.text[index] = text[index]
+  }
+}
+fn macro_play(app: *App, typography: *Typography) {
+  if app.macro_state.replaying || app.macro_state.recording {
+    return
+  }
+  selected := app.register_state.selected
+  slot := &app.macro_state.slots[selected]
+  app.register_state.selected = 0
+  count := app.input_state.repeat_count
+  app.input_state.repeat_count = 0
+  if count == 0 {
+    count = 1
+  }
+  if slot.count == 0 {
+    notice(app, "Macro is empty.")
+    return
+  }
+  if count > 10000 / slot.count {
+    notice(app, "Macro replay exceeds 10000 events.")
+    return
+  }
+  app.macro_state.play_slot = selected
+  app.macro_state.index = 0
+  app.macro_state.remaining = count * slot.count
+  _ = macro_tick(app, typography)
+}
+fn macro_tick(app: *App, typography: *Typography) bool {
+  if app.macro_state.remaining == 0 {
+    return false
+  }
+  slot := &app.macro_state.slots[app.macro_state.play_slot]
+  app.macro_state.replaying = true
+  deadline := sdl.ticks() + 2
+  processed: usize = 0
+  for app.macro_state.remaining > 0 && app.running && processed < 64 {
+    event := &slot.events[app.macro_state.index]
+    if event.key != 0 {
+      app.input_state.character = event.character
+      key_input(app, typography, event.key, event.modifiers)
+    }
+    else {
+      text_input(app, event.text[..event.text_length])
+    }
+    app.macro_state.index += 1
+    if app.macro_state.index == slot.count {
+      app.macro_state.index = 0
+    }
+    app.macro_state.remaining -= 1
+    processed += 1
+    if sdl.ticks() >= deadline {
+      break
+    }
+  }
+  app.macro_state.replaying = false
+  return true
+}
+fn macros_release(app: *App) {
+  for index in 0..27 {
+    if app.macro_state.slots[index].owned {
+      _ = mem.arena_release(&app.macro_state.slots[index].arena)
+      app.macro_state.slots[index].owned = false
+    }
+  }
+}

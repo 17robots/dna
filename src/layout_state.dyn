@@ -1,0 +1,144 @@
+struct LayoutView { slot, cursor, anchor: usize }
+
+fn layout_apply_tree(app: *App, parsed: *const layout.Layout) {
+  pane_init(app)
+  pane_store(app)
+  views: [8]LayoutView = []
+  count: usize = 0
+  layout_collect_views(app, 0, views[..], &count)
+  current := LayoutView{slot: app.documents.active, cursor: app.documents.current.cursor, anchor: app.documents.current.anchor}
+  leaf: usize = 0
+  first: usize = 15
+  for index in 0..15 {
+    pane := &app.view.panes[index]
+    pane.* = Pane{}
+    if index < parsed.node_count {
+      source := &parsed.nodes[index]
+      pane.used = true
+      pane.branch = source.branch
+      pane.vertical = source.vertical
+      pane.parent = source.parent
+      pane.first = source.first
+      pane.second = source.second
+      pane.split_fraction = #cast(f32) source.percent / 100.0
+      if !pane.branch {
+        view := current
+        if leaf < count {
+          view = views[leaf]
+        }
+        leaf += 1
+        pane.slot = view.slot
+        doc_view := app.documents.slots[view.slot].document
+        doc_view.marks[index * 2] = view.cursor
+        doc_view.marks[index * 2 + 1] = view.anchor
+        if first == 15 {
+          first = index
+        }
+      }
+    }
+  }
+  app.view.focused = first
+  pane_load(app, first)
+  app.view.revision += 1
+}
+fn layout_tree_text(app: *App, index: usize, output: []u8, used: *usize) {
+  pane := &app.view.panes[index]
+  if !pane.branch {
+    add_text(output, used, "f")
+    return
+  }
+  if pane.vertical {
+    add_text(output, used, "v")
+  } else {
+    add_text(output, used, "h")
+  }
+  add_number(output, used, #cast(usize) (pane.split_fraction * 100.0 + 0.5))
+  add_text(output, used, "(")
+  layout_tree_text(app, pane.first, output, used)
+  add_text(output, used, ",")
+  layout_tree_text(app, pane.second, output, used)
+  add_text(output, used, ")")
+}
+fn layout_save(app: *App, argument: []const u8) {
+  if #len(argument) == 0 {
+    notice(app, "Use :layout-save /path/name.toml. Place it in the config layouts directory to appear in :layouts.")
+    return
+  }
+  storage: [4096]u8 = []
+  path := expand_home(argument, storage[..])
+  if #len(path) == 0 || #len(path) > 3980 {
+    notice(app, "Invalid layout path.")
+    return
+  }
+  pane_init(app)
+  output: [4096]u8 = []
+  used: usize = 0
+  add_text(output[..], &used, "tree = \"")
+  layout_tree_text(app, 0, output[..], &used)
+  add_text(output[..], &used, "\"\n")
+  add_text(output[..], &used, "line_numbers=")
+  if app.view.line_numbers {
+    add_text(output[..], &used, "1\n")
+  } else {
+    add_text(output[..], &used, "0\n")
+  }
+  add_text(output[..], &used, "relative_numbers=")
+  if app.view.relative_numbers {
+    add_text(output[..], &used, "1\n")
+  } else {
+    add_text(output[..], &used, "0\n")
+  }
+  add_text(output[..], &used, "status_line=")
+  if app.view.status_line {
+    add_text(output[..], &used, "1\n")
+  } else {
+    add_text(output[..], &used, "0\n")
+  }
+  add_text(output[..], &used, "highlight_line=")
+  if app.view.highlight_line {
+    add_text(output[..], &used, "1\n")
+  } else {
+    add_text(output[..], &used, "0\n")
+  }
+  add_text(output[..], &used, "reduced_motion=")
+  if app.view.reduced_motion {
+    add_text(output[..], &used, "1\n")
+  } else {
+    add_text(output[..], &used, "0\n")
+  }
+  info := files.metadata(path)
+  if info.ok && (info.mode & 61440) != 32768 {
+    notice(app, "Layout destination must be a regular file.")
+    return
+  }
+  temporary: [4096]u8 = []
+  length := copy_text(temporary[..], path)
+  add_text(temporary[..], &length, ".tmp")
+  tx := fs.atomic_begin(path, temporary[..length])
+  if !tx.ok {
+    notice(app, "Cannot write layout; check parent directory and temporary file.")
+    return
+  }
+  defer {
+    if tx.transaction.active {
+      _ = fs.atomic_abort(&tx.transaction)
+    }
+  }
+  if !fs.write(&tx.transaction.file, output[..used]).ok || !fs.atomic_commit(&tx.transaction).ok {
+    notice(app, "Layout write failed.")
+    return
+  }
+  notice(app, "Relative split layout saved. Loading it reuses current views and keeps hidden buffers open.")
+}
+
+fn layout_collect_views(app: *App, index: usize, views: []LayoutView, count: *usize) {
+  pane := &app.view.panes[index]
+  if pane.branch {
+    layout_collect_views(app, pane.first, views, count)
+    layout_collect_views(app, pane.second, views, count)
+    return
+  }
+  doc := app.documents.slots[pane.slot].document
+  views[count.*] = LayoutView{slot: pane.slot, cursor: doc.marks[index * 2], anchor: doc.marks[index * 2 + 1]}
+  count.* += 1
+}

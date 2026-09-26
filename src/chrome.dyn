@@ -1,54 +1,258 @@
+struct WindowTitleState {
+  text: [8192]u8,
+  length: usize,
+}
+
 fn add_number(output: []u8, used: *usize, number: usize) {
-  digits: [24]u8 = [] value := number count: usize = 0
-  for true { digits[count] = #cast(u8) (value % 10) + 48 count += 1 value /= 10 if value == 0 { break } }
-  for count > 0 { count -= 1 add_text(output, used, digits[count..count + 1]) }
-}
-fn line_number(doc: *const buffer.Document) usize {
-  row: usize = 1 at: usize = 0 for at < doc.cursor { if doc.bytes[at] == 10 { row += 1 } at += 1 } return row
-}
-fn chrome_text(typography: *Typography, text: []const u8, x: f32, y: f32, active: bool) {
-  red: u8 = 115 green: u8 = 131 blue: u8 = 144
-  if active { red = 190 green = 209 blue = 214 }
-  if !ttf.color(typography.chrome, red, green, blue, 255) || !ttf.set(typography.chrome, &text[0], #len(text)) || !ttf.draw(typography.chrome, x, y) { #panic("chrome draw failed") }
-}
-fn draw_chrome(renderer: rawptr, app: *App, typography: *Typography, width: i32, height: i32, margin: f32, gutter: f32) {
-  doc := app.document current := line_number(doc)
-  if app.line_numbers {
-    row: usize = 1 at: usize = 0 y := margin - app.scroll_y
-    bottom := #cast(f32) height if app.status_line { bottom -= typography.line }
-    for true {
-      if y >= bottom { break }
-      if y + typography.line > 0.0 {
-        number := row
-        if app.relative_numbers && row != current { if row > current { number = row - current } else { number = current - row } }
-        label: [32]u8 = [] length: usize = 0 add_number(label[..], &length, number)
-        x := margin + gutter - (#cast(f32) length + 2.0) * typography.cell
-        chrome_text(typography, label[..length], x, y, row == current)
-      }
-      for at < doc.length && doc.bytes[at] != 10 { at += 1 }
-      if at == doc.length { break } at += 1 row += 1 y += typography.line
+  digits: [24]u8 = []
+  value := number
+  count: usize = 0
+  for true {
+    digits[count] = #cast(u8) (value % 10) + 48
+    count += 1
+    value /= 10
+    if value == 0 {
+      break
     }
   }
-  if app.status_line {
-    bar := sdl.Rect{x: 0.0, y: #cast(f32) height - typography.line, width: #cast(f32) width, height: typography.line}
-    if !sdl.color(renderer, 30, 37, 44, 255) || !sdl.fill(renderer, &bar) { #panic("status background") }
-    text: [8192]u8 = [] used: usize = 0
-    if app.insert { add_text(text[..], &used, "INSERT") } else if app.extend { add_text(text[..], &used, "SELECT") } else { add_text(text[..], &used, "NORMAL") }
-    add_text(text[..], &used, "  ")
-    path := files.name(app.file) leaf := #len(path) for leaf > 0 && path[leaf - 1] != '/' { leaf -= 1 }
-    if #len(path) == 0 { add_text(text[..], &used, "Untitled") } else { add_text(text[..], &used, path[leaf..]) }
-    if buffer.dirty(doc) { add_text(text[..], &used, " [+]") }
-    add_text(text[..], &used, "  ") add_number(text[..], &used, app.buffer_count) if app.buffer_count == 1 { add_text(text[..], &used, " buffer  ") } else { add_text(text[..], &used, " buffers  ") }
-    add_number(text[..], &used, current) add_text(text[..], &used, ":")
-    column: usize = 1 offset := buffer.line_start(doc, doc.cursor)
-    for offset < doc.cursor { column += 1 offset = buffer.next(doc, offset) }
-    add_number(text[..], &used, column)
-    if doc.anchor != doc.cursor {
-      count: usize = 0 selected := buffer.start(doc)
-      for selected < buffer.end(doc) { count += 1 selected = buffer.next(doc, selected) }
-      add_text(text[..], &used, "  selected ") add_number(text[..], &used, count)
+  for count > 0 {
+    count -= 1
+    add_text(output, used, digits[count..count + 1])
+  }
+}
+fn line_number(doc: *const buffer.Document) usize {
+  return line_at(doc, doc.cursor)
+}
+fn line_at(doc: *const buffer.Document, position: usize) usize {
+  return buffer.row_at(doc, position) + 1
+}
+fn chrome_text(typography: *Typography, text: []const u8, x: f32, y: f32, active: bool) {
+  color := theme().muted
+  if active {
+    color = theme().text
+  }
+  cached := cached_ui_text(typography, text)
+  if cached != nil {
+    if !tint(cached, color) || !ttf.draw(cached, x, y) {
+      #panic("cached UI text")
     }
-    add_text(text[..], &used, "  : commands")
-    chrome_text(typography, text[..used], margin, bar.y, true)
+    return
+  }
+  if !tint(typography.chrome, color) || !ttf.set(typography.chrome, &text[0], #len(text)) || !ttf.draw(typography.chrome, x, y) {
+    #panic("chrome draw failed")
+  }
+}
+fn draw_chrome(renderer: rawptr, app: *App, typography: *Typography, width: i32, height: i32, margin: f32, gutter: f32, scroll_y: f32) {
+  doc := app.documents.current
+  position := doc.cursor
+  if !app.view.insert {
+    position = buffer.head(doc)
+  }
+  current := line_at(doc, position)
+  if app.view.line_numbers {
+    bottom := #cast(f32) height
+    if app.view.status_line {
+      bottom -= typography.line
+    }
+    draw_gutter(doc, typography, margin + gutter, margin, bottom, scroll_y, app.view.relative_numbers, position)
+  }
+  if app.view.status_line {
+    draw_status(renderer, app, typography, width, height, margin, current, position)
+  }
+}
+
+fn draw_gutter(doc: *const buffer.Document, typography: *Typography, right: f32, top: f32, bottom: f32, scroll_y: f32, relative: bool, position: usize) {
+  current := line_at(doc, position)
+  first := #cast(usize) (scroll_y / typography.line)
+  row := first + 1
+  y := top + #cast(f32) first * typography.line - scroll_y
+  for true {
+    if y >= bottom {
+      break
+    }
+    if y + typography.line > top {
+      number := row
+      if relative && row != current {
+        if row > current {
+          number = row - current
+        } else {
+          number = current - row
+        }
+      }
+      label: [32]u8 = []
+      length: usize = 0
+      add_number(label[..], &length, number)
+      x := right - (#cast(f32) length + 2.0) * typography.cell
+      chrome_text(typography, label[..length], x, y, row == current)
+    }
+    if row >= doc.line_count {
+      break
+    }
+    row += 1
+    y += typography.line
+  }
+}
+const StatusBase: usize = 1000000
+// One status segment; clickable segments run a command for their pane.
+fn status_segment(app: *App, ui: *UiState, pane: usize, name: []const u8, text: []const u8, command: usize, flags: u32) {
+  segment_flags := flags | UiText
+  if command != 0 {
+    segment_flags = segment_flags | UiClickable | UiHover
+  }
+  segment := ui_make(ui, ui_key(ui, name), segment_flags)
+  ui_text_set(ui, segment, text)
+  ui.boxes[segment].value = StatusBase + pane * 1000 + command
+  ui.boxes[segment].padding[0] = ui.cell
+  ui_size(ui, segment, UiAxisX, UiSizeKind.Text, 0.0, 1.0)
+  ui_size(ui, segment, UiAxisY, UiSizeKind.Percent, 1.0, 1.0)
+  ui_animate(app, ui, segment, false)
+}
+// Status line built from segments. Clicking the file or buffer count opens
+// the buffer picker, the filetype sets the language, !N lists diagnostics,
+// line:col opens goto, [+] saves and ": commands" opens the palette.
+fn draw_status(renderer: rawptr, app: *App, typography: *Typography, width: i32, height: i32, margin: f32, current: usize, position: usize) {
+  ui := &app.ui
+  ui_panel_begin(ui, typography)
+  doc := app.documents.current
+  pane := typography.current_pane
+  area := app.view.panes[pane].rect
+  bar := ui_make(ui, ui_hash_number(ui_hash(0, "status"), pane), UiFloating | UiBackground | UiClip)
+  ui.boxes[bar].axis = UiAxisX
+  ui.boxes[bar].fill = theme().surface
+  ui.boxes[bar].floating[0] = #cast(f32) area.x
+  ui.boxes[bar].floating[1] = #cast(f32) area.y + #cast(f32) height - typography.line
+  ui.boxes[bar].padding[0] = margin - typography.cell
+  if ui.boxes[bar].padding[0] < 0.0 {
+    ui.boxes[bar].padding[0] = 0.0
+  }
+  ui_size(ui, bar, UiAxisX, UiSizeKind.Pixels, #cast(f32) width / typography.scale, 1.0)
+  ui_size(ui, bar, UiAxisY, UiSizeKind.Pixels, typography.line / typography.scale, 1.0)
+  ui_push(ui, bar)
+  mode: []const u8 = "NORMAL"
+  if app.view.insert {
+    mode = "INSERT"
+  } else if app.view.extend {
+    mode = "SELECT"
+  } else if app.config.vim_keys && app.vim.mode == VimMode.Visual {
+    mode = "VISUAL"
+  } else if app.config.vim_keys && app.vim.mode == VimMode.VisualLine {
+    mode = "V-LINE"
+  } else if app.config.vim_keys && app.vim.mode == VimMode.VisualBlock {
+    mode = "V-BLOCK"
+  }
+  if app.macro_state.recording {
+    recording: [32]u8 = []
+    length := copy_text(recording[..], mode)
+    add_text(recording[..], &length, " REC")
+    status_segment(app, ui, pane, "mode", recording[..length], 0, 0)
+  } else {
+    status_segment(app, ui, pane, "mode", mode, 0, 0)
+  }
+  path := files.name(app.documents.file)
+  leaf := #len(path)
+  for leaf > 0 && path[leaf - 1] != '/' {
+    leaf -= 1
+  }
+  if #len(path) == 0 {
+    status_segment(app, ui, pane, "file", "Untitled", 21, 0)
+  } else {
+    status_segment(app, ui, pane, "file", path[leaf..], 21, 0)
+  }
+  kind: [96]u8 = []
+  kind_length := copy_text(kind[..], "[")
+  add_text(kind[..], &kind_length, filetype_name(&app.documents.slots[app.documents.active]))
+  add_text(kind[..], &kind_length, "]")
+  status_segment(app, ui, pane, "filetype", kind[..kind_length], 54, 0)
+  if app.documents.slots[app.documents.active].disk_changed {
+    status_segment(app, ui, pane, "disk", "[disk changed: :reload]", 86, 0)
+  }
+  if app.lsp.failed {
+    status_segment(app, ui, pane, "lsp", "[LSP error: :lsp-log]", 84, 0)
+  }
+  diagnostics := &app.documents.slots[app.documents.active].diagnostics
+  if diagnostics.revision == doc.revision && diagnostics.count > 0 {
+    problems: [32]u8 = []
+    problems_length := copy_text(problems[..], "!")
+    add_number(problems[..], &problems_length, diagnostics.count)
+    status_segment(app, ui, pane, "problems", problems[..problems_length], 80, 0)
+  }
+  if buffer.dirty_cached(doc) {
+    status_segment(app, ui, pane, "dirty", "[+]", 1, 0)
+  }
+  buffers: [32]u8 = []
+  buffers_length: usize = 0
+  add_number(buffers[..], &buffers_length, app.documents.count)
+  if app.documents.count == 1 {
+    add_text(buffers[..], &buffers_length, " buffer")
+  } else {
+    add_text(buffers[..], &buffers_length, " buffers")
+  }
+  status_segment(app, ui, pane, "buffers", buffers[..buffers_length], 21, 0)
+  counts := &typography.pane_text[typography.current_pane].counts
+  identity := app.documents.slots[app.documents.active].identity
+  low := buffer.start(doc)
+  high := buffer.end(doc)
+  invalid := !counts.ready || counts.revision != doc.revision || counts.identity != identity
+  if invalid || counts.position != position {
+    counts.column = buffer.codepoints(doc, buffer.line_start(doc, position), position) + 1
+  }
+  if invalid || counts.low != low || counts.high != high {
+    counts.selected = buffer.codepoints(doc, low, high)
+  }
+  counts.ready = true
+  counts.revision = doc.revision
+  counts.identity = identity
+  counts.position = position
+  counts.low = low
+  counts.high = high
+  location: [48]u8 = []
+  location_length: usize = 0
+  add_number(location[..], &location_length, current)
+  add_text(location[..], &location_length, ":")
+  add_number(location[..], &location_length, counts.column)
+  status_segment(app, ui, pane, "location", location[..location_length], 90, 0)
+  if doc.secondary.count > 0 {
+    cursors: [32]u8 = []
+    cursors_length := copy_text(cursors[..], "cursors ")
+    add_number(cursors[..], &cursors_length, doc.secondary.count + 1)
+    status_segment(app, ui, pane, "cursors", cursors[..cursors_length], 0, 0)
+  }
+  if doc.anchor != doc.cursor {
+    chosen: [32]u8 = []
+    chosen_length := copy_text(chosen[..], "selected ")
+    add_number(chosen[..], &chosen_length, counts.selected)
+    status_segment(app, ui, pane, "selected", chosen[..chosen_length], 0, 0)
+  }
+  if app.input_state.pending != 0 {
+    status_segment(app, ui, pane, "pending", "awaiting character (Esc cancels)", 0, 0)
+  } else {
+    status_segment(app, ui, pane, "commands", ": commands", 91, 0)
+  }
+  if diagnostics.revision == doc.revision {
+    diagnostic_index: usize = 0
+    for diagnostic_index < diagnostics.count {
+      diagnostic := &diagnostics.items[diagnostic_index]
+      if diagnostic.line <= current - 1 && diagnostic.end_line >= current - 1 {
+        message: [600]u8 = []
+        message_length := copy_text(message[..], "| ")
+        add_text(message[..], &message_length, diagnostic.text[..diagnostic.length])
+        // The message yields space first and clips at the pane edge.
+        status_segment(app, ui, pane, "message", message[..message_length], 80, UiClip)
+        last := ui.boxes[bar].last
+        ui_size(ui, last, UiAxisX, UiSizeKind.Text, 0.0, 0.0)
+        break
+      }
+      diagnostic_index += 1
+    }
+  }
+  ui_pop(ui)
+  ui_layout(ui)
+  // Build in window coordinates; draw outside the pane viewport.
+  if !sdl.viewport(renderer, nil) {
+    #panic("status viewport")
+  }
+  ui_render(renderer, ui, typography, #cast(i32) (area.x + width), #cast(i32) (area.y + height))
+  if !sdl.viewport(renderer, &area) {
+    #panic("status viewport restore")
   }
 }

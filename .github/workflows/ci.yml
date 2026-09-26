@@ -1,0 +1,40 @@
+name: Linux checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: dna-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    container: archlinux:base
+    timeout-minutes: 30
+    steps:
+      - name: Install build dependencies
+        run: pacman -Syu --noconfirm --needed base-devel git curl python cmake ninja clang llvm lld just sdl3 libvterm tree-sitter fontconfig pcre2 utf8proc ttf-dejavu
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned Dyn compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --location --retry 3 https://github.com/17robots/dyn/releases/download/v0.1.0-preview.8/dyn-0.1.0-preview.8-linux-x86_64-glibc2.39.tar.gz -o /tmp/dyn.tar.gz
+          echo 'aacc0e6b4285f02c18ca861c9646b28de5b7db0843bec53400c7f04164250d34  /tmp/dyn.tar.gz' | sha256sum --check
+          mkdir -p /opt/dyn
+          tar -xzf /tmp/dyn.tar.gz --strip-components=1 -C /opt/dyn
+          echo /opt/dyn/bin >> "$GITHUB_PATH"
+      - name: Test editor and native boundaries
+        run: just smoke
+      - name: Extended resource and editing soak
+        if: github.event_name == 'workflow_dispatch'
+        run: just soak
+      - name: Verify relocatable deterministic package
+        run: python3 tests/package.py
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dna-preview-linux-x86_64
+          path: build/packages/dna-preview-linux-x86_64.tar.gz
+          if-no-files-found: error

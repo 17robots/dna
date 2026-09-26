@@ -1,0 +1,131 @@
+struct Formatting {
+  path: [4096]u8,
+  source: [4096]u8,
+  process: rawptr,
+  identity: u64,
+  revision: u64,
+  save: bool,
+  source_length: usize,
+  slot: usize,
+  path_length: usize,
+}
+
+// Formatter processes own their input; results only apply to the captured revision.
+extern fn job_open "dna_job_open"(command: *const u8, directory: *const u8, input: *const u8, length: usize, timeout: u32) rawptr
+extern fn job_status "dna_job_status"(job: rawptr) i32
+extern fn job_output "dna_job_output"(job: rawptr, output: *u8, capacity: usize) usize
+extern fn job_error "dna_job_error"(job: rawptr, output: *u8, capacity: usize) usize
+extern fn job_close "dna_job_close"(job: rawptr)
+
+fn format_release(app: *App) {
+  if app.formatting.process != nil {
+    job_close(app.formatting.process)
+    app.formatting.process = nil
+  }
+}
+fn format_start(app: *App, save: bool, path: []const u8) {
+  if app.formatting.process != nil {
+    notice(app, "A formatter is already running. Use :format-cancel to stop it.")
+    return
+  }
+  slot := &app.documents.slots[app.documents.active]
+  file := file_config(app, slot)
+  destination := FileConfig{}
+  if save {
+    file = save_file_config(app, path, &destination)
+  }
+  configured := &file.language
+  if slot.terminal.handle != nil || !file.has_language || configured.formatter_length == 0 {
+    notice(app, "Set formatter in this language's configuration first.")
+    return
+  }
+  resolved_storage: [4096]u8 = []
+  resolved: []const u8 = ""
+  if save {
+    resolved = files.resolve(path, resolved_storage[..])
+    if #len(resolved) == 0 {
+      notice(app, "Invalid save destination; formatter not started.")
+      return
+    }
+  }
+  directory: [4096]u8 = []
+  root := file_config_directory(file.path[..file.path_length])
+  if file.project_length > 0 {
+    root = file_config_directory(file.project[..file.project_length])
+  }
+  if #len(root) == 0 {
+    root = "/"
+  }
+  _ = copy_text(directory[..4095], root)
+  process := job_open(&configured.formatter[0], &directory[0], &slot.document.bytes[0], slot.document.length, #cast(u32) app.config.lsp_timeout_ms)
+  if process == nil {
+    notice(app, "Could not start the formatter.")
+    return
+  }
+  state := &app.formatting
+  state.process = process
+  state.slot = app.documents.active
+  state.identity = slot.identity
+  state.revision = slot.document.revision
+  state.save = save
+  state.path_length = copy_text(state.path[..], resolved)
+  state.source_length = copy_text(state.source[..], files.name(&slot.file))
+  app.prompt_state.panel = Panel.None
+}
+fn format_tick(app: *App) bool {
+  state := &app.formatting
+  if state.process == nil {
+    return false
+  }
+  status := job_status(state.process)
+  if status == 1 {
+    return false
+  }
+  defer format_release(app)
+  if status != 2 {
+    error: [4096]u8 = []
+    error_length := job_error(state.process, &error[0], 4096)
+    if error_length > 0 {
+      notice(app, error[..error_length])
+    }
+    else if status == 5 {
+      notice(app, "Formatter timed out; buffer unchanged.")
+    }
+    else if status == 4 {
+      notice(app, "Formatter output exceeds buffer capacity; buffer unchanged.")
+    }
+    else {
+      notice(app, "Formatter failed; buffer unchanged.")
+    }
+    save_cancel(app)
+    return true
+  }
+  slot := &app.documents.slots[state.slot]
+  if slot.document == nil || slot.identity != state.identity || slot.document.revision != state.revision || app.documents.active != state.slot || app.prompt_state.panel != Panel.None || !buffer.equal(files.name(&slot.file), state.source[..state.source_length]) {
+    save_cancel(app)
+    notice(app, "Formatter result discarded because the buffer changed or is no longer active. Run it again.")
+    return true
+  }
+  reserved := buffer.reserve(buffer.Capacity + 1)
+  if !reserved.ok {
+    save_cancel(app)
+    notice(app, "Cannot allocate formatter result; buffer unchanged.")
+    return true
+  }
+  defer _ = mem.arena_release(&reserved.arena)
+  output := reserved.arena.data
+  length := job_output(state.process, &output[0], #len(output))
+  if !buffer.valid(output[..length]) {
+    save_cancel(app)
+    notice(app, "Formatter produced invalid text; buffer unchanged.")
+    return true
+  }
+  doc := slot.document
+  if !buffer.transform(doc, output[..length]) {
+    #panic("validated formatter output")
+  }
+  if state.save {
+    save_file_ready(app, state.path[..state.path_length])
+  }
+  return true
+}

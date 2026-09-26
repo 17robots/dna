@@ -1,0 +1,131 @@
+struct DiskWatch { identity, epoch: u64, path: [4096]u8, length: usize }
+struct DiskState { worker: rawptr, watches: [16]DiskWatch }
+
+extern fn disk_open "dna_disk_open"() rawptr
+extern fn disk_close "dna_disk_close"(disk: rawptr)
+extern fn disk_watch "dna_disk_watch"(disk: rawptr, index: u32, identity: u64, path: *const u8, saved: *const u8, length: usize)
+extern fn disk_pending "dna_disk_pending"(disk: rawptr, index: u32, identity: u64) isize
+extern fn disk_take "dna_disk_take"(disk: rawptr, index: u32, identity: u64, bytes: *u8, capacity: usize) i32
+
+fn disk_release(app: *App) {
+  if app.disk.worker != nil {
+    disk_close(app.disk.worker)
+    app.disk.worker = nil
+  }
+}
+fn disk_replace(doc: *buffer.Document, bytes: []const u8) {
+  cursor := doc.cursor
+  anchor := doc.anchor
+  marks: [992]usize = []
+  for saved_index in 0..992 {
+    marks[saved_index] = doc.marks[saved_index]
+  }
+  _ = buffer.load(doc, bytes)
+  if cursor > doc.length {
+    cursor = doc.length
+  }
+  if anchor > doc.length {
+    anchor = doc.length
+  }
+  for cursor > 0 && cursor < doc.length && (doc.bytes[cursor] & 192) == 128 {
+    cursor -= 1
+  }
+  for anchor > 0 && anchor < doc.length && (doc.bytes[anchor] & 192) == 128 {
+    anchor -= 1
+  }
+  doc.cursor = cursor
+  doc.anchor = anchor
+  for index in 0..992 {
+    position := marks[index]
+    if position > doc.length {
+      position = doc.length
+    }
+    for position > 0 && position < doc.length && (doc.bytes[position] & 192) == 128 {
+      position -= 1
+    }
+    doc.marks[index] = position
+  }
+}
+fn disk_tick(app: *App) bool {
+  changed: bool = false
+  for index in 0..16 {
+    slot := &app.documents.slots[index]
+    watched := &app.disk.watches[index]
+    if slot.document == nil || slot.file.length == 0 || slot.terminal.handle != nil {
+      if watched.identity != 0 {
+        blank: [1]u8 = [0]
+        disk_watch(app.disk.worker, #cast(u32) index, 0, &blank[0], &blank[0], 0)
+        watched.identity = 0
+      }
+      continue
+    }
+    if app.disk.worker == nil {
+      app.disk.worker = disk_open()
+      if app.disk.worker == nil {
+        return false
+      }
+    }
+    if watched.identity != slot.identity || watched.epoch != slot.document.saved_epoch || !buffer.equal(watched.path[..watched.length], files.name(&slot.file)) {
+      disk_watch(app.disk.worker, #cast(u32) index, slot.identity, &slot.file.path[0], &slot.document.saved[0], slot.document.saved_length)
+      watched.identity = slot.identity
+      watched.epoch = slot.document.saved_epoch
+      watched.length = copy_text(watched.path[..], files.name(&slot.file))
+    }
+    pending := disk_pending(app.disk.worker, #cast(u32) index, slot.identity)
+    if pending != 0 {
+      if pending < 0 {
+        empty: [1]u8 = [0]
+        status := disk_take(app.disk.worker, #cast(u32) index, slot.identity, &empty[0], 1)
+        slot.disk_changed = status != 5
+        changed = true
+      } else {
+        allocated := mem.arena_create(#cast(usize) pending)
+        if !allocated.ok {
+          return changed
+        }
+        bytes := (#cast(*u8) mem.arena_push_uninit(&allocated.arena, #cast(usize) pending, 1))[..#cast(usize) pending]
+        if disk_take(app.disk.worker, #cast(u32) index, slot.identity, &bytes[0], #len(bytes)) == 1 {
+          content := bytes[..#len(bytes) - 1]
+          if app.config.reload_clean_buffers && !buffer.dirty_cached(slot.document) && #len(content) <= buffer.Capacity && buffer.valid(content) {
+            disk_replace(slot.document, content)
+            slot.disk_changed = false
+          }
+          else {
+            slot.disk_changed = true
+          }
+          changed = true
+        }
+        _ = mem.arena_release(&allocated.arena)
+      }
+    }
+    index += 1
+  }
+  return changed
+}
+fn disk_reload(app: *App, confirmed: bool) {
+  if app.documents.file.length == 0 || app.documents.slots[app.documents.active].terminal.handle != nil {
+    notice(app, "This buffer has no file to reload.")
+    return
+  }
+  if buffer.dirty_cached(app.documents.current) && !confirmed {
+    app.prompt_state.panel = Panel.FileConflict
+    return
+  }
+  mark := mem.arena_mark(app.scratch)
+  defer mem.arena_rewind(app.scratch, mark)
+  path := files.name(app.documents.file)
+  info := files.metadata(path)
+  if !info.ok || (info.mode & 61440) != 32768 {
+    notice(app, "File is missing or is not a regular file. Buffer preserved.")
+    return
+  }
+  read := files.read_text(path)
+  defer files.release_text(&read)
+  if !read.ok || !buffer.valid(read.data) {
+    notice(app, "File is unreadable, too large, or invalid text. Buffer preserved.")
+    return
+  }
+  disk_replace(app.documents.current, read.data)
+  app.documents.slots[app.documents.active].disk_changed = false
+  app.prompt_state.panel = Panel.None
+}

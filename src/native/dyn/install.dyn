@@ -1,0 +1,290 @@
+// Linux/glibc installation transactions. Keep old versions until explicitly removed.
+// InstallStat and InstallEntry mirror the x86_64 glibc ABI, like process.dyn.
+struct InstallStat {
+  device, inode, links: u64,
+  mode, uid, gid, padding: u32,
+  rdevice: u64,
+  size, block_size, blocks: i64,
+  access_seconds, access_nanos, modify_seconds, modify_nanos: i64,
+  change_seconds, change_nanos: i64,
+  reserved: [3]i64,
+}
+struct InstallEntry { inode: u64, offset: i64, length: u16, kind: u8, name: [256]u8 }
+extern fn install_fstat "fstat"(fd: i32, info: *InstallStat) i32
+extern fn install_lstat "lstat"(path: *const u8, info: *InstallStat) i32
+extern fn install_fstatat "fstatat"(fd: i32, path: *const u8, info: *InstallStat, flags: i32) i32
+extern fn install_openat "openat"(fd: i32, path: *const u8, flags: i32, mode: u32) i32
+extern fn install_mkdtemp "mkdtemp"(path: *u8) *u8
+extern fn install_rmdir "rmdir"(path: *const u8) i32
+extern fn install_rename "renameat2"(source_fd: i32, source: *const u8, target_fd: i32, target: *const u8, flags: u32) i32
+extern fn install_dup "dup"(fd: i32) i32
+extern fn install_fdopendir "fdopendir"(fd: i32) rawptr
+extern fn install_readdir "readdir"(entries: rawptr) *InstallEntry
+extern fn install_closedir "closedir"(entries: rawptr) i32
+
+fn install_text(text: *const u8) []const u8 {
+  return text[..string_length(text)]
+}
+fn install_equal(text: *const u8, expected: []const u8) bool {
+  if string_length(text) != #len(expected) {
+    return false
+  }
+  for index in 0..#len(expected) {
+    if text[..#len(expected)][index] != expected[index] {
+      return false
+    }
+  }
+  return true
+}
+fn install_name(name: *const u8) bool {
+  if name == nil || name.* == 0 || install_equal(name, ".") || install_equal(name, "..") {
+    return false
+  }
+  for byte in install_text(name) {
+    if byte == 47 {
+      return false
+    }
+  }
+  return true
+}
+// Match bounded snprintf: retain a truncated, terminated path on overflow so
+// failure cleanup behaves exactly like the original transaction.
+fn install_path(output: []u8, first: []const u8, second: []const u8, third: []const u8, fourth: []const u8) bool {
+  at: usize = 0
+  for part in [first, second, third, fourth] {
+    for byte in part {
+      if at + 1 < #len(output) {
+        output[at] = byte
+      }
+      at += 1
+    }
+  }
+  end := at
+  if end >= #len(output) {
+    end = #len(output) - 1
+  }
+  output[end] = 0
+  return at < #len(output)
+}
+fn install_copy(source: *const u8, destination: *const u8, mode: u32, maximum: usize) bool {
+  input := rec_open(source, 657408, 0) // NOFOLLOW | NONBLOCK | CLOEXEC
+  if input < 0 {
+    return false
+  }
+  defer _ = rec_close(input)
+  info := InstallStat{}
+  if install_fstat(input, &info) != 0 || (info.mode & 61440) != 32768 || info.size < 0 || #cast(u64) info.size > #cast(u64) maximum {
+    return false
+  }
+  output := rec_open(destination, 524481, mode)
+  if output < 0 {
+    return false
+  }
+  bytes: [16384]u8 = []
+  total: usize = 0
+  ok := true
+  for {
+    length := proc_read_raw(input, &bytes[0], 16384)
+    if length < 0 && rec_errno().* == 4 {
+      continue
+    }
+    if length < 0 {
+      ok = false
+break
+    }
+    if length == 0 {
+      break
+    }
+    total += #cast(usize) length
+    if total > maximum {
+      ok = false
+break
+    }
+    offset: usize = 0
+    for offset < #cast(usize) length {
+      written := rec_write(output, &bytes[offset], #cast(usize) length - offset)
+      if written < 0 && rec_errno().* == 4 {
+        continue
+      }
+      if written <= 0 {
+        ok = false
+break
+      }
+      offset += #cast(usize) written
+    }
+    if !ok {
+      break
+    }
+  }
+  if rec_sync(output) != 0 {
+    ok = false
+  }
+  if rec_close(output) != 0 {
+    ok = false
+  }
+  return ok
+}
+pub fn dna_plugin_install(manifest: *const u8, executable: *const u8, root: *const u8, name: *const u8, leaf: *const u8) i32 {
+  if !install_name(name) || !install_name(leaf) || install_equal(leaf, "plugin.json") || install_equal(leaf, ".dna-managed") || install_equal(leaf, ".dna-source") {
+    return 0
+  }
+  if dna_make_directories(root) == 0 {
+    return 0
+  }
+  stage: [4096]u8 = []
+  target: [4096]u8 = []
+  program: [4096]u8 = []
+  config: [4096]u8 = []
+  marker: [4096]u8 = []
+  provenance: [4096]u8 = []
+  if !install_path(stage[..], install_text(root), "/.", install_text(name), "-XXXXXX") || !install_path(target[..], install_text(root), "/", install_text(name), "") || install_mkdtemp(&stage[0]) == nil {
+    return 0
+  }
+  stage_text := install_text(&stage[0])
+  ok := install_path(program[..], stage_text, "/", install_text(leaf), "") && install_path(config[..], stage_text, "/plugin.json", "", "") && install_path(marker[..], stage_text, "/.dna-managed", "", "")
+  if ok {
+    ok = install_copy(executable, &program[0], 448, 16777216) && install_copy(manifest, &config[0], 384, 16384)
+  }
+  if ok {
+    fd := rec_open(&marker[0], 524481, 384)
+    if fd < 0 {
+      ok = false
+    } else {
+      _ = rec_close(fd)
+    }
+  }
+  if ok {
+    ok = install_path(provenance[..], stage_text, "/.dna-source", "", "")
+    fd: i32 = -1
+    if ok {
+      fd = rec_open(&provenance[0], 524481, 384)
+    }
+    if fd < 0 {
+      ok = false
+    } else {
+      length := string_length(manifest)
+      if rec_write(fd, manifest, length) != #cast(isize) length || rec_sync(fd) != 0 {
+        ok = false
+      }
+      _ = rec_close(fd)
+    }
+  }
+  if ok && install_rename(-100, &stage[0], -100, &target[0], 1) == 0 {
+    return 1
+  }
+  if ok && rec_errno().* == 17 {
+    owned: [4096]u8 = []
+    info := InstallStat{}
+    if install_lstat(&target[0], &info) == 0 && (info.mode & 61440) == 16384 && install_path(owned[..], install_text(&target[0]), "/.dna-managed", "", "") && install_lstat(&owned[0], &info) == 0 && (info.mode & 61440) == 32768 && install_rename(-100, &stage[0], -100, &target[0], 2) == 0 {
+      return 1
+    }
+  }
+  if program[0] != 0 {
+    _ = rec_unlink(&program[0])
+  }
+  if config[0] != 0 {
+    _ = rec_unlink(&config[0])
+  }
+  if marker[0] != 0 {
+    _ = rec_unlink(&marker[0])
+  }
+  if provenance[0] != 0 {
+    _ = rec_unlink(&provenance[0])
+  }
+  _ = install_rmdir(&stage[0])
+  return 0
+}
+pub fn dna_plugin_remove(root: *const u8, name: *const u8) i32 {
+  if root == nil || !install_name(name) {
+    return 0
+  }
+  target: [4096]u8 = []
+  marker: [4096]u8 = []
+  archive: [4096]u8 = []
+  if !install_path(target[..], install_text(root), "/", install_text(name), "") || !install_path(marker[..], install_text(&target[0]), "/.dna-managed", "", "") || !install_path(archive[..], install_text(root), "/.removed-", install_text(name), "-XXXXXX") {
+    return 0
+  }
+  info := InstallStat{}
+  if install_lstat(&target[0], &info) != 0 || (info.mode & 61440) != 16384 || install_lstat(&marker[0], &info) != 0 || (info.mode & 61440) != 32768 {
+    return 0
+  }
+  if install_mkdtemp(&archive[0]) == nil || install_rmdir(&archive[0]) != 0 {
+    return 0
+  }
+  if install_rename(-100, &target[0], -100, &archive[0], 1) == 0 {
+    return 1
+  }
+  return 0
+}
+fn install_managed(root: i32, name: *const u8, info: *InstallStat) bool {
+  fd := install_openat(root, name, 720896, 0) // DIRECTORY | NOFOLLOW | CLOEXEC
+  if fd < 0 {
+    return false
+  }
+  defer _ = rec_close(fd)
+  marker := InstallStat{}
+  path: []const u8 = ".dna-managed\0"
+  return install_fstat(fd, info) == 0 && install_fstatat(fd, &path[0], &marker, 256) == 0 && (marker.mode & 61440) == 32768
+}
+pub fn dna_plugin_rollback(root: *const u8, name: *const u8) i32 {
+  if !install_name(name) || string_length(name) > 127 {
+    return 0
+  }
+  fd := rec_open(root, 720896, 0)
+  if fd < 0 {
+    return 0
+  }
+  defer _ = rec_close(fd)
+  active := InstallStat{}
+  best := InstallStat{}
+  if !install_managed(fd, name, &active) {
+    return 0
+  }
+  duplicate := install_dup(fd)
+  entries: rawptr = nil
+  if duplicate >= 0 {
+    entries = install_fdopendir(duplicate)
+  }
+  if entries == nil {
+    if duplicate >= 0 {
+      _ = rec_close(duplicate)
+    }
+    return 0
+  }
+  prefix: [132]u8 = []
+  selected: [256]u8 = []
+  _ = install_path(prefix[..], ".", install_text(name), "-", "")
+  prefix_length := string_length(&prefix[0])
+  for {
+    entry := install_readdir(entries)
+    if entry == nil {
+      break
+    }
+    if string_length(&entry.name[0]) != prefix_length + 6 {
+      continue
+    }
+    matches := true
+    for index in 0..prefix_length {
+      if entry.name[index] != prefix[index] {
+        matches = false
+break
+      }
+    }
+    if !matches {
+      continue
+    }
+    candidate := InstallStat{}
+    if !install_managed(fd, &entry.name[0], &candidate) {
+      continue
+    }
+    if selected[0] == 0 || candidate.change_seconds > best.change_seconds || (candidate.change_seconds == best.change_seconds && candidate.change_nanos > best.change_nanos) {
+      _ = copy(&selected[0], &entry.name[0], prefix_length + 7)
+      best = candidate
+    }
+  }
+  _ = install_closedir(entries)
+  if selected[0] != 0 && install_rename(fd, name, fd, &selected[0], 2) == 0 {
+    return 1
+  }
+  return 0
+}

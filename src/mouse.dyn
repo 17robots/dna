@@ -1,0 +1,429 @@
+struct PointerState {
+  x: f32,
+  y: f32,
+  seen: bool,
+  dragging: bool,
+  hover_due: u64,
+  hover_index: usize,
+  // A press on the line numbers selects whole lines while dragging.
+  line_drag: bool,
+  line_anchor: usize,
+}
+
+fn mouse_select(app: *App, typography: *Typography, x: f32, y: f32, dragging: bool, extend: bool, clicks: u8) {
+  if !app.config.mouse_enabled || app.prompt_state.panel != Panel.None {
+    return
+  }
+  pane_init(app)
+  if !dragging {
+    for index in 0..15 {
+      pane := &app.view.panes[index]
+      rect := pane.rect
+      if pane.used && !pane.branch && x >= #cast(f32) rect.x && y >= #cast(f32) rect.y && x < #cast(f32) (rect.x + rect.width) && y < #cast(f32) (rect.y + rect.height) {
+        if index != app.view.focused {
+          pane_focus(app, index)
+        }
+        break
+      }
+    }
+  }
+  active_rect := app.view.panes[app.view.focused].rect
+  margin := app.config.document_padding * typography.scale
+  gutter: f32 = 0.0
+  if app.view.line_numbers {
+    gutter = typography.cell * 7.0
+  }
+  scroll_x := app.view.scroll_x
+  scroll_y := app.view.scroll_y
+  if app.view.animation.document == app.documents.current && app.view.animation.view_revision == app.view.revision && app.view.animation.file.y.ready {
+    scroll_x = app.view.animation.file.x.value
+    scroll_y = app.view.animation.file.y.value
+  }
+  local_y := y - #cast(f32) active_rect.y - margin + scroll_y
+  if local_y < 0.0 {
+    local_y = 0.0
+  }
+  row := #cast(usize) (local_y / typography.line)
+  doc := app.documents.current
+  if row >= doc.line_count {
+    row = doc.line_count - 1
+  }
+  // Line numbers: click selects the line, drag extends by whole lines.
+  in_gutter := app.view.line_numbers && x - #cast(f32) active_rect.x < margin + gutter
+  if !dragging {
+    app.pointer.line_drag = in_gutter
+    app.pointer.line_anchor = row
+  }
+  if app.pointer.line_drag {
+    first_row := app.pointer.line_anchor
+    last_row := row
+    if last_row < first_row {
+      first_row = row
+      last_row = app.pointer.line_anchor
+    }
+    buffer.checkpoint(doc)
+    low := buffer.row_start(doc, first_row)
+    high := buffer.line_end(doc, buffer.row_start(doc, last_row))
+    if high < doc.length {
+      high += 1
+    }
+    if row < app.pointer.line_anchor {
+      doc.anchor = high
+      doc.cursor = low
+    }
+    else {
+      doc.anchor = low
+      doc.cursor = high
+    }
+    doc.goal_valid = false
+    app.view.extend = true
+    pane_store(app)
+    return
+  }
+  beginning := buffer.row_start(doc, row)
+  ending := buffer.line_end(doc, beginning)
+  position := beginning
+  if ending > beginning {
+    if !ttf.set(typography.caret_text, &doc.bytes[beginning], ending - beginning) {
+      #panic("mouse line")
+    }
+    // Hit-testing reuses the caret layout; drop its cached line identity.
+    typography.caret_document = nil
+    typography.pane_text[typography.current_pane].caret_document = nil
+    hit := ttf.Substring{}
+    local_x := x - #cast(f32) active_rect.x - margin - gutter + scroll_x
+    if ttf.at_point(typography.caret_text, #cast(i32) local_x, #cast(i32) (typography.line * 0.5), &hit) {
+      offset := hit.offset
+      if local_x > #cast(f32) hit.x + #cast(f32) hit.width * 0.5 {
+        offset += hit.length
+      }
+      if offset > 0 {
+        position += #cast(usize) offset
+      }
+      if position > ending {
+        position = ending
+      }
+    }
+  }
+  buffer.checkpoint(doc)
+  buffer.move_to(doc, buffer.boundary(doc, position), dragging || extend)
+  if !dragging && clicks == 2 {
+    if doc.cursor == ending && doc.cursor > beginning {
+      doc.cursor = buffer.previous(doc, doc.cursor)
+    }
+    probe := doc.cursor
+    if probe < doc.length {
+      doc.cursor = buffer.next(doc, probe)
+      buffer.word(doc, 1, false, false)
+    }
+    doc.anchor = doc.cursor
+    buffer.word(doc, 2, false, true)
+  } else if !dragging && clicks >= 3 {
+    buffer.select_line(doc)
+  }
+  app.view.extend = doc.cursor != doc.anchor
+  pane_store(app)
+}
+fn mouse_event(renderer: rawptr, window: rawptr, app: *App, typography: *Typography, event: *const sdl.Event, kind: u32) {
+  released := kind == 1026
+  if released {
+    app.pointer.dragging = false
+  }
+  if !app.config.mouse_enabled {
+    app.pointer.dragging = false
+    return
+  }
+  x: f32 = 0.0
+  y: f32 = 0.0
+  clicks: u8 = 1
+  dragging := kind == 1024
+  held := false
+  if dragging {
+    motion := #cast(*const sdl.MouseMotion) event
+    held = (motion.state & 1) != 0
+    if (motion.state & 1) == 0 {
+      app.pointer.dragging = false
+    }
+    x = motion.x
+    y = motion.y
+  } else {
+    button := #cast(*const sdl.MouseButton) event
+    if button.button != 1 {
+      return
+    }
+    x = button.x
+    y = button.y
+    clicks = button.clicks
+    if !released {
+      app.pointer.dragging = app.prompt_state.panel == Panel.None || app.prompt_state.panel == Panel.Terminal
+    }
+  }
+  width: i32 = 0
+  height: i32 = 0
+  pixels_x: i32 = 0
+  pixels_y: i32 = 0
+  if !sdl.window_size(window, &width, &height) || !sdl.size(renderer, &pixels_x, &pixels_y) || width <= 0 || height <= 0 {
+    return
+  }
+  x *= #cast(f32) pixels_x / #cast(f32) width
+  y *= #cast(f32) pixels_y / #cast(f32) height
+  // Grabbing a dock edge or a floating panel's header comes before the
+  // panel's own handling.
+  if place_drag_mouse(app, x, y, pixels_x, pixels_y, !dragging && !released, held, released) {
+    app.pointer.dragging = false
+    return
+  }
+  // Immediate-mode panels hit-test their own last drawn frame.
+  if app.prompt_state.panel == Panel.Hover && !dragging {
+    if hover_mouse(app, x, y, !released) {
+      return
+    }
+  }
+  if completion_visible(app) {
+    if completion_mouse(app, typography, x, y, !dragging && !released, dragging) {
+      return
+    }
+  }
+  if app.prompt_state.panel == Panel.Commands || app.prompt_state.panel == Panel.Open || app.prompt_state.panel == Panel.Buffers || key_menu_is(app.prompt_state.panel) {
+    app.pointer.dragging = false
+    pressed := !dragging && !released
+    if app.prompt_state.panel == Panel.Commands {
+      _ = command_palette_mouse(app, typography, x, y, pressed, dragging)
+    }
+    else if app.prompt_state.panel == Panel.Open || app.prompt_state.panel == Panel.Buffers {
+      picker_ui_mouse(app, typography, x, y, pressed, dragging, clicks)
+    }
+    else {
+      key_menu_mouse(app, typography, x, y, pressed, dragging)
+    }
+    return
+  }
+  if app.prompt_state.panel == Panel.Directory {
+    app.pointer.dragging = false
+    explorer_mouse(app, typography, x, y, !dragging && !released, dragging, clicks)
+    return
+  }
+  if tree_mouse(app, typography, x, y, !dragging && !released, dragging, clicks) {
+    app.pointer.dragging = false
+    return
+  }
+  if app.prompt_state.panel == Panel.ProjectSearch || app.prompt_state.panel == Panel.ReplacePreview {
+    app.pointer.dragging = false
+    sheet_mouse(app, typography, x, y, !dragging && !released, dragging, clicks)
+    return
+  }
+  if dialog_panel(app) {
+    app.pointer.dragging = false
+    dialog_mouse(app, typography, x, y, !dragging && !released, dragging)
+    return
+  }
+  // Split handles: drag to resize, double-click to equalize.
+  if app.ui.split_drag != 0 {
+    if released {
+      app.ui.split_drag = 0
+      app.ui.redraw = true
+    }
+    else if dragging {
+      split_drag_move(app, x, y)
+    }
+    return
+  }
+  if app.prompt_state.panel == Panel.None && !dragging && !released {
+    hit := ui_hit(&app.ui, x, y)
+    if hit != 0 && app.ui.boxes[hit].value >= SplitBase {
+      split := app.ui.boxes[hit].value - SplitBase
+      if clicks >= 2 {
+        // Even shares for this split's panes, like :equalize for one split.
+        branch := &app.view.panes[split]
+        first := pane_weight(app, branch.first, branch.vertical)
+        second := pane_weight(app, branch.second, branch.vertical)
+        branch.split_fraction = #cast(f32) first / #cast(f32) (first + second)
+      }
+      else {
+        app.ui.split_drag = split + 1
+      }
+      app.ui.redraw = true
+      return
+    }
+    if hit != 0 && app.ui.boxes[hit].value >= StatusBase {
+      status_click(app, typography, app.ui.boxes[hit].value - StatusBase)
+      return
+    }
+  }
+  if dragging {
+    ui_pointer(&app.ui, x, y)
+  }
+  if dragging {
+    app.pointer.x = x
+    app.pointer.y = y
+    app.pointer.seen = true
+    app.pointer.hover_due = 0
+    app.pointer.hover_index = 128
+    diagnostics := &app.documents.slots[app.documents.active].diagnostics
+    if !app.pointer.dragging && app.prompt_state.panel == Panel.None && diagnostics.count > 0 && diagnostics.revision == app.documents.current.revision {
+      app.pointer.hover_due = sdl.ticks() + 50
+    }
+    if !app.pointer.dragging {
+      return
+    }
+  } else {
+    app.pointer.seen = false
+    app.pointer.hover_due = 0
+  }
+  if app.prompt_state.panel == Panel.None && !dragging && !released {
+    for view_index in 0..15 {
+      view := &app.view.panes[view_index]
+      if view.used && !view.branch && x >= #cast(f32) view.rect.x && y >= #cast(f32) view.rect.y && x < #cast(f32) (view.rect.x + view.rect.width) && y < #cast(f32) (view.rect.y + view.rect.height) {
+        if view_index != app.view.focused {
+          pane_focus(app, view_index)
+        }
+        break
+      }
+    }
+  }
+  target := terminal_target(app)
+  if target != nil {
+    if app.prompt_state.panel == Panel.None {
+      x -= #cast(f32) app.view.panes[app.view.focused].rect.x
+      y -= #cast(f32) app.view.panes[app.view.focused].rect.y
+    }
+    drag: i32 = 0
+    if dragging {
+      drag = 1
+    }
+    if released {
+      drag = 2
+    }
+    if terminal_mode(app).input && terminal_application_mouse(target, x, y, drag, #cast(u32) sdl.modifiers()) != 0 {
+      return
+    }
+    if !released {
+      review_slot := terminal_review_slot(app, target)
+      if !terminal_mode(app).input && review_slot != nil && review_slot.terminal.review {
+        position := terminal_review_point(target, x, y)
+        buffer.select_to(review_slot.document, position, dragging)
+      }
+      else {
+        terminal_mouse(target, x, y, drag)
+      }
+    }
+    return
+  }
+  if released {
+    return
+  }
+  mouse_select(app, typography, x, y, dragging, (sdl.modifiers() & 3) != 0, clicks)
+}
+
+// Wheel input for immediate-mode panels; true when it needs a redraw.
+fn mouse_wheel(renderer: rawptr, window: rawptr, app: *App, event: *const sdl.Event) bool {
+  if app.config.mouse_enabled && (app.prompt_state.panel == Panel.None || app.prompt_state.panel == Panel.Tree) {
+    tree_wheel_event := #cast(*const sdl.MouseWheel) event
+    tree_amount := tree_wheel_event.y
+    if tree_wheel_event.direction == 1 {
+      tree_amount = -tree_amount
+    }
+    if tree_wheel(app, tree_amount) {
+      return true
+    }
+  }
+  if !app.config.mouse_enabled || (app.prompt_state.panel != Panel.Directory && app.prompt_state.panel != Panel.Commands && app.prompt_state.panel != Panel.Open && app.prompt_state.panel != Panel.Buffers && !completion_visible(app) && app.prompt_state.panel != Panel.Hover && !dialog_panel(app) && app.prompt_state.panel != Panel.ProjectSearch && app.prompt_state.panel != Panel.ReplacePreview) {
+    return false
+  }
+  wheel := #cast(*const sdl.MouseWheel) event
+  amount := wheel.y
+  if wheel.direction == 1 {
+    amount = -amount
+  }
+  if app.prompt_state.panel == Panel.Directory && !app.explorer.insert && app.explorer.document != nil {
+    steps := #cast(i32) (amount * 3.0)
+    key: u32 = KeyK
+    if steps < 0 {
+      key = KeyJ
+      steps = -steps
+    }
+    for steps > 0 {
+      explorer_key(app, nil, key, 0)
+      steps -= 1
+    }
+    return true
+  }
+  app.ui.wheel += amount
+  return amount != 0.0
+}
+// Status segment click: focus that pane, then run the segment's command.
+fn status_click(app: *App, typography: *Typography, encoded: usize) {
+  pane := encoded / 1000
+  command := encoded % 1000
+  if pane < 15 && pane != app.view.focused && app.view.panes[pane].used {
+    pane_focus(app, pane)
+  }
+  if command == 54 {
+    panel(app, Panel.Commands)
+    app.prompt_state.length = copy_text(app.prompt_state.text[..], "filetype ")
+    return
+  }
+  if command == 90 {
+    app.input_state.goto_count = 0
+    app.input_state.goto_explorer = false
+    panel(app, Panel.Goto)
+    return
+  }
+  if command != 0 {
+    action(app, typography, command)
+  }
+}
+// Resize arrows over split handles, a pointer over clickable items.
+fn ui_cursor_update(app: *App) {
+  ui := &app.ui
+  kind := UiCursorDefault
+  hovered: usize = 0
+  if ui.mouse_seen {
+    hovered = ui_hit(ui, ui.mouse_x, ui.mouse_y)
+  }
+  split := ui.split_drag
+  if split == 0 && hovered != 0 && ui.boxes[hovered].value >= SplitBase {
+    split = ui.boxes[hovered].value - SplitBase + 1
+  }
+  placing := place_cursor(app)
+  if placing != 0 {
+    kind = placing
+  }
+  else if split != 0 && split <= 15 {
+    kind = UiCursorResizeY
+    if app.view.panes[split - 1].vertical {
+      kind = UiCursorResizeX
+    }
+  }
+  else if hovered != 0 {
+    kind = UiCursorPointer
+  }
+  else if ui.mouse_seen && app.prompt_state.panel == Panel.None && pointer_over_text(app) {
+    kind = UiCursorText
+  }
+  ui_cursor(ui, kind)
+}
+// Document text area of a text pane (not a terminal, gutter or status line).
+fn pointer_over_text(app: *App) bool {
+  ui := &app.ui
+  for index in 0..15 {
+    pane := &app.view.panes[index]
+    rect := sdl.Rect{x: #cast(f32) pane.rect.x, y: #cast(f32) pane.rect.y, width: #cast(f32) pane.rect.width, height: #cast(f32) pane.rect.height}
+    if pane.used && !pane.branch && ui_contains(rect, ui.mouse_x, ui.mouse_y) {
+      if app.documents.slots[pane.slot].terminal.handle != nil {
+        return false
+      }
+      gutter: f32 = 0.0
+      if app.view.line_numbers {
+        gutter = ui.cell * 7.0
+      }
+      status: f32 = 0.0
+      if app.view.status_line {
+        status = ui.line
+      }
+      left := rect.x + app.config.document_padding * ui.scale + gutter
+      return ui.mouse_x >= left && ui.mouse_y < rect.y + rect.height - status
+    }
+  }
+  return false
+}

@@ -1,0 +1,295 @@
+fn protocol_language(name: []const u8) []const u8 {
+  if buffer.equal(name, "tsx") {
+    return "typescriptreact"
+  }
+  if buffer.equal(name, "bash") {
+    return "shellscript"
+  }
+  return name
+}
+fn lsp_signature(app: *App, result: *const json.Value) {
+  signatures := json.object_get(result, "signatures")
+  if !json.is_array(signatures) || signatures.first == nil {
+    hover_notice(app, "No signature information.")
+    return
+  }
+  active := lsp.number(json.object_get(result, "activeSignature"))
+  selected := signatures.first
+  index: usize = 0
+  for active.ok && index < active.value && selected.next != nil {
+    selected = selected.next
+    index += 1
+  }
+  text: [8192]u8 = []
+  used := copy_text(text[..], json_text(selected, "label"))
+  add_text(text[..], &used, "\n\n")
+  lsp_markup(text[..], &used, json.object_get(selected, "documentation"))
+  parameter := lsp.number(json.object_get(selected, "activeParameter"))
+  if !parameter.ok {
+    parameter = lsp.number(json.object_get(result, "activeParameter"))
+  }
+  if parameter.ok {
+    add_text(text[..], &used, "\n\nActive parameter: ")
+    add_number(text[..], &used, parameter.value + 1)
+  }
+  hover_notice(app, text[..used])
+}
+fn lsp_prepare_format(app: *App, result: *const json.Value) {
+  lsp_edits_release(app)
+  if !json.is_array(result) || result.first == nil {
+    notice(app, "No formatting changes.")
+    return
+  }
+  allocated := buffer.reserve((buffer.Capacity + 1) * 2 + 65536)
+  if !allocated.ok {
+    notice(app, "Cannot allocate formatting preview.")
+    return
+  }
+  app.lsp.edits.arena = allocated.arena
+  app.lsp.edits.owned = true
+  uri: [16384]u8 = []
+  encoded := lsp.uri(files.name(app.documents.file), uri[..])
+  if #len(encoded) == 0 || !lsp_edit_file(app, encoded, result, nil) {
+    lsp_edits_release(app)
+    notice(app, "Formatting edits rejected; buffer unchanged.")
+    return
+  }
+  lsp_preview_edits(app)
+}
+fn diagnostic_jump(app: *App, backwards: bool) {
+  slot := &app.documents.slots[app.documents.active]
+  diagnostics := &slot.diagnostics
+  doc := slot.document
+  if diagnostics.count == 0 || diagnostics.revision != doc.revision {
+    notice(app, "No current diagnostics in this buffer.")
+    return
+  }
+  current := buffer.head(doc)
+  chosen: usize = 0
+  found: bool = false
+  fallback: usize = 0
+  fallback_set: bool = false
+  index: usize = 0
+  for index < diagnostics.count {
+    item := &diagnostics.items[index]
+    point := lsp.offset(doc.bytes[..doc.length], lsp.Position{line: item.line, character: item.character})
+    if point.ok {
+      if !fallback_set || (!backwards && point.value < fallback) || (backwards && point.value > fallback) {
+        fallback = point.value
+        fallback_set = true
+      }
+      if (!backwards && point.value > current && (!found || point.value < chosen)) || (backwards && point.value < current && (!found || point.value > chosen)) {
+        chosen = point.value
+        found = true
+      }
+    }
+    index += 1
+  }
+  if !found {
+    chosen = fallback
+  }
+  buffer.select_to(doc, chosen, false)
+  app.prompt_state.panel = Panel.None
+}
+fn language_cursor(doc: *buffer.Document, insert: bool) usize {
+  if insert {
+    return doc.cursor
+  }
+  return buffer.head(doc)
+}
+fn completion_visible(app: *App) bool {
+  return app.prompt_state.panel == Panel.LspResults && app.lsp.results.kind == 1 && app.view.insert
+}
+fn completion_tick(app: *App) {
+  state := &app.lsp
+  if snippet_valid(app) {
+    state.completion_due = 0
+    return
+  }
+  // Keep a displayed completion consumed; other panels suspend and rearm it.
+  if !app.view.insert || (app.prompt_state.panel != Panel.None && !completion_visible(app)) {
+    state.completion_identity = 0
+  }
+  if !app.config.automatic_completion || !app.view.insert || (app.prompt_state.panel != Panel.None && !completion_visible(app)) || app.documents.file.length == 0 {
+    state.completion_due = 0
+    state.completion_typed = false
+    return
+  }
+  index := lsp_for(app)
+  if index == 8 || !state.servers[index].ready {
+    state.completion_due = 0
+    return
+  }
+  slot := &app.documents.slots[app.documents.active]
+  doc := slot.document
+  // Only typed text arms automatic completion; cursor motion never does.
+  if (state.completion_typed || state.completion_retry) && (state.completion_identity != slot.identity || state.completion_revision != doc.revision || state.completion_position != doc.cursor) {
+    state.completion_identity = slot.identity
+    state.completion_revision = doc.revision
+    state.completion_position = doc.cursor
+    state.completion_due = sdl.ticks() + #cast(u64) app.config.completion_delay_ms
+    state.completion_retry = false
+  }
+  state.completion_typed = false
+  if state.pending != 0 && state.automatic && state.kind == 1 && (state.identity != slot.identity || state.revision != doc.revision || state.position != doc.cursor) {
+    lsp_cancel_request(app)
+    if state.servers[index].process == nil {
+      return
+    }
+    lsp_note(app, "Obsolete automatic completion cancelled; waiting for the typing pause.")
+  }
+  if state.completion_due == 0 || sdl.ticks() < state.completion_due || state.pending != 0 {
+    return
+  }
+  state.completion_due = 0
+  if doc.cursor == 0 {
+    return
+  }
+  if state.completion_position != doc.cursor || state.completion_revision != doc.revision {
+    return
+  }
+  byte := doc.bytes[doc.cursor - 1]
+  if !completion_word_byte(byte) && byte != '.' && byte != ':' && byte != '>' && byte != '#' && byte != '@' {
+    return
+  }
+  lsp_request(app, 1, "")
+  state.automatic = true
+  if state.pending != 0 {
+    lsp_note(app, "Automatic completion request pending.")
+  }
+}
+
+fn completion_word_byte(byte: u8) bool {
+  return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || (byte >= '0' && byte <= '9') || byte == '_' || byte >= 128
+}
+fn completion_prefix_start(doc: *buffer.Document, position: usize) usize {
+  beginning := position
+  for beginning > 0 {
+    previous := buffer.previous(doc, beginning)
+    if !completion_word_byte(doc.bytes[previous]) {
+      break
+    }
+    beginning = previous
+  }
+  if beginning > 0 && doc.bytes[beginning - 1] == '#' {
+    beginning -= 1
+  }
+  return beginning
+}
+fn completion_filter_text(item: *const json.Value) []const u8 {
+  label := json_text(item, "filterText")
+  if #len(label) == 0 {
+    label = json_text(item, "label")
+  }
+  return label
+}
+// -1 rejects. The first typed word character must start a word in the label,
+// like mainstream editors; later characters may match fuzzily.
+fn completion_score(prefix: []const u8, item: *const json.Value) i32 {
+  if #len(prefix) == 0 {
+    return 0
+  }
+  label := completion_filter_text(item)
+  score := fuzzy_score(label, prefix)
+  if score < 0 {
+    return -1
+  }
+  wanted := lower(prefix[0])
+  at: usize = 0
+  found: bool = false
+  for at < #len(label) && !found {
+    byte := label[at]
+    boundary := at == 0 || !completion_word_byte(label[at - 1]) || (byte >= 'A' && byte <= 'Z' && label[at - 1] >= 'a' && label[at - 1] <= 'z')
+    if boundary && lower(byte) == wanted {
+      found = true
+    }
+    at += 1
+  }
+  if !found {
+    return -1
+  }
+  if #len(label) >= #len(prefix) && contains(label[..#len(prefix)], prefix) {
+    score += 64
+  }
+  return score
+}
+fn completion_order_text(item: *const json.Value) []const u8 {
+  text := json_text(item, "sortText")
+  if #len(text) == 0 {
+    text = json_text(item, "label")
+  }
+  return text
+}
+// Higher score first; ties follow the server's sortText, then shorter labels.
+fn completion_before(a: *const json.Value, a_score: i32, b: *const json.Value, b_score: i32) bool {
+  if a_score != b_score {
+    return a_score > b_score
+  }
+  left := completion_order_text(a)
+  right := completion_order_text(b)
+  index: usize = 0
+  for index < #len(left) && index < #len(right) {
+    if left[index] != right[index] {
+      return left[index] < right[index]
+    }
+    index += 1
+  }
+  if #len(left) != #len(right) {
+    return #len(left) < #len(right)
+  }
+  return #len(json_text(a, "label")) < #len(json_text(b, "label"))
+}
+// Rank every response item against the word before state.position; keep the best 128.
+fn completion_collect(state: *LspResults, doc: *buffer.Document) {
+  state.count = 0
+  if state.position > doc.length {
+    return
+  }
+  prefix := doc.bytes[completion_prefix_start(doc, state.position)..state.position]
+  item := state.source
+  for item != nil {
+    score := completion_score(prefix, item)
+    if score >= 0 && (state.count < 128 || completion_before(item, score, state.items[127], state.scores[127])) {
+      at := state.count
+      if at == 128 {
+        at = 127
+      } else {
+        state.count += 1
+      }
+      for at > 0 && completion_before(item, score, state.items[at - 1], state.scores[at - 1]) {
+        state.items[at] = state.items[at - 1]
+        state.scores[at] = state.scores[at - 1]
+        at -= 1
+      }
+      state.items[at] = item
+      state.scores[at] = score
+    }
+    item = item.next
+  }
+}
+// Typing inside an open completion refilters the cached response at once.
+fn completion_refilter(app: *App) {
+  state := &app.lsp.results
+  slot := &app.documents.slots[state.slot]
+  doc := slot.document
+  if state.kind != 1 || state.source == nil || app.documents.active != state.slot || doc == nil || slot.identity != state.identity || doc.secondary.count > 0 || doc.cursor < state.origin || doc.cursor != doc.anchor {
+    app.prompt_state.panel = Panel.None
+    lsp_results_release(app)
+    return
+  }
+  state.position = doc.cursor
+  state.revision = doc.revision
+  completion_collect(state, doc)
+  app.prompt_state.selected = 0
+  if state.count == 0 {
+    app.prompt_state.panel = Panel.None
+    lsp_results_release(app)
+  }
+}
+// Shift a response range end by text typed after the request was sent.
+fn completion_shift(state: *const LspResults, offset: usize) usize {
+  if offset >= state.origin && state.position > state.origin {
+    return offset + (state.position - state.origin)
+  }
+  return offset
+}

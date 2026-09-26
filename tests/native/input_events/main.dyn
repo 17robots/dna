@@ -1,0 +1,103 @@
+extern fn input_ticks "SDL_GetTicksNS"() u64
+extern fn input_length "strlen"(text: *const u8) usize
+extern fn input_equal "strcmp"(a: *const u8, b: *const u8) i32
+frames: u64 = 0
+titles: u64 = 0
+duplicate_titles: u64 = 0
+previous_title: [8192]u8 = []
+started: u64 = 0
+saw_complete_document: bool = false
+injected: bool = false
+step: u32 = 0
+pub fn SDL_WaitEventTimeout(event: rawptr, milliseconds: i32) bool {
+  if !injected {
+    injected = true
+    started = input_ticks()
+    probe_key(105)
+    for _ in 0..200 {
+      probe_key(97)
+      probe_text("a \0")
+    }
+  } else if saw_complete_document {
+    if probe_env("DNA_INPUT_SAVE_TEST\0") != nil {
+      previous := step
+      step += 1
+      if previous == 0 {
+        probe_key(27)
+      }
+      else if previous == 1 {
+        probe_key(58)
+      }
+      else if previous == 2 {
+        probe_text("write\0")
+      }
+      else if previous == 3 {
+        probe_key(13)
+      }
+      else {
+        probe_key_mod(113, 192)
+        probe_key(100)
+      }
+    } else {
+      probe_key(27)
+      probe_key_mod(113, 192)
+      probe_key(100)
+    }
+  }
+  next := #cast(*fn(rawptr, i32) bool) probe_next("SDL_WaitEventTimeout\0")
+  return next(event, milliseconds)
+}
+pub fn TTF_SetTextString(text: rawptr, string: *const u8, length: usize) bool {
+  if length == 400 {
+    exact := true
+    for index in 0..length {
+      expected: u8 = 97
+      if index % 2 != 0 {
+        expected = 32
+      }
+      if string[..length][index] != expected {
+        exact = false
+      }
+    }
+    if exact {
+      saw_complete_document = true
+    }
+  }
+  next := #cast(*fn(rawptr, *const u8, usize) bool) probe_next("TTF_SetTextString\0")
+  return next(text, string, length)
+}
+pub fn SDL_SetWindowTitle(window: rawptr, title: *const u8) bool {
+  titles += 1
+  if input_equal(&previous_title[0], title) == 0 {
+    duplicate_titles += 1
+  }
+  length := input_length(title)
+  if length > 8191 {
+    length = 8191
+  }
+  for index in 0..length {
+    previous_title[index] = title[..length][index]
+  }
+  previous_title[length] = 0
+  next := #cast(*fn(rawptr, *const u8) bool) probe_next("SDL_SetWindowTitle\0")
+  return next(window, title)
+}
+pub fn SDL_RenderPresent(renderer: rawptr) bool {
+  frames += 1
+  next := #cast(*fn(rawptr) bool) probe_next("SDL_RenderPresent\0")
+  return next(renderer)
+}
+pub fn SDL_Quit() {
+  probe_log("input burst: ")
+  probe_number(frames)
+  probe_log(" frames, ")
+  probe_number(titles)
+  probe_log(" titles, ")
+  probe_number(duplicate_titles)
+  probe_log(" redundant titles, ")
+  probe_decimal(#cast(f64) (input_ticks() - started) / 1000000.0)
+  probe_log(" ms\n")
+  probe_check(saw_complete_document && frames <= 16 && duplicate_titles == 0, "lost input, excessive redraws, or redundant titles")
+  next := #cast(*fn()) probe_next("SDL_Quit\0")
+  next()
+}

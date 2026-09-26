@@ -1,0 +1,277 @@
+use "std/sync"
+struct PopupText { text: *const u8 }
+stage: u32 = 0
+typed: u32 = 0
+completion: bool = false
+hover: bool = false
+snippet_expanded: bool = false
+completion_first: u64 = 0
+last_typed: u64 = 0
+started: u64 = 0
+typing_ready: sync.AtomicU32 = sync.AtomicU32{}
+popup_layer: bool = false
+captured: bool = false
+opening: u32 = 0
+timer_started: bool = false
+inside_stage: u32 = 0
+next_letter: u64 = 0
+extern fn popup_ticks "SDL_GetTicks"() u64
+extern fn popup_timer "SDL_AddTimer"(interval: u32, callback: *fn(rawptr, u32, u32) u32, state: rawptr) u32
+extern fn popup_parse "strtoul"(text: *const u8, end: rawptr, base: i32) u64
+extern fn popup_find "strstr"(text: *const u8, needle: *const u8) *const u8
+extern fn popup_compare "strcmp"(a: *const u8, b: *const u8) i32
+extern fn popup_prefix "strncmp"(a: *const u8, b: *const u8, size: usize) i32
+extern fn popup_pixels "SDL_RenderReadPixels"(renderer: rawptr, rect: rawptr) rawptr
+extern fn popup_save "SDL_SaveBMP"(surface: rawptr, path: *const u8) bool
+extern fn popup_destroy "SDL_DestroySurface"(surface: rawptr)
+fn popup_wake(state: rawptr, id: u32, interval: u32) u32 {
+  _ = state
+  _ = id
+  _ = interval
+  event := ProbeEvent{}
+  probe_kind(#cast(rawptr) &event).* = 32768
+  _ = probe_push(#cast(rawptr) &event)
+  return 0
+}
+fn popup_begin(state: rawptr, id: u32, interval: u32) u32 {
+  sync.store_u32(&typing_ready, 1)
+  return popup_wake(state, id, interval)
+}
+fn popup_contains(text: *const u8, fragment: []const u8) bool {
+  return text != nil && popup_find(text, &fragment[0]) != nil
+}
+fn popup_row(value: *const u8) bool {
+  if !popup_layer || value == nil {
+    return false
+  }
+  if probe_env("DNA_POPUP_PLATFORM\0") != nil {
+    prefix: []const u8 = "pol\0"
+    return popup_prefix(value, &prefix[0], 3) == 0
+  }
+  expected: []const u8 = "helper\0"
+  return popup_compare(value, &expected[0]) == 0
+}
+fn popup_text(event: rawptr, text: *const u8) {
+  probe_kind(event).* = 771
+  (#cast(**const u8) (#cast(usize) event + 24)).* = text
+}
+fn popup_mod(event: rawptr, modifiers: u16) {
+  (#cast(*u16) (#cast(usize) event + 32)).* = modifiers
+}
+fn popup_wait(event: rawptr, milliseconds: i32) bool {
+  next := #cast(*fn(rawptr, i32) bool) probe_next("SDL_WaitEventTimeout\0")
+  return next(event, milliseconds)
+}
+pub fn SDL_SetRenderTarget(renderer: rawptr, texture: rawptr) bool {
+  popup_layer = texture != nil
+  next := #cast(*fn(rawptr, rawptr) bool) probe_next("SDL_SetRenderTarget\0")
+  return next(renderer, texture)
+}
+pub fn TTF_DrawRendererText(text: rawptr, x: f32, y: f32) bool {
+  bytes := (#cast(*PopupText) text).text
+  if stage >= 7 && popup_contains(bytes, "helper(123)\0") {
+    snippet_expanded = true
+  }
+  if popup_row(bytes) {
+    if probe_env("DNA_POPUP_PLATFORM\0") == nil && (x > 250.0 || y > 180.0) {
+      probe_log("FAIL completion is not cursor-local\n")
+      probe_exit(91)
+    }
+    if completion_first == 0 {
+      completion_first = popup_ticks()
+      if typed == 3 {
+        probe_log("completion latency: ")
+        probe_number(completion_first - last_typed)
+        probe_log(" ms after final keystroke\n")
+      }
+    }
+    if probe_env("DNA_POPUP_SETTLE\0") == nil || popup_ticks() - completion_first >= 40 {
+      completion = true
+    }
+  }
+  if stage >= 10 && popup_contains(bytes, "fn helper\0") && !popup_contains(bytes, "fn main\0") && !popup_row(bytes) {
+    if x > 250.0 || y > 180.0 {
+      probe_log("FAIL hover is not cursor-local\n")
+      probe_exit(92)
+    }
+    hover = true
+  }
+  next := #cast(*fn(rawptr, f32, f32) bool) probe_next("TTF_DrawRendererText\0")
+  return next(text, x, y)
+}
+pub fn SDL_RenderPresent(renderer: rawptr) bool {
+  path := probe_env("DNA_POPUP_CAPTURE\0")
+  if (hover || (completion && probe_env("DNA_POPUP_PLATFORM\0") != nil)) && path != nil && !captured {
+    surface := popup_pixels(renderer, nil)
+    if surface == nil || !popup_save(surface, path) {
+      probe_exit(93)
+    }
+    popup_destroy(surface)
+    captured = true
+  }
+  next := #cast(*fn(rawptr) bool) probe_next("SDL_RenderPresent\0")
+  return next(renderer)
+}
+pub fn SDL_WaitEventTimeout(event: rawptr, milliseconds: i32) bool {
+  if started == 0 {
+    started = popup_ticks()
+  }
+  probe_clear(event)
+  open_path := probe_env("DNA_POPUP_OPENFILE\0")
+  if open_path != nil && opening < 3 {
+    if opening == 0 {
+      probe_kind(event).* = 768
+      probe_u32(event, 28).* = 111
+      popup_mod(event, 192)
+    } else if opening == 1 {
+      popup_text(event, open_path)
+    }
+    else {
+      probe_kind(event).* = 768
+      probe_u32(event, 28).* = 13
+    }
+    opening += 1
+    return true
+  }
+  if probe_env("DNA_POPUP_DELAY\0") != nil && !timer_started {
+    timer_started = true
+    delay := probe_env("DNA_POPUP_DELAY_MS\0")
+    interval: u32 = 500
+    if delay != nil {
+      interval = #cast(u32) popup_parse(delay, nil, 10)
+    }
+    _ = popup_timer(interval, &popup_begin, nil)
+  }
+  if probe_env("DNA_POPUP_DELAY\0") != nil && sync.load_u32(&typing_ready) == 0 {
+    return popup_wait(event, milliseconds)
+  }
+  key: u32 = 0
+  initial: [5]u32 = [103, 103, 106, 106, 97]
+  if probe_env("DNA_POPUP_PLATFORM\0") != nil && stage < 3 {
+    platform_keys: [3]u32 = [103, 101, 111]
+    key = platform_keys[stage]
+    stage += 1
+    if stage == 3 {
+      stage = 5
+    }
+  } else if stage < 5 {
+    key = initial[stage]
+    if stage == 4 {
+      popup_mod(event, 3)
+    }
+    stage += 1
+  } else if stage == 5 {
+    if probe_env("DNA_POPUP_INSIDE\0") != nil && inside_stage < 3 {
+      current := inside_stage
+      inside_stage += 1
+      if current == 0 {
+        definition: []const u8 = "fn dna_completion_probe() {\n\n}\n\0"
+        popup_text(event, &definition[0])
+      } else {
+        probe_kind(event).* = 768
+        probe_u32(event, 28).* = 1073741906
+      }
+      return true
+    }
+    letters: [3][]const u8 = ["h\0", "e\0", "l\0"]
+    platform_letters: [3][]const u8 = ["p\0", "o\0", "l\0"]
+    if typed < 3 && popup_ticks() < next_letter {
+      return popup_wait(event, milliseconds)
+    }
+    if typed < 3 {
+      pace := probe_env("DNA_POPUP_KEY_DELAY_MS\0")
+      if pace != nil {
+        delay := #cast(u32) popup_parse(pace, nil, 10)
+        next_letter = popup_ticks() + #cast(u64) delay
+        _ = popup_timer(delay, &popup_wake, nil)
+      }
+      completion = false
+      completion_first = 0
+      letter := letters[typed]
+      if probe_env("DNA_POPUP_PLATFORM\0") != nil {
+        letter = platform_letters[typed]
+      }
+      typed += 1
+      probe_kind(event).* = 768
+      probe_u32(event, 28).* = #cast(u32) letter[0]
+      text_event := ProbeEvent{}
+      popup_text(#cast(rawptr) &text_event, &letter[0])
+      if !probe_push(#cast(rawptr) &text_event) {
+        probe_exit(95)
+      }
+      last_typed = popup_ticks()
+      return true
+    }
+    if completion && probe_env("DNA_POPUP_PLATFORM\0") != nil {
+      probe_log("PASS automatic completion while typing in platform.dyn\n")
+      probe_kind(event).* = 256
+      stage = 12
+      return true
+    }
+    if completion {
+      key = 9
+      stage += 1
+    }
+  } else if probe_env("DNA_POPUP_SNIPPET\0") != nil && stage >= 6 && stage < 12 {
+    if stage == 6 {
+      argument: []const u8 = "123\0"
+      popup_text(event, &argument[0])
+      stage += 1
+      return true
+    }
+    if stage == 7 {
+      key = 9
+      stage += 1
+    } else if snippet_expanded {
+      probe_log("PASS real Dyn snippet placeholder replacement and Tab navigation\n")
+      probe_kind(event).* = 256
+      stage = 12
+      return true
+    }
+  } else if stage == 6 {
+    key = 27
+    stage += 1
+  } else if stage == 7 || stage == 8 {
+    key = 104
+    stage += 1
+  } else if stage == 9 {
+    key = 32
+    stage += 1
+  } else if stage == 10 {
+    key = 107
+    stage += 1
+  } else if stage == 11 && hover {
+    probe_log("PASS default timed completion, Tab acceptance, cursor-local symbol hover\n")
+    probe_kind(event).* = 256
+    stage += 1
+    return true
+  } else if stage == 12 {
+    key = 100
+    stage += 1
+  }
+  if key != 0 {
+    probe_kind(event).* = 768
+    probe_u32(event, 28).* = key
+    return true
+  }
+  if popup_ticks() - started > 7000 {
+    probe_log("FAIL language popups stage=")
+    probe_number(#cast(u64) stage)
+    probe_log(" completion=")
+    if completion {
+      probe_log("1")
+    } else {
+      probe_log("0")
+    }
+    probe_log(" hover=")
+    if hover {
+      probe_log("1")
+    } else {
+      probe_log("0")
+    }
+    probe_log("\n")
+    probe_exit(94)
+  }
+  // Preserve real scheduler deadlines: forced polling can hide lost wakeups.
+  return popup_wait(event, milliseconds)
+}

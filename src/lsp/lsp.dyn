@@ -1,0 +1,246 @@
+use "../buffer"
+use "std/encoding/json"
+use "std/unicode/utf8"
+
+pub struct Position { line, character: usize }
+pub struct Offset { value: usize, ok: bool }
+pub struct Edit { start, end: usize, text: []const u8 }
+
+pub fn position(text: []const u8, offset: usize) Position {
+  result := Position{}
+  at: usize = 0
+  for at < offset && at < #len(text) {
+    rune := utf8.decode(text, at)
+    if text[at] == 10 {
+      result.line += 1
+      result.character = 0
+    }
+    else {
+      result.character += 1
+      if rune.codepoint > 65535 {
+        result.character += 1
+      }
+    }
+    at += rune.width
+  }
+  return result
+}
+// Resolves positions in ascending order with one forward scan. Earlier lines
+// restart from the beginning, so any order stays correct.
+struct LineCursor { row, at: usize }
+fn cursor_offset(text: []const u8, cursor: *LineCursor, target: Position) Offset {
+  if target.line < cursor.row {
+    cursor.row = 0
+    cursor.at = 0
+  }
+  for cursor.at < #len(text) && cursor.row < target.line {
+    if text[cursor.at] == 10 {
+      cursor.row += 1
+    }
+    cursor.at += 1
+  }
+  if cursor.row != target.line {
+    return Offset{}
+  }
+  at := cursor.at
+  units: usize = 0
+  for at < #len(text) && text[at] != 10 && text[at] != 13 && units < target.character {
+    rune := utf8.decode(text, at)
+    units += 1
+    if rune.codepoint > 65535 {
+      units += 1
+    }
+    at += rune.width
+  }
+  if units != target.character {
+    return Offset{}
+  }
+  return Offset{value: at, ok: true}
+}
+pub fn offset(text: []const u8, target: Position) Offset {
+  cursor := LineCursor{}
+  return cursor_offset(text, &cursor, target)
+}
+pub fn number(value: *const json.Value) Offset {
+  if !json.is_number(value) || #len(value.text) == 0 || #len(value.text) > 9 {
+    return Offset{}
+  }
+  n: usize = 0
+  for byte in value.text {
+    if byte < 48 || byte > 57 {
+      return Offset{}
+    }
+    n = n * 10 + #cast(usize) (byte - 48)
+  }
+  return Offset{value: n, ok: true}
+}
+pub fn json_offset(text: []const u8, value: *const json.Value) Offset {
+  line := number(json.object_get(value, "line"))
+  character := number(json.object_get(value, "character"))
+  if !line.ok || !character.ok {
+    return Offset{}
+  }
+  return offset(text, Position{line: line.value, character: character.value})
+}
+fn hex(byte: u8) u8 {
+  if byte < 10 {
+    return 48 + byte
+  }
+  return 65 + byte - 10
+}
+fn unhex(byte: u8) usize {
+  if byte >= 48 && byte <= 57 {
+    return #cast(usize) (byte - 48)
+  }
+  if byte >= 65 && byte <= 70 {
+    return #cast(usize) (byte - 55)
+  }
+  if byte >= 97 && byte <= 102 {
+    return #cast(usize) (byte - 87)
+  }
+  return 256
+}
+pub fn uri(path: []const u8, output: []u8) []const u8 {
+  if #len(path) == 0 || path[0] != 47 || #len(output) < 8 {
+    return ""
+  }
+  prefix := "file://"
+  at: usize = 0
+  for prefix_byte in prefix {
+    output[at] = prefix_byte
+    at += 1
+  }
+  for byte in path {
+    safe := (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 47 || byte == 45 || byte == 46 || byte == 95 || byte == 126
+    if at + 4 >= #len(output) {
+      return ""
+    }
+    if safe {
+      output[at] = byte
+      at += 1
+    } else {
+      output[at] = 37
+      output[at + 1] = hex(byte >> 4)
+      output[at + 2] = hex(byte & 15)
+      at += 3
+    }
+  }
+  output[at] = 0
+  return output[..at]
+}
+pub fn path(uri: []const u8, output: []u8) []const u8 {
+  if #len(uri) < 8 || !buffer.equal(uri[..7], "file://") || uri[7] != 47 {
+    return ""
+  }
+  at: usize = 7
+  used: usize = 0
+  for at < #len(uri) {
+    byte := uri[at]
+    at += 1
+    if byte == 37 {
+      if at + 2 > #len(uri) {
+        return ""
+      }
+      a := unhex(uri[at])
+      b := unhex(uri[at + 1])
+      if a > 15 || b > 15 {
+        return ""
+      }
+      byte = #cast(u8) (a * 16 + b)
+      at += 2
+    }
+    else if byte == 63 || byte == 35 {
+      return ""
+    }
+    if byte == 0 || byte == 10 || byte == 13 || used + 1 >= #len(output) {
+      return ""
+    }
+    output[used] = byte
+    used += 1
+  }
+  output[used] = 0
+  if !utf8.valid(output[..used]) {
+    return ""
+  }
+  return output[..used]
+}
+// Validate all UTF-16 ranges before producing any bytes. Stable sorting retains
+// server order for multiple insertions at one position; overlaps are rejected.
+struct PendingEdit { start, end: Position, text: []const u8 }
+fn position_before(a: Position, b: Position) bool {
+  return a.line < b.line || (a.line == b.line && a.character < b.character)
+}
+fn json_position(value: *const json.Value, output: *Position) bool {
+  line := number(json.object_get(value, "line"))
+  character := number(json.object_get(value, "character"))
+  output.line = line.value
+  output.character = character.value
+  return line.ok && character.ok
+}
+pub fn edits(source: []const u8, changes: *const json.Value, output: []u8) Offset {
+  if !json.is_array(changes) || json.array_length(changes) > 1024 {
+    return Offset{}
+  }
+  // Sort by position first (stable, so same-position inserts keep order),
+  // then resolve offsets in one forward pass instead of one scan per edit.
+  pending: [1024]PendingEdit = []
+  count: usize = 0
+  item := changes.first
+  for item != nil {
+    range := json.object_get(item, "range")
+    text := json.object_get(item, "newText")
+    next := PendingEdit{}
+    if !json_position(json.object_get(range, "start"), &next.start) || !json_position(json.object_get(range, "end"), &next.end) || !json.is_string(text) || !buffer.valid(text.text) {
+      return Offset{}
+    }
+    next.text = text.text
+    insertion := count
+    for insertion > 0 && position_before(next.start, pending[insertion - 1].start) {
+      pending[insertion] = pending[insertion - 1]
+      insertion -= 1
+    }
+    pending[insertion] = next
+    count += 1
+    item = item.next
+  }
+  plan: [1024]Edit = []
+  line := LineCursor{}
+  for index in 0..count {
+    low := cursor_offset(source, &line, pending[index].start)
+    high := cursor_offset(source, &line, pending[index].end)
+    if !low.ok || !high.ok || low.value > high.value {
+      return Offset{}
+    }
+    plan[index] = Edit{start: low.value, end: high.value, text: pending[index].text}
+  }
+  cursor: usize = 0
+  used: usize = 0
+  for index in 0..count {
+    edit := plan[index]
+    if edit.start < cursor {
+      return Offset{}
+    }
+    length := edit.start - cursor + #len(edit.text)
+    if used + length > buffer.Capacity || used + length >= #len(output) {
+      return Offset{}
+    }
+    for source_byte in source[cursor..edit.start] {
+      output[used] = source_byte
+      used += 1
+    }
+    for edit_byte in edit.text {
+      output[used] = edit_byte
+      used += 1
+    }
+    cursor = edit.end
+  }
+  if used + #len(source) - cursor > buffer.Capacity || used + #len(source) - cursor >= #len(output) {
+    return Offset{}
+  }
+  for byte in source[cursor..] {
+    output[used] = byte
+    used += 1
+  }
+  output[used] = 0
+  return Offset{value: used, ok: true}
+}

@@ -1,0 +1,338 @@
+use "std/crypto/sha2" sha2
+
+// Project configuration: dna.toml in the project directory or an ancestor,
+// applied over the global config. Keys that run programs or load files wait
+// for :trust; trust is a SHA-256 of the file, so any edit asks again.
+struct ProjectConfig {
+  path: [4096]u8,
+  path_length: usize,
+  stamp: [6]u64,
+  stamp_ready: bool,
+  trusted: bool,
+  // Project directory the file was looked up from; a change reloads.
+  root: [4096]u8,
+  root_length: usize,
+  // Report for :config-sources, owned copies of the layer's lists.
+  applied: [2048]u8,
+  applied_length: usize,
+  skipped: [1024]u8,
+  skipped_length: usize,
+  locks: [1024]u8,
+  locks_length: usize,
+  // [project."PATH"] sections of the global file that matched the project.
+  sections: usize,
+}
+
+fn project_config_find(app: *App) {
+  state := &app.project_config
+  state.path_length = 0
+  state.root_length = copy_text(state.root[..], app.workspace.project[..app.workspace.project_length])
+  directory := state.root_length
+  for directory > 0 {
+    candidate: [4096]u8 = []
+    length := copy_text(candidate[..], state.root[..directory])
+    if length > 0 && candidate[length - 1] != '/' {
+      add_text(candidate[..], &length, "/")
+    }
+    add_text(candidate[..], &length, "dna.toml")
+    if buffer.equal(candidate[..length], app.configuration.path[..app.configuration.path_length]) {
+      return
+    }
+    info := files.metadata(candidate[..length])
+    if info.ok && (info.mode & 61440) == 32768 {
+      state.path_length = copy_text(state.path[..], candidate[..length])
+      return
+    }
+    // Up one directory.
+    directory -= 1
+    for directory > 0 && state.root[directory - 1] != '/' {
+      directory -= 1
+    }
+    if directory > 0 {
+      directory -= 1
+    }
+    if directory == 0 && state.root[0] == '/' && length > 9 {
+      root_file := "/dna.toml"
+      root_info := files.metadata(root_file)
+      if root_info.ok && (root_info.mode & 61440) == 32768 {
+        state.path_length = copy_text(state.path[..], root_file)
+      }
+      return
+    }
+  }
+}
+fn trust_store_path(output: []u8) []const u8 {
+  storage: [4096]u8 = []
+  used: usize = 0
+  base := process.environment("XDG_STATE_HOME", storage[..])
+  if base.ok && base.found && #len(base.value) > 0 {
+    used = copy_text(output, base.value)
+  }
+  else {
+    home := process.environment("HOME", storage[..])
+    if !home.ok || !home.found {
+      return output[..0]
+    }
+    used = copy_text(output, home.value)
+    add_text(output, &used, "/.local/state")
+  }
+  add_text(output, &used, "/dna/trust")
+  return output[..used]
+}
+fn trust_digest(text: []const u8, output: []u8) []const u8 {
+  digest: [32]u8 = []
+  _ = sha2.sum256(digest[..], text)
+  digits: []const u8 = "0123456789abcdef"
+  for index in 0..32 {
+    output[index * 2] = digits[digest[index] >> 4]
+    output[index * 2 + 1] = digits[digest[index] & 15]
+  }
+  return output[..64]
+}
+// Trust lines are "<sha256> <path>"; the newest line for a path wins.
+fn trust_check(app: *App, path: []const u8, text: []const u8) bool {
+  store_storage: [4096]u8 = []
+  store := trust_store_path(store_storage[..])
+  if #len(store) == 0 {
+    return false
+  }
+  mark := mem.arena_mark(app.scratch)
+  defer mem.arena_rewind(app.scratch, mark)
+  read := fs.read_all(app.scratch, store, 262144)
+  if !read.ok {
+    return false
+  }
+  digest_storage: [64]u8 = []
+  digest := trust_digest(text, digest_storage[..])
+  trusted := false
+  at: usize = 0
+  for at < #len(read.data) {
+    end := at
+    for end < #len(read.data) && read.data[end] != 10 {
+      end += 1
+    }
+    line := read.data[at..end]
+    if #len(line) > 65 && line[64] == ' ' && buffer.equal(line[65..], path) {
+      trusted = buffer.equal(line[..64], digest)
+    }
+    at = end + 1
+  }
+  return trusted
+}
+// :trust records the current dna.toml and reloads the configuration.
+fn trust_project(app: *App, typography: *Typography) {
+  state := &app.project_config
+  if state.path_length == 0 {
+    notice(app, "No dna.toml in this project.")
+    return
+  }
+  path := state.path[..state.path_length]
+  read := files.read_text(path)
+  defer files.release_text(&read)
+  if !read.ok {
+    notice(app, "Cannot read dna.toml.")
+    return
+  }
+  store_storage: [4096]u8 = []
+  store := trust_store_path(store_storage[..])
+  if #len(store) == 0 {
+    notice(app, "No state directory for trust: set HOME or XDG_STATE_HOME.")
+    return
+  }
+  parent := #len(store)
+  for parent > 0 && store[parent - 1] != '/' {
+    parent -= 1
+  }
+  directories: [4096]u8 = []
+  _ = copy_text(directories[..], store[..parent - 1])
+  if config_directories(&directories[0]) == 0 {
+    notice(app, "Cannot create the trust store directory.")
+    return
+  }
+  line: [4200]u8 = []
+  used: usize = 0
+  digest_storage: [64]u8 = []
+  add_text(line[..], &used, trust_digest(read.data, digest_storage[..]))
+  add_text(line[..], &used, " ")
+  add_text(line[..], &used, path)
+  add_text(line[..], &used, "\n")
+  opened := fs.append(store)
+  if !opened.ok {
+    notice(app, "Cannot write the trust store.")
+    return
+  }
+  written := fs.write(&opened.file, line[..used])
+  _ = fs.close(&opened.file)
+  if !written.ok {
+    notice(app, "Cannot write the trust store.")
+    return
+  }
+  config_reload(app, typography, false)
+  notice(app, "Trusted this dna.toml; commands, servers and fonts from it now apply.")
+}
+// Apply dna.toml over parsed global settings. Returns false only when the
+// project file is invalid; the caller then keeps the global settings alone.
+fn project_config_apply(app: *App, parsed: *settings.Settings, global: *const settings.Layer) bool {
+  state := &app.project_config
+  state.applied_length = 0
+  state.skipped_length = 0
+  state.trusted = false
+  state.locks_length = 0
+  for index in 0..global.lock_count {
+    if state.locks_length > 0 {
+      add_text(state.locks[..], &state.locks_length, ", ")
+    }
+    add_text(state.locks[..], &state.locks_length, global.locks[index])
+  }
+  if state.path_length == 0 {
+    return true
+  }
+  path := state.path[..state.path_length]
+  read := fs.read_all(app.scratch, path, 16384)
+  if !read.ok {
+    notice(app, "Cannot read dna.toml (maximum 16 KiB); project settings ignored.")
+    return false
+  }
+  layer := settings.Layer{project: true, trusted: trust_check(app, path, read.data)}
+  layer.locks = global.locks
+  layer.lock_count = global.lock_count
+  state.trusted = layer.trusted
+  if !settings.parse_layer(read.data, parsed, &layer) {
+    message: [256]u8 = []
+    used: usize = 0
+    add_text(message[..], &used, "Invalid dna.toml at line ")
+    add_number(message[..], &used, parsed.error_line)
+    add_text(message[..], &used, "; project settings ignored.")
+    notice(app, message[..used])
+    return false
+  }
+  for index in 0..layer.applied_count {
+    if state.applied_length > 0 {
+      add_text(state.applied[..], &state.applied_length, ", ")
+    }
+    add_text(state.applied[..], &state.applied_length, layer.applied[index])
+  }
+  untrusted: usize = 0
+  for index in 0..layer.skipped_count {
+    if state.skipped_length > 0 {
+      add_text(state.skipped[..], &state.skipped_length, ", ")
+    }
+    add_text(state.skipped[..], &state.skipped_length, layer.skipped[index])
+    reason := layer.skip_reasons[index]
+    if reason == settings.SkipLocked {
+      add_text(state.skipped[..], &state.skipped_length, " (locked)")
+    }
+    else if reason == settings.SkipPersonal {
+      add_text(state.skipped[..], &state.skipped_length, " (personal)")
+    }
+    else {
+      add_text(state.skipped[..], &state.skipped_length, " (needs :trust)")
+      untrusted += 1
+    }
+  }
+  if untrusted > 0 {
+    notice(app, "dna.toml has commands, servers or fonts that wait for :trust. :config-sources lists them.")
+  }
+  return true
+}
+// [project."PATH"] sections of the global file whose PATH holds the project
+// directory apply over dna.toml, in file order. Personal keys are allowed:
+// the file is yours.
+fn project_sections_apply(app: *App, parsed: *settings.Settings, global: *const settings.Layer, source: []const u8) {
+  app.project_config.sections = 0
+  if #len(source) == 0 || app.workspace.project_length == 0 {
+    return
+  }
+  space := mem.arena_try_push(app.scratch, #len(source), 1)
+  trial := scratch_settings(app)
+  if !space.ok || trial == nil {
+    return
+  }
+  output := space.memory[..#len(source)]
+  home_storage: [4096]u8 = []
+  home := process.environment("HOME", home_storage[..])
+  home_text: []const u8 = ""
+  if home.ok && home.found {
+    home_text = home.value
+  }
+  project := app.workspace.project[..app.workspace.project_length]
+  at: usize = 0
+  for settings.project_section_next(source, project, home_text, &at, output) {
+    trial.* = parsed.*
+    layer := settings.Layer{project: true, trusted: true, session: true}
+    layer.locks = global.locks
+    layer.lock_count = global.lock_count
+    if !settings.parse_layer(output, trial, &layer) {
+      message: [256]u8 = []
+      used := copy_text(message[..], "Invalid [project] section in config at line ")
+      add_number(message[..], &used, trial.error_line)
+      add_text(message[..], &used, "; it was skipped.")
+      notice(app, message[..used])
+      continue
+    }
+    parsed.* = trial.*
+    app.project_config.sections += 1
+  }
+}
+// :config-sources: where the effective settings come from.
+fn config_sources(app: *App) {
+  state := &app.project_config
+  report: [8192]u8 = []
+  used: usize = 0
+  add_text(report[..], &used, "Global: ")
+  add_text(report[..], &used, app.configuration.path[..app.configuration.path_length])
+  add_text(report[..], &used, "\nLocked: ")
+  if state.locks_length == 0 {
+    add_text(report[..], &used, "nothing")
+  }
+  else {
+    add_text(report[..], &used, state.locks[..state.locks_length])
+  }
+  add_text(report[..], &used, "\nProject: ")
+  if state.path_length == 0 {
+    add_text(report[..], &used, "no dna.toml")
+  }
+  else {
+    add_text(report[..], &used, state.path[..state.path_length])
+    if state.trusted {
+      add_text(report[..], &used, " (trusted)")
+    }
+    else {
+      add_text(report[..], &used, " (not trusted)")
+    }
+    add_text(report[..], &used, "\nFrom the project: ")
+    if state.applied_length == 0 {
+      add_text(report[..], &used, "nothing")
+    }
+    else {
+      add_text(report[..], &used, state.applied[..state.applied_length])
+    }
+    add_text(report[..], &used, "\nIgnored: ")
+    if state.skipped_length == 0 {
+      add_text(report[..], &used, "nothing")
+    }
+    else {
+      add_text(report[..], &used, state.skipped[..state.skipped_length])
+    }
+  }
+  add_text(report[..], &used, "\n[project] sections matching: ")
+  add_number(report[..], &used, state.sections)
+  file_config_report(app, report[..], &used)
+  hover_notice(app, report[..used])
+}
+// Locks from the global file also bind in-editor changes such as :keymap.
+fn config_locked(app: *const App, name: []const u8) bool {
+  locks := app.project_config.locks[..app.project_config.locks_length]
+  at: usize = 0
+  for at < #len(locks) {
+    end := at
+    for end < #len(locks) && locks[end] != ',' {
+      end += 1
+    }
+    if buffer.equal(locks[at..end], name) {
+      return true
+    }
+    at = end + 2
+  }
+  return false
+}

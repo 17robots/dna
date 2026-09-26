@@ -1,0 +1,94 @@
+use "../../src/motion" motion
+fn main() {
+  value := motion.Tween{}
+  _ = motion.move(&value, 10.0, 0.0, 100.0, false)
+  if value.value != 10.0 || value.active {
+    #panic("first position snaps")
+  }
+  _ = motion.move(&value, 110.0, 0.0, 100.0, false)
+  motion.sample(&value, 50.0, 100.0)
+  if value.value <= 10.0 || value.value >= 110.0 || !value.active {
+    #panic("intermediate motion")
+  }
+  previous := value.value
+  _ = motion.move(&value, 0.0, 50.0, 100.0, false)
+  if value.value != previous {
+    #panic("retarget must be continuous")
+  }
+  motion.sample(&value, 75.0, 100.0)
+  if value.value >= previous || value.value <= 0.0 {
+    #panic("reversed motion")
+  }
+  motion.sample(&value, 150.0, 100.0)
+  if value.value != 0.0 || value.active {
+    #panic("animation settles exactly")
+  }
+  _ = motion.move(&value, 200.0, 151.0, 100.0, false)
+  _ = motion.move(&value, 200.0, 152.0, 100.0, true)
+  if value.value != 200.0 || value.active {
+    #panic("reduced motion interrupts")
+  }
+  _ = motion.move(&value, 300.0, 153.0, 100.0, false)
+  _ = motion.move(&value, 300.0, 1000.0, 100.0, false)
+  if value.value != 300.0 || value.active {
+    #panic("late frames settle")
+  }
+  spring_checks()
+}
+// Springs settle within their duration, never overshoot from rest, keep their
+// velocity when retargeted, and match regardless of frame timing.
+fn spring_checks() {
+  moving := motion.Tween{}
+  _ = motion.follow(&moving, 0.0, 0.0, 100.0, false)
+  _ = motion.follow(&moving, 100.0, 0.0, 100.0, false)
+  if !moving.active || moving.value <= 0.0 || moving.value >= 100.0 {
+    #panic("spring starts moving on its first frame")
+  }
+  time: f32 = 0.0
+  previous := moving.value
+  for time < 100.0 {
+    time += 4.0
+    value := motion.follow(&moving, 100.0, time, 100.0, false)
+    if value < previous || value > 100.0 {
+      #panic("spring from rest is monotonic without overshoot")
+    }
+    previous = value
+  }
+  time += 30.0
+  if motion.follow(&moving, 100.0, time, 100.0, false) != 100.0 || moving.active {
+    #panic("spring settles exactly")
+  }
+  // Retargeting mid-flight keeps position and velocity continuous.
+  glide := motion.Tween{}
+  _ = motion.follow(&glide, 0.0, 0.0, 100.0, false)
+  _ = motion.follow(&glide, 50.0, 0.0, 100.0, false)
+  _ = motion.follow(&glide, 50.0, 20.0, 100.0, false)
+  before := glide.value
+  speed := glide.velocity
+  _ = motion.follow(&glide, 100.0, 20.0, 100.0, false)
+  if glide.value != before || glide.velocity != speed || speed <= 0.0 {
+    #panic("retarget keeps value and velocity")
+  }
+  // Frame-rate independence: 2 ms and 10 ms steps reach the same place.
+  fine := motion.Tween{}
+  coarse := motion.Tween{}
+  _ = motion.follow(&fine, 0.0, 0.0, 100.0, false)
+  _ = motion.follow(&coarse, 0.0, 0.0, 100.0, false)
+  _ = motion.follow(&fine, 80.0, 0.0, 100.0, false)
+  _ = motion.follow(&coarse, 80.0, 0.0, 100.0, false)
+  step: f32 = 0.0
+  for step < 40.0 {
+    step += 2.0
+    _ = motion.follow(&fine, 80.0, step, 100.0, false)
+    if (#cast(i32) step) % 10 == 0 {
+      _ = motion.follow(&coarse, 80.0, step, 100.0, false)
+    }
+  }
+  difference := fine.value - coarse.value
+  if difference < 0.0 {
+    difference = -difference
+  }
+  if difference > 0.05 {
+    #panic("spring is frame-rate independent")
+  }
+}

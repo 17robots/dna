@@ -1,0 +1,253 @@
+use "./motion"
+
+struct AnimatedView { x, y, cursor_x, cursor_y: motion.Tween, trail: CursorTrail }
+// Neovide-style cursor: every corner follows its own spring. On a jump the
+// corners facing the motion get shorter durations than the trailing ones, so
+// the cursor stretches toward its target and the tail catches up.
+struct CursorTrail { corners: [8]motion.Tween, durations: [4]f32, target_x, target_y: f32 }
+struct Animation {
+  file: AnimatedView,
+  directory: AnimatedView,
+  popup: motion.Tween,
+  epoch: u64,
+  frame: u64,
+  view_revision: u64,
+  reset: bool,
+  active: bool,
+  document: *buffer.Document,
+  now: f32,
+  line: f32,
+  width: i32,
+  height: i32,
+  panel: Panel,
+  texture: rawptr,
+}
+
+fn animation_begin(app: *App, typography: *Typography, width: i32, height: i32) {
+  state := &app.view.animation
+  ticks := sdl.ticks()
+  if state.epoch == 0 {
+    state.epoch = ticks
+  }
+  // Relative milliseconds avoid losing precision with system uptime.
+  state.now = #cast(f32) (ticks - state.epoch)
+  state.frame = ticks
+  state.active = false
+  state.reset = app.view.reduced_motion || state.document != app.documents.current || state.view_revision != app.view.revision || state.line != typography.line || state.width != width || state.height != height
+  if state.width != width || state.height != height {
+    if state.texture != nil {
+      sdl.destroy_texture(state.texture)
+      state.texture = nil
+    }
+  }
+  state.document = app.documents.current
+  state.view_revision = app.view.revision
+  state.line = typography.line
+  state.width = width
+  state.height = height
+}
+fn animated_value(app: *App, tween: *motion.Tween, target: f32, duration: f32, reset: bool) f32 {
+  value := motion.move(tween, target, app.view.animation.now, duration, reset || app.view.reduced_motion || duration <= 0.0)
+  if tween.active {
+    app.view.animation.active = true
+  }
+  return value
+}
+// Spring motion for scrolling and cursors: continuous through retargets.
+fn animated_follow(app: *App, tween: *motion.Tween, target: f32, duration: f32, reset: bool) f32 {
+  value := motion.follow(tween, target, app.view.animation.now, duration, reset || app.view.reduced_motion || duration <= 0.0)
+  if tween.active {
+    app.view.animation.active = true
+  }
+  return value
+}
+fn distance(a: f32, b: f32) f32 {
+  if a > b {
+    return a - b
+  }
+  return b - a
+}
+// Small cursor steps (key repeat, typing, Enter, one line) snap so the cursor
+// never trails the key; larger jumps glide. Measured on a real display: with
+// a 33 ms key repeat a 50 ms glide always lags one step behind.
+fn cursor_step_snaps(x: *const motion.Tween, y: *const motion.Tween, target_x: f32, target_y: f32, cell: f32, line: f32) bool {
+  if !x.ready || !y.ready {
+    return true
+  }
+  rows := distance(target_y, y.target)
+  if rows > line * 1.5 {
+    return false
+  }
+  return rows > line * 0.5 || distance(target_x, x.target) <= cell * 3.0
+}
+fn corner_x(index: usize, width: f32) f32 {
+  if index == 1 || index == 2 {
+    return width
+  }
+  return 0.0
+}
+fn corner_y(index: usize, height: f32) f32 {
+  if index >= 2 {
+    return height
+  }
+  return 0.0
+}
+// Draws the stretched cursor while a jump is in flight and returns true;
+// returns false when the caller should draw the plain rectangle.
+fn draw_cursor_trail(renderer: rawptr, app: *App, trail: *CursorTrail, target: sdl.Rect, snap: bool, color: Rgb) bool {
+  size := app.config.cursor_trail_size
+  duration := app.config.cursor_animation_ms
+  if snap || size <= 0.0 || duration <= 0.0 || app.view.reduced_motion || !trail.corners[0].ready {
+    for index in 0..4 {
+      motion.snap(&trail.corners[index * 2], target.x + corner_x(index, target.width))
+      motion.snap(&trail.corners[index * 2 + 1], target.y + corner_y(index, target.height))
+    }
+    trail.target_x = target.x
+    trail.target_y = target.y
+    return false
+  }
+  if target.x != trail.target_x || target.y != trail.target_y {
+    // Rank corners along the travel direction: the front gets the shortest
+    // duration, the back keeps the full one.
+    center_x: f32 = 0.0
+    center_y: f32 = 0.0
+    for index in 0..4 {
+      center_x += trail.corners[index * 2].value * 0.25
+      center_y += trail.corners[index * 2 + 1].value * 0.25
+    }
+    direction_x := target.x + target.width * 0.5 - center_x
+    direction_y := target.y + target.height * 0.5 - center_y
+    lowest: f32 = 0.0
+    highest: f32 = 0.0
+    for index in 0..4 {
+      reach := (corner_x(index, target.width) - target.width * 0.5) * direction_x + (corner_y(index, target.height) - target.height * 0.5) * direction_y
+      trail.durations[index] = reach
+      if index == 0 || reach < lowest {
+        lowest = reach
+      }
+      if index == 0 || reach > highest {
+        highest = reach
+      }
+    }
+    for index in 0..4 {
+      lead: f32 = 0.0
+      if highest - lowest > 0.001 {
+        lead = (trail.durations[index] - lowest) / (highest - lowest)
+      }
+      trail.durations[index] = duration * (1.0 - size * lead)
+    }
+    trail.target_x = target.x
+    trail.target_y = target.y
+  }
+  moving := false
+  vertices: [4]sdl.Vertex = [sdl.Vertex{}, sdl.Vertex{}, sdl.Vertex{}, sdl.Vertex{}]
+  for index in 0..4 {
+    x := animated_follow(app, &trail.corners[index * 2], target.x + corner_x(index, target.width), trail.durations[index], false)
+    y := animated_follow(app, &trail.corners[index * 2 + 1], target.y + corner_y(index, target.height), trail.durations[index], false)
+    moving = moving || trail.corners[index * 2].active || trail.corners[index * 2 + 1].active
+    vertices[index] = sdl.Vertex{x: x, y: y, red: #cast(f32) color.red / 255.0, green: #cast(f32) color.green / 255.0, blue: #cast(f32) color.blue / 255.0, alpha: 1.0}
+  }
+  if !moving {
+    return false
+  }
+  // Both diagonals' triangles cover the corners' convex hull, so a stretched
+  // quad that folds over itself still draws as one solid smear.
+  indices: [12]i32 = [0, 1, 2, 0, 2, 3, 0, 1, 3, 1, 2, 3]
+  if !sdl.geometry(renderer, nil, &vertices[0], 4, &indices[0], 12) {
+    #panic("cursor trail draw failed")
+  }
+  return true
+}
+fn animated_scroll(app: *App, view: *AnimatedView, x: f32, y: f32, height: f32, reset: bool) {
+  reset = reset || !app.config.smooth_scroll
+  // Long jumps land near their destination, avoiding a tour through the file.
+  if view.y.ready && (y - view.y.value > height || view.y.value - y > height) {
+    offset := height * 0.15
+    if y < view.y.value {
+      offset = -offset
+    }
+    motion.snap(&view.y, y - offset)
+    motion.snap(&view.cursor_y, 0.0)
+    view.cursor_y.ready = false
+  }
+  // One or two lines of scroll (the cursor pushing an edge) snap; pages glide.
+  line := app.view.animation.line
+  near_y := view.y.ready && distance(y, view.y.target) <= line * 2.0
+  near_x := view.x.ready && distance(x, view.x.target) <= line * 2.0
+  _ = animated_follow(app, &view.x, x, app.config.scroll_animation_ms, reset || near_x)
+  _ = animated_follow(app, &view.y, y, app.config.scroll_animation_ms, reset || near_y)
+}
+fn measure_position(doc: *const buffer.Document, typography: *Typography, position: usize) ttf.Substring {
+  beginning := buffer.line_start(doc, position)
+  ending := buffer.line_end(doc, position)
+  // SDL_ttf interprets length 0 as strlen; use a real empty string for blank lines.
+  empty: [1]u8 = [0]
+  bytes := &doc.bytes[beginning]
+  if beginning == ending {
+    bytes = &empty[0]
+  }
+  if typography.caret_document != doc || typography.caret_revision != doc.revision || typography.caret_start != beginning || typography.caret_end != ending {
+    if !ttf.set(typography.caret_text, bytes, ending - beginning) {
+      #panic("caret line update")
+    }
+    typography.caret_document = doc
+    typography.caret_revision = doc.revision
+    typography.caret_start = beginning
+    typography.caret_end = ending
+  }
+  caret := ttf.Substring{}
+  if !ttf.substring(typography.caret_text, #cast(i32) (position - beginning), &caret) {
+    #panic("caret geometry")
+  }
+  return caret
+}
+fn popup_begin(renderer: rawptr, app: *App) {
+  state := &app.view.animation
+  if state.texture == nil {
+    state.texture = sdl.create_texture(renderer, 0x16462004, 2, state.width, state.height)
+    if state.texture == nil || !sdl.texture_blend(state.texture, 1) {
+      #panic("popup surface")
+    }
+  }
+  if !sdl.target(renderer, state.texture) || !sdl.color(renderer, 0, 0, 0, 0) || !sdl.clear(renderer) {
+    #panic("popup target")
+  }
+}
+// Whether a popup layer is up. A focused docked tree is part of the layout,
+// not a popup over it.
+fn popup_shown(app: *const App) bool {
+  return app.prompt_state.panel != Panel.None && !(app.prompt_state.panel == Panel.Tree && tree_docked(app))
+}
+fn popup_present(renderer: rawptr, app: *App) {
+  state := &app.view.animation
+  showing := popup_shown(app)
+  if !state.popup.ready {
+    motion.snap(&state.popup, 0.0)
+  }
+  if showing && state.panel == Panel.None && state.popup.value == 0.0 {
+    motion.snap(&state.popup, 0.2)
+  }
+  target: f32 = 0.0
+  if showing {
+    target = 1.0
+  }
+  opacity := animated_value(app, &state.popup, target, app.config.popup_animation_ms, app.view.reduced_motion || !app.config.popup_transitions)
+  state.panel = app.prompt_state.panel
+  if state.texture != nil {
+    if !sdl.target(renderer, nil) {
+      #panic("popup target reset")
+    }
+    if opacity > 0.0 {
+      if !sdl.texture_alpha(state.texture, #cast(u8) (opacity * 255.0)) || !sdl.render_texture(renderer, state.texture, nil, nil) {
+        #panic("popup composite")
+      }
+    }
+  }
+}
+
+fn release_popup(app: *App) {
+  ui_cursors_release(&app.ui)
+  if app.view.animation.texture != nil {
+    sdl.destroy_texture(app.view.animation.texture)
+  }
+}

@@ -1,0 +1,109 @@
+struct RegisterState {
+  clipboard: Clipboard,
+  named: [26]Clipboard,
+  selected: usize,
+  pending: bool,
+}
+
+// One continuous band per selected logical row, aligned to line spacing rather
+// than glyph ink bounds. Newlines inside larger selections extend to the viewport
+// edge; a lone selected newline occupies one cell, like the normal-mode cursor.
+fn draw_selection(renderer: rawptr, doc: *const buffer.Document, text: *const LineLayout, viewport: TextViewport, typography: *Typography, x: f32, y: f32, scroll_x: f32, scroll_y: f32, right: f32) {
+  draw_selection_range(renderer, doc, text, viewport, typography, x, y, scroll_x, scroll_y, right, buffer.start(doc), buffer.end(doc))
+  for index in 0..doc.secondary.count {
+    selection := doc.secondary.ranges[index]
+    low := selection.anchor
+    high := selection.cursor
+    if low > high {
+      swap := low
+      low = high
+      high = swap
+    }
+    draw_selection_range(renderer, doc, text, viewport, typography, x, y, scroll_x, scroll_y, right, low, high)
+  }
+}
+fn draw_selection_range(renderer: rawptr, doc: *const buffer.Document, text: *const LineLayout, viewport: TextViewport, typography: *Typography, x, y, scroll_x, scroll_y, right: f32, low: usize, high: usize) {
+  if low == high {
+    return
+  }
+  at := viewport.start
+  row: usize = 0
+  for at < viewport.end && at < high {
+    ending := buffer.line_end(doc, at)
+    after := ending
+    if after < doc.length {
+      after += 1
+    }
+    if low < after && high > at {
+      beginning := at
+      if low > beginning {
+        beginning = low
+      }
+      finish := ending
+      if high < finish {
+        finish = high
+      }
+      first := ttf.Substring{}
+      last := ttf.Substring{}
+      if !layout_substring(text, doc, beginning, &first) {
+        break
+      }
+      left := x - scroll_x
+      if beginning > at {
+        left += #cast(f32) first.x
+      }
+      edge := right
+      if high <= ending {
+        if !layout_substring(text, doc, finish, &last) {
+          break
+        }
+        edge = x + #cast(f32)
+        last.x - scroll_x
+      }
+      if high == low + 1 && doc.bytes[low] == 10 {
+        edge = left + typography.cell
+      }
+      if edge < left {
+        swap := edge
+        edge = left
+        left = swap
+      }
+      band := sdl.Rect{x: left, y: y + viewport.y + #cast(f32) row * typography.line - scroll_y, width: edge - left, height: typography.line}
+      if band.width > 0.0 && (!paint(renderer, theme().selection) || !sdl.fill(renderer, &band)) {
+        #panic("selection band")
+      }
+    }
+    if after <= at {
+      break
+    }
+    at = after
+    row += 1
+  }
+}
+
+fn draw_extra_cursors(renderer: rawptr, doc: *const buffer.Document, text: *const LineLayout, viewport: TextViewport, typography: *Typography, origin, top, scroll_x, scroll_y: f32, insert: bool) {
+  for index in 0..doc.secondary.count {
+    selection := doc.secondary.ranges[index]
+    position := selection.cursor
+    if !insert && position > selection.anchor {
+      position = buffer.previous(doc, position)
+    }
+    if position >= viewport.start && position <= viewport.end {
+      substring := ttf.Substring{}
+      if layout_substring(text, doc, position, &substring) {
+        width := typography.cell
+        if insert {
+          width = 2.0 * typography.scale
+        }
+        left := #cast(f32) substring.x
+        if buffer.line_start(doc, position) == position {
+          left = 0.0
+        }
+        rect := sdl.Rect{x: origin + left - scroll_x, y: top + #cast(f32) (line_at(doc, position) - 1) * typography.line - scroll_y, width: width, height: typography.points * typography.scale + 5.0 * typography.scale}
+        if !paint(renderer, theme().cursor) || !sdl.fill(renderer, &rect) {
+          #panic("secondary cursor")
+        }
+      }
+    }
+  }
+}

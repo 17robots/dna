@@ -1,0 +1,111 @@
+struct SelectionRect { x, y, w, h: f32 }
+selected: bool = false
+selection_color: bool = false
+cursor_color: bool = false
+line_only: bool = false
+multiple: bool = false
+newline_only: bool = false
+blank_only: bool = false
+end_only: bool = false
+cursors: u32 = 0
+bands: u32 = 0
+previous: SelectionRect = SelectionRect{}
+fn selection_push(event: rawptr) {
+  probe_check(probe_push(event), "selection event push")
+}
+fn selection_mod(event: rawptr, modifiers: u16) {
+  (#cast(*u16) (#cast(usize) event + 32)).* = modifiers
+}
+pub fn SDL_WaitEventTimeout(event: rawptr, milliseconds: i32) bool {
+  if !selected {
+    input := ProbeEvent{}
+    pointer := #cast(rawptr) &input
+    probe_kind(pointer).* = 768
+    end_only = probe_env("DNA_EOL_SELECT\0") != nil
+    newline_only = probe_env("DNA_NEWLINE_SELECT\0") != nil
+    blank_only = probe_env("DNA_BLANK_SELECT\0") != nil
+    line_only = probe_env("DNA_LINE_SELECT\0") != nil
+    multiple = probe_env("DNA_MULTI_SELECT\0") != nil
+    probe_u32(pointer, 28).* = 97
+    selection_mod(pointer, 192)
+    if line_only || multiple {
+      probe_u32(pointer, 28).* = 120
+      selection_mod(pointer, 0)
+    }
+    probe_byte(pointer, 36).* = 1
+    if newline_only || blank_only || end_only {
+      probe_u32(pointer, 28).* = 1073741901
+      selection_mod(pointer, 0)
+    }
+    selection_push(pointer)
+    if newline_only || blank_only {
+      probe_u32(pointer, 28).* = 1073741901
+      selection_mod(pointer, 0)
+      selection_push(pointer)
+      probe_u32(pointer, 28).* = 1073741903
+      selection_push(pointer)
+      if blank_only {
+        selection_push(pointer)
+      }
+    }
+    if multiple {
+      probe_u32(pointer, 28).* = 99
+      selection_mod(pointer, 3)
+      selection_push(pointer)
+      selection_push(pointer)
+    }
+    selected = true
+  }
+  next := #cast(*fn(rawptr, i32) bool) probe_next("SDL_WaitEventTimeout\0")
+  return next(event, milliseconds)
+}
+pub fn SDL_SetRenderDrawColor(renderer: rawptr, r: u8, g: u8, b: u8, a: u8) bool {
+  cursor_color = r == 139 && g == 163 && b == 190
+  selection_color = r == 53 && g == 65 && b == 80
+  next := #cast(*fn(rawptr, u8, u8, u8, u8) bool) probe_next("SDL_SetRenderDrawColor\0")
+  return next(renderer, r, g, b, a)
+}
+pub fn SDL_RenderFillRect(renderer: rawptr, rectangle: *const SelectionRect) bool {
+  if selected && (newline_only || blank_only || end_only) && cursor_color && rectangle != nil {
+    probe_check(bands == 1 && previous.w <= rectangle.w + 1.0 && previous.x == rectangle.x && previous.y == rectangle.y, "newline selection must align with cursor")
+    cursors += 1
+  }
+  if selected && multiple && cursor_color && rectangle != nil {
+    cursors += 1
+  }
+  if selected && line_only && cursor_color && rectangle != nil {
+    probe_check(bands != 0 && rectangle.y == previous.y, "x draws cursor on next line")
+    cursors += 1
+  }
+  if selected && selection_color && rectangle != nil {
+    if !multiple && bands != 0 {
+      probe_check(rectangle.y == previous.y + previous.h, "fragmented selection bands")
+    }
+    if !multiple && bands == 1 {
+      probe_check(rectangle.x == previous.x && rectangle.w == previous.w, "blank line band width")
+    }
+    previous = rectangle.*
+    bands += 1
+  }
+  next := #cast(*fn(rawptr, *const SelectionRect) bool) probe_next("SDL_RenderFillRect\0")
+  return next(renderer, rectangle)
+}
+pub fn SDL_RenderPresent(renderer: rawptr) bool {
+  next := #cast(*fn(rawptr) bool) probe_next("SDL_RenderPresent\0")
+  ok := next(renderer)
+  if selected && (newline_only || blank_only || end_only) {
+    probe_check(bands == 1 && cursors == 1, "single-cell selection")
+    probe_log("PASS single newline uses one selected cell\n")
+    probe_exit(0)
+  }
+  if selected {
+    expected: u32 = 3
+    if line_only {
+      expected = 1
+    }
+    probe_check(bands == expected && (!line_only || cursors == 1) && (!multiple || cursors == 3), "selection bands/cursors")
+    probe_log("PASS continuous selection bands and cursor positions\n")
+    probe_exit(0)
+  }
+  return ok
+}

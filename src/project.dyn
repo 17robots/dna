@@ -1,0 +1,51 @@
+#link("c")
+
+struct Workspace {
+  language_root: [4096]u8,
+  project: [4096]u8,
+  previous_project: [4096]u8,
+  project_length: usize,
+  previous_project_length: usize,
+  language_root_length: usize,
+}
+
+extern fn project_chdir "chdir"(path: *const u8) i32
+
+fn project_cd(app: *App, requested: []const u8) {
+  if explorer_dirty(app) {
+    notice(app, "Apply or discard staged explorer edits before changing project directory.")
+    return
+  }
+  storage: [4096]u8 = []
+  path := expand_home(requested, storage[..])
+  if buffer.equal(requested, "-") {
+    path = app.workspace.previous_project[..app.workspace.previous_project_length]
+  }
+  if #len(requested) == 0 {
+    path = expand_home("~", storage[..])
+  }
+  if #len(path) == 0 {
+    notice(app, "No previous directory or invalid path.")
+    return
+  }
+  absolute: [4096]u8 = []
+  length := files.directory_path(path, absolute[..])
+  if length == 0 {
+    notice(app, "Directory does not exist or is inaccessible.")
+    return
+  }
+  info := files.metadata(absolute[..length])
+  if !info.ok || (info.mode & 61440) != 16384 || project_chdir(&absolute[0]) != 0 {
+    notice(app, "Cannot change to that directory.")
+    return
+  }
+  app.workspace.previous_project_length = copy_text(app.workspace.previous_project[..], app.workspace.project[..app.workspace.project_length])
+  app.workspace.project_length = copy_text(app.workspace.project[..], absolute[..length])
+  app.directory_state.length = copy_text(app.directory_state.path[..], absolute[..length])
+  app.explorer.stale = true
+  app.picker_state.epoch += 1
+  if app.picker_state.index != nil {
+    app.picker_state.index.root_length = 0
+  }
+  app.prompt_state.panel = Panel.None
+}

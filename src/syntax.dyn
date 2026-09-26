@@ -1,0 +1,564 @@
+extern fn syntax_open_named "dna_syntax_open_named"(root: *const u8, name: *const u8) rawptr
+extern fn syntax_name "dna_syntax_name"(syntax: rawptr) *const u8
+extern fn syntax_open "dna_syntax_open"(root: *const u8, filename: *const u8) rawptr
+extern fn syntax_update "dna_syntax_update"(syntax: rawptr, text: *const u8, length: u32, revision: u64)
+extern fn syntax_colors "dna_syntax_colors"(syntax: rawptr, output: *u8, length: u32, revision: u64) i32
+extern fn syntax_close "dna_syntax_close"(syntax: rawptr)
+extern fn syntax_retire "dna_syntax_retire"(syntax: rawptr) i32
+extern fn syntax_collect "dna_syntax_collect"(wait: i32)
+extern fn language_helper "dna_language_helper"(output: *u8, capacity: usize) i32
+extern fn syntax_object "dna_syntax_object"(syntax: rawptr, revision: u64, low: u32, high: u32, kind: u32, count: u32, start: *u32, end: *u32) i32
+extern fn syntax_indent "dna_syntax_indent"(syntax: rawptr) u32
+extern fn syntax_select "dna_syntax_select"(syntax: rawptr, revision: u64, low: u32, high: u32, mode: u32, start: *u32, end: *u32) i32
+
+fn language_root(app: *App) {
+  storage: [4096]u8 = []
+  configured := process.environment("DNA_LANGUAGE_DIR", storage[..])
+  if configured.ok && configured.found {
+    app.workspace.language_root_length = copy_text(app.workspace.language_root[..], configured.value)
+    return
+  }
+
+  base := process.environment("XDG_DATA_HOME", storage[..])
+  if base.ok && base.found {
+    app.workspace.language_root_length = copy_text(app.workspace.language_root[..], base.value)
+  } else {
+    home := process.environment("HOME", storage[..])
+    if !home.ok || !home.found {
+      return
+    }
+    app.workspace.language_root_length = copy_text(app.workspace.language_root[..], home.value)
+    add_text(app.workspace.language_root[..], &app.workspace.language_root_length, "/.local/share")
+  }
+  add_text(app.workspace.language_root[..], &app.workspace.language_root_length, "/dna/languages")
+}
+fn slot_syntax_release(slot: *Slot) {
+  if slot.syntax != nil {
+    syntax_close(slot.syntax)
+    slot.syntax = nil
+  }
+  slot.syntax_checked = false
+  slot.syntax_revision = 0
+  slot.syntax_used = 0
+}
+fn syntax_release(app: *App) {
+  for index in 0..16 {
+    slot_syntax_release(&app.documents.slots[index])
+  }
+  preview_syntax_release(app)
+  syntax_collect(1)
+}
+// Inactive syntax state is disposable; text, selections and undo remain owned
+// by the document. Target two inactive parsers; defer further eviction while
+// the single background disposal slot is busy.
+fn syntax_trim(app: *App) {
+  for true {
+    count: usize = 0
+    oldest: usize = 16
+    for index in 0..16 {
+      slot := &app.documents.slots[index]
+      if slot.syntax != nil && !slot_visible(app, index) {
+        count += 1
+        if oldest == 16 || slot.syntax_used < app.documents.slots[oldest].syntax_used {
+          oldest = index
+        }
+      }
+    }
+    if count <= 2 {
+      return
+    }
+    evicted := &app.documents.slots[oldest]
+    if syntax_retire(evicted.syntax) == 0 {
+      return
+    }
+    evicted.syntax = nil
+    evicted.syntax_checked = false
+    evicted.syntax_revision = 0
+    evicted.syntax_used = 0
+  }
+}
+fn syntax_tick(app: *App) bool {
+  syntax_collect(0)
+  if !app.config.syntax_enabled {
+    return false
+  }
+  syntax_trim(app)
+  changed: bool = false
+  index: usize = 0
+  for index < 16 {
+    visible := index == app.documents.active
+    for pane_index in 0..15 {
+      pane := &app.view.panes[pane_index]
+      if pane.used && !pane.branch && pane.slot == index {
+        visible = true
+      }
+    }
+    if !visible {
+      index += 1
+      continue
+    }
+    slot := &app.documents.slots[index]
+    if slot.document != nil && slot.terminal.handle == nil && (slot.file.length > 0 || slot.filetype_length > 0) {
+      if !slot.syntax_checked {
+        if slot.filetype_length == 0 {
+          slot.syntax = syntax_open(&app.workspace.language_root[0], &slot.file.path[0])
+        } else if !buffer.equal(slot.filetype[..slot.filetype_length], "text") {
+          slot.syntax = syntax_open_named(&app.workspace.language_root[0], &slot.filetype[0])
+        }
+        slot.syntax_checked = true
+      }
+      // Large files stay plain text, like other editors' large-file modes.
+      if slot.syntax != nil && slot.document.length < buffer.LargeFile {
+        slot.syntax_used = sdl.ticks()
+        doc := slot.document
+        syntax_update(slot.syntax, &doc.bytes[0], #cast(u32) doc.length, doc.revision)
+        if slot.syntax_revision != doc.revision && syntax_colors(slot.syntax, &slot.colors[0], #cast(u32) doc.length, doc.revision) != 0 {
+          slot.syntax_revision = doc.revision
+          changed = true
+        }
+      }
+    }
+    index += 1
+  }
+  if preview_syntax_tick(app) {
+    changed = true
+  }
+  return changed
+}
+fn syntax_waiting(app: *App) bool {
+  if preview_syntax_waiting(app) {
+    return true
+  }
+  for index in 0..16 {
+    slot := &app.documents.slots[index]
+    if slot.document != nil && slot.syntax != nil && slot.syntax_revision != slot.document.revision && slot.document.length < buffer.LargeFile {
+      return true
+    }
+  }
+  return false
+}
+fn syntax_color(style: u8) Rgb {
+  colors := theme()
+  if style == 1 {
+    return colors.syntax_comment
+  }
+  if style == 2 {
+    return colors.syntax_string
+  }
+  if style == 3 {
+    return colors.syntax_keyword
+  }
+  if style == 4 {
+    return colors.syntax_function
+  }
+  if style == 5 {
+    return colors.syntax_type
+  }
+  return colors.syntax_constant
+}
+fn draw_syntax(renderer: rawptr, app: *App, typography: *Typography, viewport: TextViewport, x: f32, y: f32, clipping: sdl.PixelRect) {
+  if !app.config.syntax_enabled {
+    return
+  }
+  slot := &app.documents.slots[app.documents.active]
+  doc := app.documents.current
+  if slot.syntax == nil || slot.syntax_revision != doc.revision {
+    return
+  }
+  at := viewport.start
+  span_index: usize = 0
+  for at < viewport.end {
+    // Tabs/newlines have no colored ink. Split at them so tab stops retain the
+    // positions from the original document layout, rather than a span's origin.
+    if doc.bytes[at] == 9 || doc.bytes[at] == 10 {
+      at += 1
+      continue
+    }
+    style := slot.colors[at]
+    end := at + 1
+    for end < viewport.end && slot.colors[end] == style && doc.bytes[end] != 9 && doc.bytes[end] != 10 {
+      end += 1
+    }
+    if style != 0 {
+      first := ttf.Substring{}
+      last := ttf.Substring{}
+      cached: *SpanText = nil
+      if span_index < 128 {
+        cached = &typography.pane_text[typography.current_pane].spans[span_index]
+        if cached.identity != slot.identity || cached.revision != doc.revision || cached.start != at || cached.end != end {
+          cached.identity = slot.identity
+          cached.revision = doc.revision
+          cached.start = at
+          cached.end = end
+          cached.geometry_ready = false
+          cached.text_ready = false
+        }
+        if cached.viewport_start != viewport.start || cached.viewport_end != viewport.end {
+          cached.viewport_start = viewport.start
+          cached.viewport_end = viewport.end
+          cached.geometry_ready = false
+        }
+      }
+      span_index += 1
+      geometry_ready: bool = false
+      if cached != nil && cached.geometry_ready {
+        first = cached.first
+        last = cached.last
+        geometry_ready = true
+      }
+      else {
+        geometry_ready = layout_substring(typography.layout, doc, at, &first) && layout_substring(typography.layout, doc, buffer.previous(doc, end), &last)
+        if cached != nil && geometry_ready {
+          cached.first = first
+          cached.last = last
+          cached.geometry_ready = true
+        }
+      }
+      if geometry_ready {
+        left := #cast(i32) x + first.x
+        top := #cast(i32) y + first.y
+        right := #cast(i32) x + last.x + last.width
+        bottom := top + #cast(i32) typography.line
+        if left < clipping.x {
+          left = clipping.x
+        }
+        if top < clipping.y {
+          top = clipping.y
+        }
+        if right > clipping.x + clipping.width {
+          right = clipping.x + clipping.width
+        }
+        if bottom > clipping.y + clipping.height {
+          bottom = clipping.y + clipping.height
+        }
+        clip := sdl.PixelRect{ x: left, y: top, width: right - left, height: bottom - top }
+        if clip.width > 0 && clip.height > 0 {
+          span_start := ttf.Substring{}
+          span_text := typography.syntax_text
+          if cached != nil {
+            if cached.text == nil {
+              blank: [1]u8 = [0]
+              cached.text = ttf.create(typography.engine, typography.font, &blank[0], 0)
+              if cached.text == nil || !ttf.whitespace_visible(cached.text, true) || !ttf.wrap(cached.text, 0) {
+                #panic("syntax cache allocation")
+              }
+            }
+            span_text = cached.text
+            if !cached.text_ready {
+              if !ttf.set(span_text, &doc.bytes[at], end - at) || !ttf.substring(span_text, 0, &cached.origin) {
+                #panic("syntax span update")
+              }
+              cached.text_ready = true
+            }
+            span_start = cached.origin
+          } else {
+            if !ttf.set(span_text, &doc.bytes[at], end - at) || !ttf.substring(span_text, 0, &span_start) {
+              #panic("syntax overflow span")
+            }
+          }
+          // Cached geometry is local to the text. Scroll/clip and theme remain live.
+          ttf.italic(span_text, syntax_italic(style))
+          if !sdl.clip(renderer, &clip) || !tint(span_text, syntax_color(style)) || !ttf.draw(span_text, x + #cast(f32) (first.x - span_start.x), y + #cast(f32) (first.y - span_start.y)) {
+            #panic("syntax span draw")
+          }
+        }
+      }
+    }
+    at = end
+  }
+  _ = sdl.clip(renderer, &clipping)
+}
+fn shell_quote(output: []u8, used: *usize, text: []const u8) {
+  add_text(output, used, "'")
+  for byte in text {
+    if byte == 39 {
+      add_text(output, used, "'\\''")
+    } else {
+      single: [1]u8 = [byte]
+      add_text(output, used, single[..])
+    }
+  }
+  add_text(output, used, "'")
+}
+fn language_install(app: *App, name: []const u8) {
+  script: [4096]u8 = []
+  if language_helper(&script[0], 4096) == 0 {
+    notice(app, "Cannot locate language installer.")
+    return
+  }
+  command: [4096]u8 = []
+  used: usize = 0
+  shell_quote(command[..], &used, script[..c.string_length(&script[0], 4096)])
+  if #len(name) == 0 {
+    add_text(command[..], &used, " list")
+  } else {
+    for byte in name {
+      if !((byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 95) {
+        notice(app, "Language name must use lowercase letters, digits, and underscores.")
+        return
+      }
+    }
+    add_text(command[..], &used, " install ")
+    shell_quote(command[..], &used, name)
+  }
+  terminal_show(app, true, command[..used])
+}
+fn indent_width(app: *App) usize {
+  config := active_file_config(app)
+  if config.indent_explicit {
+    return config.indent_width
+  }
+  if app.documents.slots[app.documents.active].syntax != nil {
+    return #cast(usize) syntax_indent(app.documents.slots[app.documents.active].syntax)
+  }
+  return config.indent_width
+}
+fn syntax_reset(slot: *Slot) {
+  if slot.syntax != nil {
+    syntax_close(slot.syntax)
+    slot.syntax = nil
+  }
+  slot.syntax_checked = false
+  slot.syntax_revision = 0
+}
+fn filetype_name(slot: *Slot) []const u8 {
+  if slot.filetype_length > 0 {
+    return slot.filetype[..slot.filetype_length]
+  }
+  if slot.syntax != nil {
+    name := syntax_name(slot.syntax)
+    return name[..c.string_length(name, 65)]
+  }
+  return filetype_path(files.name(&slot.file))
+}
+fn filetype_path(path: []const u8) []const u8 {
+  if explorer_suffix(path, ".dyn") {
+    return "dyn"
+  }
+  if explorer_suffix(path, ".py") || explorer_suffix(path, ".pyi") {
+    return "python"
+  }
+  if explorer_suffix(path, ".ts") || explorer_suffix(path, ".mts") || explorer_suffix(path, ".cts") {
+    return "typescript"
+  }
+  if explorer_suffix(path, ".tsx") {
+    return "tsx"
+  }
+  if explorer_suffix(path, ".js") || explorer_suffix(path, ".jsx") || explorer_suffix(path, ".mjs") || explorer_suffix(path, ".cjs") {
+    return "javascript"
+  }
+  if explorer_suffix(path, ".json") || explorer_suffix(path, ".jsonc") {
+    return "json"
+  }
+  if explorer_suffix(path, ".yml") || explorer_suffix(path, ".yaml") {
+    return "yaml"
+  }
+  if explorer_suffix(path, ".html") || explorer_suffix(path, ".htm") {
+    return "html"
+  }
+  if explorer_suffix(path, ".css") {
+    return "css"
+  }
+  if explorer_suffix(path, ".sh") || explorer_suffix(path, ".bash") {
+    return "bash"
+  }
+  if explorer_suffix(path, ".rs") {
+    return "rust"
+  }
+  if explorer_suffix(path, ".go") {
+    return "go"
+  }
+  if explorer_suffix(path, ".c") || explorer_suffix(path, ".h") {
+    return "c"
+  }
+  if explorer_suffix(path, ".cpp") || explorer_suffix(path, ".hpp") || explorer_suffix(path, ".cc") {
+    return "cpp"
+  }
+  if explorer_suffix(path, ".toml") {
+    return "toml"
+  }
+  return "text"
+}
+fn filetype_command(app: *App, requested: []const u8) {
+  slot := &app.documents.slots[app.documents.active]
+
+  if slot.terminal.handle != nil {
+    notice(app, "Terminal buffers do not have a filetype.")
+    return
+  }
+
+  if #len(requested) > 0 {
+    name := requested
+
+    if buffer.equal(name, "plain") || buffer.equal(name, "plaintext") {
+      name = "text"
+    }
+    if #len(name) > 64 {
+      notice(app, "Filetype names must fit in 64 bytes.")
+      return
+    }
+    for byte in name {
+      if !((byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 95) {
+        notice(app, "Filetype names use lowercase letters, digits, and underscores.")
+        return
+      }
+    }
+    syntax_reset(slot)
+    slot.filetype_length = 0
+    slot.inferred_filetype = false
+    if !buffer.equal(name, "auto") {
+      slot.filetype_length = copy_text(slot.filetype[..], name)
+    }
+    app.view.revision += 1
+  }
+  _ = syntax_tick(app)
+  message: [256]u8 = []
+  used: usize = 0
+  add_text(message[..], &used, "Filetype: ")
+  add_text(message[..], &used, filetype_name(slot))
+  if slot.filetype_length == 0 {
+    add_text(message[..], &used, " (automatic)")
+  }
+  if slot.filetype_length > 0 && slot.syntax == nil && !buffer.equal(slot.filetype[..slot.filetype_length], "text") {
+    add_text(message[..], &used, "; grammar unavailable. Use :language-install ")
+    add_text(message[..], &used, slot.filetype[..slot.filetype_length])
+  }
+  notice(app, message[..used])
+}
+fn use_tabs(app: *App) bool {
+  return active_file_config(app).insert_tabs
+}
+fn configured_filetypes(app: *App) {
+  for slot_index in 0..16 {
+    slot := &app.documents.slots[slot_index]
+    if slot.document != nil && slot.file.length > 0 && slot.filetype_length == 0 && slot.terminal.handle == nil {
+      path := files.name(&slot.file)
+      index: usize = 0
+      matched: bool = false
+      for index < app.config.language_count && !matched {
+        config := &app.config.languages[index]
+        at: usize = 0
+        for at < config.extensions_length {
+          end := at
+          for end < config.extensions_length && config.extensions[end] != 44 {
+            end += 1
+          }
+          extension := settings.trim(config.extensions[at..end])
+          at = end + 1
+          if #len(extension) > 0 && explorer_suffix(path, extension) {
+            slot.filetype_length = copy_text(slot.filetype[..], config.name[..config.name_length])
+            slot.inferred_filetype = true
+            syntax_reset(slot)
+            matched = true
+            break
+          }
+        }
+        index += 1
+      }
+    }
+  }
+}
+fn syntax_selection(app: *App, mode: u32) {
+  slot := &app.documents.slots[app.documents.active]
+  doc := app.documents.current
+  if slot.syntax == nil {
+    notice(app, "Install a grammar for syntax selections.")
+    return
+  }
+  selections: [32]buffer.Selection = []
+  selections[0] = buffer.Selection{anchor: doc.anchor, cursor: doc.cursor}
+  index: usize = 0
+  for index < doc.secondary.count {
+    selections[index + 1] = doc.secondary.ranges[index]
+    index += 1
+  }
+  index = 0
+  for index <= doc.secondary.count {
+    selected := &selections[index]
+    low := selected.anchor
+    high := selected.cursor
+    backward := low > high
+    if backward {
+      low = selected.cursor
+      high = selected.anchor
+    }
+    start: u32 = 0
+    end: u32 = 0
+    if syntax_select(slot.syntax, doc.revision, #cast(u32) low, #cast(u32) high, mode, &start, &end) == 0 {
+      notice(app, "No syntax node available; parsing may still be pending.")
+      return
+    }
+    selected.anchor = #cast(usize) start
+    selected.cursor = #cast(usize) end
+    if backward {
+      selected.anchor = #cast(usize) end
+      selected.cursor = #cast(usize) start
+    }
+    index += 1
+  }
+  doc.goal_valid = false
+  doc.anchor = selections[0].anchor
+  doc.cursor = selections[0].cursor
+  index = 0
+  for index < doc.secondary.count {
+    doc.secondary.ranges[index] = selections[index + 1]
+    index += 1
+  }
+}
+fn syntax_textobject(app: *App, key: u8, around: bool, count: usize) bool {
+  slot := &app.documents.slots[app.documents.active]
+  doc := app.documents.current
+  if slot.syntax == nil {
+    return false
+  }
+  kind: u32 = 0
+  if key == 116 {
+    kind = 2
+  } else if key == 97 {
+    kind = 4
+  } else if key == 99 {
+    kind = 6
+  }
+  if around {
+    kind += 1
+  }
+  selections: [32]buffer.Selection = []
+  selections[0] = buffer.Selection{anchor: doc.anchor, cursor: doc.cursor}
+  index: usize = 0
+  for index < doc.secondary.count {
+    selections[index + 1] = doc.secondary.ranges[index]
+    index += 1
+  }
+  index = 0
+  for index <= doc.secondary.count {
+    selected := &selections[index]
+    low := selected.anchor
+    high := selected.cursor
+    backward := low > high
+    if backward {
+      low = selected.cursor
+      high = selected.anchor
+    }
+    start: u32 = 0
+    end: u32 = 0
+    if syntax_object(slot.syntax, doc.revision, #cast(u32) low, #cast(u32) high, kind, #cast(u32) count, &start, &end) == 0 {
+      return false
+    }
+    selected.anchor = #cast(usize) start
+    selected.cursor = #cast(usize) end
+    if backward {
+      selected.anchor = #cast(usize) end
+      selected.cursor = #cast(usize) start
+    }
+    index += 1
+  }
+  doc.goal_valid = false
+  doc.anchor = selections[0].anchor
+  doc.cursor = selections[0].cursor
+  index = 0
+  for index < doc.secondary.count {
+    doc.secondary.ranges[index] = selections[index + 1]
+    index += 1
+  }
+  return true
+}
