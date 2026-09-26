@@ -34,7 +34,7 @@ is needed with this environment. `just smoke-direct` checks this direct-run path
 without inheriting the library paths from `just`.
 
 Start in normal mode. Press `i` to type, Escape to return to normal mode,
-`Space w` to save, and `:` for searchable commands. Space opens a shortcut guide;
+`:write` then Enter to save, and `:` for searchable commands. Space opens a shortcut guide;
 Ctrl shortcuts remain alternatives. An unnamed
 buffer prompts for a new destination when saved. File paths in Open/Save As
 are relative to the directory where DNA was launched; directory-buffer create
@@ -71,7 +71,7 @@ with movement, and typing in insert mode replaces a selection.
 | Buffer picker / next / previous | `Space b` / `Space n` / `Space p` |
 | Close current buffer | `Space c` or `:bd` |
 | New empty buffer | `:enew` |
-| Open / save | `Space f` / `Space w`; `Ctrl O` / `Ctrl S` |
+| Open / save | `Space f` / `:write` then Enter; `Ctrl O` / `Ctrl S` |
 | Directory buffer | `Space e`; `Ctrl E` |
 | Font larger/smaller/reset | `Ctrl +` / `Ctrl -` / `Ctrl 0` |
 | Quit | `:q`, `Ctrl Q`, or close window |
