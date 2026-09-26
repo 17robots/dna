@@ -57,7 +57,7 @@ fn main() {
   palette := ttf.create(engine, font, &empty[0], 0)
   if palette == nil { #panic("palette text failed") }
   defer ttf.destroy(palette)
-  if !ttf.wrap(document, 0) || !ttf.color(document, 205, 214, 224, 255) || !ttf.color(palette, 218, 228, 235, 255) { #panic("text style failed") }
+  if !ttf.whitespace_visible(document, true) || !ttf.wrap(document, 0) || !ttf.color(document, 205, 214, 224, 255) || !ttf.color(palette, 218, 228, 235, 255) { #panic("text style failed") }
   typography := Typography{font: font, document: document, palette: palette, points: 20.0, scale: sdl.display_scale(window)}
   if typography.scale <= 0.0 { typography.scale = 1.0 }
   resize_font(&typography)
@@ -65,6 +65,7 @@ fn main() {
   input_storage: [64]u8 = []
   if smoke.ok && smoke.found {
     if #sizeof(sdl.Event) != 128 || #sizeof(sdl.KeyEvent) != 40 || #sizeof(sdl.TextEvent) != 32 || #sizeof(ttf.Substring) != 36 { #panic("unexpected ABI") }
+    whitespace_smoke(app, &typography)
     workflow_smoke(app, &typography)
     _ = buffer.load(doc, "one\ntwo\nthree\n") app.file.length = 0 app.panel = Panel.None
     queue_key(105, 0)
@@ -93,21 +94,35 @@ fn main() {
       }
       continue
     }
-    kind := #cast(u32) (event.words[0] & 4294967295)
-    if kind == 256 || kind == 528 { action(app, &typography, 16) }
-    else if kind == 768 { key := #cast(*const sdl.KeyEvent) &event key_input(app, &typography, key.key, key.modifiers) }
-    else if kind == 771 {
-      received := #cast(*const sdl.TextEvent) &event
-      if received.text != nil {
-        length := c.string_length(received.text, 65536)
-        if length < 65536 { text_input(app, received.text[..length]) } else { notice(app, "Text input exceeds capacity.") }
+    // Preserve event order, but draw once per bounded batch instead of once
+    // for both key-down and its following text event. Bound prevents starvation.
+    processed: usize = 0 redraw: bool = false
+    for true {
+      kind := #cast(u32) (event.words[0] & 4294967295)
+      if kind == 256 || kind == 528 { action(app, &typography, 16) }
+      else if kind == 768 { key := #cast(*const sdl.KeyEvent) &event key_input(app, &typography, key.key, key.modifiers) }
+      else if kind == 771 {
+        received := #cast(*const sdl.TextEvent) &event
+        if received.text != nil {
+          length := c.string_length(received.text, 65536)
+          if length < 65536 { text_input(app, received.text[..length]) } else { notice(app, "Text input exceeds capacity.") }
+        }
       }
+      if kind >= 512 && kind <= 540 {
+        scale := sdl.display_scale(window)
+        if scale > 0.0 && scale != typography.scale { typography.scale = scale resize_font(&typography) }
+      }
+      if kind == 768 || kind == 771 || kind == 256 || (kind >= 512 && kind <= 540) { redraw = true }
+      input_now := prompting(app) || (app.panel == Panel.None && app.insert)
+      if input_now != receiving {
+        if input_now { if !sdl.start_text(window) { #panic("start input failed") } }
+        else { if !sdl.stop_text(window) { #panic("stop input failed") } }
+        receiving = input_now
+      }
+      processed += 1
+      if !app.running || processed >= 64 || !sdl.poll(&event) { break }
     }
-    if kind >= 512 && kind <= 540 {
-      scale := sdl.display_scale(window)
-      if scale > 0.0 && scale != typography.scale { typography.scale = scale resize_font(&typography) }
-    }
-    if kind == 768 || kind == 771 || kind == 256 || (kind >= 512 && kind <= 540) { draw(renderer, window, app, &typography) }
+    if redraw { draw(renderer, window, app, &typography) }
   }
   if !buffer.dirty(doc) { files.discard_recovery(&app.file) }
   if smoke.ok && smoke.found {

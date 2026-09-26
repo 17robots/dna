@@ -144,12 +144,17 @@ Tests cover UTF-8 edits, selections, bounded undo/redo, search, capacity rollbac
 file conflicts, permission preservation, recovery, symlink/FIFO rejection, layout
 validation, and the native open/edit/save/create/rename/trash workflow. Synthetic
 SDL input passes through the actual event loop. Font geometry and ABI checks run
-against the installed headers. Physical keyboard and IME testing remain separate.
+against the installed headers. A native input-burst test verifies that all text
+arrives without a frame per key/text event or redundant title updates; its timings
+are not measurements of human input latency. Physical keyboard and IME testing
+remain separate.
 
 The document owns its text, saved baseline, and bounded undo snapshots in an arena.
 File/prompt/event bytes are copied before their source expires. Temporary file
 reads use a rewindable scratch arena. SDL text objects die before their font,
-engine, and renderer. Rendering happens on relevant events; idle waits do not redraw.
+engine, and renderer. Queued events are processed in bounded batches before drawing, and unchanged
+window titles are not resubmitted. Idle waits do not redraw. Trailing spaces
+and indentation retain their layout width, including in cursor/selection geometry.
 The editing, file, and layout modules do not depend on SDL.
 
 Non-colocated jj, local only. No remote or publication. The project name DNA is

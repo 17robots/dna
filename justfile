@@ -17,6 +17,9 @@ smoke: deps test
     just build debug
     just build release
     python3 scripts/smoke.py
+    cc -shared -fPIC -Wall -Wextra -Werror $(pkg-config --cflags --libs sdl3) -Ibuild/deps/install/include tests/input_events.c -ldl -o build/input-events.so
+    SDL_VIDEODRIVER=dummy LD_PRELOAD="$PWD/build/input-events.so" timeout 20 ./build/dna-debug
+    SDL_VIDEODRIVER=dummy LD_PRELOAD="$PWD/build/input-events.so" timeout 20 ./build/dna-release
 
 # Exercise the user's direct command without inheriting this recipe's paths.
 smoke-direct: deps
