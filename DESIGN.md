@@ -145,7 +145,11 @@ font/text-layout backend; deletion recovery mechanism; third-party plugin langua
 packaging, permissions and isolation; remote synchronization protocol; full Vim
 compatibility scope; complete accessibility and platform integration design.
 
-Next implementation step: choose a separate project home and build a minimal Dyn
-window/input/text-binding experiment. Use its results to select the platform layer,
-then implement the first keyboard workflow above. Do not expand the compiler repo
-with editor application code.
+Current prototype: the separate `dna` repository implements native SDL3/SDL_ttf
+rendering, a single UTF-8 file buffer, modal selection/editing, undo/redo, search,
+command and directory popups, individual file create/rename/trash actions,
+validated popup/font layout files, explicit saves, and named-file recovery.
+README.md describes the tested behavior and limits. This is not yet the complete
+architecture above: directory batches, nested/persistent supporting buffers,
+relative splits, editing profiles, extension interfaces, and a shared TUI remain
+next steps. Keep editor application code out of the compiler repository.

@@ -1,0 +1,149 @@
+use "std/unicode/utf8" utf8
+pub const Capacity: usize = 65535
+pub struct Snapshot { bytes: [65536]u8, length: usize, cursor: usize, anchor: usize }
+// Allocate Document in an arena, not on the call stack. All retained bytes are
+// owned here; no slices from file I/O, SDL, or frame scratch survive a call.
+pub struct Document {
+  bytes: [65536]u8, length: usize, cursor: usize, anchor: usize,
+  saved: [65536]u8, saved_length: usize,
+  history: [64]Snapshot, history_count: usize, history_at: usize,
+  revision: u64,
+}
+pub fn equal(a: []const u8, b: []const u8) bool {
+  if #len(a) != #len(b) { return false }
+  index: usize = 0 for index < #len(a) { if a[index] != b[index] { return false } index += 1 }
+  return true
+}
+pub fn valid(text: []const u8) bool {
+  if #len(text) > Capacity || !utf8.valid(text) { return false }
+  for byte in text { if byte == 0 { return false } }
+  return true
+}
+fn snapshot(document: *Document, index: usize) {
+  entry := &document.history[index]
+  entry.length = document.length entry.cursor = document.cursor entry.anchor = document.anchor
+  position: usize = 0 for position <= document.length { entry.bytes[position] = document.bytes[position] position += 1 }
+}
+pub fn mark_saved(document: *Document) {
+  document.saved_length = document.length
+  index: usize = 0 for index <= document.length { document.saved[index] = document.bytes[index] index += 1 }
+}
+pub fn load(document: *Document, text: []const u8) bool {
+  if !valid(text) { return false }
+  document.length = #len(text) document.cursor = 0 document.anchor = 0
+  index: usize = 0 for index < #len(text) { document.bytes[index] = text[index] index += 1 }
+  document.bytes[document.length] = 0
+  document.history_at = 0 document.history_count = 1 document.revision += 1
+  mark_saved(document) snapshot(document, 0)
+  return true
+}
+pub fn dirty(document: *const Document) bool { return !equal(document.bytes[..document.length], document.saved[..document.saved_length]) }
+pub fn start(document: *const Document) usize { if document.cursor < document.anchor { return document.cursor } return document.anchor }
+pub fn end(document: *const Document) usize { if document.cursor > document.anchor { return document.cursor } return document.anchor }
+pub fn previous(document: *const Document, offset: usize) usize {
+  if offset == 0 { return 0 }
+  at := offset - 1 for at > 0 && (document.bytes[at] & 192) == 128 { at -= 1 }
+  return at
+}
+pub fn next(document: *const Document, offset: usize) usize {
+  if offset >= document.length { return document.length }
+  decoded := utf8.decode(document.bytes[..document.length], offset)
+  return offset + decoded.width
+}
+pub fn replace(document: *Document, text: []const u8) bool {
+  if !valid(text) { return false }
+  low := start(document) high := end(document)
+  removed := high - low
+  if #len(text) > Capacity - (document.length - removed) { return false }
+  tail := document.length - high
+  if #len(text) > removed {
+    index := tail for index > 0 { index -= 1 document.bytes[low + #len(text) + index] = document.bytes[high + index] }
+  } else {
+    forward: usize = 0 for forward < tail { document.bytes[low + #len(text) + forward] = document.bytes[high + forward] forward += 1 }
+  }
+  copied: usize = 0 for copied < #len(text) { document.bytes[low + copied] = text[copied] copied += 1 }
+  document.length = document.length - removed + #len(text)
+  document.bytes[document.length] = 0 document.cursor = low + #len(text) document.anchor = document.cursor document.revision += 1
+  return true
+}
+pub fn checkpoint(document: *Document) {
+  entry := &document.history[document.history_at]
+  if equal(document.bytes[..document.length], entry.bytes[..entry.length]) { return }
+  if document.history_at == 63 {
+    index: usize = 1 for index < 64 { destination := &document.history[index - 1] source := &document.history[index]
+      destination.length = source.length destination.cursor = source.cursor destination.anchor = source.anchor
+      copied: usize = 0 for copied <= source.length { destination.bytes[copied] = source.bytes[copied] copied += 1 } index += 1 }
+    document.history_at = 62
+  }
+  document.history_at += 1 document.history_count = document.history_at + 1
+  snapshot(document, document.history_at)
+}
+fn restore(document: *Document) {
+  entry := &document.history[document.history_at]
+  document.length = entry.length document.cursor = entry.cursor document.anchor = entry.anchor
+  index: usize = 0 for index <= entry.length { document.bytes[index] = entry.bytes[index] index += 1 }
+  document.revision += 1
+}
+pub fn undo(document: *Document) {
+  checkpoint(document)
+  if document.history_at > 0 { document.history_at -= 1 restore(document) }
+}
+pub fn redo(document: *Document) {
+  entry := &document.history[document.history_at]
+  if !equal(document.bytes[..document.length], entry.bytes[..entry.length]) { return }
+  if document.history_at + 1 < document.history_count { document.history_at += 1 restore(document) }
+}
+pub fn move_to(document: *Document, position: usize, extend: bool) {
+  if position > document.length { return }
+  document.cursor = position if !extend { document.anchor = position }
+}
+pub fn line_start(document: *const Document, position: usize) usize {
+  at := position for at > 0 && document.bytes[at - 1] != 10 { at -= 1 } return at
+}
+pub fn line_end(document: *const Document, position: usize) usize {
+  at := position for at < document.length && document.bytes[at] != 10 { at += 1 } return at
+}
+pub fn vertical(document: *Document, down: bool, extend: bool) {
+  beginning := line_start(document, document.cursor)
+  column: usize = 0 scan := beginning
+  for scan < document.cursor { scan = next(document, scan) column += 1 }
+  destination: usize = 0
+  if down {
+    ending := line_end(document, document.cursor)
+    if ending == document.length { return }
+    destination = ending + 1
+  } else {
+    if beginning == 0 { return }
+    destination = line_start(document, beginning - 1)
+  }
+  moved: usize = 0
+  for moved < column && destination < document.length && document.bytes[destination] != 10 { destination = next(document, destination) moved += 1 }
+  move_to(document, destination, extend)
+}
+pub fn erase(document: *Document, backward: bool) {
+  if document.cursor == document.anchor {
+    if backward { document.anchor = previous(document, document.cursor) }
+    else { document.anchor = next(document, document.cursor) }
+  }
+  _ = replace(document, "")
+}
+pub fn select_line(document: *Document) {
+  document.anchor = line_start(document, document.cursor)
+  document.cursor = line_end(document, document.cursor)
+  if document.cursor < document.length { document.cursor += 1 }
+}
+pub fn find(document: *Document, query: []const u8, backwards: bool) bool {
+  if #len(query) == 0 || #len(query) > document.length { return false }
+  base := document.cursor
+  if backwards { base = start(document) }
+  step: usize = 0
+  for step <= document.length + 1 {
+    at := (base + step) % (document.length + 1)
+    if backwards { at = (base + document.length - (step % (document.length + 1))) % (document.length + 1) }
+    if at + #len(query) <= document.length && equal(document.bytes[at..at + #len(query)], query) {
+      document.anchor = at document.cursor = at + #len(query) return true
+    }
+    step += 1
+  }
+  return false
+}

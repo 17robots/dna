@@ -1,5 +1,8 @@
 #include <stddef.h>
 #include <SDL3/SDL.h>
+#include <SDL3_ttf/SDL_ttf.h>
+_Static_assert(sizeof(TTF_SubString) == 36, "substring storage");
+_Static_assert(offsetof(TTF_SubString, rect) == 20, "substring rectangle");
 _Static_assert(sizeof(SDL_Event) == 128, "event storage");
 _Static_assert(_Alignof(SDL_Event) == 8, "event alignment");
 _Static_assert(sizeof(SDL_KeyboardEvent) == 40, "keyboard storage");

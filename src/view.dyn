@@ -1,0 +1,65 @@
+fn draw(renderer: rawptr, window: rawptr, app: *App, typography: *Typography) {
+  if !sdl.color(renderer, 20, 24, 29, 255) || !sdl.clear(renderer) { #panic("clear failed") }
+  margin := 28.0 * typography.scale
+  width: i32 = 0 height: i32 = 0
+  if !sdl.size(renderer, &width, &height) { #panic("size failed") }
+  doc := app.document
+  if typography.rendered_revision != doc.revision {
+    if !ttf.set(typography.document, &doc.bytes[0], doc.length) { #panic("document update failed") }
+    typography.rendered_revision = doc.revision
+  }
+  caret := ttf.Substring{}
+  if !ttf.substring(typography.document, #cast(i32) doc.cursor, &caret) { #panic("cursor geometry failed") }
+  caret_x := #cast(f32) caret.x caret_y := #cast(f32) caret.y
+  visible_width := #cast(f32) width - margin * 2.0 visible_height := #cast(f32) height - margin * 2.0
+  if visible_width < typography.cell { visible_width = typography.cell }
+  if visible_height < typography.line { visible_height = typography.line }
+  if caret_x < app.scroll_x { app.scroll_x = caret_x }
+  if caret_y < app.scroll_y { app.scroll_y = caret_y }
+  if caret_x + typography.cell > app.scroll_x + visible_width { app.scroll_x = caret_x + typography.cell - visible_width }
+  if caret_y + typography.line > app.scroll_y + visible_height { app.scroll_y = caret_y + typography.line - visible_height }
+  at := buffer.start(doc) ending := buffer.end(doc)
+  for at < ending {
+    part := ttf.Substring{}
+    if !ttf.substring(typography.document, #cast(i32) at, &part) { break }
+    rect := sdl.Rect{x: margin + #cast(f32) part.x - app.scroll_x, y: margin + #cast(f32) part.y - app.scroll_y, width: #cast(f32) part.width, height: typography.line}
+    if rect.width < 1.0 { rect.width = typography.cell }
+    if rect.y + rect.height >= 0.0 && rect.y < #cast(f32) height {
+      if !sdl.color(renderer, 53, 76, 84, 255) || !sdl.fill(renderer, &rect) { #panic("selection draw failed") }
+    }
+    next := buffer.next(doc, at)
+    if part.length > 0 && #cast(usize) (part.offset + part.length) > next { next = #cast(usize) (part.offset + part.length) }
+    at = next
+  }
+  cursor_width := typography.cell if app.insert { cursor_width = 2.0 * typography.scale }
+  cursor := sdl.Rect{x: margin + caret_x - app.scroll_x, y: margin + caret_y - app.scroll_y, width: cursor_width, height: typography.points * typography.scale + 5.0 * typography.scale}
+  if !sdl.color(renderer, 143, 185, 166, 255) || !sdl.fill(renderer, &cursor) { #panic("cursor draw failed") }
+  if !ttf.draw(typography.document, margin - app.scroll_x, margin - app.scroll_y) { #panic("text draw failed") }
+  if app.panel != Panel.None {
+    popup_rect := sdl.Rect{x: #cast(f32) width * (1.0-app.popup_width) / 2.0, y: #cast(f32) height * (1.0-app.popup_height) / 2.0, width: #cast(f32) width * app.popup_width, height: #cast(f32) height * app.popup_height}
+    minimum := 520.0 * typography.scale
+    if popup_rect.width < minimum { popup_rect.width = minimum }
+    if popup_rect.width > #cast(f32) width { popup_rect.width = #cast(f32) width }
+    popup_rect.x = (#cast(f32) width - popup_rect.width) / 2.0
+    labels: [16384]u8 = [] count := popup_text(app, labels[..])
+    wrap_width := #cast(i32) (popup_rect.width - margin * 2.0) if wrap_width < 1 { wrap_width = 1 }
+    if !ttf.set(typography.palette, &labels[0], count) || !ttf.wrap(typography.palette, wrap_width) { #panic("popup layout failed") }
+    text_width: i32 = 0 text_height: i32 = 0
+    if !ttf.size(typography.palette, &text_width, &text_height) { #panic("popup measure failed") }
+    needed := #cast(f32) text_height + margin * 2.0
+    if popup_rect.height < needed { popup_rect.height = needed }
+    if popup_rect.height > #cast(f32) height { popup_rect.height = #cast(f32) height }
+    popup_rect.y = (#cast(f32) height - popup_rect.height) / 2.0
+    clipping := sdl.PixelRect{x: #cast(i32) popup_rect.x, y: #cast(i32) popup_rect.y, width: #cast(i32) popup_rect.width, height: #cast(i32) popup_rect.height}
+    if !sdl.clip(renderer, &clipping) { #panic("popup clip failed") }
+    if !sdl.color(renderer, 35, 43, 49, 255) || !sdl.fill(renderer, &popup_rect) { #panic("popup draw failed") }
+    if !ttf.draw(typography.palette, popup_rect.x + margin, popup_rect.y + margin) { #panic("popup text failed") }
+    if !sdl.clip(renderer, nil) { #panic("clip reset failed") }
+  }
+  title: [8192]u8 = [] used: usize = 0
+  if buffer.dirty(doc) { add_text(title[..], &used, "[+] ") }
+  if app.insert { add_text(title[..], &used, "INSERT  ") } else if app.extend { add_text(title[..], &used, "SELECT  ") } else { add_text(title[..], &used, "NORMAL  ") }
+  if app.file.length == 0 { add_text(title[..], &used, "Untitled") } else { add_text(title[..], &used, files.name(&app.file)) }
+  add_text(title[..], &used, " — DNA")
+  if !sdl.title(window, &title[0]) || !sdl.present(renderer) { #panic("present failed") }
+}

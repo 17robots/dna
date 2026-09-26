@@ -1,0 +1,48 @@
+use "../../src/buffer" buffer
+use "std/mem"
+fn main() {
+  arena := mem.arena_create(#sizeof(buffer.Document)) if !arena.ok { #panic("arena") }
+  defer _ = mem.arena_release(&arena.arena)
+  document := #cast(*buffer.Document) mem.arena_push(&arena.arena, #sizeof(buffer.Document), #alignof(buffer.Document))
+  if !buffer.load(document, "one\ntwo\nthree") { #panic("load") }
+  buffer.move_to(document, 4, false)
+  if !buffer.replace(document, "X") { #panic("insert") }
+  buffer.checkpoint(document)
+  if !buffer.equal(document.bytes[..document.length], "one\nXtwo\nthree") { #panic("middle insertion") }
+  buffer.move_to(document, 4, false) buffer.move_to(document, 8, true)
+  if !buffer.replace(document, "TWO") { #panic("selection") }
+  buffer.checkpoint(document) buffer.undo(document)
+  if !buffer.equal(document.bytes[..document.length], "one\nXtwo\nthree") { #panic("undo") }
+  buffer.redo(document)
+  if !buffer.equal(document.bytes[..document.length], "one\nTWO\nthree") { #panic("redo") }
+  if !buffer.find(document, "one", false) || document.anchor != 0 { #panic("wrapped search") }
+  buffer.undo(document)
+  _ = buffer.replace(document, "branch") buffer.checkpoint(document)
+  before := document.history_at buffer.redo(document)
+  if document.history_at != before { #panic("redo branch invalidation") }
+  if !buffer.load(document, "aé\nb中\n") { #panic("UTF8 load") }
+  buffer.move_to(document, 3, false) buffer.erase(document, true)
+  if !buffer.equal(document.bytes[..document.length], "a\nb中\n") { #panic("UTF8 backspace") }
+  buffer.move_to(document, 1, false) buffer.vertical(document, true, false)
+  if document.cursor != 3 { #panic("vertical movement") }
+  buffer.mark_saved(document) if buffer.dirty(document) { #panic("saved state") }
+  if !buffer.replace(document, "!") || !buffer.dirty(document) { #panic("dirty state") }
+  old_length := document.length invalid: [2]u8 = [192, 175]
+  if buffer.replace(document, invalid[..]) || document.length != old_length { #panic("invalid UTF8 mutation") }
+  _ = buffer.load(document, "aaaa")
+  if !buffer.find(document, "aa", false) || document.anchor != 0 { #panic("first search") }
+  if !buffer.find(document, "aa", false) || document.anchor != 2 { #panic("adjacent search") }
+  if !buffer.find(document, "aa", true) || document.anchor != 1 { #panic("reverse search") }
+  _ = buffer.load(document, "")
+  count: usize = 0 for count < 80 { _ = buffer.replace(document, "x") buffer.checkpoint(document) count += 1 }
+  if document.history_count != 64 { #panic("history limit") }
+  undone: usize = 0 for undone < 70 { buffer.undo(document) undone += 1 }
+  if document.length != 17 { #panic("history rollover") }
+  redone: usize = 0 for redone < 70 { buffer.redo(document) redone += 1 }
+  if document.length != 80 { #panic("history rollover redo") }
+  full: [65535]u8 = [] fill: usize = 0 for fill < 65535 { full[fill] = 'a' fill += 1 }
+  _ = buffer.load(document, full[..]) buffer.move_to(document, document.length, false)
+  if buffer.replace(document, "b") || document.length != 65535 || buffer.dirty(document) { #panic("capacity rollback") }
+  buffer.erase(document, true)
+  if !buffer.replace(document, "b") || document.length != 65535 { #panic("capacity boundary") }
+}

@@ -1,62 +1,28 @@
-use "./platform" sdl
-use "./text" ttf
-use "std/c"
 use "std/process"
-
-// Document storage outlives rendering. SDL input is copied before the next event.
-// Editing remains ASCII-only for now; rendering uses a real font. No disk saves.
-struct Editor { bytes: [8192]u8, length: usize, insert: bool, popup: bool, wide: bool }
-fn append(editor: *Editor, text: []const u8) {
-  if editor.length + #len(text) >= 8192 { return }
-  for byte in text { if byte != 10 && (byte < 32 || byte > 126) { return } }
-  for copied_byte in text { editor.bytes[editor.length] = copied_byte editor.length += 1 }
-  editor.bytes[editor.length] = 0
-}
-struct Typography { font: rawptr, document: rawptr, palette: rawptr, points: f32, scale: f32, cell: f32, line: f32 }
-fn resize_font(typography: *Typography) {
-  if !ttf.font_size(typography.font, typography.points * typography.scale) { #panic("font resize failed") }
-  typography.line = typography.points * typography.scale * 1.5
-  ttf.line_skip(typography.font, #cast(i32) typography.line)
-  glyph: [2]u8 = [77, 0] width: i32 = 0 height: i32 = 0
-  if !ttf.measure(typography.font, &glyph[0], 1, &width, &height) { #panic("font measure failed") }
-  typography.cell = #cast(f32) width
-}
-fn draw(renderer: rawptr, editor: *const Editor, typography: *Typography) {
-  if !sdl.color(renderer, 20, 24, 29, 255) || !sdl.clear(renderer) { #panic("clear failed") }
-  margin := 28.0 * typography.scale
-  width: i32 = 0 height: i32 = 0
-  if !sdl.size(renderer, &width, &height) { #panic("size failed") }
-  column: usize = 0 row: usize = 0
-  for byte in editor.bytes[..editor.length] { if byte == 10 { row += 1 column = 0 } else { column += 1 } }
-  // Follow the append cursor vertically when the document grows beyond the view.
-  scroll: f32 = 0.0
-  bottom := margin + (#cast(f32) row + 1.0) * typography.line
-  if bottom > #cast(f32) height - margin { scroll = bottom - (#cast(f32) height - margin) }
-  cursor_width := typography.cell if editor.insert { cursor_width = 2.0 * typography.scale }
-  cursor := sdl.Rect{x: margin + #cast(f32) column * typography.cell, y: margin + #cast(f32) row * typography.line - scroll, width: cursor_width, height: typography.points * typography.scale + 5.0 * typography.scale}
-  if !sdl.color(renderer, 143, 185, 166, 255) || !sdl.fill(renderer, &cursor) { #panic("cursor draw failed") }
-  if !ttf.set(typography.document, &editor.bytes[0], editor.length) || !ttf.draw(typography.document, margin, margin - scroll) { #panic("document draw failed") }
-  if editor.popup {
-    fraction: f32 = 0.64 if editor.wide { fraction = 0.84 }
-    rect := sdl.Rect{x: #cast(f32) width * (1.0-fraction) / 2.0, y: #cast(f32) height * 0.22, width: #cast(f32) width * fraction, height: #cast(f32) height * 0.56}
-    if !sdl.color(renderer, 35, 43, 49, 255) || !sdl.fill(renderer, &rect) { #panic("popup draw failed") }
-    if !ttf.draw(typography.palette, rect.x + margin, rect.y + margin) { #panic("palette draw failed") }
-  }
-  if !sdl.present(renderer) { #panic("present failed") }
-}
-// Synthetic SDL events use the same ABI and event loop as keyboard input.
-fn queue_key(value: u32) {
-  event := sdl.Event{}
-  key := #cast(*sdl.KeyEvent) &event
-  key.kind = 768 key.key = value key.down = true
+fn queue_key(value: u32, modifiers: u16) {
+  event := sdl.Event{} key := #cast(*sdl.KeyEvent) &event
+  key.kind = 768 key.key = value key.modifiers = modifiers key.down = true
   if !sdl.push(&event) { #panic("queue key failed") }
 }
 fn main() {
-  editor := Editor{}
-  append(&editor, "fn main() {\n    text := \"hello\"\n    _ = text\n}\n")
+  owned := mem.arena_create(#sizeof(buffer.Document) + #sizeof(App) + 128)
+  scratch := mem.arena_create(2097152)
+  if !owned.ok || !scratch.ok { #panic("editor allocation failed") }
+  defer _ = mem.arena_release(&owned.arena)
+  defer _ = mem.arena_release(&scratch.arena)
+  doc := #cast(*buffer.Document) mem.arena_push(&owned.arena, #sizeof(buffer.Document), #alignof(buffer.Document))
+  app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
+  app.document = doc app.scratch = &scratch.arena app.running = true app.popup_width = 0.64 app.popup_height = 0.56
+  _ = buffer.load(doc, "")
+  cwd := #syscall(79, &app.directory[0], 4096)
+  if cwd <= 0 { #panic("working directory unavailable") }
+  app.directory_length = #cast(usize) cwd - 1
+  arguments := process.arguments(&scratch.arena)
+  if !arguments.ok { #panic("arguments unavailable") }
+  if #len(arguments.values) > 1 && #len(arguments.values[1]) > 0 { open_file(app, arguments.values[1]) }
   if !sdl.init(32) { #panic("SDL video init failed") }
   defer sdl.quit()
-  title: [64]u8 = [] encoded_title := c.string_from_bytes(title[..], "DNA - native experiment")
+  title: [64]u8 = [] encoded_title := c.string_from_bytes(title[..], "DNA")
   if !encoded_title.ok { #panic("title capacity") }
   window := sdl.create_window(encoded_title.value, 1100, 760, 8224)
   if window == nil { #panic("window creation failed") }
@@ -83,74 +49,68 @@ fn main() {
   defer ttf.close(font)
   engine := ttf.engine(renderer) if engine == nil { #panic("text engine failed") }
   defer ttf.destroy_engine(engine)
-  document := ttf.create(engine, font, &editor.bytes[0], editor.length)
+
+  document := ttf.create(engine, font, &doc.bytes[0], doc.length)
   if document == nil { #panic("document text failed") }
   defer ttf.destroy(document)
-  labels: [512]u8 = []
-  palette_label := c.string_from_bytes(labels[..], "Commands\n\n1  Switch layout: compact\n2  Switch layout: wide\n\nCtrl + / -   Text size\nEscape       Return to buffer")
-  if !palette_label.ok { #panic("palette capacity") }
-  palette := ttf.create(engine, font, palette_label.value, 0)
+  empty: [1]u8 = [0]
+  palette := ttf.create(engine, font, &empty[0], 0)
   if palette == nil { #panic("palette text failed") }
   defer ttf.destroy(palette)
-  if !ttf.wrap(document, 0) || !ttf.wrap(palette, 0) || !ttf.color(document, 205, 214, 224, 255) || !ttf.color(palette, 218, 228, 235, 255) { #panic("text style failed") }
+  if !ttf.wrap(document, 0) || !ttf.color(document, 205, 214, 224, 255) || !ttf.color(palette, 218, 228, 235, 255) { #panic("text style failed") }
   typography := Typography{font: font, document: document, palette: palette, points: 20.0, scale: sdl.display_scale(window)}
   if typography.scale <= 0.0 { typography.scale = 1.0 }
   resize_font(&typography)
-  draw(renderer, &editor, &typography)
   environment: [16]u8 = [] smoke := process.environment("DYN_EDITOR_SMOKE", environment[..])
   input_storage: [64]u8 = []
-  initial_length := editor.length
   if smoke.ok && smoke.found {
-    if #sizeof(sdl.Event) != 128 || #alignof(sdl.Event) != 8 || #sizeof(sdl.KeyEvent) != 40 || #sizeof(sdl.TextEvent) != 32 { #panic("unexpected event ABI") }
-    text_width: i32 = 0 text_height: i32 = 0
-    if !ttf.size(document, &text_width, &text_height) || #cast(f32) text_height < typography.line * 3.0 { #panic("document must render multiple lines") }
-    typography.points = 26.0 resize_font(&typography)
-    enlarged_height: i32 = 0
-    if !ttf.size(document, &text_width, &enlarged_height) || enlarged_height <= text_height { #panic("font zoom failed") }
-    typography.points = 20.0 resize_font(&typography)
-    queue_key(105)
-    simulated := sdl.Event{}
-    incoming_test := #cast(*sdl.TextEvent) &simulated
-    incoming_test.kind = 771
-    input_text := c.string_from_bytes(input_storage[..], "abc")
-    if !input_text.ok { #panic("test text capacity") }
-    incoming_test.text = input_text.value
+    if #sizeof(sdl.Event) != 128 || #sizeof(sdl.KeyEvent) != 40 || #sizeof(sdl.TextEvent) != 32 || #sizeof(ttf.Substring) != 36 { #panic("unexpected ABI") }
+    workflow_smoke(app, &typography)
+    _ = buffer.load(doc, "one\ntwo\nthree\n") app.file.length = 0 app.panel = Panel.None
+    queue_key(105, 0)
+    simulated := sdl.Event{} incoming := #cast(*sdl.TextEvent) &simulated incoming.kind = 771
+    input_text := c.string_from_bytes(input_storage[..], "aé中") incoming.text = input_text.value
     if !sdl.push(&simulated) { #panic("queue text failed") }
-    queue_key(8) queue_key(13) queue_key(27)
-    queue_key(32) queue_key(50) queue_key(32) queue_key(27)
-    quit_event := sdl.Event{} quit_event.words[0] = 256
-    if !sdl.push(&quit_event) { #panic("queue quit failed") }
+    queue_key(8, 0) queue_key(13, 0) queue_key(27, 0)
+    queue_key(117, 0) queue_key(117, 1)
+    queue_key(32, 0) queue_key(27, 0)
+    queue_key(113, 64) queue_key(100, 0)
   }
-  event := sdl.Event{}
-  for true {
-    if !sdl.wait(&event) { #panic("event wait failed") }
+  draw(renderer, window, app, &typography)
+  event := sdl.Event{} receiving: bool = false
+  for app.running {
+    wants_text := prompting(app) || (app.panel == Panel.None && app.insert)
+    if wants_text != receiving {
+      if wants_text { if !sdl.start_text(window) { #panic("start input failed") } }
+      else { if !sdl.stop_text(window) { #panic("stop input failed") } }
+      receiving = wants_text
+    }
+    if !sdl.wait_timeout(&event, 500) {
+      if doc.revision != app.recovery_revision {
+        app.recovery_revision = doc.revision
+        error := files.snapshot(&app.file, doc)
+        if #len(error) > 0 { notice(app, error) draw(renderer, window, app, &typography) }
+      }
+      continue
+    }
     kind := #cast(u32) (event.words[0] & 4294967295)
-    if kind == 256 || kind == 528 { break }
-    if kind == 768 {
-      key := #cast(*const sdl.KeyEvent) &event
-      if (key.modifiers & 192) != 0 && (key.key == 61 || key.key == 43 || key.key == 45 || key.key == 48) {
-        if key.key == 45 && typography.points > 12.0 { typography.points -= 1.0 }
-        else if (key.key == 61 || key.key == 43) && typography.points < 36.0 { typography.points += 1.0 }
-        else if key.key == 48 { typography.points = 20.0 }
-        resize_font(&typography)
-      }
-      else if key.key == 27 { editor.popup = false editor.insert = false if !sdl.stop_text(window) { #panic("stop text failed") } }
-      else if !editor.insert && (key.key == 32 || key.key == 1073741882) { editor.popup = true }
-      else if editor.popup && (key.key == 49 || key.key == 50) { editor.wide = key.key == 50 editor.popup = false }
-      else if !editor.popup && !editor.insert && key.key == 105 { editor.insert = true if !sdl.start_text(window) { #panic("start text failed") } }
-      else if editor.insert && key.key == 8 && editor.length > 0 { editor.length -= 1 editor.bytes[editor.length] = 0 }
-      else if editor.insert && key.key == 13 { append(&editor, "\n") }
-    }
-    if kind == 771 && editor.insert && !editor.popup {
-      incoming := #cast(*const sdl.TextEvent) &event
-      if incoming.text != nil {
-        length := c.string_length(incoming.text, 8192)
-        if length < 8192 { append(&editor, incoming.text[..length]) }
+    if kind == 256 || kind == 528 { action(app, &typography, 16) }
+    else if kind == 768 { key := #cast(*const sdl.KeyEvent) &event key_input(app, &typography, key.key, key.modifiers) }
+    else if kind == 771 {
+      received := #cast(*const sdl.TextEvent) &event
+      if received.text != nil {
+        length := c.string_length(received.text, 65536)
+        if length < 65536 { text_input(app, received.text[..length]) } else { notice(app, "Text input exceeds capacity.") }
       }
     }
-    if kind == 768 || kind == 771 || (kind >= 512 && kind <= 540) { draw(renderer, &editor, &typography) }
+    if kind >= 512 && kind <= 540 {
+      scale := sdl.display_scale(window)
+      if scale > 0.0 && scale != typography.scale { typography.scale = scale resize_font(&typography) }
+    }
+    if kind == 768 || kind == 771 || kind == 256 || (kind >= 512 && kind <= 540) { draw(renderer, window, app, &typography) }
   }
+  if !buffer.dirty(doc) { files.discard_recovery(&app.file) }
   if smoke.ok && smoke.found {
-    if editor.length != initial_length + 3 || editor.bytes[initial_length] != 97 || editor.bytes[initial_length + 1] != 98 || editor.bytes[initial_length + 2] != 10 || editor.bytes[editor.length] != 0 || editor.insert || editor.popup || !editor.wide { #panic("input and popup smoke failed") }
+    if !buffer.equal(doc.bytes[..doc.length], "aé\none\ntwo\nthree\n") || app.insert { #panic("editing smoke failed") }
   }
 }

@@ -1,0 +1,53 @@
+use "../../src/files" files
+use "../../src/buffer" buffer
+use "std/fs" fs
+use "std/mem" mem
+use "std/process" process
+fn require_empty(error: []const u8) { if #len(error) != 0 { #panic(error) } }
+fn main() {
+  arena := mem.arena_create(#sizeof(buffer.Document) + 2097152) if !arena.ok { #panic("arena") }
+  defer _ = mem.arena_release(&arena.arena)
+  doc := #cast(*buffer.Document) mem.arena_push(&arena.arena, #sizeof(buffer.Document), #alignof(buffer.Document))
+  _ = buffer.load(doc, "first\n")
+  state := files.State{}
+  require_empty(files.save(&state, doc, "sample.txt", &arena.arena))
+  if buffer.dirty(doc) || !fs.metadata("sample.txt").ok { #panic("new save") }
+  if #syscall(90, &state.path[0], 448) != 0 { #panic("chmod fixture") }
+  buffer.move_to(doc, doc.length, false) _ = buffer.replace(doc, "second\n")
+  require_empty(files.snapshot(&state, doc))
+  if (fs.metadata("sample.txt.dna-recovery").mode & 511) != 384 { #panic("private recovery") }
+  _ = buffer.replace(doc, "third\n") require_empty(files.snapshot(&state, doc))
+  require_empty(files.save(&state, doc, "sample.txt", &arena.arena))
+  if (fs.metadata("sample.txt").mode & 511) != 448 || fs.metadata("sample.txt.dna-recovery").ok { #panic("permissions or recovery cleanup") }
+  _ = fs.write_all("sample.txt", "external\n")
+  _ = buffer.replace(doc, "local\n")
+  if #len(files.save(&state, doc, "sample.txt", &arena.arena)) == 0 { #panic("external conflict accepted") }
+  check := fs.read_all(&arena.arena, "sample.txt", 100)
+  if !check.ok || !buffer.equal(check.data, "external\n") { #panic("external content lost") }
+  if #len(files.open(&state, doc, "sample.txt", &arena.arena)) == 0 { #panic("dirty open accepted") }
+  require_empty(files.save(&state, doc, "new.txt", &arena.arena))
+  if #len(files.save(&state, doc, "sample.txt", &arena.arena)) == 0 { #panic("save-as overwrite accepted") }
+  buffer.move_to(doc, doc.length, false) _ = buffer.replace(doc, "recover me\n")
+  require_empty(files.snapshot(&state, doc))
+  // Simulate a fresh editor after a crash: sidecar exists, original still saved.
+  state.recovery_owned = false
+  _ = buffer.load(doc, "")
+  require_empty(files.open(&state, doc, "new.txt", &arena.arena))
+  _ = buffer.replace(doc, "other")
+  if #len(files.snapshot(&state, doc)) == 0 { #panic("unclaimed recovery replaced") }
+  _ = buffer.load(doc, doc.saved[..doc.saved_length])
+  require_empty(files.recover(&state, doc, &arena.arena))
+  if !buffer.dirty(doc) || !buffer.find(doc, "recover me", false) { #panic("recover contents") }
+  files.discard_recovery(&state)
+  _ = buffer.load(doc, "")
+  if #len(files.open(&state, doc, "link.txt", &arena.arena)) == 0 { #panic("symlink opened") }
+  _ = buffer.replace(doc, "safe")
+  if #len(files.save(&state, doc, "link.txt", &arena.arena)) == 0 { #panic("symlink replaced") }
+  _ = buffer.load(doc, "unchanged")
+  if #len(files.open(&state, doc, "binary.txt", &arena.arena)) == 0 || !buffer.equal(doc.bytes[..doc.length], "unchanged") { #panic("invalid read mutated document") }
+  if #len(files.open(&state, doc, "large.txt", &arena.arena)) == 0 { #panic("oversized read accepted") }
+  if #len(files.open(&state, doc, "pipe.txt", &arena.arena)) == 0 { #panic("FIFO accepted") }
+  resolved: [4096]u8 = [] alternate: [4096]u8 = []
+  a := files.resolve("./sample.txt", resolved[..]) b := files.resolve("sample.txt", alternate[..])
+  if #len(a) == 0 || !buffer.equal(a, b) { #panic("path aliases") }
+}

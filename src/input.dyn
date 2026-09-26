@@ -1,0 +1,130 @@
+// All input paths feed the same document operations, including smoke events.
+fn prompting(app: *const App) bool {
+  return app.panel == Panel.Commands || app.panel == Panel.Open || app.panel == Panel.SaveAs || app.panel == Panel.Search || app.panel == Panel.Layout || app.panel == Panel.Create || app.panel == Panel.Rename
+}
+fn changed(app: *App, text: []const u8) {
+  if !buffer.replace(app.document, text) { notice(app, "Edit rejected: invalid UTF-8, NUL, or document exceeds 65535 bytes.") }
+}
+fn text_input(app: *App, text: []const u8) {
+  if !buffer.valid(text) { notice(app, "Input must be UTF-8 text without NUL bytes.") return }
+  if prompting(app) {
+    if app.prompt_length + #len(text) >= 4096 { notice(app, "Input is too long.") return }
+    add_text(app.prompt[..], &app.prompt_length, text) app.selected = 0
+  } else if app.panel == Panel.None && app.insert { changed(app, text) }
+}
+fn clipboard_copy(app: *App) {
+  storage: [65536]u8 = [] doc := app.document
+  if doc.cursor == doc.anchor { return }
+  _ = copy_text(storage[..], doc.bytes[buffer.start(doc)..buffer.end(doc)])
+  if !sdl.clipboard_set(&storage[0]) { notice(app, "Clipboard copy failed.") }
+}
+fn clipboard_paste(app: *App) {
+  incoming := sdl.clipboard_get() if incoming == nil { notice(app, "Clipboard unavailable.") return }
+  defer sdl.free(#cast(rawptr) incoming)
+  length := c.string_length(incoming, 65536)
+  if length == 65536 { notice(app, "Clipboard exceeds document capacity.") return }
+  buffer.checkpoint(app.document) changed(app, incoming[..length]) buffer.checkpoint(app.document)
+}
+fn key_input(app: *App, typography: *Typography, key: u32, modifiers: u16) {
+  shift := (modifiers & 3) != 0 control := (modifiers & 192) != 0 doc := app.document
+  if key == 27 {
+    if app.panel != Panel.None { app.panel = Panel.None app.quit_after_save = false }
+    else { buffer.checkpoint(doc) app.insert = false app.extend = false doc.anchor = doc.cursor }
+    return
+  }
+  if app.panel == Panel.Quit {
+    if key == 115 { app.quit_after_save = true action(app, typography, 1) }
+    else if key == 100 { files.discard_recovery(&app.file) app.running = false }
+    return
+  }
+  if app.panel == Panel.Message {
+    if app.selected == 15 && key == 100 {
+      files.discard_recovery(&app.file) _ = buffer.load(doc, doc.saved[..doc.saved_length]) app.panel = Panel.None app.extend = false
+    } else if app.selected != 15 && key == 13 { app.panel = Panel.None }
+    return
+  }
+  if app.panel != Panel.None {
+    if prompting(app) && control && key == 118 {
+      pasted := sdl.clipboard_get()
+      if pasted == nil { notice(app, "Clipboard unavailable.") return }
+      defer sdl.free(#cast(rawptr) pasted)
+      paste_length := c.string_length(pasted, 4096)
+      if paste_length >= 4096 { notice(app, "Clipboard exceeds prompt capacity.") return }
+      text_input(app, pasted[..paste_length]) return
+    }
+    if key == 13 { submit(app, typography) return }
+    if app.panel == Panel.Directory {
+      if (key == 106 || key == 1073741905) && app.entry_selected + 1 < app.entry_count { app.entry_selected += 1 }
+      else if (key == 107 || key == 1073741906) && app.entry_selected > 0 { app.entry_selected -= 1 }
+      else if key == 99 { action(app, typography, 18) }
+      else if key == 114 { action(app, typography, 19) }
+      else if key == 100 { action(app, typography, 20) }
+      else if key == 8 {
+        length := app.directory_length
+        for length > 1 && app.directory[length - 1] == '/' { length -= 1 }
+        for length > 1 && app.directory[length - 1] != '/' { length -= 1 }
+        app.directory_length = length app.directory[length] = 0 directory_refresh(app)
+      }
+      return
+    }
+    if app.panel == Panel.Commands {
+      matches(app)
+      if key == 1073741905 && app.selected + 1 < app.match_count { app.selected += 1 }
+      if key == 1073741906 && app.selected > 0 { app.selected -= 1 }
+    }
+    if prompting(app) && key == 8 && app.prompt_length > 0 {
+      app.prompt_length -= 1
+      for app.prompt_length > 0 && (app.prompt[app.prompt_length] & 192) == 128 { app.prompt_length -= 1 }
+      app.prompt[app.prompt_length] = 0 app.selected = 0
+    }
+    return
+  }
+  if control {
+    if key == 111 { action(app, typography, 0) }
+    else if key == 115 { action(app, typography, 1) }
+    else if key == 112 { panel(app, Panel.Commands) }
+    else if key == 102 { action(app, typography, 3) }
+    else if key == 101 { action(app, typography, 7) }
+    else if key == 113 { action(app, typography, 16) }
+    else if key == 122 { if shift { buffer.redo(doc) } else { buffer.undo(doc) } }
+    else if key == 121 { buffer.redo(doc) }
+    else if key == 97 { doc.anchor = 0 doc.cursor = doc.length }
+    else if key == 99 { clipboard_copy(app) }
+    else if key == 118 { clipboard_paste(app) }
+    else if key == 61 || key == 43 { action(app, typography, 11) }
+    else if key == 45 { action(app, typography, 12) }
+    else if key == 48 { action(app, typography, 13) }
+    return
+  }
+  extend := app.extend || shift
+  if key == 1073741904 || (!app.insert && key == 104) { buffer.checkpoint(doc) buffer.move_to(doc, buffer.previous(doc, doc.cursor), extend) }
+  else if key == 1073741903 || (!app.insert && key == 108) { buffer.checkpoint(doc) buffer.move_to(doc, buffer.next(doc, doc.cursor), extend) }
+  else if key == 1073741906 || (!app.insert && key == 107) { buffer.checkpoint(doc) buffer.vertical(doc, false, extend) }
+  else if key == 1073741905 || (!app.insert && key == 106) { buffer.checkpoint(doc) buffer.vertical(doc, true, extend) }
+  else if key == 1073741898 { buffer.move_to(doc, buffer.line_start(doc, doc.cursor), extend) }
+  else if key == 1073741901 { buffer.move_to(doc, buffer.line_end(doc, doc.cursor), extend) }
+  else if key == 1073741899 || key == 1073741902 {
+    buffer.checkpoint(doc) count: usize = 0 for count < 20 { buffer.vertical(doc, key == 1073741902, extend) count += 1 }
+  }
+  else if app.insert {
+    if key == 8 { buffer.erase(doc, true) }
+    else if key == 127 { buffer.erase(doc, false) }
+    else if key == 13 { changed(app, "\n") }
+    else if key == 9 { changed(app, "    ") }
+  }
+  else if key == 105 { buffer.checkpoint(doc) app.insert = true app.extend = false }
+  else if key == 97 { buffer.move_to(doc, buffer.next(doc, doc.cursor), false) buffer.checkpoint(doc) app.insert = true app.extend = false }
+  else if key == 111 {
+    buffer.checkpoint(doc) buffer.move_to(doc, buffer.line_end(doc, doc.cursor), false) changed(app, "\n") app.insert = true app.extend = false
+  }
+  else if key == 118 { app.extend = !app.extend if app.extend { doc.anchor = doc.cursor } }
+  else if key == 120 { buffer.select_line(doc) }
+  else if key == 100 || key == 99 { buffer.checkpoint(doc) buffer.erase(doc, false) buffer.checkpoint(doc) app.extend = false if key == 99 { app.insert = true } }
+  else if key == 117 { if shift { buffer.redo(doc) } else { buffer.undo(doc) } }
+  else if key == 103 { if shift { buffer.move_to(doc, doc.length, extend) } else { buffer.move_to(doc, 0, extend) } }
+  else if key == 121 { clipboard_copy(app) }
+  else if key == 112 { clipboard_paste(app) }
+  else if key == 47 { action(app, typography, 3) }
+  else if key == 110 { if !buffer.find(doc, app.search[..app.search_length], shift) { notice(app, "No search match.") } }
+  else if key == 32 || key == 1073741882 { panel(app, Panel.Commands) }
+}
