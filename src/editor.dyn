@@ -9,9 +9,13 @@ use "std/mem" mem
 use "std/unicode/utf8" utf8
 
 struct Entry { name: [512]u8, length: usize, directory: bool }
-enum Panel { None, Commands, Open, SaveAs, Search, Message, Quit, Directory, Layout, Create, Rename, Trash }
+enum Panel { None, Commands, Open, SaveAs, Search, Message, Quit, Directory, Layout, Create, Rename, Trash, Buffers, Leader }
 struct App {
-  document: *buffer.Document, file: files.State, scratch: *mem.Arena,
+  completions: [128]Entry, completion_count: usize, completion_selected: usize, completion_chosen: bool, completion_error: bool,
+  completion_prefix: [4096]u8, completion_prefix_length: usize,
+  view_revision: u64, slots: [16]Slot, active: usize, buffer_count: usize, closing_one: bool,
+  line_numbers: bool, relative_numbers: bool, status_line: bool, highlight_line: bool,
+  document: *buffer.Document, file: *files.State, scratch: *mem.Arena,
   insert: bool, extend: bool, running: bool = true, panel: Panel,
   prompt: [4096]u8, prompt_length: usize, message: [8192]u8, message_length: usize,
   search: [4096]u8, search_length: usize,
@@ -21,7 +25,7 @@ struct App {
   recovery_revision: u64, quit_after_save: bool,
   window_title: [8192]u8, window_title_length: usize,
 }
-struct Typography { font: rawptr, document: rawptr, palette: rawptr, points: f32, scale: f32, cell: f32, line: f32, rendered_revision: u64 }
+struct Typography { font: rawptr, document: rawptr, palette: rawptr, points: f32, scale: f32, cell: f32, line: f32, rendered_revision: u64, rendered_document: *buffer.Document, rendered_view_revision: u64, chrome: rawptr }
 fn resize_font(typography: *Typography) {
   if !ttf.font_size(typography.font, typography.points * typography.scale) { #panic("font resize failed") }
   typography.line = typography.points * typography.scale * 1.5
@@ -46,6 +50,7 @@ fn notice(app: *App, text: []const u8) {
 fn panel(app: *App, kind: Panel) {
   buffer.checkpoint(app.document)
   app.panel = kind app.prompt_length = 0 app.prompt[0] = 0 app.selected = 0
+  if kind == Panel.Open { completion_refresh(app) }
 }
 fn lower(byte: u8) u8 { if byte >= 65 && byte <= 90 { return byte + 32 } return byte }
 fn contains(text: []const u8, query: []const u8) bool {
@@ -58,14 +63,14 @@ fn contains(text: []const u8, query: []const u8) bool {
   return false
 }
 fn command_name(id: usize) []const u8 {
-  if id == 0 { return "Open file                     Ctrl O" }
-  if id == 1 { return "Save                          Ctrl S" }
+  if id == 0 { return "Open file                     Space f" }
+  if id == 1 { return "Write / Save                  Space w" }
   if id == 2 { return "Save as" }
   if id == 3 { return "Search                        /" }
   if id == 4 { return "Find next                     n" }
   if id == 5 { return "Undo                          u" }
   if id == 6 { return "Redo                          U" }
-  if id == 7 { return "Directory buffer              Ctrl E" }
+  if id == 7 { return "Directory buffer              Space e" }
   if id == 8 { return "Load layout file" }
   if id == 9 { return "Switch layout: compact" }
   if id == 10 { return "Switch layout: wide" }
@@ -78,16 +83,27 @@ fn command_name(id: usize) []const u8 {
   if id == 17 { return "New empty buffer" }
   if id == 18 { return "Create file in directory" }
   if id == 19 { return "Rename selected directory entry" }
-  return "Move selected file to .dna-trash" }
+  if id == 20 { return "Move selected file to .dna-trash" }
+  if id == 21 { return "Buffers                       Space b" }
+  if id == 22 { return "Next buffer                   Space n" }
+  if id == 23 { return "Previous buffer               Space p" }
+  if id == 24 { return "Close buffer                  Space c" }
+  if id == 25 { return "Toggle line numbers" }
+  if id == 26 { return "Toggle status line" }
+  if id == 27 { return "Toggle relative line numbers" }
+  return "Toggle current-line highlight"
+}
 fn matches(app: *App) {
   app.match_count = 0 index: usize = 0
-  for index < 21 {
+  for index < 29 {
     if contains(command_name(index), app.prompt[..app.prompt_length]) { app.matches[app.match_count] = index app.match_count += 1 }
     index += 1
   }
   if app.selected >= app.match_count { app.selected = 0 }
 }
 fn directory_refresh(app: *App) {
+  previous_name: [512]u8 = [] previous_length: usize = 0
+  if app.entry_selected < app.entry_count { previous := &app.entries[app.entry_selected] previous_length = copy_text(previous_name[..], previous.name[..previous.length]) }
   storage: [8192]u8 = []
   opened := fs.open_directory(app.directory[..app.directory_length], storage[..])
   if !opened.ok { notice(app, "Cannot read directory.") return }
@@ -99,6 +115,7 @@ fn directory_refresh(app: *App) {
     if #len(entry.name) >= 512 || !utf8.valid(entry.name) { continue }
     output := &app.entries[app.entry_count]
     output.length = copy_text(output.name[..], entry.name) output.directory = entry.kind == 4
+    if buffer.equal(output.name[..output.length], previous_name[..previous_length]) { app.entry_selected = app.entry_count }
     app.entry_count += 1
   }
 }
@@ -112,8 +129,19 @@ fn joined(app: *const App, leaf: []const u8, output: []u8) []const u8 {
 }
 fn open_file(app: *App, path: []const u8) {
   normalized: [4096]u8 = [] resolved := files.resolve(path, normalized[..])
-  error := files.open(&app.file, app.document, resolved, app.scratch)
-  if #len(error) > 0 { notice(app, error) return }
+  if #len(resolved) == 0 { notice(app, "Invalid path or missing parent directory.") return }
+  index: usize = 0 for index < 16 {
+    if app.slots[index].document != nil && buffer.equal(files.name(&app.slots[index].file), resolved) { activate(app, index) return }
+    index += 1
+  }
+  previous := app.active
+  reuse := app.file.length == 0 && app.document.length == 0 && !buffer.dirty(app.document)
+  if !reuse && !new_buffer(app) { return }
+  error := files.open(app.file, app.document, resolved, app.scratch)
+  if #len(error) > 0 {
+    if !reuse { close_clean(app) activate(app, previous) }
+    notice(app, error) return
+  }
   app.panel = Panel.None app.insert = false app.extend = false app.scroll_x = 0.0 app.scroll_y = 0.0
   at := app.file.length for at > 0 && app.file.path[at - 1] != '/' { at -= 1 }
   if at > 1 { at -= 1 }
@@ -122,16 +150,16 @@ fn open_file(app: *App, path: []const u8) {
 }
 fn save_file(app: *App, path: []const u8) {
   normalized: [4096]u8 = [] resolved := files.resolve(path, normalized[..])
-  error := files.save(&app.file, app.document, resolved, app.scratch)
+  error := files.save(app.file, app.document, resolved, app.scratch)
   if #len(error) > 0 { app.quit_after_save = false notice(app, error) return }
   buffer.checkpoint(app.document) app.panel = Panel.None
-  if app.quit_after_save { app.running = false }
+  if app.quit_after_save { app.quit_after_save = false if app.closing_one { close_clean(app) } else { request_quit(app) } }
 }
 fn action(app: *App, typography: *Typography, id: usize) {
   app.panel = Panel.None
   if id == 0 { panel(app, Panel.Open) }
-  else if id == 1 { if app.file.length == 0 { panel(app, Panel.SaveAs) } else { save_file(app, files.name(&app.file)) } }
-  else if id == 2 { panel(app, Panel.SaveAs) app.prompt_length = copy_text(app.prompt[..], files.name(&app.file)) }
+  else if id == 1 { if app.file.length == 0 { panel(app, Panel.SaveAs) } else { save_file(app, files.name(app.file)) } }
+  else if id == 2 { panel(app, Panel.SaveAs) app.prompt_length = copy_text(app.prompt[..], files.name(app.file)) }
   else if id == 3 { panel(app, Panel.Search) }
   else if id == 4 { if !buffer.find(app.document, app.search[..app.search_length], false) { notice(app, "No search match.") } }
   else if id == 5 { buffer.undo(app.document) }
@@ -143,15 +171,20 @@ fn action(app: *App, typography: *Typography, id: usize) {
   else if id == 11 { if typography.points < 36.0 { typography.points += 1.0 } resize_font(typography) }
   else if id == 12 { if typography.points > 12.0 { typography.points -= 1.0 } resize_font(typography) }
   else if id == 13 { typography.points = 20.0 resize_font(typography) }
-  else if id == 14 { error := files.recover(&app.file, app.document, app.scratch) if #len(error) > 0 { notice(app, error) } }
+  else if id == 14 { error := files.recover(app.file, app.document, app.scratch) if #len(error) > 0 { notice(app, error) } }
   else if id == 15 { panel(app, Panel.Message) app.message_length = copy_text(app.message[..], "Discard edits? Press D to discard, or Escape to cancel.") app.selected = 15 }
-  else if id == 16 { if buffer.dirty(app.document) { panel(app, Panel.Quit) } else { app.running = false } }
-  else if id == 17 {
-    if buffer.dirty(app.document) { notice(app, "Save or discard edits before creating a new buffer.") }
-    else { files.discard_recovery(&app.file) _ = buffer.load(app.document, "") app.file.length = 0 app.file.recovery_owned = false app.scroll_x = 0.0 app.scroll_y = 0.0 }
-  }
+  else if id == 16 { request_quit(app) }
+  else if id == 17 { _ = new_buffer(app) }
   else if id == 18 { panel(app, Panel.Create) }
   else if id == 19 { if app.entry_count == 0 { notice(app, "Open a directory and select an entry first.") } else { app.panel = Panel.Rename app.prompt_length = 0 app.prompt[0] = 0 } }
+  else if id == 21 { panel(app, Panel.Buffers) }
+  else if id == 22 { next_buffer(app, false) }
+  else if id == 23 { next_buffer(app, true) }
+  else if id == 24 { if buffer.dirty(app.document) { app.closing_one = true panel(app, Panel.Quit) } else { close_clean(app) } }
+  else if id == 25 { app.line_numbers = !app.line_numbers }
+  else if id == 26 { app.status_line = !app.status_line }
+  else if id == 27 { app.relative_numbers = !app.relative_numbers }
+  else if id == 28 { app.highlight_line = !app.highlight_line }
   else if id == 20 { if app.entry_count == 0 { notice(app, "Open a directory and select a file first.") } else { app.panel = Panel.Trash } }
 }
 fn valid_leaf(name: []const u8) bool {
@@ -164,7 +197,11 @@ fn move_entry(app: *App, trash: bool) {
   entry := &app.entries[app.entry_selected]
   if entry.directory { notice(app, "Directory moves are not enabled in this version.") return }
   source_storage: [4096]u8 = [] source := joined(app, entry.name[..entry.length], source_storage[..])
-  if buffer.dirty(app.document) { notice(app, "Save the open document before moving its file.") return }
+  affected: usize = 0 for affected < 16 {
+    slot := &app.slots[affected]
+    if slot.document != nil && buffer.equal(source, files.name(&slot.file)) && buffer.dirty(slot.document) { notice(app, "Save the affected buffer before moving its file.") return }
+    affected += 1
+  }
   destination_storage: [4096]u8 = [] destination: []const u8 = destination_storage[..0]
   if trash {
     trash_storage: [4096]u8 = [] trash_path := joined(app, ".dna-trash", trash_storage[..])
@@ -176,12 +213,17 @@ fn move_entry(app: *App, trash: bool) {
   } else { if !valid_leaf(app.prompt[..app.prompt_length]) { notice(app, "Enter a single valid filename.") return } destination = joined(app, app.prompt[..app.prompt_length], destination_storage[..]) }
   if #len(source) == 0 || #len(destination) == 0 { notice(app, "Path is too long.") return }
   if #syscall(316, -100, &source_storage[0], -100, &destination_storage[0], 1) != 0 { notice(app, "Move failed: destination may already exist or permissions deny the move.") return }
-  if buffer.equal(source, files.name(&app.file)) { files.discard_recovery(&app.file) _ = files.set_name(&app.file, destination) }
+  updated: usize = 0 for updated < 16 {
+    moved := &app.slots[updated]
+    if moved.document != nil && buffer.equal(source, files.name(&moved.file)) { files.discard_recovery(&moved.file) _ = files.set_name(&moved.file, destination) }
+    updated += 1
+  }
   app.panel = Panel.Directory directory_refresh(app)
 }
 fn submit(app: *App, typography: *Typography) {
-  if app.panel == Panel.Commands { matches(app) if app.match_count > 0 { action(app, typography, app.matches[app.selected]) } }
-  else if app.panel == Panel.Open { open_file(app, app.prompt[..app.prompt_length]) }
+  if app.panel == Panel.Commands { command_submit(app, typography) }
+  else if app.panel == Panel.Open { open_prompt(app) }
+  else if app.panel == Panel.Buffers { buffer_matches(app) if app.match_count > 0 { activate(app, app.matches[app.selected]) } }
   else if app.panel == Panel.SaveAs { save_file(app, app.prompt[..app.prompt_length]) }
   else if app.panel == Panel.Search {
     app.search_length = copy_text(app.search[..], app.prompt[..app.prompt_length])
@@ -193,8 +235,10 @@ fn submit(app: *App, typography: *Typography) {
     read := fs.read_all(app.scratch, app.prompt[..app.prompt_length], 4096)
     if !read.ok { notice(app, "Cannot read layout file.") return }
     parsed := layout.parse(read.data)
-    if !parsed.ok { notice(app, "Invalid layout. Use popup_width/height = 0.25..1.0 and font_size = 12..36; no duplicate or unknown keys.") return }
-    app.popup_width = parsed.width app.popup_height = parsed.height typography.points = parsed.font_size resize_font(typography) app.panel = Panel.None
+    if !parsed.ok { notice(app, "Invalid layout. Popup fractions: 0.25..1; font_size: 12..36; line_numbers, relative_numbers, status_line, highlight_line: 0 or 1. No duplicate/unknown keys.") return }
+    app.popup_width = parsed.width app.popup_height = parsed.height typography.points = parsed.font_size
+    app.line_numbers = parsed.line_numbers app.relative_numbers = parsed.relative_numbers app.status_line = parsed.status_line app.highlight_line = parsed.highlight_line
+    resize_font(typography) app.panel = Panel.None
   }
   else if app.panel == Panel.Directory {
     if app.entry_count == 0 { return }
@@ -216,8 +260,21 @@ fn submit(app: *App, typography: *Typography) {
 }
 fn popup_text(app: *App, output: []u8) usize {
   used: usize = 0
-  if app.panel == Panel.Commands {
-    matches(app) add_text(output, &used, "Commands  /  ") add_text(output, &used, app.prompt[..app.prompt_length]) add_text(output, &used, "\n\n")
+  if app.panel == Panel.Leader { add_text(output, &used, "Space\n\nf  Open file    e  Directory    b  Buffers\nw  Write        n  Next         p  Previous\nc  Close buffer :  Commands\n\nEscape cancels") }
+  else if app.panel == Panel.Buffers {
+    buffer_matches(app) add_text(output, &used, "Buffers / ") add_text(output, &used, app.prompt[..app.prompt_length]) add_text(output, &used, "\n\n")
+    first_buffer: usize = 0 if app.selected > 4 { first_buffer = app.selected - 4 }
+    row := first_buffer for row < app.match_count && row < first_buffer + 7 {
+      slot := &app.slots[app.matches[row]]
+      if row == app.selected { add_text(output, &used, "> ") } else { add_text(output, &used, "  ") }
+      add_number(output, &used, app.matches[row] + 1) add_text(output, &used, "  ")
+      if buffer.dirty(slot.document) { add_text(output, &used, "[+] ") }
+      if slot.file.length == 0 { add_text(output, &used, "Untitled") } else { add_text(output, &used, files.name(&slot.file)) }
+      add_text(output, &used, "\n") row += 1
+    }
+  }
+  else if app.panel == Panel.Commands {
+    matches(app) add_text(output, &used, "Commands  :  ") add_text(output, &used, app.prompt[..app.prompt_length]) add_text(output, &used, "\n\n")
     first: usize = 0 if app.selected > 4 { first = app.selected - 4 }
     index := first for index < app.match_count && index < first + 7 {
       if index == app.selected { add_text(output, &used, "> ") } else { add_text(output, &used, "  ") }
@@ -225,7 +282,7 @@ fn popup_text(app: *App, output: []u8) usize {
     }
     if app.match_count == 0 { add_text(output, &used, "No matching commands.\n") }
   } else if app.panel == Panel.Message { add_text(output, &used, app.message[..app.message_length]) }
-  else if app.panel == Panel.Quit { add_text(output, &used, "Unsaved changes\n\nS  Save and quit\nD  Discard and quit\nEscape  Cancel") }
+  else if app.panel == Panel.Quit { add_text(output, &used, "Unsaved changes in this buffer\n\nS  Save and continue closing\nD  Discard and continue closing\nEscape  Cancel") }
   else if app.panel == Panel.Directory {
     add_text(output, &used, app.directory[..app.directory_length]) add_text(output, &used, "\nEnter open / Backspace parent / c create / r rename / d trash\n\n")
     first_entry: usize = 0 if app.entry_selected > 4 { first_entry = app.entry_selected - 4 }
@@ -249,7 +306,21 @@ fn popup_text(app: *App, output: []u8) usize {
       add_text(output, &used, "Rename selected file to")
       if app.entry_selected < app.entry_count { add_text(output, &used, "\nFrom: ") renamed := &app.entries[app.entry_selected] add_text(output, &used, renamed.name[..renamed.length]) }
     }
-    add_text(output, &used, "\n\n> ") add_text(output, &used, app.prompt[..app.prompt_length]) add_text(output, &used, "_\n\nEnter confirms. Escape cancels.")
+    add_text(output, &used, "\n\n> ") add_text(output, &used, app.prompt[..app.prompt_length]) add_text(output, &used, "_\n\n")
+    if app.panel == Panel.Open {
+      first_path: usize = 0 if app.completion_selected > 3 { first_path = app.completion_selected - 3 }
+      item := first_path for item < app.completion_count && item < first_path + 5 {
+        candidate := &app.completions[item]
+        if item == app.completion_selected { add_text(output, &used, "> ") } else { add_text(output, &used, "  ") }
+        add_text(output, &used, candidate.name[..candidate.length]) if candidate.directory { add_text(output, &used, "/") }
+        add_text(output, &used, "\n") item += 1
+      }
+      if app.completion_error { add_text(output, &used, "Cannot list this directory.\n") }
+      else if app.completion_count == 0 { add_text(output, &used, "No matching paths.\n") }
+      if app.completion_count == 128 { add_text(output, &used, "First 128 matches; type more to narrow.\n") }
+      add_text(output, &used, "Tab complete / arrows choose / Enter open\n")
+    }
+    add_text(output, &used, "Enter confirms. Escape cancels.")
   }
   return used
 }

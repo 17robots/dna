@@ -35,6 +35,7 @@ bool SDL_WaitEventTimeout(SDL_Event *event, int milliseconds) {
             text.text.text = "a ";
             if (!SDL_PushEvent(&text)) exit(1);
         }
+    } else if (saw_complete_document) {
         queue_key(SDLK_ESCAPE, 0);
         queue_key(SDLK_Q, SDL_KMOD_CTRL);
         queue_key(SDLK_D, 0);

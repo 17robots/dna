@@ -8,7 +8,8 @@ the production UI or implementation technology.
 ## Experience
 
 The default screen contains only the current file buffer. No persistent toolbar,
-sidebar, layout selector, tabs, or required status line. Supporting views appear
+sidebar, layout selector, or tabs. A hideable line-number gutter and slim status
+line are enabled by default, with subtle current-line highlighting. Supporting views appear
 as popup buffers when invoked by a keybinding or command. Optional arrangements
 can keep views visible without assigning any view a permanent sidebar role.
 
@@ -146,10 +147,10 @@ packaging, permissions and isolation; remote synchronization protocol; full Vim
 compatibility scope; complete accessibility and platform integration design.
 
 Current prototype: the separate `dna` repository implements native SDL3/SDL_ttf
-rendering, a single UTF-8 file buffer, modal selection/editing, undo/redo, search,
+rendering, multiple UTF-8 file buffers, modal selection/editing, undo/redo, search,
 command and directory popups, individual file create/rename/trash actions,
-validated popup/font layout files, explicit saves, and named-file recovery.
+validated popup/font/chrome layout files, explicit saves, and named-file recovery.
 README.md describes the tested behavior and limits. This is not yet the complete
 architecture above: directory batches, nested/persistent supporting buffers,
-relative splits, editing profiles, extension interfaces, and a shared TUI remain
+relative splits, persistent sessions, editing profiles, extension interfaces, and a shared TUI remain
 next steps. Keep editor application code out of the compiler repository.

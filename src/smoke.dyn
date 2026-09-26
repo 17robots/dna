@@ -67,3 +67,60 @@ fn whitespace_smoke(app: *App, typography: *Typography) {
   if !buffer.equal(doc.bytes[..doc.length], "a  \n    ") { #panic("spaces must remain in document") }
   _ = buffer.load(doc, "") app.insert = false
 }
+fn session_smoke(app: *App, typography: *Typography) {
+  original := app.active
+  original_doc := app.document
+  buffer.move_to(original_doc, 2, false) app.scroll_y = 30.0
+  _ = buffer.replace(original_doc, "first edit") buffer.checkpoint(original_doc)
+  key_input(app, typography, 58, 0) text_input(app, "enew") key_input(app, typography, 13, 0)
+  if app.document == original_doc || app.buffer_count != 2 { #panic("new buffer must retain old document") }
+  second := app.active
+  _ = buffer.replace(app.document, "second edit") buffer.checkpoint(app.document)
+  key_input(app, typography, 32, 0) key_input(app, typography, 112, 0)
+  if app.active != original || app.scroll_y != 30.0 || !buffer.dirty(app.document) { #panic("buffer view restoration") }
+  buffer.undo(app.document)
+  if buffer.dirty(app.document) { #panic("independent undo") }
+  activate(app, second)
+  if !buffer.equal(app.document.bytes[..app.document.length], "second edit") { #panic("other buffer edits retained") }
+  key_input(app, typography, 32, 0) key_input(app, typography, 99, 0)
+  if app.panel != Panel.Quit || !app.closing_one { #panic("dirty close confirmation") }
+  key_input(app, typography, 27, 0)
+  if app.buffer_count != 2 { #panic("close cancellation") }
+  action(app, typography, 24) key_input(app, typography, 100, 0)
+  if app.buffer_count != 1 || app.active != original { #panic("close only selected buffer") }
+  // Quit must discover edits in an inactive buffer.
+  _ = buffer.replace(app.document, "unsaved")
+  _ = new_buffer(app)
+  request_quit(app)
+  if app.panel != Panel.Quit || app.active != original || !app.running { #panic("hidden dirty buffer quit") }
+  key_input(app, typography, 27, 0)
+  _ = buffer.load(app.document, app.document.saved[..app.document.saved_length])
+  next_buffer(app, false) close_clean(app)
+  app.scroll_y = 0.0 app.insert = false app.extend = false
+  // Palette toggles remain accessible without control modifiers.
+  key_input(app, typography, 59, 1) text_input(app, "toggle status line") key_input(app, typography, 13, 0)
+  if app.status_line { #panic("status toggle") }
+  action(app, typography, 26)
+}
+fn completion_smoke(app: *App, typography: *Typography) {
+  storage: [4096]u8 = [] directory := process.environment("DNA_WORKFLOW_TEST", storage[..])
+  if !directory.ok || !directory.found { return }
+  old := app.active before := app.buffer_count
+  key_input(app, typography, 32, 0) key_input(app, typography, 102, 0)
+  if app.panel != Panel.Open { #panic("leader open") }
+  text_input(app, directory.value) text_input(app, "/sub")
+  if app.completion_count != 1 || !app.completions[0].directory { #panic("directory suggestions") }
+  key_input(app, typography, 9, 0)
+  if app.prompt[app.prompt_length - 1] != '/' { #panic("Tab directory completion") }
+  text_input(app, "other") key_input(app, typography, 13, 0)
+  if app.panel != Panel.None || !buffer.equal(app.document.bytes[..app.document.length], "other file\n") || app.buffer_count != before + 1 { #panic("file completion and new buffer") }
+  open_file(app, files.name(app.file))
+  if app.buffer_count != before + 1 { #panic("duplicate open buffer") }
+  key_input(app, typography, 32, 0) key_input(app, typography, 98, 0)
+  text_input(app, "input.txt") key_input(app, typography, 13, 0)
+  if app.active != old { #panic("filtered buffer switcher") }
+  next_buffer(app, false) close_clean(app)
+  expanded: [4096]u8 = [] home: [4096]u8 = [] env := process.environment("HOME", home[..])
+  result := expand_home("~/", expanded[..])
+  if env.ok && env.found && (#len(result) != #len(env.value) + 1 || !buffer.equal(result[..#len(env.value)], env.value)) { #panic("home expansion") }
+}

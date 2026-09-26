@@ -5,15 +5,16 @@ fn queue_key(value: u32, modifiers: u16) {
   if !sdl.push(&event) { #panic("queue key failed") }
 }
 fn main() {
-  owned := mem.arena_create(#sizeof(buffer.Document) + #sizeof(App) + 128)
+  owned := mem.arena_create(#sizeof(App) + 128)
   scratch := mem.arena_create(2097152)
   if !owned.ok || !scratch.ok { #panic("editor allocation failed") }
   defer _ = mem.arena_release(&owned.arena)
   defer _ = mem.arena_release(&scratch.arena)
-  doc := #cast(*buffer.Document) mem.arena_push(&owned.arena, #sizeof(buffer.Document), #alignof(buffer.Document))
   app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
-  app.document = doc app.scratch = &scratch.arena app.running = true app.popup_width = 0.64 app.popup_height = 0.56
-  _ = buffer.load(doc, "")
+  app.scratch = &scratch.arena app.running = true app.popup_width = 0.64 app.popup_height = 0.56
+  app.line_numbers = true app.relative_numbers = true app.status_line = true app.highlight_line = true
+  if !new_buffer(app) { #panic("document allocation failed") }
+  defer release_buffers(app)
   cwd := #syscall(79, &app.directory[0], 4096)
   if cwd <= 0 { #panic("working directory unavailable") }
   app.directory_length = #cast(usize) cwd - 1
@@ -50,7 +51,7 @@ fn main() {
   engine := ttf.engine(renderer) if engine == nil { #panic("text engine failed") }
   defer ttf.destroy_engine(engine)
 
-  document := ttf.create(engine, font, &doc.bytes[0], doc.length)
+  document := ttf.create(engine, font, &app.document.bytes[0], app.document.length)
   if document == nil { #panic("document text failed") }
   defer ttf.destroy(document)
   empty: [1]u8 = [0]
@@ -58,7 +59,10 @@ fn main() {
   if palette == nil { #panic("palette text failed") }
   defer ttf.destroy(palette)
   if !ttf.whitespace_visible(document, true) || !ttf.wrap(document, 0) || !ttf.color(document, 205, 214, 224, 255) || !ttf.color(palette, 218, 228, 235, 255) { #panic("text style failed") }
-  typography := Typography{font: font, document: document, palette: palette, points: 20.0, scale: sdl.display_scale(window)}
+  chrome := ttf.create(engine, font, &empty[0], 0)
+  if chrome == nil { #panic("chrome text failed") }
+  defer ttf.destroy(chrome)
+  typography := Typography{chrome: chrome,font: font, document: document, palette: palette, points: 20.0, scale: sdl.display_scale(window)}
   if typography.scale <= 0.0 { typography.scale = 1.0 }
   resize_font(&typography)
   environment: [16]u8 = [] smoke := process.environment("DYN_EDITOR_SMOKE", environment[..])
@@ -67,7 +71,9 @@ fn main() {
     if #sizeof(sdl.Event) != 128 || #sizeof(sdl.KeyEvent) != 40 || #sizeof(sdl.TextEvent) != 32 || #sizeof(ttf.Substring) != 36 { #panic("unexpected ABI") }
     whitespace_smoke(app, &typography)
     workflow_smoke(app, &typography)
-    _ = buffer.load(doc, "one\ntwo\nthree\n") app.file.length = 0 app.panel = Panel.None
+    completion_smoke(app, &typography)
+    session_smoke(app, &typography)
+    _ = buffer.load(app.document, "one\ntwo\nthree\n") app.file.length = 0 app.panel = Panel.None
     queue_key(105, 0)
     simulated := sdl.Event{} incoming := #cast(*sdl.TextEvent) &simulated incoming.kind = 771
     input_text := c.string_from_bytes(input_storage[..], "aé中") incoming.text = input_text.value
@@ -87,10 +93,14 @@ fn main() {
       receiving = wants_text
     }
     if !sdl.wait_timeout(&event, 500) {
-      if doc.revision != app.recovery_revision {
-        app.recovery_revision = doc.revision
-        error := files.snapshot(&app.file, doc)
-        if #len(error) > 0 { notice(app, error) draw(renderer, window, app, &typography) }
+      recovery_index: usize = 0 for recovery_index < 16 {
+        slot := &app.slots[recovery_index]
+        if slot.document != nil && slot.document.revision != slot.recovery_revision {
+          slot.recovery_revision = slot.document.revision
+          error := files.snapshot(&slot.file, slot.document)
+          if #len(error) > 0 { notice(app, error) draw(renderer, window, app, &typography) }
+        }
+        recovery_index += 1
       }
       continue
     }
@@ -124,8 +134,8 @@ fn main() {
     }
     if redraw { draw(renderer, window, app, &typography) }
   }
-  if !buffer.dirty(doc) { files.discard_recovery(&app.file) }
+  if !buffer.dirty(app.document) { files.discard_recovery(app.file) }
   if smoke.ok && smoke.found {
-    if !buffer.equal(doc.bytes[..doc.length], "aé\none\ntwo\nthree\n") || app.insert { #panic("editing smoke failed") }
+    if !buffer.equal(app.document.bytes[..app.document.length], "one\ntwo\nthree\n") || app.insert { #panic("editing smoke failed") }
   }
 }

@@ -1,0 +1,71 @@
+// Documents own their storage; switching views never copies text or undo history.
+struct Slot { arena: mem.Arena, document: *buffer.Document, file: files.State, scroll_x: f32, scroll_y: f32, insert: bool, extend: bool, recovery_revision: u64 }
+fn activate(app: *App, index: usize) {
+  if app.document != nil {
+    previous := &app.slots[app.active]
+    buffer.checkpoint(app.document)
+    previous.scroll_x = app.scroll_x previous.scroll_y = app.scroll_y previous.insert = app.insert previous.extend = app.extend
+  }
+  app.view_revision += 1
+  app.active = index current := &app.slots[index]
+  app.document = current.document app.file = &current.file
+  app.scroll_x = current.scroll_x app.scroll_y = current.scroll_y app.insert = current.insert app.extend = current.extend
+  app.panel = Panel.None
+}
+fn new_buffer(app: *App) bool {
+  index: usize = 0 for index < 16 && app.slots[index].document != nil { index += 1 }
+  if index == 16 { notice(app, "Buffer limit reached (16). Close a buffer first.") return false }
+  allocated := mem.arena_create(#sizeof(buffer.Document))
+  if !allocated.ok { notice(app, "Cannot allocate document.") return false }
+  slot := &app.slots[index] slot.arena = allocated.arena
+  slot.document = #cast(*buffer.Document) mem.arena_push(&slot.arena, #sizeof(buffer.Document), #alignof(buffer.Document))
+  _ = buffer.load(slot.document, "")
+  app.buffer_count += 1 activate(app, index) return true
+}
+fn release_buffers(app: *App) {
+  index: usize = 0 for index < 16 {
+    slot := &app.slots[index]
+    if slot.document != nil { if !buffer.dirty(slot.document) { files.discard_recovery(&slot.file) } _ = mem.arena_release(&slot.arena) }
+    index += 1
+  }
+}
+fn next_buffer(app: *App, backwards: bool) {
+  step: usize = 1 for step <= 16 {
+    index := (app.active + step) % 16 if backwards { index = (app.active + 16 - step) % 16 }
+    if app.slots[index].document != nil { activate(app, index) return } step += 1
+  }
+}
+fn close_clean(app: *App) {
+  slot := &app.slots[app.active]
+  files.discard_recovery(&slot.file)
+  if app.buffer_count == 1 {
+    _ = buffer.load(slot.document, "") slot.file.length = 0 slot.file.path[0] = 0
+    app.scroll_x = 0.0 app.scroll_y = 0.0 app.insert = false app.extend = false app.panel = Panel.None app.view_revision += 1
+    return
+  }
+  _ = mem.arena_release(&slot.arena)
+  slot.document = nil slot.file.length = 0 slot.file.recovery_owned = false slot.scroll_x = 0.0 slot.scroll_y = 0.0 slot.insert = false slot.extend = false slot.recovery_revision = 0
+  app.document = nil app.buffer_count -= 1
+  if app.buffer_count == 0 { _ = new_buffer(app) } else { next_buffer(app, false) }
+}
+fn request_quit(app: *App) {
+  index: usize = 0 for index < 16 {
+    if app.slots[index].document != nil && buffer.dirty(app.slots[index].document) {
+      activate(app, index) app.closing_one = false panel(app, Panel.Quit) return
+    }
+    index += 1
+  }
+  app.running = false
+}
+fn buffer_matches(app: *App) {
+  app.match_count = 0 index: usize = 0
+  for index < 16 {
+    slot := &app.slots[index]
+    if slot.document != nil {
+      name := files.name(&slot.file) if #len(name) == 0 { name = "Untitled" }
+      if contains(name, app.prompt[..app.prompt_length]) { app.matches[app.match_count] = index app.match_count += 1 }
+    }
+    index += 1
+  }
+  if app.selected >= app.match_count { app.selected = 0 }
+}

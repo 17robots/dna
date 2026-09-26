@@ -1,7 +1,8 @@
 # DNA
 
 A native modal editor prototype written in Dyn. The window shows your document;
-commands, search, files, and layout controls appear as keyboard-invoked popups.
+line numbers and a slim status line provide orientation. Commands, search, files,
+and buffer switching appear as keyboard-invoked popups.
 No web runtime. [DESIGN.md](DESIGN.md) records the broader product direction.
 
 ## Run
@@ -33,11 +34,14 @@ is needed with this environment. `just smoke-direct` checks this direct-run path
 without inheriting the library paths from `just`.
 
 Start in normal mode. Press `i` to type, Escape to return to normal mode,
-`Ctrl S` to save, and Space or `Ctrl P` for searchable commands. An unnamed
+`Space w` to save, and `:` for searchable commands. Space opens a shortcut guide;
+Ctrl shortcuts remain alternatives. An unnamed
 buffer prompts for a new destination when saved. File paths in Open/Save As
 are relative to the directory where DNA was launched; directory-buffer create
-and rename operations use the directory being displayed. Paths are literal:
-no shell expansion of `~`, environment variables, or globs.
+and rename operations use the directory being displayed. Open expands `~`/`~/` and suggests matching files/directories as you type.
+Tab completes, arrows choose, and Enter opens a file or enters a directory.
+Completion uses filename prefixes, showing at most 128 matches. No shell expansion
+of environment variables or globs is performed.
 
 Text uses antialiased fonts, 1.5× line spacing, and display-aware scaling. Zed Mono
 is preferred, with Noto Sans Mono as fallback. Choose a font with
@@ -62,11 +66,33 @@ with movement, and typing in insert mode replaces a selection.
 | Undo / redo | `u` / `Shift U`; `Ctrl Z` / `Ctrl Shift Z` or `Ctrl Y` |
 | Copy / paste | `y` / `p`; `Ctrl C` / `Ctrl V` |
 | Search; next/previous match | `/` or `Ctrl F`; `n` / `Shift N` |
-| Command palette | Space or F1 in normal mode; `Ctrl P` |
-| Open / save | `Ctrl O` / `Ctrl S` |
-| Directory buffer | `Ctrl E` |
+| Command palette | `:` or F1 in normal mode; `Ctrl P` |
+| Shortcut guide | Space |
+| Buffer picker / next / previous | `Space b` / `Space n` / `Space p` |
+| Close current buffer | `Space c` or `:bd` |
+| New empty buffer | `:enew` |
+| Open / save | `Space f` / `Space w`; `Ctrl O` / `Ctrl S` |
+| Directory buffer | `Space e`; `Ctrl E` |
 | Font larger/smaller/reset | `Ctrl +` / `Ctrl -` / `Ctrl 0` |
-| Quit | `Ctrl Q` or close window |
+| Quit | `:q`, `Ctrl Q`, or close window |
+
+The command palette supports descriptive names and short commands: `open`/`e`,
+`write`/`w`, `quit`/`q`, `buffers`/`b`, `bn`, `bp`, `bd`, and `enew`. `:open path`
+and `:write path` accept a literal path (including spaces) and expand `~/`.
+
+Each document retains its text, undo history, cursor, selection, editing mode,
+and scroll position when switched away. Opening another file preserves the
+current buffer, including unsaved edits; reopening the same resolved path switches
+to its existing buffer. Buffer search filters by filename and marks modified files.
+Closing a modified buffer prompts for save/discard/cancel. Quit visits every dirty
+buffer, including hidden ones; Escape cancels further closing. Confirmed discards
+before cancellation remain discarded. Buffer/session state is not persisted across
+launches.
+
+Line numbers are relative except for the current line, which shows its absolute
+number. The status line shows mode, filename, modified state, buffer count,
+line/column, and selected codepoints. Palette commands independently toggle line
+numbers, relative numbering, the status line, and current-line highlighting.
 
 In prompts, type and press Enter; Backspace edits the query. The palette filters
 case-insensitively; arrows select a command. Document search is literal,
@@ -83,16 +109,21 @@ Restore trashed files manually from `.dna-trash`; collisions there are refused.
 
 Use **Load layout file** in the palette, or the built-in compact/wide commands.
 Examples are in `layouts/`. The current layout implementation controls popup
-size and font size; document splits and arbitrary buffer placement are future work.
+size, font size, and document chrome; document splits and arbitrary buffer placement are future work.
 
 ```ini
 popup_width = 0.64
 popup_height = 0.56
 font_size = 20
+line_numbers = 1
+relative_numbers = 1
+status_line = 1
+highlight_line = 1
 ```
 
 Popup dimensions are fractions of the window, between 0.25 and 1.0. Font size
-is 12–36. Blank lines and whole-line `#` comments are accepted. Duplicate/unknown
+is 12–36. Chrome switches use 0/1 and default to enabled.
+`layouts/minimal.dna-layout` hides the gutter, status line, and line highlight. Blank lines and whole-line `#` comments are accepted. Duplicate/unknown
 keys and invalid values are rejected before anything changes. Popups expand when
 needed for readable content, capped by the window. Switching layouts preserves
 text, selections, and undo history. It does not persist changes to a layout file.
@@ -102,11 +133,11 @@ text, selections, and undo history. It does not persist changes to a layout file
 Saving writes a sibling temporary file, flushes it, then renames it over the
 original. Existing file permission bits are preserved. A content check refuses
 to overwrite a file changed externally; Save As only creates new destinations.
-Opening another file or creating a new buffer refuses to discard unsaved edits.
-Quit offers save/discard/cancel. The palette also provides an explicit discard
+Opening another file or creating a new buffer retains unsaved edits in its original
+buffer. Close and quit offer save/discard/cancel. The palette also provides an explicit discard
 confirmation. Symlink files are refused; open their targets explicitly.
 
-For a **named, modified** document, a 500 ms idle period writes a separate
+For each **named, modified** document, including inactive buffers, a 500 ms idle period writes a separate
 `<filename>.dna-recovery` snapshot with private permissions. It never autosaves
 the original. After a crash, reopen the original and choose **Restore recovery
 snapshot**, then save normally. An existing unclaimed snapshot is preserved until
@@ -121,14 +152,15 @@ not a replacement for backups or version control.
 
 ## Current limits
 
-- One open document, up to **65,535 UTF-8 bytes**; NUL/binary files are refused.
+- Up to **16 open documents**, each up to **65,535 UTF-8 bytes**; NUL/binary files
+  are refused. Storage allocates lazily, roughly 4.3 MiB per open document.
 - Up to 64 undo states, with insert runs grouped until movement/mode changes.
 - UTF-8 codepoint movement/deletion; grapheme-aware editing, composed-character
   cursor behavior, IME preedit UI, and comprehensive bidirectional text need work.
 - Keyboard editing and cursor-following scrolling; no mouse editing/wheel scrolling.
 - Directory listings show at most 256 entries; paths/prompts have fixed limits.
 - No syntax highlighting, LSP, configurable keymap, full Vim profile, TUI, SSH,
-  public plugin API, multi-buffer sessions, or queued filesystem batches yet.
+  public plugin API, split views, persistent sessions, or queued filesystem batches yet.
 - File operations currently target Linux x86-64. Windows/macOS are not supported
   by this prototype yet, despite the portable SDL rendering layer.
 
@@ -142,7 +174,8 @@ LD_LIBRARY_PATH="$PWD/build/deps/install/lib" SDL_VIDEODRIVER=wayland python3 sc
 
 Tests cover UTF-8 edits, selections, bounded undo/redo, search, capacity rollback,
 file conflicts, permission preservation, recovery, symlink/FIFO rejection, layout
-validation, and the native open/edit/save/create/rename/trash workflow. Synthetic
+validation, multi-buffer undo/view restoration, close/quit cancellation, path
+completion, and the native open/edit/save/create/rename/trash workflow. Synthetic
 SDL input passes through the actual event loop. Font geometry and ABI checks run
 against the installed headers. A native input-burst test verifies that all text
 arrives without a frame per key/text event or redundant title updates; its timings

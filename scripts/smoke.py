@@ -8,6 +8,8 @@ ROOT = Path(__file__).resolve().parents[1]
 for mode in ("debug", "release"):
     with tempfile.TemporaryDirectory(prefix="dna-ui-") as directory:
         fixtures = Path(directory)
+        (fixtures / "subdir").mkdir()
+        (fixtures / "subdir" / "other.txt").write_text("other file\n")
         (fixtures / "input.txt").write_text("first\nsecond\n")
         (fixtures / "test.dna-layout").write_text("popup_width=0.8\npopup_height=0.7\nfont_size=22\n")
         env = dict(os.environ, DYN_EDITOR_SMOKE="1", DNA_WORKFLOW_TEST=directory)
