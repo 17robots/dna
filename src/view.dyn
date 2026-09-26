@@ -48,25 +48,37 @@ fn draw(renderer: rawptr, window: rawptr, app: *App, typography: *Typography) {
   if !ttf.draw(typography.document, origin - app.scroll_x, margin - app.scroll_y) { #panic("text draw failed") }
   if !sdl.clip(renderer, nil) { #panic("document clip reset") }
   draw_chrome(renderer, app, typography, width, height, margin, gutter)
-  if app.panel != Panel.None {
+  if app.panel == Panel.Directory { draw_explorer(renderer, app, typography, width, height) }
+  else if app.panel != Panel.None {
     popup_rect := sdl.Rect{x: #cast(f32) width * (1.0-app.popup_width) / 2.0, y: #cast(f32) height * (1.0-app.popup_height) / 2.0, width: #cast(f32) width * app.popup_width, height: #cast(f32) height * app.popup_height}
     minimum := 520.0 * typography.scale
     if popup_rect.width < minimum { popup_rect.width = minimum }
     if popup_rect.width > #cast(f32) width { popup_rect.width = #cast(f32) width }
     popup_rect.x = (#cast(f32) width - popup_rect.width) / 2.0
+    compact := app.panel == Panel.Commands
+    padding := margin if compact { padding = 10.0 * typography.scale }
     labels: [16384]u8 = [] count := popup_text(app, labels[..])
-    wrap_width := #cast(i32) (popup_rect.width - margin * 2.0) if wrap_width < 1 { wrap_width = 1 }
-    if !ttf.set(typography.palette, &labels[0], count) || !ttf.wrap(typography.palette, wrap_width) { #panic("popup layout failed") }
+    wrap_width := #cast(i32) (popup_rect.width - padding * 2.0) if wrap_width < 1 { wrap_width = 1 }
+    if !buffer.equal(labels[..count], typography.palette_bytes[..typography.palette_length]) {
+      if !ttf.set(typography.palette, &labels[0], count) { #panic("popup text update failed") }
+      typography.palette_length = copy_text(typography.palette_bytes[..], labels[..count]) typography.palette_updates += 1
+    }
+    if typography.palette_wrap != wrap_width {
+      if !ttf.wrap(typography.palette, wrap_width) { #panic("popup wrap failed") }
+      typography.palette_wrap = wrap_width
+    }
     text_width: i32 = 0 text_height: i32 = 0
     if !ttf.size(typography.palette, &text_width, &text_height) { #panic("popup measure failed") }
-    needed := #cast(f32) text_height + margin * 2.0
+    needed := #cast(f32) text_height + padding * 2.0
+    if compact { popup_rect.height = needed }
     if popup_rect.height < needed { popup_rect.height = needed }
     if popup_rect.height > #cast(f32) height { popup_rect.height = #cast(f32) height }
     popup_rect.y = (#cast(f32) height - popup_rect.height) / 2.0
+    if compact { popup_rect.y = #cast(f32) height - status_height - popup_rect.height - 12.0 * typography.scale if popup_rect.y < 0.0 { popup_rect.y = 0.0 } }
     clipping := sdl.PixelRect{x: #cast(i32) popup_rect.x, y: #cast(i32) popup_rect.y, width: #cast(i32) popup_rect.width, height: #cast(i32) popup_rect.height}
     if !sdl.clip(renderer, &clipping) { #panic("popup clip failed") }
     if !sdl.color(renderer, 35, 43, 49, 255) || !sdl.fill(renderer, &popup_rect) { #panic("popup draw failed") }
-    if !ttf.draw(typography.palette, popup_rect.x + margin, popup_rect.y + margin) { #panic("popup text failed") }
+    if !ttf.draw(typography.palette, popup_rect.x + padding, popup_rect.y + padding) { #panic("popup text failed") }
     if !sdl.clip(renderer, nil) { #panic("clip reset failed") }
   }
   title: [8192]u8 = [] used: usize = 0

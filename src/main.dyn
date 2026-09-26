@@ -15,6 +15,7 @@ fn main() {
   app.line_numbers = true app.relative_numbers = true app.status_line = true app.highlight_line = true
   if !new_buffer(app) { #panic("document allocation failed") }
   defer release_buffers(app)
+  defer { if app.explorer.document != nil { _ = mem.arena_release(&app.explorer.arena) } }
   cwd := #syscall(79, &app.directory[0], 4096)
   if cwd <= 0 { #panic("working directory unavailable") }
   app.directory_length = #cast(usize) cwd - 1
@@ -62,7 +63,10 @@ fn main() {
   chrome := ttf.create(engine, font, &empty[0], 0)
   if chrome == nil { #panic("chrome text failed") }
   defer ttf.destroy(chrome)
-  typography := Typography{chrome: chrome,font: font, document: document, palette: palette, points: 20.0, scale: sdl.display_scale(window)}
+  directory_text := ttf.create(engine, font, &empty[0], 0)
+  if directory_text == nil || !ttf.whitespace_visible(directory_text, true) || !ttf.wrap(directory_text, 0) || !ttf.color(directory_text, 205, 214, 224, 255) { #panic("explorer text failed") }
+  defer ttf.destroy(directory_text)
+  typography := Typography{directory_text: directory_text, chrome: chrome,font: font, document: document, palette: palette, points: 20.0, scale: sdl.display_scale(window)}
   if typography.scale <= 0.0 { typography.scale = 1.0 }
   resize_font(&typography)
   environment: [16]u8 = [] smoke := process.environment("DYN_EDITOR_SMOKE", environment[..])
@@ -73,6 +77,17 @@ fn main() {
     workflow_smoke(app, &typography)
     completion_smoke(app, &typography)
     session_smoke(app, &typography)
+    explorer_smoke(app, &typography)
+    if app.explorer.document != nil { app.panel = Panel.Directory draw(renderer, window, app, &typography) }
+    palette_smoke(app)
+    panel(app, Panel.Commands) text_input(app, "write")
+    draw(renderer, window, app, &typography)
+    palette_updates := typography.palette_updates
+    draw(renderer, window, app, &typography)
+    if typography.palette_updates != palette_updates { #panic("unchanged palette text reshaped") }
+    text_input(app, " explorer") draw(renderer, window, app, &typography)
+    if typography.palette_updates != palette_updates + 1 { #panic("palette rendering cache invalidation") }
+    app.panel = Panel.None
     _ = buffer.load(app.document, "one\ntwo\nthree\n") app.file.length = 0 app.panel = Panel.None
     queue_key(105, 0)
     simulated := sdl.Event{} incoming := #cast(*sdl.TextEvent) &simulated incoming.kind = 771
@@ -86,7 +101,7 @@ fn main() {
   draw(renderer, window, app, &typography)
   event := sdl.Event{} receiving: bool = false
   for app.running {
-    wants_text := prompting(app) || (app.panel == Panel.None && app.insert)
+    wants_text := prompting(app) || (app.panel == Panel.None && app.insert) || (app.panel == Panel.Directory && app.explorer.insert)
     if wants_text != receiving {
       if wants_text { if !sdl.start_text(window) { #panic("start input failed") } }
       else { if !sdl.stop_text(window) { #panic("stop input failed") } }
@@ -123,7 +138,7 @@ fn main() {
         if scale > 0.0 && scale != typography.scale { typography.scale = scale resize_font(&typography) }
       }
       if kind == 768 || kind == 771 || kind == 256 || (kind >= 512 && kind <= 540) { redraw = true }
-      input_now := prompting(app) || (app.panel == Panel.None && app.insert)
+      input_now := prompting(app) || (app.panel == Panel.None && app.insert) || (app.panel == Panel.Directory && app.explorer.insert)
       if input_now != receiving {
         if input_now { if !sdl.start_text(window) { #panic("start input failed") } }
         else { if !sdl.stop_text(window) { #panic("stop input failed") } }

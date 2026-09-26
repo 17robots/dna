@@ -21,20 +21,20 @@ fn workflow_smoke(app: *App, typography: *Typography) {
   layout_storage: [4096]u8 = [] layout_path := joined(app, "test.dna-layout", layout_storage[..])
   text_input(app, layout_path) key_input(app, typography, 13, 0)
   if app.panel != Panel.None || typography.points != 22.0 || app.popup_width != 0.8 { #panic("layout file workflow") }
-  key_input(app, typography, 101, 64) key_input(app, typography, 99, 0)
+  key_input(app, typography, 101, 64) action(app, typography, 18)
   text_input(app, "created.txt") key_input(app, typography, 13, 0)
   if app.panel != Panel.Directory { #panic("create workflow") }
   target: usize = 0 for target < app.entry_count && !buffer.equal(app.entries[target].name[..app.entries[target].length], "created.txt") { target += 1 }
   if target == app.entry_count { #panic("created entry missing") }
-  app.entry_selected = target key_input(app, typography, 114, 0) text_input(app, "renamed.txt") key_input(app, typography, 13, 0)
+  app.entry_selected = target action(app, typography, 19) text_input(app, "renamed.txt") key_input(app, typography, 13, 0)
   if app.panel != Panel.Directory { #panic("rename workflow") }
   renamed: usize = 0 for renamed < app.entry_count && !buffer.equal(app.entries[renamed].name[..app.entries[renamed].length], "renamed.txt") { renamed += 1 }
   if renamed == app.entry_count { #panic("renamed entry missing") }
-  app.entry_selected = renamed key_input(app, typography, 100, 0)
+  app.entry_selected = renamed action(app, typography, 20)
   if app.panel != Panel.Trash { #panic("trash confirmation") }
   key_input(app, typography, 27, 0)
   action(app, typography, 7)
-  app.entry_selected = renamed key_input(app, typography, 100, 0) key_input(app, typography, 13, 0)
+  app.entry_selected = renamed action(app, typography, 20) key_input(app, typography, 13, 0)
   if app.panel != Panel.Directory { #panic("trash workflow") }
   trash_storage: [4096]u8 = [] trashed := joined(app, ".dna-trash/renamed.txt", trash_storage[..])
   if !files.metadata(trashed).ok { #panic("recoverable trash missing") }
@@ -123,4 +123,106 @@ fn completion_smoke(app: *App, typography: *Typography) {
   expanded: [4096]u8 = [] home: [4096]u8 = [] env := process.environment("HOME", home[..])
   result := expand_home("~/", expanded[..])
   if env.ok && env.found && (#len(result) != #len(env.value) + 1 || !buffer.equal(result[..#len(env.value)], env.value)) { #panic("home expansion") }
+}
+fn explorer_smoke(app: *App, typography: *Typography) {
+  configured_storage: [4096]u8 = [] configured := process.environment("DNA_WORKFLOW_TEST", configured_storage[..])
+  if !configured.ok || !configured.found { return }
+  root: [4096]u8 = [] root_length := copy_text(root[..], configured.value) add_text(root[..], &root_length, "/explorer")
+  app.directory_length = copy_text(app.directory[..], root[..root_length]) app.panel = Panel.Directory directory_refresh(app)
+  doc := app.explorer.document if doc == nil { #panic("editable explorer allocation") }
+  opened_storage: [4096]u8 = [] opened_path := joined(app, "alpha.txt", opened_storage[..])
+  open_file(app, opened_path) explorer_open(app)
+  // Rename using the real insert-mode path; the row id remains unchanged.
+  if !buffer.find(doc, "alpha.txt", false) { #panic("explorer fixture") }
+  key_input(app, typography, 105, 0) text_input(app, "renamed.txt") key_input(app, typography, 27, 0)
+  if !explorer_dirty(app) || app.panel != Panel.Directory || app.explorer.insert { #panic("explorer insert mode") }
+  key_input(app, typography, 117, 0)
+  if explorer_dirty(app) { #panic("explorer undo") }
+  key_input(app, typography, 117, 1)
+  if !explorer_dirty(app) { #panic("explorer redo") }
+  // New rows create files; deleted existing rows go to trash.
+  buffer.move_to(doc, doc.length, false) key_input(app, typography, 105, 0) text_input(app, "created.txt\n") key_input(app, typography, 27, 0)
+  if !buffer.find(doc, "delete.txt", false) { #panic("trash fixture") }
+  key_input(app, typography, 120, 0) key_input(app, typography, 100, 0)
+  key_input(app, typography, 27, 0)
+  if app.panel != Panel.None || !explorer_dirty(app) { #panic("dismiss keeps draft") }
+  action(app, typography, 7)
+  if !explorer_dirty(app) || app.panel != Panel.Directory { #panic("reopen keeps draft") }
+  key_input(app, typography, 58, 0) text_input(app, "write") key_input(app, typography, 13, 0)
+  if app.panel != Panel.DirectoryApply || app.explorer.edit_count != 3 { #panic("directory plan preview") }
+  existing_storage: [4096]u8 = [] existing := joined(app, "alpha.txt", existing_storage[..])
+  created_storage: [4096]u8 = [] created := joined(app, "created.txt", created_storage[..])
+  if !files.metadata(existing).ok || files.metadata(created).ok { #panic("preview mutated disk") }
+  key_input(app, typography, 27, 0)
+  if app.panel != Panel.Directory || !explorer_dirty(app) { #panic("cancel preview keeps edits") }
+  explorer_preview(app) key_input(app, typography, 13, 0)
+  if app.panel != Panel.Directory || explorer_dirty(app) || files.metadata(existing).ok || !files.metadata(created).ok { #panic("apply staged explorer edits") }
+  if !buffer.equal(app.document.bytes[..app.document.length], "alpha contents") || !contains(files.name(app.file), "/renamed.txt") { #panic("rename must update open buffer path") }
+  close_clean(app) app.panel = Panel.Directory
+  // Directories cannot accidentally be removed by deleting their rows.
+  if !buffer.find(doc, "keep/", false) { #panic("directory row fixture") }
+  buffer.select_line(doc) _ = buffer.replace(doc, "")
+  if #len(explorer_plan(app)) == 0 { #panic("directory deletion accepted") }
+  _ = buffer.load(doc, doc.saved[..doc.saved_length])
+  // Duplicate ids and destinations fail before any syscall can mutate disk.
+  buffer.move_to(doc, doc.length, false) _ = buffer.replace(doc, "created.txt\n")
+  if #len(explorer_plan(app)) == 0 { #panic("duplicate destination accepted") }
+  _ = buffer.load(doc, doc.saved[..doc.saved_length])
+  buffer.move_to(doc, doc.length, false) _ = buffer.replace(doc, "[1] extra.txt\n")
+  if #len(explorer_plan(app)) == 0 { #panic("duplicate id accepted") }
+  _ = buffer.load(doc, doc.saved[..doc.saved_length])
+  // External collision after preview is rechecked on Enter.
+  buffer.move_to(doc, doc.length, false) _ = buffer.replace(doc, "collision.txt\n")
+  explorer_preview(app) if app.panel != Panel.DirectoryApply { #panic("collision preview") }
+  collision_storage: [4096]u8 = [] collision := joined(app, "collision.txt", collision_storage[..])
+  if !fs.write_all(collision, "external").ok { #panic("collision fixture write") }
+  explorer_apply(app)
+  if app.panel != Panel.Message || !explorer_dirty(app) { #panic("external collision not refused") }
+  app.explorer.quit_after_discard = false app.panel = Panel.DirectoryDiscard key_input(app, typography, 100, 0)
+  // Source identity is rechecked after the preview, not just destination names.
+  if !buffer.find(doc, "renamed.txt", false) { #panic("renamed row") }
+  _ = buffer.replace(doc, "moved.txt") explorer_preview(app)
+  if app.panel != Panel.DirectoryApply { #panic("source change preview") }
+  renamed_storage: [4096]u8 = [] renamed := joined(app, "renamed.txt", renamed_storage[..])
+  backup_storage: [4096]u8 = [] backup := joined(app, "external-backup.txt", backup_storage[..])
+  if !fs.rename(renamed, backup).ok || !fs.write_all(renamed, "external replacement").ok { #panic("external replacement fixture") }
+  explorer_apply(app)
+  if app.panel != Panel.Message { #panic("changed source accepted") }
+  if !fs.remove(renamed).ok || !fs.rename(backup, renamed).ok { #panic("restore external fixture") }
+  app.explorer.quit_after_discard = false app.panel = Panel.DirectoryDiscard key_input(app, typography, 100, 0)
+  // Unsaved affected documents, including a separately opened file, block apply.
+  open_file(app, renamed)
+  _ = buffer.replace(app.document, "unsaved")
+  if !buffer.find(doc, "renamed.txt", false) { #panic("dirty affected row") }
+  _ = buffer.replace(doc, "moved.txt") explorer_preview(app)
+  if app.panel != Panel.Message { #panic("affected unsaved buffer accepted") }
+  buffer.undo(app.document) close_clean(app)
+  app.explorer.quit_after_discard = false app.panel = Panel.DirectoryDiscard key_input(app, typography, 100, 0)
+  buffer.move_to(doc, doc.length, false) key_input(app, typography, 13, 0)
+  if app.panel != Panel.Directory { #panic("empty explorer row navigation") }
+  // Directory write commands cannot accidentally save the file underneath.
+  if !buffer.find(doc, "created.txt", false) { #panic("created row") }
+  _ = buffer.replace(doc, "another.txt")
+  key_input(app, typography, 58, 0) text_input(app, "w ") text_input(app, configured.value) text_input(app, "/accidental.txt") key_input(app, typography, 13, 0)
+  if app.panel != Panel.Message { #panic("explorer write path escaped context") }
+  request_quit(app)
+  if app.panel != Panel.DirectoryDiscard || !app.running { #panic("quit loses staged directory edits") }
+  key_input(app, typography, 27, 0)
+  if !explorer_dirty(app) { #panic("quit cancellation lost draft") }
+  app.explorer.quit_after_discard = false app.panel = Panel.DirectoryDiscard key_input(app, typography, 100, 0)
+  app.panel = Panel.None
+}
+fn palette_smoke(app: *App) {
+  panel(app, Panel.Commands)
+  text_input(app, "write") matches(app)
+  before := app.command_filter_runs
+  matches(app) matches(app)
+  if app.command_filter_runs != before || app.match_count == 0 || app.matches[0] != 1 { #panic("palette query cache or ranking") }
+  text_input(app, " explorer") matches(app)
+  if app.command_filter_runs != before + 1 || app.match_count != 1 || app.matches[0] != 29 { #panic("palette cache invalidation") }
+  app.prompt_length = copy_text(app.prompt[..], "write") app.explorer.commands = true matches(app)
+  if app.match_count != 1 || app.matches[0] != 29 { #panic("explorer command context") }
+  app.explorer.commands = false matches(app)
+  if app.matches[0] != 1 { #panic("file command context restoration") }
+  app.panel = Panel.None
 }

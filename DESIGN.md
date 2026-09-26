@@ -148,9 +148,9 @@ compatibility scope; complete accessibility and platform integration design.
 
 Current prototype: the separate `dna` repository implements native SDL3/SDL_ttf
 rendering, multiple UTF-8 file buffers, modal selection/editing, undo/redo, search,
-command and directory popups, individual file create/rename/trash actions,
+command and directory popups, editable directory drafts with previewed create/rename/trash batches,
 validated popup/font/chrome layout files, explicit saves, and named-file recovery.
 README.md describes the tested behavior and limits. This is not yet the complete
-architecture above: directory batches, nested/persistent supporting buffers,
+architecture above: crash recovery for directory drafts, nested supporting buffers,
 relative splits, persistent sessions, editing profiles, extension interfaces, and a shared TUI remain
 next steps. Keep editor application code out of the compiler repository.

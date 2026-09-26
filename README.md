@@ -94,22 +94,72 @@ number. The status line shows mode, filename, modified state, buffer count,
 line/column, and selected codepoints. Palette commands independently toggle line
 numbers, relative numbering, the status line, and current-line highlighting.
 
-In prompts, type and press Enter; Backspace edits the query. The palette filters
-case-insensitively; arrows select a command. Document search is literal,
+In prompts, type and press Enter; Backspace edits the query. The command palette
+is a compact panel near the bottom with up to four visible results. It filters
+case-insensitively, prioritizes prefixes, and caches unchanged queries/text layouts;
+arrows select a command. Document search is literal,
 case-sensitive, and wraps. Insert-mode Tab inserts four spaces.
 
-In the directory buffer, `j/k` or arrows select, Enter opens, Backspace goes to
-the parent, `c` creates, `r` renames, and `d` requests a move to `.dna-trash`.
-Rename and trash show a confirmation before applying. Existing destinations are
-never replaced. These operations affect one file at a time; directories cannot
-be renamed or trashed yet. Filesystem operations are separate from text undo.
-Restore trashed files manually from `.dna-trash`; collisions there are refused.
+## Editable explorer
+
+`Space e` opens an editable directory popup. It shares the document editing keys:
+`h/j/k/l`, `i`, `a`, `o`, `v`, `x`, `d`, `c`, `u`/`Shift U`, and clipboard commands.
+Enter in normal mode opens the current row; Backspace goes to its parent.
+Apply or discard pending edits before navigating to another directory.
+
+Existing rows look like `[1] filename.txt`. Keep the `[id]` and its following space
+unchanged; edit the filename to stage a rename. The id identifies the original file
+even if rows move. Add a plain filename on a new line to stage an empty file.
+Delete an entire existing row (`x`, then `d`) to stage a move to `.dna-trash`.
+Directory rows end in `/` and must remain unchanged; folder creation, renaming,
+and removal are not supported yet. Names beginning with `[` cannot be created
+through a new row, and control characters in names are unsupported.
+
+For example, changing:
+
+```text
+[1] notes.txt
+[2] old.txt
+```
+
+to:
+
+```text
+[1] journal.txt
+new.txt
+```
+
+stages a rename, a new file, and a move of `old.txt` to trash. **Nothing on disk
+changes while you type.** Escape leaves insert/select mode; another Escape hides
+the explorer while keeping its draft and undo history.
+
+Inside the explorer, `:write` shows the complete operation count and a scrollable
+preview. Enter applies; Escape returns to editing without applying. `:undo`,
+`:redo`, `:refresh`, `:discard`, and `:quit` are explorer commands; `:quit` hides the
+popup and retains its draft. The palette also exposes **Write explorer changes**,
+**Discard explorer edits**, and **Refresh explorer** outside this context. Discard
+requires confirmation; application quit checks pending explorer edits as well.
+
+Apply rechecks source identity, directory identity, existing destinations, and
+unsaved affected file buffers. Renames update open-buffer paths. Existing targets
+and trash collisions are refused; swaps/cycles and overwriting destinations must
+be split into separate operations. Deleted files can be restored manually from
+`.dna-trash`. File operations are not text undo and a batch is not atomic: on a
+partial failure, DNA reports how many operations completed, keeps the draft for
+reference, and requires discard/refresh before another attempt. The filesystem
+is not locked against concurrent changes. Explorer drafts live only in memory
+and do not yet have crash recovery.
+
+The older individual create/rename/trash commands remain in the palette and
+refuse to run while a directory draft is pending.
 
 ## Layout files
 
 Use **Load layout file** in the palette, or the built-in compact/wide commands.
 Examples are in `layouts/`. The current layout implementation controls popup
 size, font size, and document chrome; document splits and arbitrary buffer placement are future work.
+The command palette uses content-sized height, and the editable explorer uses a
+larger scrolling view; neither reserves the generic popup height.
 
 ```ini
 popup_width = 0.64
@@ -158,9 +208,10 @@ not a replacement for backups or version control.
 - UTF-8 codepoint movement/deletion; grapheme-aware editing, composed-character
   cursor behavior, IME preedit UI, and comprehensive bidirectional text need work.
 - Keyboard editing and cursor-following scrolling; no mouse editing/wheel scrolling.
-- Directory listings show at most 256 entries; paths/prompts have fixed limits.
+- Directory listings and staged batches support at most 256 entries/operations.
+  Explorer text has the same 65,535-byte limit and allocates its own undo arena.
 - No syntax highlighting, LSP, configurable keymap, full Vim profile, TUI, SSH,
-  public plugin API, split views, persistent sessions, or queued filesystem batches yet.
+  public plugin API, split views, or persistent sessions yet.
 - File operations currently target Linux x86-64. Windows/macOS are not supported
   by this prototype yet, despite the portable SDL rendering layer.
 
@@ -175,7 +226,8 @@ LD_LIBRARY_PATH="$PWD/build/deps/install/lib" SDL_VIDEODRIVER=wayland python3 sc
 Tests cover UTF-8 edits, selections, bounded undo/redo, search, capacity rollback,
 file conflicts, permission preservation, recovery, symlink/FIFO rejection, layout
 validation, multi-buffer undo/view restoration, close/quit cancellation, path
-completion, and the native open/edit/save/create/rename/trash workflow. Synthetic
+completion, staged explorer edits, preview cancellation, external-source/destination
+changes, palette caching, and the native open/edit/save/create/rename/trash workflow. Synthetic
 SDL input passes through the actual event loop. Font geometry and ABI checks run
 against the installed headers. A native input-burst test verifies that all text
 arrives without a frame per key/text event or redundant title updates; its timings

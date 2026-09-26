@@ -11,6 +11,8 @@ fn text_input(app: *App, text: []const u8) {
     if app.prompt_length + #len(text) >= 4096 { notice(app, "Input is too long.") return }
     add_text(app.prompt[..], &app.prompt_length, text) app.selected = 0
     if app.panel == Panel.Open { completion_refresh(app) }
+  } else if app.panel == Panel.Directory && app.explorer.insert {
+    if !buffer.replace(app.explorer.document, text) { notice(app, "Explorer edit exceeds text capacity.") }
   } else if app.panel == Panel.None && app.insert { changed(app, text) }
 }
 fn clipboard_copy(app: *App) {
@@ -28,7 +30,25 @@ fn clipboard_paste(app: *App) {
 }
 fn key_input(app: *App, typography: *Typography, key: u32, modifiers: u16) {
   shift := (modifiers & 3) != 0 control := (modifiers & 192) != 0 doc := app.document
+  if app.panel == Panel.Directory { explorer_key(app, typography, key, modifiers) return }
+  if app.panel == Panel.DirectoryApply {
+    if key == 27 { app.panel = Panel.Directory }
+    else if key == 13 { explorer_apply(app) }
+    else if key == 1073741905 && app.explorer.preview_row + 1 < app.explorer.edit_count { app.explorer.preview_row += 1 }
+    else if key == 1073741906 && app.explorer.preview_row > 0 { app.explorer.preview_row -= 1 }
+    return
+  }
+  if app.panel == Panel.DirectoryDiscard {
+    if key == 27 { app.panel = Panel.Directory app.explorer.quit_after_discard = false }
+    else if key == 100 {
+      if app.explorer.document != nil { buffer.mark_saved(app.explorer.document) }
+      app.panel = Panel.Directory directory_refresh(app)
+      if app.explorer.quit_after_discard { app.explorer.quit_after_discard = false request_quit(app) }
+    }
+    return
+  }
   if key == 27 {
+    if app.panel == Panel.Commands && app.explorer.commands { app.explorer.commands = false app.panel = Panel.Directory return }
     if app.panel != Panel.None { app.panel = Panel.None app.quit_after_save = false }
     else { buffer.checkpoint(doc) app.insert = false app.extend = false doc.anchor = doc.cursor }
     return
@@ -55,7 +75,7 @@ fn key_input(app: *App, typography: *Typography, key: u32, modifiers: u16) {
   if app.panel == Panel.Message {
     if app.selected == 15 && key == 100 {
       files.discard_recovery(app.file) _ = buffer.load(doc, doc.saved[..doc.saved_length]) app.panel = Panel.None app.extend = false
-    } else if app.selected != 15 && key == 13 { app.panel = Panel.None }
+    } else if app.selected != 15 && key == 13 { if explorer_dirty(app) { app.panel = Panel.Directory } else { app.panel = Panel.None } }
     return
   }
   if app.panel != Panel.None {
@@ -68,20 +88,6 @@ fn key_input(app: *App, typography: *Typography, key: u32, modifiers: u16) {
       text_input(app, pasted[..paste_length]) return
     }
     if key == 13 { submit(app, typography) return }
-    if app.panel == Panel.Directory {
-      if (key == 106 || key == 1073741905) && app.entry_selected + 1 < app.entry_count { app.entry_selected += 1 }
-      else if (key == 107 || key == 1073741906) && app.entry_selected > 0 { app.entry_selected -= 1 }
-      else if key == 99 { action(app, typography, 18) }
-      else if key == 114 { action(app, typography, 19) }
-      else if key == 100 { action(app, typography, 20) }
-      else if key == 8 {
-        length := app.directory_length
-        for length > 1 && app.directory[length - 1] == '/' { length -= 1 }
-        for length > 1 && app.directory[length - 1] != '/' { length -= 1 }
-        app.directory_length = length app.directory[length] = 0 directory_refresh(app)
-      }
-      return
-    }
     if app.panel == Panel.Open {
       if key == 9 { _ = complete_path(app) return }
       if key == 1073741905 && app.completion_selected + 1 < app.completion_count { app.completion_selected += 1 app.completion_chosen = true }
@@ -117,6 +123,15 @@ fn key_input(app: *App, typography: *Typography, key: u32, modifiers: u16) {
     else if key == 48 { action(app, typography, 13) }
     return
   }
+  if !app.insert && key == 47 { action(app, typography, 3) }
+  else if !app.insert && key == 110 { if !buffer.find(doc, app.search[..app.search_length], shift) { notice(app, "No search match.") } }
+  else if !app.insert && key == 32 { panel(app, Panel.Leader) }
+  else if !app.insert && (key == 58 || (key == 59 && shift) || key == 1073741882) { panel(app, Panel.Commands) }
+  else { edit_key(app, key, modifiers) }
+}
+// Shared document editing semantics for file text and explorer drafts.
+fn edit_key(app: *App, key: u32, modifiers: u16) {
+  doc := app.document shift := (modifiers & 3) != 0
   extend := app.extend || shift
   if key == 1073741904 || (!app.insert && key == 104) { buffer.checkpoint(doc) buffer.move_to(doc, buffer.previous(doc, doc.cursor), extend) }
   else if key == 1073741903 || (!app.insert && key == 108) { buffer.checkpoint(doc) buffer.move_to(doc, buffer.next(doc, doc.cursor), extend) }
@@ -145,8 +160,4 @@ fn key_input(app: *App, typography: *Typography, key: u32, modifiers: u16) {
   else if key == 103 { if shift { buffer.move_to(doc, doc.length, extend) } else { buffer.move_to(doc, 0, extend) } }
   else if key == 121 { clipboard_copy(app) }
   else if key == 112 { clipboard_paste(app) }
-  else if key == 47 { action(app, typography, 3) }
-  else if key == 110 { if !buffer.find(doc, app.search[..app.search_length], shift) { notice(app, "No search match.") } }
-  else if key == 32 { panel(app, Panel.Leader) }
-  else if key == 58 || (key == 59 && shift) || key == 1073741882 { panel(app, Panel.Commands) }
 }
