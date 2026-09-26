@@ -17,3 +17,7 @@ smoke: deps test
     just build debug
     just build release
     python3 scripts/smoke.py
+
+# Exercise the user's direct command without inheriting this recipe's paths.
+smoke-direct: deps
+    env -u DYN_LIBRARY_PATH -u LD_LIBRARY_PATH SDL_VIDEODRIVER=dummy DYN_EDITOR_SMOKE=1 mise exec -- "$DYN" run src --no-cache

@@ -17,6 +17,21 @@ just run                 # empty buffer
 just run README.md       # open an existing file
 ```
 
+With mise activated in your shell, direct Dyn commands work too:
+
+```sh
+just deps                # once after cloning, builds the local font library
+mise trust               # trust this repository's mise.toml
+# Let the shell refresh its environment (or leave and re-enter the directory).
+dyn run src
+```
+
+`mise.toml` supplies the local native-library search paths for both the compiler
+and runtime. Without shell activation, use `mise exec -- dyn run src` instead.
+The SDL_ttf dependency is declared in the font bindings; no manual `--link` flag
+is needed with this environment. `just smoke-direct` checks this direct-run path
+without inheriting the library paths from `just`.
+
 Start in normal mode. Press `i` to type, Escape to return to normal mode,
 `Ctrl S` to save, and Space or `Ctrl P` for searchable commands. An unnamed
 buffer prompts for a new destination when saved. File paths in Open/Save As
