@@ -735,14 +735,14 @@ fn vim_store(app: *App, text: []const u8, linewise: bool) {
     notice(app, "Cannot allocate register.")
     return
   }
-  storage := (#cast(*u8) mem.arena_push_uninit(&allocated.arena, #len(text) + 1, 1))[..#len(text) + 1]
+  storage := (#cast(*u8) mem.arena_push_uninit_or_panic(&allocated.arena, #len(text) + 1, 1))[..#len(text) + 1]
   _ = buffer.copy_bytes(&storage[0], &text[0], #len(text))
   storage[#len(text)] = 0
   slot := vim_register_slot(app)
   if slot.owned {
     _ = mem.arena_release(&slot.arena)
   }
-  slot.arena = allocated.arena
+  slot.arena = mem.arena_take(&allocated.arena)
   slot.owned = true
   slot.text = storage[..#len(text)]
   slot.count = 1
@@ -1377,6 +1377,14 @@ fn vim_after_search(app: *App) {
 // Returns true when the Vim profile handled the key. Keys it leaves alone
 // (Space leader, :, Ctrl shortcuts DNA owns) fall through to DNA.
 fn vim_key(app: *App, typography: *Typography, key: u32, modifiers: u16) bool {
+  // The captured count belongs only to a live operator. Clear it on every
+  // completion/cancellation path, while retaining it across pending prefixes.
+  defer {
+    if app.vim.operator == 0 {
+      app.vim.operator_count = 0
+      app.vim.operator_g = false
+    }
+  }
   if app.view.insert {
     return vim_insert_key(app, key, modifiers)
   }
@@ -1561,6 +1569,9 @@ fn vim_pending(app: *App, typography: *Typography, character: u32, key: u32) {
     app.vim.find_kind = pending
     app.vim.find_length = vim_encode(character, app.vim.find_text[..])
     count := vim_take_count(app)
+    if app.vim.operator != 0 && app.vim.operator_count > 0 {
+      count *= app.vim.operator_count
+    }
     motion := vim_find(doc, vim_head(app), pending, app.vim.find_text[..app.vim.find_length], count, false)
     vim_finish_motion(app, motion, count)
     return
@@ -1803,9 +1814,20 @@ fn vim_text_object(app: *App, character: u32, around: bool) {
   if vim_visual(app) {
     selection = buffer.Selection{anchor: doc.anchor, cursor: doc.cursor}
   }
-  span := buffer.text_object(doc, selection, key, around, count)
-  if !span.found || span.high <= span.low {
+  span := buffer.text_object_with_syntax(doc, selection, key, around, count, match_syntax(app, app.prompt_state.panel == Panel.Directory))
+  if !span.found || span.high < span.low {
     app.vim.operator = 0
+    return
+  }
+  if span.high == span.low {
+    operator := app.vim.operator
+    app.vim.operator = 0
+    app.vim.operator_g = false
+    if !vim_visual(app) && operator == 'c' {
+      buffer.checkpoint(doc)
+      vim_register_done(app)
+      vim_start_insert(app, span.low, 1, false)
+    }
     return
   }
   linewise := key == 'p'

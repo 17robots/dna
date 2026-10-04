@@ -46,7 +46,7 @@ with tempfile.TemporaryDirectory(prefix='dna-package-') as temporary:
     shutil.copy2(ROOT/'config.example.toml', tree/'share/dna/config.example.toml')
     (tree/'README.md').write_text("""# DNA Linux preview
 
-Run `./dna [file]` from this directory, or add this directory to PATH.
+Run `./dna [file-or-directory]` from this directory, or add this directory to PATH.
 Keep `bin`, `lib`, and `share` beside the launcher. No Dyn SDK or Python is
 required to run the editor. A system monospace font, compatible glibc, and
 Linux display/graphics-driver libraries are required.
@@ -71,14 +71,16 @@ See PLUGINS.md for the experimental process API. The uppercase example lives
 in examples/plugins/uppercase. Plugins require explicit loading and permission
 review; editor API permissions are not an OS sandbox.
 
-This is a local prototype build: 16 buffers, 1,048,575 text bytes per buffer,
+This is an experimental preview: 16 buffers, 268,435,455 text bytes per buffer,
 8 views. LSP clients are included; install language servers separately.
+See PRERELEASE.md for known limitations and the validation scope.
 Other platform ports are not included. `build-info.json`
 records dependencies; SHA256SUMS verifies extracted files. Nothing is installed
 system-wide by extracting or running this archive.
 """)
     shutil.copytree(ROOT/'examples/plugins/uppercase',tree/'examples/plugins/uppercase',ignore=shutil.ignore_patterns('*.dyncache*','__pycache__'))
     shutil.copy2(ROOT/'PLUGINS.md', tree/'PLUGINS.md')
+    shutil.copy2(ROOT/'PRERELEASE.md', tree/'PRERELEASE.md')
     shutil.copy2(ROOT/'LICENSE', tree/'LICENSE')
     shutil.copy2(ROOT/'plugin-catalog.example.json', tree/'plugin-catalog.example.json')
     for example in ('lsp.example.json','plugin-catalog.example.json'):

@@ -14,7 +14,7 @@ struct SyntaxWorker {
   ranges: [1024]SyntaxRange, object_count: u32,
   thread, mutex, wake: rawptr, stopping, pending, ready, retry: bool, indent: u32,
   text: []u8, length: u32, revision, finished: u64,
-  colors: []u8, cancel: native_atomic.AtomicU32,
+  colors: []u8, cancel: native_atomic.AtomicU32, small_revisions: u32,
 }
 struct SyntaxInput { text: []u8, length: u32, revision: u64 }
 struct SyntaxDeadline { worker: *SyntaxWorker, end: u64 }
@@ -91,6 +91,24 @@ fn syntax_reserve(bytes: *[]u8, length: usize) bool {
 fn syntax_buffer_free(bytes: []u8) {
   if #len(bytes) != 0 {
     dna_memory_free(#cast(rawptr) &bytes[0])
+  }
+}
+// Eight completed small revisions provide hysteresis: one shrink or alternating
+// large/small edits keep capacity warm. Realloc failure leaves ownership intact.
+fn syntax_oversized(bytes: []u8, length: usize) bool {
+  return #len(bytes) >= 1048576 && length + 1 <= #len(bytes) / 4
+}
+fn syntax_trim(bytes: *[]u8, length: usize) {
+  capacity: usize = 4096
+  for capacity <= length {
+    capacity *= 2
+  }
+  if #len(bytes.*) < 1048576 || capacity > #len(bytes.*) / 4 {
+    return
+  }
+  pointer := #cast(*u8) dna_memory_realloc(#cast(rawptr) &bytes.*[0], capacity, 0)
+  if pointer != nil {
+    bytes.* = pointer[..capacity]
   }
 }
 fn syntax_millis() u64 {
@@ -303,6 +321,21 @@ fn syntax_worker(context: rawptr) i32 {
       worker.published = nil
       if tree != nil {
         worker.published = syntax_tree_copy(tree)
+      }
+      // Parsing and queries have finished; no reader retains these byte slices.
+      // The mutex also protects published colors and the UI's pending text.
+      if syntax_oversized(input.text, #cast(usize) input.length) || syntax_oversized(previous.text, #cast(usize) previous.length) || syntax_oversized(scratch_colors, #cast(usize) input.length) || syntax_oversized(worker.text, #cast(usize) worker.length) || syntax_oversized(worker.colors, #cast(usize) input.length) {
+        worker.small_revisions += 1
+        if worker.small_revisions >= 8 {
+          syntax_trim(&worker.text, #cast(usize) worker.length)
+          syntax_trim(&worker.colors, #cast(usize) input.length)
+          syntax_trim(&input.text, #cast(usize) input.length)
+          syntax_trim(&previous.text, #cast(usize) previous.length)
+          syntax_trim(&scratch_colors, #cast(usize) input.length)
+          worker.small_revisions = 0
+        }
+      } else {
+        worker.small_revisions = 0
       }
       worker.finished = input.revision
       worker.ready = true
@@ -558,6 +591,9 @@ pub fn dna_syntax_update(worker: *SyntaxWorker, text: *const u8, length: u32, re
   }
   rec_lock(worker.mutex)
   if worker.revision != revision || worker.retry || (!worker.ready && !worker.pending && worker.revision == 0) {
+    if #cast(usize) length + 1 > #len(worker.text) / 4 {
+      worker.small_revisions = 0
+    }
     if !syntax_reserve(&worker.text, #cast(usize) length) || !syntax_reserve(&worker.colors, #cast(usize) length) {
       rec_unlock(worker.mutex)
       return

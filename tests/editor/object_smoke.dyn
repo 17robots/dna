@@ -1,0 +1,106 @@
+// Both keymaps exercise the same scanner, with language context from the slot.
+fn object_keys_smoke(app: *App, typography: *Typography) {
+  original := app.documents.active
+  saved_keys := app.config.vim_keys
+  defer app.config.vim_keys = saved_keys
+  if !new_buffer(app) { #panic("object key fixture") }
+  doc := app.documents.current
+  slot := &app.documents.slots[app.documents.active]
+  slot.filetype_length = copy_text(slot.filetype[..], "dyn")
+  fixtures: [4][]const u8 = ["fn f() { \x2f/ don't count } ( [\n @\n} tail", "call( \x2f* unmatched \" } ] */ @ ) tail", "value[ \x2f/ unmatched ' ]\r\n @ ] tail", "outer { inner { \x2f/ }\n @\n } tail }"]
+  inside: [4][]const u8 = [" \x2f/ don't count } ( [\n @\n", " \x2f* unmatched \" } ] */ @ ", " \x2f/ unmatched ' ]\r\n @ ", " \x2f/ }\n @\n "]
+  keys: [4]u8 = ['{', '(', '[', '{']
+  for profile in 0..2 {
+    app.config.vim_keys = profile == 1
+    for index in 0..4 {
+      vim_start(app, fixtures[index])
+      position: usize = 0
+      for doc.bytes[position] != '@' { position += 1 }
+      buffer.move_to(doc, position, false)
+      key_text: [1]u8 = [keys[index]]
+      if profile == 1 {
+        vim_type(app, typography, "vi")
+        vim_type(app, typography, key_text[..])
+      } else {
+        key_input(app, typography, KeyM, 0)
+        key_input(app, typography, KeyI, 0)
+        text_input(app, key_text[..])
+      }
+      if !buffer.equal(doc.bytes[buffer.start(doc)..buffer.end(doc)], inside[index]) {
+        #panic("vi/mi delimiter selection ignores comment punctuation")
+      }
+      if profile == 1 {
+        vim_type(app, typography, "a")
+        vim_type(app, typography, key_text[..])
+      } else {
+        key_input(app, typography, KeyM, 0)
+        key_input(app, typography, KeyA, 0)
+        text_input(app, key_text[..])
+      }
+      if doc.bytes[buffer.start(doc)] != keys[index] || !buffer.equal(doc.bytes[buffer.start(doc) + 1..buffer.end(doc) - 1], inside[index]) {
+        #panic("va/ma delimiter selection includes the actual enclosing pair")
+      }
+    }
+  }
+  app.config.vim_keys = true
+  vim_start(app, "{} [] ()\n")
+  vim_type(app, typography, "ci{x\x1b")
+  vim_expect(app, "{x} [] ()\n", 1, "ci{ empty pair")
+  vim_type(app, typography, "f[ci[y\x1b")
+  vim_expect(app, "{x} [y] ()\n", 5, "ci[ empty pair")
+  vim_type(app, typography, "f(ci(z\x1b")
+  vim_expect(app, "{x} [y] (z)\n", 9, "ci( empty pair")
+  vim_type(app, typography, "u")
+  if !buffer.equal(doc.bytes[..doc.length], "{x} [y] ()\n") { #panic("empty pair change undo") }
+  // Shift-[ must dispatch as { even without a translated SDL character.
+  vim_start(app, "{word}\n")
+  vim_type(app, typography, "lvi")
+  key_input(app, typography, 1073742049, ModShift)
+  key_input(app, typography, '[', ModShift)
+  if !buffer.equal(doc.bytes[buffer.start(doc)..buffer.end(doc)], "word") { #panic("shifted brace text object") }
+  // Reported GUI case: cursor immediately after foreground in a one-line struct.
+  vim_start(app, "\nstruct Cell { character: u32, foreground: u32, background: u32, underline: u32, flags: u8 }\n")
+  reported_position: usize = 0
+  for !buffer.equal(doc.bytes[reported_position..reported_position + 11], "foreground:") { reported_position += 1 }
+  vim_place(app, reported_position + 10)
+  vim_type(app, typography, "vi")
+  key_input(app, typography, 1073742049, ModShift)
+  key_input(app, typography, '[', ModShift)
+  if !buffer.equal(doc.bytes[buffer.start(doc)..buffer.end(doc)], " character: u32, foreground: u32, background: u32, underline: u32, flags: u8 ") {
+    #panic("GUI vi{ selects the reported Cell fields, not the preceding blank line")
+  }
+  // Physical modifier events must not turn vi{ into the { paragraph motion.
+  modifier_keys: [9]u32 = [1073742048, 1073742049, 1073742050, 1073742051, 1073742052, 1073742053, 1073742054, 1073742055, 1073742081]
+  modifier_masks: [9]u16 = [64, 1, 256, 1024, 128, 2, 512, 2048, 16384]
+  for index in 0..9 {
+    vim_start(app, "before\n\n{\n first\n @here\n last\n}\n")
+    position: usize = 0
+    for doc.bytes[position] != '@' { position += 1 }
+    vim_place(app, position)
+    vim_type(app, typography, "vi")
+    recorded := app.vim.candidate.count
+    key_input(app, typography, modifier_keys[index], modifier_masks[index])
+    if app.vim.pending != 'i' || buffer.head(doc) != position || app.vim.candidate.count != recorded {
+      #panic("modifier press must preserve pending text object and cursor")
+    }
+    key_input(app, typography, '[', ModShift)
+    if !buffer.equal(doc.bytes[buffer.start(doc)..buffer.end(doc)], "\n first\n @here\n last\n") {
+      #panic("physical vi{ must select block contents instead of previous paragraph")
+    }
+  }
+  // Shift also occurs inside an operator sequence; dot must replay the command.
+  vim_start(app, "{one} {two}\n")
+  vim_type(app, typography, "lci")
+  key_input(app, typography, 1073742049, ModShift)
+  key_input(app, typography, '[', ModShift)
+  vim_type(app, typography, "X\x1b")
+  vim_expect(app, "{X} {two}\n", 1, "physical ci{ changes only contents")
+  vim_type(app, typography, "ft.")
+  vim_expect(app, "{X} {X}\n", 5, "dot replays shifted text-object change")
+  app.view.insert = false
+  app.view.extend = false
+  vim_reset(app)
+  buffer.mark_saved(doc)
+  close_clean(app)
+  activate(app, original)
+}

@@ -1,0 +1,110 @@
+use "./buffer" buffer
+use "std/mem"
+extern fn memory_test_fill "__memset_chk"(target: *u8, byte: i32, length: usize, room: usize) rawptr
+extern fn memory_test_write "write"(fd: i32, bytes: *const u8, length: usize) isize
+extern fn memory_test_read "read"(fd: i32, bytes: *u8, length: usize) isize
+const Size: usize = 4194304
+fn phase(label: []const u8) {
+  _ = memory_test_write(1, &label[0], #len(label))
+  token: u8 = 0
+  if memory_test_read(0, &token, 1) != 1 { #panic("memory phase acknowledgment") }
+}
+fn main() {
+  text := buffer.reserve(Size)
+  if !text.ok { #panic("text allocation") }
+  defer _ = mem.arena_release(&text.arena)
+  _ = memory_test_fill(&text.arena.data[0], 97, Size, Size + 1)
+  owners: [8]mem.Arena = []
+  documents: [8]*buffer.Document = []
+  defer {
+    for index in 0..8 { _ = mem.arena_release(&owners[index]) }
+  }
+  for index in 0..8 {
+    owner := buffer.reserve(#sizeof(buffer.Document))
+    if !owner.ok { #panic("document allocation") }
+    owners[index] = mem.arena_take(&owner.arena)
+    documents[index] = buffer.allocate(&owners[index])
+  }
+  phase("empty\n")
+  for index in 0..8 {
+    _ = buffer.load(documents[index], text.arena.data)
+  }
+  phase("clean\n")
+  for index in 0..8 {
+    _ = buffer.replace(documents[index], "x")
+  }
+  phase("first_edit\n")
+  for index in 0..8 {
+    doc := documents[index]
+    // Saving midway through a group must retain its older undo baseline.
+    buffer.mark_saved(doc)
+    _ = buffer.replace(doc, "?")
+    if doc.saved[0] != 'x' || doc.saved[1] != 'a' || doc.checkpoint_bytes[0] != 'a' {
+      #panic("save within edit group corrupts baseline")
+    }
+    buffer.checkpoint(doc)
+    buffer.mark_saved(doc)
+  }
+  phase("saved\n")
+  for index in 0..8 {
+    doc := documents[index]
+    buffer.undo(doc)
+    if doc.length != Size || doc.bytes[0] != 'a' || !buffer.dirty(doc) {
+      #panic("undo after page reclamation")
+    }
+    buffer.redo(doc)
+    if doc.length != Size + 2 || doc.bytes[0] != 'x' || doc.bytes[1] != '?' || buffer.dirty(doc) {
+      #panic("redo after page reclamation")
+    }
+    buffer.mark_saved(doc)
+  }
+  phase("resaved\n")
+  for index in 0..8 {
+    doc := documents[index]
+    _ = buffer.replace(doc, "z")
+    buffer.erase(doc, true)
+    buffer.checkpoint(doc)
+    buffer.mark_saved(doc)
+  }
+  phase("unchanged_save\n")
+  for index in 0..8 {
+    doc := documents[index]
+    doc.anchor = 0
+    doc.cursor = doc.length
+    _ = buffer.replace(doc, "x\n")
+    buffer.checkpoint(doc)
+    buffer.mark_saved(doc)
+    buffer.undo(doc)
+    if doc.length != Size + 2 || doc.bytes[0] != 'x' || doc.bytes[1] != '?' {
+      #panic("large undo delta remains usable")
+    }
+    buffer.redo(doc)
+  }
+  phase("history_retained\n")
+  for index in 0..8 {
+    _ = buffer.load(documents[index], "tiny\n")
+  }
+  phase("tiny_after_history\n")
+  // A newline-dense file commits a much larger line index than ordinary text.
+  _ = memory_test_fill(&text.arena.data[0], 10, Size, Size + 1)
+  for index in 0..8 {
+    _ = buffer.load(documents[index], text.arena.data)
+    if documents[index].line_count != Size + 1 {
+      #panic("large line index")
+    }
+  }
+  phase("many_lines\n")
+  for index in 0..8 {
+    doc := documents[index]
+    // Loading from an alias must consume the source before reclaiming its pages.
+    _ = buffer.load(doc, doc.bytes[Size - 5..Size])
+    if doc.length != 5 || doc.line_count != 6 || doc.bytes[4] != 10 {
+      #panic("aliased small reload")
+    }
+    buffer.undo(doc)
+    if doc.length != 5 || doc.history_count != 1 {
+      #panic("reload resets history")
+    }
+  }
+  phase("tiny_after_lines\n")
+}

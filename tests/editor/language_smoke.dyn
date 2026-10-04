@@ -10,6 +10,82 @@ fn language_wait(app: *App) {
   }
   #panic("language response deadline")
 }
+// Large unchanged prefixes must not size every incremental message to the file.
+fn language_incremental_budget(app: *App) {
+  doc := app.documents.current
+  mark := mem.arena_mark(app.scratch)
+  defer mem.arena_rewind(app.scratch, mark)
+  original := (#cast(*u8) mem.arena_push_uninit_or_panic(app.scratch, doc.length + 1, 1))[..doc.length]
+  if doc.length > 0 { _ = buffer.copy_bytes(&original[0], &doc.bytes[0], doc.length) }
+  text := (#cast(*u8) mem.arena_push_uninit_or_panic(app.scratch, 262144, 1))[..262144]
+  for index in 0..#len(text) {
+    text[index] = 'a'
+    if index % 64 == 63 { text[index] = 10 }
+  }
+  _ = buffer.load(doc, text)
+  lsp_sync(app, 0, true)
+  allocated := app.operations.allocated_bytes
+  buffer.move_to(doc, doc.length, false)
+  _ = buffer.replace(doc, "é😀")
+  lsp_sync(app, 0, true)
+  if app.operations.allocated_bytes - allocated > 262144 {
+    #panic("small LSP edit allocated for unchanged document")
+  }
+  // Merged edits move both the suffix and UTF-16 columns across a newline.
+  buffer.move_to(doc, 131073, false)
+  _ = buffer.replace(doc, "😀\nZ")
+  buffer.move_to(doc, 131075 + 4, false)
+  _ = buffer.replace(doc, "é")
+  lsp_sync(app, 0, true)
+  buffer.checkpoint(doc)
+  buffer.undo(doc)
+  lsp_sync(app, 0, true)
+  buffer.redo(doc)
+  lsp_sync(app, 0, true)
+  // More revisions than the journal retains must fall back to a correct diff.
+  for index in 0..130 {
+    buffer.move_to(doc, doc.length, false)
+    _ = buffer.replace(doc, "x")
+  }
+  lsp_sync(app, 0, true)
+  if !buffer.equal(app.lsp.shadows[0].bytes[..app.lsp.shadows[0].length], doc.bytes[..doc.length]) {
+    #panic("incremental shadow diverged")
+  }
+  app.lsp.log_length = 0
+  buffer.mark_saved(doc)
+  lsp_sync(app, 0, true)
+  deadline := sdl.ticks() + 3000
+  for !contains(app.lsp.log[..app.lsp.log_length], "fixture saved") && sdl.ticks() < deadline {
+    _ = lsp_tick(app)
+    language_test_delay(1)
+  }
+  if !contains(app.lsp.log[..app.lsp.log_length], "fixture saved") {
+    #panic("large incremental document diverged from server")
+  }
+  // Full-sync capability and an unavailable incremental shadow remain valid.
+  app.lsp.servers[0].sync = 1
+  buffer.move_to(doc, doc.length, false)
+  _ = buffer.replace(doc, "é\n😀")
+  lsp_sync(app, 0, true)
+  app.lsp.servers[0].sync = 2
+  app.lsp.shadows[0].ready = false
+  buffer.move_to(doc, doc.length, false)
+  _ = buffer.replace(doc, "Z")
+  lsp_sync(app, 0, true)
+  app.lsp.log_length = 0
+  buffer.mark_saved(doc)
+  lsp_sync(app, 0, true)
+  deadline = sdl.ticks() + 3000
+  for !contains(app.lsp.log[..app.lsp.log_length], "fixture saved") && sdl.ticks() < deadline {
+    _ = lsp_tick(app)
+    language_test_delay(1)
+  }
+  if !contains(app.lsp.log[..app.lsp.log_length], "fixture saved") {
+    #panic("full sync or unavailable shadow diverged from server")
+  }
+  _ = buffer.load(doc, original)
+  lsp_sync(app, 0, true)
+}
 fn language_smoke() {
   command: [4096]u8 = []
   configured := process.environment("DNA_TEST_LSP", command[..4095])
@@ -28,15 +104,17 @@ fn language_smoke() {
   }
   defer _ = mem.arena_release(&owned.arena)
   defer _ = mem.arena_release(&scratch.arena)
-  app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
+  app := #cast(*App) mem.arena_push_or_panic(&owned.arena, #sizeof(App), #alignof(App))
   app.scratch = &scratch.arena
   app.config = settings.Settings{}
+  defer operations_release(app)
   defer release_editor_state(app)
   defer lsp_release(app)
   app.workspace.project_length = copy_text(app.workspace.project[..], root.value)
   if !new_buffer(app) {
     #panic("language buffer")
   }
+  completion_words_smoke(app)
   path: [4096]u8 = []
   length := copy_text(path[..], root.value)
   add_text(path[..], &length, "/language test.dyn")
@@ -60,6 +138,29 @@ fn language_smoke() {
   if !contains(app.lsp.log[..app.lsp.log_length], "fixture saved") {
     #panic("save notification")
   }
+  // Server trigger characters must bypass the ordinary typing pause, including
+  // punctuation outside the editor's identifier rules and multibyte characters.
+  app.config.completion_delay_ms = 2000.0
+  app.view.insert = true
+  for trigger in ["/", "😀"] {
+    app.prompt_state.panel = Panel.None
+    buffer.move_to(app.documents.current, app.documents.current.length - 1, false)
+    text_input(app, trigger)
+    completion_tick(app)
+    if app.lsp.pending == 0 {
+      #panic("server trigger must request completion without debounce")
+    }
+    language_wait(app)
+    if !buffer.equal(json_text(app.lsp.results.source, "detail"), "fixture trigger accepted") {
+      #panic("server must receive matching trigger context")
+    }
+    app.lsp.log_length = 0
+    lsp_results_release(app)
+    _ = buffer.load(app.documents.current, "al é😀\n")
+  }
+  app.prompt_state.panel = Panel.None
+  app.view.insert = false
+  app.config.completion_delay_ms = 25.0
   // Incremental sync: mid-document edits around multi-byte text, then a save
   // the fixture server checks against its own copy (it exits on mismatch).
   incremental := app.documents.current
@@ -91,6 +192,7 @@ fn language_smoke() {
   if !contains(app.lsp.log[..app.lsp.log_length], "fixture saved") || app.lsp.servers[0].process == nil {
     #panic("incremental edits diverged from the server copy")
   }
+  language_incremental_budget(app)
   incremental.anchor = 0
   incremental.cursor = incremental.length
   _ = buffer.replace(incremental, original[..original_length])
@@ -103,7 +205,9 @@ fn language_smoke() {
   if app.prompt_state.panel != Panel.LspResults || app.lsp.results.count != 1 {
     #panic("completion result")
   }
+  lsp_request(app, 1, "")
   lsp_accept(app)
+  if app.lsp.pending != 0 { #panic("accepting completion left a refresh pending") }
   if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "alphabet é😀\n") || !app.view.insert || app.documents.current.cursor != 8 {
     #panic("completion apply")
   }
@@ -146,6 +250,51 @@ fn language_smoke() {
   if !contains(app.lsp.log[..app.lsp.log_length], "Automatic completion: 1 results; popup opened.") {
     #panic("completion response must replace pending status")
   }
+  // A complete response filters a longer prefix without another round trip.
+  text_input(app, "p")
+  completion_tick(app)
+  if !completion_visible(app) || app.lsp.pending != 0 || app.lsp.completion_due != 0 {
+    #panic("complete candidates must filter without a server round trip")
+  }
+  key_input(app, nil, KeyBackspace, 0)
+  if !completion_visible(app) || app.lsp.results.count != 1 {
+    #panic("backspace must filter cached completion immediately")
+  }
+  // Explicitly incomplete responses still refresh in the background.
+  app.lsp.results.incomplete = true
+  // An open popup must survive typing and the replacement request's latency.
+  text_input(app, "p")
+  if !completion_visible(app) { #panic("completion disappeared while filtering") }
+  completion_tick(app)
+  app.lsp.completion_due = 1
+  completion_tick(app)
+  if app.lsp.pending == 0 || !completion_visible(app) {
+    #panic("completion disappeared while refreshing")
+  }
+  text_input(app, "h")
+  if !completion_visible(app) || app.lsp.results.count != 1 {
+    #panic("completion disappeared while typing during refresh")
+  }
+  completion_tick(app)
+  if app.lsp.pending == 0 || !completion_visible(app) {
+    #panic("compatible typing must reuse the pending completion")
+  }
+  app.lsp.completion_due = 1
+  completion_tick(app)
+  language_wait(app)
+  if !completion_visible(app) { #panic("completion refresh did not retain popup") }
+  lsp_request(app, 1, "")
+  key_input(app, nil, KeyEscape, 0)
+  if app.lsp.pending != 0 || app.prompt_state.panel != Panel.None {
+    #panic("Escape must dismiss completion and cancel its refresh")
+  }
+  _ = lsp_tick(app)
+  completion_tick(app)
+  if completion_visible(app) || app.lsp.completion_due != 0 {
+    #panic("dismissed completion reopened")
+  }
+  buffer.erase(app.documents.current, true)
+  buffer.erase(app.documents.current, true)
   lsp_status(app)
   if !contains(app.prompt_state.message[..app.prompt_state.message_length], configured.value) || !contains(app.prompt_state.message[..app.prompt_state.message_length], "Completion delay: 25 ms") || !contains(app.prompt_state.message[..app.prompt_state.message_length], "Last response:") {
     #panic("language status must identify server and timings")
@@ -193,7 +342,7 @@ fn language_smoke() {
     completion_tick(app)
     language_test_delay(1)
   }
-  text_input(app, "q")
+  text_input(app, ".q")
   completion_tick(app)
   if app.lsp.pending != 0 || app.lsp.completion_due == 0 {
     #panic("obsolete automatic completion must cancel and rearm")
@@ -364,7 +513,7 @@ fn disk_smoke() {
   }
   defer _ = mem.arena_release(&owned.arena)
   defer _ = mem.arena_release(&scratch.arena)
-  app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
+  app := #cast(*App) mem.arena_push_or_panic(&owned.arena, #sizeof(App), #alignof(App))
   app.scratch = &scratch.arena
   app.config = settings.Settings{}
   defer release_editor_state(app)
@@ -424,7 +573,7 @@ fn clipboard_smoke() {
     #panic("clipboard test memory")
   }
   defer _ = mem.arena_release(&owned.arena)
-  app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
+  app := #cast(*App) mem.arena_push_or_panic(&owned.arena, #sizeof(App), #alignof(App))
   defer release_editor_state(app)
   if !new_buffer(app) {
     #panic("clipboard test buffer")
@@ -469,7 +618,7 @@ fn formatting_smoke() {
   }
   defer _ = mem.arena_release(&owned.arena)
   defer _ = mem.arena_release(&scratch.arena)
-  app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
+  app := #cast(*App) mem.arena_push_or_panic(&owned.arena, #sizeof(App), #alignof(App))
   app.scratch = &scratch.arena
   defer release_editor_state(app)
   defer format_release(app)
@@ -550,7 +699,7 @@ fn format_save_smoke() {
   }
   defer _ = mem.arena_release(&owned.arena)
   defer _ = mem.arena_release(&scratch.arena)
-  app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
+  app := #cast(*App) mem.arena_push_or_panic(&owned.arena, #sizeof(App), #alignof(App))
   app.scratch = &scratch.arena
   defer release_editor_state(app)
   defer format_release(app)
@@ -592,7 +741,7 @@ fn settings_inspector_smoke(typography: *Typography) {
     #panic("settings inspector memory")
   }
   defer _ = mem.arena_release(&owned.arena)
-  app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
+  app := #cast(*App) mem.arena_push_or_panic(&owned.arena, #sizeof(App), #alignof(App))
   if !settings.parse("terminal_escape = \"alt-x\"\n[keys.normal]\n\"f2\" = \"write\"\n[languages.dyn]\nindent_width = 2\nformatter = \"dyn fmt\"\n", &app.config) {
     #panic("inspector config")
   }
@@ -634,7 +783,7 @@ fn picker_mouse_smoke(renderer: rawptr, typography: *Typography) {
     #panic("picker mouse scratch")
   }
   defer _ = mem.arena_release(&scratch.arena)
-  app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
+  app := #cast(*App) mem.arena_push_or_panic(&owned.arena, #sizeof(App), #alignof(App))
   app.scratch = &scratch.arena
   settings.defaults(&app.config)
   if !new_buffer(app) {
@@ -746,7 +895,7 @@ fn dyn_language_smoke(renderer: rawptr, typography: *Typography) {
   }
   defer _ = mem.arena_release(&owned.arena)
   defer _ = mem.arena_release(&scratch.arena)
-  app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
+  app := #cast(*App) mem.arena_push_or_panic(&owned.arena, #sizeof(App), #alignof(App))
   app.scratch = &scratch.arena
   settings.defaults(&app.config)
   defer release_editor_state(app)
@@ -1006,4 +1155,50 @@ fn diagnostic_render_smoke(renderer: rawptr, typography: *Typography, app: *App)
     #panic("stale diagnostic decoration")
   }
   doc.revision -= 1
+}
+
+fn completion_words_smoke(app: *App) {
+  doc := app.documents.current
+  _ = buffer.load(doc, "alphabet alphabet al")
+  buffer.move_to(doc, doc.length, false)
+  app.view.insert = true
+  app.prompt_state.panel = Panel.None
+  app.lsp.pending = 77
+  allocated := app.operations.reserved
+  completion_words(app)
+  if !completion_visible(app) || app.lsp.results.count != 1 || app.lsp.pending != 77 {
+    #panic("local completion must be immediate, deduplicated, and retain server request")
+  }
+  text_input(app, "p")
+  key_input(app, nil, KeyBackspace, 0)
+  key_input(app, nil, KeyBackspace, 0)
+  if !completion_visible(app) || doc.bytes[doc.cursor - 1] != 'a' {
+    #panic("local completion must survive backspacing before request position")
+  }
+  text_input(app, "z")
+  if completion_visible(app) { #panic("unmatched completion must hide") }
+  key_input(app, nil, KeyBackspace, 0)
+  if !completion_visible(app) { #panic("backspace must restore cached matches") }
+  app.lsp.pending = 0
+  lsp_accept(app)
+  if !buffer.equal(doc.bytes[..doc.length], "alphabet alphabet alphabet") || app.operations.reserved != allocated {
+    #panic("local completion acceptance or ownership")
+  }
+  _ = buffer.load(doc, "école école éc")
+  buffer.move_to(doc, doc.length, false)
+  completion_words(app)
+  if !completion_visible(app) || app.lsp.results.count != 1 { #panic("Unicode word completion") }
+  // A server edit ending at the old UTF-16 cursor is invalid after backspace.
+  ranged := json.parse(app.scratch, "[{\"label\":\"école\",\"textEdit\":{\"range\":{\"start\":{\"line\":0,\"character\":12},\"end\":{\"line\":0,\"character\":14}},\"newText\":\"école\"}}]")
+  if !ranged.ok { #panic("completion range fixture") }
+  app.lsp.results.source = ranged.root.first
+  key_input(app, nil, KeyBackspace, 0)
+  if completion_visible(app) || !app.lsp.results.incomplete { #panic("backspace exposed an obsolete text edit") }
+  app.view.insert = false
+  completion_tick(app)
+  if app.lsp.results.active { #panic("completion cache survived leaving insert mode") }
+  lsp_results_release(app)
+  app.prompt_state.panel = Panel.None
+  app.view.insert = false
+  _ = buffer.load(doc, "")
 }

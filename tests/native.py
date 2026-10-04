@@ -77,6 +77,28 @@ if (root/'dyn').exists():
         while not lib.dna_syntax_colors(p,output,len(text),1) and time.monotonic()<deadline: time.sleep(.01)
         assert output[0]==3 and output[text.index(b'hello')]==2 and output[text.index(b'comment')]==1
         assert not lib.dna_syntax_colors(p,output,len(text),2),'stale colors accepted'
+        # The installed parser and bundled query must agree on allocator syntax.
+        builtins = ('alloc', 'alloc_or_panic', 'alloc_uninit', 'alloc_uninit_or_panic',
+                    'alloc_slice', 'alloc_slice_or_panic', 'alloc_slice_uninit',
+                    'alloc_slice_uninit_or_panic')
+        source = 'fn allocation(output: Allocator) #AllocResult(*u8) {\n'
+        source += '  fixed: [4 * 1024]u8 = []\n  other := #allocator(nil, &callback)\n'
+        for index, builtin in enumerate(builtins):
+            arguments = 'u8, output, 4' if 'slice' in builtin else 'u8, output'
+            source += f'  value{index} := #{builtin}({arguments})\n'
+        source += '  return #alloc(u8, output)\n}\n'
+        text = source.encode()
+        output = (c.c_ubyte * len(text))()
+        lib.dna_syntax_update(p, text, len(text), 2)
+        deadline = time.monotonic() + 5
+        while not lib.dna_syntax_colors(p, output, len(text), 2):
+            assert time.monotonic() < deadline, 'allocator syntax timed out'
+            time.sleep(.01)
+        for token in ('allocator', 'AllocResult', *builtins):
+            start = text.index(('#' + token + '(').encode())
+            assert list(output[start:start + len(token) + 1]) == [4] * (len(token) + 1), token
+        assert output[text.index(b'Allocator')] == 5, 'Allocator primitive highlighting'
+
     finally: lib.dna_syntax_close(p)
     print('PASS background Dyn highlighting and revision isolation')
 

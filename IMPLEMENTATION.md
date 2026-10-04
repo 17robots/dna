@@ -502,3 +502,360 @@ fall back to 16 ms polling after hangup if pidfd creation is unavailable.
 The notification regression closes all child terminal descriptors before a
 delayed exit and requires an event-driven wake, with no timer polling to hide
 the race. Private boundary coverage checks the unavailable-pidfd fallback.
+
+Final validation: `mise exec -- just smoke` passed, including debug/release unit
+and editor workflows, GUI/TUI coverage, static/minimal/terminal profiles, the
+128 MiB retained-memory gate, and native lifecycle/notification regressions.
+Completion-focused release fuzz passed seeds 71–73 with 1,000 events each.
+Logs: `build/comparison-smoke.log` and `build/comparison-fuzz.log`.
+
+### Follow-up performance fixes (2026-10-04)
+
+Completion now retains server-advertised trigger characters from initialization,
+including Unicode characters, and sends the matching LSP completion context.
+A typed trigger requests completion immediately. Other typed characters keep the
+configured 25 ms default pause. Manual completion sends the invoked context.
+The capability and request fields follow the [LSP completion specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#textDocument_completion).
+Regression coverage uses `/` and `😀` triggers with a 2,000 ms ordinary delay,
+and the fake server verifies the trigger against its synchronized document.
+Before the fix the same test failed because no immediate request was sent.
+
+On the same Dyn `h` workload described above, three fresh sessions with ten warm
+samples each measured these popup latencies (median / p95 / maximum, ms):
+
+| Editor | Warm completion |
+| --- | --- |
+| DNA | 2.267 / 2.329 / 2.356 |
+| Neovim | 26.623 / 27.750 / 27.779 |
+| Helix | 7.799 / 8.975 / 9.141 |
+
+The pre-change DNA check measured 26.623 ms median. Dyn advertises `h` as a
+trigger, so this gain comes from honoring its scheduling request; it is not a
+claim that every language server or ordinary typing completion takes 2 ms.
+Protocol server time remained about 0.6 ms. Logs and samples are retained in
+`build/further-completion-after/` and `build/further-completion-before.log`.
+The comparison harness now waits for the complete owned process tree to exit,
+including language-server jobs in separate process groups, before deleting its
+fixtures. A regression covers a separate-group child that ignores SIGTERM.
+
+Dirty-state checks now compare only the span that edits could have changed.
+The saved-text prefix/suffix bounds are updated by replacement, case conversion,
+and undo/redo. Saves and proven equality reset the bounds. A 3,000-operation
+mixed test compares this result against full saved-text equality after every
+operation; existing row-identity and Unicode tests remain in place.
+
+Three alternating before/after runs of the 5,279,949-byte terminal workload
+(180 insertion and backspace samples per binary) produced:
+
+| Operation | Before, median / p95 ms | After, median / p95 ms |
+| --- | --- | --- |
+| Backspace | 0.472 / 0.588 | 0.349 / 0.435 |
+| Insert | 0.326 / 0.407 | 0.355 / 0.437 |
+| Startup to file content | 5.930 / 6.733 | 5.950 / 6.687 |
+
+Backspace improved 26%; this run did not show an insertion or startup gain.
+Maximum insertion was 2.675/2.523 ms and maximum backspace 0.729/0.786 ms, so
+worst-case latency is not uniformly better. Twelve-file retained PSS remained
+99.17/99.16 MiB. Evidence is in `build/further-paired-{before,after}-{0,1,2}.json`
+and `build/further-paired-summary.json`.
+
+The startup probe now optionally reports SDL initialization, window creation,
+renderer creation, and font opening with `DNA_STARTUP_TRACE=1`, and honors an
+explicit `SDL_VIDEODRIVER`. On the local Wayland desktop the unchanged shared
+release binary spent roughly 57–66 ms creating its renderer, out of 66–75 ms to
+first presentation return. OpenGL ES and Vulkan did not improve total startup,
+so the renderer default was not changed. These instrumented desktop timings use
+a different endpoint/environment from the isolated Gamescope comparison above;
+they do not establish physical display latency or a GUI startup improvement.
+
+Validation passed: full `mise exec -- just smoke`, including debug/release unit
+and editor integration tests, memory/lifecycle gates, process-tree cleanup,
+standalone/minimal/terminal profiles, and the new trigger regressions.
+Completion-focused release fuzz passed seeds 81–83 with 1,000 events each.
+The tested standalone executable replaced `./dna`; dummy and real Wayland startup
+both exited successfully. Logs: `build/further-smoke.log` and
+`build/further-fuzz.log`.
+
+### Snapshot memory cleanup (2026-10-04)
+
+Saved text and the undo checkpoint now share one preserved copy when they are
+identical. Saving inside an uncheckpointed edit group can make the baselines
+diverge; the older checkpoint is copied before its shared storage is reused.
+Undo/redo uses separately owned history deltas and does not preserve a checkpoint
+that it is about to replace.
+
+When saved and checkpoint views both refer to current text, unused full pages
+in their backing arrays are returned to the OS with `MADV_DONTNEED`. Written
+high-water marks bound the reclamation; partial boundary pages are retained so
+adjacent state cannot be discarded. A no-op checkpoint also reattaches its view
+to current text, allowing a subsequent save to reclaim storage. Active edit
+groups retain hot storage; editing after reclamation faults needed pages back
+in. Virtual document capacity and undo-history limits are unchanged.
+
+`tests/document_memory.py` measures a paused child process with eight 4 MiB
+buffers. It exercises first edits, saving inside an edit group, checkpointing,
+saving again, undo/redo, and typing/deleting back to unchanged text before saving.
+Before the change, both duplicate-copy and post-save-retention assertions failed.
+Representative process PSS measurements, in MiB:
+
+| Phase | Before | After |
+| --- | --- | --- |
+| Loaded, unedited | 37.70 | 37.70 |
+| First edit in all eight buffers | 101.76 | 69.73 |
+| Saved and checkpointed | 101.76 | 37.82 |
+| Undo/redo, then saved again | 101.78 | 37.83 |
+
+These are retained-memory measurements at the stated phases, not a claim that
+all temporary peaks disappear. Distinct saved and checkpoint baselines still
+need separate storage. The new regression runs in `just smoke`, requiring
+first-edit growth below 40 MiB and post-save growth below 8 MiB over its baseline.
+Evidence: `build/memory-snapshots-before.json`, `build/memory-snapshots-after.json`,
+and `build/memory-unchanged-red.log`.
+
+Three alternating before/after runs of the existing twelve-file, 5.28 MB terminal
+workload retained 99.23/94.14 MiB PSS. Insertion median/p95/maximum was
+0.351/0.448/2.679 ms before and 0.352/0.441/2.150 ms after. Backspace was
+0.344/0.448/0.523 ms before and 0.364/0.429/0.481 ms after. The memory saving did
+not produce a general median typing improvement. Samples and aggregate results
+are in `build/memory-paired-{before,after}-{0,1,2}.json` and
+`build/memory-paired-summary.json`.
+
+Validation initially exposed an intermittent existing interactive-shell test
+failure (`exited interactive terminal remains open`). The fixture sent SIGINT
+and `exit` without establishing that `cat` had returned control to the shell.
+The test now assigns a deterministic prompt, waits for that prompt after SIGINT,
+and sends `exit` once. It does not lengthen the exit timeout or change production
+terminal behavior. Temporary diagnostic logging was removed; debug/release
+editor workflows passed with the readiness barrier.
+
+Final validation passed: full `mise exec -- just smoke`, including the new
+snapshot-memory gate, save/undo/redo tests, debug/release GUI/TUI workflows,
+native resource cleanup, and standalone/minimal/terminal profiles. Random
+release fuzz passed seeds 91–93 with 1,000 input events each. The tested standalone
+build replaced `./dna`; dummy and real Wayland startup both passed. Logs:
+`build/memory-cleanup-verified.log` and `build/memory-cleanup-fuzz.log`.
+
+### Reload reclamation and replacement speed (2026-10-04)
+
+Document reload now reclaims unused text, line-index, and undo-storage pages.
+Each storage region tracks its largest written prefix, so reclamation remains
+bounded even after edits shrink the current text or reuse earlier history slots.
+Reload already resets undo history; the change discards only pages no longer
+needed by that reset. Aliased source text is copied before any pages are released.
+Ordinary editing retains its live undo deltas and reusable storage.
+
+The document-memory regression now starts with eight empty documents, loads
+4 MiB into each, creates large undo deltas, and reloads tiny text. It also loads
+newline-dense files to grow the line index, then reloads from a slice of each
+buffer's own text. Representative process PSS, including the 4 MiB fixture:
+
+| Phase | Before, MiB | After, MiB |
+| --- | --- | --- |
+| Empty documents and fixture | 5.68 | 5.69 |
+| Tiny reload after large text/undo history | 69.81 | 5.89 |
+| Tiny reload after newline-dense files | 197.81 | 5.92 |
+
+These are buffer-reuse stress cases, not normal startup memory. The existing
+`just smoke` memory gate now checks these phases against the empty baseline.
+Evidence: `build/reload-memory-before.json`, `build/reload-memory-after.json`,
+`build/reload-memory-red.log`, and `build/reload-memory-green.log`.
+
+Equal-length replacements with unchanged newline counts no longer rewrite all
+later line offsets. Internal newline positions are still rebuilt. Regression
+coverage checks moved/deleted newlines, undo/redo, and the existing randomized
+line-index oracle. In the release buffer benchmark, a one-character replacement
+at the start of a 1 MB file dropped from 4.984 to 0.537 microseconds; the middle
+case dropped from 2.743 to 0.547 microseconds. This is the buffer operation only,
+not end-to-end GUI latency. Evidence: `build/reload-speed-{before,after}.log`.
+
+Three alternating runs of the existing 5.28 MB terminal workload showed insertion
+medians of 0.364/0.363 ms and backspace medians of 0.376/0.376 ms before/after.
+Retained twelve-file PSS remained about 94.17 MiB because that workload does not
+reload smaller text into its buffers. Insertion p95/max was 0.485/1.729 ms before
+and 0.503/2.517 ms after; jump median was 0.176/0.209 ms. This run establishes no
+general editor speedup or uniformly better tail latency. Raw samples and summary:
+`build/reload-paired-{before,after}-{0,1,2}.json` and
+`build/reload-paired-summary.json`.
+
+Validation: the full `mise exec -- just smoke` suite passed, including debug and
+release unit tests, memory gates, native resource checks, and terminal profiles.
+Release random-input fuzz passed seeds 101–103 with 1,000 events each. The tested
+standalone build replaced `./dna`; dummy and real Wayland startup both passed.
+Logs: `build/reload-smoke.log` and `build/reload-fuzz.log`.
+
+### Delimiter selection regressions (2026-10-05)
+
+Checked the updated preview-17 build and reproduced three defects:
+
+- A closing brace inside a line comment could close the scanner's inner block,
+  making `mi{` or `vi{` select the outer block instead. An apostrophe or unmatched
+  quote in a comment could also prevent the requested pair from being found.
+- The scanner continued through unrelated text after finding the requested pair.
+  A later nesting overflow could discard that otherwise valid result.
+- Vim rejected an empty inner text object before handling its operator. With
+  `ci(` on `()`, insert mode never started, so the next typed character executed
+  as a normal-mode command instead.
+
+The shared buffer scanner now accepts explicit comment syntax from the editor's
+existing file-type classification. Plain-text callers retain the old lexical
+mode. Recognized line comments and C-style block comments shield delimiter and
+quote characters; Rust, Swift, and Kotlin allow nested block comments. Both
+keymaps and Helix surround operations pass that context. Python floor division,
+quoted comment markers, explicit slash surrounds, and explorer/plain-text
+buffers remain distinct. This is still lexical matching, not a full parser for
+raw strings, interpolation, or every language-specific comment form.
+
+Pair scanning returns as soon as the requested enclosing pair closes, avoiding
+both the unrelated-suffix failure and the old temporary candidate array. Vim
+handles an empty change as insertion at the inner boundary, preserving delimiters
+and undo grouping.
+
+Regression coverage lives in `tests/objects/main.dyn` (part of `scripts/test.py`)
+and `tests/editor/object_smoke.dyn`. It checks both selection directions, inner
+then around commands, comments and quotes, nested blocks, three selections,
+empty changes and undo, and shifted brace dispatch. The editor checks exercise
+`vi{`/`mi{` and the parenthesis/bracket equivalents through the key-input paths.
+Before-fix failures are recorded in `build/objects-comment-red.log`,
+`build/objects-suffix-red.log`, and `build/objects-ui-red.log`.
+
+Validation: all 20 debug/release unit runs and the full `just smoke` suite passed.
+The final expanded object cases and both editor keymaps also passed separate
+focused debug/release runs. Release input fuzz passed seeds 111–113 with 1,000
+events each. Logs: `build/objects-full-smoke.log`, `build/objects-focused.log`,
+`build/objects-ui-final.log`, and `build/objects-fuzz.log`. The tested standalone
+build replaced `./dna`; dummy and real Wayland startup passed. The previous
+executable is retained at `build/dna-before-object-fixes`.
+
+### Physical Shift canceled Vim text objects (2026-10-05)
+
+The follow-up GUI report reproduced with `vi{` from `foreground|:` in
+`struct Cell { character: u32, foreground: u32, background: u32, underline: u32, flags: u8 }`.
+SDL delivers Shift as a separate key-down event before the bracket key. That
+non-character event cleared Vim's pending `i`; the following `{` consequently ran
+as the previous-paragraph motion, selecting backward toward the preceding blank
+line. The earlier tests supplied the shifted character/modifier directly without
+first pressing Shift, so they missed the actual event sequence.
+
+`key_input` now ignores standalone left/right Shift, Ctrl, Alt, GUI, and Mode
+modifier events before recording or dispatch. The following character still
+carries its modifier mask. This keeps incomplete commands, completion, and
+snippets from treating a modifier press as a command. Escape and other actual
+keys retain their existing dispatch behavior.
+
+`tests/editor/object_smoke.dyn` now includes the exact reported line, a multiline
+block, all nine standalone modifier keycodes, and physical Shift during `ci{`
+followed by dot-repeat. The original failure is in `build/vim-modifier-red.log`.
+
+Validation: the complete editor workflow passed in debug and release with the
+exact reported fixture (`build/vim-modifier-final.log`). Release input-event,
+terminal-rendering, and 3,000 randomized-input checks passed
+(`build/vim-modifier-validation.log`, seeds 121–123). Rebuilt `./dna` without
+compiler cache; dummy and real Wayland startup passed. The previous executable is
+retained at `build/dna-before-vim-modifier-fix`.
+
+
+### Incremental edits, bounded syntax retention, and background picker
+
+Vim now clears completed/canceled operator counts while retaining pending motion
+counts; counted find motions include the operator multiplier. Workspace release
+failure retains the owner and accounting, and growth refuses to replace an owner
+that could not be released. Native thread join failure waits for entry completion
+before callers may release state. Unjoined bookkeeping stays on a retry list until
+a later lifecycle operation successfully joins it.
+
+A 128-entry revision journal bounds LSP differences; overflow or missing revisions
+fall back to the existing full diff. UTF-16 positions use the document line index.
+Incremental synchronization copies the changed range and moves a shifted suffix,
+and sizes scratch storage from the outgoing edit. A small edit in a 256 KiB file
+now reserves 256 KiB of LSP workspace instead of roughly 3.13 MiB.
+
+Undo checkpoints track touched prefix/suffix bounds and update an independent
+mirror incrementally. The first independent mirror still copies the document.
+The 64 MiB EOF edit/checkpoint benchmark fell from roughly 5.4 ms/op to 0.71–0.73 ms/op
+(three paired runs, initial mirror construction included, twenty operations). Warm top edits remain
+roughly 2.7 ms; first top edits roughly 14 ms. Contiguous storage is retained for
+this pass: removing that remaining file-size dependence requires a gap buffer or
+piece table plus changes to consumers of direct document bytes. These measurements
+are buffer operations, not key-to-screen latency or comparisons with other editors.
+
+Syntax workers trim five oversized buffers after eight consecutive small completed
+revisions. Tracked live storage in the large-to-small fixture fell from 41,955,624
+to 33,064 bytes. Alternating large/small revisions keep capacity warm; failed trims
+preserve ownership and retry after the next eight small revisions.
+
+The picker now scans in one worker with generation cancellation and directory-watch
+invalidation. Watch overflow/failure enables a two-second refresh fallback; normal
+changes debounce for 60 ms. Background refresh preserves selection by filename.
+Expired refresh deadlines do not spin while a scan is pending. Closing the panel
+cancels work; editor teardown joins before freeing the worker. Native tests cover
+nested create/rename/delete, stale generations, bounded watches, cancellation and
+allocation balance across repeated lifecycles. UI smoke covers refresh selection
+and notification fallback deadlines.
+
+Validation: full `mise exec -- just smoke` passed after correcting save-time mirror
+reclamation (the existing document-memory gate caught that regression). Debug and
+release UI workflows also passed on Wayland. Helix and Vim each passed seeds
+131–133 with 1,000 random input events per seed. The tested standalone executable
+replaces root `./dna`; `build/dna-before-all-cleanup` retains the previous binary.
+Installed startup passed with both dummy and Wayland drivers, without library-path
+overrides. Detailed logs: `build/all-cleanup-smoke-final.log`,
+`build/cleanup-wayland-workflow.log`, and `build/cleanup-fuzz-{helix,vim}.log`.
+
+
+### Completion popup continuity
+
+Completion refresh requests now keep an already visible, locally filtered list
+open while the server responds. Previously every request set the panel to None,
+so the reply reopened it and restarted its opening animation. Continued typing
+still filters cached candidates immediately and cancels obsolete requests.
+Escape and accepting a candidate now also cancel pending completion refreshes and
+clear their debounce/retry state, preventing a late response from reopening the
+list. Empty matches and edits outside completion context retain their existing
+closing behavior.
+
+The editor regression test checks typing, a pending refresh, cancellation while
+typing, replacement replies, acceptance, and explicit dismissal. The fake server
+uses a complete filterText for its alphabet candidate so cached filtering can be
+exercised across multiple keystrokes.
+
+
+### Completion latency in project files
+
+A real-project `src/platform/tui.dyn` test reproduced a 1,179 ms first popup.
+Protocol tracing found most time inside Dyn, not the UI. Direct pinned-preview17
+server tests measured roughly 539–720 ms for completion inside a function, versus
+14–18 ms at top level: the synthetic local-completion expression bypasses semantic
+snapshot reuse and rebuilds project analysis. The compiler and SDK are unchanged.
+
+DNA now reuses complete candidate lists without another request while a word grows.
+A pending automatic response can serve later typing only when the revision journal
+proves pure word-character insertion at the request cursor and candidates still
+match. Cursor moves, other edits, missing history, and buffer changes keep strict
+stale-response checks. Backspace filters retained candidates immediately, including
+restoring a previously empty list. Explicit text edits invalidated by deleting
+before the response cursor, and shifted additional edits, wait for fresh results.
+Leaving insert mode or opening another language feature invalidates the session.
+
+After 20 ms of pending automatic completion, a local preview scans at most 64 KiB
+near the cursor, deduplicates at most 128 matching words, and owns a 256 KiB JSON
+arena. It inserts plain words labeled “word from file”; it does not synthesize
+snippets or semantic claims. Server results replace the preview in place. Shared
+preview eligibility prevents expired deadlines from spinning when completion is
+disabled, the active buffer changes, or another panel opens. Acceptance/dismissal
+cancel pending refreshes as before.
+
+Repeated actual-project tests (dummy and Wayland) measured 29–30 ms to the first
+word preview and 1–2 ms after backspace/retyping. This measures initial suggestions,
+not completion of semantic analysis: richer or server-only candidates can arrive
+later. Reproduce with `DNA_POPUP_PLATFORM=1 DNA_POPUP_SOURCE="$PWD/src/platform/tui.dyn"
+DNA_POPUP_WORD=tty DNA_POPUP_INSIDE=1 DNA_POPUP_KEY_DELAY_MS=100 DNA_POPUP_RETYPE=1
+DNA_POPUP_MAX_MS=80 python3 tests/language_popups.py` after `just build debug`.
+The probe now explicitly waits for server signatures when testing snippet insertion.
+
+Validation: debug/release UI workflows passed on dummy and Wayland; real Dyn
+completion and snippet handoff passed. Helix and Vim each passed 1,000 random
+input events. Additional checks cover Unicode words, duplicate elimination,
+backspace across the response cursor, invalidated UTF-16 edits, empty-list
+recovery, arena accounting, and disabled-preview deadlines. Root `./dna` now
+contains the rebuilt standalone executable; the previous binary is retained at
+`build/dna-before-completion-fast`. Installed dummy/Wayland startup passed.

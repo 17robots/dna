@@ -1,0 +1,76 @@
+use "../../src/buffer" buffer
+use "std/mem"
+
+fn main() {
+  arena := buffer.reserve(#sizeof(buffer.Document))
+  if !arena.ok { #panic("arena") }
+  defer _ = mem.arena_release(&arena.arena)
+  doc := buffer.allocate(&arena.arena)
+  _ = buffer.load(doc, "{ \x2f/ don't treat } as code\n  value\n}\n")
+  buffer.move_to(doc, 28, false)
+  if !buffer.select_objects_with_syntax(doc, '{', false, 1, false, false, buffer.ObjectSyntax{line_comment: "\x2f/"}) || doc.anchor != 1 || doc.cursor != doc.length - 2 {
+    #panic("mi{ must ignore quotes and braces in line comments")
+  }
+  lexical_checks(doc)
+  // Every cursor must select its pair, including the second secondary cursor.
+  _ = buffer.load(doc, "(aa) {bb} [cc]")
+  doc.anchor = 1
+  doc.cursor = 2
+  doc.secondary.count = 2
+  doc.secondary.ranges[0] = buffer.Selection{anchor: 6, cursor: 7}
+  doc.secondary.ranges[1] = buffer.Selection{anchor: 11, cursor: 12}
+  if !buffer.select_objects(doc, 'm', true, 1, false, false) || doc.anchor != 0 || doc.cursor != 4 || doc.secondary.ranges[0].anchor != 5 || doc.secondary.ranges[0].cursor != 9 || doc.secondary.ranges[1].anchor != 10 || doc.secondary.ranges[1].cursor != 14 {
+    #panic("all three cursors must select their enclosing pair")
+  }
+}
+
+fn check_pair(doc: *buffer.Document, text: []const u8, key: u8, syntax: buffer.ObjectSyntax, expected: []const u8) {
+  _ = buffer.load(doc, text)
+  position: usize = 0
+  for position < doc.length && doc.bytes[position] != '@' { position += 1 }
+  if position == doc.length { #panic("missing pair fixture cursor") }
+  for reverse in 0..2 {
+    doc.anchor = position
+    doc.cursor = position + 1
+    if reverse == 1 { doc.anchor = position + 1
+    doc.cursor = position }
+    if !buffer.select_objects_with_syntax(doc, key, false, 1, false, false, syntax) || !buffer.equal(doc.bytes[buffer.start(doc)..buffer.end(doc)], expected) {
+      #panic("inner pair boundaries with comments/quotes and selection direction")
+    }
+    if !buffer.select_objects_with_syntax(doc, key, true, 1, false, false, syntax) || buffer.start(doc) == 0 || buffer.end(doc) > doc.length || !buffer.equal(doc.bytes[buffer.start(doc) + 1..buffer.end(doc) - 1], expected) {
+      #panic("around pair after inner selection")
+    }
+  }
+}
+
+fn lexical_checks(doc: *buffer.Document) {
+  code := buffer.ObjectSyntax{line_comment: "\x2f/", block_comments: true}
+  check_pair(doc, "outer { inner { \x2f/ }\n @\n } tail }", '{', code, " \x2f/ }\n @\n ")
+  check_pair(doc, "fn f() { \x2f/ don't count } ( [\n @\n} tail", '{', code, " \x2f/ don't count } ( [\n @\n")
+  check_pair(doc, "call( \x2f* unmatched \" } ] */ @ ) tail", '(', code, " \x2f* unmatched \" } ] */ @ ")
+  check_pair(doc, "value[ \x2f/ unmatched ' ]\r\n @ ] tail", '[', code, " \x2f/ unmatched ' ]\r\n @ ")
+  check_pair(doc, "a { \"\x2f* } \x2f/\" @ } z", '}', code, " \"\x2f* } \x2f/\" @ ")
+  check_pair(doc, "a { \x2f* outer \x2f* nested */ } */ @ } z", '{', buffer.ObjectSyntax{block_comments: true, nested_comments: true}, " \x2f* outer \x2f* nested */ } */ @ ")
+  check_pair(doc, "a { \x2f* ends at first */ @ } \x2f* later */", '{', code, " \x2f* ends at first */ @ ")
+  check_pair(doc, "a { # don't count }\n @ } z", '{', buffer.ObjectSyntax{line_comment: "#"}, " # don't count }\n @ ")
+  check_pair(doc, "a { -- don't count }\n @ } z", '{', buffer.ObjectSyntax{line_comment: "--"}, " -- don't count }\n @ ")
+  // Python floor division and ordinary prose must not become C comments.
+  check_pair(doc, "a (9 \x2f/ 2 + @) z", '(', buffer.ObjectSyntax{line_comment: "#"}, "9 \x2f/ 2 + @")
+  check_pair(doc, "a {# @} z", '{', buffer.ObjectSyntax{}, "# @")
+  check_pair(doc, "a /@/ z", '/', code, "@")
+  // A complete requested pair does not depend on unrelated nesting afterward.
+  suffix: [520]u8 = []
+  suffix[0] = '{'
+    suffix[1] = '@'
+    suffix[2] = '}'
+  for index in 3..#len(suffix) { suffix[index] = '(' }
+  _ = buffer.load(doc, suffix[..])
+  buffer.move_to(doc, 1, false)
+  if !buffer.select_objects(doc, '{', false, 1, false, false) || doc.anchor != 1 || doc.cursor != 2 {
+    #panic("later nesting overflow must not invalidate a completed pair")
+  }
+  before := buffer.Selection{anchor: doc.anchor, cursor: doc.cursor}
+  if buffer.select_objects(doc, '{', false, 0, false, false) || doc.anchor != before.anchor || doc.cursor != before.cursor {
+    #panic("zero count preserves selection")
+  }
+}

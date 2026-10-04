@@ -45,6 +45,9 @@ fn main() {
     #panic("unused document storage touched")
   }
   snapshot_baseline_checks(document)
+  same_size_line_checks(document)
+  revision_journal_checks(document)
+  randomized_dirty_checks(document)
   batch_failure_checks(document)
   rotation_checks(document)
   batch_edit_checks(document)
@@ -715,6 +718,26 @@ fn main() {
   line_selection_checks(document)
 }
 
+fn same_size_line_checks(document: *buffer.Document) {
+  _ = buffer.load(document, "a\nbb\nccc\n")
+  document.anchor = 0
+  document.cursor = 5
+  _ = buffer.replace(document, "xy\nz\n")
+  buffer.checkpoint(document)
+  if document.line_count != 4 || buffer.row_start(document, 1) != 3 || buffer.row_start(document, 2) != 5 || buffer.row_start(document, 3) != 9 {
+    #panic("same-size replacement must update moved internal newlines")
+  }
+  buffer.undo(document)
+  if buffer.row_start(document, 1) != 2 { #panic("same-size newline undo") }
+  buffer.redo(document)
+  if buffer.row_start(document, 1) != 3 { #panic("same-size newline redo") }
+  document.anchor = 0
+  document.cursor = 5
+  _ = buffer.replace(document, "abcde")
+  if document.line_count != 2 || buffer.row_start(document, 1) != 9 {
+    #panic("same-size replacement must still remove old newlines")
+  }
+}
 fn snapshot_baseline_checks(document: *buffer.Document) {
   _ = buffer.load(document, "Abcé")
   buffer.move_to(document, 1, false)
@@ -1146,4 +1169,75 @@ fn line_selection_checks(document: *buffer.Document) {
   if !buffer.lines_selected(document) {
     #panic("empty line counts as selected")
   }
+}
+
+// Compare optimized dirty tracking against full byte equality after mixed
+// mutations. Saves may occur inside an uncheckpointed edit group.
+fn randomized_dirty_checks(document: *buffer.Document) {
+  _ = buffer.load(document, "Alpha beta\nGamma delta\n")
+  seed: u64 = 817239
+  for step in 0..3000 {
+    action := random_value(&seed) % 9
+    if action < 4 {
+      a := random_value(&seed) % (document.length + 1)
+      b := random_value(&seed) % (document.length + 1)
+      document.anchor = a
+      document.cursor = b
+      if action == 0 { _ = buffer.replace(document, "") }
+      else if action == 1 { _ = buffer.replace(document, "x") }
+      else if action == 2 { _ = buffer.replace(document, "Ab\n") }
+      else { buffer.change_case(document, 0) }
+    } else if action == 4 {
+      buffer.mark_saved(document)
+    } else if action == 5 {
+      buffer.checkpoint(document)
+    } else if action == 6 {
+      buffer.undo(document)
+    } else if action == 7 {
+      buffer.redo(document)
+    } else {
+      _ = buffer.load(document, "Alpha beta\nGamma delta\n")
+    }
+    expected := !buffer.equal(document.bytes[..document.length], document.saved[..document.saved_length])
+    if buffer.dirty(document) != expected || buffer.dirty_cached(document) != expected {
+      #panic("dirty tracking must match full saved-text equality")
+    }
+  }
+}
+
+fn revision_journal_checks(document: *buffer.Document) {
+  _ = buffer.load(document, "abc\ndef\n")
+  baseline: [4096]u8 = []
+  state: u64 = 731
+  for round in 0..100 {
+    length := document.length
+    _ = buffer.copy_bytes(&baseline[0], &document.bytes[0], length)
+    revision := document.revision
+    for edit in 0..5 {
+      state = (state * 1664525 + 1013904223) % 4294967296
+      low := #cast(usize) state % (document.length + 1)
+      document.anchor = low
+      document.cursor = low
+      if low < document.length && state % 2 == 0 { document.cursor += 1 }
+      if !buffer.replace(document, "q\n") { #panic("journal replacement") }
+    }
+    range := buffer.changes_since(document, revision)
+    if !range.found || range.old_length != length || !buffer.equal(baseline[..range.low], document.bytes[..range.low]) || !buffer.equal(baseline[range.old_high..length], document.bytes[range.high..document.length]) {
+      #panic("revision journal must bound all changed bytes")
+    }
+    buffer.checkpoint(document)
+    if !buffer.equal(document.bytes[..document.length], document.checkpoint_bytes[..document.length]) { #panic("checkpoint mirror mismatch") }
+  }
+  revision := document.revision
+  for edit in 0..129 { _ = buffer.replace(document, "") }
+  if buffer.changes_since(document, revision).found { #panic("journal overflow needs fallback") }
+  revision = document.revision
+  _ = buffer.load(document, "new")
+  if buffer.changes_since(document, revision).found { #panic("reload invalidates revision journal") }
+  // A metadata-only undo step must not underflow overlapping unchanged bounds.
+  document.rows.count = 1
+  document.rows.offsets[0] = 0
+  buffer.checkpoint(document)
+  buffer.undo(document)
+  if !buffer.equal(document.bytes[..document.length], "new") { #panic("row-only checkpoint changes text") }
 }

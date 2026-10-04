@@ -13,7 +13,10 @@ for item in stage.iterdir():
     else: item.unlink()
 shutil.copytree(ROOT/'src', stage, dirs_exist_ok=True)
 shutil.copytree(ROOT/'tests/editor', stage, dirs_exist_ok=True)
+# This harness explicitly links shared SDL_ttf. Do not mix it with mise's
+# default static SDL archive, which would create two independent SDL states.
+environment = dict(os.environ, DYN_LIBRARY_PATH=str(ROOT/'build/deps/install/lib'))
 for mode in os.environ.get('DNA_SMOKE_MODES', 'debug release').split():
     subprocess.run(['python3', str(ROOT/'scripts/compile.py'), os.environ.get('DYN','dyn'),
                     'build', str(stage), '--'+mode, '--output', str(ROOT/f'build/dna-smoke-{mode}'),
-                    '--link', str(ROOT/'build/deps/install/lib/libSDL3_ttf.so')], check=True)
+                    '--link', str(ROOT/'build/deps/install/lib/libSDL3_ttf.so')], env=environment, check=True)

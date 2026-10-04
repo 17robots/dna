@@ -1,0 +1,100 @@
+extern fn picker_native_open "dna_picker_open"() rawptr
+extern fn picker_native_submit "dna_picker_submit"(worker: rawptr, root: *const u8) u64
+extern fn picker_native_poll "dna_picker_poll"(worker: rawptr, generation: u64, count: *usize, visited: *usize, flags: *u32) i32
+extern fn picker_native_row "dna_picker_row"(worker: rawptr, generation: u64, index: usize, output: *u8, capacity: usize) usize
+extern fn picker_native_changed "dna_picker_changed"(worker: rawptr) i32
+extern fn picker_native_close "dna_picker_close"(worker: rawptr)
+fn picker_index_submit(app: *App) {
+  state := &app.picker_state
+  if state.worker == nil { state.worker = picker_native_open() }
+  if state.worker == nil {
+    state.index.error = true
+    state.pending = false
+    return
+  }
+  state.generation = picker_native_submit(state.worker, &state.index.root[0])
+  state.pending = true
+  state.watching = true
+  state.refresh_due = 0
+}
+fn picker_index_receive(app: *App) bool {
+  state := &app.picker_state
+  if !state.pending || state.worker == nil || state.index == nil { return false }
+  count: usize = 0
+  visited: usize = 0
+  flags: u32 = 0
+  status := picker_native_poll(state.worker, state.generation, &count, &visited, &flags)
+  if status == 0 { return false }
+  state.pending = false
+  if status < 0 { return false }
+  index := state.index
+  index.count = 0
+  index.visited = visited
+  index.limited = (flags & 1) != 0
+  index.error = (flags & 2) != 0
+  state.watch_fallback = (flags & 4) != 0
+  for row in 0..count {
+    entry := &index.entries[index.count]
+    length := picker_native_row(state.worker, state.generation, row, &entry.name[0], #len(entry.name))
+    if length > 0 {
+      entry.length = length
+      entry.directory = false
+      index.count += 1
+    }
+  }
+  if state.watch_fallback && state.refresh_due == 0 { state.refresh_due = sdl.ticks() + 2000 }
+  return true
+}
+fn picker_index_tick(app: *App) bool {
+  state := &app.picker_state
+  if state.worker == nil { return false }
+  visible := (app.prompt_state.panel == Panel.Open || app.prompt_state.panel == Panel.SaveAs) && app.resource_state.kind == 0 && !app.resource_state.fonts
+  if !visible {
+    if state.watching {
+      empty: [1]u8 = [0]
+      _ = picker_native_submit(state.worker, &empty[0])
+      state.watching = false
+      state.pending = false
+      state.generation = 0
+      state.refresh_due = 0
+    }
+    return false
+  }
+  if picker_native_changed(state.worker) != 0 {
+    due := sdl.ticks() + 60
+    if state.refresh_due == 0 || due < state.refresh_due { state.refresh_due = due }
+  }
+  selected_name: [512]u8 = []
+  selected_length: usize = 0
+  chosen := app.completion.chosen
+  if app.completion.selected < app.completion.count {
+    selected := &app.completion.entries[app.completion.selected]
+    selected_length = copy_text(selected_name[..], selected.name[..selected.length])
+  }
+  changed := picker_index_receive(app)
+  if state.refresh_due != 0 && sdl.ticks() >= state.refresh_due && !state.pending {
+    picker_index_submit(app)
+  }
+  if changed {
+    completion_refresh(app)
+    for row in 0..app.completion.count {
+      entry := &app.completion.entries[row]
+      if selected_length > 0 && buffer.equal(entry.name[..entry.length], selected_name[..selected_length]) {
+        app.completion.selected = row
+        app.completion.chosen = chosen
+        break
+      }
+    }
+  }
+  return changed
+}
+fn picker_index_close(app: *App) {
+  state := &app.picker_state
+  if state.worker != nil {
+    picker_native_close(state.worker)
+    state.worker = nil
+  }
+  state.pending = false
+  state.watching = false
+  state.refresh_due = 0
+}

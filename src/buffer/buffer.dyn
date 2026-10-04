@@ -30,9 +30,16 @@ pub struct Document {
   batching, goal_valid: bool,
   dirty_cached, dirty_text: bool,
   dirty_revision, dirty_epoch, dirty_scans: u64,
-  // Borrowed views, valid until the next document mutation. They share bytes
-  // until an edit materializes their separate owned backing below.
+  // Runs known equal to the saved text, measured from either end. Edits only
+  // shrink these bounds; a proven clean state or save resets them.
+  saved_prefix, saved_suffix: usize,
+  checkpoint_prefix, checkpoint_suffix: usize,
+  changes: [128]TextChange,
+  // Borrowed views, invalidated by mutations including save/checkpoint. They
+  // share current or saved bytes until differing baselines require owned copies.
   saved, checkpoint_bytes: []u8,
+  saved_storage_used, checkpoint_storage_used: usize,
+  text_storage_used, line_storage_used, history_storage_used: usize,
   secondary: SelectionSet,
   length, cursor, anchor, saved_length, history_next, history_count, history_at, line_count, goal_column, goal_cursor, goal_anchor: usize,
   history: [64]Snapshot,
@@ -83,8 +90,8 @@ pub fn allocate(arena: *mem.Arena) *Document {
   if arena.owns_memory {
     _ = #syscall(28, &arena.data[0], #len(arena.data), 15)
   }
-  memory := mem.arena_push_uninit(arena, #sizeof(Document), #alignof(Document))
-  document := #cast(*Document) memory
+  document := #alloc_uninit_or_panic(Document, mem.arena_allocator(arena))
+  memory := #cast(*u8) document
   metadata := #cast(usize) &document.bytes[0] - #cast(usize) memory
   mem.zero(memory[..metadata])
   _ = load(document, "")
@@ -135,6 +142,8 @@ pub fn valid(text: []const u8) bool {
 }
 fn snapshot(document: *Document, index: usize) {
   document.checkpoint_revision = document.revision
+  document.checkpoint_prefix = document.length
+  document.checkpoint_suffix = document.length
   entry := &document.history[index]
   entry.secondary = document.secondary
   entry.rows = document.rows
@@ -142,26 +151,104 @@ fn snapshot(document: *Document, index: usize) {
   entry.cursor = document.cursor
   entry.anchor = document.anchor
   document.checkpoint_bytes = document.bytes[..]
+  release_clean_baselines(document)
 }
 pub fn mark_saved(document: *Document) {
   document.saved_epoch += 1
   document.saved_rows = document.rows
   document.saved_length = document.length
   document.saved = document.bytes[..]
+  document.saved_prefix = document.length
+  document.saved_suffix = document.length
+  // A completed checkpoint mirror contains this exact revision. Saving can
+  // borrow current text and reclaim both copies without changing undo history.
+  if document.checkpoint_revision == document.revision {
+    document.checkpoint_bytes = document.bytes[..]
+  }
+  release_clean_baselines(document)
 }
-// A saved/checkpoint baseline can share unchanged text. Materialize its owned
-// backing immediately before mutation, so read-only buffers need one text copy.
-fn preserve_saved(document: *Document) {
+extern fn snapshot_page_size "getpagesize"() i32
+fn release_storage_tail(storage: *u8, used: *usize, keep: usize) {
+  if used.* <= keep {
+    return
+  }
+  page := #cast(usize) snapshot_page_size()
+  // The arrays need not be page-aligned. Never discard adjacent live bytes.
+  address := #cast(usize) storage
+  first := ((address + keep + page - 1) / page) * page
+  last := ((address + used.*) / page) * page
+  if last > first && #syscall(28, first, last - first, 4) < 0 {
+    return
+  }
+  used.* = keep
+}
+fn release_clean_baselines(document: *Document) {
+  if #len(document.checkpoint_bytes) == 0 || &document.saved[0] != &document.bytes[0] || &document.checkpoint_bytes[0] != &document.bytes[0] {
+    return
+  }
+  // Keep hot snapshot storage while editing. Once saved and checkpointed,
+  // neither view needs it; undo deltas live in separate history storage.
+  release_storage_tail(&document.saved_storage[0], &document.saved_storage_used, 0)
+  release_storage_tail(&document.checkpoint_storage[0], &document.checkpoint_storage_used, 0)
+}
+fn record_text_storage(document: *Document) {
+  if document.length + 1 > document.text_storage_used {
+    document.text_storage_used = document.length + 1
+  }
+}
+fn record_line_storage(document: *Document) {
+  used := document.line_count * #sizeof(u32)
+  if used > document.line_storage_used {
+    document.line_storage_used = used
+  }
+}
+fn saved_change(document: *Document, low: usize, high: usize) {
+  if low < document.saved_prefix {
+    document.saved_prefix = low
+  }
+  suffix := document.length - high
+  if suffix < document.saved_suffix {
+    document.saved_suffix = suffix
+  }
+}
+// Saved and checkpoint baselines share one preserved copy while identical.
+// Split them only when saving within an edit group makes their text diverge.
+fn preserve_saved(document: *Document, keep_checkpoint: bool) {
   if &document.saved[0] == &document.bytes[0] {
+    if keep_checkpoint && &document.checkpoint_bytes[0] == &document.saved_storage[0] {
+      // A save inside an edit group can make the saved and undo baselines
+      // diverge. Preserve the older shared checkpoint before reusing storage.
+      length := document.history[document.history_at].length + 1
+      _ = copy_bytes(&document.checkpoint_storage[0], &document.saved_storage[0], length)
+      if length > document.checkpoint_storage_used {
+        document.checkpoint_storage_used = length
+      }
+      document.checkpoint_bytes = document.checkpoint_storage[..]
+    }
     _ = copy_bytes(&document.saved_storage[0], &document.bytes[0], document.length + 1)
+    if document.length + 1 > document.saved_storage_used {
+      document.saved_storage_used = document.length + 1
+    }
     document.saved = document.saved_storage[..]
   }
 }
-fn before_change(document: *Document) {
-  preserve_saved(document)
+fn before_change(document: *Document, low: usize, high: usize) {
+  note_change(document, low, high)
+  if low < document.checkpoint_prefix { document.checkpoint_prefix = low }
+  suffix := document.length - high
+  if suffix < document.checkpoint_suffix { document.checkpoint_suffix = suffix }
+  shared := &document.saved[0] == &document.bytes[0]
+  preserve_saved(document, true)
   if &document.checkpoint_bytes[0] == &document.bytes[0] {
-    _ = copy_bytes(&document.checkpoint_storage[0], &document.bytes[0], document.length + 1)
-    document.checkpoint_bytes = document.checkpoint_storage[..]
+    if shared {
+      document.checkpoint_bytes = document.saved
+    } else {
+      _ = copy_bytes(&document.checkpoint_storage[0], &document.bytes[0], document.length + 1)
+      if document.length + 1 > document.checkpoint_storage_used {
+        document.checkpoint_storage_used = document.length + 1
+      }
+      document.checkpoint_bytes = document.checkpoint_storage[..]
+    }
   }
 }
 pub fn load(document: *Document, text: []const u8) bool {
@@ -181,6 +268,7 @@ pub fn load(document: *Document, text: []const u8) bool {
     _ = move_bytes(&document.bytes[0], &text[0], #len(text))
   }
   document.bytes[document.length] = 0
+  record_text_storage(document)
   document.history_at = 0
   document.history_count = 1
   document.revision += 1
@@ -191,9 +279,17 @@ pub fn load(document: *Document, text: []const u8) bool {
   document.history[0].removed = 0
   document.history[0].inserted = 0
   document.history_storage[0] = 0
+  if document.history_storage_used == 0 {
+    document.history_storage_used = 1
+  }
   index_lines(document)
   mark_saved(document)
   snapshot(document, 0)
+  // Reload deliberately resets undo history. Consume aliased input first,
+  // then reclaim only pages beyond the newly live text/index/history prefixes.
+  release_storage_tail(&document.bytes[0], &document.text_storage_used, document.length + 1)
+  release_storage_tail(#cast(*u8) &document.line_offsets[0], &document.line_storage_used, document.line_count * #sizeof(u32))
+  release_storage_tail(&document.history_storage[0], &document.history_storage_used, 1)
   return true
 }
 fn same_rows(a: *const RowAnchors, b: *const RowAnchors) bool {
@@ -244,7 +340,11 @@ pub fn row_id(document: *const Document, offset: usize) usize {
 // identities remain independently compared because explorer staging edits them.
 pub fn dirty_cached(document: *Document) bool {
   if !document.dirty_cached || document.dirty_revision != document.revision || document.dirty_epoch != document.saved_epoch {
-    document.dirty_text = !equal(document.bytes[..document.length], document.saved[..document.saved_length])
+    document.dirty_text = saved_text_changed(document)
+    if !document.dirty_text {
+      document.saved_prefix = document.length
+      document.saved_suffix = document.length
+    }
     document.dirty_revision = document.revision
     document.dirty_epoch = document.saved_epoch
     document.dirty_cached = true
@@ -253,7 +353,18 @@ pub fn dirty_cached(document: *Document) bool {
   return document.dirty_text || !same_rows(&document.rows, &document.saved_rows)
 }
 pub fn dirty(document: *const Document) bool {
-  return !equal(document.bytes[..document.length], document.saved[..document.saved_length]) || !same_rows(&document.rows, &document.saved_rows)
+  return saved_text_changed(document) || !same_rows(&document.rows, &document.saved_rows)
+}
+fn saved_text_changed(document: *const Document) bool {
+  if document.length != document.saved_length {
+    return true
+  }
+  low := document.saved_prefix
+  high := document.length - document.saved_suffix
+  if low >= high {
+    return false
+  }
+  return !equal(document.bytes[low..high], document.saved[low..high])
 }
 pub fn start(document: *const Document) usize {
   if document.cursor < document.anchor {
@@ -313,7 +424,8 @@ pub fn replace(document: *Document, text: []const u8) bool {
   if #len(text) > Capacity - (document.length - removed) {
     return false
   }
-  before_change(document)
+  before_change(document, low, high)
+  saved_change(document, low, high)
   move_marks(document, low, high, #len(text))
   // Whole-row deletion removes its identity; filename replacement retains it.
   // Inserting at a row start moves its identity with the original text.
@@ -345,6 +457,7 @@ pub fn replace(document: *Document, text: []const u8) bool {
   }
   document.length = document.length - removed + #len(text)
   document.bytes[document.length] = 0
+  record_text_storage(document)
   document.cursor = low + #len(text)
   document.anchor = document.cursor
   document.revision += 1
@@ -364,16 +477,24 @@ pub fn checkpoint(document: *Document) {
     return
   }
   entry := &document.history[document.history_at]
-  if (document.checkpoint_revision == document.revision || equal(document.bytes[..document.length], document.checkpoint_bytes[..entry.length])) && same_rows(&document.rows, &entry.rows) {
+  if !checkpoint_changed(document) && same_rows(&document.rows, &entry.rows) {
     entry.cursor = document.cursor
     entry.anchor = document.anchor
     entry.secondary = document.secondary
     document.checkpoint_revision = document.revision
+    document.checkpoint_prefix = document.length
+    document.checkpoint_suffix = document.length
+    // Retain an already synchronized mirror while editing.
+    if &document.saved[0] == &document.bytes[0] { document.checkpoint_bytes = document.bytes[..] }
+    release_clean_baselines(document)
     return
   }
-  prefix: usize = 0
-  old_end := entry.length
-  new_end := document.length
+  prefix := document.checkpoint_prefix
+  old_length := entry.length
+  old_end := old_length - document.checkpoint_suffix
+  new_end := document.length - document.checkpoint_suffix
+  if old_end < prefix { old_end = prefix }
+  if new_end < prefix { new_end = prefix }
   // Compare unchanged runs in libc with shrinking blocks, then locate the
   // exact changed bytes; a large file costs a few thousand calls, not millions.
   for block in Blocks {
@@ -440,10 +561,14 @@ pub fn checkpoint(document: *Document) {
     target.bytes[0] = 0
   }
   document.history_next = beginning + needed
-  snapshot(document, document.history_at)
+  if document.history_next > document.history_storage_used {
+    document.history_storage_used = document.history_next
+  }
+  advance_checkpoint(document, prefix, old_end, new_end, old_length)
 }
 fn restore(document: *Document, delta: *const Snapshot, forward: bool) {
-  preserve_saved(document)
+  // Restore replaces the checkpoint using an owned undo delta below.
+  preserve_saved(document, false)
   retained_positions: [992]TextPosition = []
   if delta.line_positions {
     for saved_mark in 0..992 {
@@ -460,6 +585,8 @@ fn restore(document: *Document, delta: *const Snapshot, forward: bool) {
   }
   low := delta.prefix
   high := low + removed
+  note_change(document, low, high)
+  saved_change(document, low, high)
   move_marks(document, low, high, inserted)
   tail := document.length - high
   if tail > 0 {
@@ -475,10 +602,13 @@ fn restore(document: *Document, delta: *const Snapshot, forward: bool) {
   document.cursor = entry.cursor
   document.anchor = entry.anchor
   document.bytes[document.length] = 0
+  record_text_storage(document)
   document.checkpoint_bytes = document.bytes[..]
   document.revision += 1
   index_lines(document)
   document.checkpoint_revision = document.revision
+  document.checkpoint_prefix = document.length
+  document.checkpoint_suffix = document.length
   if delta.line_positions {
     for restored_mark in 0..992 {
       document.marks[restored_mark] = position_offset(document, retained_positions[restored_mark])
@@ -495,7 +625,7 @@ pub fn undo(document: *Document) {
 }
 pub fn redo(document: *Document) {
   entry := &document.history[document.history_at]
-  if !equal(document.bytes[..document.length], document.checkpoint_bytes[..entry.length]) || !same_rows(&document.rows, &entry.rows) {
+  if checkpoint_changed(document) || !same_rows(&document.rows, &entry.rows) {
     return
   }
   if document.history_at + 1 < document.history_count {
@@ -789,17 +919,20 @@ fn index_lines(document: *Document) {
     document.line_offsets[document.line_count] = #cast(u32) at
     document.line_count += 1
   }
+  record_line_storage(document)
 }
 fn replace_lines(document: *Document, low: usize, high: usize, text: []const u8) {
   first := row_at(document, low) + 1
   last := row_at(document, high) + 1
   added := count_newlines(text)
   tail := document.line_count - last
+  // Skip suffix writes when its line indexes and byte offsets stay unchanged.
+  // Newline positions inside the replacement are still rebuilt below.
   if first + added > last {
     for back in #reverse(0..tail) {
       document.line_offsets[first + added + back] = #cast(u32) (#cast(usize) document.line_offsets[last + back] - (high - low) + #len(text))
     }
-  } else {
+  } else if first + added < last || #len(text) != high - low {
     for forward in 0..tail {
       document.line_offsets[first + added + forward] = #cast(u32) (#cast(usize) document.line_offsets[last + forward] - (high - low) + #len(text))
     }
@@ -816,6 +949,7 @@ fn replace_lines(document: *Document, low: usize, high: usize, text: []const u8)
     inserted += 1
   }
   document.line_count = first + added + tail
+  record_line_storage(document)
 }
 fn count_newlines(text: []const u8) usize {
   count: usize = 0

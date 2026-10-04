@@ -1,0 +1,178 @@
+// Traversal belongs to one worker. Published rows are immutable until the next
+// generation completes
+// Callers reject stale roots by generation.
+struct PickerPath { length: usize, bytes: [512]u8 }
+struct NativePicker {
+  thread, lock, wake: rawptr,
+  stop: native_atomic.AtomicU32,
+  generation: native_atomic.AtomicU64,
+  root: [4096]u8,
+  published: u64,
+  count, visited: usize,
+  flags: u32,
+  watch: *DiskDirectoryWatch,
+  rows, working: [2048]PickerPath,
+}
+struct PickerScan {
+  owner: *NativePicker,
+  generation: u64,
+  count, visited: usize,
+  flags: u32,
+}
+fn picker_cancelled(scan: *PickerScan) bool {
+  return native_atomic.load_u32(&scan.owner.stop) != 0 || native_atomic.load_u64(&scan.owner.generation) != scan.generation
+}
+fn picker_walk(scan: *PickerScan, path: *const u8, relative: *const u8, depth: usize) {
+  if picker_cancelled(scan) { return }
+  if depth > 12 || scan.visited >= 8192 || scan.count == 2048 {
+    scan.flags |= 1
+    return
+  }
+  rec_lock(scan.owner.lock)
+  if dna_directory_watch_add(scan.owner.watch, path) == 0 { scan.flags |= 4 }
+  rec_unlock(scan.owner.lock)
+  fd := rec_open(path, 589824, 0)
+  if fd < 0 { scan.flags |= 2
+    return }
+  directory := install_fdopendir(fd)
+  if directory == nil { _ = rec_close(fd)
+    scan.flags |= 2
+    return }
+  defer _ = install_closedir(directory)
+  for !picker_cancelled(scan) && scan.visited < 8192 && scan.count < 2048 {
+    entry := install_readdir(directory)
+    if entry == nil { return }
+    scan.visited += 1
+    name := &entry.name[0]
+    if name.* == 46 || !search_valid_name(name) { continue }
+    name_length := string_length(name)
+    prefix_length := string_length(relative)
+    path_length := string_length(path)
+    if prefix_length + name_length >= 512 || path_length + name_length + 2 >= 4096 { scan.flags |= 1
+    continue }
+    child: [4096]u8 = []
+    _ = copy(&child[0], path, path_length)
+    child[path_length] = 47
+    _ = copy(&child[path_length + 1], name, name_length + 1)
+    rel: [512]u8 = []
+    _ = copy(&rel[0], relative, prefix_length)
+    _ = copy(&rel[prefix_length], name, name_length + 1)
+    info := InstallStat{}
+    // Match the existing picker policy: follow links, bounded by depth/visits.
+    if install_fstatat(search_dirfd(directory), name, &info, 0) != 0 { scan.flags |= 2
+    continue }
+    if (info.mode & 61440) == 16384 {
+      skip_build: []const u8 = "build\0"
+      skip_target: []const u8 = "target\0"
+      skip_modules: []const u8 = "node_modules\0"
+      if search_compare(name, &skip_build[0]) == 0 || search_compare(name, &skip_target[0]) == 0 || search_compare(name, &skip_modules[0]) == 0 { continue }
+      if prefix_length + name_length + 1 >= 512 { scan.flags |= 1
+    continue }
+      rel[prefix_length + name_length] = 47
+      rel[prefix_length + name_length + 1] = 0
+      picker_walk(scan, &child[0], &rel[0], depth + 1)
+    } else if (info.mode & 61440) == 32768 {
+      row := &scan.owner.working[scan.count]
+      row.length = prefix_length + name_length
+      _ = copy(&row.bytes[0], &rel[0], row.length + 1)
+      scan.count += 1
+    }
+  }
+  if !picker_cancelled(scan) { scan.flags |= 1 }
+}
+fn picker_worker(pointer: rawptr) i32 {
+  worker := #cast(*NativePicker) pointer
+  completed: u64 = 0
+  for {
+    rec_lock(worker.lock)
+    for native_atomic.load_u32(&worker.stop) == 0 && completed == native_atomic.load_u64(&worker.generation) { rec_wait(worker.wake, worker.lock) }
+    if native_atomic.load_u32(&worker.stop) != 0 { rec_unlock(worker.lock)
+    break }
+    completed = native_atomic.load_u64(&worker.generation)
+    root := worker.root
+    dna_directory_watch_clear(worker.watch)
+    _ = dna_directory_watch_poll(worker.watch)
+    rec_unlock(worker.lock)
+    scan := PickerScan{owner: worker, generation: completed}
+    empty: [1]u8 = [0]
+    if root[0] != 0 { picker_walk(&scan, &root[0], &empty[0], 0) }
+    rec_lock(worker.lock)
+    if !picker_cancelled(&scan) {
+      for index in 0..scan.count {
+        worker.rows[index].length = worker.working[index].length
+        _ = copy(&worker.rows[index].bytes[0], &worker.working[index].bytes[0], worker.working[index].length + 1)
+      }
+      worker.count = scan.count
+      worker.visited = scan.visited
+      worker.flags = scan.flags
+      worker.published = completed
+    }
+    rec_unlock(worker.lock)
+    rec_notify()
+  }
+  return 0
+}
+pub fn dna_picker_open() *NativePicker {
+  worker := #cast(*NativePicker) search_calloc(1, #sizeof(NativePicker), 1)
+  if worker == nil { return nil }
+  worker.lock = rec_mutex()
+  worker.wake = rec_condition()
+  worker.watch = dna_directory_watch_open()
+  if worker.lock != nil && worker.wake != nil { worker.thread = rec_thread(&picker_worker, #cast(rawptr) worker) }
+  if worker.thread == nil {
+    if worker.watch != nil { dna_directory_watch_close(worker.watch) }
+    if worker.wake != nil { rec_condition_free(worker.wake) }
+    if worker.lock != nil { rec_mutex_free(worker.lock) }
+    search_free(#cast(rawptr) worker)
+    return nil
+  }
+  return worker
+}
+pub fn dna_picker_submit(worker: *NativePicker, root: *const u8) u64 {
+  if worker == nil { return 0 }
+  rec_lock(worker.lock)
+  search_copy_text(worker.root[..], root)
+  request_generation := native_atomic.fetch_add_u64(&worker.generation, 1) + 1
+  rec_signal(worker.wake)
+  rec_unlock(worker.lock)
+  return request_generation
+}
+// -1 stale, 0 pending, 1 complete. flags: limited=1,error=2,watch fallback=4.
+pub fn dna_picker_poll(worker: *NativePicker, request_generation: u64, count: *usize, visited: *usize, flags: *u32) i32 {
+  if worker == nil { return -1 }
+  rec_lock(worker.lock)
+  defer rec_unlock(worker.lock)
+  if native_atomic.load_u64(&worker.generation) != request_generation { return -1 }
+  if worker.published != request_generation { return 0 }
+  count.* = worker.count
+  visited.* = worker.visited
+  flags.* = worker.flags
+  return 1
+}
+pub fn dna_picker_row(worker: *NativePicker, request_generation: u64, index: usize, output: *u8, capacity: usize) usize {
+  if worker == nil { return 0 }
+  rec_lock(worker.lock)
+  defer rec_unlock(worker.lock)
+  if native_atomic.load_u64(&worker.generation) != request_generation || worker.published != request_generation || index >= worker.count || worker.rows[index].length >= capacity { return 0 }
+  row := &worker.rows[index]
+  _ = copy(output, &row.bytes[0], row.length + 1)
+  return row.length
+}
+pub fn dna_picker_changed(worker: *NativePicker) i32 {
+  if worker == nil { return 0 }
+  rec_lock(worker.lock)
+  defer rec_unlock(worker.lock)
+  return dna_directory_watch_poll(worker.watch)
+}
+pub fn dna_picker_close(worker: *NativePicker) {
+  if worker == nil { return }
+  rec_lock(worker.lock)
+  native_atomic.store_u32(&worker.stop, 1)
+  rec_signal(worker.wake)
+  rec_unlock(worker.lock)
+  rec_join(worker.thread, nil)
+  dna_directory_watch_close(worker.watch)
+  rec_condition_free(worker.wake)
+  rec_mutex_free(worker.lock)
+  search_free(#cast(rawptr) worker)
+}

@@ -47,83 +47,6 @@ fn picker_match(name: []const u8, query: []const u8) bool {
   }
   return at == #len(query)
 }
-fn picker_scan(index: *PickerIndex, root: []const u8, relative: []const u8, depth: usize) {
-  if depth > 12 || index.visited >= 8192 || index.count == 2048 {
-    index.limited = true
-    return
-  }
-  path: [4096]u8 = []
-  length := copy_text(path[..], root)
-  if length > 0 && path[length - 1] != '/' {
-    add_text(path[..], &length, "/")
-  }
-  if length + #len(relative) >= 4096 {
-    index.limited = true
-    return
-  }
-  add_text(path[..], &length, relative)
-  storage: [8192]u8 = []
-  opened := fs.open_directory(path[..length], storage[..])
-  if !opened.ok {
-    index.error = true
-    return
-  }
-  defer _ = fs.close_directory(&opened.directory)
-  name: [512]u8 = []
-  full: [4096]u8 = []
-  for index.count < 2048 && index.visited < 8192 {
-    item := fs.directory_next(&opened.directory)
-    if !item.ok {
-      if item.error != 0 {
-        index.error = true
-      }
-      return
-    }
-    index.visited += 1
-    if #len(item.name) == 0 || item.name[0] == '.' || !valid_leaf(item.name) {
-      continue
-    }
-    used := copy_text(name[..], relative)
-    if used + #len(item.name) >= 512 {
-      index.limited = true
-      continue
-    }
-    add_text(name[..], &used, item.name)
-    directory := item.kind == 4
-    regular := item.kind == 8
-    if item.kind == 0 || item.kind == 10 {
-      full_length := copy_text(full[..], path[..length])
-      if full_length + #len(item.name) + 1 >= 4096 {
-        index.limited = true
-        continue
-      }
-      if full_length > 0 && full[full_length - 1] != '/' {
-        add_text(full[..], &full_length, "/")
-      }
-      add_text(full[..], &full_length, item.name)
-      info := files.metadata(full[..full_length])
-      directory = info.ok && (info.mode & 61440) == 16384
-      regular = info.ok && (info.mode & 61440) == 32768
-    }
-    if directory {
-      if buffer.equal(item.name, "build") || buffer.equal(item.name, "node_modules") || buffer.equal(item.name, "target") {
-        continue
-      }
-      if used + 1 >= 512 {
-        index.limited = true
-        continue
-      }
-      add_text(name[..], &used, "/")
-      picker_scan(index, root, name[..used], depth + 1)
-    } else if regular {
-      entry := &index.entries[index.count]
-      entry.length = copy_text(entry.name[..], name[..used])
-      entry.directory = false
-      index.count += 1
-    }
-  }
-  index.limited = true
-}
 fn completion_refresh(app: *App) {
   if app.resource_state.kind == 5 {
     task_refresh(app)
@@ -155,21 +78,22 @@ fn completion_refresh(app: *App) {
       app.completion.error = true
       return
     }
-    app.picker_state.arena = allocated.arena
+    app.picker_state.arena = mem.arena_take(&allocated.arena)
     // A fresh mapping is already zero; only touched entries become resident.
-    app.picker_state.index = #cast(*PickerIndex) mem.arena_push_uninit(&app.picker_state.arena, #sizeof(PickerIndex), #alignof(PickerIndex))
-    entries := #cast(*Entry) mem.arena_push_uninit(&app.picker_state.arena, #sizeof(Entry) * 2048, #alignof(Entry))
+    app.picker_state.index = #cast(*PickerIndex) mem.arena_push_uninit_or_panic(&app.picker_state.arena, #sizeof(PickerIndex), #alignof(PickerIndex))
+    entries := #cast(*Entry) mem.arena_push_uninit_or_panic(&app.picker_state.arena, #sizeof(Entry) * 2048, #alignof(Entry))
     app.picker_state.index.entries = entries[..2048]
   }
   index := app.picker_state.index
-  if !buffer.equal(directory, index.root[..index.root_length]) {
+  if !buffer.equal(directory, index.root[..index.root_length]) || !app.picker_state.watching {
     index.root_length = copy_text(index.root[..], directory)
     index.count = 0
     index.visited = 0
     index.error = false
     index.limited = false
-    picker_scan(index, directory, "", 0)
+    picker_index_submit(app)
   }
+  _ = picker_index_receive(app)
   app.completion.error = index.error
   for pass in 0..3 {
     row: usize = 0

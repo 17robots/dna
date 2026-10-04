@@ -16,7 +16,7 @@ probe = ROOT / 'build/startup-latency.so'
 subprocess.run(['python3', str(ROOT/'scripts/native_test.py'), 'startup_latency', str(probe)], check=True)
 command = sys.argv[1:] or [str(ROOT / 'build/dna-debug')]
 for trial in range(3):
-    env = dict(os.environ, SDL_VIDEODRIVER='dummy', LD_PRELOAD=str(probe),
+    env = dict(os.environ, SDL_VIDEODRIVER=os.environ.get('SDL_VIDEODRIVER', 'dummy'), LD_PRELOAD=str(probe),
                LD_LIBRARY_PATH=str(ROOT / 'build/deps/install/lib'),
                DNA_STARTUP_BEGIN=str(time.monotonic()))
     env.pop('DYN_EDITOR_SMOKE', None)

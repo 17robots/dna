@@ -29,7 +29,7 @@ while True:
         key,value=line.decode().split(':',1);headers[key.lower()]=value.strip()
     message=json.loads(sys.stdin.buffer.read(int(headers['content-length'])))
     method=message.get('method');params=message.get('params',{});ident=message.get('id')
-    if method=='initialize':result={'capabilities':{'positionEncoding':'utf-16','textDocumentSync':{'openClose':True,'change':2,'save':{'includeText':True}},'completionProvider':{},'hoverProvider':True,'definitionProvider':True,'referencesProvider':True,'renameProvider':True,'codeActionProvider':True}}
+    if method=='initialize':result={'capabilities':{'positionEncoding':'utf-16','textDocumentSync':{'openClose':True,'change':2,'save':{'includeText':True}},'completionProvider':{'triggerCharacters':['/', '😀']},'hoverProvider':True,'definitionProvider':True,'referencesProvider':True,'renameProvider':True,'codeActionProvider':True}}
     elif method in ('textDocument/didOpen','textDocument/didChange'):
         doc=params['textDocument'];uri=doc['uri'];versions[uri]=doc['version']
         if method.endswith('didOpen'):texts[uri]=doc['text']
@@ -54,7 +54,16 @@ while True:
         assert params['options']['tabSize'] > 0
         result=[edit('formatted')]
     elif method=='textDocument/hover':result={'contents':{'kind':'markdown','value':'**fixture hover**'}}
-    elif method=='textDocument/completion':result=[{'label':'alphabet','insertText':'alphabet','filterText':texts[params['textDocument']['uri']][:params['position']['character']]}]
+    elif method=='textDocument/completion':
+        context=params.get('context', {})
+        if context.get('triggerKind')==2:
+            character=context['triggerCharacter']
+            text=texts[params['textDocument']['uri']]
+            assert character in ('/', '😀') and text[:offset(text,params['position'])].endswith(character)
+        prefix = texts[params['textDocument']['uri']][:params['position']['character']]
+        result=[{'label':'alphabet','insertText':'alphabet','filterText':'alphabet' if 'alphabet'.startswith(prefix) else prefix}]
+        if context.get('triggerKind')==2:
+            result[0]['detail']='fixture trigger accepted'
     elif method in ('textDocument/definition','textDocument/references','textDocument/typeDefinition','textDocument/implementation'):
         result=[{'uri':params['textDocument']['uri'],'range':edit('')['range']}]
     elif method=='textDocument/rename':result={'changes':{params['textDocument']['uri']:[edit(params['newName'])]}}

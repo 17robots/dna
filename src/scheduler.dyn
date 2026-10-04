@@ -32,6 +32,7 @@ fn editor_wait_ms(app: *App, notifications: bool) i32 {
   delay = deadline_wait(now, terminal_escape_due(app), delay)
   if app.lsp.pending != 0 {
     delay = deadline_wait(now, app.lsp.deadline, delay)
+    delay = deadline_wait(now, completion_preview_due(app), delay)
   }
   for index in 0..8 {
     if app.lsp.servers[index].process != nil {
@@ -42,10 +43,12 @@ fn editor_wait_ms(app: *App, notifications: bool) i32 {
     }
   }
   delay = lsp_wait_ms(app, delay)
+  if !app.picker_state.pending { delay = deadline_wait(now, app.picker_state.refresh_due, delay) }
+  if !notifications && app.picker_state.watching && delay > 250 { delay = 250 }
   if terminals_waiting_for_exit(app) && delay > 16 {
     delay = 16
   }
-  if !notifications && (terminals_running(app) || syntax_waiting(app) || app.project_find.status == 1 || plugins_running(app) || app.formatting.process != nil || lsp_running(app)) && delay > 16 {
+  if !notifications && (terminals_running(app) || syntax_waiting(app) || app.project_find.status == 1 || app.picker_state.pending || plugins_running(app) || app.formatting.process != nil || lsp_running(app)) && delay > 16 {
     delay = 16
   }
   if app.view.animation.active {
@@ -108,6 +111,7 @@ fn background_tick(app: *App, typography: *Typography) {
   operation_end(app, "format", operation_started)
   operation_started = operation_begin(app)
   search_changed := project_search_tick(app)
+  if picker_index_tick(app) { search_changed = true }
   operation_end(app, "search", operation_started)
   operation_started = operation_begin(app)
   macro_changed := macro_tick(app, typography)

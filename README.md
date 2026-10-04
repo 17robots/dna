@@ -5,11 +5,54 @@ line numbers and a slim status line provide orientation. Commands, search, files
 and buffer switching appear as keyboard-invoked popups.
 No web runtime. [DESIGN.md](DESIGN.md) records the broader product direction.
 
+## Install the prerelease with mise
+
+The Linux x86-64 preview requires **glibc 2.43 or newer**, a system monospace
+font, and desktop display libraries for GUI mode. It does not run on Ubuntu
+24.04's glibc 2.39. See [PRERELEASE.md](PRERELEASE.md) before installing.
+
+```sh
+mise use -g 'github:17robots/dna[prerelease=true,strip_components=1,bin_path=.]@0.1.0-preview.1'
+dna path/to/file.dyn
+dna path/to/project
+```
+
+Use `mise exec github:17robots/dna@0.1.0-preview.1 -- dna path/to/project`
+if mise is not activated in your shell. The explicit `bin_path=.` selects the
+archive's launcher, which loads its bundled libraries. The Dyn SDK is needed to
+build DNA, but is not required to run this package. Language servers are
+installed separately.
+
+This uses [mise's GitHub backend](https://mise.jdx.dev/dev-tools/backends/github.html);
+no separate mise plugin or registry entry is required.
+
+## Dyn SDK migration
+
+DNA now targets Dyn 0.1.0-preview.17. Run `mise install`, then `just deps` to
+rebuild native adapters and the language installer with the matching runtime.
+Existing language installations have independent pins: run
+`build/deps/install/bin/dna-language install dyn`, then `:language-reload` in an
+open editor. The registry pins the allocator-capable grammar and DNA bundles
+its matching highlight query, including `Allocator`, `#allocator`, `#AllocResult`
+and all typed allocation forms.
+
+Allocation calls preserve their earlier failure policy: required allocations use
+`_or_panic`, and recoverable scratch allocations still check their result. Arena
+ownership transfers use `mem.arena_take`; allocator handles are created only
+at the destination owner. Sparse document/App storage stays explicitly
+uninitialized, with the existing initialization and page-reclamation contracts.
+No generic allocator replaces concrete arenas that need reset, rewind or release.
+
+The [SDK migration guide](https://github.com/17robots/dyn/blob/v0.1.0-preview.17/docs/migrations/0.1.0-preview.17.md)
+links the preview 16 allocation changes. To roll this migration back, revert its
+source, SDK and grammar/query changes together and rebuild the native adapters;
+document, session and configuration formats are unchanged.
+
 ## Run
 
 Requirements: Linux x86-64, a working Dyn SDK, SDL3 development/runtime libraries,
 FreeType, HarfBuzz, PCRE2, utf8proc, libvterm, Tree-sitter (0.25+), and Fontconfig development libraries, CMake, Python 3.12+, a C compiler,
-and `just`. Tested with Dyn 0.1.0-preview.11, SDL 3.4.16 and SDL_ttf 3.2.2.
+and `just`. Tested with Dyn 0.1.0-preview.17, SDL 3.4.16 and SDL_ttf 3.2.2.
 `just build` downloads and builds pinned SDL_ttf into ignored `build/deps`.
 The build applies a small fix to avoid repeatedly shaping remaining lines when
 wrapping is disabled; its fingerprint also upgrades existing local builds.
@@ -25,7 +68,7 @@ SDK does not invalidate its executable cache when an external archive changes.
 `just build` uses the freshly rebuilt shared adapter. Regex selection uses the system PCRE2 library
 (`libpcre2-dev` on Debian/Ubuntu, `pcre2-devel` on Fedora, `pcre2` on Arch).
 
-Use the tested **Dyn 0.1.0-preview.11** version pinned in `mise.toml`. For daily development, `just run` uses
+Use the tested **Dyn 0.1.0-preview.17** version pinned in `mise.toml`. For daily development, `just run` uses
 cached debug builds and the 2 GiB memory guard. `dyn run src/` also reuses
 unchanged modules. Preview 7 fixes cache lookup through PATH and large aggregate
 code generation; this editor's full release build now completes in about seven
@@ -174,6 +217,12 @@ buffer and resource pickers like the command palette (query and matches only,
 up to 12 rows). `dropdown` does the same but hangs pickers and the command
 palette from the top edge of the window. `[place.picker]` and
 `[place.palette]` still override where they go.
+
+Launch with a file or directory: `./dna src/main.dyn` opens the file;
+`./dna ./src` uses that directory as the project and opens the explorer.
+Paths containing spaces must be quoted. Use `./dna -- --gui` to open a file
+literally named `--gui`. The first path is used; `--gui` and `--tui` select
+the frontend and may appear before or after it (before `--`).
 
 ### Terminal frontend
 
@@ -1024,8 +1073,12 @@ apply to multiple selections in one undo group. Escape cancels any unfinished
 sequence, including after the old delimiter in `mr`. If any selection lacks its
 requested pair, the whole operation leaves text and selections unchanged.
 
-Pair matching is lexical: it handles nested brackets and escaped quotes, but does
-not parse language syntax, comments, raw strings, or interpolation. Angle brackets
+Pair matching is lexical: it handles nested brackets and escaped quotes. For
+recognized file types it skips the language's line comments and C-style block
+comments where supported, including nested block comments for Rust, Swift, and
+Kotlin. Plain text and explorer buffers do not guess comment syntax. Raw strings,
+interpolation, and language-specific block comments outside these forms are not
+parsed. Angle brackets
 are supported explicitly (`mi<`, etc.) but excluded from automatic nearest-pair
 matching so comparison operators do not interfere with parentheses. Surround
 characters are single printable ASCII characters. Nesting is bounded at 256 pairs.
@@ -1255,12 +1308,22 @@ For local compiler development, `DNA_DYN_LSP="/path/to/dyn lsp"` overrides the
 built-in Dyn server command. An explicit `[languages.dyn] server` takes precedence.
 
 Completion defaults to a 25 ms typing pause; `[lsp] completion_delay_ms` accepts
-10–2000 ms. Explicit settings retain their value. Document-sync delays,
+10–2000 ms. Server-advertised trigger characters request completion immediately,
+including Unicode triggers, and include the trigger context in the LSP request.
+The configured pause still applies to ordinary typing. Explicit settings retain
+their value. Document-sync delays,
 cursor/scroll/popup animations, and diagnostic mouse hover default to 50 ms. Language-server computation adds to that delay.
 `:lsp-log` shows the active server command, configured delays, and request-to-response
-time. Obsolete automatic completion requests are cancelled as you keep typing.
-Typing dismisses stale suggestions and
-continues editing; arrows select, Enter or Tab accepts, Escape dismisses.
+time. Complete candidate lists filter locally, including backspace, without
+repeating server analysis. Requests remain usable while only word characters are
+appended at their cursor; other edits still reject stale responses.
+If an automatic request takes more than 20 ms, DNA can show matching words from a
+bounded region of the current file. These entries say “word from file” and insert
+plain text; function signatures and snippets arrive with the server response.
+No matches hide the list; backspace can restore cached matches immediately.
+The completion menu reserves eight rows (clipped to the pane), so filtering and
+server updates do not change its height. Unused rows remain empty.
+Arrows select, Enter or Tab accepts, Escape dismisses.
 Hover, cursor diagnostics, signatures, and completion appear beside the cursor
 inside its pane. Hover flips above the cursor near the bottom edge; Up/Down scroll
 long hover text and Escape dismisses it.
@@ -1272,10 +1335,12 @@ candidate window is positioned near the editing area. Complex mixed-direction
 text and real desktop IME behavior still need broader manual coverage.
 
 Linux CI is prepared in `.github/workflows/ci.yml`: pinned compiler download,
-checks, package verification, and downloadable workflow artifact. It has not yet
-run on GitHub; this repository still has no remote. CI uses Arch libraries, and
+checks, package verification, and downloadable workflow artifact. CI uses Arch libraries, and
 the archive records its glibc requirement. It is not a claim of compatibility
 with every Linux distribution.
+
+See [PRERELEASE.md](PRERELEASE.md) for the prerelease audit, package requirements,
+and known limitations.
 
 ### Build memory limits
 
@@ -1420,6 +1485,11 @@ syntax parser preserves the document and undo history; syntax rebuilds on revisi
 Terminal history retains its existing 2,000-row limit (240 columns), and terminal
 review snapshots remain limited by document capacity. Search results remain
 limited to 1,024 rows. No automatic eviction discards open text or unsaved edits.
+File-picker traversal runs on a cancellable background worker. Directory watches
+refresh cached results without losing the selected filename; incomplete watch
+coverage uses periodic refresh. Syntax buffers shrink after eight consecutive
+small revisions. Undo checkpoints and incremental LSP updates use changed ranges
+to avoid repeated full-document scans and copies.
 Dirty text equality is cached by document revision and saved-baseline epoch;
 explorer row identities are checked independently.
 

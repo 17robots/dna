@@ -5,7 +5,7 @@
 struct NativeMutex { storage: [5]u64 }
 struct NativeCondition { storage: [6]u64 }
 struct NativeTimespec { seconds: i64, nanoseconds: i64 }
-struct NativeThread { handle: usize, entry: *fn(rawptr) i32, state: rawptr, result: i32 }
+struct NativeThread { handle: usize, entry: *fn(rawptr) i32, state: rawptr, result: i32, finished: native_atomic.AtomicU32, retired_next: *NativeThread }
 extern fn sync_mutex_init "pthread_mutex_init"(lock: rawptr, attributes: rawptr) i32
 extern fn sync_mutex_destroy "pthread_mutex_destroy"(lock: rawptr) i32
 extern fn sync_mutex_lock "pthread_mutex_lock"(lock: rawptr) i32
@@ -16,6 +16,7 @@ extern fn sync_condition_wait "pthread_cond_wait"(condition: rawptr, lock: rawpt
 extern fn sync_condition_signal "pthread_cond_signal"(condition: rawptr) i32
 extern fn sync_thread_create "pthread_create"(thread: *usize, attributes: rawptr, entry: *fn(rawptr) rawptr, state: rawptr) i32
 extern fn sync_thread_join "pthread_join"(thread: usize, result: rawptr) i32
+extern fn sync_thread_self "pthread_self"() usize
 extern fn sync_clock "clock_gettime"(clock: i32, result: *NativeTimespec) i32
 sync_clock_lock: NativeMutex = NativeMutex{}
 sync_clock_start: u64 = 0
@@ -74,9 +75,31 @@ pub fn dna_condition_signal(condition: rawptr) {
 fn sync_run(pointer: rawptr) rawptr {
   thread := #cast(*NativeThread) pointer
   thread.result = thread.entry(thread.state)
+  native_atomic.store_u32(&thread.finished, 1)
   return nil
 }
+// Only successfully joined records may be freed. On a persistent join
+// error the owner can release its state after entry returns, but the pthread
+// bookkeeping remains here for another lifecycle operation to collect.
+sync_retired_lock: NativeMutex = NativeMutex{}
+sync_retired_threads: *NativeThread = nil
+fn sync_collect_threads() {
+  _ = sync_mutex_lock(#cast(rawptr) &sync_retired_lock)
+  link := &sync_retired_threads
+  for link.* != nil {
+    thread := link.*
+    if sync_thread_join(thread.handle, nil) == 0 {
+      link.* = thread.retired_next
+      rec_free(#cast(rawptr) thread)
+    }
+    else {
+      link = &thread.retired_next
+    }
+  }
+  _ = sync_mutex_unlock(#cast(rawptr) &sync_retired_lock)
+}
 pub fn dna_thread_create(entry: *fn(rawptr) i32, state: rawptr) rawptr {
+  sync_collect_threads()
   thread := #cast(*NativeThread) rec_malloc(#sizeof(NativeThread))
   if thread == nil {
     return nil
@@ -93,11 +116,31 @@ pub fn dna_thread_join(pointer: rawptr, status: *i32) {
   if thread == nil {
     return
   }
-  _ = sync_thread_join(thread.handle, nil)
+  if thread.handle == sync_thread_self() {
+    // Returning would let the caller release the state this entry still uses.
+    #panic("cannot join the current native thread")
+  }
+  joined := sync_thread_join(thread.handle, nil) == 0
+  if !joined {
+    for native_atomic.load_u32(&thread.finished) == 0 {
+      delay := NativeTimespec{nanoseconds: 1000000}
+      _ = #syscall(35, &delay, 0)
+    }
+    joined = sync_thread_join(thread.handle, nil) == 0
+  }
   if status != nil {
     status.* = thread.result
   }
-  rec_free(#cast(rawptr) thread)
+  if joined {
+    rec_free(#cast(rawptr) thread)
+    sync_collect_threads()
+  }
+  else {
+    _ = sync_mutex_lock(#cast(rawptr) &sync_retired_lock)
+    thread.retired_next = sync_retired_threads
+    sync_retired_threads = thread
+    _ = sync_mutex_unlock(#cast(rawptr) &sync_retired_lock)
+  }
 }
 
 // Dyn's current executable entry point does not run archive .init_array

@@ -21,6 +21,7 @@ test:
     python3 scripts/test.py
 smoke: deps test
     python3 tests/build_guard.py
+    python3 tests/benchmark_cleanup.py
     python3 tests/dyn_support.py
     python3 tests/native_foundation.py
     python3 tests/static_native.py
@@ -33,6 +34,7 @@ smoke: deps test
     python3 scripts/compile.py "$DYN" build examples/plugins/uppercase --debug --output examples/plugins/uppercase/uppercase
     python3 scripts/build_smoke.py
     python3 scripts/smoke.py
+    python3 tests/launch.py
     python3 tests/input_save.py
     python3 tests/redraw_idle.py
     python3 tests/redraw_coalesce.py
@@ -56,6 +58,7 @@ smoke: deps test
     DNA_PERF_COMBINED=1 python3 tests/workflow_performance.py
     DNA_PERF_COMBINED=1 DNA_PERF_REAL_SYNTAX=1 python3 tests/workflow_performance.py
     python3 scripts/benchmark_editors.py --editors dna --dna build/dna-release --bytes 5280000 --samples 5 --repeats 1 --max-dna-pss-kib 131072 --output build/document-memory-gate.json
+    python3 tests/document_memory.py
     python3 tests/terminal_review.py
     python3 tests/terminal_boundaries.py
     python3 tests/rpc.py
@@ -72,6 +75,8 @@ smoke: deps test
     python3 tests/resource_cycles.py
     python3 tests/native_memory.py
     python3 tests/syntax_memory.py
+    python3 tests/thread_join.py
+    python3 tests/picker_index.py
     python3 tests/syntax_faults.py
     python3 tests/render_cache.py
     python3 tests/recovery.py

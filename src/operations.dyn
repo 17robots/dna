@@ -115,7 +115,10 @@ fn work_drop(app: *App, work: *WorkArena, name: []const u8) {
   if work.capacity == 0 {
     return
   }
-  _ = mem.arena_release(&work.arena)
+  // Failed unmapping leaves the arena owned and available for a later retry.
+  if !mem.arena_release(&work.arena).ok {
+    return
+  }
   allocation_record(app, name, work.capacity, work.born, true)
   work.capacity = 0
   work.born = 0
@@ -127,6 +130,9 @@ fn work_acquire(app: *App, work: *WorkArena, needed: usize, name: []const u8) bo
     return true
   }
   work_drop(app, work, name)
+  if work.capacity != 0 {
+    return false
+  }
   capacity: usize = 65536
   for capacity < needed && capacity < 2097152 {
     capacity *= 2
@@ -138,7 +144,7 @@ fn work_acquire(app: *App, work: *WorkArena, needed: usize, name: []const u8) bo
   if !allocated.ok {
     return false
   }
-  work.arena = allocated.arena
+  work.arena = mem.arena_take(&allocated.arena)
   work.capacity = capacity
   if app.render_trace.enabled {
     work.born = render_clock()

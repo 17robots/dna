@@ -1,3 +1,5 @@
+pub struct ObjectSyntax { line_comment: []const u8, block_comments, nested_comments: bool }
+
 pub struct ObjectSpan { found: bool, low, high: usize }
 struct Delimiter { position: usize, byte: u8 }
 
@@ -40,9 +42,12 @@ fn escaped(document: *const Document, at: usize) bool {
   }
   return count % 2 != 0
 }
-// Lexical pairs, not language syntax: quoted strings shield brackets, escaped
-// quotes do not close strings, and mismatched brackets invalidate the stack.
+// Lexical pairs, not language syntax: strings and C-style comments shield
+// brackets, escaped quotes do not close strings, and mismatches reset the stack.
 pub fn surrounding(document: *const Document, selection: Selection, key: u8, count: usize) ObjectSpan {
+  return surrounding_with_syntax(document, selection, key, count, ObjectSyntax{})
+}
+pub fn surrounding_with_syntax(document: *const Document, selection: Selection, key: u8, count: usize, syntax: ObjectSyntax) ObjectSpan {
   low := selection.anchor
   high := selection.cursor
   if low > high {
@@ -53,21 +58,40 @@ pub fn surrounding(document: *const Document, selection: Selection, key: u8, cou
   wanted := opening(key)
   stack: [256]Delimiter = []
   depth: usize = 0
-  candidates: [256]ObjectSpan = []
   found: usize = 0
   at: usize = 0
   quote: u8 = 0
   quote_at: usize = 0
+  line_comment: bool = false
+  comment_depth: usize = 0
   for at < document.length {
     byte := document.bytes[at]
     pair := ObjectSpan{}
     pair_key: u8 = 0
-    if quote != 0 {
+    if line_comment {
+      if byte == 10 || byte == 13 {
+        line_comment = false
+      }
+    } else if comment_depth > 0 {
+      if syntax.nested_comments && byte == 47 && at + 1 < document.length && document.bytes[at + 1] == 42 {
+        comment_depth += 1
+        at += 1
+      } else if byte == 42 && at + 1 < document.length && document.bytes[at + 1] == 47 {
+        comment_depth -= 1
+        at += 1
+      }
+    } else if quote != 0 {
       if byte == quote && !escaped(document, at) {
         pair = ObjectSpan{found: true, low: quote_at, high: at + 1}
         pair_key = quote
         quote = 0
       }
+    } else if #len(syntax.line_comment) > 0 && #len(syntax.line_comment) <= document.length - at && equal(document.bytes[at..at + #len(syntax.line_comment)], syntax.line_comment) && (key == 109 || wanted != closing(wanted) || wanted != byte) {
+      line_comment = true
+      at += #len(syntax.line_comment) - 1
+    } else if syntax.block_comments && byte == 47 && at + 1 < document.length && document.bytes[at + 1] == 42 && (key == 109 || wanted != 47) {
+      comment_depth = 1
+      at += 1
     } else if (byte == 34 || byte == 39 || byte == 96 || (key != 109 && wanted == closing(wanted) && byte == wanted)) && !escaped(document, at) {
       quote = byte
       quote_at = at
@@ -89,19 +113,16 @@ pub fn surrounding(document: *const Document, selection: Selection, key: u8, cou
       }
     }
     if pair.found && (key == 109 || wanted == pair_key) && low >= pair.low && high <= pair.high && low < pair.high {
-      if found == 256 {
-        return ObjectSpan{}
-      }
-      candidates[found] = pair
       found += 1
+      // Nested pairs close inside-out. Later unrelated text cannot change
+      // an already complete enclosing pair (or overflow its nesting limit).
+      if found == count {
+        return pair
+      }
     }
     at = next(document, at)
   }
-  // Nested pairs close from inside out, already ordered by containment.
-  if count == 0 || count > found {
-    return ObjectSpan{}
-  }
-  return candidates[count - 1]
+  return ObjectSpan{}
 }
 fn blank_line(document: *const Document, position: usize) bool {
   ending := line_end(document, position)
@@ -114,12 +135,15 @@ fn blank_line(document: *const Document, position: usize) bool {
   return true
 }
 pub fn text_object(document: *const Document, selection: Selection, key: u8, around: bool, count: usize) ObjectSpan {
+  return text_object_with_syntax(document, selection, key, around, count, ObjectSyntax{})
+}
+pub fn text_object_with_syntax(document: *const Document, selection: Selection, key: u8, around: bool, count: usize, syntax: ObjectSyntax) ObjectSpan {
   position := selection.cursor
   if position > selection.anchor {
     position = previous(document, position)
   }
   if key != 119 && key != 87 && key != 112 {
-    pair := surrounding(document, selection, key, count)
+    pair := surrounding_with_syntax(document, selection, key, count, syntax)
     if pair.found && !around {
       pair.low += 1
       pair.high -= 1
@@ -212,6 +236,9 @@ pub fn text_object(document: *const Document, selection: Selection, key: u8, aro
   return ObjectSpan{found: true, low: low, high: high}
 }
 pub fn select_objects(document: *Document, key: u8, around: bool, count: usize, jump: bool, extend: bool) bool {
+  return select_objects_with_syntax(document, key, around, count, jump, extend, ObjectSyntax{})
+}
+pub fn select_objects_with_syntax(document: *Document, key: u8, around: bool, count: usize, jump: bool, extend: bool, syntax: ObjectSyntax) bool {
   originals: [32]Selection = []
   originals[0] = Selection{cursor: document.cursor, anchor: document.anchor}
   output: [32]Selection = []
@@ -222,7 +249,7 @@ pub fn select_objects(document: *Document, key: u8, around: bool, count: usize, 
 
   for index in 0..=document.secondary.count {
     original := originals[index]
-    span := text_object(document, original, key, around, count)
+    span := text_object_with_syntax(document, original, key, around, count, syntax)
     if !span.found {
       return false
     }
@@ -289,6 +316,9 @@ fn surround_edit(edits: []SurroundEdit, count: *usize, edit: SurroundEdit) bool 
 // One validated batch and one undo group, including multiple selections. Only
 // delimiter bytes change; row identities and other panes' tracked positions survive.
 pub fn surround(document: *Document, mode: u8, from: u8, to: u8, count: usize) bool {
+  return surround_with_syntax(document, mode, from, to, count, ObjectSyntax{})
+}
+pub fn surround_with_syntax(document: *Document, mode: u8, from: u8, to: u8, count: usize, syntax: ObjectSyntax) bool {
   originals: [32]Selection = []
   originals[0] = Selection{cursor: document.cursor, anchor: document.anchor}
   for index in 0..document.secondary.count {
@@ -308,7 +338,7 @@ pub fn surround(document: *Document, mode: u8, from: u8, to: u8, count: usize) b
       high = swap
     }
     if mode != 0 {
-      pair := surrounding(document, selection, from, count)
+      pair := surrounding_with_syntax(document, selection, from, count, syntax)
       if !pair.found {
         return false
       }

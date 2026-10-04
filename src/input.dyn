@@ -81,7 +81,11 @@ fn text_input(app: *App, text: []const u8) {
   }
   // Word characters keep an open completion and refilter it; anything else closes it.
   refilter := false
-  if completion_visible(app) {
+  if completion_visible(app) && !completion_session(app) {
+    app.prompt_state.panel = Panel.None
+    lsp_results_release(app)
+  }
+  if completion_session(app) {
     refilter = #len(text) > 0
     for byte in text {
       if !completion_word_byte(byte) {
@@ -188,7 +192,7 @@ fn clipboard_copy(app: *App) bool {
     notice(app, "Cannot allocate register.")
     return false
   }
-  storage := (#cast(*u8) mem.arena_push_uninit(&allocated.arena, total + 1, 1))[..total + 1]
+  storage := (#cast(*u8) mem.arena_push_uninit_or_panic(&allocated.arena, total + 1, 1))[..total + 1]
   offsets: [32]usize = []
   lengths: [32]usize = []
   used: usize = 0
@@ -211,7 +215,7 @@ fn clipboard_copy(app: *App) bool {
   if slot.owned {
     _ = mem.arena_release(&slot.arena)
   }
-  slot.arena = allocated.arena
+  slot.arena = mem.arena_take(&allocated.arena)
   slot.owned = true
   slot.text = storage[..used]
   slot.linewise = false
@@ -321,6 +325,12 @@ fn key_trace(app: *App, key: u32, modifiers: u16) {
   _ = #syscall(1, 2, &line[0], used)
 }
 fn key_input(app: *App, typography: *Typography, key: u32, modifiers: u16) {
+  // SDL sends modifier presses separately from the modified character.
+  // They are not commands: e.g. Shift between vi and { must not cancel i.
+  // Ignore them before prefix dispatch, completion/snippet handling, or recording.
+  if (key >= 1073742048 && key <= 1073742055) || key == 1073742081 {
+    return
+  }
   vim_record_key(app, key, modifiers)
   key_dispatch(app, typography, key, modifiers)
   vim_settle(app)
@@ -399,6 +409,12 @@ fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
     }
   }
   // Printable keys reach text_input, which refilters or closes the completion.
+  if key == KeyBackspace && modifiers == 0 && completion_session(app) && app.documents.current.cursor > app.lsp.results.prefix_start {
+    buffer.erase_all(app.documents.current, true)
+    app.lsp.completion_typed = true
+    completion_refilter(app)
+    return
+  }
   printable := key >= KeySpace && key < KeyDelete && (modifiers & ModCtrlAlt) == 0
   if completion_visible(app) && !printable && key != KeyTab && key != KeyEscape && key != KeyReturn && key != KeyDown && key != KeyUp {
     app.prompt_state.panel = Panel.None
@@ -427,6 +443,7 @@ fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
   }
   if app.prompt_state.panel == Panel.LspResults || app.prompt_state.panel == Panel.LspEdit || app.prompt_state.panel == Panel.Diagnostics {
     if key == KeyEscape {
+      if completion_visible(app) { completion_cancel_refresh(app) }
       if app.prompt_state.panel == Panel.LspEdit {
         lsp_edits_release(app)
       }

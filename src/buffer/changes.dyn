@@ -1,0 +1,59 @@
+// Bounded revision journal: consumers can skip unchanged text without borrowing
+// old document storage. Missing revisions fall back to the caller's full diff.
+struct TextChange { revision: u64, length, low, high: usize }
+pub struct ChangedRange { found: bool, low, old_high, high, old_length: usize }
+fn note_change(document: *Document, low: usize, high: usize) {
+  revision := document.revision + 1
+  document.changes[#cast(usize) (revision % 128)] = TextChange{revision: revision, length: document.length, low: low, high: high}
+}
+pub fn changes_since(document: *const Document, revision: u64) ChangedRange {
+  if revision >= document.revision || document.revision - revision > 128 { return ChangedRange{} }
+  first := &document.changes[#cast(usize) ((revision + 1) % 128)]
+  if first.revision != revision + 1 { return ChangedRange{} }
+  original := first.length
+  prefix := original
+  suffix := original
+  for changed in revision + 1..=document.revision {
+    entry := &document.changes[#cast(usize) (changed % 128)]
+    if entry.revision != changed { return ChangedRange{} }
+    if entry.low < prefix { prefix = entry.low }
+    after := entry.length - entry.high
+    if after < suffix { suffix = after }
+  }
+  return ChangedRange{found: true, low: prefix, old_high: original - suffix, high: document.length - suffix, old_length: original}
+}
+fn checkpoint_changed(document: *const Document) bool {
+  entry := &document.history[document.history_at]
+  if document.length != entry.length { return true }
+  low := document.checkpoint_prefix
+  high := document.length - document.checkpoint_suffix
+  if low >= high { return false }
+  return !equal(document.bytes[low..high], document.checkpoint_bytes[low..high])
+}
+// Keep a synchronized independent mirror between checkpoints. Only the first
+// checkpoint needs a full copy; subsequent EOF edits touch their changed bytes.
+// Saved baselines remain separate, including saves inside an open edit group.
+fn advance_checkpoint(document: *Document, low: usize, old_high: usize, high: usize, old_length: usize) {
+  if &document.saved[0] == &document.bytes[0] {
+    snapshot(document, document.history_at)
+    return
+  }
+  storage := &document.checkpoint_storage[0]
+  if &document.checkpoint_bytes[0] != storage {
+    _ = copy_bytes(storage, &document.bytes[0], document.length + 1)
+  } else {
+    tail := old_length - old_high
+    if tail > 0 && high != old_high {
+      _ = move_bytes(&document.checkpoint_storage[high], &document.checkpoint_storage[old_high], tail)
+    }
+    if high > low {
+      _ = copy_bytes(&document.checkpoint_storage[low], &document.bytes[low], high - low)
+    }
+    document.checkpoint_storage[document.length] = 0
+  }
+  if document.length + 1 > document.checkpoint_storage_used { document.checkpoint_storage_used = document.length + 1 }
+  // snapshot's metadata initialization is shared, but it aliases the document.
+  // saved points to separate storage here, so snapshot cannot release the mirror.
+  snapshot(document, document.history_at)
+  document.checkpoint_bytes = document.checkpoint_storage[..]
+}

@@ -30,7 +30,7 @@ fn lsp_edit_file(app: *App, uri: []const u8, edits: *const json.Value, version: 
       item.slot = slot_index
       item.identity = slot.identity
       item.revision = slot.document.revision
-      storage := (#cast(*u8) mem.arena_push_uninit(&plan.arena, slot.document.length + 1, 1))[..slot.document.length + 1]
+      storage := (#cast(*u8) mem.arena_push_uninit_or_panic(&plan.arena, slot.document.length + 1, 1))[..slot.document.length + 1]
       _ = copy_text(storage, slot.document.bytes[..slot.document.length])
       item.before = storage[..slot.document.length]
       break
@@ -50,7 +50,7 @@ fn lsp_edit_file(app: *App, uri: []const u8, edits: *const json.Value, version: 
     }
     item.before = read.data
   }
-  output := (#cast(*u8) mem.arena_push_uninit(&plan.arena, buffer.Capacity + 1, 1))[..buffer.Capacity + 1]
+  output := (#cast(*u8) mem.arena_push_uninit_or_panic(&plan.arena, buffer.Capacity + 1, 1))[..buffer.Capacity + 1]
   applied := lsp.edits(item.before, edits, output)
   if !applied.ok {
     return false
@@ -70,7 +70,7 @@ fn lsp_prepare_edit(app: *App, edit: *const json.Value) {
     notice(app, "Cannot allocate language edit preview.")
     return
   }
-  app.lsp.edits.arena = allocated.arena
+  app.lsp.edits.arena = mem.arena_take(&allocated.arena)
   app.lsp.edits.owned = true
   changes := json.object_get(edit, "changes")
   documents := json.object_get(edit, "documentChanges")
@@ -215,8 +215,8 @@ fn lsp_completion(app: *App, item: *const json.Value) {
   }
   defer _ = mem.arena_release(&allocated.arena)
   capacity := (buffer.Capacity + 1) * 6
-  message := (#cast(*u8) mem.arena_push_uninit(&allocated.arena, capacity, 1))[..capacity]
-  encoded := (#cast(*u8) mem.arena_push_uninit(&allocated.arena, capacity, 1))[..capacity]
+  message := (#cast(*u8) mem.arena_push_uninit_or_panic(&allocated.arena, capacity, 1))[..capacity]
+  encoded := (#cast(*u8) mem.arena_push_uninit_or_panic(&allocated.arena, capacity, 1))[..capacity]
   used := copy_text(message, "{\"changes\":{")
   lsp_document_uri(message, &used, files.name(&slot.file))
   add_text(message, &used, ":[")
@@ -231,7 +231,7 @@ fn lsp_completion(app: *App, item: *const json.Value) {
   snippet := lsp.Snippet{}
   insertion_start := state.position
   if format.value == 2 {
-    plain := mem.arena_push_uninit(&allocated.arena, buffer.Capacity + 1, 1)[..buffer.Capacity + 1]
+    plain := mem.arena_push_uninit_or_panic(&allocated.arena, buffer.Capacity + 1, 1)[..buffer.Capacity + 1]
     snippet = lsp.parse_snippet(content, plain)
     if !snippet.ok {
       notice(app, "Completion uses unsupported snippet variables, choices, or transforms; buffer unchanged.")
@@ -327,6 +327,7 @@ fn lsp_accept(app: *App) {
   }
   item := state.items[app.prompt_state.selected]
   if state.kind == 1 {
+    completion_cancel_refresh(app)
     lsp_completion(app, item)
     return
   }

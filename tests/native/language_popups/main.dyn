@@ -5,8 +5,13 @@ typed: u32 = 0
 completion: bool = false
 hover: bool = false
 snippet_expanded: bool = false
+snippet_candidates: bool = false
 completion_first: u64 = 0
 last_typed: u64 = 0
+first_typed: u64 = 0
+first_popup_seen: bool = false
+retyped: u32 = 0
+custom_letters: [3][2]u8 = []
 started: u64 = 0
 typing_ready: sync.AtomicU32 = sync.AtomicU32{}
 popup_layer: bool = false
@@ -45,6 +50,8 @@ fn popup_row(value: *const u8) bool {
     return false
   }
   if probe_env("DNA_POPUP_PLATFORM\0") != nil {
+    word := probe_env("DNA_POPUP_WORD\0")
+    if word != nil { return popup_prefix(value, word, 3) == 0 }
     prefix: []const u8 = "pol\0"
     return popup_prefix(value, &prefix[0], 3) == 0
   }
@@ -69,8 +76,27 @@ pub fn SDL_SetRenderTarget(renderer: rawptr, texture: rawptr) bool {
 }
 pub fn TTF_DrawRendererText(text: rawptr, x: f32, y: f32) bool {
   bytes := (#cast(*PopupText) text).text
+  // A buffer-word preview deliberately has no inferred function signature.
+  // Snippet acceptance must wait for the real server's replacement candidates.
+  if popup_layer && popup_contains(bytes, "fn helper(\0") {
+    snippet_candidates = true
+    if stage == 5 && typed == 3 && probe_env("DNA_POPUP_SNIPPET\0") != nil { completion = true }
+  }
   if stage >= 7 && popup_contains(bytes, "helper(123)\0") {
     snippet_expanded = true
+  }
+  if popup_row(bytes) || (popup_layer && popup_contains(bytes, "word from file\0")) {
+    if !first_popup_seen && first_typed != 0 {
+      first_popup_seen = true
+      probe_log("first completion latency: ")
+      probe_number(popup_ticks() - first_typed)
+      probe_log(" ms after first keystroke\n")
+      limit := probe_env("DNA_POPUP_MAX_MS\0")
+      if limit != nil && popup_ticks() - first_typed > popup_parse(limit, nil, 10) {
+        probe_log("FAIL first completion latency budget\n")
+        probe_exit(96)
+      }
+    }
   }
   if popup_row(bytes) {
     if probe_env("DNA_POPUP_PLATFORM\0") == nil && (x > 250.0 || y > 180.0) {
@@ -83,9 +109,14 @@ pub fn TTF_DrawRendererText(text: rawptr, x: f32, y: f32) bool {
         probe_log("completion latency: ")
         probe_number(completion_first - last_typed)
         probe_log(" ms after final keystroke\n")
+        limit := probe_env("DNA_POPUP_MAX_MS\0")
+        if limit != nil && completion_first - last_typed > popup_parse(limit, nil, 10) {
+          probe_log("FAIL repeated completion latency budget\n")
+          probe_exit(96)
+        }
       }
     }
-    if probe_env("DNA_POPUP_SETTLE\0") == nil || popup_ticks() - completion_first >= 40 {
+    if (probe_env("DNA_POPUP_SNIPPET\0") == nil || snippet_candidates) && (probe_env("DNA_POPUP_SETTLE\0") == nil || popup_ticks() - completion_first >= 40) {
       completion = true
     }
   }
@@ -190,6 +221,11 @@ pub fn SDL_WaitEventTimeout(event: rawptr, milliseconds: i32) bool {
       letter := letters[typed]
       if probe_env("DNA_POPUP_PLATFORM\0") != nil {
         letter = platform_letters[typed]
+        word := probe_env("DNA_POPUP_WORD\0")
+        if word != nil {
+          custom_letters[typed][0] = word[..3][typed]
+          letter = custom_letters[typed][..]
+        }
       }
       typed += 1
       probe_kind(event).* = 768
@@ -200,10 +236,20 @@ pub fn SDL_WaitEventTimeout(event: rawptr, milliseconds: i32) bool {
         probe_exit(95)
       }
       last_typed = popup_ticks()
+      if first_typed == 0 { first_typed = last_typed }
       return true
     }
     if completion && probe_env("DNA_POPUP_PLATFORM\0") != nil {
-      probe_log("PASS automatic completion while typing in platform.dyn\n")
+      if probe_env("DNA_POPUP_RETYPE\0") != nil && retyped < 3 {
+        retyped += 1
+        typed = 2
+        completion = false
+        completion_first = 0
+        probe_kind(event).* = 768
+        probe_u32(event, 28).* = 8
+        return true
+      }
+      probe_log("PASS automatic completion in saved Dyn file\n")
       probe_kind(event).* = 256
       stage = 12
       return true

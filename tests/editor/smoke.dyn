@@ -236,6 +236,7 @@ fn completion_smoke(app: *App, typography: *Typography) {
   }
   text_input(app, directory.value)
   text_input(app, "/sub")
+  picker_wait_smoke(app)
   if app.completion.count != 1 || app.completion.entries[0].directory || !buffer.equal(app.completion.entries[0].name[..app.completion.entries[0].length], "subdir/other.txt") {
     #panic("flat file suggestions")
   }
@@ -312,8 +313,15 @@ fn completion_smoke(app: *App, typography: *Typography) {
   }
   text_input(app, directory.value)
   text_input(app, "/oth")
+  picker_wait_smoke(app)
   if app.completion.count != 1 || app.completion.entries[0].directory {
     #panic("recursive filename query")
+  }
+  app.completion.chosen = true
+  picker_index_submit(app)
+  picker_wait_smoke(app)
+  if app.completion.count != 1 || !app.completion.chosen || app.completion.selected != 0 {
+    #panic("picker background refresh selection")
   }
   visited := app.picker_state.index.visited
   text_input(app, "r")
@@ -1528,7 +1536,7 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
     #panic("reopening terminal duplicated split")
   }
   // Give review motions a deterministic first line, independent of shell prompts.
-  review_command := "printf '\\033[2J\\033[HDNA-review-ready\\n'\n"
+  review_command := "PS1='DNA-terminal-ready> '; PROMPT_COMMAND=; printf '\\033[2J\\033[HDNA-review-ready\\n'\n"
   terminal_text(exited, &review_command[0], #len(review_command))
   review_deadline := sdl.ticks() + 2000
   review_ready: bool = false
@@ -1661,6 +1669,23 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
     #panic("double Escape must not send ESC to the program")
   }
   terminal_key(exited, 99, 64)
+  // Wait for cat to finish and the shell to accept commands. Sending exit
+  // while SIGINT is still being handled can flush it or deliver it to cat.
+  shell_prompt: []const u8 = "DNA-terminal-ready>"
+  shell_ready: bool = false
+  shell_deadline := sdl.ticks() + 2000
+  for !shell_ready && sdl.ticks() < shell_deadline {
+    _ = terminal_poll(exited)
+    shell_screen: [32768]u8 = []
+    shell_length := terminal_snapshot(exited, &shell_screen[0], 32768)
+    for shell_length > 0 && (shell_screen[shell_length - 1] == 32 || shell_screen[shell_length - 1] == 10 || shell_screen[shell_length - 1] == 13) {
+      shell_length -= 1
+    }
+    shell_ready = shell_length >= #len(shell_prompt) && buffer.equal(shell_screen[shell_length - #len(shell_prompt)..shell_length], shell_prompt)
+  }
+  if !shell_ready {
+    #panic("cat interrupt must return to shell prompt")
+  }
   // Leave one Escape held, as the checks below expect.
   key_input(app, typography, 27, 0)
   key_input(app, typography, 27, 0)
@@ -1677,7 +1702,6 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
   if app.documents.slots[exited_slot].terminal.handle != exited || app.documents.active != exited_slot {
     #panic("cancel must retain running terminal")
   }
-  terminal_key(exited, 99, 64)
   exit_command: []const u8 = "exit\n"
   terminal_text(exited, &exit_command[0], #len(exit_command))
   exit_deadline := sdl.ticks() + 3000
@@ -2421,7 +2445,7 @@ fn persistence_smoke() {
   }
   defer _ = mem.arena_release(&owner.arena)
   defer _ = mem.arena_release(&temporary.arena)
-  test_app := #cast(*App) mem.arena_push(&owner.arena, #sizeof(App), #alignof(App))
+  test_app := #cast(*App) mem.arena_push_or_panic(&owner.arena, #sizeof(App), #alignof(App))
   test_app.scratch = &temporary.arena
   test_app.config = settings.Settings{}
   defer release_editor_state(test_app)
@@ -2489,7 +2513,7 @@ fn plugin_host_smoke(typography: *Typography) {
   }
   defer _ = mem.arena_release(&owner.arena)
   defer _ = mem.arena_release(&temporary.arena)
-  test_app := #cast(*App) mem.arena_push(&owner.arena, #sizeof(App), #alignof(App))
+  test_app := #cast(*App) mem.arena_push_or_panic(&owner.arena, #sizeof(App), #alignof(App))
   test_app.scratch = &temporary.arena
   test_app.config = settings.Settings{}
   defer release_editor_state(test_app)
@@ -2819,3 +2843,14 @@ fn pane_widths_even(app: *App, columns: usize) bool {
   }
   return count == columns && largest - smallest <= 2 && total == 1200
 }
+
+// Async traversal completes through the same tick path used by the editor.
+fn picker_wait_smoke(app: *App) {
+  deadline := sdl.ticks() + 3000
+  for app.picker_state.pending {
+    _ = picker_index_tick(app)
+    if sdl.ticks() > deadline { #panic("picker worker timeout") }
+    language_test_delay(1)
+  }
+}
+

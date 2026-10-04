@@ -7,7 +7,7 @@ fn operations_smoke() {
   }
   defer _ = mem.arena_release(&owner.arena)
   defer _ = mem.arena_release(&scratch.arena)
-  app := #cast(*App) mem.arena_push(&owner.arena, #sizeof(App), #alignof(App))
+  app := #cast(*App) mem.arena_push_or_panic(&owner.arena, #sizeof(App), #alignof(App))
   app.scratch = &scratch.arena
   settings.defaults(&app.config)
   app.workspace.project_length = copy_text(app.workspace.project[..], "/tmp")
@@ -24,6 +24,21 @@ fn operations_smoke() {
   }
   app.lsp.servers[0].documents[0].revision = app.documents.current.revision
   work := &app.operations.lsp_receive
+  // Dropping and growing workspaces must account for each owner exactly once.
+  reserved := app.operations.reserved
+  releases := app.operations.releases
+  allocations := app.operations.allocations
+  if !work_acquire(app, work, 65536, "lsp_receive") || app.operations.reserved != reserved + 65536 {
+    #panic("workspace initial accounting")
+  }
+  if !work_acquire(app, work, 131072, "lsp_receive") || app.operations.reserved != reserved + 131072 || app.operations.releases != releases + 1 || app.operations.allocations != allocations + 2 {
+    #panic("workspace growth accounting")
+  }
+  work_drop(app, work, "lsp_receive")
+  work_drop(app, work, "lsp_receive")
+  if work.capacity != 0 || work.born != 0 || mem.arena_capacity(&work.arena) != 0 || app.operations.reserved != reserved || app.operations.releases != releases + 2 {
+    #panic("workspace release accounting")
+  }
   log: []const u8 = "{\"jsonrpc\":\"2.0\",\"method\":\"window/logMessage\",\"params\":{\"message\":\"background\"}}"
   baseline_allocations := app.operations.allocations
   index: usize = 0
@@ -99,6 +114,16 @@ fn operations_smoke() {
   app.render_trace.pending = 0
   app.config.reload_config = false
   app.config.recovery_enabled = false
+  app.picker_state.pending = true
+  app.picker_state.watching = true
+  app.picker_state.refresh_due = 1
+  if editor_wait_ms(app, true) == 0 || editor_wait_ms(app, false) > 16 {
+    #panic("pending picker refresh deadline")
+  }
+  app.picker_state.pending = false
+  app.picker_state.refresh_due = 0
+  if editor_wait_ms(app, false) > 250 { #panic("picker notification fallback") }
+  app.picker_state.watching = false
   if editor_wait_ms(app, true) != 2147483647 {
     #panic("idle deadline polls")
   }
@@ -112,6 +137,17 @@ fn operations_smoke() {
   if editor_wait_ms(app, true) > 75 {
     #panic("LSP timeout deadline ignored")
   }
+  app.lsp.automatic = true
+  app.lsp.kind = 1
+  app.view.insert = true
+  app.lsp.request_started = sdl.ticks()
+  app.config.automatic_completion = false
+  language_test_delay(21)
+  if editor_wait_ms(app, true) == 0 { #panic("disabled completion preview must not spin") }
+  app.config.automatic_completion = true
+  app.view.insert = false
+  app.lsp.automatic = false
+  app.lsp.kind = 0
   app.lsp.pending = 0
   // A hidden command still drains output, then repaints when made visible.
   terminal_popup(app, true, "printf first; sleep 0.2; printf second; sleep 1")
@@ -200,7 +236,7 @@ fn syntax_budget_smoke() {
     #panic("syntax budget fixture")
   }
   defer _ = mem.arena_release(&owned.arena)
-  app := #cast(*App) mem.arena_push(&owned.arena, #sizeof(App), #alignof(App))
+  app := #cast(*App) mem.arena_push_or_panic(&owned.arena, #sizeof(App), #alignof(App))
   defer release_editor_state(app)
   defer syntax_release(app)
   name: [5]u8 = [106, 115, 111, 110, 0]

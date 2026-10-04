@@ -115,13 +115,43 @@ class Terminal:
         self.pump(settle)
 
     def close(self):
+        # LSP jobs may create their own process groups. Keep pidfds for the
+        # complete owned tree so they cannot write into fixtures during removal.
+        pending = [self.pid]
+        seen = set()
+        descriptors = []
+        while pending:
+            pid = pending.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            try:
+                descriptors.append(os.pidfd_open(pid))
+                for task in Path(f'/proc/{pid}/task').iterdir():
+                    pending.extend(map(int, (task / 'children').read_text().split()))
+            except (FileNotFoundError, ProcessLookupError):
+                pass
         try:
-            os.killpg(self.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        os.waitpid(self.pid, 0)
-        os.close(self.fd)
-        self.lib.vterm_free(self.terminal)
+            for descriptor in descriptors:
+                try:
+                    signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            deadline = time.monotonic() + 2
+            for descriptor in descriptors:
+                if not select.select([descriptor], [], [], max(0, deadline-time.monotonic()))[0]:
+                    try:
+                        signal.pidfd_send_signal(descriptor, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    if not select.select([descriptor], [], [], 2)[0]:
+                        raise RuntimeError('benchmark child did not exit')
+            os.waitpid(self.pid, 0)
+        finally:
+            for descriptor in descriptors:
+                os.close(descriptor)
+            os.close(self.fd)
+            self.lib.vterm_free(self.terminal)
 
 
 def records(path):

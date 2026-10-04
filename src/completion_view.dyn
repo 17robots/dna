@@ -10,13 +10,9 @@ fn draw_completion(renderer: rawptr, app: *App, typography: *Typography, width: 
   padding := app.config.popup_padding * scale
   count := state.count
   selected := app.prompt_state.selected
-  shown := count
-  if shown > 8 {
-    shown = 8
-  }
-  if shown == 0 {
-    shown = 1
-  }
+  // Reserve the full viewport even while filtering or awaiting server
+  // results. A changing height can also flip the popup across the caret.
+  shown: usize = 8
   // Size to the widest visible label and detail, within the pane.
   widest: f32 = 0.0
   for measured in 0..count {
@@ -39,15 +35,10 @@ fn draw_completion(renderer: rawptr, app: *App, typography: *Typography, width: 
   }
   bounds := app.view.panes[app.view.focused].rect
   place := place_rect(app, SurfaceCompletion, width, height, line, scale, language_popup_rect(bounds, app.view.animation.file.cursor_x.value, app.view.animation.file.cursor_y.value, widest + padding * 2.0, line * #cast(f32) shown + padding * 2.0, line, scale))
-  // Opening drops the list a few pixels as it fades in.
   opening := app.view.animation.panel != Panel.LspResults
-  if opening {
-    motion.snap(&ui.completion_open, -6.0 * scale)
-  }
-  drop := animated_value(app, &ui.completion_open, 0.0, app.config.popup_animation_ms * 2.0, false)
   frame := ui_make(ui, ui_hash(0, "completion"), UiFloating | UiBackground | UiBorder | UiClip)
   ui.boxes[frame].floating[0] = place.x
-  ui.boxes[frame].floating[1] = place.y + drop
+  ui.boxes[frame].floating[1] = place.y
   ui.boxes[frame].fill = theme().surface
   ui.boxes[frame].padding[0] = padding
   ui.boxes[frame].padding[1] = padding
@@ -57,8 +48,12 @@ fn draw_completion(renderer: rawptr, app: *App, typography: *Typography, width: 
   list := ui_make(ui, ui_key(ui, "list"), UiClip | UiScroll)
   ui_size(ui, list, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
   ui_size(ui, list, UiAxisY, UiSizeKind.Percent, 1.0, 1.0)
-  ui_list_scroll(app, ui, list, count, selected, line * #cast(f32) shown, opening, opening || selected != ui.completion_selected || count != ui.completion_count)
-  window := ui_list_window(ui, list, count, line * #cast(f32) shown)
+  viewport := place.height - padding * 2.0
+  if viewport < 1.0 { viewport = 1.0 }
+  changed := count != ui.completion_count
+  // Refiltering replaces the row set: discard its old scroll offset now.
+  ui_list_scroll(app, ui, list, count, selected, viewport, opening || changed, opening || selected != ui.completion_selected || changed)
+  window := ui_list_window(ui, list, count, viewport)
   ui_push(ui, list)
   ui_spacer(ui, "above", #cast(f32) window.first * line)
   for row in window.first..window.last {

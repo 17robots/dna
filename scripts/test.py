@@ -8,7 +8,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 DYN = os.environ.get("DYN", "dyn")
-for suite in ("buffer", "files", "layout", "motion", "pattern", "settings", "workspace", "lsp", "servers"):
+for suite in ("objects", "buffer", "files", "layout", "motion", "pattern", "settings", "workspace", "lsp", "servers"):
     stage = ROOT / "build" / f"test-{suite}"
     stage.mkdir(parents=True, exist_ok=True)
     for module in ("buffer", "files", "layout", "motion", "pattern", "settings", "workspace", "lsp", "servers"):

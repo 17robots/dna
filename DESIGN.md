@@ -231,12 +231,31 @@ storing only removed/inserted bytes for each checkpoint. A retained checkpoint
 baseline lets grouped edits form one delta. Cursor/selection/explorer identities
 remain per-state metadata; discarded redo storage is reused immediately.
 Large replacements can exhaust the byte budget sooner than small edits.
-Saved and checkpoint views share the current text while unchanged. Before the
-first mutation, the editor materializes each baseline in its reserved backing;
-subsequent edits reuse that storage. Saving or checkpointing can share the new
-current text again. This avoids two full resident copies for untouched open
-files while preserving saved-content comparisons and grouped undo. The first
-edit bears the copy cost; returned baseline views are borrowed until mutation.
+Saved and checkpoint views share the current text while unchanged. The first
+mutation preserves one copy shared by both baselines. Saving inside an edit group
+can make them diverge; only then does the editor preserve separate copies.
+Checkpoints retain a synchronized mirror and update only the bounded changed span
+plus a shifted suffix. A 128-revision change journal also bounds incremental LSP
+diffs; missing revisions safely fall back to a full comparison. Subsequent edits
+reuse that storage. Once saved and checkpointed, both views can
+share current text again and unused snapshot pages are returned to the OS with
+`MADV_DONTNEED`. Only full pages inside the written array bounds are discarded;
+adjacent state and retained undo deltas remain intact. Hot storage stays resident
+while editing. Baseline views are borrowed until mutation, save, or checkpoint.
+Text, line-index, and undo storage also record their largest written prefixes.
+Reloading a document already resets its undo history; after consuming the input
+and rebuilding the new index, reload now returns unused full pages from those
+old prefixes to the OS. Inputs may alias document storage because reclamation
+happens after copying. Ordinary edits keep active storage and retained undo
+deltas resident. Equal-length replacements with unchanged newline counts skip
+rewriting the unaffected suffix of the line index; changed internal newline
+positions are still rebuilt.
+Dirty-state checks track prefix and suffix runs known to match the saved text.
+Replacement, case changes, and undo/redo shrink these bounds before mutation;
+saving or proving text equality resets them. Equal-length documents compare only
+the potentially changed span, so typing and erasing a character does not scan an
+entire large file just to update the modified indicator. Row identity checks
+remain independent.
 
 Syntax workers grow their snapshot and color buffers to match document size,
 with geometric capacity growth and a byte of EOF slack. Shared buffers remain
@@ -284,11 +303,23 @@ leaves the last atomically replaced record. The single recovery worker creates
 directories and files, flushes replacements, and reports failures for the UI to
 consume. Legacy sidecar recovery remains read-compatible only.
 
+The file picker scans on one cancellable worker. Generations reject stale roots;
+filesystem watches trigger debounced rescans, with a two-second fallback when
+watch coverage is incomplete. Filtering cached rows stays on the UI thread.
+Refresh preserves the selected filename. Scans retain the existing 2,048-file,
+8,192-entry and 12-level bounds. Closing the picker cancels work; editor shutdown
+joins the worker before releasing its storage.
+
+Syntax worker buffers shrink after eight consecutive small completed revisions.
+Alternating large/small updates retain warm capacity; failed shrink allocations
+preserve the original owner and retry after another eight small revisions.
+
 ## Storage decision and performance checks
 
 Keep contiguous document storage up to 256 MiB. Edits cost one memmove of the
-text after the cursor, and checkpoints compare and copy the document, so bulk
-operations go through glibc (`__memcpy_chk`/`__memmove_chk`, `memchr`, `memcmp`):
+text after the cursor. Checkpoints compare the changed span and update a retained
+mirror; the first independent mirror still needs a full copy. Bulk operations go
+through glibc (`__memcpy_chk`/`__memmove_chk`, `memchr`, `memcmp`):
 the Dyn runtime's own memcpy/memmove/memset copy a byte at a time and are kept
 local to the executable (version script) so other libraries keep glibc's. On a
 100 MiB log, typing at the top of the file measured 8.6 ms from key to present,

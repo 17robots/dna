@@ -1,3 +1,14 @@
+// Reuse the editor's language classification without guessing comments in text.
+fn match_syntax(app: *App, explorer: bool) buffer.ObjectSyntax {
+  if explorer { return buffer.ObjectSyntax{} }
+  name := filetype_name(&app.documents.slots[app.documents.active])
+  token := comment_token(app)
+  blocks := buffer.equal(token, "\x2f/") || buffer.equal(name, "css")
+  if buffer.equal(name, "css") { token = "" }
+  nested := buffer.equal(name, "rust") || buffer.equal(name, "swift") || buffer.equal(name, "kotlin")
+  return buffer.ObjectSyntax{line_comment: token, block_comments: blocks, nested_comments: nested}
+}
+
 struct MatchState { stage, from: u8, count: usize, explorer, error, syntax_error: bool }
 
 fn match_open(app: *App, explorer: bool) {
@@ -43,7 +54,7 @@ fn match_key(app: *App, key: u32) {
       doc = app.explorer.document
       extending = app.explorer.extend
     }
-    if buffer.select_objects(doc, 109, true, state.count, true, extending) {
+    if buffer.select_objects_with_syntax(doc, 109, true, state.count, true, extending, match_syntax(app, state.explorer)) {
       match_close(app)
     } else {
       state.error = true
@@ -82,12 +93,12 @@ fn match_character(app: *App, text: []const u8) {
       state.syntax_error = true
       return
     }
-    ok = buffer.select_objects(doc, key, state.stage == 2, state.count, false, false)
+    ok = buffer.select_objects_with_syntax(doc, key, state.stage == 2, state.count, false, false, match_syntax(app, state.explorer))
   } else if state.stage == 3 {
-    ok = buffer.surround(doc, 0, 0, key, 1)
+    ok = buffer.surround_with_syntax(doc, 0, 0, key, 1, match_syntax(app, state.explorer))
   }
   else if state.stage == 4 {
-    ok = buffer.surround(doc, 1, key, 0, state.count)
+    ok = buffer.surround_with_syntax(doc, 1, key, 0, state.count, match_syntax(app, state.explorer))
   }
   else if state.stage == 5 {
     state.from = key
@@ -96,7 +107,7 @@ fn match_character(app: *App, text: []const u8) {
     return
   }
   else if state.stage == 6 {
-    ok = buffer.surround(doc, 2, state.from, key, state.count)
+    ok = buffer.surround_with_syntax(doc, 2, state.from, key, state.count, match_syntax(app, state.explorer))
   }
   if ok {
     match_close(app)

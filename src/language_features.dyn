@@ -45,7 +45,7 @@ fn lsp_prepare_format(app: *App, result: *const json.Value) {
     notice(app, "Cannot allocate formatting preview.")
     return
   }
-  app.lsp.edits.arena = allocated.arena
+  app.lsp.edits.arena = mem.arena_take(&allocated.arena)
   app.lsp.edits.owned = true
   uri: [16384]u8 = []
   encoded := lsp.uri(files.name(app.documents.file), uri[..])
@@ -100,6 +100,101 @@ fn language_cursor(doc: *buffer.Document, insert: bool) usize {
 fn completion_visible(app: *App) bool {
   return app.prompt_state.panel == Panel.LspResults && app.lsp.results.kind == 1 && app.view.insert
 }
+fn completion_session(app: *App) bool {
+  state := &app.lsp.results
+  doc := app.documents.current
+  return app.view.insert && (app.prompt_state.panel == Panel.None || completion_visible(app)) && state.active && state.kind == 1 && state.source != nil && state.slot == app.documents.active && state.identity == app.documents.slots[app.documents.active].identity && state.revision == doc.revision && state.position == doc.cursor && doc.cursor == doc.anchor && doc.secondary.count == 0
+}
+fn completion_preview_due(app: *App) u64 {
+  state := &app.lsp
+  if state.pending == 0 || !state.automatic || state.kind != 1 || state.completion_previewed == state.pending || !app.config.automatic_completion || !app.view.insert || app.documents.file.length == 0 || state.slot != app.documents.active || state.identity != app.documents.slots[app.documents.active].identity || !state.servers[state.server].ready || (app.prompt_state.panel != Panel.None && !completion_visible(app)) || snippet_valid(app) { return 0 }
+  if lsp_for(app) != state.server { return 0 }
+  return state.request_started + 20
+}
+// An in-flight response remains usable when only word characters were appended
+// at its cursor. All other edits retain the strict stale-response rejection.
+fn completion_request_compatible(app: *App) bool {
+  state := &app.lsp
+  doc := app.documents.current
+  if state.kind != 1 || !state.automatic || !app.view.insert || state.slot != app.documents.active || state.identity != app.documents.slots[app.documents.active].identity || doc.cursor != doc.anchor || doc.secondary.count != 0 { return false }
+  change := buffer.changes_since(doc, state.revision)
+  if !change.found || change.low != state.position || change.old_high != state.position || change.high != doc.cursor { return false }
+  for byte in doc.bytes[change.low..change.high] {
+    if !completion_word_byte(byte) { return false }
+  }
+  return true
+}
+fn completion_response_matches(app: *App, result: *const json.Value) bool {
+  items := result
+  if json.is_object(items) { items = json.object_get(items, "items") }
+  if !json.is_array(items) { return false }
+  doc := app.documents.current
+  prefix := doc.bytes[completion_prefix_start(doc, doc.cursor)..doc.cursor]
+  item := items.first
+  for item != nil {
+    if completion_score(prefix, item) >= 0 { return true }
+    item = item.next
+  }
+  return false
+}
+// Dismissal and acceptance end the refresh cycle as well as the visible list.
+fn completion_cancel_refresh(app: *App) {
+  if app.lsp.kind == 1 { lsp_cancel_request(app) }
+  app.lsp.completion_due = 0
+  app.lsp.completion_typed = false
+  app.lsp.completion_retry = false
+  app.lsp.results.active = false
+}
+// Store complete UTF-8 characters by value; initialization JSON is temporary.
+fn completion_character(text: []const u8) u32 {
+  if #len(text) == 0 || #len(text) > 4 || !buffer.valid(text) {
+    return 0
+  }
+  character: u32 = 0
+  for index in 0..#len(text) {
+    if index > 0 && (text[index] & 192) != 128 {
+      return 0
+    }
+    character |= #cast(u32) text[index] << #cast(u32) (index * 8)
+  }
+  return character
+}
+fn completion_capabilities(server: *LanguageServer, provider: *const json.Value) {
+  server.completion_trigger_count = 0
+  triggers := json.object_get(provider, "triggerCharacters")
+  if !json.is_array(triggers) {
+    return
+  }
+  item := triggers.first
+  for item != nil && server.completion_trigger_count < 128 {
+    if json.is_string(item) {
+      character := completion_character(item.text)
+      if character != 0 {
+        server.completion_triggers[server.completion_trigger_count] = character
+        server.completion_trigger_count += 1
+      }
+    }
+    item = item.next
+  }
+}
+fn completion_trigger(server: *const LanguageServer, doc: *const buffer.Document, position: usize) []const u8 {
+  if position == 0 || position > doc.length {
+    return ""
+  }
+  // Triggers are Unicode characters, not grapheme clusters.
+  beginning := position - 1
+  for beginning > 0 && (doc.bytes[beginning] & 192) == 128 {
+    beginning -= 1
+  }
+  text := doc.bytes[beginning..position]
+  character := completion_character(text)
+  for index in 0..server.completion_trigger_count {
+    if character != 0 && server.completion_triggers[index] == character {
+      return text
+    }
+  }
+  return ""
+}
 fn completion_tick(app: *App) {
   state := &app.lsp
   if snippet_valid(app) {
@@ -109,6 +204,7 @@ fn completion_tick(app: *App) {
   // Keep a displayed completion consumed; other panels suspend and rearm it.
   if !app.view.insert || (app.prompt_state.panel != Panel.None && !completion_visible(app)) {
     state.completion_identity = 0
+    state.results.active = false
   }
   if !app.config.automatic_completion || !app.view.insert || (app.prompt_state.panel != Panel.None && !completion_visible(app)) || app.documents.file.length == 0 {
     state.completion_due = 0
@@ -122,16 +218,38 @@ fn completion_tick(app: *App) {
   }
   slot := &app.documents.slots[app.documents.active]
   doc := slot.document
+  trigger := completion_trigger(&state.servers[index], doc, doc.cursor)
+  preview_due := completion_preview_due(app)
+  if preview_due != 0 && sdl.ticks() >= preview_due {
+    state.completion_previewed = state.pending
+    if (state.identity == slot.identity && state.revision == doc.revision && state.position == doc.cursor) || completion_request_compatible(app) {
+      completion_words(app)
+    }
+  }
+  // A complete list already contains candidates for a longer prefix. Filtering
+  // it needs no server analysis. Shorter prefixes may need additional candidates.
+  if state.pending == 0 && completion_session(app) && state.results.count > 0 && !state.results.incomplete && !state.results.narrowed && #len(trigger) == 0 {
+    state.completion_due = 0
+    state.completion_typed = false
+    state.completion_retry = false
+    return
+  }
   // Only typed text arms automatic completion; cursor motion never does.
   if (state.completion_typed || state.completion_retry) && (state.completion_identity != slot.identity || state.completion_revision != doc.revision || state.completion_position != doc.cursor) {
     state.completion_identity = slot.identity
     state.completion_revision = doc.revision
     state.completion_position = doc.cursor
     state.completion_due = sdl.ticks() + #cast(u64) app.config.completion_delay_ms
+    if #len(trigger) != 0 {
+      state.completion_due = sdl.ticks()
+      if state.completion_due == 0 {
+        state.completion_due = 1
+      }
+    }
     state.completion_retry = false
   }
   state.completion_typed = false
-  if state.pending != 0 && state.automatic && state.kind == 1 && (state.identity != slot.identity || state.revision != doc.revision || state.position != doc.cursor) {
+  if state.pending != 0 && state.automatic && state.kind == 1 && (state.identity != slot.identity || state.revision != doc.revision || state.position != doc.cursor) && !completion_request_compatible(app) {
     lsp_cancel_request(app)
     if state.servers[index].process == nil {
       return
@@ -149,10 +267,10 @@ fn completion_tick(app: *App) {
     return
   }
   byte := doc.bytes[doc.cursor - 1]
-  if !completion_word_byte(byte) && byte != '.' && byte != ':' && byte != '>' && byte != '#' && byte != '@' {
+  if #len(trigger) == 0 && !completion_word_byte(byte) && byte != '.' && byte != ':' && byte != '>' && byte != '#' && byte != '@' {
     return
   }
-  lsp_request(app, 1, "")
+  lsp_request(app, 1, trigger)
   state.automatic = true
   if state.pending != 0 {
     lsp_note(app, "Automatic completion request pending.")
@@ -248,6 +366,13 @@ fn completion_collect(state: *LspResults, doc: *buffer.Document) {
   prefix := doc.bytes[completion_prefix_start(doc, state.position)..state.position]
   item := state.source
   for item != nil {
+    // Backspacing before the response position invalidates explicit edit ranges.
+    // Keep simple insertions usable; refresh richer edits from the server.
+    if (state.narrowed && json.object_get(item, "textEdit") != nil) || ((state.narrowed || state.position != state.origin) && json.object_get(item, "additionalTextEdits") != nil) {
+      state.incomplete = true
+      item = item.next
+      continue
+    }
     score := completion_score(prefix, item)
     if score >= 0 && (state.count < 128 || completion_before(item, score, state.items[127], state.scores[127])) {
       at := state.count
@@ -272,18 +397,20 @@ fn completion_refilter(app: *App) {
   state := &app.lsp.results
   slot := &app.documents.slots[state.slot]
   doc := slot.document
-  if state.kind != 1 || state.source == nil || app.documents.active != state.slot || doc == nil || slot.identity != state.identity || doc.secondary.count > 0 || doc.cursor < state.origin || doc.cursor != doc.anchor {
+  if state.kind != 1 || state.source == nil || app.documents.active != state.slot || doc == nil || slot.identity != state.identity || doc.secondary.count > 0 || doc.cursor < state.prefix_start || doc.cursor != doc.anchor || completion_prefix_start(doc, doc.cursor) != state.prefix_start {
     app.prompt_state.panel = Panel.None
     lsp_results_release(app)
     return
   }
   state.position = doc.cursor
   state.revision = doc.revision
+  if state.position < state.origin { state.narrowed = true }
   completion_collect(state, doc)
   app.prompt_state.selected = 0
   if state.count == 0 {
     app.prompt_state.panel = Panel.None
-    lsp_results_release(app)
+  } else {
+    app.prompt_state.panel = Panel.LspResults
   }
 }
 // Shift a response range end by text typed after the request was sent.

@@ -1,0 +1,31 @@
+// Assert the real command-line launch state before other UI smoke tests edit it.
+launch_test_active: bool = false
+fn launch_smoke(app: *App) bool {
+  storage: [4096]u8 = []
+  expected := process.environment("DNA_LAUNCH_EXPECT", storage[..])
+  if !expected.ok || !expected.found { return false }
+  launch_test_active = true
+  kind_storage: [32]u8 = []
+  kind := process.environment("DNA_LAUNCH_KIND", kind_storage[..])
+  if buffer.equal(kind.value, "directory") {
+    if !buffer.equal(app.workspace.project[..app.workspace.project_length], expected.value) || !buffer.equal(app.directory_state.path[..app.directory_state.length], expected.value) {
+      #panic("launch directory did not become project")
+    }
+    cwd: [4096]u8 = []
+    size := #syscall(79, &cwd[0], 4096)
+    if size <= 0 || !buffer.equal(cwd[..#cast(usize) size - 1], expected.value) { #panic("launch directory cwd") }
+    if app.prompt_state.panel != Panel.Directory && !tree_open(app) { #panic("launch directory explorer") }
+    if app.documents.file.length != 0 { #panic("directory opened as file") }
+  }
+  else if buffer.equal(kind.value, "error") {
+    if app.documents.file.length != 0 || app.prompt_state.panel != Panel.Message { #panic("invalid launch path silently accepted") }
+  }
+  else {
+    if !buffer.equal(files.name(app.documents.file), expected.value) { #panic("launch file path") }
+    if app.prompt_state.panel != Panel.None { #panic("launch file failed") }
+  }
+  event := sdl.Event{}
+  event.words[0] = 256
+  if !sdl.push(&event) { #panic("launch test exit") }
+  return true
+}

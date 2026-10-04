@@ -25,7 +25,7 @@ fn editor_main() {
   // the resident set instead of faulting all of it in up front.
   _ = #syscall(28, &owned.arena.data[0], #len(owned.arena.data), 15)
   _ = #syscall(28, &scratch.arena.data[0], #len(scratch.arena.data), 15)
-  app := #cast(*App) mem.arena_push_uninit(&owned.arena, #sizeof(App), #alignof(App))
+  app := #alloc_uninit_or_panic(App, mem.arena_allocator(&owned.arena))
   render_trace_open(app)
   defer render_trace_close(app)
   defer operations_release(app)
@@ -63,19 +63,31 @@ fn editor_main() {
     #panic("arguments unavailable")
   }
   // --tui and --gui choose the frontend for this launch; the first other
-  // argument is the file to open.
+  // argument is the file or project directory to open.
   flag_frontend: u8 = 0
+  target_seen := false
+  literal_paths := false
+  launch_directory := false
   for index in 1..#len(arguments.values) {
     argument := arguments.values[index]
-    if buffer.equal(argument, "--tui") {
+    if !literal_paths && buffer.equal(argument, "--") {
+      literal_paths = true
+    }
+    else if !literal_paths && buffer.equal(argument, "--tui") {
       flag_frontend = 2
     }
-    else if buffer.equal(argument, "--gui") {
+    else if !literal_paths && buffer.equal(argument, "--gui") {
       flag_frontend = 1
     }
-    else if #len(argument) > 0 && app.documents.file.length == 0 {
-      open_file(app, argument)
+    else if #len(argument) > 0 && !target_seen {
+      target_seen = true
+      launch_directory = launch_open(app, argument)
     }
+  }
+  launch_error: [512]u8 = []
+  launch_error_length: usize = 0
+  if app.prompt_state.panel == Panel.Message {
+    launch_error_length = copy_text(launch_error[..], app.prompt_state.message[..app.prompt_state.message_length])
   }
   terminal := frontend_choose(app, flag_frontend)
   if terminal && !sdl.tui_start() {
@@ -224,6 +236,13 @@ fn editor_main() {
   defer project_search_release(app)
   resize_font(&typography)
   config_reload(app, &typography, true)
+  // Loading settings normally dismisses panels; retain a failed launch notice.
+  if launch_error_length > 0 && app.prompt_state.panel == Panel.None {
+    notice(app, launch_error[..launch_error_length])
+  }
+  if launch_directory && app.prompt_state.panel == Panel.None {
+    explorer_open(app)
+  }
   if terminal {
     app.config.document_padding = 0.0
   }
