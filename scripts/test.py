@@ -8,10 +8,10 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 DYN = os.environ.get("DYN", "dyn")
-for suite in ("buffer", "files", "layout", "motion", "pattern", "settings", "workspace", "lsp"):
+for suite in ("buffer", "files", "layout", "motion", "pattern", "settings", "workspace", "lsp", "servers"):
     stage = ROOT / "build" / f"test-{suite}"
     stage.mkdir(parents=True, exist_ok=True)
-    for module in ("buffer", "files", "layout", "motion", "pattern", "settings", "workspace", "lsp"):
+    for module in ("buffer", "files", "layout", "motion", "pattern", "settings", "workspace", "lsp", "servers"):
         shutil.copytree(ROOT / "src" / module, stage / module, dirs_exist_ok=True)
     source = (ROOT / "tests" / suite / "main.dyn").read_text()
     (stage / "main.dyn").write_text(source.replace('../../src/', './'))
