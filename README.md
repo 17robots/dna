@@ -12,12 +12,12 @@ font, and desktop display libraries for GUI mode. It does not run on Ubuntu
 24.04's glibc 2.39. See [PRERELEASE.md](PRERELEASE.md) before installing.
 
 ```sh
-mise use -g 'github:17robots/dna[prerelease=true,strip_components=1,bin_path=.]@0.1.0-preview.1'
+mise use -g 'github:17robots/dna[prerelease=true,strip_components=1,bin_path=.]@0.1.0-preview.2'
 dna path/to/file.dyn
 dna path/to/project
 ```
 
-Use `mise exec github:17robots/dna@0.1.0-preview.1 -- dna path/to/project`
+Use `mise exec github:17robots/dna@0.1.0-preview.2 -- dna path/to/project`
 if mise is not activated in your shell. The explicit `bin_path=.` selects the
 archive's launcher, which loads its bundled libraries. The Dyn SDK is needed to
 build DNA, but is not required to run this package. Language servers are
@@ -328,10 +328,12 @@ Supported settings include `font_size` (8–72), `line_height` (1–3), `font` (
 file path), optional `fallback_font` for missing Unicode glyphs, `indent_width`
 (1–16), `theme` (`charcoal`, `light`, or a theme file path), line-number/status options,
 `reduced_motion`, `shell`, and `terminal_escape` (default `ctrl-backslash`).
-`:font` opens a searchable list of installed monospace fonts; `:font /path/font.ttf`
+In the GUI, `:font` opens a searchable list of installed monospace fonts; `:font /path/font.ttf`
 applies an explicit file. Ctrl +/-/0 or `:zoom-in`, `:zoom-out`, `:zoom-reset`
 change size; reset uses the configured size. Picker/zoom changes are temporary;
-edit the config to persist them.
+edit the config to persist them. `:set font_family` suggests installed family
+names. In the TUI, the terminal emulator controls font family and size; `:font`
+explains this instead of opening an ineffective picker.
 
 This is a deliberately restricted TOML reader: flat assignments, decimal numbers,
 booleans, quoted strings without escapes, full-line comments, and `[keys.normal]`
@@ -1230,8 +1232,11 @@ order. Enter opens the selected entry; Backspace goes to the parent and reselect
 the directory you came from. `h`/`l` retain Helix filename movement.
 
 File and folder icons are drawn natively in a separate gutter, with file-type
-colors from the theme. They work with ordinary fonts and never enter selections,
-clipboard text, undo history, or staged filenames. Folder rows retain their `/`
+colors from the theme. GUI icons work with ordinary fonts; TUI icons use Nerd
+Font file/folder glyphs. Ghostty includes these symbols; other terminals may
+need a Nerd Font selected in their settings. Icons
+never enter selections, clipboard text, undo history, or staged filenames.
+`explorer_icons = false` hides them in both frontends. Folder rows retain their `/`
 suffix. Parent and preview columns are read-only context; the middle column is
 the editable buffer. Navigation still requires applying or discarding staged
 changes, and `:write` still opens a preview before touching files.

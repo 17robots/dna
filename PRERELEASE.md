@@ -80,3 +80,18 @@ and testing on those target distributions. Broader desktop/IME testing and
 sustained use on different projects remain outstanding. The local checks do not
 establish that every edit is crash-safe or that memory cannot grow in other
 workloads. The first release is `v0.1.0-preview.1`; it is explicitly marked as a prerelease.
+
+## Preview 2
+
+`v0.1.0-preview.2` fixes TUI syntax colors disappearing in splits and beside
+docked explorers by aligning their geometry to terminal cells. Both explorer
+styles now draw file/folder glyphs in the TUI. Ghostty includes Nerd Font
+symbols; other terminals may need a Nerd Font configured.
+
+GUI font-family suggestions now contain family names instead of paths. TUI
+`:font` explains that the terminal owns font family and size.
+
+Regression checks cover odd terminal dimensions, nested splits, resizing, all
+four dock sides, explorer icon toggles, and font suggestions. Full TUI tests
+passed for the normal release and terminal-only build; debug/release native UI
+checks passed. Platform and glibc requirements remain unchanged.
