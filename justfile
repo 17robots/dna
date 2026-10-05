@@ -111,7 +111,7 @@ smoke: deps test
 
     # A direct `dyn build` (mise.toml's library path) links SDL, SDL_ttf and the
     # native library statically: it needs none of them and no build directory.
-    env -u LD_LIBRARY_PATH -u DYN_LIBRARY_PATH mise exec -- dyn build src --release --no-cache --output build/dna-standalone
+    env -u LD_LIBRARY_PATH DYN_LIBRARY_PATH="$PWD/build/deps/static:$PWD/build/deps/install/lib" python3 scripts/compile.py "$DYN" build src --release --no-cache --output build/dna-standalone
     ! readelf -d build/dna-standalone | grep -E 'NEEDED.*(SDL3|dna_native)'
     ! nm -D --defined-only build/dna-standalone | grep -wE 'memcpy|memmove|memset'
     if command -v bwrap >/dev/null; then hide=""; for f in /usr/lib/libSDL3*.so* /usr/lib64/libSDL3*.so* /usr/lib/x86_64-linux-gnu/libSDL3*.so*; do [ -f "$f" ] && [ ! -L "$f" ] && hide="$hide --bind /dev/null $f"; done; status=0; bwrap --ro-bind / / $hide --tmpfs /run --ro-bind "$PWD/build/dna-standalone" /run/dna-standalone --tmpfs "$PWD/build" --dev /dev --proc /proc --tmpfs /tmp env -i HOME=/tmp PATH=/usr/bin DNA_RECOVERY=0 SDL_VIDEODRIVER=dummy timeout 4 /run/dna-standalone "$PWD/README.md" || status=$?; [ "$status" = 124 ]; fi
