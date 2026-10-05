@@ -295,6 +295,66 @@ def check_file_config(root, environment):
         config.unlink()
 
 
+
+def check_split_syntax(root, environment):
+    """Odd terminal dimensions must not clip syntax ink out of split panes."""
+    class Position(ctypes.Structure):
+        _fields_ = [('row', ctypes.c_int), ('column', ctypes.c_int)]
+
+    class Cell(ctypes.Structure):
+        _fields_ = [('chars', ctypes.c_uint32 * 6), ('width', ctypes.c_char),
+                    ('attrs', ctypes.c_uint), ('fg', ctypes.c_uint8 * 4),
+                    ('bg', ctypes.c_uint8 * 4)]
+
+    vterm.vterm_screen_get_cell.argtypes = [ctypes.c_void_p, Position, ctypes.POINTER(Cell)]
+    split_config = root / 'split-config' / 'dna'
+    split_config.mkdir(parents=True, exist_ok=True)
+    (split_config / 'config.toml').write_text('[modules]\nexplorer = "tree"\n')
+    sample = root / 'split-colors.json'
+    sample.write_text('{"n":42}\n' * 12)
+    session = Session(['--tui', str(sample)], dict(
+        environment, COLORTERM='truecolor', XDG_CONFIG_HOME=str(split_config.parent),
+        DNA_LANGUAGE_DIR=str(ROOT / 'build/test-languages')))
+    try:
+        session.wait_for('{"n":42}')
+        session.pump(0.5)
+
+        def number_colors():
+            found = []
+            for row, text in enumerate(session.text()):
+                start = 0
+                while (column := text.find('42}', start)) >= 0:
+                    for digit in (column, column + 1):
+                        cell = Cell()
+                        assert vterm.vterm_screen_get_cell(session.screen, Position(row, digit), ctypes.byref(cell))
+                        found.append(tuple(cell.fg))
+                    start = column + 3
+            assert found, session.text()
+            return found
+
+        baseline = number_colors()[0]
+        # JSON numbers must be syntax colored before exercising the split.
+        assert baseline[1:] != (212, 212, 212), ('JSON grammar did not highlight fixture', baseline)
+        for rows, columns, command in ((25, 81, b'split\r'), (23, 83, b'vsplit\r'),
+                                       (27, 85, b'split\r')):
+            session.resize(rows, columns)
+            session.send(b':')
+            session.send(command, 0.6)
+            colors = number_colors()
+            assert all(color == baseline for color in colors), (
+                'split lost syntax colors', rows, columns, baseline, colors, session.text())
+        session.send(b' e', 0.6)
+        session.send(b'\x1b[27u')
+        for side in ('left', 'right', 'top', 'bottom'):
+            session.send(b':')
+            session.send(f'place explorer dock {side} 0.3\r'.encode(), 0.6)
+            session.send(b'\x1b[27u')
+            colors = number_colors()
+            assert all(color == baseline for color in colors), (
+                'dock lost syntax colors', side, baseline, colors, session.text())
+    finally:
+        session.close()
+
 with tempfile.TemporaryDirectory(prefix='dna-tui-') as directory:
     root = Path(directory)
     # The project directory is the working directory; keep it to the fixture.
@@ -538,6 +598,8 @@ with tempfile.TemporaryDirectory(prefix='dna-tui-') as directory:
         tree_rows = [row for row in rows if 'pkg/' in row]
         if '▸' not in tree_rows[0]:
             fail('collapsed folder marker', rows)
+        if '\uf07b' not in tree_rows[0] or '\uf15b' not in ''.join(rows):
+            fail('TUI explorer must render folder and file glyphs when icons are enabled', rows)
         # Files created and removed outside DNA show up without a reload.
         (root / 'fresh.txt').write_text('new\n')
         session.wait_for('fresh.txt')
@@ -575,5 +637,31 @@ with tempfile.TemporaryDirectory(prefix='dna-tui-') as directory:
             fail('dropdown picker must hang from the top edge', rows)
     finally:
         session.close()
+    # Both explorer variants use glyphs; disabling icons removes the gutter.
+    for variant, enabled in (("buffer", True), ("tree", False)):
+        (root / 'config' / 'dna' / 'config.toml').write_text(
+            f'explorer_icons = {str(enabled).lower()}\n[modules]\nexplorer = "{variant}"\n')
+        session = Session(['--tui', str(sample)], environment)
+        try:
+            session.wait_for('first line')
+            session.send(b' ')
+            session.send(b'e', 0.6)
+            rows = session.wait_for('pkg/')
+            rendered = ''.join(rows)
+            if enabled and ('\uf07b' not in rendered or '\uf15b' not in rendered):
+                fail('editable explorer must render terminal icon glyphs', rows)
+            if not enabled and ('\uf07b' in rendered or '\uf15b' in rendered):
+                fail('explorer_icons=false must hide terminal icons', rows)
+        finally:
+            session.close()
+    session = Session(['--tui', str(sample)], environment)
+    try:
+        session.wait_for('first line')
+        session.send(b':')
+        session.send(b'font\r', 0.5)
+        session.wait_for('TUI fonts')
+    finally:
+        session.close()
+    check_split_syntax(root, environment)
     check_file_config(root, environment)
 print('PASS TUI frontend: per-file config, document, status, insert, palette frame, splits, terminal pane, :frontend handoff, suspend, tree explorer, dock drag, dropdown picker, italics, undercurl, pastes, resize')
