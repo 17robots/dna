@@ -8,6 +8,7 @@ import pty
 import select
 import signal
 import struct
+import subprocess
 import sys
 import tempfile
 import termios
@@ -15,6 +16,15 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = ROOT / 'build' / ('dna-' + (sys.argv[1] if len(sys.argv) > 1 else 'release'))
+# Syntax checks must use explicit fixtures, never the developer's language
+# installation. A clean CI checkout has no parsers until we install them.
+LANGUAGES = ROOT / 'build/test-languages'
+for language in ('json', 'dyn'):
+    if not (LANGUAGES / language / 'parser.so').exists():
+        subprocess.run(['python3', str(ROOT / 'scripts/compile.py'),
+                        str(ROOT / 'build/deps/install/bin/dna-language'), 'install', language],
+                       env=dict(os.environ, DNA_LANGUAGE_DIR=str(LANGUAGES)),
+                       check=True, timeout=180)
 ROWS, COLUMNS = 24, 80
 # The terminal profile (just build-profile terminal) has no GUI to switch to.
 TERMINAL_ONLY = BINARY.name == 'dna-terminal'
@@ -364,7 +374,7 @@ with tempfile.TemporaryDirectory(prefix='dna-tui-') as directory:
     sample.write_text('first line\nsecond line\n')
     environment = {key: value for key, value in os.environ.items() if not key.startswith('DNA_')}
     environment.pop('COLORTERM', None)
-    environment.update(TERM='xterm-256color', XDG_CONFIG_HOME=str(root / 'config'), XDG_STATE_HOME=str(root / 'state'), DNA_DEFAULT_SERVERS='0', SHELL='/bin/sh', ENV='', PS1='$ ')
+    environment.update(TERM='xterm-256color', XDG_CONFIG_HOME=str(root / 'config'), XDG_STATE_HOME=str(root / 'state'), DNA_DEFAULT_SERVERS='0', DNA_LANGUAGE_DIR=str(LANGUAGES), SHELL='/bin/sh', ENV='', PS1='$ ')
     environment.pop('DISPLAY', None)
     environment.pop('WAYLAND_DISPLAY', None)
     with tempfile.TemporaryDirectory(prefix='dna-handoff-') as handoff_directory:
@@ -567,7 +577,7 @@ with tempfile.TemporaryDirectory(prefix='dna-tui-') as directory:
         try:
             session.wait_for('a comment')
             deadline = time.time() + 8
-            while time.time() < deadline and wanted not in bytes(session.raw):
+            while time.time() < deadline and (wanted not in bytes(session.raw) or b'\x1b[3m' not in bytes(session.raw)):
                 session.pump(0.2)
             raw = bytes(session.raw)
             if wanted not in raw:
