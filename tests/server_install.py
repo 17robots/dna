@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise the real Dyn installer with a deterministic package-manager fixture."""
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -11,6 +12,11 @@ with tempfile.TemporaryDirectory(prefix='dna-servers-') as directory:
     base = Path(directory)
     tools = base / 'bin'
     tools.mkdir()
+    # Only fixture commands and required system utilities are on PATH.
+    for utility in ('mkdir', 'chmod', 'timeout', 'rm'):
+        executable = shutil.which(utility)
+        assert executable, f'missing test utility: {utility}'
+        (tools / utility).symlink_to(executable)
     npm = tools / 'npm'
     npm.write_text('''#!/bin/sh
 set -eu
@@ -25,13 +31,19 @@ printf '{}' > "$prefix/package-lock.json"
 ''')
     npm.chmod(0o755)
     languages = base / 'languages with spaces'
-    env = dict(os.environ, PATH=f'{tools}:{os.environ["PATH"]}', DNA_LANGUAGE_DIR=str(languages), XDG_CONFIG_HOME=str(base / 'config'))
+    env = dict(os.environ, PATH=str(tools), DNA_LANGUAGE_DIR=str(languages), XDG_CONFIG_HOME=str(base / 'config'))
     def run(*args, success=True):
         result = subprocess.run([helper, *args], env=env, capture_output=True, text=True, timeout=15)
-        assert (result.returncode == 0) == success, result.stderr
+        assert (result.returncode == 0) == success, result.stdout + result.stderr
         return result.stdout
     listing = run('list')
     assert 'Language servers available to install:' in listing and 'python: pyright@' in listing
+    # The installer checks for Node, but our shell-only npm/server fixtures
+    # never execute it. Also retain proof that a missing runtime is rejected.
+    run('server-install', 'python', success=False)
+    node = tools / 'node'
+    node.write_text('#!/bin/sh\nexit 99\n')
+    node.chmod(0o755)
     run('server-install', 'python')
     active = languages / '.servers/python'
     first = active.resolve()
