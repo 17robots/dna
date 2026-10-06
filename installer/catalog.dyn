@@ -1,0 +1,42 @@
+// Stable, bounded records for the editor's package manager. Registry names
+// cannot contain tabs/newlines; installation state comes from actual files.
+fn grammar_installed(root: []const u8, name: []const u8) bool {
+  package_storage: [4096]u8 = [] file_storage: [4096]u8 = []
+  package := append_path(package_storage[..], root, name)
+  for leaf in ["parser.so", "highlights.scm", "extensions"] {
+    info := fs.metadata(append_path(file_storage[..], package, leaf))
+    if !info.ok || (info.mode & 61440) != 32768 || info.size == 0 { return false }
+  }
+  return true
+}
+fn catalog(registry: *Registry, root: []const u8) {
+  for index in 0..registry.count {
+    state: []const u8 = "available"
+    if grammar_installed(root, registry.entries[index].name) { state = "installed" }
+    _ = io.println(io.stdout(), "grammar\t{}\t{}", registry.entries[index].name, state)
+  }
+  for index in 0..9 {
+    item := server_package(index) storage: [4096]u8 = []
+    info := fs.metadata(server_executable(root, item, storage[..]))
+    state: []const u8 = "available"
+    if info.ok && (info.mode & 73) != 0 { state = "installed" }
+    _ = io.println(io.stdout(), "server\t{}\t{}", item.name, state)
+  }
+}
+fn uninstall(root: []const u8, name: []const u8) {
+  if !identifier(name) { #panic("invalid package name") }
+  active_storage: [4096]u8 = [] target_storage: [4096]u8 = [] prefix_storage: [4096]u8 = []
+  active := append_path(active_storage[..], root, name)
+  target := fs.read_link(active, target_storage[..])
+  if !target.ok { #panic("refusing to remove a package not managed by DNA") }
+  used: usize = 0 add(prefix_storage[..], &used, root) add(prefix_storage[..], &used, "/.") add(prefix_storage[..], &used, name) add(prefix_storage[..], &used, "-")
+  if #len(target.path) != used + 6 || !equal(target.path[..used], prefix_storage[..used]) { #panic("package points outside its managed directory") }
+  for byte in target.path[used..] {
+    if !((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || (byte >= '0' && byte <= '9')) { #panic("invalid managed version") }
+  }
+  if !fs.remove(active).ok { #panic("cannot deactivate package") }
+  frames: [128]fs.RemovalFrame = [] scratch: [65536]u8 = []
+  removed := fs.remove_tree(target.path, frames[..], scratch[..])
+  if !removed.ok && removed.error != -2 { #panic("package deactivated but cleanup failed; refresh the package list") }
+  _ = io.println(io.stdout(), "Uninstalled {}. Older retained versions are unchanged.", name)
+}

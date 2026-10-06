@@ -24,6 +24,35 @@ reliability or compatibility with every Linux distribution.
   symlinks are rejected by the file loader; directory symlinks are supported.
 - Plugin permission checks are not an operating-system sandbox.
 
+## macOS and Windows release status
+
+DNA does not yet have a native macOS or Windows release. The pinned Dyn SDK
+provides macOS ARM64 and Windows x86-64 compilers, but compiler availability
+alone does not make DNA portable. The current blockers are in this repository:
+
+- `src/native/dyn/notify.dyn` uses Linux epoll and eventfd; `disk.dyn` uses
+  inotify. Other platforms need readiness and file-change implementations.
+- `tty.dyn`, `process.dyn`, and `sync.dyn` assume Linux/glibc structures,
+  constants, signals, and process behavior. `tests/native_abi.py` explicitly
+  checks those Linux layouts. Each port needs its own ABI checks and terminal,
+  subprocess, thread, and shutdown tests.
+- `recovery.dyn` binds glibc's `__errno_location`. Recovery and save paths need
+  platform-specific error handling and filesystem validation.
+- `scripts/deps.py` and `scripts/package.py` produce ELF shared libraries,
+  GNU linker scripts, and Linux runtime paths. macOS needs Mach-O dependency
+  packaging; Windows needs PE/DLL packaging and a portable build wrapper
+  (`scripts/compile.py` currently imports Unix-only Python modules).
+- `src/syntax.dyn` and `installer/main.dyn` call Linux syscall 79 directly
+  for the working directory; these calls need a portable replacement.
+- The language installer uses POSIX shell commands, symlinks, executable mode
+  bits, and `parser.so`. Config paths, managed executables, parser loading,
+  install/update/uninstall, and bundled tools need platform-specific validation.
+
+Port the native boundary first, then build on native CI runners and test GUI,
+TUI, editing, save/recovery, language management, and relocation of the extracted
+archive. Publish platform assets only after those checks pass. Adding a CI
+matrix alone would produce failing builds, not usable releases.
+
 ## Launch
 
 ```

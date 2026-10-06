@@ -49,6 +49,7 @@ extern fn syntax_dlopen "dlopen"(path: *const u8, flags: i32) rawptr
 extern fn syntax_dlclose "dlclose"(library: rawptr) i32
 extern fn syntax_dladdr "dladdr"(address: rawptr, info: *SyntaxLibraryInfo) i32
 extern fn syntax_realpath "realpath"(path: *const u8, output: *u8) *u8
+extern fn syntax_access "access"(path: *const u8, mode: i32) i32
 extern fn syntax_atoi "atoi"(text: *const u8) i32
 syntax_memory_once: i32 = 0
 syntax_retire_thread: rawptr = nil
@@ -688,12 +689,18 @@ fn syntax_installed_path(relative: []const u8, output: *u8, capacity: usize) i32
   if !found {
     return 0
   }
-  used: usize = 0
-  if !syntax_put(output[..capacity], &used, path[..slash]) || !syntax_put(output[..capacity], &used, "/../") || !syntax_put(output[..capacity], &used, relative) {
-    return 0
+  // dladdr names the native library in shared builds and the editor itself
+  // in static builds. Resolve package and development layouts from that file,
+  // never from the current project directory.
+  for prefix in ["/../", "/deps/install/", "/build/deps/install/"] {
+    used: usize = 0
+    if !syntax_put(output[..capacity], &used, path[..slash]) || !syntax_put(output[..capacity], &used, prefix) || !syntax_put(output[..capacity], &used, relative) {
+      return 0
+    }
+    output[..capacity][used] = 0
+    if syntax_access(output, 4) == 0 { return 1 }
   }
-  output[..capacity][used] = 0
-  return 1
+  return 0
 }
 pub fn dna_language_helper(output: *u8, capacity: usize) i32 {
   return syntax_installed_path("bin/dna-language", output, capacity)

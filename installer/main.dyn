@@ -152,17 +152,29 @@ fn main() {
   home_storage: [4096]u8 = [] home := process.environment("HOME", home_storage[..])
   config_storage: [4096]u8 = [] config := process.environment("XDG_CONFIG_HOME", config_storage[..])
   config_path: [4096]u8 = [] config_length: usize = 0
-  if config.ok && config.found { add(config_path[..], &config_length, config.value) } else if home.ok && home.found { add(config_path[..], &config_length, home.value) add(config_path[..], &config_length, "/.config") }
+  if config.ok && config.found && #len(config.value) > 0 { add(config_path[..], &config_length, config.value) } else if home.ok && home.found { add(config_path[..], &config_length, home.value) add(config_path[..], &config_length, "/.config") }
   add(config_path[..], &config_length, "/dna/languages.toml")
   custom := fs.read_all(arena, config_path[..config_length], 65536) if custom.ok { load_registry(&registry, custom.data) }
   root_storage: [4096]u8 = [] root_length: usize = 0 env_storage: [4096]u8 = [] configured := process.environment("DNA_LANGUAGE_DIR", env_storage[..])
   if configured.ok && configured.found { add(root_storage[..], &root_length, configured.value) }
-  else { data_storage: [4096]u8 = [] data := process.environment("XDG_DATA_HOME", data_storage[..]) if data.ok && data.found { add(root_storage[..], &root_length, data.value) } else { if !home.ok || !home.found { #panic("HOME unavailable") } add(root_storage[..], &root_length, home.value) add(root_storage[..], &root_length, "/.local/share") } add(root_storage[..], &root_length, "/dna/languages") }
+  else { data_storage: [4096]u8 = [] data := process.environment("XDG_CONFIG_HOME", data_storage[..]) if data.ok && data.found && #len(data.value) > 0 { add(root_storage[..], &root_length, data.value) } else { if !home.ok || !home.found { #panic("HOME unavailable") } add(root_storage[..], &root_length, home.value) add(root_storage[..], &root_length, "/.config") } add(root_storage[..], &root_length, "/dna/languages") }
   if root_length == 0 { #panic("language data directory is empty") }
   if root_storage[0] != '/' {
     relative_root: [4096]u8 = [] relative_length: usize = 0 add(relative_root[..], &relative_length, root_storage[..root_length])
     cwd := #syscall(79, &root_storage[0], 4096) if cwd <= 0 { #panic("working directory unavailable") }
     root_length = #cast(usize) cwd - 1 add(root_storage[..], &root_length, "/") add(root_storage[..], &root_length, relative_root[..relative_length])
+  }
+  if #len(args.values) == 2 && equal(args.values[1], "catalog") {
+    catalog(&registry, root_storage[..root_length])
+    return
+  }
+  if #len(args.values) == 3 && equal(args.values[1], "uninstall") {
+    index: usize = 0
+    for index < registry.count {
+      if equal(registry.entries[index].name, args.values[2]) { uninstall(root_storage[..root_length], args.values[2]) return }
+      index += 1
+    }
+    #panic("unknown language")
   }
   if #len(args.values) == 3 && server_command(root_storage[..root_length], args.values[1], args.values[2]) { return }
   if #len(args.values) < 2 || equal(args.values[1], "list") {

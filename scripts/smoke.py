@@ -23,6 +23,19 @@ for mode in os.environ.get("DNA_SMOKE_MODES", "debug release").split():
         (fixtures / "subdir" / "other.txt").write_text("other file\n")
         (fixtures / "input.txt").write_text("first\nsecond\n")
         (fixtures / "test.dna-layout").write_text("popup_width=0.8\npopup_height=0.7\nfont_size=22\nreduced_motion=1\n")
+        manager = fixtures / 'manager languages'
+        manager.mkdir()
+        for language in ('json', 'toml', 'python'):
+            target = (manager / ('.' + language + '-Ab123x') if language != 'python'
+                      else fixtures / 'unmanaged-python')
+            target.mkdir()
+            for leaf in ('parser.so', 'highlights.scm', 'extensions'):
+                (target / leaf).write_text('fixture')
+            (manager / language).symlink_to(target)
+        server = manager / '.servers/python/node_modules/.bin/pyright-langserver'
+        server.parent.mkdir(parents=True)
+        server.write_text('#!/bin/sh\nexec python3 "' + str(ROOT / 'tests/fake_lsp.py') + '"\n')
+        server.chmod(0o755)
         # Tests use the dyn on PATH, never a personal DNA_DYN_LSP override.
         base_env = {key: value for key, value in os.environ.items() if key != 'DNA_DYN_LSP'}
         env = with_real_dyn(dict(base_env, DNA_TEST_LSP="python3 " + str(ROOT / "tests/fake_lsp.py"), DYN_EDITOR_SMOKE="1", DNA_WORKFLOW_TEST=directory, DNA_TEST_PLUGIN=str(ROOT/"examples/plugins/uppercase/plugin.json"), XDG_CONFIG_HOME=str(fixtures / "config"), XDG_STATE_HOME=str(fixtures / "state"), DNA_CONFIG=str(fixtures / "startup-config.toml"), DNA_LANGUAGE_DIR=str(fixtures / "languages")))

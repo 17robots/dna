@@ -57,4 +57,37 @@ printf '{}' > "$prefix/package-lock.json"
     assert active.resolve() == second
     run('server-install', '../invalid', success=False)
     assert '  python\n' in run('list')
+    assert 'server\tpython\tinstalled\n' in run('catalog')
+    env.pop('DNA_FAIL_INSTALL')
+    run('server-uninstall', 'python')
+    assert not active.is_symlink() and not second.exists()
+    assert first.is_dir(), 'uninstall must not delete retained versions'
+    assert 'server\tpython\tavailable\n' in run('catalog')
+    run('server-run', 'python', success=False)
+    # Do not follow a replacement symlink outside the managed package root.
+    outside = base / 'outside'
+    outside.mkdir()
+    active.symlink_to(outside)
+    run('server-uninstall', 'python', success=False)
+    assert active.is_symlink() and outside.is_dir()
+    active.unlink()
+    # Grammar removal follows the same ownership rule, including spaces.
+    grammar = languages / '.json-Ab123x'
+    grammar.mkdir()
+    for leaf in ('parser.so', 'highlights.scm', 'extensions'):
+        (grammar / leaf).write_text('fixture')
+    (languages / 'json').symlink_to(grammar)
+    assert 'grammar\tjson\tinstalled\n' in run('catalog')
+    run('uninstall', 'json')
+    assert not grammar.exists() and not (languages / 'json').is_symlink()
+    run('uninstall', '../outside', success=False)
+    # Both HOME defaults and XDG overrides install inside DNA's config folder.
+    env.pop('DNA_LANGUAGE_DIR')
+    env['HOME'] = str(base / 'home')
+    run('server-install', 'python')
+    assert (base / 'config/dna/languages/.servers/python').is_symlink()
+    env.pop('XDG_CONFIG_HOME')
+    run('server-install', 'python')
+    assert (base / 'home/.config/dna/languages/.servers/python').is_symlink()
+    assert not (base / 'home/.local/share/dna').exists()
 print('PASS managed servers: listing, install, launch, retained update, failed-update preservation, invalid names')

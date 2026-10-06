@@ -482,9 +482,31 @@ Applications emitting explicit truecolour RGB retain those colours.
 
 ## Language installation and highlighting
 
-Nothing downloads on startup. `:languages` opens a report with separate
-**Installed languages** and **Available to install** sections, including explicit
-empty states. Incomplete packages remain available to install. The bundled
+Nothing downloads on startup. `:languages` opens a searchable package manager in
+both the GUI and TUI. Rows distinguish **grammar** packages from language
+**servers**, grouped into **Installed** and **Available** sections. Use arrows or
+`j`/`k` to select a package, `i` to install an available package, and `x` to uninstall
+an installed package. **gg / Home** jumps to the first visible package;
+**G / End** jumps to the last. These jumps also extend an active visual range;
+**Shift+Home/End** starts and extends a range. Press **v** on a package to start visual selection; arrows
+or `j`/`k` extend or shrink the highlighted range. **Shift+Up/Down** can also start
+and extend a range. **v** or **Escape** finishes the range and keeps its marks;
+`i`/`x`/`u` can act on it directly. Section headings are skipped when marking.
+Starting visual mode replaces earlier marks with a fresh range; moving back
+unselects packages outside it. The `>` marker identifies the focused row.
+**Space** marks or unmarks individual packages; **q** clears all marks and exits visual selection without closing the menu (**c** also works).
+When anything is marked, `i`, `x`, and `u` act only on eligible marked packages,
+including marks hidden by filtering. Marks survive filtering, refreshing, and
+reopening the menu. Successful operations clear their marks; failed operations
+keep them for retry. Without marks, `i`/`x` act on the focused package and `u` updates all
+installed grammars and managed servers, including packages hidden by the current filter. Updates use this DNA build's
+pinned catalogue versions, not unverified upstream releases. `r` refreshes status.
+Press `/` to filter; Enter or Escape finishes filtering and returns to package
+commands. Escape again closes the manager. Enter on a package uses the same
+install action as `i`. The editor stays usable while work runs; reopening
+`:languages` shows progress. Failures stay in the menu with an option to view details; other
+packages in a bulk update still run.
+Incomplete packages remain available to install. The bundled
 catalogue contains 55 languages: **Dyn, C, C++, C#, Python, JavaScript/JSX,
 TypeScript, TSX, Rust, Go, Zig, Odin, Java, Kotlin, Scala, Dart,
 Ruby, PHP, Lua, Haskell, OCaml, Elixir, Erlang, Gleam, Elm, Clojure,
@@ -498,10 +520,18 @@ packages; language servers are listed under Language servers. `:language-install
 downloads and builds a pinned grammar (for example, `:language-install json`).
 Listings and installation progress/errors remain visible after the command finishes,
 in navigation mode: Esc or `q` hides the popup; `:bd` closes its buffer. Then use
-`:language-reload` to attach installed grammars to open files.
+`:language-reload` to attach installed grammars to open files. The manager reloads
+grammars automatically after successful changes.
 
-Grammars live under `$XDG_DATA_HOME/dna/languages` (default
-`~/.local/share/dna/languages`), overridable with `DNA_LANGUAGE_DIR`. The installer
+Grammars live under `$XDG_CONFIG_HOME/dna/languages` (default
+`~/.config/dna/languages`), overridable with `DNA_LANGUAGE_DIR`. Managed servers
+live under its `.servers` directory. These paths follow DNA's config-directory
+convention on the currently supported Linux build and survive mise upgrades.
+Existing packages in the previous `~/.local/share/dna/languages` location are
+left untouched: reinstall them through the menu to use the new location, or set
+`DNA_LANGUAGE_DIR` to the old directory to keep using them. Uninstall removes the
+active managed package; older versions retained by updates remain on disk.
+The installer
 checks the pinned archive SHA-256, compiles locally, validates the grammar ABI and
 highlight query, and activates a complete version atomically. Installation uses the compiled Dyn helper plus `curl`, GNU `tar`,
 `sha256sum`, `timeout`, and a C compiler; it runs outside the UI loop. No admin access or runtime Python is needed. Python scripts remain development
@@ -1284,9 +1314,12 @@ Bundled dependencies retain their own licenses.
 
 ### Managed servers and language features
 
-`:languages` includes separate installed/available lists for grammars and language
-servers. `:server-install python` installs pinned Pyright into DNA's language data
-directory; `:server-start python` connects it. `:server-update python` activates a
+`:languages` manages both grammar and server packages. `:server-install python`
+remains available to install pinned Pyright into DNA's language config directory;
+`:server-start python` connects it. Managed servers are discovered automatically
+for matching buffers, respecting `default_servers` and per-language `auto_start`
+settings. Dyn's server ships with the Dyn compiler and is not a separate managed
+package. `:server-update python` activates a
 new copy of the version pinned in this DNA build's catalog. Prior installations
 remain on disk. A failed download/install leaves the active version intact.
 Node/npm and `timeout` must be on PATH. npm lifecycle scripts are disabled; these
