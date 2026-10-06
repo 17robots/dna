@@ -1,0 +1,62 @@
+// DNA's filesystem boundary supplements the pinned SDK's portable byte I/O.
+use "std/fs" base
+use "std/mem"
+use "std/errors"
+
+pub type File = base.File
+pub type FileResult = base.FileResult
+pub type Result = base.Result
+pub type ReadAllResult = base.ReadAllResult
+pub struct Metadata { size, inode, device: u64, mode: u16, error: isize, kind: errors.Kind, ok: bool }
+pub struct PathResult { path: []u8, error: isize, kind: errors.Kind, ok: bool }
+pub struct DirectoryResult { directory: Directory, error: isize, kind: errors.Kind, ok: bool }
+pub struct DirectoryEntry { name: []const u8, kind: u8, ok: bool, error: isize, error_kind: errors.Kind }
+pub struct AtomicFile { file: File, destination, temporary: []const u8, active: bool }
+pub struct AtomicResult { transaction: AtomicFile, error: isize, kind: errors.Kind, ok: bool }
+
+pub fn open(path: []const u8) FileResult { return base.open(path) }
+pub fn create(path: []const u8) FileResult { return base.create(path) }
+pub fn create_exclusive(path: []const u8) FileResult { return base.create_exclusive(path) }
+pub fn append(path: []const u8) FileResult { return base.append(path) }
+pub fn adopt_handle(handle: isize) File { return base.adopt_handle(handle) }
+pub fn is_open(file: *const File) bool { return base.is_open(file) }
+pub fn close(file: *File) Result { return base.close(file) }
+pub fn read(file: *File, destination: []u8) Result { return base.read(file, destination) }
+pub fn write(file: *File, source: []const u8) Result { return base.write(file, source) }
+pub fn sync(file: *File) Result { return base.sync(file) }
+pub fn read_all(arena: *mem.Arena, path: []const u8, maximum: usize) ReadAllResult { return base.read_all(arena, path, maximum) }
+pub fn write_all(path: []const u8, source: []const u8) Result { return base.write_all(path, source) }
+
+// Borrow paths until commit/abort. The caller supplies a sibling temporary.
+pub fn atomic_begin(destination: []const u8, temporary: []const u8) AtomicResult {
+  if #len(destination) == 0 || #len(temporary) == 0 { return AtomicResult{error: -22, kind: errors.Kind.InvalidInput} }
+  created := atomic_create_exclusive(temporary)
+  if !created.ok { return AtomicResult{error: created.error, kind: created.kind} }
+  return AtomicResult{transaction: AtomicFile{file: created.file, destination: destination, temporary: temporary, active: true}, ok: true}
+}
+pub fn atomic_commit(transaction: *AtomicFile) Result {
+  if !transaction.active { return Result{error: -22, kind: errors.Kind.InvalidState} }
+  synced := sync(&transaction.file)
+  if !synced.ok { return synced }
+  closed := close(&transaction.file)
+  if !closed.ok { return closed }
+  renamed := rename(transaction.temporary, transaction.destination)
+  if renamed.ok { transaction.active = false }
+  return renamed
+}
+pub fn atomic_abort(transaction: *AtomicFile) Result {
+  if !transaction.active { return Result{error: -22, kind: errors.Kind.InvalidState} }
+  if is_open(&transaction.file) { _ = close(&transaction.file) }
+  removed := remove(transaction.temporary)
+  if removed.ok { transaction.active = false }
+  return removed
+}
+
+// Private session/recovery contents must never be exposed through a temporary
+// file created with a broader inherited/default access policy.
+pub fn atomic_begin_private(destination: []const u8, temporary: []const u8) AtomicResult {
+  if #len(destination) == 0 || #len(temporary) == 0 { return AtomicResult{error: -22, kind: errors.Kind.InvalidInput} }
+  created := create_private_exclusive(temporary)
+  if !created.ok { return AtomicResult{error: created.error, kind: created.kind} }
+  return AtomicResult{transaction: AtomicFile{file: created.file, destination: destination, temporary: temporary, active: true}, ok: true}
+}

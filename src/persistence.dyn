@@ -120,7 +120,7 @@ fn session_save(app: *App, argument: []const u8) bool {
   temporary: [4096]u8 = []
   used := copy_text(temporary[..], path)
   add_text(temporary[..], &used, ".tmp")
-  tx := fs.atomic_begin(path, temporary[..used])
+  tx := fs.atomic_begin_private(path, temporary[..used])
   if !tx.ok {
     notice(app, "Cannot create session snapshot. Ensure its parent directory exists and no .tmp file remains.")
     return false
@@ -130,7 +130,7 @@ fn session_save(app: *App, argument: []const u8) bool {
       _ = fs.atomic_abort(&tx.transaction)
     }
   }
-  if #syscall(91, tx.transaction.file.descriptor, 384) != 0 || !fs.write(&tx.transaction.file, bytes[..length]).ok || !fs.atomic_commit(&tx.transaction).ok {
+  if !fs.set_permissions(&tx.transaction.file, 384).ok || !fs.write(&tx.transaction.file, bytes[..length]).ok || !fs.atomic_commit(&tx.transaction).ok {
     notice(app, "Session write failed.")
     return false
   }
@@ -217,9 +217,7 @@ fn session_restore(app: *App, argument: []const u8) bool {
       doc.anchor = buffer.boundary(doc, saved.anchor)
     }
   }
-  directory: [4096]u8 = []
-  _ = copy_text(directory[..], state.project)
-  if #syscall(80, &directory[0]) != 0 {
+  if !host.change_directory(state.project) {
     notice(app, "Session project directory is unavailable. Workspace unchanged.")
     return false
   }
@@ -408,9 +406,9 @@ fn recovery_allowed(app: *App) bool {
   }
   if !app.recovery.checked {
     env: [32]u8 = []
-    disabled := process.environment("DNA_RECOVERY", env[..])
+    disabled := host.environment("DNA_RECOVERY", env[..])
     app.recovery.disabled = disabled.ok && disabled.found && buffer.equal(disabled.value, "0")
-    smoke := process.environment("DYN_EDITOR_SMOKE", env[..])
+    smoke := host.environment("DYN_EDITOR_SMOKE", env[..])
     if smoke.found {
       app.recovery.disabled = true
     }

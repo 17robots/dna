@@ -1,0 +1,73 @@
+#target(kernel: linux)
+use "std/c"
+
+pub type Directory = base.Directory
+fn linux_metadata(info: base.Metadata) Metadata {
+  return Metadata{size: info.size, inode: info.inode, device: info.device, mode: info.mode, error: info.error, kind: info.kind, ok: info.ok}
+}
+fn linux_result(code: isize) Result { return Result{error: code, kind: errors.linux(code), ok: code == 0} }
+fn path_metadata(path: []const u8, flags: usize) Metadata {
+  storage: [4096]u8 = []
+  encoded := c.string_from_bytes(storage[..], path)
+  if !encoded.ok || #len(path) == 0 { return Metadata{error: -22, kind: errors.Kind.InvalidInput} }
+  raw: [32]u64 = []
+  result := #syscall(332, -100, encoded.value, flags, 2047, &raw[0])
+  if result < 0 { return Metadata{error: result, kind: errors.linux(result)} }
+  if (raw[0] & 769) != 769 { return Metadata{error: -5, kind: errors.Kind.System} }
+  return Metadata{size: raw[5], inode: raw[4], device: raw[17], mode: #cast(u16) (raw[3] >> 32), ok: true}
+}
+pub fn metadata(path: []const u8) Metadata { return path_metadata(path, 0) }
+pub fn metadata_nofollow(path: []const u8) Metadata { return path_metadata(path, 256) }
+pub fn file_metadata(file: *const File) Metadata { return linux_metadata(base.file_metadata(file)) }
+pub fn open_directory(path: []const u8, storage: []u8) DirectoryResult {
+  result := base.open_directory(path, storage)
+  return DirectoryResult{directory: result.directory, error: result.error, kind: result.kind, ok: result.ok}
+}
+pub fn directory_next(directory: *Directory) DirectoryEntry {
+  result := base.directory_next(directory)
+  return DirectoryEntry{name: result.name, kind: result.kind, ok: result.ok, error: result.error, error_kind: result.error_kind}
+}
+pub fn close_directory(directory: *Directory) Result { return base.close_directory(directory) }
+pub fn rename(old_path: []const u8, new_path: []const u8) Result { return base.rename(old_path, new_path) }
+pub fn rename_noreplace(old_path: []const u8, new_path: []const u8) Result {
+  old_storage: [4096]u8 = [] new_storage: [4096]u8 = []
+  old := c.string_from_bytes(old_storage[..], old_path)
+  target := c.string_from_bytes(new_storage[..], new_path)
+  if !old.ok || !target.ok || #len(old_path) == 0 || #len(new_path) == 0 { return linux_result(-22) }
+  return linux_result(#syscall(316, -100, old.value, -100, target.value, 1))
+}
+pub fn remove(path: []const u8) Result { return base.remove(path) }
+pub fn make_directory(path: []const u8, mode: usize) Result { return base.make_directory(path, mode) }
+pub fn remove_directory(path: []const u8) Result { return base.remove_directory(path) }
+pub fn read_link(path: []const u8, destination: []u8) PathResult {
+  result := base.read_link(path, destination)
+  return PathResult{path: result.path, error: result.error, kind: result.kind, ok: result.ok}
+}
+pub fn set_permissions(file: *File, mode: usize) Result {
+  if !base.is_open(file) { return linux_result(-9) }
+  return linux_result(#syscall(91, file.descriptor, mode))
+}
+
+pub fn open_nofollow(path: []const u8) FileResult {
+  storage: [4096]u8 = []
+  encoded := c.string_from_bytes(storage[..], path)
+  if !encoded.ok || #len(path) == 0 { return FileResult{error: -22, kind: errors.Kind.InvalidInput} }
+  descriptor := #syscall(257, -100, encoded.value, 657408, 0)
+  if descriptor < 0 { return FileResult{error: descriptor, kind: errors.linux(descriptor)} }
+  return FileResult{file: base.adopt_handle(descriptor), ok: true}
+}
+
+fn atomic_create_exclusive(path: []const u8) FileResult { return base.create_exclusive(path) }
+pub fn create_private_exclusive(path: []const u8) FileResult {
+  storage: [4096]u8 = []
+  encoded := c.string_from_bytes(storage[..], path)
+  if !encoded.ok || #len(path) == 0 { return FileResult{error: -22, kind: errors.Kind.InvalidInput} }
+  descriptor := #syscall(257, -100, encoded.value, 524482, 384)
+  if descriptor < 0 { return FileResult{error: descriptor, kind: errors.linux(descriptor)} }
+  return FileResult{file: base.adopt_handle(descriptor), ok: true}
+}
+pub fn preserve_permissions(file: *File, source: []const u8) Result {
+  info := metadata(source)
+  if !info.ok { return Result{error: info.error, kind: info.kind} }
+  return set_permissions(file, #cast(usize) (info.mode & 511))
+}

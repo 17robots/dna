@@ -8,9 +8,11 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
 STAGE = ROOT / 'build/test-platform-abi'
-STAGE.mkdir(parents=True, exist_ok=True)
-for source_file in (ROOT / 'src/platform').glob('*.dyn'):
-    shutil.copyfile(source_file, STAGE / source_file.name)
+shutil.rmtree(STAGE, ignore_errors=True)
+STAGE.mkdir(parents=True)
+# The platform module imports ../host; stage both beside the probe.
+for module in ('platform', 'host'):
+    shutil.copytree(ROOT / 'src' / module, STAGE / module)
 # C field name -> Dyn field name, in ABI order (not grouped by type).
 EVENTS = {
     'KeyEvent': ('SDL_KeyboardEvent', 'type:kind reserved timestamp windowID:window which:device scancode key mod:modifiers raw down repeat:repeated'),
@@ -23,7 +25,7 @@ c = ['#include <SDL3/SDL.h>', '#include <stddef.h>', '#include <stdio.h>', 'int 
 checks = []
 for dyn, (native, fields) in EVENTS.items():
     c.append(f'printf("%zu %zu ", sizeof({native}), _Alignof({native}));')
-    checks.extend([(f'#sizeof({dyn})', f'{dyn} size'), (f'#alignof({dyn})', f'{dyn} alignment')])
+    checks.extend([(f'#sizeof(platform.{dyn})', f'{dyn} size'), (f'#alignof(platform.{dyn})', f'{dyn} alignment')])
     for field in fields.split():
         native_field, _, dyn_field = field.partition(':')
         dyn_field = dyn_field or native_field
@@ -35,7 +37,7 @@ flags = shlex.split(subprocess.check_output(['pkg-config', '--cflags', 'sdl3'], 
 subprocess.run(['cc', *flags, str(STAGE / 'probe.c'), '-o', str(STAGE / 'headers')], check=True)
 values = subprocess.check_output([str(STAGE / 'headers')], text=True).split()
 assert len(values) == len(checks)
-source = ['fn main() {'] + [f'  v{name} := {name}{{}}' for name in EVENTS]
+source = ['use "./platform" platform', 'fn main() {'] + [f'  v{name} := platform.{name}{{}}' for name in EVENTS]
 for (expression, label), expected in zip(checks, values):
     source.append(f'  if {expression} != {expected} {{ #panic("{label}") }}')
 source.append('}')

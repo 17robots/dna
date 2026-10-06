@@ -2,7 +2,7 @@
 import os, resource, shutil, signal, subprocess, tempfile
 from pathlib import Path
 root=Path(__file__).resolve().parents[1];stage=root/'build/save-failures';stage.mkdir(exist_ok=True)
-for module in ('files','buffer'):shutil.copytree(root/'src'/module,stage/module,dirs_exist_ok=True)
+for module in ('filesystem','files','buffer'):shutil.copytree(root/'src'/module,stage/module,dirs_exist_ok=True)
 shutil.copyfile(root/'tests/save_failures/main.dyn',stage/'main.dyn')
 for mode in ('debug','release'):
     binary=stage/mode;subprocess.run(['python3',str(root/'scripts/compile.py'),os.environ.get('DYN','dyn'),'build',str(stage),'--'+mode,'--output',str(binary)],check=True)

@@ -20,6 +20,8 @@ run file="": (build "debug")
 test:
     python3 scripts/test.py
 smoke: deps test
+    python3 scripts/test_host.py
+    python3 scripts/test_host.py filesystem
     python3 tests/build_guard.py
     python3 tests/benchmark_cleanup.py
     python3 tests/dyn_support.py

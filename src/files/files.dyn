@@ -1,4 +1,4 @@
-use "std/fs"
+use "../filesystem" fs
 use "std/mem"
 use "std/c"
 use "std/path" paths
@@ -71,17 +71,7 @@ pub fn resolve(path: []const u8, output: []u8) []const u8 {
 }
 // Path stat must not open a FIFO/device and block the UI.
 pub fn metadata(path: []const u8) fs.Metadata {
-  storage: [4096]u8 = []
-  encoded := c.string_from_bytes(storage[..], path)
-  if !encoded.ok {
-    return fs.Metadata{}
-  }
-  raw: [32]u64 = []
-  result := #syscall(332, -100, encoded.value, 256, 2047, &raw[0])
-  if result < 0 || (raw[0] & 769) != 769 {
-    return fs.Metadata{error: result}
-  }
-  return fs.Metadata{size: raw[5], inode: raw[4], device: raw[17], mode: #cast(u16) (raw[3] >> 32), ok: true}
+  return fs.metadata_nofollow(path)
 }
 // A whole file read into its own reserved mapping, outside the bounded frame
 // scratch. Release with mem.arena_release(&text.arena) once copied.
@@ -238,7 +228,7 @@ pub fn save(state: *State, document: *buffer.Document, path: []const u8, scratch
       _ = fs.atomic_abort(&transaction.transaction)
     }
   }
-  if info.ok && #syscall(91, transaction.transaction.file.descriptor, info.mode & 511) != 0 {
+  if info.ok && !fs.preserve_permissions(&transaction.transaction.file, path).ok {
     return "Cannot preserve file permissions."
   }
   written := fs.write(&transaction.transaction.file, document.bytes[..document.length])
@@ -262,7 +252,7 @@ pub fn save(state: *State, document: *buffer.Document, path: []const u8, scratch
       return "Invalid destination."
     }
     // RENAME_NOREPLACE prevents a racing creator from being overwritten.
-    if #syscall(316, -100, &temporary_storage[0], -100, destination.value, 1) != 0 {
+    if !fs.rename_noreplace(temporary, path).ok {
       return "Cannot create new file without replacing an existing destination."
     }
     transaction.transaction.active = false

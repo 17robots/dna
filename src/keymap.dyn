@@ -219,11 +219,10 @@ extern fn frontend_isatty "isatty"(descriptor: i32) i32
 extern fn handoff_arm "dna_handoff_arm"(flag: *const u8, session: *const u8) i32
 extern fn handoff_unsetenv "unsetenv"(name: *const u8) i32
 extern fn handoff_setenv "setenv"(name: *const u8, value: *const u8, overwrite: i32) i32
-extern fn handoff_unlink "unlink"(path: *const u8) i32
 fn display_available() bool {
   storage: [256]u8 = []
-  wayland := process.environment("WAYLAND_DISPLAY", storage[..])
-  x11 := process.environment("DISPLAY", storage[..])
+  wayland := host.environment("WAYLAND_DISPLAY", storage[..])
+  x11 := host.environment("DISPLAY", storage[..])
   return (wayland.ok && wayland.found && #len(wayland.value) > 0) || (x11.ok && x11.found && #len(x11.value) > 0)
 }
 // :frontend tui|gui moves this session to the other frontend: the session
@@ -280,7 +279,7 @@ fn frontend_switch(app: *App, name: []const u8) {
     return
   }
   add_text(path[..], &used, "/handoff-")
-  add_number(path[..], &used, #cast(usize) #syscall(39))
+  add_number(path[..], &used, #cast(usize) host.process_id())
   add_text(path[..], &used, ".session")
   if !session_save(app, path[..used]) {
     return
@@ -291,7 +290,7 @@ fn frontend_switch(app: *App, name: []const u8) {
     flag = "--tui\0"
   }
   if handoff_arm(&flag[0], &path[0]) == 0 {
-    _ = handoff_unlink(&path[0])
+    _ = fs.remove(path[..used])
     notice(app, "Handoff path too long.")
     return
   }
@@ -314,7 +313,7 @@ fn handoff_export(variable: []const u8, value: []const u8) {
 // Takes a handed-over session block; returns its length (0 when absent).
 fn handoff_import(variable: []const u8, destination: []u8) usize {
   storage: [4097]u8 = []
-  value := process.environment(variable[..#len(variable) - 1], storage[..4096])
+  value := host.environment(variable[..#len(variable) - 1], storage[..4096])
   _ = handoff_unsetenv(&variable[0])
   if !value.ok || !value.found || #len(value.value) > #len(destination) {
     return 0
@@ -324,7 +323,7 @@ fn handoff_import(variable: []const u8, destination: []u8) usize {
 // A handoff from :frontend: restore the saved session once, then forget it.
 fn frontend_handoff_restore(app: *App, typography: *Typography) {
   storage: [4096]u8 = []
-  handoff := process.environment("DNA_HANDOFF", storage[..4095])
+  handoff := host.environment("DNA_HANDOFF", storage[..4095])
   if !handoff.ok || !handoff.found || #len(handoff.value) == 0 {
     return
   }
@@ -341,7 +340,7 @@ fn frontend_handoff_restore(app: *App, typography: *Typography) {
   }
   if session_restore(app, storage[..length]) {
     storage[length] = 0
-    _ = handoff_unlink(&storage[0])
+    _ = fs.remove(storage[..length])
   } else {
     // Keep both the original failure and the path needed to retry recovery.
     add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\n\nHandoff preserved. Retry with :session-restore ")
@@ -373,8 +372,8 @@ fn frontend_choose(app: *App, flag: u8) bool {
     return false
   }
   storage: [256]u8 = []
-  wayland := process.environment("WAYLAND_DISPLAY", storage[..])
-  x11 := process.environment("DISPLAY", storage[..])
+  wayland := host.environment("WAYLAND_DISPLAY", storage[..])
+  x11 := host.environment("DISPLAY", storage[..])
   has_display := (wayland.ok && wayland.found && #len(wayland.value) > 0) || (x11.ok && x11.found && #len(x11.value) > 0)
   return !has_display && frontend_isatty(0) != 0 && frontend_isatty(1) != 0
 }

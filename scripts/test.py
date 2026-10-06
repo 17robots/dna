@@ -11,7 +11,7 @@ DYN = os.environ.get("DYN", "dyn")
 for suite in ("objects", "buffer", "files", "layout", "motion", "pattern", "settings", "workspace", "lsp", "servers"):
     stage = ROOT / "build" / f"test-{suite}"
     stage.mkdir(parents=True, exist_ok=True)
-    for module in ("buffer", "files", "layout", "motion", "pattern", "settings", "workspace", "lsp", "servers"):
+    for module in ("host", "filesystem", "buffer", "files", "layout", "motion", "pattern", "settings", "workspace", "lsp", "servers"):
         shutil.copytree(ROOT / "src" / module, stage / module, dirs_exist_ok=True)
     source = (ROOT / "tests" / suite / "main.dyn").read_text()
     (stage / "main.dyn").write_text(source.replace('../../src/', './'))
