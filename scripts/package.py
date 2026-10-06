@@ -63,7 +63,12 @@ Copy `share/dna/config.example.toml` to `~/.config/dna/config.toml` to configure
 DNA. Place custom themes/layouts in sibling `themes`/`layouts` directories;
 examples are under `share/dna/`. `DNA_CONFIG` overrides the configuration path.
 
-`:languages` lists syntax packages; `:language-install name` installs one.
+`:languages` groups Installed and Available packages. Use i to install, x to
+uninstall, u to update, and / to filter. Space marks multiple packages; q (or c) clears
+marks. Use gg/Home and G/End for the first/last package, including in visual
+mode. Use v then arrows or j/k to select a range. With no marks, u updates all
+installed packages. Packages live in ~/.config/dna/languages (or
+$XDG_CONFIG_HOME/dna/languages); DNA_LANGUAGE_DIR overrides this location.
 Grammar installation additionally needs curl, tar, sha256sum, timeout, awk,
 and a C compiler. These developer tools are not included in this archive.
 

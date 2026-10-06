@@ -1,0 +1,356 @@
+struct LanguagePackage {
+  name: [65]u8,
+  length: usize,
+  server, installed, wanted, attempted, update, marked: bool,
+}
+struct LanguageManager {
+  packages: [80]LanguagePackage,
+  count: usize,
+  rows: [128]usize,
+  process: rawptr,
+  loading, applying, loaded, searching: bool,
+  active: usize,
+  visual, pending_g: bool,
+  visual_anchor: usize,
+  error: [4096]u8,
+  error_length: usize,
+}
+fn language_manager_release(app: *App) {
+  if app.language_manager.process != nil {
+    job_close(app.language_manager.process)
+    app.language_manager.process = nil
+  }
+}
+fn language_manager_job(app: *App, verb: []const u8, name: []const u8) bool {
+  if app.workspace.language_root_length == 0 { return false }
+  helper: [4096]u8 = []
+  if language_helper(&helper[0], 4096) == 0 { return false }
+  command: [32768]u8 = [] used: usize = 0
+  // Freeze the same absolute root used by syntax and server discovery, even
+  // when the editor changes its working directory while a job is running.
+  add_text(command[..], &used, "DNA_LANGUAGE_DIR=")
+  shell_quote(command[..], &used, app.workspace.language_root[..app.workspace.language_root_length])
+  add_text(command[..], &used, " ")
+  shell_quote(command[..], &used, helper[..c.string_length(&helper[0], 4096)])
+  add_text(command[..], &used, " ") add_text(command[..], &used, verb)
+  if #len(name) > 0 { add_text(command[..], &used, " ") shell_quote(command[..], &used, name) }
+  command[used] = 0
+  directory: [2]u8 = ['/', 0] empty: [1]u8 = [0]
+  app.language_manager.process = job_open(&command[0], &directory[0], &empty[0], 0, 240000)
+  return app.language_manager.process != nil
+}
+fn language_manager_open(app: *App) {
+  state := &app.language_manager
+  app.resource_state.kind = 6
+  app.resource_state.fonts = false
+  if !state.loaded && state.process == nil {
+    state.loading = true
+    if !language_manager_job(app, "catalog", "") {
+      state.loading = false
+      state.error_length = copy_text(state.error[..], "Cannot start the language installer.")
+    }
+  }
+  state.searching = false
+  state.pending_g = false
+  state.visual = false
+  panel(app, Panel.Open)
+}
+fn language_manager_row(app: *App, id: usize, text: []const u8) {
+  if app.completion.count >= 128 { return }
+  row := app.completion.count
+  entry := &app.completion.entries[row]
+  entry.length = copy_text(entry.name[..], text)
+  entry.directory = false
+  app.language_manager.rows[row] = id
+  app.completion.count += 1
+}
+fn language_manager_marked(app: *App) usize {
+  count: usize = 0
+  for index in 0..app.language_manager.count {
+    if app.language_manager.packages[index].marked { count += 1 }
+  }
+  return count
+}
+fn language_manager_refresh(app: *App) {
+  state := &app.language_manager
+  selected := app.completion.selected
+  selected_id: usize = 999
+  if selected < app.completion.count { selected_id = state.rows[selected] }
+  app.completion.count = 0
+  app.completion.prefix_length = 0
+  app.completion.error = false
+  if state.process != nil {
+    language_manager_row(app, 83, "Working… You can close this menu and keep editing.")
+  } else {
+    if language_manager_marked(app) > 0 { language_manager_row(app, 80, "Update marked installed packages (u)") }
+    else { language_manager_row(app, 80, "Update all installed packages (u)") }
+    language_manager_row(app, 82, "Refresh installed packages (r)")
+  }
+  if state.error_length > 0 { language_manager_row(app, 84, "Last operation failed — Enter to view details") }
+  for section in 0..2 {
+    if section == 0 { language_manager_row(app, 85, "── Installed ──") }
+    else { language_manager_row(app, 86, "── Available ──") }
+    matches: usize = 0
+    for index in 0..state.count {
+      item := &state.packages[index]
+      if item.installed != (section == 0) { continue }
+      label: [256]u8 = [] used: usize = 0
+      if item.marked { add_text(label[..], &used, "[x] ") } else { add_text(label[..], &used, "[ ] ") }
+      if item.server { add_text(label[..], &used, "server  ") } else { add_text(label[..], &used, "grammar ") }
+      add_text(label[..], &used, item.name[..item.length])
+      match_end := used
+      if item.update { add_text(label[..], &used, "  [update]") }
+      else if item.wanted != item.installed {
+        if item.wanted { add_text(label[..], &used, "  [install]") } else { add_text(label[..], &used, "  [uninstall]") }
+      }
+      if picker_match(label[4..match_end], app.prompt_state.text[..app.prompt_state.length]) {
+        language_manager_row(app, index, label[..used])
+        matches += 1
+      }
+    }
+    if matches == 0 { language_manager_row(app, 87 + section, "  (none)") }
+  }
+  app.completion.selected = 0
+  for row in 0..app.completion.count {
+    if state.rows[row] == selected_id { app.completion.selected = row return }
+  }
+  if selected < app.completion.count { app.completion.selected = selected }
+}
+fn language_manager_catalog(app: *App, text: []const u8) bool {
+  state := &app.language_manager
+  previous := state.packages
+  previous_count := state.count
+  state.count = 0
+  at: usize = 0
+  for at < #len(text) {
+    end := at
+    for end < #len(text) && text[end] != 10 { end += 1 }
+    line := text[at..end] at = end + 1
+    first: usize = 0
+    for first < #len(line) && line[first] != 9 { first += 1 }
+    second := first + 1
+    for second < #len(line) && line[second] != 9 { second += 1 }
+    if first >= #len(line) || second >= #len(line) || second <= first + 1 || second - first > 65 || state.count >= 80 { return false }
+    kind := line[..first] name := line[first + 1..second] status := line[second + 1..]
+    if !buffer.equal(kind, "grammar") && !buffer.equal(kind, "server") { return false }
+    if !buffer.equal(status, "installed") && !buffer.equal(status, "available") { return false }
+    for byte in name {
+      if !((byte >= 'a' && byte <= 'z') || (byte >= '0' && byte <= '9') || byte == '_') { return false }
+    }
+    item := &state.packages[state.count]
+    item.* = LanguagePackage{}
+    item.length = copy_text(item.name[..], name)
+    item.server = buffer.equal(kind, "server")
+    item.installed = buffer.equal(status, "installed")
+    item.wanted = item.installed
+    for index in 0..previous_count {
+      old := &previous[index]
+      if old.marked && old.server == item.server && buffer.equal(old.name[..old.length], name) { item.marked = true }
+    }
+    state.count += 1
+  }
+  return true
+}
+fn language_manager_next(app: *App) {
+  state := &app.language_manager
+  for index in 0..state.count {
+    item := &state.packages[index]
+    if (item.wanted == item.installed && !item.update) || item.attempted { continue }
+    item.attempted = true state.active = index
+    verb: []const u8 = "uninstall"
+    if item.wanted { verb = "install" }
+    if item.server {
+      verb = "server-uninstall"
+      if item.wanted { verb = "server-install" }
+      if item.update { verb = "server-update" }
+    }
+    if language_manager_job(app, verb, item.name[..item.length]) { return }
+    state.error_length = copy_text(state.error[..], "Cannot start the language installer.")
+  }
+  state.applying = false
+}
+// Start a fresh explicit action. Failed jobs do not silently retry when a
+// different package is selected. Bulk updates use all installed rows, not the filter.
+fn language_manager_prepare(app: *App, update_all: bool) {
+  state := &app.language_manager
+  state.error_length = 0
+  for index in 0..state.count {
+    item := &state.packages[index]
+    item.wanted = item.installed
+    item.attempted = false
+    item.update = update_all && item.installed
+  }
+}
+fn language_manager_action(app: *App, key: u32) {
+  state := &app.language_manager
+  if state.process != nil { return }
+  state.visual = false
+  if key == KeyR {
+    state.loaded = false
+    state.error_length = 0
+    language_manager_open(app)
+    return
+  }
+  marked := language_manager_marked(app) > 0
+  current: usize = 999
+  if app.completion.selected < app.completion.count { current = state.rows[app.completion.selected] }
+  language_manager_prepare(app, false)
+  for index in 0..state.count {
+    item := &state.packages[index]
+    chosen := item.marked
+    if !marked { chosen = key == KeyU || index == current }
+    if !chosen { continue }
+    if key == KeyU && item.installed { item.update = true }
+    else if key == KeyI && !item.installed { item.wanted = true }
+    else if key == KeyX && item.installed { item.wanted = false }
+  }
+  state.applying = true
+  language_manager_next(app)
+  language_manager_refresh(app)
+}
+fn language_manager_select(app: *App) {
+  state := &app.language_manager
+  state.pending_g = false
+  if state.searching { state.searching = false return }
+  if app.completion.selected >= app.completion.count { return }
+  id := state.rows[app.completion.selected]
+  if id == 84 { notice(app, state.error[..state.error_length]) return }
+  if id == 80 { language_manager_action(app, KeyU) }
+  else if id == 82 { language_manager_action(app, KeyR) }
+  else if id < state.count { language_manager_action(app, KeyI) }
+}
+fn language_manager_visual_start(app: *App) {
+  state := &app.language_manager
+  if state.process != nil || app.completion.selected >= app.completion.count { return }
+  if state.rows[app.completion.selected] >= state.count { return }
+  state.visual = true
+  state.visual_anchor = state.rows[app.completion.selected]
+  language_manager_visual_extend(app)
+}
+fn language_manager_visual_extend(app: *App) {
+  state := &app.language_manager
+  if !state.visual { return }
+  anchor: usize = 0
+  for anchor < app.completion.count && state.rows[anchor] != state.visual_anchor { anchor += 1 }
+  if anchor == app.completion.count { state.visual = false return }
+  // A visual selection is exactly one range, not a union with old marks.
+  // Resolve its anchor by package identity before clearing/rebuilding marks.
+  for index in 0..state.count { state.packages[index].marked = false }
+  low := anchor high := app.completion.selected
+  if low > high { low = app.completion.selected high = anchor }
+  for row in low..high + 1 {
+    if row < app.completion.count {
+      id := state.rows[row]
+      if id < state.count { state.packages[id].marked = true }
+    }
+  }
+  language_manager_refresh(app)
+}
+fn language_manager_key(app: *App, key: u32, modifiers: u16) bool {
+  state := &app.language_manager
+  pending_g := state.pending_g
+  state.pending_g = false
+  if state.searching {
+    if key == KeyEscape || key == KeyReturn { state.searching = false return true }
+    return key == KeyTab
+  }
+  if key == KeyEscape {
+    if state.visual { state.visual = false return true }
+    return false
+  }
+  if (modifiers & ModCtrlAlt) != 0 { return false }
+  if key == KeyHome || key == KeyEnd || key == KeyG {
+    shift := (modifiers & ModShift) != 0
+    if key == KeyG && !shift && !pending_g { state.pending_g = true return true }
+    if key != KeyG && shift && !state.visual { language_manager_visual_start(app) }
+    bottom := key == KeyEnd || (key == KeyG && shift)
+    // Jump to package rows, skipping action rows, headings and empty sections.
+    for row in 0..app.completion.count {
+      if state.rows[row] < state.count {
+        app.completion.selected = row
+        if !bottom { break }
+      }
+    }
+    language_manager_visual_extend(app)
+  } else if key == KeySlash {
+    state.visual = false
+    state.searching = true
+    app.prompt_state.length = 0
+    app.prompt_state.text[0] = 0
+    language_manager_refresh(app)
+  } else if key == KeyV {
+    if state.visual { state.visual = false }
+    else { language_manager_visual_start(app) }
+  } else if key == KeySpace || key == KeyC || key == KeyQ {
+    if state.process == nil {
+      state.visual = false
+      if key == KeyC || key == KeyQ {
+        for index in 0..state.count { state.packages[index].marked = false }
+      } else if app.completion.selected < app.completion.count {
+        id := state.rows[app.completion.selected]
+        if id < state.count { state.packages[id].marked = !state.packages[id].marked }
+      }
+      language_manager_refresh(app)
+    }
+  } else if key == KeyI || key == KeyX || key == KeyU || key == KeyR {
+    language_manager_action(app, key)
+  } else if key == KeyReturn {
+    language_manager_select(app)
+  } else if key == KeyJ || key == KeyDown {
+    if (modifiers & ModShift) != 0 && !state.visual { language_manager_visual_start(app) }
+    if app.completion.selected + 1 < app.completion.count { app.completion.selected += 1 }
+    language_manager_visual_extend(app)
+  } else if key == KeyK || key == KeyUp {
+    if (modifiers & ModShift) != 0 && !state.visual { language_manager_visual_start(app) }
+    if app.completion.selected > 0 { app.completion.selected -= 1 }
+    language_manager_visual_extend(app)
+  }
+  return true
+}
+fn language_manager_tick(app: *App) bool {
+  state := &app.language_manager
+  if state.process == nil { return false }
+  status := job_status(state.process)
+  if status == 1 { return false }
+  if status != 2 {
+    if !state.loading {
+      item := &state.packages[state.active]
+      item.wanted = item.installed
+      item.update = false
+    }
+    state.error_length = job_error(state.process, &state.error[0], 4096)
+    if state.error_length == 0 { state.error_length = copy_text(state.error[..], "Language operation failed or timed out. Check the installer dependencies and retry.") }
+  } else if state.loading {
+    output: [16384]u8 = []
+    length := job_output(state.process, &output[0], 16384)
+    state.loaded = length > 0 && language_manager_catalog(app, output[..length])
+    if !state.loaded {
+      state.count = 0
+      state.error_length = copy_text(state.error[..], "Invalid language catalogue. Rebuild the editor and installer together.")
+    }
+  } else {
+    item := &state.packages[state.active]
+    item.installed = item.wanted
+    item.update = false
+    item.marked = false
+    if !item.server { syntax_release(app) }
+    else {
+      for index in 0..DefaultServers {
+        if buffer.equal(default_server(index).language, item.name[..item.length]) {
+          app.lsp.default_started = app.lsp.default_started & ~ (#cast(u64) 1 << index)
+        }
+      }
+      if !item.installed {
+        for index in 0..8 {
+          server := &app.lsp.servers[index]
+          if server.process != nil && server.managed && buffer.equal(server.language[..server.length], item.name[..item.length]) { lsp_stop(app, index) }
+        }
+      }
+    }
+  }
+  language_manager_release(app)
+  state.loading = false
+  if state.applying { language_manager_next(app) }
+  if app.prompt_state.panel == Panel.Open && app.resource_state.kind == 6 { language_manager_refresh(app) }
+  return true
+}

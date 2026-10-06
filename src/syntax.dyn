@@ -16,11 +16,12 @@ fn language_root(app: *App) {
   configured := process.environment("DNA_LANGUAGE_DIR", storage[..])
   if configured.ok && configured.found {
     app.workspace.language_root_length = copy_text(app.workspace.language_root[..], configured.value)
+    language_root_absolute(app)
     return
   }
 
-  base := process.environment("XDG_DATA_HOME", storage[..])
-  if base.ok && base.found {
+  base := process.environment("XDG_CONFIG_HOME", storage[..])
+  if base.ok && base.found && #len(base.value) > 0 {
     app.workspace.language_root_length = copy_text(app.workspace.language_root[..], base.value)
   } else {
     home := process.environment("HOME", storage[..])
@@ -28,9 +29,20 @@ fn language_root(app: *App) {
       return
     }
     app.workspace.language_root_length = copy_text(app.workspace.language_root[..], home.value)
-    add_text(app.workspace.language_root[..], &app.workspace.language_root_length, "/.local/share")
+    add_text(app.workspace.language_root[..], &app.workspace.language_root_length, "/.config")
   }
   add_text(app.workspace.language_root[..], &app.workspace.language_root_length, "/dna/languages")
+  language_root_absolute(app)
+}
+fn language_root_absolute(app: *App) {
+  if app.workspace.language_root_length == 0 || app.workspace.language_root[0] == '/' { return }
+  relative: [4096]u8 = []
+  length := copy_text(relative[..], app.workspace.language_root[..app.workspace.language_root_length])
+  cwd := #syscall(79, &app.workspace.language_root[0], 4096)
+  if cwd <= 0 { app.workspace.language_root_length = 0 return }
+  app.workspace.language_root_length = #cast(usize) cwd - 1
+  add_text(app.workspace.language_root[..], &app.workspace.language_root_length, "/")
+  add_text(app.workspace.language_root[..], &app.workspace.language_root_length, relative[..length])
 }
 fn slot_syntax_release(slot: *Slot) {
   if slot.syntax != nil {
@@ -286,8 +298,11 @@ fn language_install(app: *App, name: []const u8) {
     notice(app, "Cannot locate language installer.")
     return
   }
-  command: [4096]u8 = []
+  command: [32768]u8 = []
   used: usize = 0
+  add_text(command[..], &used, "DNA_LANGUAGE_DIR=")
+  shell_quote(command[..], &used, app.workspace.language_root[..app.workspace.language_root_length])
+  add_text(command[..], &used, " ")
   shell_quote(command[..], &used, script[..c.string_length(&script[0], 4096)])
   if #len(name) == 0 {
     add_text(command[..], &used, " list")

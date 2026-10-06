@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import pty
 import select
+import shutil
 import signal
 import struct
 import subprocess
@@ -15,7 +16,7 @@ import termios
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
-BINARY = ROOT / 'build' / ('dna-' + (sys.argv[1] if len(sys.argv) > 1 else 'release'))
+BINARY = Path(os.environ.get('DNA_TUI_BINARY', str(ROOT / 'build' / ('dna-' + (sys.argv[1] if len(sys.argv) > 1 else 'release')))))
 # Syntax checks must use explicit fixtures, never the developer's language
 # installation. A clean CI checkout has no parsers until we install them.
 LANGUAGES = ROOT / 'build/test-languages'
@@ -365,6 +366,192 @@ def check_split_syntax(root, environment):
     finally:
         session.close()
 
+def check_language_manager(root, sample, environment):
+    # Isolated installed grammar; missing tools make an install fail locally,
+    # without downloading anything, while exercising the actual i/x key paths.
+    env = dict(environment, PATH='/nonexistent')
+    env.pop('DNA_LANGUAGE_DIR', None)
+    packages = root / 'config/dna/languages'
+    version = packages / '.json-Ab123x'
+    version.mkdir(parents=True)
+    for leaf in ('parser.so', 'highlights.scm', 'extensions'):
+        (version / leaf).write_text('fixture')
+    active = packages / 'json'
+    active.symlink_to(version)
+    session = Session(['--tui', str(sample)], env)
+    try:
+        session.wait_for('first line')
+        session.send(b':')
+        session.send(b'languages\r', 0.5)
+        session.wait_for('Update all installed')
+        session.wait_for('Installed')
+        session.send(b'/')
+        session.send(b'json')
+        session.wait_for('grammar json')
+        session.wait_for('Available')
+        session.send(b'\r')
+        # Update, refresh, Installed heading, then the installed JSON grammar.
+        session.send(b'\x1b[B' * 3)
+        session.send(b'x', 0.5)
+        deadline = time.time() + 5
+        while active.is_symlink() and time.time() < deadline:
+            session.pump(0.1)
+        assert not active.is_symlink() and not version.exists(), session.text()
+        # Selection follows JSON into Available; i runs installation directly.
+        session.send(b'i', 0.5)
+        session.wait_for('Last operation failed')
+        session.send(b'u', 0.5)
+        assert not any('Last operation failed' in row for row in session.text()), session.text()
+        # Commands become ordinary characters while filtering.
+        session.send(b'/')
+        session.send(b'ixu')
+        session.wait_for('ixu_')
+        assert not active.is_symlink()
+        session.send(b'\x1b[27u')
+        session.wait_for('Update all installed')
+        session.send(b'\x1b[27u')
+        session.send(b':')
+        session.send(b'languages\r', 0.5)
+        session.wait_for('Update all installed')
+    finally:
+        session.close()
+
+def check_language_update_all(root, sample, environment):
+    tools = root / 'config/manager-tools'
+    tools.mkdir()
+    for utility in ('mkdir', 'chmod', 'timeout', 'rm'):
+        (tools / utility).symlink_to(shutil.which(utility))
+    (tools / 'node').write_text('#!/bin/sh\nexit 99\n')
+    (tools / 'node').chmod(0o755)
+    (tools / 'npm').write_text("""#!/bin/sh
+set -eu
+while test "$1" != --prefix; do shift; done
+shift
+prefix=$1
+mkdir -p "$prefix/node_modules/.bin"
+for name in pyright-langserver yaml-language-server vscode-json-language-server; do
+  printf '#!/bin/sh\\nexit 0\\n' > "$prefix/node_modules/.bin/$name"
+  chmod +x "$prefix/node_modules/.bin/$name"
+done
+""")
+    (tools / 'npm').chmod(0o755)
+    config = root / 'config/update-test'
+    packages = config / 'dna/languages/.servers'
+    previous = {}
+    for language, executable in (('python', 'pyright-langserver'), ('yaml', 'yaml-language-server'), ('json', 'vscode-json-language-server')):
+        version = packages / ('.' + language + '-Ab123x')
+        program = version / 'node_modules/.bin' / executable
+        program.parent.mkdir(parents=True)
+        program.write_text('#!/bin/sh\nexit 0\n')
+        program.chmod(0o755)
+        (packages / language).symlink_to(version)
+        previous[language] = version
+    env = dict(environment, PATH=str(tools), XDG_CONFIG_HOME=str(config))
+    env.pop('DNA_LANGUAGE_DIR', None)
+    session = Session(['--tui', str(sample)], env)
+    try:
+        session.wait_for('first line')
+        session.send(b':')
+        session.send(b'languages\r', 0.5)
+        session.wait_for('server  python')
+        def mark(name, installed):
+            session.send(b'/')
+            session.send(('server ' + name).encode())
+            session.send(b'\r')
+            session.send(b'\x1b[A' * 20)
+            session.send(b'\x1b[B' * (3 if installed else 5))
+            session.send(b' ')
+            session.wait_for('[x] server  ' + name)
+
+        def wait_packages(predicate):
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                session.pump(0.1)
+                if predicate():
+                    session.wait_for('Update all installed')
+                    return
+            fail('batch package operation did not finish', session.text())
+
+        session.send(b'/')
+        session.send(b'server')
+        session.send(b'\r')
+        session.send(b'gg')
+        top = next(row for row in session.text() if '> [ ] server' in row)
+        session.send(b'G')
+        bottom = next(row for row in session.text() if '> [ ] server' in row)
+        assert top != bottom, session.text()
+        session.send(b'\x1b[H')
+        assert top in session.text(), session.text()
+        session.send(b'\x1b[F')
+        assert bottom in session.text(), session.text()
+        session.send(b'\x1b[A' * 20)
+        session.send(b'\x1b[B' * 3)
+        session.send(b'v')
+        session.wait_for('VISUAL (1 marked)')
+        session.send(b'j')
+        session.wait_for('VISUAL (2 marked)')
+        session.send(b'k')
+        session.wait_for('VISUAL (1 marked)')
+        session.send(b'j')
+        session.send(b'\x1b[27u')
+        session.wait_for('languages (2 marked)')
+        session.send(b'q')
+        session.wait_for('languages (0 marked)')
+        session.send(b'v')
+        session.send(b'k')
+        session.wait_for('VISUAL (2 marked)')
+        session.send(b'q')
+        session.wait_for('languages (0 marked)')
+        session.send(b'j')
+        # Re-entering visual mode must not pin the previous range as old marks.
+        session.send(b'v')
+        session.wait_for('VISUAL (1 marked)')
+        session.send(b'k')
+        session.wait_for('VISUAL (2 marked)')
+        session.send(b'j')
+        session.wait_for('VISUAL (1 marked)')
+        rows = session.text()
+        assert any('> [x] server  yaml' in row for row in rows), rows
+        assert any('[ ] server  python' in row for row in rows), rows
+        session.send(b'k')
+        session.send(b'\x1b[27u')
+        session.send(b'r', 0.5)
+        session.wait_for('Update marked installed')
+        session.wait_for('2 marked')
+        # Marks survive closing/reopening and filtering one marked package out.
+        session.send(b'\x1b[27u')
+        session.send(b':')
+        session.send(b'languages\r', 0.5)
+        session.wait_for('2 marked')
+        session.send(b'/')
+        session.send(b'python')
+        session.send(b'\r')
+        session.send(b'u', 0.5)
+        wait_packages(lambda: all((packages / name).resolve() != previous[name] for name in ('python', 'yaml')))
+        assert (packages / 'json').resolve() == previous['json'], 'unmarked server must not update'
+        for old in previous.values():
+            assert old.is_dir(), 'updates retain the previous working version'
+        # Remove both marked packages, then select them across Available filters
+        # and install both with one i. The unmarked JSON package remains intact.
+        mark('python', True)
+        mark('yaml', True)
+        session.send(b'x', 0.5)
+        wait_packages(lambda: all(not (packages / name).is_symlink() for name in ('python', 'yaml')))
+        mark('python', False)
+        mark('yaml', False)
+        session.send(b'i', 0.5)
+        wait_packages(lambda: all((packages / name).is_symlink() for name in ('python', 'yaml')))
+        assert (packages / 'json').resolve() == previous['json']
+        mark('python', True)
+        session.send(b'c')
+        session.wait_for('0 marked')
+        # With marks cleared, u keeps its original update-all behavior.
+        session.send(b'u', 0.5)
+        wait_packages(lambda: (packages / 'json').resolve() != previous['json'])
+        assert not any('Last operation failed' in row for row in session.text()), session.text()
+    finally:
+        session.close()
+
 with tempfile.TemporaryDirectory(prefix='dna-tui-') as directory:
     root = Path(directory)
     # The project directory is the working directory; keep it to the fixture.
@@ -377,6 +564,11 @@ with tempfile.TemporaryDirectory(prefix='dna-tui-') as directory:
     environment.update(TERM='xterm-256color', XDG_CONFIG_HOME=str(root / 'config'), XDG_STATE_HOME=str(root / 'state'), DNA_DEFAULT_SERVERS='0', DNA_LANGUAGE_DIR=str(LANGUAGES), SHELL='/bin/sh', ENV='', PS1='$ ')
     environment.pop('DISPLAY', None)
     environment.pop('WAYLAND_DISPLAY', None)
+    check_language_manager(root, sample, environment)
+    check_language_update_all(root, sample, environment)
+    if os.environ.get('DNA_TUI_MANAGER_ONLY') == '1':
+        print('PASS TUI language manager: sections, i/x/u actions, filter isolation, reopen')
+        sys.exit(0)
     with tempfile.TemporaryDirectory(prefix='dna-handoff-') as handoff_directory:
         check_failed_handoff(Path(handoff_directory), dict(environment, DNA_RECOVERY='0'))
     session = Session(['--tui', str(sample)], environment)

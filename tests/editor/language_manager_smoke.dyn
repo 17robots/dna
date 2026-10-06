@@ -1,0 +1,154 @@
+fn language_manager_wait(app: *App) {
+  deadline := sdl.ticks() + 5000
+  for app.language_manager.process != nil && sdl.ticks() < deadline {
+    _ = language_manager_tick(app)
+    language_test_delay(1)
+  }
+  if app.language_manager.process != nil { #panic("language manager job timeout") }
+}
+fn language_manager_smoke(typography: *Typography) {
+  storage: [4096]u8 = []
+  fixture := process.environment("DNA_WORKFLOW_TEST", storage[..])
+  if !fixture.ok || !fixture.found { return }
+  owned := mem.arena_create(#sizeof(App) + 128)
+  scratch := mem.arena_create(2097152)
+  if !owned.ok || !scratch.ok { #panic("manager test memory") }
+  defer _ = mem.arena_release(&owned.arena)
+  defer _ = mem.arena_release(&scratch.arena)
+  app := #cast(*App) mem.arena_push_or_panic(&owned.arena, #sizeof(App), #alignof(App))
+  app.scratch = &scratch.arena
+  settings.defaults(&app.config)
+  defer release_editor_state(app)
+  defer language_manager_release(app)
+  if !new_buffer(app) { #panic("manager buffer") }
+  // Visual ranges replace old marks and shrink/reverse without sticky rows.
+  if !language_manager_catalog(app, "grammar\talpha\tinstalled\ngrammar\txml\tinstalled\ngrammar\tomega\tavailable\n") { #panic("visual catalogue") }
+  app.resource_state.kind = 6
+  app.prompt_state.panel = Panel.Open
+  app.language_manager.packages[0].marked = true
+  app.prompt_state.length = copy_text(app.prompt_state.text[..], "x")
+  language_manager_refresh(app)
+  for row in 0..app.completion.count {
+    id := app.language_manager.rows[row]
+    if id < app.language_manager.count && id != 1 { #panic("checkbox must not change filtered package membership") }
+  }
+  app.prompt_state.length = 0
+  app.language_manager.packages[0].marked = false
+  app.language_manager.packages[2].marked = true
+  language_manager_refresh(app)
+  app.completion.selected = 4
+  key_input(app, typography, KeyV, 0)
+  if language_manager_marked(app) != 1 || !app.language_manager.packages[1].marked { #panic("visual replaces existing selection") }
+  key_input(app, typography, KeyK, 0)
+  if language_manager_marked(app) != 2 { #panic("visual upward range") }
+  key_input(app, typography, KeyJ, 0)
+  if app.language_manager.packages[0].marked || language_manager_marked(app) != 1 { #panic("visual shrink removes old selection") }
+  key_input(app, typography, KeyK, 0)
+  key_input(app, typography, KeyK, 0)
+  if language_manager_marked(app) != 2 { #panic("visual heading must not mark a package") }
+  key_input(app, typography, KeyEscape, 0)
+  if app.language_manager.visual || app.prompt_state.panel != Panel.Open { #panic("visual escape keeps manager open") }
+  key_input(app, typography, KeyC, 0)
+  app.completion.selected = 3
+  key_input(app, typography, KeyDown, ModShift)
+  if !app.language_manager.visual || language_manager_marked(app) != 2 { #panic("shift down visual range") }
+  key_input(app, typography, KeyQ, 0)
+  if app.language_manager.visual || language_manager_marked(app) != 0 || app.prompt_state.panel != Panel.Open { #panic("q clears visual selection without closing manager") }
+  key_input(app, typography, KeySpace, 0)
+  key_input(app, typography, KeyQ, 0)
+  if language_manager_marked(app) != 0 { #panic("q clears individual marks") }
+  key_input(app, typography, KeyEnd, 0)
+  if app.language_manager.rows[app.completion.selected] != 2 { #panic("end jumps to last package") }
+  key_input(app, typography, KeyG, 0)
+  if app.language_manager.rows[app.completion.selected] != 2 { #panic("g waits for second key") }
+  key_input(app, typography, KeyG, 0)
+  if app.language_manager.rows[app.completion.selected] != 0 { #panic("gg jumps to first package") }
+  key_input(app, typography, KeyV, 0)
+  key_input(app, typography, KeyG, ModShift)
+  if language_manager_marked(app) != 3 { #panic("G extends visual range across sections") }
+  key_input(app, typography, KeyHome, 0)
+  if language_manager_marked(app) != 1 { #panic("home shrinks visual range") }
+  key_input(app, typography, KeyQ, 0)
+  key_input(app, typography, KeyEnd, ModShift)
+  if !app.language_manager.visual || language_manager_marked(app) != 3 { #panic("shift end starts range") }
+  key_input(app, typography, KeyQ, 0)
+  app.prompt_state.length = copy_text(app.prompt_state.text[..], "xml")
+  language_manager_refresh(app)
+  key_input(app, typography, KeyHome, 0)
+  key_input(app, typography, KeyEnd, 0)
+  if app.language_manager.rows[app.completion.selected] != 1 { #panic("jumps respect filter") }
+  app.prompt_state.length = 0
+  app.workspace.language_root_length = copy_text(app.workspace.language_root[..], fixture.value)
+  add_text(app.workspace.language_root[..], &app.workspace.language_root_length, "/manager languages")
+  language_manager_open(app)
+  language_manager_wait(app)
+  if !app.language_manager.loaded || app.language_manager.count < 10 { #panic("manager catalogue") }
+  // Filter mode treats command letters as text; Escape returns to browsing.
+  key_input(app, typography, KeySlash, 0)
+  text_input(app, "ixu")
+  if !app.language_manager.searching || !buffer.equal(app.prompt_state.text[..app.prompt_state.length], "ixu") || app.language_manager.process != nil { #panic("manager filter commands") }
+  key_input(app, typography, KeyEscape, 0)
+  if app.language_manager.searching || app.prompt_state.panel != Panel.Open { #panic("manager filter escape") }
+  // Direct uninstall follows package identity as rows change sections.
+  for name in ["json", "toml", "python"] {
+    app.prompt_state.length = copy_text(app.prompt_state.text[..], name)
+    completion_refresh(app)
+    found := false
+    for row in 0..app.completion.count {
+      id := app.language_manager.rows[row]
+      if id < app.language_manager.count {
+        item := &app.language_manager.packages[id]
+        if !item.server && buffer.equal(item.name[..item.length], name) {
+          if !item.installed { #panic("manager installed state") }
+          app.completion.selected = row
+          key_input(app, typography, KeyI, 0)
+          if app.language_manager.process != nil { #panic("install key must ignore installed packages") }
+          key_input(app, typography, KeySpace, 0)
+          if !item.marked { #panic("manager mark") }
+          key_input(app, typography, KeyX, 0)
+          if item.wanted || app.resource_state.kind != 6 || app.prompt_state.panel != Panel.Open { #panic("manager uninstall shortcut") }
+          // Work continues after closing without stealing focus.
+          app.prompt_state.panel = Panel.None
+          language_manager_wait(app)
+          if app.prompt_state.panel != Panel.None { #panic("manager completion stole focus") }
+          if item.marked != buffer.equal(name, "python") { #panic("manager marks clear on success and remain on failure") }
+          language_manager_open(app)
+          found = true
+          break
+        }
+      }
+    }
+    if !found { #panic("manager filtered row") }
+  }
+  for index in 0..app.language_manager.count {
+    item := &app.language_manager.packages[index]
+    if item.server { continue }
+    name := item.name[..item.length]
+    if (buffer.equal(name, "json") || buffer.equal(name, "toml")) && item.installed { #panic("manager batch removal") }
+    if buffer.equal(name, "python") && !item.installed { #panic("manager failed removal changed state") }
+  }
+  if app.language_manager.error_length == 0 { #panic("manager failure missing") }
+  // Bulk updates include installed entries hidden by the current filter.
+  app.prompt_state.length = copy_text(app.prompt_state.text[..], "not-a-language")
+  language_manager_prepare(app, true)
+  updates: usize = 0
+  for index in 0..app.language_manager.count {
+    item := &app.language_manager.packages[index]
+    if item.update != item.installed { #panic("manager update-all includes only installed packages") }
+    if item.update { updates += 1 }
+  }
+  if updates != 2 { #panic("manager update-all ignores filter") }
+  language_manager_prepare(app, false)
+  // Managed server discovery uses the same root and explicit starts retain ownership.
+  if !managed_server_available(app, default_server(6)) { #panic("managed server discovery") }
+  app.workspace.project_length = copy_text(app.workspace.project[..], fixture.value)
+  server_tool(app, "server-start", "python")
+  started := false
+  for index in 0..8 {
+    server := &app.lsp.servers[index]
+    if server.process != nil && server.managed { started = true }
+  }
+  lsp_release(app)
+  if !started { #panic("managed server launch") }
+  if language_manager_catalog(app, "grammar\t../escape\tinstalled\n") { #panic("manager malformed catalogue") }
+}
