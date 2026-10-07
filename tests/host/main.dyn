@@ -1,0 +1,46 @@
+use "../../src/host"
+use "std/io"
+use "std/mem"
+use "../../src/filesystem" fs
+
+fn equal(a: []const u8, b: []const u8) bool {
+  if #len(a) != #len(b) { return false }
+  for index in 0..#len(a) { if a[index] != b[index] { return false } }
+  return true
+}
+fn main() {
+  value: [128]u8 = []
+  environment := host.environment("DNA_HOST_TEST", value[..])
+  if !environment.ok || !environment.found || !equal(environment.value, "value café 日本語") { #panic("environment Unicode") }
+  missing := host.environment("DNA_HOST_MISSING_7ab218", value[..])
+  if !missing.ok || missing.found { #panic("missing environment") }
+  empty := host.environment("DNA_HOST_EMPTY", value[..])
+  if !empty.ok || !empty.found || #len(empty.value) != 0 { #panic("empty environment") }
+  if host.environment("DNA_HOST_TEST", value[..1]).ok { #panic("short environment destination") }
+  if host.environment("bad=name", value[..]).ok || host.environment("bad\0name", value[..]).ok { #panic("invalid environment name") }
+  allocated := mem.arena_create(8192)
+  if !allocated.ok { #panic("arguments arena") }
+  defer _ = mem.arena_release(&allocated.arena)
+  arguments := host.arguments(&allocated.arena)
+  if !arguments.ok || #len(arguments.values) != 4 { #panic("argument count") }
+  if !equal(arguments.values[1], "argument café 日本語") || #len(arguments.values[2]) != 0 || !equal(arguments.values[3], "with space") { #panic("argument bytes") }
+  tiny_arena := mem.Arena{data: value[..1]}
+  if host.arguments(&tiny_arena).ok || mem.arena_mark(&tiny_arena) != 0 { #panic("arguments rollback") }
+  if !fs.metadata(".").ok { #panic("host and filesystem integration") }
+
+  original: [4096]u8 = []
+  length := host.current_directory(original[..])
+  if length == 0 || original[length] != 0 { #panic("current directory") }
+  tiny: [1]u8 = []
+  if host.current_directory(tiny[..]) != 0 { #panic("short current directory buffer") }
+  if host.change_directory("") || host.change_directory("invalid\0path") { #panic("invalid directory accepted") }
+  if host.change_directory("dna-directory-that-does-not-exist-7ab218") { #panic("missing directory accepted") }
+  if !host.change_directory("..") || !host.change_directory(original[..length]) { #panic("change directory and restore") }
+  restored: [4096]u8 = []
+  if host.current_directory(restored[..]) != length { #panic("directory length changed") }
+  for index in 0..length { if original[index] != restored[index] { #panic("directory changed") } }
+  if host.process_id() == 0 { #panic("process id") }
+  host.small_pages(tiny[..0])
+  host.write_error("host stderr probe\n")
+  _ = io.println(io.stdout(), "PASS host paths, Unicode working directory, process id, stderr")
+}

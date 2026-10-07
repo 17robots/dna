@@ -1,4 +1,4 @@
-use "std/process"
+use "host"
 
 extern fn notifications_start "dna_notify_start"() i32
 extern fn notifications_stop "dna_notify_stop"()
@@ -23,8 +23,8 @@ fn editor_main() {
   // Fresh mappings are already zero. Pushing uninitialized memory and opting
   // out of huge pages keeps untouched state (path buffers, caches, pools) off
   // the resident set instead of faulting all of it in up front.
-  _ = #syscall(28, &owned.arena.data[0], #len(owned.arena.data), 15)
-  _ = #syscall(28, &scratch.arena.data[0], #len(scratch.arena.data), 15)
+  host.small_pages(owned.arena.data)
+  host.small_pages(scratch.arena.data)
   app := #alloc_uninit_or_panic(App, mem.arena_allocator(&owned.arena))
   render_trace_open(app)
   defer render_trace_close(app)
@@ -48,17 +48,17 @@ fn editor_main() {
   defer release_editor_state(app)
   defer replace_release(app)
 
-  cwd := #syscall(79, &app.directory_state.path[0], 4096)
+  cwd := host.current_directory(app.directory_state.path[..])
   if cwd <= 0 {
     #panic("working directory unavailable")
   }
 
-  app.directory_state.length = #cast(usize) cwd - 1
+  app.directory_state.length = cwd
   app.workspace.project_length = copy_text(app.workspace.project[..], app.directory_state.path[..app.directory_state.length])
   config_location(app)
   language_root(app)
 
-  arguments := process.arguments(&scratch.arena)
+  arguments := host.arguments(&scratch.arena)
   if !arguments.ok {
     #panic("arguments unavailable")
   }
@@ -128,7 +128,7 @@ fn editor_main() {
   // Frames land on the display's refresh, evenly spaced and without tearing.
   // DNA_VSYNC=0 opts out (timer pacing from the display refresh instead).
   vsync_storage: [8]u8 = []
-  vsync_setting := process.environment("DNA_VSYNC", vsync_storage[..])
+  vsync_setting := host.environment("DNA_VSYNC", vsync_storage[..])
   if !(vsync_setting.ok && vsync_setting.found && buffer.equal(vsync_setting.value, "0")) {
     // Probe support, then start with immediate presentation; draw() turns
     // vsync on only while something animates.
@@ -144,7 +144,7 @@ fn editor_main() {
   defer ttf.quit()
 
   font_path: [4096]u8 = []
-  configured := process.environment("DNA_FONT", font_path[..4095])
+  configured := host.environment("DNA_FONT", font_path[..4095])
   if !configured.ok {
     #panic("DNA_FONT is too long or unavailable")
   }
@@ -248,10 +248,10 @@ fn editor_main() {
     app.config.document_padding = 0.0
   }
   environment: [16]u8 = []
-  smoke := process.environment("DYN_EDITOR_SMOKE", environment[..])
+  smoke := host.environment("DYN_EDITOR_SMOKE", environment[..])
   input_storage: [64]u8 = []
   reduced_storage: [16]u8 = []
-  reduced := process.environment("DNA_REDUCED_MOTION", reduced_storage[..])
+  reduced := host.environment("DNA_REDUCED_MOTION", reduced_storage[..])
   if reduced.ok && reduced.found {
     app.view.reduced_motion = buffer.equal(reduced.value, "1")
   }

@@ -1,0 +1,31 @@
+#target(kernel: windows)
+#link("kernel32")
+extern fn vm_allocate "VirtualAlloc"(address: rawptr, size: usize, allocation: u32, protection: u32) rawptr
+extern fn vm_free "VirtualFree"(address: rawptr, size: usize, operation: u32) i32
+extern fn vm_last_error "GetLastError"() u32
+struct SystemInformation {
+  architecture, reserved: u16, page: u32,
+  minimum, maximum: rawptr, active_mask: usize,
+  processors, processor_type, allocation_granularity: u32,
+  processor_level, processor_revision: u16,
+}
+extern fn vm_system_info "GetSystemInfo"(information: *SystemInformation)
+fn native_reserve(size: usize, sparse: bool) mem.ArenaResult {
+  allocation: u32 = 12288 // MEM_RESERVE | MEM_COMMIT
+  if sparse { allocation = 8192 }
+  address := vm_allocate(nil, size, allocation, 4) // PAGE_READWRITE
+  if address == nil { return mem.ArenaResult{error: mem.ErrorKind.System, code: #cast(isize) vm_last_error()} }
+  return mem.ArenaResult{arena: mem.Arena{data: (#cast(*u8) address)[..size], owns_memory: true}, ok: true}
+}
+fn native_commit(address: *u8, length: usize) bool {
+  return vm_allocate(#cast(rawptr) address, length, 4096, 4) != nil
+}
+fn native_discard(address: *u8, length: usize) bool {
+  return vm_free(#cast(rawptr) address, length, 16384) != 0 // MEM_DECOMMIT
+}
+fn native_page_size() usize {
+  info := SystemInformation{}
+  vm_system_info(&info)
+  return #cast(usize) info.page
+}
+fn native_small_pages(memory: []u8) { _ = memory }

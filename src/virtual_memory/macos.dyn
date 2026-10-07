@@ -1,0 +1,20 @@
+#target(kernel: darwin)
+#link("System")
+extern fn vm_getpagesize "getpagesize"() i32
+fn native_reserve(size: usize, sparse: bool) mem.ArenaResult {
+  _ = sparse
+  // Darwin MAP_PRIVATE=2, MAP_ANON=4096. Same allocation ABI as std/mem.
+  // apple-oss-distributions/xnu/bsd/sys/mman.h
+  address := #syscall(197, 0, size, 3, 4098, -1, 0)
+  if address < 0 { return mem.ArenaResult{error: mem.ErrorKind.System, code: address} }
+  return mem.ArenaResult{arena: mem.Arena{data: (#cast(*u8) address)[..size], owns_memory: true}, ok: true}
+}
+fn native_commit(address: *u8, length: usize) bool { _ = address _ = length return true }
+// MADV_DONTNEED=4 is advice only on Darwin, not a zero-fill guarantee.
+fn native_discard(address: *u8, length: usize) bool { return #syscall(75, address, length, 4) == 0 }
+fn native_page_size() usize {
+  size := vm_getpagesize()
+  if size <= 0 { return 0 }
+  return #cast(usize) size
+}
+fn native_small_pages(memory: []u8) { _ = memory }

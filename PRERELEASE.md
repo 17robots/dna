@@ -42,11 +42,33 @@ alone does not make DNA portable. The current blockers are in this repository:
   GNU linker scripts, and Linux runtime paths. macOS needs Mach-O dependency
   packaging; Windows needs PE/DLL packaging and a portable build wrapper
   (`scripts/compile.py` currently imports Unix-only Python modules).
-- `src/syntax.dyn` and `installer/main.dyn` call Linux syscall 79 directly
-  for the working directory; these calls need a portable replacement.
+- `installer/main.dyn` still calls Linux syscall 79 directly for the working
+  directory. Editor working-directory operations now use `src/host` adapters.
 - The language installer uses POSIX shell commands, symlinks, executable mode
   bits, and `parser.so`. Config paths, managed executables, parser loading,
   install/update/uninstall, and bundled tools need platform-specific validation.
+
+The first porting layer is implemented in `src/host`: UTF-8 working-directory
+operations, process IDs, stderr output, and an optional Linux residency hint.
+`.github/workflows/native-ports.yml` builds and executes this production code
+in debug and release on Linux, macOS ARM64, and Windows x64, including paths
+with spaces and non-ASCII characters. This workflow validates host adapters;
+it does **not** build or qualify a complete editor release.
+
+Further investigation found two prerequisites beyond native-service adapters:
+
+- The pinned Dyn SDK exposes metadata, directory enumeration, atomic file
+  replacement, and recursive removal only on Linux (`std/fs/linux_extra.dyn`
+  and `std/fs/remove_tree.dyn`). Full editor type checking on macOS reports
+  these missing APIs. Equivalent filesystem operations must preserve DNA's
+  no-follow, no-overwrite, and recovery guarantees.
+- Document storage reserves multiple GiB of sparse address space. The current
+  Linux mappings cannot be replaced with Windows `arena_create`: the SDK
+  commits the entire allocation on Windows. Explicit commitment and reclamation
+  are needed at document and scratch-buffer write boundaries.
+
+The first published macOS and Windows builds must include **both GUI and TUI**.
+Host-adapter tests or a GUI-only build do not satisfy that release requirement.
 
 Port the native boundary first, then build on native CI runners and test GUI,
 TUI, editing, save/recovery, language management, and relocation of the extracted

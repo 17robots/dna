@@ -1,0 +1,45 @@
+#target(kernel: windows)
+use "std/process" process
+#link("kernel32")
+
+extern fn host_getcwd "GetCurrentDirectoryW"(capacity: u32, output: *u16) u32
+extern fn host_chdir "SetCurrentDirectoryW"(path: *const u16) i32
+extern fn host_getpid "GetCurrentProcessId"() u32
+extern fn host_utf16 "MultiByteToWideChar"(page: u32, flags: u32, source: *const u8, length: i32, output: *u16, capacity: i32) i32
+extern fn host_utf8 "WideCharToMultiByte"(page: u32, flags: u32, source: *const u16, length: i32, output: *u8, capacity: i32, replacement: rawptr, replaced: rawptr) i32
+fn native_current_directory(destination: []u8) usize {
+  wide: [32768]u16 = []
+  length := host_getcwd(32768, &wide[0])
+  if length == 0 || length >= 32768 || #len(destination) > 2147483647 { return 0 }
+  used := host_utf8(65001, 128, &wide[0], #cast(i32) length, &destination[0], #cast(i32) #len(destination) - 1, nil, nil)
+  if used <= 0 { destination[0] = 0 return 0 }
+  destination[#cast(usize) used] = 0
+  return #cast(usize) used
+}
+fn native_change_directory(path: []const u8) bool {
+  if #len(path) > 2147483647 { return false }
+  wide: [32768]u16 = []
+  used := host_utf16(65001, 8, &path[0], #cast(i32) #len(path), &wide[0], 32767)
+  if used <= 0 { return false }
+  wide[#cast(usize) used] = 0
+  return host_chdir(&wide[0]) != 0
+}
+fn native_process_id() u32 { return host_getpid() }
+fn native_small_pages(memory: []u8) { _ = memory }
+
+fn native_environment(name: []const u8, destination: []u8) EnvironmentResult {
+  result := process.environment(name, destination)
+  return EnvironmentResult{value: result.value, found: result.found, error: result.error, kind: result.kind, ok: result.ok}
+}
+fn native_arguments(arena: *mem.Arena) ArgumentsResult {
+  result := process.arguments(arena)
+  return ArgumentsResult{values: result.values, error: result.error, kind: result.kind, ok: result.ok}
+}
+
+// Keep one foreign declaration per Win32 conversion symbol across adapters.
+pub fn utf16(page: u32, flags: u32, source: *const u8, length: i32, output: *u16, capacity: i32) i32 {
+  return host_utf16(page, flags, source, length, output, capacity)
+}
+pub fn utf8(page: u32, flags: u32, source: *const u16, length: i32, output: *u8, capacity: i32, replacement: rawptr, replaced: rawptr) i32 {
+  return host_utf8(page, flags, source, length, output, capacity, replacement, replaced)
+}
