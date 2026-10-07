@@ -31,7 +31,7 @@ for seed in range(first, first + runs):
         (work / "project" / "sub" / "data.json").write_text('{"a": [1, 2, {"b": "c"}]}\n')
         # The sandbox makes a real shell safe: only the scratch directory is writable.
         # DNA_FUZZ_VIM=1 fuzzes the Vim keymap profile.
-        vim = '[editor]\nvim_keys = true\n' if os.environ.get("DNA_FUZZ_VIM") else ''
+        vim = '[modules]\nkeymap = "vim"\n' if os.environ.get("DNA_FUZZ_VIM") else ''
         # DNA_FUZZ_PLACE=1 docks the explorer and terminal and floats the rest.
         if os.environ.get("DNA_FUZZ_PLACE"):
             vim += ('[place.explorer]\nside = "left"\nsize = 0.3\n[place.terminal]\nside = "bottom"\nsize = 0.4\n'

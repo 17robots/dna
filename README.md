@@ -147,14 +147,12 @@ DNA is built from module slots: **keymap** (`helix`, `vim`), **frontend** (`gui`
 
 ```toml
 [modules]
-keymap = "vim"        # also [editor] vim_keys = true
+keymap = "vim"
 frontend = "auto"
 explorer = "buffer"
 picker = "full"
 ```
 
-`keymap` and `[editor] vim_keys` are the same choice; a file that sets both to
-different values is reported as invalid at the second one.
 `:modules` lists the active module in each slot and what this build includes;
 `:module keymap vim` (or `:keymap vim`) switches for the session. A module the
 build leaves out falls back to the slot's default with a message, and `lock`
@@ -607,7 +605,7 @@ character, so `x` never highlights the first character of the following line. Wo
 | View: center / top / bottom / scroll a line | `z` then `z`/`c`, `t`, `b`, `k`/`j`; `Z` keeps the menu open |
 | Next / previous diagnostic, first/last diagnostic, paragraph, add blank line | `]` / `[` then `d`, `D`, `p`, Space |
 | Toggle line comments | `:comment` (Helix's `Ctrl C` / `Space c` keep DNA's copy / close buffer) |
-| Keymap profile | `:keymap helix` or `:keymap vim`; `[editor] vim_keys` sets the default |
+| Keymap profile | `:keymap helix` or `:keymap vim`; `[modules] keymap` sets the default |
 | Character find / till (reverse with Shift) | `f` / `t`, then a character; Escape cancels |
 | Replace selected characters / replace with clipboard | `r`, then a character / `R` |
 | Indent / unindent; join lines | `>` / `<`; `J` |
@@ -648,7 +646,7 @@ The command palette supports descriptive names and short commands: `open`/`e`,
 and `:write path` accept a literal path (including spaces) and expand `~/`.
 
 Every command is in the palette under its name and its short forms, and every
-option is too: typing part of an option's name (`scroll`, `vim_keys`) lists
+option is too: typing part of an option's name (`scroll`, `keymap`) lists
 **Set option** rows with the current value. After a command name, the palette
 suggests its arguments as you type: files and folders for `:open`, `:write`,
 `:cd` and sessions; themes, layouts, fonts, languages and installed plugins;
@@ -727,7 +725,7 @@ arrows select a command. Document search accepts case-sensitive regular expressi
 
 ## Vim keys
 
-`[editor] vim_keys = true` (or `:keymap vim` for the session) switches normal
+`[modules] keymap = "vim"` (or `:keymap vim` for the session) switches normal
 mode to Vim's grammar: operator, then motion or text object, with counts on
 either (`d3w`, `3dd`, `2d2w`). Insert mode keeps DNA's insert keys plus Vim's
 Ctrl-w and Ctrl-u; Escape steps the cursor back one character. Space still
