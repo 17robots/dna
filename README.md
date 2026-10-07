@@ -200,8 +200,12 @@ focus returns to the editor; Space e or a click moves focus back to it.
 | `h` / Left | fold, or go to the parent folder |
 | `-` / Backspace | make the root's parent the root |
 | `.` | make the selected folder the root |
-| `r` | reload from disk |
-| `e` | edit the selected folder in the editable explorer (create, rename, trash) |
+| `a` | new file beside the selection (inside it for a folder); end with `/` for a folder, and use `dir/sub/name` to create the folders on the way |
+| `r` | rename (the prompt starts with the current name) |
+| `c` / `m` | copy / move to a path relative to the entry's folder (`../x` works) |
+| `d` | move to `.dna-trash` beside it, after confirmation |
+| `R` | reload from disk |
+| `e` | edit the selected folder as text in the editable explorer |
 | Esc | back to the editor (a floating tree closes) |
 | `q` | close the tree |
 
@@ -670,6 +674,11 @@ and unsaved edits, including the same file in another split. With one view, it
 closes the current buffer (prompting if dirty). The final buffer becomes an empty
 scratch buffer; `:q` on that final empty scratch view exits the editor.
 `:bd` closes the shared buffer across views.
+
+Closing the last buffer follows `[files] close_last_buffer`: `"auto"` (the
+default) quits in the terminal frontend, where an empty editor has nothing to
+show, and keeps an empty buffer in a window; `"quit"` and `"keep"` pick one
+behaviour everywhere. Unsaved text and running terminal panes still ask first.
 `:quit-all` checks every dirty buffer and staged explorer edit before exiting.
 `:x` saves and closes the active buffer, including its other views. `:wa` saves
 modified file buffers and restores focus; `:xa` saves them before exiting.

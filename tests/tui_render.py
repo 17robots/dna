@@ -552,6 +552,119 @@ done
     finally:
         session.close()
 
+def check_close_last(root, environment):
+    """close_last_buffer: auto quits the terminal frontend when the last
+    buffer closes, keep stays open, and unsaved text still asks first."""
+    target = root / 'last.txt'
+    def exits(session):
+        deadline = time.time() + 5
+        while time.time() < deadline and session.open:
+            session.pump(0.1)
+        return not session.open
+    target.write_text('only buffer\n')
+    session = Session(['--tui', str(target)], environment)
+    try:
+        session.wait_for('only buffer')
+        session.send(b':', 0.4)
+        session.send(b'bd\r', 0.4)
+        if not exits(session):
+            fail('closing the last buffer must quit the terminal frontend', session.text())
+    finally:
+        session.close()
+    config = root / 'config' / 'dna' / 'config.toml'
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text('[files]\nclose_last_buffer = "keep"\n')
+    session = Session(['--tui', str(target)], environment)
+    try:
+        session.wait_for('only buffer')
+        session.send(b':', 0.4)
+        session.send(b'bd\r', 0.8)
+        if not session.open or any('only buffer' in row for row in session.text()):
+            fail('keep must leave an empty buffer open', session.text())
+    finally:
+        session.close()
+        config.unlink()
+    # Unsaved: the save/discard dialog comes first; discarding then quits.
+    session = Session(['--tui', str(target)], environment)
+    try:
+        session.wait_for('only buffer')
+        session.send(b'i')
+        session.send(b'changed ', 0.3)
+        session.send(b'\x1b[27u', 0.3)
+        session.send(b':', 0.4)
+        session.send(b'bd\r', 0.6)
+        session.wait_for('Discard')
+        if not session.open:
+            fail('unsaved last buffer must ask before quitting', session.text())
+        session.send(b'd', 0.4)
+        if not exits(session):
+            fail('discarding the last buffer must quit', session.text())
+        if target.read_text() != 'only buffer\n':
+            fail('discard must not save', session.text())
+    finally:
+        session.close()
+
+
+def check_tree_actions(root, environment):
+    """NERDTree-style actions in the docked tree: a, r, c, m and d."""
+    project = root / 'treeops'
+    project.mkdir()
+    (project / 'alpha.txt').write_text('alpha\n')
+    config = root / 'config' / 'dna' / 'config.toml'
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text('[modules]\nexplorer = "tree"\n')
+    previous = Path.cwd()
+    os.chdir(project)
+    session = Session(['--tui', str(project / 'alpha.txt')], environment)
+    def wait_path(path, present=True):
+        deadline = time.time() + 5
+        while time.time() < deadline and path.exists() != present:
+            session.pump(0.1)
+        if path.exists() != present:
+            fail(f'{path.relative_to(project)} should {"" if present else "not "}exist', session.text())
+    def prompt(key, text, erase=0):
+        session.send(key, 0.4)
+        session.send(b'\x7f' * erase, 0.2)
+        session.send(text.encode() + b'\r', 0.6)
+    try:
+        session.wait_for('alpha')
+        session.send(b' ')
+        session.send(b'e', 0.6)
+        session.wait_for('alpha.txt')
+        prompt(b'a', 'pkg/deep/new.txt')
+        wait_path(project / 'pkg' / 'deep' / 'new.txt')
+        # a creates beside the selection: new.txt is selected, so in deep/.
+        prompt(b'a', 'empty/')
+        wait_path(project / 'pkg' / 'deep' / 'empty')
+        if not (project / 'pkg' / 'deep' / 'empty').is_dir():
+            fail('a with a trailing / must make a folder', session.text())
+        session.send(b'gg', 0.3)
+        rows = session.wait_for('alpha.txt')
+        # Select alpha.txt, then copy, rename and move it.
+        for _ in range(8):
+            if any('alpha.txt' in row and '>' in row for row in session.text()):
+                break
+            session.send(b'j', 0.15)
+        prompt(b'c', 'copy.txt', erase=len('alpha.txt'))
+        wait_path(project / 'copy.txt')
+        if (project / 'copy.txt').read_text() != 'alpha\n':
+            fail('copy must keep the contents', session.text())
+        prompt(b'r', 'beta.txt', erase=len('copy.txt'))
+        wait_path(project / 'beta.txt')
+        wait_path(project / 'copy.txt', present=False)
+        prompt(b'm', 'pkg/beta.txt', erase=len('beta.txt'))
+        wait_path(project / 'pkg' / 'beta.txt')
+        session.send(b'd', 0.4)
+        session.wait_for('dna-trash')
+        session.send(b'\r', 0.6)
+        wait_path(project / 'pkg' / 'beta.txt', present=False)
+        wait_path(project / 'pkg' / '.dna-trash' / 'beta.txt')
+    finally:
+        session.close()
+        os.chdir(previous)
+        config.unlink()
+
+
 with tempfile.TemporaryDirectory(prefix='dna-tui-') as directory:
     root = Path(directory)
     # The project directory is the working directory; keep it to the fixture.
@@ -866,4 +979,6 @@ with tempfile.TemporaryDirectory(prefix='dna-tui-') as directory:
         session.close()
     check_split_syntax(root, environment)
     check_file_config(root, environment)
-print('PASS TUI frontend: per-file config, document, status, insert, palette frame, splits, terminal pane, :frontend handoff, suspend, tree explorer, dock drag, dropdown picker, italics, undercurl, pastes, resize')
+    check_close_last(root, environment)
+    check_tree_actions(root, environment)
+print('PASS TUI frontend: per-file config, close last buffer, tree actions, document, status, insert, palette frame, splits, terminal pane, :frontend handoff, suspend, tree explorer, dock drag, dropdown picker, italics, undercurl, pastes, resize')
