@@ -631,6 +631,10 @@ def check_tree_actions(root, environment):
         session.send(b' ')
         session.send(b'e', 0.6)
         session.wait_for('alpha.txt')
+        # Cancelling a prompt returns focus to the tree: the next a still
+        # acts there instead of typing into the file.
+        session.send(b'a', 0.4)
+        session.send(b'\x1b[27u', 0.4)
         prompt(b'a', 'pkg/deep/new.txt')
         wait_path(project / 'pkg' / 'deep' / 'new.txt')
         # a creates beside the selection: new.txt is selected, so in deep/.
@@ -659,6 +663,12 @@ def check_tree_actions(root, environment):
         session.send(b'\r', 0.6)
         wait_path(project / 'pkg' / 'beta.txt', present=False)
         wait_path(project / 'pkg' / '.dna-trash' / 'beta.txt')
+        # Escape closes the tree, like q.
+        session.send(b'\x1b[27u', 0.6)
+        if any('treeops' in row and '│' in row for row in session.text()[:3]):
+            fail('Escape must close the tree', session.text())
+        if (project / 'alpha.txt').exists() and 'aalpha' in (project / 'alpha.txt').read_text():
+            fail('tree keys typed into the file', session.text())
     finally:
         session.close()
         os.chdir(previous)

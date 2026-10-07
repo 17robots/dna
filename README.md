@@ -207,7 +207,7 @@ focus returns to the editor; Space e or a click moves focus back to it.
 | `R` | reload from disk |
 | `e` | edit the selected folder as text in the editable explorer |
 | Esc | back to the editor (a floating tree closes) |
-| `q` | close the tree |
+| `q` / Escape | close the tree (Space e opens it again) |
 
 The tree opens on the current file, keeps open folders across reloads and
 hides `.git`. While it is open it watches its root and every open folder, so
@@ -768,7 +768,10 @@ starts as one column on the current folder, with a preview of the selected
 entry beside it. `l` (or Enter, or Right) on a folder walks into it and keeps
 the folder you came from as a column on the left, so the explorer grows as you
 go deeper; on a file it opens it. `h` (or Backspace, or Left) walks back out.
-When columns no longer fit, the oldest drop off the left.
+When columns no longer fit, the oldest drop off the left. `q` or Escape (in
+normal mode) closes it; staged edits stay until applied or discarded. Every
+explorer closes the same way, and a cancelled file prompt returns to the
+explorer that opened it.
 
 The column you are in is an editable buffer and shares the document editing
 keys: `j/k`, `w/b/e`, motion counts, `i`, `a`, `o`, `v`, `x`, `d`, `c`,

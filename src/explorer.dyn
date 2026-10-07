@@ -493,6 +493,15 @@ fn explorer_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
     app.explorer.commands = true
     return
   }
+  // q closes, like Escape in normal mode; staged edits stay until applied
+  // or discarded.
+  if !app.explorer.insert && !app.explorer.extend && !control && !shift && key == KeyQ {
+    app.input_state.pending = 0
+    app.input_state.repeat_count = 0
+    buffer.checkpoint(doc)
+    app.prompt_state.panel = Panel.None
+    return
+  }
   if !app.explorer.insert && !control && key == KeyM {
     match_open(app, true)
     return
@@ -673,60 +682,74 @@ fn draw_explorer(renderer: rawptr, app: *App, typography: *Typography, width: i3
   scale := typography.scale
   padding := 14.0 * scale
   rect := place_rect(app, SurfaceExplorer, width, height, 0.0, typography.scale, sdl.Rect{x: #cast(f32) width * 0.04, y: #cast(f32) height * 0.1, width: #cast(f32) width * 0.92, height: #cast(f32) height * 0.8})
-  desired_height := typography.line * #cast(f32) (doc.line_count + 3) + padding * 2.0
-  minimum_height := typography.line * 9.0 + padding * 2.0
-  if desired_height < minimum_height {
-    desired_height = minimum_height
-  }
-  // A floating explorer fits its listing; a docked one fills its strip.
-  if desired_height < rect.height && place_of(app, SurfaceExplorer).mode != settings.PlaceDock {
-    rect.height = desired_height
-  }
+  docked := place_of(app, SurfaceExplorer).mode == settings.PlaceDock
   // Overlays redraw the explorer each frame too; only a real reopening slides.
   if ui.explorer_seen + 1 < ui.frame {
     motion.snap(&ui.explorer_open, -12.0 * scale)
   }
   ui.explorer_seen = ui.frame
   slide := animated_value(app, &ui.explorer_open, 0.0, app.config.popup_animation_ms * 2.0, false)
-  // mini.files: the folders walked through stay as columns on the left; the
-  // edited folder and the preview of its selection follow. Older columns
-  // drop off the left when space runs out.
+  // mini.files: the folders walked through stay as columns on the left of
+  // the edited one, with a preview on the right. Every column has the same
+  // width; the edited one has an accent border. The popup keeps its left
+  // edge and height while open, growing rightwards; when full, the oldest
+  // columns slide off the left.
   gap := 8.0 * scale
-  side_width := rect.width * 0.22
-  if side_width < typography.cell * 18.0 {
-    side_width = typography.cell * 18.0
+  column_width := rect.width * 0.22
+  if column_width < typography.cell * 22.0 {
+    column_width = typography.cell * 22.0
   }
+  slot := column_width + gap
   context := &app.explorer.context
-  preview := app.config.explorer_preview && rect.width > typography.cell * 60.0
+  preview := app.config.explorer_preview
   if preview {
     explorer_context_preview(app)
   }
-  room := rect.width - typography.cell * 40.0
+  fixed := 1.0
   if preview {
-    room -= side_width + gap
+    fixed = 2.0
   }
   shown := context.trail_count
-  for shown > 0 && #cast(f32) shown * (side_width + gap) > room {
+  for shown > 0 && #cast(f32) (shown) * slot + fixed * slot - gap > rect.width {
     shown -= 1
   }
-  // The edited column is a little wider than the others; the whole explorer
-  // is only as wide as its columns, so it grows as you walk in.
-  main_width := side_width * 1.6
-  total := #cast(f32) shown * (side_width + gap) + main_width
-  if preview {
-    total += gap + side_width
-  }
-  if total > rect.width {
-    main_width -= total - rect.width
-    total = rect.width
-  }
-  if place_of(app, SurfaceExplorer).mode != settings.PlaceDock {
-    rect.x += (rect.width - total) / 2.0
+  total := (#cast(f32) shown + fixed) * slot - gap
+  if !docked {
+    if !context.placed {
+      // First frame: centre the single column and preview, then stay.
+      context.origin_x = rect.x + (rect.width - total) / 2.0
+      fitted := typography.line * 22.0 + padding * 2.0
+      if fitted > rect.height {
+        fitted = rect.height
+      }
+      context.fixed_height = fitted
+      context.placed = true
+      context.drawn_trail = context.trail_count
+    }
+    // Growing past the right edge moves the left edge only as far as needed.
+    if context.origin_x + total > rect.x + rect.width {
+      context.origin_x = rect.x + rect.width - total
+    }
+    if context.origin_x < rect.x {
+      context.origin_x = rect.x
+    }
+    rect.x = context.origin_x
     rect.width = total
+    rect.height = context.fixed_height
   }
+  // A full popup that walked in or out shifts its contents by a column:
+  // start them where they were and ease into place.
+  if context.drawn_trail != context.trail_count {
+    if shown < context.trail_count || shown < context.drawn_trail {
+      steps := #cast(f32) context.trail_count - #cast(f32) context.drawn_trail
+      motion.snap(&context.slide, steps * slot)
+    }
+    context.drawn_trail = context.trail_count
+  }
+  shift := animated_value(app, &context.slide, 0.0, app.config.popup_animation_ms * 2.0, false)
   root := ui_make(ui, ui_hash(0, "explorer"), UiFloating)
   ui.boxes[root].axis = UiAxisX
-  ui.boxes[root].floating[0] = rect.x
+  ui.boxes[root].floating[0] = rect.x + shift
   ui.boxes[root].floating[1] = rect.y + slide
   ui_size(ui, root, UiAxisX, UiSizeKind.Pixels, rect.width / scale, 1.0)
   ui_size(ui, root, UiAxisY, UiSizeKind.Pixels, rect.height / scale, 1.0)
@@ -734,30 +757,29 @@ fn draw_explorer(renderer: rawptr, app: *App, typography: *Typography, width: i3
   for index in context.trail_count - shown..context.trail_count {
     column := &context.trail[index]
     names: [6][]const u8 = ["trail 0", "trail 1", "trail 2", "trail 3", "trail 4", "trail 5"]
-    explorer_column(ui, app, typography, names[index], "", column.entries[..column.count], column.selected, side_width, index + 1)
+    explorer_column(ui, app, typography, names[index], "", column.entries[..column.count], column.selected, column_width, index + 1)
     space := ui_make(ui, ui_hash(ui_key(ui, "gap"), names[index]), 0)
     ui_size(ui, space, UiAxisX, UiSizeKind.Pixels, gap / scale, 1.0)
   }
-  main := ui_make(ui, ui_key(ui, "main"), UiBackground | UiBorder | UiClip)
+  main := ui_make(ui, ui_key(ui, "main"), UiBackground | UiBorder | UiClip | UiFocus)
   ui.boxes[main].fill = theme().surface
-  ui_size(ui, main, UiAxisX, UiSizeKind.Pixels, main_width / scale, 0.0)
+  ui_size(ui, main, UiAxisX, UiSizeKind.Pixels, column_width / scale, 1.0)
   ui_size(ui, main, UiAxisY, UiSizeKind.Percent, 1.0, 1.0)
   preview_body: usize = 0
   if preview {
     space_right := ui_make(ui, ui_key(ui, "right gap"), 0)
     ui_size(ui, space_right, UiAxisX, UiSizeKind.Pixels, gap / scale, 1.0)
     if context.preview_directory {
-      explorer_column(ui, app, typography, "contents", "", context.children[..context.child_count], 64, side_width, ExplorerTrail + 1)
+      explorer_column(ui, app, typography, "contents", "", context.children[..context.child_count], 64, column_width, ExplorerTrail + 1)
     }
     else {
       pane := ui_make(ui, ui_key(ui, "preview"), UiBackground | UiBorder | UiClip)
       ui.boxes[pane].fill = theme().surface
       ui.boxes[pane].padding[0] = padding
       ui.boxes[pane].padding[1] = padding
-      ui_size(ui, pane, UiAxisX, UiSizeKind.Pixels, side_width / scale, 1.0)
+      ui_size(ui, pane, UiAxisX, UiSizeKind.Pixels, column_width / scale, 1.0)
       ui_size(ui, pane, UiAxisY, UiSizeKind.Percent, 1.0, 1.0)
       ui_push(ui, pane)
-      _ = ui_label(ui, "title", "Preview", UiMuted)
       preview_body = ui_make(ui, ui_key(ui, "body"), UiClip)
       ui_size(ui, preview_body, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
       ui_size(ui, preview_body, UiAxisY, UiSizeKind.Percent, 1.0, 0.0)
@@ -814,10 +836,8 @@ fn draw_explorer(renderer: rawptr, app: *App, typography: *Typography, width: i3
     add_text(header[..], &used, " [+]")
   }
   chrome_text(typography, header[..used], rect.x + padding, rect.y + padding, true)
-  hint: []const u8 = "l / h in and out | i edit names | :w apply"
-  chrome_text(typography, hint, rect.x + padding, rect.y + padding + typography.line, false)
-  top := rect.y + padding + typography.line * 2.0
-  body_height := rect.height - padding * 2.0 - typography.line * 2.0
+  top := rect.y + padding + typography.line * 1.5
+  body_height := rect.height - padding * 2.0 - typography.line * 1.5
   if body_height < typography.line {
     body_height = typography.line
   }
