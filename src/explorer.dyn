@@ -47,8 +47,11 @@ fn explorer_buffer_open(app: *App) {
     app.prompt_state.panel = Panel.Directory
     return
   }
+  // A fresh opening starts as one column again.
+  explorer_context_restart(app)
   if app.explorer.document != nil && buffer.equal(app.directory_state.path[..app.directory_state.length], app.explorer.path[..app.explorer.path_length]) && !app.explorer.stale {
     app.prompt_state.panel = Panel.Directory
+    explorer_context_reset(app)
     return
   }
   app.prompt_state.panel = Panel.Directory
@@ -536,8 +539,13 @@ fn explorer_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
     submit(app, typography)
     return
   }
-  if !app.explorer.insert && key == KeyBackspace {
+  if !app.explorer.insert && !app.explorer.extend && !control && (key == KeyBackspace || key == KeyH || key == KeyLeft) {
     explorer_parent(app)
+    return
+  }
+  // l walks into the selected folder; on a file it opens it, like Enter.
+  if !app.explorer.insert && !app.explorer.extend && !control && (key == KeyL || key == KeyRight) {
+    submit(app, typography)
     return
   }
   // Borrow the same editing engine without changing the active file/view.
@@ -590,8 +598,10 @@ fn explorer_column(ui: *UiState, app: *App, typography: *Typography, name: []con
   ui_size(ui, column, UiAxisX, UiSizeKind.Pixels, width / scale, 1.0)
   ui_size(ui, column, UiAxisY, UiSizeKind.Percent, 1.0, 1.0)
   ui_push(ui, column)
-  heading := ui_label(ui, "title", title, UiMuted)
-  ui_size(ui, heading, UiAxisX, UiSizeKind.Percent, 1.0, 0.0)
+  if #len(title) > 0 {
+    heading := ui_label(ui, "title", title, UiMuted)
+    ui_size(ui, heading, UiAxisX, UiSizeKind.Percent, 1.0, 0.0)
+  }
   previous := ui.boxes[column].rect.height
   rows: usize = 8
   if previous > typography.line * 3.0 {
@@ -678,12 +688,41 @@ fn draw_explorer(renderer: rawptr, app: *App, typography: *Typography, width: i3
   }
   ui.explorer_seen = ui.frame
   slide := animated_value(app, &ui.explorer_open, 0.0, app.config.popup_animation_ms * 2.0, false)
-  columns := app.config.explorer_columns && rect.width > typography.cell * 78.0
-  side_width := rect.width * 0.25
+  // mini.files: the folders walked through stay as columns on the left; the
+  // edited folder and the preview of its selection follow. Older columns
+  // drop off the left when space runs out.
   gap := 8.0 * scale
+  side_width := rect.width * 0.22
+  if side_width < typography.cell * 18.0 {
+    side_width = typography.cell * 18.0
+  }
   context := &app.explorer.context
-  if columns && app.config.explorer_preview {
+  preview := app.config.explorer_preview && rect.width > typography.cell * 60.0
+  if preview {
     explorer_context_preview(app)
+  }
+  room := rect.width - typography.cell * 40.0
+  if preview {
+    room -= side_width + gap
+  }
+  shown := context.trail_count
+  for shown > 0 && #cast(f32) shown * (side_width + gap) > room {
+    shown -= 1
+  }
+  // The edited column is a little wider than the others; the whole explorer
+  // is only as wide as its columns, so it grows as you walk in.
+  main_width := side_width * 1.6
+  total := #cast(f32) shown * (side_width + gap) + main_width
+  if preview {
+    total += gap + side_width
+  }
+  if total > rect.width {
+    main_width -= total - rect.width
+    total = rect.width
+  }
+  if place_of(app, SurfaceExplorer).mode != settings.PlaceDock {
+    rect.x += (rect.width - total) / 2.0
+    rect.width = total
   }
   root := ui_make(ui, ui_hash(0, "explorer"), UiFloating)
   ui.boxes[root].axis = UiAxisX
@@ -692,21 +731,23 @@ fn draw_explorer(renderer: rawptr, app: *App, typography: *Typography, width: i3
   ui_size(ui, root, UiAxisX, UiSizeKind.Pixels, rect.width / scale, 1.0)
   ui_size(ui, root, UiAxisY, UiSizeKind.Pixels, rect.height / scale, 1.0)
   ui_push(ui, root)
-  if columns {
-    explorer_column(ui, app, typography, "parent", "Parent", context.parent[..context.parent_count], context.parent_selected, side_width, 1)
-    space := ui_make(ui, ui_key(ui, "left gap"), 0)
+  for index in context.trail_count - shown..context.trail_count {
+    column := &context.trail[index]
+    names: [6][]const u8 = ["trail 0", "trail 1", "trail 2", "trail 3", "trail 4", "trail 5"]
+    explorer_column(ui, app, typography, names[index], "", column.entries[..column.count], column.selected, side_width, index + 1)
+    space := ui_make(ui, ui_hash(ui_key(ui, "gap"), names[index]), 0)
     ui_size(ui, space, UiAxisX, UiSizeKind.Pixels, gap / scale, 1.0)
   }
   main := ui_make(ui, ui_key(ui, "main"), UiBackground | UiBorder | UiClip)
   ui.boxes[main].fill = theme().surface
-  ui_size(ui, main, UiAxisX, UiSizeKind.Percent, 1.0, 0.0)
+  ui_size(ui, main, UiAxisX, UiSizeKind.Pixels, main_width / scale, 0.0)
   ui_size(ui, main, UiAxisY, UiSizeKind.Percent, 1.0, 1.0)
   preview_body: usize = 0
-  if columns && app.config.explorer_preview {
+  if preview {
     space_right := ui_make(ui, ui_key(ui, "right gap"), 0)
     ui_size(ui, space_right, UiAxisX, UiSizeKind.Pixels, gap / scale, 1.0)
     if context.preview_directory {
-      explorer_column(ui, app, typography, "contents", "Contents", context.children[..context.child_count], 64, side_width, 2)
+      explorer_column(ui, app, typography, "contents", "", context.children[..context.child_count], 64, side_width, ExplorerTrail + 1)
     }
     else {
       pane := ui_make(ui, ui_key(ui, "preview"), UiBackground | UiBorder | UiClip)
@@ -727,7 +768,10 @@ fn draw_explorer(renderer: rawptr, app: *App, typography: *Typography, width: i3
   ui_layout(ui)
   ui_render(renderer, ui, typography, width, height)
   if app.config.explorer_icons {
-    explorer_column_icons(renderer, ui, typography, "parent", context.parent[..context.parent_count])
+    trail_names: [6][]const u8 = ["trail 0", "trail 1", "trail 2", "trail 3", "trail 4", "trail 5"]
+    for index in context.trail_count - shown..context.trail_count {
+      explorer_column_icons(renderer, ui, typography, trail_names[index], context.trail[index].entries[..context.trail[index].count])
+    }
     explorer_column_icons(renderer, ui, typography, "contents", context.children[..context.child_count])
   }
   if preview_body != 0 {
@@ -755,12 +799,22 @@ fn draw_explorer(renderer: rawptr, app: *App, typography: *Typography, width: i3
   } else {
     add_text(header[..], &used, "NORMAL  ")
   }
-  add_text(header[..], &used, app.explorer.path[..app.explorer.path_length])
+  // From the folder the explorer opened on; the trail shows the rest.
+  shown_path := app.explorer.path[..app.explorer.path_length]
+  anchor := app.explorer.context.anchor[..app.explorer.context.anchor_length]
+  anchor_leaf := explorer_parent_length(anchor)
+  if #len(anchor) > 1 && anchor_leaf < #len(shown_path) && buffer.equal(shown_path[..#len(anchor)], anchor) {
+    shown_path = shown_path[anchor_leaf..]
+    if #len(shown_path) > 0 && shown_path[0] == 47 {
+      shown_path = shown_path[1..]
+    }
+  }
+  add_text(header[..], &used, shown_path)
   if buffer.dirty_cached(doc) {
     add_text(header[..], &used, " [+]")
   }
   chrome_text(typography, header[..used], rect.x + padding, rect.y + padding, true)
-  hint: []const u8 = "i edit | :write | Enter / Backspace"
+  hint: []const u8 = "l / h in and out | i edit names | :w apply"
   chrome_text(typography, hint, rect.x + padding, rect.y + padding + typography.line, false)
   top := rect.y + padding + typography.line * 2.0
   body_height := rect.height - padding * 2.0 - typography.line * 2.0
@@ -916,18 +970,26 @@ fn explorer_mouse(app: *App, typography: *Typography, x: f32, y: f32, pressed: b
     explorer_key(app, typography, KeyEscape, 0)
   }
 }
-// Open an entry from a side column: 1 = parent directory listing,
-// 2 = contents of the selected directory. Directories are browsed; files open.
+// Open an entry from a column: 1..ExplorerTrail are the trail columns, left
+// to right; ExplorerTrail + 1 is the contents preview of the selected
+// folder. Folders are browsed; files open.
 fn explorer_open_entry(app: *App, kind: usize, index: usize) {
   context := &app.explorer.context
   base: [4096]u8 = []
   base_length := copy_text(base[..], app.explorer.path[..app.explorer.path_length])
   entry: *Entry = nil
-  if kind == 1 && index < context.parent_count {
-    base_length = explorer_parent_length(base[..base_length])
-    entry = &context.parent[index]
+  if kind >= 1 && kind <= context.trail_count {
+    column := &context.trail[kind - 1]
+    if index >= column.count {
+      return
+    }
+    // Trail column k lists the folder (trail_count - k + 1) levels up.
+    for level in 0..context.trail_count - kind + 1 {
+      base_length = explorer_parent_length(base[..base_length])
+    }
+    entry = &column.entries[index]
   }
-  else if kind == 2 && index < context.child_count && app.directory_state.selected < app.directory_state.count {
+  else if kind == ExplorerTrail + 1 && index < context.child_count && app.directory_state.selected < app.directory_state.count {
     selected := &app.directory_state.entries[app.directory_state.selected]
     if base_length > 0 && base[base_length - 1] != '/' {
       add_text(base[..], &base_length, "/")

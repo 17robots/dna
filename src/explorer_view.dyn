@@ -1,13 +1,25 @@
+// Columns to the left of the editable one: the folders walked through since
+// the explorer opened, mini.files style. They are decorative and never
+// become editable text.
+const ExplorerTrail: usize = 6
+struct ExplorerColumn {
+  entries: [64]Entry,
+  count: usize,
+  selected: usize,
+}
 // Decorative explorer context never becomes editable document text.
 struct ExplorerContext {
   children: [64]Entry,
-  parent: [64]Entry,
+  trail: [6]ExplorerColumn,
+  trail_count: usize,
+  // The leftmost folder shown; the trail runs from it to the editable
+  // column's parent. Opening the explorer starts it at the edited folder.
+  anchor: [4096]u8,
+  anchor_length: usize,
   preview: [8192]u8,
   preview_path: [4096]u8,
   preview_path_length: usize,
   preview_revision: u64,
-  parent_count: usize,
-  parent_selected: usize,
   child_count: usize,
   preview_length: usize,
   preview_row: usize,
@@ -75,30 +87,67 @@ fn explorer_parent_length(path: []const u8) usize {
   }
   return length
 }
+// Rebuilds the trail: one column per folder from the anchor down to the
+// edited folder's parent, each highlighting the folder walked into. The
+// anchor resets when the edited folder is not under it.
 fn explorer_context_reset(app: *App) {
   context := &app.explorer.context
   context.preview_ready = false
-  context.parent_count = 0
-  context.parent_selected = 64
+  context.trail_count = 0
+  path := app.explorer.path[..app.explorer.path_length]
+  anchor := context.anchor[..context.anchor_length]
+  if #len(anchor) == 0 || #len(path) < #len(anchor) || !buffer.equal(path[..#len(anchor)], anchor) || (#len(path) > #len(anchor) && path[#len(anchor)] != 47 && !(#len(anchor) == 1 && anchor[0] == 47)) {
+    context.anchor_length = copy_text(context.anchor[..], path)
+    return
+  }
   if !app.config.explorer_columns {
     return
   }
-  path := app.explorer.path[..app.explorer.path_length]
-  if #len(path) <= 1 {
-    return
-  }
-  parent := explorer_parent_length(path)
-  context.parent_count = explorer_context_list(path[..parent], context.parent[..])
-  leaf := #len(path)
-  for leaf > 0 && path[leaf - 1] != 47 {
-    leaf -= 1
-  }
-  for index in 0..context.parent_count {
-    entry := &context.parent[index]
-    if buffer.equal(entry.name[..entry.length], path[leaf..]) {
-      context.parent_selected = index
+  // Folders between anchor and path, outermost first; keep the last few.
+  starts: [64]usize = []
+  levels: usize = 0
+  at := #len(anchor)
+  for at < #len(path) && levels < 64 {
+    if path[at] == 47 {
+      at += 1
+    }
+    starts[levels] = at
+    levels += 1
+    for at < #len(path) && path[at] != 47 {
+      at += 1
     }
   }
+  first: usize = 0
+  if levels > ExplorerTrail {
+    first = levels - ExplorerTrail
+  }
+  for level in first..levels {
+    // The column lists the folder above this component.
+    folder_end := starts[level]
+    if folder_end > 1 && path[folder_end - 1] == 47 {
+      folder_end -= 1
+    }
+    if folder_end == 0 {
+      folder_end = 1
+    }
+    leaf_end := starts[level]
+    for leaf_end < #len(path) && path[leaf_end] != 47 {
+      leaf_end += 1
+    }
+    column := &context.trail[context.trail_count]
+    column.count = explorer_context_list(path[..folder_end], column.entries[..])
+    column.selected = 64
+    for index in 0..column.count {
+      if buffer.equal(column.entries[index].name[..column.entries[index].length], path[starts[level]..leaf_end]) {
+        column.selected = index
+      }
+    }
+    context.trail_count += 1
+  }
+}
+// Opening the explorer afresh starts with a single column.
+fn explorer_context_restart(app: *App) {
+  app.explorer.context.anchor_length = 0
 }
 fn explorer_context_preview(app: *App) {
   context := &app.explorer.context

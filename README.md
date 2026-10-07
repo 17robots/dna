@@ -763,9 +763,16 @@ not `a\|b`). Ctrl-x closes the buffer only in the Helix keymap.
 
 ## Editable explorer
 
-`Space e` opens an editable directory popup. It shares the document editing keys:
-`h/j/k/l`, `w/b/e`, motion counts, `i`, `a`, `o`, `v`, `x`, `d`, `c`, `u`/`Shift U`, and clipboard commands.
-Enter in normal mode opens the current row; Backspace goes to its parent.
+`Space e` opens an editable directory popup that works like mini.files. It
+starts as one column on the current folder, with a preview of the selected
+entry beside it. `l` (or Enter, or Right) on a folder walks into it and keeps
+the folder you came from as a column on the left, so the explorer grows as you
+go deeper; on a file it opens it. `h` (or Backspace, or Left) walks back out.
+When columns no longer fit, the oldest drop off the left.
+
+The column you are in is an editable buffer and shares the document editing
+keys: `j/k`, `w/b/e`, motion counts, `i`, `a`, `o`, `v`, `x`, `d`, `c`,
+`u`/`Shift U`, and clipboard commands.
 Apply or discard pending edits before navigating to another directory.
 
 The editable area contains filenames only. The gutter uses the same numbering as
@@ -1274,8 +1281,9 @@ Font file/folder glyphs. Ghostty includes these symbols; other terminals may
 need a Nerd Font selected in their settings. Icons
 never enter selections, clipboard text, undo history, or staged filenames.
 `explorer_icons = false` hides them in both frontends. Folder rows retain their `/`
-suffix. Parent and preview columns are read-only context; the middle column is
-the editable buffer. Navigation still requires applying or discarding staged
+suffix. The columns you walked through and the preview are read-only context;
+only the current column is editable (`explorer_columns = false` hides the
+walked-through columns). Navigation still requires applying or discarding staged
 changes, and `:write` still opens a preview before touching files.
 
 ```toml
