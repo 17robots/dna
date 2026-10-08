@@ -17,6 +17,20 @@ lib.dna_recovery_submit.argtypes=[c.c_void_p,c.c_char_p,c.c_size_t]
 def resources():
     pages=int(Path('/proc/self/statm').read_text().split()[1])
     return len(list(Path('/proc/self/fd').iterdir())),len(list(Path('/proc/self/task').iterdir())),pages*os.sysconf('SC_PAGE_SIZE')
+def settled():
+    """Resources once background workers (such as the parser disposer that a
+    retire hands off to) have exited; a sample taken mid-exit counts a thread
+    that is already finishing."""
+    deadline=time.monotonic()+2
+    best=resources()
+    while time.monotonic()<deadline:
+        time.sleep(.02)
+        sample=resources()
+        if sample[:2]<=best[:2]:
+            if sample[:2]==best[:2] and sample[1]==1:
+                return sample
+            best=sample
+    return best
 def parsed(syntax, text, revision):
     colors=c.create_string_buffer(max(1,len(text)))
     deadline=time.monotonic()+3
@@ -64,7 +78,7 @@ with tempfile.TemporaryDirectory() as d:
         assert time.monotonic()-started<1, 'syntax cancellation/teardown stalled'
         lib.dna_plugin_close(plugin);lib.dna_search_close(search);lib.dna_recovery_close(recovery)
         assert not list((Path(d)/'recovery').glob('session-*'))
-        if cycle==9:baseline=resources()
-    final=resources();assert final[:2]==baseline[:2],(baseline,final)
+        if cycle==9:baseline=settled()
+    final=settled();assert final[:2]==baseline[:2],(baseline,final)
     assert final[2]-baseline[2]<8*1024*1024,(baseline,final)
     print(f'PASS {cycles} lifecycle cycles: descriptors/threads unchanged; RSS growth',final[2]-baseline[2],'bytes')
