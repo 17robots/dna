@@ -17,9 +17,19 @@ build-profile name="full" mode="release": deps
     python3 scripts/profile.py {{name}} {{mode}}
 run file="": (build "debug")
     env -u DNA_DEFAULT_SERVERS ./build/dna-debug {{quote(file)}}
+# dyn fmt skips nested module directories, so visit each one.
+fmt:
+    find src tests examples -name '*.dyn' -printf '%h\n' | sort -u | xargs -n1 "$DYN" fmt
+fmt-check:
+    find src tests examples -name '*.dyn' -printf '%h\n' | sort -u | xargs -n1 "$DYN" fmt --check
 test:
     python3 scripts/test.py
-smoke: deps test
+# Checks never read your own config, trust store or recovery files: a personal
+# setting such as frontend = "tui" must not change what they exercise.
+smoke:
+    rm -rf build/test-home && mkdir -p build/test-home/config build/test-home/state
+    XDG_CONFIG_HOME="$PWD/build/test-home/config" XDG_STATE_HOME="$PWD/build/test-home/state" just _smoke
+_smoke: deps test
     python3 scripts/test_host.py
     python3 scripts/test_host.py filesystem
     python3 tests/build_guard.py
@@ -148,6 +158,9 @@ bench-buffer:
 
 # Longer repeated workflows. SDL_VIDEODRIVER=wayland selects a real desktop.
 soak:
+    rm -rf build/test-home && mkdir -p build/test-home/config build/test-home/state
+    XDG_CONFIG_HOME="$PWD/build/test-home/config" XDG_STATE_HOME="$PWD/build/test-home/state" just _soak
+_soak:
     DNA_PERF_ROUNDS=20 python3 tests/workflow_performance.py
     DNA_PERF_ROUNDS=4 DNA_PERF_COMBINED=1 DNA_PERF_REAL_SYNTAX=1 python3 tests/workflow_performance.py
     DNA_RESOURCE_CYCLES=300 python3 tests/native_memory.py

@@ -2,92 +2,169 @@ use "../../src/filesystem" fs
 use "std/io"
 
 fn equal(a: []const u8, b: []const u8) bool {
-  if #len(a) != #len(b) { return false }
-  for i in 0..#len(a) { if a[i] != b[i] { return false } }
+  if #len(a) != #len(b) {
+    return false
+  }
+  for i in 0..#len(a) {
+    if a[i] != b[i] {
+      return false
+    }
+  }
   return true
 }
 fn content(path: []const u8, expected: []const u8) {
   opened := fs.open(path)
-  if !opened.ok { #panic("open content") }
+  if !opened.ok {
+    #panic("open content")
+  }
   defer _ = fs.close(&opened.file)
   storage: [128]u8 = []
   read := fs.read(&opened.file, storage[..])
-  if !read.ok || !equal(storage[..read.transferred], expected) { #panic("content changed unexpectedly") }
+  if !read.ok || !equal(storage[..read.transferred], expected) {
+    #panic("content changed unexpectedly")
+  }
 }
 fn require(result: fs.Result, operation: []const u8) {
-  if !result.ok { _ = io.println(io.stderr(), "{} failed: {}", operation, result.error) #panic(operation) }
+  if !result.ok {
+    _ = io.println(io.stderr(), "{} failed: {}", operation, result.error)
+    #panic(operation)
+  }
 }
 fn main() {
   private := fs.create_private_exclusive("private.txt")
-  if !private.ok { _ = io.println(io.stderr(), "create private failed: {}", private.error) #panic("private create") }
+  if !private.ok {
+    _ = io.println(io.stderr(), "create private failed: {}", private.error)
+    #panic("private create")
+  }
   require(fs.write(&private.file, "private"), "private write")
   require(fs.set_permissions(&private.file, 384), "private chmod")
   require(fs.close(&private.file), "private close")
-  if !fs.make_directory("private-directory", 448).ok { #panic("private directory permissions") }
+  if !fs.make_directory("private-directory", 448).ok {
+    #panic("private directory permissions")
+  }
   copied := fs.create_private_exclusive("copied-permissions.txt")
-  if !copied.ok { #panic("create permission copy") }
+  if !copied.ok {
+    #panic("create permission copy")
+  }
   require(fs.preserve_permissions(&copied.file, "private.txt"), "preserve permissions")
   require(fs.write(&copied.file, "copied"), "permission copy write")
   require(fs.close(&copied.file), "permission copy close")
   private_transaction := fs.atomic_begin_private("session.txt", "session.tmp")
-  if !private_transaction.ok || !fs.write(&private_transaction.transaction.file, "session").ok || !fs.atomic_commit(&private_transaction.transaction).ok { #panic("private atomic save") }
-  if fs.metadata("absent").ok { #panic("missing metadata") }
-  if !fs.write_all("source café.txt", "source").ok || !fs.write_all("target 日本語.txt", "target").ok { #panic("create fixtures") }
+  if !private_transaction.ok || !fs.write(&private_transaction.transaction.file, "session").ok || !fs.atomic_commit(&private_transaction.transaction).ok {
+    #panic("private atomic save")
+  }
+  if fs.metadata("absent").ok {
+    #panic("missing metadata")
+  }
+  if !fs.write_all("source café.txt", "source").ok || !fs.write_all("target 日本語.txt", "target").ok {
+    #panic("create fixtures")
+  }
   safe := fs.open_nofollow("source café.txt")
-  if !safe.ok { #panic("safe open regular file") }
+  if !safe.ok {
+    #panic("safe open regular file")
+  }
   info := fs.file_metadata(&safe.file)
-  if !info.ok || info.size != 6 || !fs.close(&safe.file).ok { #panic("handle metadata") }
+  if !info.ok || info.size != 6 || !fs.close(&safe.file).ok {
+    #panic("handle metadata")
+  }
   source := fs.metadata("source café.txt")
-  if !source.ok || source.size != 6 || (source.mode & 61440) != 32768 { #panic("regular metadata") }
-  if fs.rename_noreplace("source café.txt", "target 日本語.txt").ok { #panic("rename overwrote destination") }
+  if !source.ok || source.size != 6 || (source.mode & 61440) != 32768 {
+    #panic("regular metadata")
+  }
+  if fs.rename_noreplace("source café.txt", "target 日本語.txt").ok {
+    #panic("rename overwrote destination")
+  }
   content("source café.txt", "source")
   content("target 日本語.txt", "target")
-  if !fs.rename_noreplace("source café.txt", "moved.txt").ok || fs.metadata("source café.txt").ok { #panic("rename to new path") }
+  if !fs.rename_noreplace("source café.txt", "moved.txt").ok || fs.metadata("source café.txt").ok {
+    #panic("rename to new path")
+  }
   content("moved.txt", "source")
   transaction := fs.atomic_begin("target 日本語.txt", "temporary.txt")
-  if !transaction.ok || !fs.write(&transaction.transaction.file, "replacement").ok { #panic("atomic begin/write") }
+  if !transaction.ok || !fs.write(&transaction.transaction.file, "replacement").ok {
+    #panic("atomic begin/write")
+  }
   content("target 日本語.txt", "target")
-  if !fs.atomic_commit(&transaction.transaction).ok || transaction.transaction.active || fs.metadata("temporary.txt").ok { #panic("atomic commit") }
+  if !fs.atomic_commit(&transaction.transaction).ok || transaction.transaction.active || fs.metadata("temporary.txt").ok {
+    #panic("atomic commit")
+  }
   content("target 日本語.txt", "replacement")
   aborted := fs.atomic_begin("target 日本語.txt", "temporary.txt")
-  if !aborted.ok || !fs.write(&aborted.transaction.file, "discard").ok || !fs.atomic_abort(&aborted.transaction).ok { #panic("atomic abort") }
+  if !aborted.ok || !fs.write(&aborted.transaction.file, "discard").ok || !fs.atomic_abort(&aborted.transaction).ok {
+    #panic("atomic abort")
+  }
   content("target 日本語.txt", "replacement")
-  if fs.metadata("temporary.txt").ok { #panic("abort left temporary") }
+  if fs.metadata("temporary.txt").ok {
+    #panic("abort left temporary")
+  }
   // A directory cannot be overwritten with a regular file. Abort must still
   // clean the temporary after commit has closed its handle and rename fails.
   failed := fs.atomic_begin("protected-directory", "temporary.txt")
-  if !failed.ok || !fs.write(&failed.transaction.file, "discard").ok { #panic("failure fixture") }
-  if fs.atomic_commit(&failed.transaction).ok || !failed.transaction.active { #panic("invalid replacement succeeded") }
-  if !fs.atomic_abort(&failed.transaction).ok { #panic("abort after failed commit") }
-  if (fs.metadata("protected-directory").mode & 61440) != 16384 { #panic("directory lost") }
+  if !failed.ok || !fs.write(&failed.transaction.file, "discard").ok {
+    #panic("failure fixture")
+  }
+  if fs.atomic_commit(&failed.transaction).ok || !failed.transaction.active {
+    #panic("invalid replacement succeeded")
+  }
+  if !fs.atomic_abort(&failed.transaction).ok {
+    #panic("abort after failed commit")
+  }
+  if (fs.metadata("protected-directory").mode & 61440) != 16384 {
+    #panic("directory lost")
+  }
   storage: [8192]u8 = []
   opened := fs.open_directory(".", storage[..])
-  if !opened.ok { #panic("open directory") }
+  if !opened.ok {
+    #panic("open directory")
+  }
   found: usize = 0
   for true {
     entry := fs.directory_next(&opened.directory)
     if !entry.ok {
-      if entry.error != 0 { #panic("directory enumeration failed") }
+      if entry.error != 0 {
+        #panic("directory enumeration failed")
+      }
       break
     }
-    if equal(entry.name, ".") || equal(entry.name, "..") { #panic("dot entry") }
-    if equal(entry.name, "target 日本語.txt") { found += 1 }
-    if equal(entry.name, "moved.txt") { found += 1 }
-    if equal(entry.name, "protected-directory") { found += 1 }
+    if equal(entry.name, ".") || equal(entry.name, "..") {
+      #panic("dot entry")
+    }
+    if equal(entry.name, "target 日本語.txt") {
+      found += 1
+    }
+    if equal(entry.name, "moved.txt") {
+      found += 1
+    }
+    if equal(entry.name, "protected-directory") {
+      found += 1
+    }
   }
-  if found != 3 || !fs.close_directory(&opened.directory).ok { #panic("directory names or close") }
+  if found != 3 || !fs.close_directory(&opened.directory).ok {
+    #panic("directory names or close")
+  }
   if fs.metadata("link-enabled").ok {
     refused := fs.open_nofollow("link.txt")
-    if refused.ok { _ = fs.close(&refused.file) #panic("safe open followed symlink") }
+    if refused.ok {
+      _ = fs.close(&refused.file)
+      #panic("safe open followed symlink")
+    }
     link := fs.metadata_nofollow("link.txt")
     followed := fs.metadata("link.txt")
-    if !link.ok || (link.mode & 61440) != 40960 || !followed.ok || followed.size != 11 { #panic("symlink metadata") }
+    if !link.ok || (link.mode & 61440) != 40960 || !followed.ok || followed.size != 11 {
+      #panic("symlink metadata")
+    }
     target: [4096]u8 = []
     result := fs.read_link("link.txt", target[..])
-    if !result.ok || !equal(result.path, "target 日本語.txt") { #panic("symlink target") }
-    if !fs.remove("link.txt").ok { #panic("unlink symlink") }
+    if !result.ok || !equal(result.path, "target 日本語.txt") {
+      #panic("symlink target")
+    }
+    if !fs.remove("link.txt").ok {
+      #panic("unlink symlink")
+    }
     content("target 日本語.txt", "replacement")
   }
-  if !fs.remove("moved.txt").ok || fs.metadata("moved.txt").ok { #panic("remove") }
+  if !fs.remove("moved.txt").ok || fs.metadata("moved.txt").ok {
+    #panic("remove")
+  }
   _ = io.println(io.stdout(), "PASS filesystem Unicode, metadata, enumeration, no-overwrite, atomic commit/abort")
 }
