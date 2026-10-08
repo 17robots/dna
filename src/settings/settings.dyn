@@ -120,10 +120,7 @@ pub struct Settings {
   popup_animation_ms: f32 = 50.0,
   cursor_thickness: f32 = 2.0,
   cursor_trail_size: f32 = 1.0,
-  terminal_height: f32 = 0.25,
   split_ratio: f32 = 0.5,
-  picker_width: f32 = 0.9,
-  picker_height: f32 = 0.88,
   popup_width: f32 = 0.64,
   popup_height: f32 = 0.56,
   popup_padding: f32 = 10.0,
@@ -147,6 +144,9 @@ pub struct Settings {
   // [modules]: 0 is the default module of each slot. frontend: auto, gui,
   // tui; explorer: buffer, tree; picker: full, compact, dropdown.
   frontend, explorer_style, picker_style: u8,
+  // Closing the last buffer: 0 auto (quit in the terminal, keep the window),
+  // 1 quit, 2 keep an empty buffer.
+  close_last_buffer: u8,
   reload_config: bool = true,
   line_numbers: bool = true,
   relative_numbers: bool = true,
@@ -184,10 +184,7 @@ pub fn defaults(result: *Settings) {
   result.popup_animation_ms = 50.0
   result.cursor_thickness = 2.0
   result.cursor_trail_size = 1.0
-  result.terminal_height = 0.25
   result.split_ratio = 0.5
-  result.picker_width = 0.9
-  result.picker_height = 0.88
   result.popup_width = 0.64
   result.popup_height = 0.56
   result.popup_padding = 10.0
@@ -335,7 +332,7 @@ pub fn lock_matches(lock: []const u8, section: []const u8, key: []const u8, cano
 // How you like to work, rather than what a project needs: a dna.toml never
 // sets these. [project."PATH"] sections in the global file can.
 fn personal_key(canonical: []const u8) bool {
-  return buffer.equal(canonical, "vim_keys") || buffer.equal(canonical, "keymap") || buffer.equal(canonical, "frontend") ||
+  return buffer.equal(canonical, "keymap") || buffer.equal(canonical, "frontend") ||
     buffer.equal(canonical, "theme") || buffer.equal(canonical, "font") || buffer.equal(canonical, "font_family") ||
     buffer.equal(canonical, "fallback_font") || buffer.equal(canonical, "font_size") || buffer.equal(canonical, "line_height")
 }
@@ -345,7 +342,7 @@ fn trust_needed(section: []const u8, key: []const u8, canonical: []const u8) boo
     return true
   }
   if #len(section) > 10 && buffer.equal(section[..10], "languages.") {
-    return buffer.equal(key, "server") || buffer.equal(key, "language_server") || buffer.equal(key, "formatter") || buffer.equal(key, "auto_start") || buffer.equal(key, "format_on_save")
+    return buffer.equal(key, "server") || buffer.equal(key, "formatter") || buffer.equal(key, "auto_start") || buffer.equal(key, "format_on_save")
   }
   return buffer.equal(canonical, "shell") || buffer.equal(canonical, "build_command") || buffer.equal(canonical, "test_command") || buffer.equal(canonical, "run_command") || buffer.equal(canonical, "font") || buffer.equal(canonical, "fallback_font") || buffer.equal(canonical, "theme")
 }
@@ -379,7 +376,7 @@ fn layer_applied(layer: *Layer, canonical: []const u8) {
     layer.applied_count += 1
   }
 }
-// lock = ["vim_keys", "theme", "languages"]: only in the global file.
+// lock = ["keymap", "theme", "languages"]: only in the global file.
 fn parse_locks(layer: *Layer, value: []const u8) bool {
   if layer.project || #len(value) < 2 || value[0] != 91 || value[#len(value) - 1] != 93 {
     return false
@@ -431,9 +428,6 @@ pub fn parse_layer(source: []const u8, result: *Settings, layer: *Layer) bool {
   scope: u8 = 0
   language_index: usize = 16
   place_index: usize = PlaceSurfaces
-  // keymap and vim_keys name the same choice; a file setting both must agree.
-  keymap_value: u8 = 255
-  vim_value: u8 = 255
   section: []const u8 = ""
   for at < #len(source) {
     result.error_line += 1
@@ -562,6 +556,10 @@ pub fn parse_layer(source: []const u8, result: *Settings, layer: *Layer) bool {
       layer_applied(layer, section)
       continue
     }
+    // The [modules] explorer and picker keys are the only spellings.
+    if #len(section) == 0 && (buffer.equal(key, "explorer_style") || buffer.equal(key, "picker_style")) {
+      return false
+    }
     canonical := section_key(section, key)
     if layer_skip(layer, section, key, canonical) != 0 {
       continue
@@ -572,15 +570,6 @@ pub fn parse_layer(source: []const u8, result: *Settings, layer: *Layer) bool {
       extra_bit := #cast(u64) 1 << extra_index
       if (extra_seen & extra_bit) != 0 || !extra_apply(result, extra_index, value) {
         return false
-      }
-      if buffer.equal(canonical, "vim_keys") {
-        vim_value = 0
-        if result.vim_keys {
-          vim_value = 1
-        }
-        if keymap_value != 255 && keymap_value != vim_value {
-          return false
-        }
       }
       extra_seen = extra_seen | extra_bit
       result.explicit_extra = result.explicit_extra | extra_seen
@@ -622,10 +611,6 @@ pub fn parse_layer(source: []const u8, result: *Settings, layer: *Layer) bool {
       }
       if buffer.equal(key, "keymap") {
         bit = 1048576
-        keymap_value = choice
-        if vim_value != 255 && vim_value != choice {
-          return false
-        }
         result.vim_keys = choice == 1
       }
       else if buffer.equal(key, "frontend") {
@@ -639,6 +624,20 @@ pub fn parse_layer(source: []const u8, result: *Settings, layer: *Layer) bool {
       else {
         bit = 8388608
         result.picker_style = choice
+      }
+    } else if buffer.equal(key, "close_last_buffer") {
+      bit = 16777216
+      if buffer.equal(value, "\"auto\"") {
+        result.close_last_buffer = 0
+      }
+      else if buffer.equal(value, "\"quit\"") {
+        result.close_last_buffer = 1
+      }
+      else if buffer.equal(value, "\"keep\"") {
+        result.close_last_buffer = 2
+      }
+      else {
+        return false
       }
     } else if buffer.equal(key, "fallback_font") {
       bit = 4096

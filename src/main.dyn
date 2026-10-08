@@ -267,6 +267,11 @@ fn editor_main() {
   draw(renderer, window, app, &typography)
   event := sdl.Event{}
   receiving: bool = false
+  // In a window, SDL text input stays on: switching it on and off as panels
+  // change (the g menu, counts, leaving terminal input) restarts the input
+  // method, and on Wayland the next key can be lost. Instead, the text event
+  // SDL sends for a key that acted as a command (i, g, :) is dropped.
+  command_character: u32 = 0
   for app.running {
     background_tick(app, &typography)
     if !app.running {
@@ -278,7 +283,7 @@ fn editor_main() {
       draw(renderer, window, app, &typography)
     }
 
-    wants_text := wants_text_input(app)
+    wants_text := wants_text_input(app) || !sdl.tui_active()
     if wants_text != receiving {
       if wants_text {
         if !sdl.start_text(window) {
@@ -350,6 +355,15 @@ fn editor_main() {
           }
         } else if !(key.repeated && (key.key == KeyEscape || (key.key == KeyX && (key.modifiers & ModCtrl) != 0 && !terminal_typing(app)))) {
           app.input_state.character = sdl.key_from_scancode(key.scancode, key.modifiers, false)
+          // Its text event follows; when the key was a command rather
+          // than typing, that text must not type (i must not type an i).
+          command_character = 0
+          if !wants_text_input(app) {
+            command_character = app.input_state.character
+            if command_character == 0 {
+              command_character = key.key
+            }
+          }
           key_input(app, &typography, key.key, key.modifiers)
           app.input_state.character = 0
           redraw = true
@@ -381,7 +395,12 @@ fn editor_main() {
         composition_update(app, #cast(*const sdl.EditingEvent) &event)
       } else if kind == 771 {
         received := #cast(*const sdl.TextEvent) &event
-        if received.text != nil {
+        typing := sdl.tui_active() || wants_text_input(app)
+        if !sdl.tui_active() && received.text != nil && command_character != 0 && command_character < 128 && c.string_length(received.text, 8) == 1 && received.text[..1][0] == #cast(u8) command_character {
+          typing = false
+        }
+        command_character = 0
+        if received.text != nil && typing {
           length := c.string_length(received.text, 65536)
           if length < 65536 {
             text_input(app, received.text[..length])
@@ -412,7 +431,7 @@ fn editor_main() {
         render_request(app, RenderWindow)
       }
 
-      input_now := wants_text_input(app)
+      input_now := wants_text_input(app) || !sdl.tui_active()
       if input_now != receiving {
         if input_now {
           if !sdl.start_text(window) {

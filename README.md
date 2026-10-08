@@ -147,14 +147,12 @@ DNA is built from module slots: **keymap** (`helix`, `vim`), **frontend** (`gui`
 
 ```toml
 [modules]
-keymap = "vim"        # also [editor] vim_keys = true
+keymap = "vim"
 frontend = "auto"
 explorer = "buffer"
 picker = "full"
 ```
 
-`keymap` and `[editor] vim_keys` are the same choice; a file that sets both to
-different values is reported as invalid at the second one.
 `:modules` lists the active module in each slot and what this build includes;
 `:module keymap vim` (or `:keymap vim`) switches for the session. A module the
 build leaves out falls back to the slot's default with a message, and `lock`
@@ -202,10 +200,14 @@ focus returns to the editor; Space e or a click moves focus back to it.
 | `h` / Left | fold, or go to the parent folder |
 | `-` / Backspace | make the root's parent the root |
 | `.` | make the selected folder the root |
-| `r` | reload from disk |
-| `e` | edit the selected folder in the editable explorer (create, rename, trash) |
+| `a` | new file beside the selection (inside it for a folder); end with `/` for a folder, and use `dir/sub/name` to create the folders on the way |
+| `r` | rename (the prompt starts with the current name) |
+| `c` / `m` | copy / move to a path relative to the entry's folder (`../x` works) |
+| `d` | move to `.dna-trash` beside it, after confirmation |
+| `R` | reload from disk |
+| `e` | edit the selected folder as text in the editable explorer |
 | Esc | back to the editor (a floating tree closes) |
-| `q` | close the tree |
+| `q` / Escape | close the tree (Space e opens it again) |
 
 The tree opens on the current file, keeps open folders across reloads and
 hides `.git`. While it is open it watches its root and every open folder, so
@@ -607,7 +609,7 @@ character, so `x` never highlights the first character of the following line. Wo
 | View: center / top / bottom / scroll a line | `z` then `z`/`c`, `t`, `b`, `k`/`j`; `Z` keeps the menu open |
 | Next / previous diagnostic, first/last diagnostic, paragraph, add blank line | `]` / `[` then `d`, `D`, `p`, Space |
 | Toggle line comments | `:comment` (Helix's `Ctrl C` / `Space c` keep DNA's copy / close buffer) |
-| Keymap profile | `:keymap helix` or `:keymap vim`; `[editor] vim_keys` sets the default |
+| Keymap profile | `:keymap helix` or `:keymap vim`; `[modules] keymap` sets the default |
 | Character find / till (reverse with Shift) | `f` / `t`, then a character; Escape cancels |
 | Replace selected characters / replace with clipboard | `r`, then a character / `R` |
 | Indent / unindent; join lines | `>` / `<`; `J` |
@@ -648,7 +650,7 @@ The command palette supports descriptive names and short commands: `open`/`e`,
 and `:write path` accept a literal path (including spaces) and expand `~/`.
 
 Every command is in the palette under its name and its short forms, and every
-option is too: typing part of an option's name (`scroll`, `vim_keys`) lists
+option is too: typing part of an option's name (`scroll`, `keymap`) lists
 **Set option** rows with the current value. After a command name, the palette
 suggests its arguments as you type: files and folders for `:open`, `:write`,
 `:cd` and sessions; themes, layouts, fonts, languages and installed plugins;
@@ -672,6 +674,11 @@ and unsaved edits, including the same file in another split. With one view, it
 closes the current buffer (prompting if dirty). The final buffer becomes an empty
 scratch buffer; `:q` on that final empty scratch view exits the editor.
 `:bd` closes the shared buffer across views.
+
+Closing the last buffer follows `[files] close_last_buffer`: `"auto"` (the
+default) quits in the terminal frontend, where an empty editor has nothing to
+show, and keeps an empty buffer in a window; `"quit"` and `"keep"` pick one
+behaviour everywhere. Unsaved text and running terminal panes still ask first.
 `:quit-all` checks every dirty buffer and staged explorer edit before exiting.
 `:x` saves and closes the active buffer, including its other views. `:wa` saves
 modified file buffers and restores focus; `:xa` saves them before exiting.
@@ -727,7 +734,7 @@ arrows select a command. Document search accepts case-sensitive regular expressi
 
 ## Vim keys
 
-`[editor] vim_keys = true` (or `:keymap vim` for the session) switches normal
+`[modules] keymap = "vim"` (or `:keymap vim` for the session) switches normal
 mode to Vim's grammar: operator, then motion or text object, with counts on
 either (`d3w`, `3dd`, `2d2w`). Insert mode keeps DNA's insert keys plus Vim's
 Ctrl-w and Ctrl-u; Escape steps the cursor back one character. Space still
@@ -756,9 +763,19 @@ not `a\|b`). Ctrl-x closes the buffer only in the Helix keymap.
 
 ## Editable explorer
 
-`Space e` opens an editable directory popup. It shares the document editing keys:
-`h/j/k/l`, `w/b/e`, motion counts, `i`, `a`, `o`, `v`, `x`, `d`, `c`, `u`/`Shift U`, and clipboard commands.
-Enter in normal mode opens the current row; Backspace goes to its parent.
+`Space e` opens an editable directory popup that works like mini.files. It
+starts as one column on the current folder, with a preview of the selected
+entry beside it. `l` (or Enter, or Right) on a folder walks into it and keeps
+the folder you came from as a column on the left, so the explorer grows as you
+go deeper; on a file it opens it. `h` (or Backspace, or Left) walks back out.
+When columns no longer fit, the oldest drop off the left. `q` or Escape (in
+normal mode) closes it; staged edits stay until applied or discarded. Every
+explorer closes the same way, and a cancelled file prompt returns to the
+explorer that opened it.
+
+The column you are in is an editable buffer and shares the document editing
+keys: `j/k`, `w/b/e`, motion counts, `i`, `a`, `o`, `v`, `x`, `d`, `c`,
+`u`/`Shift U`, and clipboard commands.
 Apply or discard pending edits before navigating to another directory.
 
 The editable area contains filenames only. The gutter uses the same numbering as
@@ -1267,8 +1284,9 @@ Font file/folder glyphs. Ghostty includes these symbols; other terminals may
 need a Nerd Font selected in their settings. Icons
 never enter selections, clipboard text, undo history, or staged filenames.
 `explorer_icons = false` hides them in both frontends. Folder rows retain their `/`
-suffix. Parent and preview columns are read-only context; the middle column is
-the editable buffer. Navigation still requires applying or discarding staged
+suffix. The columns you walked through and the preview are read-only context;
+only the current column is editable (`explorer_columns = false` hides the
+walked-through columns). Navigation still requires applying or discarding staged
 changes, and `:write` still opens a preview before touching files.
 
 ```toml

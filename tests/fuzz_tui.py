@@ -110,7 +110,7 @@ for seed in range(first, first + runs):
         (project / 'main.dyn').write_text('fn main() {\n  value := 1\n}\n')
         (project / 'sub' / 'data.json').write_text('{"key": [1, 2, 3]}\n')
         (work / 'home').mkdir()
-        modules = rng.choice(['', '[modules]\nexplorer = "tree"\n', '[modules]\npicker = "dropdown"\n', '[editor]\nvim_keys = true\n'])
+        modules = rng.choice(['', '[modules]\nexplorer = "tree"\n', '[modules]\npicker = "dropdown"\n', '[modules]\nkeymap = "vim"\n'])
         (work / 'config.toml').write_text('shell = "/bin/sh"\nreload_config = false\n' + modules)
         environment = {
             'PATH': '/usr/bin:/bin', 'TERM': 'xterm-256color', 'HOME': str(work / 'home'),

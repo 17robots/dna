@@ -405,8 +405,10 @@ fn tree_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
   if page < 2 {
     page = 2
   }
+  // Escape and q both close the tree, like the column explorer; Space e
+  // brings it back.
   if key == KeyEscape {
-    tree_unfocus(app)
+    tree_close(app)
     return
   }
   if control {
@@ -505,9 +507,42 @@ fn tree_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
       tree_set_root(app, chosen)
     }
   }
-  else if key == KeyR {
+  else if key == KeyR && shift {
     tree_reload(app)
     notice(app, "Tree reloaded.")
+  }
+  else if key == KeyA || key == KeyR || key == KeyD || key == KeyC || key == KeyM {
+    // a creates beside the selection (inside it for a folder); the others
+    // act on the selected entry.
+    kind := FileOpCreate
+    if key == KeyR {
+      kind = FileOpRename
+    }
+    else if key == KeyD {
+      kind = FileOpTrash
+    }
+    else if key == KeyC {
+      kind = FileOpCopy
+    }
+    else if key == KeyM {
+      kind = FileOpMove
+    }
+    base: [4096]u8 = []
+    base_length := copy_text(base[..], tree.root[..tree.root_length])
+    source: [4096]u8 = []
+    source_length: usize = 0
+    if tree.selected < tree.count {
+      source_length = copy_text(source[..], tree_path(tree, tree.selected, source[..]))
+      folder := tree.selected
+      if !tree.nodes[folder].directory {
+        folder = tree_parent_index(tree, folder)
+      }
+      if folder < tree.count {
+        base_length = copy_text(base[..], tree_path(tree, folder, base[..]))
+      }
+    }
+    file_op_begin(app, kind, base[..base_length], source[..source_length])
+    return
   }
   else if key == KeyE {
     // File operations live in the editable explorer, opened on the
@@ -747,5 +782,16 @@ fn tree_release(app: *App) {
   if app.tree.watcher != nil {
     directory_watch_close(app.tree.watcher)
     app.tree.watcher = nil
+  }
+}
+// After a file action: reload and select what it produced.
+fn tree_after_file_op(app: *App, selected: []const u8) {
+  if !app.tree.open {
+    return
+  }
+  tree_reload(app)
+  root := app.tree.root[..app.tree.root_length]
+  if #len(selected) > #len(root) + 1 && file_op_within(selected, root) {
+    _ = tree_reveal_relative(app, selected[#len(root) + 1..])
   }
 }
