@@ -1,0 +1,389 @@
+// File actions shared by the explorers: create, rename, copy, move and
+// trash, each from a short prompt or confirmation, applied immediately.
+// Paths typed into a prompt are relative to the selected entry's folder;
+// a trailing "/" on create makes a folder, and missing parent folders are
+// created. Open documents follow renames and moves; a dirty document blocks
+// changes to its file.
+
+const FileOpCreate: u8 = 1
+const FileOpRename: u8 = 2
+const FileOpCopy: u8 = 3
+const FileOpMove: u8 = 4
+const FileOpTrash: u8 = 5
+
+struct FileOps {
+  kind: u8,
+  // The folder prompts resolve against.
+  base: [4096]u8,
+  base_length: usize,
+  // The entry renamed, copied, moved or trashed.
+  source: [4096]u8,
+  source_length: usize,
+  // Where focus returns: the explorer that started the action.
+  return_panel: Panel,
+}
+
+// Starts an action on `source` (an entry) inside folder `base`. Text
+// actions open the prompt prefilled; trash asks for confirmation.
+fn file_op_begin(app: *App, kind: u8, base: []const u8, source: []const u8) {
+  ops := &app.file_ops
+  ops.kind = kind
+  ops.base_length = copy_text(ops.base[..4000], base)
+  ops.source_length = copy_text(ops.source[..4000], source)
+  ops.return_panel = app.prompt_state.panel
+  if kind != FileOpCreate && ops.source_length == 0 {
+    notice(app, "Select a file or folder first.")
+    return
+  }
+  if kind == FileOpTrash {
+    app.prompt_state.panel = Panel.Trash
+    return
+  }
+  app.prompt_state.panel = Panel.FileOp
+  app.prompt_state.length = 0
+  // Rename and move start from the current name so small edits are quick.
+  if kind == FileOpRename || kind == FileOpMove || kind == FileOpCopy {
+    app.prompt_state.length = copy_text(app.prompt_state.text[..4095], file_op_leaf(source))
+  }
+  app.prompt_state.text[app.prompt_state.length] = 0
+}
+fn file_op_title(app: *const App) []const u8 {
+  kind := app.file_ops.kind
+  if kind == FileOpCreate {
+    return "New file (end with / for a folder)"
+  }
+  if kind == FileOpRename {
+    return "Rename to"
+  }
+  if kind == FileOpCopy {
+    return "Copy to"
+  }
+  return "Move to"
+}
+fn file_op_leaf(path: []const u8) []const u8 {
+  end := #len(path)
+  for end > 1 && path[end - 1] == '/' {
+    end -= 1
+  }
+  start := end
+  for start > 0 && path[start - 1] != '/' {
+    start -= 1
+  }
+  return path[start..end]
+}
+// base + "/" + typed, with "." and ".." resolved. Empty when invalid.
+fn file_op_target(base: []const u8, typed: []const u8, output: []u8) []const u8 {
+  if #len(typed) == 0 || #len(typed) >= 3000 {
+    return output[..0]
+  }
+  for byte in typed {
+    if byte < 32 || byte == 127 {
+      return output[..0]
+    }
+  }
+  used: usize = 0
+  if typed[0] != '/' {
+    used = copy_text(output[..3000], base)
+  }
+  at: usize = 0
+  for at < #len(typed) {
+    end := at
+    for end < #len(typed) && typed[end] != '/' {
+      end += 1
+    }
+    part := typed[at..end]
+    at = end + 1
+    if #len(part) == 0 || buffer.equal(part, ".") {
+      continue
+    }
+    if buffer.equal(part, "..") {
+      for used > 0 && output[used - 1] != '/' {
+        used -= 1
+      }
+      if used > 0 {
+        used -= 1
+      }
+      continue
+    }
+    add_text(output, &used, "/")
+    add_text(output, &used, part)
+  }
+  if used == 0 || used >= #len(output) - 1 {
+    return output[..0]
+  }
+  return output[..used]
+}
+// True when `path` is `root` or inside it.
+fn file_op_within(path: []const u8, root: []const u8) bool {
+  return #len(path) >= #len(root) && buffer.equal(path[..#len(root)], root) && (#len(path) == #len(root) || path[#len(root)] == '/')
+}
+fn file_op_dirty_inside(app: *App, root: []const u8) bool {
+  for index in 0..16 {
+    slot := &app.documents.slots[index]
+    if slot.document != nil && file_op_within(files.name(&slot.file), root) && buffer.dirty_cached(slot.document) {
+      return true
+    }
+  }
+  return false
+}
+// Open documents at or under `source` now live under `destination`.
+fn file_op_follow(app: *App, source: []const u8, destination: []const u8) {
+  for index in 0..16 {
+    slot := &app.documents.slots[index]
+    name := files.name(&slot.file)
+    if slot.document == nil || !file_op_within(name, source) {
+      continue
+    }
+    moved: [4096]u8 = []
+    used := copy_text(moved[..4000], destination)
+    add_text(moved[..], &used, name[#len(source)..])
+    files.discard_recovery(&slot.file)
+    _ = files.set_name(&slot.file, moved[..used])
+  }
+  app.view.revision += 1
+}
+// mkdir -p for every folder above `path` (and `path` itself when `last`).
+fn file_op_make_parents(path: []const u8, last: bool) bool {
+  at: usize = 1
+  for at <= #len(path) {
+    if at == #len(path) || path[at] == '/' {
+      if at < #len(path) || last {
+        info := fs.metadata(path[..at])
+        if !info.ok {
+          if !fs.make_directory(path[..at], 493).ok {
+            return false
+          }
+        }
+        else if (info.mode & 61440) != 16384 {
+          return false
+        }
+      }
+    }
+    at += 1
+  }
+  return true
+}
+fn file_op_exists(path: []const u8) bool {
+  return fs.metadata_nofollow(path).ok
+}
+// Copies a file, or a folder and everything below it, refusing symlinks and
+// existing destinations. `depth` bounds recursion.
+fn file_op_copy(source: []const u8, destination: []const u8, depth: usize) bool {
+  info := fs.metadata_nofollow(source)
+  if !info.ok || depth > 32 || file_op_exists(destination) {
+    return false
+  }
+  kind := info.mode & 61440
+  if kind == 16384 {
+    if !fs.make_directory(destination, 493).ok {
+      return false
+    }
+    storage: [8192]u8 = []
+    opened := fs.open_directory(source, storage[..])
+    if !opened.ok {
+      return false
+    }
+    ok := true
+    for ok {
+      entry := fs.directory_next(&opened.directory)
+      if !entry.ok {
+        ok = entry.error == 0
+        break
+      }
+      from: [4096]u8 = []
+      to: [4096]u8 = []
+      from_length := copy_text(from[..3800], source)
+      add_text(from[..], &from_length, "/")
+      add_text(from[..], &from_length, entry.name)
+      to_length := copy_text(to[..3800], destination)
+      add_text(to[..], &to_length, "/")
+      add_text(to[..], &to_length, entry.name)
+      if from_length >= 4000 || to_length >= 4000 {
+        ok = false
+        break
+      }
+      ok = file_op_copy(from[..from_length], to[..to_length], depth + 1)
+    }
+    _ = fs.close_directory(&opened.directory)
+    return ok
+  }
+  if kind != 32768 {
+    return false
+  }
+  input := fs.open_nofollow(source)
+  if !input.ok {
+    return false
+  }
+  defer _ = fs.close(&input.file)
+  output := fs.create_exclusive(destination)
+  if !output.ok {
+    return false
+  }
+  chunk: [65536]u8 = []
+  ok := true
+  for ok {
+    read := fs.read(&input.file, chunk[..])
+    if !read.ok {
+      ok = false
+      break
+    }
+    if read.transferred == 0 {
+      break
+    }
+    ok = fs.write(&output.file, chunk[..read.transferred]).ok
+  }
+  if ok {
+    ok = fs.preserve_permissions(&output.file, source).ok
+  }
+  ok = fs.close(&output.file).ok && ok
+  return ok
+}
+// Enter in the prompt: apply the typed path.
+fn file_op_submit(app: *App) {
+  ops := &app.file_ops
+  base := ops.base[..ops.base_length]
+  source := ops.source[..ops.source_length]
+  typed := app.prompt_state.text[..app.prompt_state.length]
+  folder := #len(typed) > 0 && typed[#len(typed) - 1] == '/'
+  // Rename keeps the entry in its folder; the others resolve against base.
+  relative_to := base
+  if ops.kind == FileOpRename || ops.kind == FileOpCopy || ops.kind == FileOpMove {
+    relative_to = source[..#len(source) - #len(file_op_leaf(source))]
+    for #len(relative_to) > 1 && relative_to[#len(relative_to) - 1] == '/' {
+      relative_to = relative_to[..#len(relative_to) - 1]
+    }
+  }
+  target_storage: [4096]u8 = []
+  target := file_op_target(relative_to, typed, target_storage[..])
+  if #len(target) == 0 {
+    notice(app, "Enter a name or relative path.")
+    return
+  }
+  if ops.kind == FileOpRename && (#len(typed) == 0 || buffer.equal(typed, file_op_leaf(source))) {
+    file_op_finish(app, "")
+    return
+  }
+  if file_op_exists(target) {
+    notice(app, "Something with that name already exists.")
+    return
+  }
+  if ops.kind == FileOpCreate {
+    if !file_op_make_parents(target, folder) {
+      notice(app, "Cannot create the folders on that path.")
+      return
+    }
+    if !folder {
+      created := fs.create_exclusive(target)
+      if !created.ok || !fs.close(&created.file).ok {
+        notice(app, "Cannot create that file.")
+        return
+      }
+    }
+    file_op_finish(app, target)
+    return
+  }
+  if file_op_within(target, source) {
+    notice(app, "A folder cannot go inside itself.")
+    return
+  }
+  if ops.kind != FileOpCopy && file_op_dirty_inside(app, source) {
+    notice(app, "Save or close the changed buffers inside it first.")
+    return
+  }
+  if !file_op_make_parents(target, false) {
+    notice(app, "Cannot create the folders on that path.")
+    return
+  }
+  if ops.kind == FileOpCopy {
+    if !file_op_copy(source, target, 0) {
+      notice(app, "Copy failed; anything copied before the failure was kept.")
+      file_op_finish(app, "")
+      return
+    }
+    file_op_finish(app, target)
+    return
+  }
+  if !fs.rename_noreplace(source, target).ok {
+    notice(app, "Move failed: the destination exists, is on another disk, or permissions deny it.")
+    return
+  }
+  file_op_follow(app, source, target)
+  file_op_finish(app, target)
+}
+// Confirmed trash: move into .dna-trash beside the entry under a free name.
+fn file_op_trash(app: *App) {
+  ops := &app.file_ops
+  source := ops.source[..ops.source_length]
+  if file_op_dirty_inside(app, source) {
+    notice(app, "Save or close the changed buffers inside it first.")
+    file_op_finish(app, "")
+    return
+  }
+  leaf := file_op_leaf(source)
+  folder := source[..#len(source) - #len(leaf)]
+  trash: [4096]u8 = []
+  trash_length := copy_text(trash[..3800], folder)
+  add_text(trash[..], &trash_length, ".dna-trash")
+  link: [4096]u8 = []
+  if fs.read_link(trash[..trash_length], link[..]).ok {
+    notice(app, "Trash destination must not be a symlink.")
+    file_op_finish(app, "")
+    return
+  }
+  if !file_op_exists(trash[..trash_length]) && !fs.make_directory(trash[..trash_length], 448).ok {
+    notice(app, "Cannot create the .dna-trash folder.")
+    file_op_finish(app, "")
+    return
+  }
+  for suffix in 0..1000 {
+    target: [4096]u8 = []
+    used := copy_text(target[..3900], trash[..trash_length])
+    add_text(target[..], &used, "/")
+    add_text(target[..], &used, leaf)
+    if suffix > 0 {
+      add_text(target[..], &used, ".")
+      add_number(target[..], &used, suffix)
+    }
+    if file_op_exists(target[..used]) {
+      continue
+    }
+    if !fs.rename_noreplace(source, target[..used]).ok {
+      notice(app, "Moving to .dna-trash failed.")
+      file_op_finish(app, "")
+      return
+    }
+    file_op_follow(app, source, target[..used])
+    file_op_finish(app, "")
+    return
+  }
+  notice(app, "No free name inside .dna-trash.")
+  file_op_finish(app, "")
+}
+// The palette's create/rename/trash commands act on the explorer's folder
+// and selected entry.
+fn directory_file_op(app: *App, kind: u8) {
+  if app.explorer.path_length > 0 {
+    app.directory_state.length = copy_text(app.directory_state.path[..], app.explorer.path[..app.explorer.path_length])
+  }
+  base := app.directory_state.path[..app.directory_state.length]
+  source: [4096]u8 = []
+  source_length: usize = 0
+  if app.directory_state.selected < app.directory_state.count {
+    entry := &app.directory_state.entries[app.directory_state.selected]
+    source_length = copy_text(source[..4000], joined(app, entry.name[..entry.length], source[..]))
+  }
+  file_op_begin(app, kind, base, source[..source_length])
+  // action() clears the panel first; these always return to the directory.
+  app.file_ops.return_panel = Panel.Directory
+}
+// Back to the explorer that started it, refreshed, showing `selected`.
+fn file_op_finish(app: *App, selected: []const u8) {
+  app.prompt_state.panel = app.file_ops.return_panel
+  if app.prompt_state.panel == Panel.Trash || app.prompt_state.panel == Panel.FileOp {
+    app.prompt_state.panel = Panel.None
+  }
+  if app.prompt_state.panel == Panel.Directory {
+    directory_refresh(app)
+  }
+  tree_after_file_op(app, selected)
+}
