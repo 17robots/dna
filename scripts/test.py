@@ -26,5 +26,7 @@ for suite in ("objects", "buffer", "files", "layout", "motion", "pattern", "sett
             # One byte past buffer.Capacity; sparse, so creating it is free.
             with open(fixtures / "large.txt", "wb") as large:
                 large.truncate(268435456)
-            subprocess.run([str(binary)], cwd=temporary, check=True, timeout=20)
+            # The debug buffer suite takes ~8 s locally; shared CI runners
+            # are several times slower, so allow a wide margin.
+            subprocess.run([str(binary)], cwd=temporary, check=True, timeout=60)
         print(f"PASS {suite} ({mode})", flush=True)
