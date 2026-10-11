@@ -19,7 +19,7 @@
 ; function
 (fn name: (identifier) @function)
 (extern_fn name: (identifier) @function)
-[ "#alignof" "#bitcast" "#cast" "#len" "#panic" "#reverse" "#sizeof" "#syscall" "#typeof" ] @function.builtin
+[ "#alignof" "#assert" "#bitcast" "#cast" "#len" "#load" "#offsetof" "#panic" "#reverse" "#sizeof" "#syscall" "#typeof" ] @function.builtin
 (call (primary (identifier) @function))
 (call (primary (field_access (identifier) @function)))
 
@@ -64,8 +64,8 @@
 ; string
 (string_) @string
 (escape_sequence) @string.escape
-(use (string_) @string)
-(use alias: (identifier) @namespace)
+(import (string_) @string)
+(import alias: (identifier) @namespace)
 
 ; type
 (enum (identifier) @type)
