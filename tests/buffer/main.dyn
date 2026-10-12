@@ -16,28 +16,22 @@ fn uniform(text: []const u8, byte: u8, scratch: []u8) bool {
   return buffer.equal(text, scratch[..#len(text)])
 }
 fn main() {
-  arena := buffer.reserve(#sizeof(buffer.Document))
-  if !arena.ok {
-    #panic("arena")
-  }
-  defer _ = mem.arena_release(&arena.arena)
-  large := buffer.reserve(buffer.Capacity)
-  check := buffer.reserve(buffer.Capacity)
-  if !large.ok || !check.ok {
-    #panic("capacity scratch")
-  }
-  defer _ = mem.arena_release(&large.arena)
-  defer _ = mem.arena_release(&check.arena)
-  full := large.arena.data
+  arena := mem.arena_create(#sizeof(buffer.Document))
+  defer mem.arena_release(&arena)
+  large := mem.arena_create(buffer.Capacity)
+  check := mem.arena_create(buffer.Capacity)
+  defer mem.arena_release(&large)
+  defer mem.arena_release(&check)
+  full := large.data
   // Allocation must also work on dirty/reused backing: poison the metadata
   // and the far end of each storage array, which must stay untouched.
-  probe := #cast(*buffer.Document) &arena.arena.data[0]
+  probe := #cast(*buffer.Document) &arena.data[0]
   metadata := #cast(usize) &probe.bytes[0] - #cast(usize) probe
-  fill(arena.arena.data[..metadata], 165)
+  fill(arena.data[..metadata], 165)
   probe.bytes[buffer.Capacity] = 165
   probe.saved_storage[buffer.Capacity] = 165
   probe.history_storage[#len(probe.history_storage) - 1] = 165
-  document := buffer.allocate(&arena.arena)
+  document := buffer.allocate(&arena)
   if buffer.dirty(document) || document.length != 0 || document.cursor != 0 || document.secondary.count != 0 || document.history_count != 1 || document.bytes[0] != 0 || document.saved[0] != 0 {
     #panic("document allocation initialization")
   }
@@ -687,7 +681,7 @@ fn main() {
     history_step += 1
   }
   expected := #cast(u8) (#cast(usize) 84 - retained_steps)
-  if !uniform(document.bytes[..document.length], expected, check.arena.data) {
+  if !uniform(document.bytes[..document.length], expected, check.data) {
     #panic("large delta rollover undo")
   }
   history_step = 0
@@ -695,7 +689,7 @@ fn main() {
     buffer.redo(document)
     history_step += 1
   }
-  if !uniform(document.bytes[..document.length], 84, check.arena.data) {
+  if !uniform(document.bytes[..document.length], 84, check.data) {
     #panic("large delta rollover redo")
   }
   // Repeated branches reuse discarded redo storage.
@@ -1122,13 +1116,10 @@ fn batch_failure_checks(doc: *buffer.Document) {
   if !buffer.open_lines_count(doc, false, 2) || !buffer.equal(doc.bytes[..doc.length], "a\n\n\nb\n\n") || doc.secondary.count != 1 {
     #panic("counted multi open")
   }
-  large := buffer.reserve(buffer.Capacity)
-  if !large.ok {
-    #panic("capacity scratch")
-  }
-  defer _ = mem.arena_release(&large.arena)
-  fill(large.arena.data, 97)
-  _ = buffer.load(doc, large.arena.data)
+  large := mem.arena_create(buffer.Capacity)
+  defer mem.arena_release(&large)
+  fill(large.data, 97)
+  _ = buffer.load(doc, large.data)
   doc.anchor = 0
   doc.cursor = 1
   doc.secondary.count = 1

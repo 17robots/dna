@@ -731,18 +731,14 @@ fn vim_store(app: *App, text: []const u8, linewise: bool) {
     return
   }
   allocated := mem.arena_create(#len(text) + 1)
-  if !allocated.ok {
-    notice(app, "Cannot allocate register.")
-    return
-  }
-  storage := (#cast(*u8) mem.arena_push_uninit_or_panic(&allocated.arena, #len(text) + 1, 1))[..#len(text) + 1]
+  storage := mem.push_bytes_uninit(&allocated, #len(text) + 1)
   _ = buffer.copy_bytes(&storage[0], &text[0], #len(text))
   storage[#len(text)] = 0
   slot := vim_register_slot(app)
   if slot.owned {
-    _ = mem.arena_release(&slot.arena)
+    mem.arena_release(&slot.arena)
   }
-  slot.arena = mem.arena_take(&allocated.arena)
+  slot.arena = mem.arena_take(&allocated)
   slot.owned = true
   slot.text = storage[..#len(text)]
   slot.count = 1
@@ -937,13 +933,9 @@ fn vim_put(app: *App, after: bool, count: usize) {
   if fetched.linewise && body[#len(body) - 1] != 10 {
     size += count
   }
-  reserved := buffer.reserve(size + 2)
-  if !reserved.ok {
-    notice(app, "Cannot allocate paste.")
-    return
-  }
-  defer _ = mem.arena_release(&reserved.arena)
-  storage := reserved.arena.data
+  reserved := mem.arena_create(size + 2)
+  defer mem.arena_release(&reserved)
+  storage := reserved.data
   used: usize = 0
   for copy in 0..count {
     _ = buffer.copy_bytes(&storage[used], &body[0], #len(body))
@@ -1010,11 +1002,8 @@ fn vim_replace_characters(app: *App, character: u32, count: usize) {
     encoded[0] = 10
     length = 1
   }
-  reserved := buffer.reserve(length * count + 1)
-  if !reserved.ok {
-    return
-  }
-  defer _ = mem.arena_release(&reserved.arena)
+  reserved := mem.arena_create(length * count + 1)
+  defer mem.arena_release(&reserved)
   used: usize = 0
   repeats := count
   if length == 1 && encoded[0] == 10 {
@@ -1022,13 +1011,13 @@ fn vim_replace_characters(app: *App, character: u32, count: usize) {
   }
   for copy in 0..repeats {
     for index in 0..length {
-      reserved.arena.data[used] = encoded[index]
+      reserved.data[used] = encoded[index]
       used += 1
     }
   }
   buffer.checkpoint(doc)
   vim_set_range(doc, head, high)
-  _ = buffer.replace(doc, reserved.arena.data[..used])
+  _ = buffer.replace(doc, reserved.data[..used])
   buffer.checkpoint(doc)
   app.vim.changed = true
   if encoded[0] == 10 && length == 1 {
@@ -1215,23 +1204,20 @@ fn vim_insert_finish(app: *App) {
   if app.vim.insert_lines {
     piece = typed + 1
   }
-  reserved := buffer.reserve(piece * (count - 1) + 1)
-  if !reserved.ok {
-    return
-  }
-  defer _ = mem.arena_release(&reserved.arena)
+  reserved := mem.arena_create(piece * (count - 1) + 1)
+  defer mem.arena_release(&reserved)
   used: usize = 0
   for copy in 1..count {
     if app.vim.insert_lines {
-      reserved.arena.data[used] = 10
+      reserved.data[used] = 10
       used += 1
     }
     if typed > 0 {
-      _ = buffer.copy_bytes(&reserved.arena.data[used], &doc.bytes[start], typed)
+      _ = buffer.copy_bytes(&reserved.data[used], &doc.bytes[start], typed)
     }
     used += typed
   }
-  _ = vim_insert_at(doc, doc.cursor, reserved.arena.data[..used])
+  _ = vim_insert_at(doc, doc.cursor, reserved.data[..used])
 }
 
 // ---------------------------------------------------------------------------
@@ -2216,13 +2202,10 @@ fn vim_visual_put(app: *App, swap: bool) {
     vim_escape(app)
     return
   }
-  reserved := buffer.reserve(#len(fetched.text) + 1)
-  if !reserved.ok {
-    return
-  }
-  defer _ = mem.arena_release(&reserved.arena)
-  _ = buffer.copy_bytes(&reserved.arena.data[0], &fetched.text[0], #len(fetched.text))
-  replacement := reserved.arena.data[..#len(fetched.text)]
+  reserved := mem.arena_create(#len(fetched.text) + 1)
+  defer mem.arena_release(&reserved)
+  _ = buffer.copy_bytes(&reserved.data[0], &fetched.text[0], #len(fetched.text))
+  replacement := reserved.data[..#len(fetched.text)]
   linewise := app.vim.mode == VimMode.VisualLine
   low := app.vim.anchor
   high := app.vim.head

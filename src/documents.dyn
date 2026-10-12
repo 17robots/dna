@@ -60,13 +60,9 @@ fn new_buffer(app: *App) bool {
     notice(app, "Buffer limit reached (16). Close a buffer first.")
     return false
   }
-  allocated := buffer.reserve(#sizeof(buffer.Document) + buffer.Capacity + 129)
-  if !allocated.ok {
-    notice(app, "Cannot allocate document.")
-    return false
-  }
+  allocated := mem.arena_create(#sizeof(buffer.Document) + buffer.Capacity + 129)
   slot := &app.documents.slots[index]
-  slot.arena = mem.arena_take(&allocated.arena)
+  slot.arena = mem.arena_take(&allocated)
   app.documents.next_identity += 1
   slot.identity = app.documents.next_identity
   if app.render_trace.enabled {
@@ -75,10 +71,10 @@ fn new_buffer(app: *App) bool {
   allocation_record(app, "document", #sizeof(buffer.Document) + buffer.Capacity + 129, slot.arena_born, false)
   slot.file_config = FileConfig{}
   slot.terminal = TerminalState{}
-  mem.zero((#cast(*u8) &slot.diagnostics)[..#sizeof(Diagnostics)])
+  mem.clear(&slot.diagnostics)
   slot.disk_changed = false
   slot.document = buffer.allocate(&slot.arena)
-  slot.colors = #alloc_slice_uninit_or_panic(u8, mem.arena_allocator(&slot.arena), buffer.Capacity + 1)
+  slot.colors = mem.push_bytes_uninit(&slot.arena, buffer.Capacity + 1)
   _ = buffer.load(slot.document, "")
   app.documents.count += 1
   activate(app, index)
@@ -101,7 +97,7 @@ fn document_release(app: *App, slot: *Slot) {
   if slot.document == nil {
     return
   }
-  _ = mem.arena_release(&slot.arena)
+  mem.arena_release(&slot.arena)
   allocation_record(app, "document", #sizeof(buffer.Document) + buffer.Capacity + 129, slot.arena_born, true)
   slot.document = nil
   slot.colors = slot.colors[..0]

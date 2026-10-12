@@ -265,13 +265,9 @@ fn plugin_run_command(app: *App, command_index: usize) {
     return
   }
   allocated := mem.arena_create(1048576)
-  if !allocated.ok {
-    notice(app, "Cannot allocate plugin request.")
-    return
-  }
-  defer _ = mem.arena_release(&allocated.arena)
-  message := (#cast(*u8) mem.arena_push_uninit_or_panic(&allocated.arena, 524288, 1))[..524288]
-  escaped := (#cast(*u8) mem.arena_push_uninit_or_panic(&allocated.arena, 524288, 1))[..524288]
+  defer mem.arena_release(&allocated)
+  message := mem.push_bytes_uninit(&allocated, 524288)
+  escaped := mem.push_bytes_uninit(&allocated, 524288)
   used: usize = 0
   add_text(message, &used, "{\"type\":\"command\",\"name\":")
   add_text(message, &used, json.write_string(escaped, command.name[..command.length]))
@@ -531,29 +527,27 @@ fn plugin_list(app: *App) {
     }
   }
   allocated := mem.arena_create(262144)
-  if allocated.ok {
-    catalog := plugin_catalog(app, &allocated.arena)
-    if catalog != nil {
-      add_text(text[..], &used, "\nAvailable from your catalog (not installed):\n")
-      candidate := catalog.first
-      for candidate != nil {
-        if json.is_string(candidate) && valid_leaf(candidate.key) {
-          installed: [4096]u8 = []
-          installed_length := copy_text(installed[..], directory[..length])
-          add_text(installed[..], &installed_length, "/")
-          add_text(installed[..], &installed_length, candidate.key)
-          add_text(installed[..], &installed_length, "/plugin.json")
-          if !files.metadata(installed[..installed_length]).ok {
-            add_text(text[..], &used, "  ")
-            add_text(text[..], &used, candidate.key)
-            add_text(text[..], &used, "\n")
-          }
+  catalog := plugin_catalog(app, &allocated)
+  if catalog != nil {
+    add_text(text[..], &used, "\nAvailable from your catalog (not installed):\n")
+    candidate := catalog.first
+    for candidate != nil {
+      if json.is_string(candidate) && valid_leaf(candidate.key) {
+        installed: [4096]u8 = []
+        installed_length := copy_text(installed[..], directory[..length])
+        add_text(installed[..], &installed_length, "/")
+        add_text(installed[..], &installed_length, candidate.key)
+        add_text(installed[..], &installed_length, "/plugin.json")
+        if !files.metadata(installed[..installed_length]).ok {
+          add_text(text[..], &used, "  ")
+          add_text(text[..], &used, candidate.key)
+          add_text(text[..], &used, "\n")
         }
-        candidate = candidate.next
       }
+      candidate = candidate.next
     }
-    _ = mem.arena_release(&allocated.arena)
   }
+  mem.arena_release(&allocated)
   add_text(text[..], &used, "\n:plugin-load /path/plugin.json\n:plugin-update <name>\n:plugin-install <catalog name or manifest path>\n:plugin-remove <name>\n:plugins-disable\n:plugin-log")
   notice(app, text[..used])
 }
@@ -671,11 +665,8 @@ fn plugin_install_named(app: *App, source: []const u8) {
     return
   }
   allocated := mem.arena_create(262144)
-  if !allocated.ok {
-    return
-  }
-  defer _ = mem.arena_release(&allocated.arena)
-  catalog := plugin_catalog(app, &allocated.arena)
+  defer mem.arena_release(&allocated)
+  catalog := plugin_catalog(app, &allocated)
   entry := json.object_get(catalog, source)
   if !json.is_string(entry) {
     notice(app, "Plugin name is not in plugin-catalog.json. Use an absolute manifest path, or add a name/path entry to your catalog.")

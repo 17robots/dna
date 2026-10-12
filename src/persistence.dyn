@@ -46,7 +46,7 @@ fn session_path(app: *App, argument: []const u8, output: []u8) []const u8 {
 fn session_capture(app: *App, state: *workspace.State, recovery: bool) bool {
   pane_init(app)
   pane_store(app)
-  mem.zero((#cast(*u8) state)[..#sizeof(workspace.State)])
+  mem.clear(state)
   state.project = app.workspace.project[..app.workspace.project_length]
   state.active = app.documents.active
   state.focused = app.view.focused
@@ -106,12 +106,8 @@ fn session_save(app: *App, argument: []const u8) bool {
   }
   snapshot_size := workspace.encoded_size(&state)
   allocated := mem.arena_create(snapshot_size)
-  if !allocated.ok {
-    notice(app, "Cannot allocate session snapshot.")
-    return false
-  }
-  defer _ = mem.arena_release(&allocated.arena)
-  bytes := (#cast(*u8) mem.arena_push_uninit_or_panic(&allocated.arena, snapshot_size, 1))[..snapshot_size]
+  defer mem.arena_release(&allocated)
+  bytes := mem.push_bytes_uninit(&allocated, snapshot_size)
   length := workspace.encode(&state, bytes)
   if length == 0 {
     notice(app, "Session exceeds snapshot capacity.")
@@ -152,18 +148,14 @@ fn session_restore(app: *App, argument: []const u8) bool {
   path := session_path(app, argument, path_storage[..])
   // Up to 16 documents with their saved text, plus layout and history metadata.
   session_limit: usize = (buffer.Capacity + 1) * 32 + 1048576
-  allocated := buffer.reserve(session_limit)
-  if !allocated.ok {
-    notice(app, "Cannot allocate session reader.")
-    return false
-  }
-  defer _ = mem.arena_release(&allocated.arena)
+  allocated := mem.arena_create(session_limit)
+  defer mem.arena_release(&allocated)
   info := files.metadata(path)
   if !info.ok || (info.mode & 61440) != 32768 {
     notice(app, "Session must be a regular file.")
     return false
   }
-  read := fs.read_all(&allocated.arena, path, session_limit)
+  read := fs.read_all(&allocated, path, session_limit)
   state := workspace.State{}
   if !read.ok || !workspace.decode(read.data, &state) {
     notice(app, "Invalid, truncated, or unsupported session. Workspace unchanged.")
@@ -179,12 +171,8 @@ fn session_restore(app: *App, argument: []const u8) bool {
   for index in 0..16 {
     saved := &state.buffers[index]
     if saved.used {
-      memory := buffer.reserve(#sizeof(buffer.Document) + buffer.Capacity + 129)
-      if !memory.ok {
-        notice(app, "Cannot allocate restored buffers. Workspace unchanged.")
-        return false
-      }
-      restored[index].arena = mem.arena_take(&memory.arena)
+      memory := mem.arena_create(#sizeof(buffer.Document) + buffer.Capacity + 129)
+      restored[index].arena = mem.arena_take(&memory)
       restored[index].document = buffer.allocate(&restored[index].arena)
       doc := restored[index].document
       if saved.reload {
@@ -252,7 +240,7 @@ fn session_restore(app: *App, argument: []const u8) bool {
         current.arena_born = render_clock()
       }
       allocation_record(app, "document", #sizeof(buffer.Document) + buffer.Capacity + 129, current.arena_born, false)
-      current.colors = (#cast(*u8) mem.arena_push_uninit_or_panic(&current.arena, buffer.Capacity + 1, 1))[..buffer.Capacity + 1]
+      current.colors = mem.push_bytes_uninit(&current.arena, buffer.Capacity + 1)
       current.disk_changed = false
       current.diagnostics.count = 0
       app.documents.next_identity += 1
@@ -313,7 +301,7 @@ fn cleanup_restored(documents: []RestoredDocument) {
   index: usize = 0
   for index < #len(documents) {
     if documents[index].document != nil {
-      _ = mem.arena_release(&documents[index].arena)
+      mem.arena_release(&documents[index].arena)
     }
     index += 1
   }
@@ -369,7 +357,7 @@ fn recovery_tick(app: *App) {
     return
   }
   defer work_finish(app, work, "recovery_encode")
-  bytes := (#cast(*u8) mem.arena_push_uninit_or_panic(&work.arena, snapshot_size, 1))[..snapshot_size]
+  bytes := mem.push_bytes_uninit(&work.arena, snapshot_size)
   encode_started := operation_begin(app)
   encoded_length := workspace.encode(&state, bytes)
   app.recovery.last_size = encoded_length

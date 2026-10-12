@@ -19,7 +19,7 @@
 ; function
 (fn name: (identifier) @function)
 (extern_fn name: (identifier) @function)
-[ "#allocator" "#AllocResult" "#alloc" "#alloc_or_panic" "#alloc_uninit" "#alloc_uninit_or_panic" "#alloc_slice" "#alloc_slice_or_panic" "#alloc_slice_uninit" "#alloc_slice_uninit_or_panic" "#alignof" "#bitcast" "#cast" "#len" "#panic" "#reverse" "#sizeof" "#syscall" "#typeof" ] @function.builtin
+[ "#alignof" "#assert" "#bitcast" "#cast" "#len" "#load" "#offsetof" "#panic" "#reverse" "#sizeof" "#syscall" "#typeof" ] @function.builtin
 (call (primary (identifier) @function))
 (call (primary (field_access (identifier) @function)))
 
@@ -34,6 +34,7 @@
 "return" @keyword.control.return
 
 (primitive) @type.builtin
+(type_parameter) @type
 
 ; label
 (break_ (identifier) @label)
@@ -63,8 +64,8 @@
 ; string
 (string_) @string
 (escape_sequence) @string.escape
-(use (string_) @string)
-(use alias: (identifier) @namespace)
+(import (string_) @string)
+(import alias: (identifier) @namespace)
 
 ; type
 (enum (identifier) @type)
