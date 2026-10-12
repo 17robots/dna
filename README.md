@@ -12,12 +12,12 @@ font, and desktop display libraries for GUI mode. It does not run on Ubuntu
 24.04's glibc 2.39. See [PRERELEASE.md](PRERELEASE.md) before installing.
 
 ```sh
-mise use -g 'github:17robots/dna[prerelease=true,strip_components=1,bin_path=.]@0.1.0-preview.2'
+mise use -g 'github:17robots/dna[prerelease=true,strip_components=1,bin_path=.]@0.1.0-preview.6'
 dna path/to/file.dyn
 dna path/to/project
 ```
 
-Use `mise exec github:17robots/dna@0.1.0-preview.2 -- dna path/to/project`
+Use `mise exec github:17robots/dna@0.1.0-preview.6 -- dna path/to/project`
 if mise is not activated in your shell. The explicit `bin_path=.` selects the
 archive's launcher, which loads its bundled libraries. The Dyn SDK is needed to
 build DNA, but is not required to run this package. Language servers are
@@ -43,7 +43,7 @@ at the destination owner. Sparse document/App storage stays explicitly
 uninitialized, with the existing initialization and page-reclamation contracts.
 No generic allocator replaces concrete arenas that need reset, rewind or release.
 
-The [SDK migration guide](https://github.com/17robots/dyn/blob/v0.1.0-preview.20/docs/migrations/0.1.0-preview.20.md)
+The [SDK migration guide](https://github.com/17robots/dyn/blob/v0.1.0-preview.20/docs/migrations/0.1.0-preview.19.md)
 links the preview 16 allocation changes. To roll this migration back, revert its
 source, SDK and grammar/query changes together and rebuild the native adapters;
 document, session and configuration formats are unchanged.
