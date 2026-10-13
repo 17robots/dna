@@ -28,7 +28,7 @@ no separate mise plugin or registry entry is required.
 
 ## Dyn SDK migration
 
-DNA now targets Dyn 0.1.0-preview.22. Run `mise install`, then `just deps` to
+DNA now targets Dyn 0.1.0-preview.23. Run `mise install`, then `just deps` to
 rebuild native adapters and the language installer with the matching runtime.
 Existing language installations have independent pins: run
 `build/deps/install/bin/dna-language install dyn`, then `:language-reload` in an
@@ -43,7 +43,7 @@ at the destination owner. Sparse document/App storage stays explicitly
 uninitialized, with the existing initialization and page-reclamation contracts.
 No generic allocator replaces concrete arenas that need reset, rewind or release.
 
-The [SDK migration guide](https://github.com/17robots/dyn/blob/v0.1.0-preview.22/docs/migrations/0.1.0-preview.19.md)
+The [SDK migration guide](https://github.com/17robots/dyn/blob/v0.1.0-preview.23/docs/migrations/0.1.0-preview.19.md)
 links the preview 16 allocation changes. To roll this migration back, revert its
 source, SDK and grammar/query changes together and rebuild the native adapters;
 document, session and configuration formats are unchanged.
@@ -52,7 +52,7 @@ document, session and configuration formats are unchanged.
 
 Requirements: Linux x86-64, a working Dyn SDK, SDL3 development/runtime libraries,
 FreeType, HarfBuzz, PCRE2, utf8proc, libvterm, Tree-sitter (0.25+), and Fontconfig development libraries, CMake, Python 3.12+, a C compiler,
-and `just`. Tested with Dyn 0.1.0-preview.22, SDL 3.4.16 and SDL_ttf 3.2.2.
+and `just`. Tested with Dyn 0.1.0-preview.23, SDL 3.4.16 and SDL_ttf 3.2.2.
 `just build` downloads and builds pinned SDL_ttf into ignored `build/deps`.
 The build applies a small fix to avoid repeatedly shaping remaining lines when
 wrapping is disabled; its fingerprint also upgrades existing local builds.
@@ -68,7 +68,7 @@ SDK does not invalidate its executable cache when an external archive changes.
 `just build` uses the freshly rebuilt shared adapter. Regex selection uses the system PCRE2 library
 (`libpcre2-dev` on Debian/Ubuntu, `pcre2-devel` on Fedora, `pcre2` on Arch).
 
-Use the tested **Dyn 0.1.0-preview.22** version pinned in `mise.toml`. For daily development, `just run` uses
+Use the tested **Dyn 0.1.0-preview.23** version pinned in `mise.toml`. For daily development, `just run` uses
 cached debug builds and the 2 GiB memory guard. `dyn run src/` also reuses
 unchanged modules. Preview 7 fixes cache lookup through PATH and large aggregate
 code generation; this editor's full release build now completes in about seven
