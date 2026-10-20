@@ -10,7 +10,7 @@ enum FileAction { Create, CreateDirectory, Rename, Trash }
 
 struct FileEdit { kind: FileAction, name: [512]u8, original, length: usize }
 struct Explorer {
-  arena: mem.Arena,
+  arena: *mem.Arena,
   path: [4096]u8,
   context: ExplorerContext,
   document: *buffer.Document,
@@ -47,7 +47,7 @@ fn explorer_buffer_open(app: *App) {
     app.prompt_state.panel = Panel.Directory
     return
   }
-  // A fresh opening starts as one column again.
+  // A fresh opening starts without ancestor columns.
   explorer_context_restart(app)
   if app.explorer.document != nil && buffer.equal(app.directory_state.path[..app.directory_state.length], app.explorer.path[..app.explorer.path_length]) && !app.explorer.stale {
     app.prompt_state.panel = Panel.Directory
@@ -59,9 +59,10 @@ fn explorer_buffer_open(app: *App) {
 }
 fn explorer_load(app: *App) {
   if app.explorer.document == nil {
-    allocated := mem.arena_create(#sizeof(buffer.Document))
-    app.explorer.arena = mem.arena_take(&allocated)
-    app.explorer.document = buffer.allocate(&app.explorer.arena)
+    allocated := mem.arena_create((#sizeof(buffer.Document)) + mem.ArenaBufferOverhead)
+    app.explorer.arena = allocated
+    allocated = nil
+    app.explorer.document = buffer.allocate(app.explorer.arena)
     _ = buffer.load(app.explorer.document, "")
   }
   listing: [65536]u8 = []
@@ -398,7 +399,7 @@ fn explorer_apply(app: *App) {
         failed = true
         break
       }
-      if !fs.close(&created.file).ok {
+      if !fs.close(&created.value).ok {
         completed += 1
         failed = true
         break
@@ -610,7 +611,7 @@ fn explorer_column(ui: *UiState, app: *App, typography: *Typography, name: []con
   previous := ui.boxes[column].rect.height
   rows: usize = 8
   if previous > typography.line * 3.0 {
-    rows = #cast(usize) ((previous - 20.0 * scale) / typography.line) - 1
+    rows = #cast(usize, ((previous - 20.0 * scale) / typography.line)) - 1
   }
   first: usize = 0
   if rows > 2 && selected < #len(entries) && selected >= rows - 2 {
@@ -648,7 +649,7 @@ fn explorer_column_icons(renderer: rawptr, ui: *UiState, typography: *Typography
   if column == 0 {
     return
   }
-  clip := sdl.PixelRect{x: #cast(i32) ui.boxes[column].rect.x, y: #cast(i32) ui.boxes[column].rect.y, width: #cast(i32) ui.boxes[column].rect.width, height: #cast(i32) ui.boxes[column].rect.height}
+  clip := sdl.PixelRect{x: #cast(i32, ui.boxes[column].rect.x), y: #cast(i32, ui.boxes[column].rect.y), width: #cast(i32, ui.boxes[column].rect.width), height: #cast(i32, ui.boxes[column].rect.height)}
   if !sdl.clip(renderer, &clip) {
     #panic("explorer icon clip")
   }
@@ -677,75 +678,43 @@ fn draw_explorer(renderer: rawptr, app: *App, typography: *Typography, width: i3
   ui_panel_begin(ui, typography)
   scale := typography.scale
   padding := 14.0 * scale
-  rect := place_rect(app, SurfaceExplorer, width, height, 0.0, typography.scale, sdl.Rect{x: #cast(f32) width * 0.04, y: #cast(f32) height * 0.1, width: #cast(f32) width * 0.92, height: #cast(f32) height * 0.8})
-  docked := place_of(app, SurfaceExplorer).mode == settings.PlaceDock
-  // Overlays redraw the explorer each frame too; only a real reopening slides.
+  status: f32 = 0.0
+  if app.view.status_line {
+    status = typography.line
+  }
+  rect := place_rect(app, SurfaceExplorer, width, height, status, scale, window_popup_rect(width, height, status))
+  // Keep opening geometry fixed while the popup layer animates opacity.
   if ui.explorer_seen + 1 < ui.frame {
-    motion.snap(&ui.explorer_open, -12.0 * scale)
+    motion.snap(&ui.explorer_open, 0.0)
   }
   ui.explorer_seen = ui.frame
   slide := animated_value(app, &ui.explorer_open, 0.0, app.config.popup_animation_ms * 2.0, false)
-  // mini.files: the folders walked through stay as columns on the left of
-  // the edited one, with a preview on the right. Every column has the same
-  // width; the edited one has an accent border. The popup keeps its left
-  // edge and height while open, growing rightwards; when full, the oldest
-  // columns slide off the left.
+  // Keep the outer frame fixed. Fit the newest ancestor columns beside
+  // the editable folder and optional preview, without overflowing on resize.
   gap := 8.0 * scale
-  column_width := rect.width * 0.22
-  if column_width < typography.cell * 22.0 {
-    column_width = typography.cell * 22.0
+  minimum := typography.cell * 22.0
+  slots: usize = 1
+  for slots < 4 && #cast(f32, (slots + 1)) * minimum + #cast(f32, slots) * gap <= rect.width {
+    slots += 1
   }
-  slot := column_width + gap
   context := &app.explorer.context
-  preview := app.config.explorer_preview
+  preview := app.config.explorer_preview && slots >= 2
   if preview {
     explorer_context_preview(app)
   }
-  fixed := 1.0
+  fixed: usize = 1
   if preview {
-    fixed = 2.0
+    fixed = 2
   }
   shown := context.trail_count
-  for shown > 0 && #cast(f32) (shown) * slot + fixed * slot - gap > rect.width {
-    shown -= 1
+  if shown > slots - fixed {
+    shown = slots - fixed
   }
-  total := (#cast(f32) shown + fixed) * slot - gap
-  if !docked {
-    if !context.placed {
-      // First frame: centre the single column and preview, then stay.
-      context.origin_x = rect.x + (rect.width - total) / 2.0
-      fitted := typography.line * 22.0 + padding * 2.0
-      if fitted > rect.height {
-        fitted = rect.height
-      }
-      context.fixed_height = fitted
-      context.placed = true
-      context.drawn_trail = context.trail_count
-    }
-    // Growing past the right edge moves the left edge only as far as needed.
-    if context.origin_x + total > rect.x + rect.width {
-      context.origin_x = rect.x + rect.width - total
-    }
-    if context.origin_x < rect.x {
-      context.origin_x = rect.x
-    }
-    rect.x = context.origin_x
-    rect.width = total
-    rect.height = context.fixed_height
-  }
-  // A full popup that walked in or out shifts its contents by a column:
-  // start them where they were and ease into place.
-  if context.drawn_trail != context.trail_count {
-    if shown < context.trail_count || shown < context.drawn_trail {
-      steps := #cast(f32) context.trail_count - #cast(f32) context.drawn_trail
-      motion.snap(&context.slide, steps * slot)
-    }
-    context.drawn_trail = context.trail_count
-  }
-  shift := animated_value(app, &context.slide, 0.0, app.config.popup_animation_ms * 2.0, false)
+  columns := shown + fixed
+  column_width := (rect.width - #cast(f32, (columns - 1)) * gap) / #cast(f32, columns)
   root := ui_make(ui, ui_hash(0, "explorer"), UiFloating)
   ui.boxes[root].axis = UiAxisX
-  ui.boxes[root].floating[0] = rect.x + shift
+  ui.boxes[root].floating[0] = rect.x
   ui.boxes[root].floating[1] = rect.y + slide
   ui_size(ui, root, UiAxisX, UiSizeKind.Pixels, rect.width / scale, 1.0)
   ui_size(ui, root, UiAxisY, UiSizeKind.Pixels, rect.height / scale, 1.0)
@@ -794,7 +763,7 @@ fn draw_explorer(renderer: rawptr, app: *App, typography: *Typography, width: i3
   }
   if preview_body != 0 {
     area := ui.boxes[preview_body].rect
-    preview_clip := sdl.PixelRect{x: #cast(i32) area.x, y: #cast(i32) area.y, width: #cast(i32) area.width, height: #cast(i32) area.height}
+    preview_clip := sdl.PixelRect{x: #cast(i32, area.x), y: #cast(i32, area.y), width: #cast(i32, area.width), height: #cast(i32, area.height)}
     if !sdl.clip(renderer, &preview_clip) {
       #panic("file preview clip")
     }
@@ -804,7 +773,7 @@ fn draw_explorer(renderer: rawptr, app: *App, typography: *Typography, width: i3
     }
   }
   rect = ui.boxes[main].rect
-  outer_clip := sdl.PixelRect{x: #cast(i32) rect.x, y: #cast(i32) rect.y, width: #cast(i32) rect.width, height: #cast(i32) rect.height}
+  outer_clip := sdl.PixelRect{x: #cast(i32, rect.x), y: #cast(i32, rect.y), width: #cast(i32, rect.width), height: #cast(i32, rect.height)}
   if !sdl.clip(renderer, &outer_clip) {
     #panic("explorer header clip")
   }
@@ -843,8 +812,8 @@ fn draw_explorer(renderer: rawptr, app: *App, typography: *Typography, width: i3
     head = buffer.head(doc)
   }
   caret := measure_position(doc, typography, head)
-  x := #cast(f32) caret.x
-  y := #cast(f32) (line_at(doc, head) - 1) * typography.line
+  x := #cast(f32, caret.x)
+  y := #cast(f32, (line_at(doc, head) - 1)) * typography.line
   if x < app.explorer.scroll_x {
     app.explorer.scroll_x = x
   }
@@ -879,7 +848,7 @@ fn draw_explorer(renderer: rawptr, app: *App, typography: *Typography, width: i3
     typography.directory_start = viewport.start
     typography.directory_end = viewport.end
   }
-  gutter_clip := sdl.PixelRect{x: #cast(i32) (rect.x + padding), y: #cast(i32) top, width: #cast(i32) gutter, height: #cast(i32) body_height}
+  gutter_clip := sdl.PixelRect{x: #cast(i32, (rect.x + padding)), y: #cast(i32, top), width: #cast(i32, gutter), height: #cast(i32, body_height)}
   if app.view.line_numbers {
     if !sdl.clip(renderer, &gutter_clip) {
       #panic("explorer gutter clip")
@@ -887,7 +856,7 @@ fn draw_explorer(renderer: rawptr, app: *App, typography: *Typography, width: i3
     draw_gutter(doc, typography, origin - icon_width, top, top + body_height, scroll_y, app.view.relative_numbers, head)
   }
   if app.config.explorer_icons {
-    icon_clip := sdl.PixelRect{x: #cast(i32) (origin - icon_width), y: #cast(i32) top, width: #cast(i32) icon_width, height: #cast(i32) body_height}
+    icon_clip := sdl.PixelRect{x: #cast(i32, (origin - icon_width)), y: #cast(i32, top), width: #cast(i32, icon_width), height: #cast(i32, body_height)}
     if !sdl.clip(renderer, &icon_clip) {
       #panic("icon clip")
     }
@@ -898,13 +867,13 @@ fn draw_explorer(renderer: rawptr, app: *App, typography: *Typography, width: i3
       name := doc.bytes[at..ending]
       directory := #len(name) > 0 && name[#len(name) - 1] == 47
       if #len(name) > 0 {
-        explorer_icon(renderer, typography, name, directory, origin - icon_width, top + #cast(f32) row * typography.line - scroll_y)
+        explorer_icon(renderer, typography, name, directory, origin - icon_width, top + #cast(f32, row) * typography.line - scroll_y)
       }
       at = ending + 1
       row += 1
     }
   }
-  clip := sdl.PixelRect{x: #cast(i32) origin, y: #cast(i32) top, width: #cast(i32) available, height: #cast(i32) body_height}
+  clip := sdl.PixelRect{x: #cast(i32, origin), y: #cast(i32, top), width: #cast(i32, available), height: #cast(i32, body_height)}
   if clip.width < 1 {
     clip.width = 1
   }
@@ -935,7 +904,8 @@ fn draw_explorer(renderer: rawptr, app: *App, typography: *Typography, width: i3
 
 fn explorer_release(app: *App) {
   if app.explorer.document != nil {
-    mem.arena_release(&app.explorer.arena)
+    mem.arena_release(app.explorer.arena)
+    app.explorer.arena = nil
     app.explorer.document = nil
   }
 }
@@ -955,7 +925,7 @@ fn explorer_mouse(app: *App, typography: *Typography, x: f32, y: f32, pressed: b
     return
   }
   if ui_contains(ui.explorer_body, x, y) {
-    row := #cast(usize) ((y - ui.explorer_top + ui.explorer_scroll) / typography.line)
+    row := #cast(usize, ((y - ui.explorer_top + ui.explorer_scroll) / typography.line))
     if row >= doc.line_count {
       return
     }

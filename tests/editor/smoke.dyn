@@ -106,7 +106,7 @@ fn workflow_smoke(app: *App, typography: *Typography) {
   }
   width: i32 = 0
   height: i32 = 0
-  if !ttf.size(typography.document, &width, &height) || #cast(f32) height < typography.line * 2.0 {
+  if !ttf.size(typography.document, &width, &height) || #cast(f32, height) < typography.line * 2.0 {
     #panic("multiline geometry")
   }
   typography.points = 30.0
@@ -128,7 +128,7 @@ fn whitespace_smoke(app: *App, typography: *Typography) {
     #panic("space text update")
   }
   first := ttf.Substring{}
-  if !ttf.substring(typography.document, #cast(i32) doc.cursor, &first) {
+  if !ttf.substring(typography.document, #cast(i32, doc.cursor), &first) {
     #panic("space cursor")
   }
   text_input(app, " ")
@@ -136,7 +136,7 @@ fn whitespace_smoke(app: *App, typography: *Typography) {
     #panic("second space update")
   }
   second := ttf.Substring{}
-  if !ttf.substring(typography.document, #cast(i32) doc.cursor, &second) || second.x <= first.x {
+  if !ttf.substring(typography.document, #cast(i32, doc.cursor), &second) || second.x <= first.x {
     #panic("trailing space must advance cursor")
   }
   text_input(app, "\n    ")
@@ -145,10 +145,10 @@ fn whitespace_smoke(app: *App, typography: *Typography) {
   }
   indent := ttf.Substring{}
   space := ttf.Substring{}
-  if !ttf.substring(typography.document, #cast(i32) doc.cursor, &indent) || indent.x <= 0 || indent.y <= second.y {
+  if !ttf.substring(typography.document, #cast(i32, doc.cursor), &indent) || indent.x <= 0 || indent.y <= second.y {
     #panic("indentation must advance cursor")
   }
-  if !ttf.substring(typography.document, #cast(i32) doc.cursor - 1, &space) || space.width <= 0 {
+  if !ttf.substring(typography.document, #cast(i32, doc.cursor) - 1, &space) || space.width <= 0 {
     #panic("selected trailing space must have width")
   }
   if !buffer.equal(doc.bytes[..doc.length], "a  \n    ") {
@@ -208,7 +208,7 @@ fn session_smoke(app: *App, typography: *Typography) {
     #panic("hidden dirty buffer quit")
   }
   key_input(app, typography, 27, 0)
-  _ = buffer.load(app.documents.current, app.documents.current.saved[..app.documents.current.saved_length])
+  _ = buffer.load(app.documents.current, buffer.saved_text(app.documents.current)[..app.documents.current.saved_length])
   next_buffer(app, false)
   close_clean(app)
   app.view.scroll_y = 0.0
@@ -749,8 +749,8 @@ fn viewport_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Typo
     _ = sdl.size(renderer, &output_width, &output_height)
     outputs[step] = output_height
     draw(renderer, window, app, typography)
-    caret_top := #cast(f32) (line_at(doc, doc.cursor) - 1) * typography.line
-    if typography.document_end != doc.length || caret_top < app.view.scroll_y || caret_top + typography.line > app.view.scroll_y + #cast(f32) output_height {
+    caret_top := #cast(f32, (line_at(doc, doc.cursor) - 1)) * typography.line
+    if typography.document_end != doc.length || caret_top < app.view.scroll_y || caret_top + typography.line > app.view.scroll_y + #cast(f32, output_height) {
       #panic("resized window must keep the caret line visible")
     }
   }
@@ -2354,6 +2354,10 @@ fn project_tools_smoke(renderer: rawptr, window: rawptr, app: *App, typography: 
     #panic("project search results")
   }
   draw(renderer, window, app, typography)
+  key_input(app, typography, KeyEscape, 0)
+  if app.prompt_state.panel != Panel.None {
+    #panic("Escape closes completed project search")
+  }
   project_search_accept(app)
   if app.prompt_state.panel != Panel.None || !buffer.equal(app.documents.current.bytes[buffer.start(app.documents.current)..buffer.end(app.documents.current)], "needle") {
     #panic("search navigation")
@@ -2422,6 +2426,18 @@ fn project_tools_smoke(renderer: rawptr, window: rawptr, app: *App, typography: 
     #panic(":equalize restores thirds")
   }
   pane_only(app)
+  // Enter closes an empty result list and cancels outstanding worker work.
+  project_search_open(app)
+  text_input(app, "no_such_project_match_12345")
+  key_input(app, typography, KeyReturn, 0)
+  if app.prompt_state.panel != Panel.None {
+    #panic("Enter dismisses empty project search")
+  }
+  project_search_open(app)
+  key_input(app, typography, KeyEscape, 0)
+  if app.prompt_state.panel != Panel.None {
+    #panic("Escape dismisses project search")
+  }
   app.workspace.project_length = copy_text(app.workspace.project[..], old_project[..old_length])
   activate(app, original_active)
   app.prompt_state.panel = Panel.None
@@ -2433,12 +2449,12 @@ fn persistence_smoke() {
   if !fixture.ok || !fixture.found {
     return
   }
-  owner := mem.arena_create(#sizeof(App) + 128)
-  temporary := mem.arena_create(2097152)
-  defer mem.arena_release(&owner)
-  defer mem.arena_release(&temporary)
-  test_app := #cast(*App) mem.arena_push(&owner, #sizeof(App), #alignof(App))
-  test_app.scratch = &temporary
+  owner := mem.arena_create((#sizeof(App) + 128) + mem.ArenaBufferOverhead)
+  temporary := mem.arena_create((2097152) + mem.ArenaBufferOverhead)
+  defer mem.arena_release(owner)
+  defer mem.arena_release(temporary)
+  test_app := #cast(*App, mem.arena_push(owner, #sizeof(App), #alignof(App)))
+  test_app.scratch = temporary
   test_app.config = settings.Settings{}
   defer release_editor_state(test_app)
   test_app.workspace.project_length = copy_text(test_app.workspace.project[..], fixture.value)
@@ -2465,7 +2481,7 @@ fn persistence_smoke() {
   if test_app.prompt_state.panel != Panel.None || !buffer.equal(test_app.documents.current.bytes[..test_app.documents.current.length], "saved edits α") || !buffer.dirty(test_app.documents.current) || !test_app.view.panes[0].branch || !buffer.equal(test_app.documents.slots[0].filetype[..test_app.documents.slots[0].filetype_length], "dyn") {
     #panic("session restore")
   }
-  if !buffer.equal(test_app.documents.current.saved[..test_app.documents.current.saved_length], "saved") {
+  if !buffer.equal(buffer.saved_text(test_app.documents.current)[..test_app.documents.current.saved_length], "saved") {
     #panic("session saved baseline")
   }
   buffer.mark_saved(test_app.documents.current)
@@ -2481,7 +2497,7 @@ fn persistence_smoke() {
   add_text(layout_path[..], &layout_length, "/saved-layout.toml")
   layout_save(test_app, layout_path[..layout_length])
   layout_read := fs.read_all(test_app.scratch, layout_path[..layout_length], 4096)
-  if !layout_read.ok || layout.parse(layout_read.data).node_count != 5 {
+  if !layout_read.ok || layout.parse(layout_read.value).node_count != 5 {
     #panic("layout save roundtrip")
   }
   buffer.mark_saved(test_app.documents.current)
@@ -2498,12 +2514,12 @@ fn plugin_host_smoke(typography: *Typography) {
   if !fixture.ok || !fixture.found {
     return
   }
-  owner := mem.arena_create(#sizeof(App) + 128)
-  temporary := mem.arena_create(2097152)
-  defer mem.arena_release(&owner)
-  defer mem.arena_release(&temporary)
-  test_app := #cast(*App) mem.arena_push(&owner, #sizeof(App), #alignof(App))
-  test_app.scratch = &temporary
+  owner := mem.arena_create((#sizeof(App) + 128) + mem.ArenaBufferOverhead)
+  temporary := mem.arena_create((2097152) + mem.ArenaBufferOverhead)
+  defer mem.arena_release(owner)
+  defer mem.arena_release(temporary)
+  test_app := #cast(*App, mem.arena_push(owner, #sizeof(App), #alignof(App)))
+  test_app.scratch = temporary
   test_app.config = settings.Settings{}
   defer release_editor_state(test_app)
   defer plugin_release(test_app)
@@ -2590,7 +2606,7 @@ fn plugin_host_smoke(typography: *Typography) {
   catalog_json: [16384]u8 = []
   quoted_path: [12288]u8 = []
   catalog_used := copy_text(catalog_json[..], "{\"uppercase\":")
-  add_text(catalog_json[..], &catalog_used, json.write_string(quoted_path[..], manifest.value))
+  add_text(catalog_json[..], &catalog_used, lsp_json_string(quoted_path[..], manifest.value))
   add_text(catalog_json[..], &catalog_used, "}")
   if !fs.write_all(catalog_path[..catalog_length], catalog_json[..catalog_used]).ok {
     #panic("plugin catalog fixture")

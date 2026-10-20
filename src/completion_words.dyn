@@ -67,8 +67,8 @@ fn completion_words(app: *App) {
   if count == 0 {
     return
   }
-  allocated := mem.arena_create(262144)
-  output := mem.push_bytes_uninit(&allocated, 32768)
+  allocated := mem.arena_create((262144) + mem.ArenaBufferOverhead)
+  output := mem.push_bytes_uninit(allocated, 32768)
   used: usize = 0
   escaped: [1024]u8 = []
   add_text(output, &used, "[")
@@ -77,20 +77,21 @@ fn completion_words(app: *App) {
       add_text(output, &used, ",")
     }
     add_text(output, &used, "{\"label\":")
-    add_text(output, &used, json.write_string(escaped[..], words[index]))
+    add_text(output, &used, lsp_json_string(escaped[..], words[index]))
     add_text(output, &used, ",\"detail\":\"word from file\"}")
   }
   add_text(output, &used, "]")
-  parsed := json.parse(&allocated, output[..used])
+  parsed := json.parse(allocated, output[..used])
   if !parsed.ok {
-    mem.arena_release(&allocated)
+    mem.arena_release(allocated)
     return
   }
   lsp_results_release(app)
   state := &app.lsp.results
-  state.arena = mem.arena_take(&allocated)
+  state.arena = allocated
+  allocated = nil
   state.owned = true
-  state.tracked_capacity = mem.arena_capacity(&state.arena)
+  state.tracked_capacity = mem.arena_capacity(state.arena)
   state.tracked_born = render_clock()
   allocation_record(app, "lsp_results", state.tracked_capacity, state.tracked_born, false)
   state.kind = 1

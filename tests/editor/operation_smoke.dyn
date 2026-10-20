@@ -1,11 +1,11 @@
 // Exercise production ownership, invalidation, and deadlines through their callers.
 fn operations_smoke() {
-  owner := mem.arena_create(#sizeof(App) + 128)
-  scratch := mem.arena_create(2097152)
-  defer mem.arena_release(&owner)
-  defer mem.arena_release(&scratch)
-  app := #cast(*App) mem.arena_push(&owner, #sizeof(App), #alignof(App))
-  app.scratch = &scratch
+  owner := mem.arena_create((#sizeof(App) + 128) + mem.ArenaBufferOverhead)
+  scratch := mem.arena_create((2097152) + mem.ArenaBufferOverhead)
+  defer mem.arena_release(owner)
+  defer mem.arena_release(scratch)
+  app := #cast(*App, mem.arena_push(owner, #sizeof(App), #alignof(App)))
+  app.scratch = scratch
   settings.defaults(&app.config)
   app.workspace.project_length = copy_text(app.workspace.project[..], "/tmp")
   defer operations_release(app)
@@ -33,7 +33,7 @@ fn operations_smoke() {
   }
   work_drop(app, work, "lsp_receive")
   work_drop(app, work, "lsp_receive")
-  if work.capacity != 0 || work.born != 0 || mem.arena_capacity(&work.arena) != 0 || app.operations.reserved != reserved || app.operations.releases != releases + 2 {
+  if work.capacity != 0 || work.born != 0 || work.arena != nil || app.operations.reserved != reserved || app.operations.releases != releases + 2 {
     #panic("workspace release accounting")
   }
   log: []const u8 = "{\"jsonrpc\":\"2.0\",\"method\":\"window/logMessage\",\"params\":{\"message\":\"background\"}}"
@@ -43,7 +43,7 @@ fn operations_smoke() {
     if !work_acquire(app, work, 131072, "lsp_receive") {
       #panic("receive pool")
     }
-    retained := lsp_handle(app, 0, log, &work.arena)
+    retained := lsp_handle(app, 0, log, work.arena)
     lsp_receive_finish(app, work, retained)
     if retained || app.render_trace.pending != 0 {
       #panic("log-only message repainted")
@@ -55,14 +55,14 @@ fn operations_smoke() {
   }
   diagnostic: []const u8 = "{\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"file:///tmp/dna-operation.dyn\",\"diagnostics\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"severity\":1,\"message\":\"error\"}]}}"
   _ = work_acquire(app, work, 131072, "lsp_receive")
-  _ = lsp_handle(app, 0, diagnostic, &work.arena)
+  _ = lsp_handle(app, 0, diagnostic, work.arena)
   work_finish(app, work, "lsp_receive")
   if (app.render_trace.pending & RenderLsp) == 0 {
     #panic("visible diagnostics did not repaint")
   }
   app.render_trace.pending = 0
   _ = work_acquire(app, work, 131072, "lsp_receive")
-  _ = lsp_handle(app, 0, diagnostic, &work.arena)
+  _ = lsp_handle(app, 0, diagnostic, work.arena)
   work_finish(app, work, "lsp_receive")
   if app.render_trace.pending != 0 {
     #panic("duplicate diagnostics repainted")
@@ -72,7 +72,7 @@ fn operations_smoke() {
   }
   app.documents.slots[0].diagnostics.count = 0
   _ = work_acquire(app, work, 131072, "lsp_receive")
-  _ = lsp_handle(app, 0, diagnostic, &work.arena)
+  _ = lsp_handle(app, 0, diagnostic, work.arena)
   work_finish(app, work, "lsp_receive")
   if app.documents.slots[0].diagnostics.count != 1 || app.render_trace.pending != 0 {
     #panic("hidden diagnostics update")
@@ -88,13 +88,13 @@ fn operations_smoke() {
   app.lsp.insert = app.view.insert
   reply: []const u8 = "{\"id\":9,\"result\":[{\"label\":\"retained\"}]}"
   _ = work_acquire(app, work, 131072, "lsp_receive")
-  kept := lsp_handle(app, 0, reply, &work.arena)
+  kept := lsp_handle(app, 0, reply, work.arena)
   lsp_receive_finish(app, work, kept)
   if !kept || work.capacity != 0 || app.lsp.results.count != 1 {
     #panic("result ownership transfer")
   }
   _ = work_acquire(app, work, 131072, "lsp_receive")
-  _ = lsp_handle(app, 0, log, &work.arena)
+  _ = lsp_handle(app, 0, log, work.arena)
   work_finish(app, work, "lsp_receive")
   if !buffer.equal(json_text(app.lsp.results.items[0], "label"), "retained") {
     #panic("pooled message corrupted retained result")
@@ -232,9 +232,9 @@ fn syntax_budget_smoke() {
   if !configured.ok || !configured.found {
     return
   }
-  owned := mem.arena_create(#sizeof(App) + 128)
-  defer mem.arena_release(&owned)
-  app := #cast(*App) mem.arena_push(&owned, #sizeof(App), #alignof(App))
+  owned := mem.arena_create((#sizeof(App) + 128) + mem.ArenaBufferOverhead)
+  defer mem.arena_release(owned)
+  app := #cast(*App, mem.arena_push(owned, #sizeof(App), #alignof(App)))
   defer release_editor_state(app)
   defer syntax_release(app)
   name: [5]u8 = [106, 115, 111, 110, 0]
@@ -248,7 +248,7 @@ fn syntax_budget_smoke() {
     if slot.syntax == nil {
       #panic("syntax budget parser")
     }
-    slot.syntax_used = #cast(u64) index + 1
+    slot.syntax_used = #cast(u64, index) + 1
     _ = buffer.load(slot.document, "{}")
     buffer.move_to(slot.document, 2, false)
     _ = buffer.replace(slot.document, " ")

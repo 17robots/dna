@@ -1,0 +1,94 @@
+// Ordinary lines use fixed-base blocks: 256 u16 offsets plus one u32 base.
+// Biasing the base gives insert/delete headroom. Long spans or large shifts
+// fall back to full u32 offsets before modifying the live index.
+const LineBlock: usize = 256
+const LineBlockBytes: usize = 516
+fn line_index_bytes(document: *const Document) usize {
+  if document.line_width == 2 {
+    return document.line_blocks * LineBlockBytes
+  }
+  return document.line_count * 4
+}
+fn line_offset(document: *const Document, row: usize) usize {
+  if document.line_width == 4 {
+    return #cast(usize, (#cast(*const u32, &document.line_storage[row * 4])).*)
+  }
+  block := (row / LineBlock) * LineBlockBytes
+  base := #cast(usize, (#cast(*const u32, &document.line_storage[block])).*)
+  relative := #cast(usize, (#cast(*const u16, &document.line_storage[block + 4 + (row % LineBlock) * 2])).*)
+  return base + relative
+}
+fn line_fits(document: *Document, row: usize, value: usize) bool {
+  if document.line_width == 4 {
+    return true
+  }
+  block := row / LineBlock
+  for document.line_blocks <= block {
+    base: usize = 0
+    if value > 32768 {
+      base = value - 32768
+    }
+    destination := #cast(*u32, &document.line_storage[document.line_blocks * LineBlockBytes])
+    destination.* = #cast(u32, base)
+    document.line_blocks += 1
+  }
+  base := #cast(usize, (#cast(*const u32, &document.line_storage[block * LineBlockBytes])).*)
+  return value >= base && value - base <= 65535
+}
+fn line_write(document: *Document, row: usize, value: usize) {
+  if document.line_width == 4 {
+    destination := #cast(*u32, &document.line_storage[row * 4])
+    destination.* = #cast(u32, value)
+    return
+  }
+  block := (row / LineBlock) * LineBlockBytes
+  base := #cast(usize, (#cast(*const u32, &document.line_storage[block])).*)
+  destination := #cast(*u16, &document.line_storage[block + 4 + (row % LineBlock) * 2])
+  destination.* = #cast(u16, (value - base))
+}
+fn line_widen(document: *Document) {
+  // The first packed relative overlaps the second unpacked slot. Keep row 0
+  // aside; reverse traversal protects every other still-packed source.
+  first := line_offset(document, 0)
+  for row in #reverse(1..document.line_count) {
+    value := line_offset(document, row)
+    destination := #cast(*u32, &document.line_storage[row * 4])
+    destination.* = #cast(u32, value)
+  }
+  destination := #cast(*u32, &document.line_storage[0])
+  destination.* = #cast(u32, first)
+  document.line_width = 4
+}
+// With row identities unchanged, shift only the packed relative values. Block
+// bounds were checked by replace_lines, so wrapping arithmetic is exact here.
+fn line_shift(document: *Document, first: usize, removed: usize, inserted: usize) {
+  if first >= document.line_count || removed == inserted {
+    return
+  }
+  amount: u16 = 0
+  increasing := inserted > removed
+  if increasing {
+    amount = #cast(u16, (inserted - removed))
+  }
+  else {
+    amount = #cast(u16, (removed - inserted))
+  }
+  row := first
+  for row < document.line_count {
+    count := LineBlock - row % LineBlock
+    if count > document.line_count - row {
+      count = document.line_count - row
+    }
+    address := (row / LineBlock) * LineBlockBytes + 4 + (row % LineBlock) * 2
+    entries := (#cast(*u16, &document.line_storage[address]))[..count]
+    for i in 0..count {
+      if increasing {
+        entries[i] = #wrap(entries[i] + amount)
+      }
+      else {
+        entries[i] = #wrap(entries[i] - amount)
+      }
+    }
+    row += count
+  }
+}

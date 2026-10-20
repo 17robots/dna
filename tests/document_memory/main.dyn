@@ -12,24 +12,26 @@ fn phase(label: []const u8) {
   }
 }
 fn main() {
-  text := mem.arena_create(Size)
-  defer mem.arena_release(&text)
-  _ = memory_test_fill(&text.data[0], 97, Size, Size + 1)
-  owners: [8]mem.Arena = []
+  text := mem.arena_create(Size + mem.ArenaBufferOverhead)
+  defer mem.arena_release(text)
+  payload := mem.push_bytes_uninit(text, Size)
+  _ = memory_test_fill(&payload[0], 97, Size, Size + 1)
+  owners: [8]*mem.Arena = []
   documents: [8]*buffer.Document = []
   defer {
     for index in 0..8 {
-      mem.arena_release(&owners[index])
+      mem.arena_release(owners[index])
     }
   }
   for index in 0..8 {
-    owner := mem.arena_create(#sizeof(buffer.Document))
-    owners[index] = mem.arena_take(&owner)
-    documents[index] = buffer.allocate(&owners[index])
+    owner := mem.arena_create(#sizeof(buffer.Document) + mem.ArenaBufferOverhead)
+    owners[index] = owner
+    owner = nil
+    documents[index] = buffer.allocate(owners[index])
   }
   phase("empty\n")
   for index in 0..8 {
-    _ = buffer.load(documents[index], text.data)
+    _ = buffer.load(documents[index], payload)
   }
   phase("clean\n")
   for index in 0..8 {
@@ -41,7 +43,7 @@ fn main() {
     // Saving midway through a group must retain its older undo baseline.
     buffer.mark_saved(doc)
     _ = buffer.replace(doc, "?")
-    if doc.saved[0] != 'x' || doc.saved[1] != 'a' || doc.checkpoint_bytes[0] != 'a' {
+    if buffer.saved_text(doc)[0] != 'x' || buffer.saved_text(doc)[1] != 'a' || buffer.checkpoint_text(doc)[0] != 'a' {
       #panic("save within edit group corrupts baseline")
     }
     buffer.checkpoint(doc)
@@ -87,10 +89,53 @@ fn main() {
     _ = buffer.load(documents[index], "tiny\n")
   }
   phase("tiny_after_history\n")
+  // Keep dirty text and distinct undo groups across thousands of distant edits.
+  // The original saved bytes remain an independent oracle throughout the run.
+  dirty_document := documents[0]
+  _ = buffer.load(dirty_document, payload)
+  phase("sustained_clean\n")
+  for batch in 0..4 {
+    for step in 0..1000 {
+      position := (batch * 1000 + step) * 997 % Size
+      dirty_document.cursor = position
+      dirty_document.anchor = position + 1
+      _ = buffer.replace(dirty_document, "z")
+      buffer.checkpoint(dirty_document)
+    }
+    if !buffer.dirty(dirty_document) || dirty_document.history_count != 64 || !buffer.saved_equal(dirty_document, payload) {
+      #panic("sustained edits corrupt saved text or history bounds")
+    }
+    if batch == 0 {
+      phase("dirty_1000\n")
+    }
+  }
+  phase("dirty_4000\n")
+  for step in 0..63 {
+    buffer.undo(dirty_document)
+  }
+  for step in 0..63 {
+    buffer.redo(dirty_document)
+  }
+  for position in 0..Size {
+    expected: u8 = 'a'
+    // All 4,000 positions are distinct and below Size.
+    if position % 997 == 0 && position / 997 < 4000 {
+      expected = 'z'
+    }
+    if dirty_document.bytes[position] != expected {
+      #panic("sustained undo/redo text")
+    }
+  }
+  if !buffer.saved_equal(dirty_document, payload) {
+    #panic("sustained undo/redo saved text")
+  }
+  phase("dirty_redo\n")
+  _ = buffer.load(dirty_document, "tiny\n")
+  phase("tiny_after_dirty\n")
   // A newline-dense file commits a much larger line index than ordinary text.
-  _ = memory_test_fill(&text.data[0], 10, Size, Size + 1)
+  _ = memory_test_fill(&payload[0], 10, Size, Size + 1)
   for index in 0..8 {
-    _ = buffer.load(documents[index], text.data)
+    _ = buffer.load(documents[index], payload)
     if documents[index].line_count != Size + 1 {
       #panic("large line index")
     }

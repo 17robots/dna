@@ -51,7 +51,7 @@ fn rec_wait(wake: rawptr, lock: rawptr) {
 fn rec_signal(wake: rawptr) {
   dna_condition_signal(wake)
 }
-fn rec_thread(entry: *fn(rawptr) i32, state: rawptr) rawptr {
+fn rec_thread(entry: fn(rawptr) i32, state: rawptr) rawptr {
   return dna_thread_create(entry, state)
 }
 fn rec_join(thread: rawptr, status: *i32) {
@@ -112,7 +112,7 @@ fn rec_snapshot(path: *const u8, bytes: *const u8, length: usize) bool {
       ok = false
       break
     }
-    offset += #cast(usize) written
+    offset += #cast(usize, written)
   }
   if rec_sync(fd) != 0 {
     ok = false
@@ -175,7 +175,7 @@ fn rec_path(state: *RecoveryWorker) bool {
   return true
 }
 fn rec_worker(context: rawptr) i32 {
-  state := #cast(*RecoveryWorker) context
+  state := #cast(*RecoveryWorker, context)
   for true {
     rec_lock(state.lock)
     for !state.stop && state.pending == nil {
@@ -194,11 +194,11 @@ fn rec_worker(context: rawptr) i32 {
     ok := rec_path(state) && rec_snapshot(&state.path[0], bytes, length)
     rec_lock(state.lock)
     if capacity <= 2097152 && capacity > state.spare_capacity {
-      rec_free(#cast(rawptr) state.spare)
+      rec_free(#cast(rawptr, state.spare))
       state.spare = bytes
       state.spare_capacity = capacity
     } else {
-      rec_free(#cast(rawptr) bytes)
+      rec_free(#cast(rawptr, bytes))
     }
     state.error = state.error || !ok
     rec_unlock(state.lock)
@@ -216,7 +216,7 @@ pub fn dna_recovery_open(directory: *const u8) *RecoveryWorker {
   if size > 4000 {
     return nil
   }
-  state := #cast(*RecoveryWorker) rec_alloc(1, #sizeof(RecoveryWorker))
+  state := #cast(*RecoveryWorker, rec_alloc(1, #sizeof(RecoveryWorker)))
   if state == nil {
     return nil
   }
@@ -224,12 +224,12 @@ pub fn dna_recovery_open(directory: *const u8) *RecoveryWorker {
   state.lock = rec_mutex()
   state.wake = rec_condition()
   if state.lock != nil && state.wake != nil {
-    state.thread = rec_thread(&rec_worker, #cast(rawptr) state)
+    state.thread = rec_thread(rec_worker, #cast(rawptr, state))
   }
   if state.thread == nil {
     rec_condition_free(state.wake)
     rec_mutex_free(state.lock)
-    rec_free(#cast(rawptr) state)
+    rec_free(#cast(rawptr, state))
     return nil
   }
   return state
@@ -243,7 +243,7 @@ pub fn dna_recovery_submit(state: *RecoveryWorker, bytes: *const u8, length: usi
   rec_lock(state.lock)
   if state.pending_capacity < length {
     if state.spare_capacity >= length {
-      rec_free(#cast(rawptr) state.pending)
+      rec_free(#cast(rawptr, state.pending))
       state.pending = state.spare
       state.pending_capacity = state.spare_capacity
       state.spare = nil
@@ -261,7 +261,7 @@ pub fn dna_recovery_submit(state: *RecoveryWorker, bytes: *const u8, length: usi
         rec_unlock(state.lock)
         return 0
       }
-      rec_free(#cast(rawptr) state.pending)
+      rec_free(#cast(rawptr, state.pending))
       state.pending = retained
       state.pending_capacity = capacity
     }
@@ -297,9 +297,9 @@ pub fn dna_recovery_close(state: *RecoveryWorker) {
   if state.path[0] != 0 {
     _ = rec_unlink(&state.path[0])
   }
-  rec_free(#cast(rawptr) state.pending)
-  rec_free(#cast(rawptr) state.spare)
+  rec_free(#cast(rawptr, state.pending))
+  rec_free(#cast(rawptr, state.spare))
   rec_condition_free(state.wake)
   rec_mutex_free(state.lock)
-  rec_free(#cast(rawptr) state)
+  rec_free(#cast(rawptr, state))
 }

@@ -4,6 +4,11 @@ use "std/c"
 use "std/path" paths
 use "../buffer"
 
+// Borrow caller storage; invalid input/capacity failure leaves it unchanged.
+fn bounded_string(storage: []u8, source: []const u8) c.StringResult {
+  return c.string_into(storage, source)
+}
+
 #link("c")
 
 pub struct State { path: [4096]u8, length: usize, recovery_owned: bool }
@@ -57,38 +62,63 @@ pub fn resolve(path: []const u8, output: []u8) []const u8 {
   }
   parent_storage: [4096]u8 = []
   absolute: [4096]u8 = []
-  parent := c.string_from_bytes(parent_storage[..], paths.dirname(path))
+  parent := bounded_string(parent_storage[..], paths.dirname(path))
   if !parent.ok || realpath(parent.value, &absolute[0]) == nil {
     return output[..0]
   }
   length := c.string_length(&absolute[0], 4096)
-  joined := paths.join(output[..#len(output) - 1], absolute[..length], paths.basename(path))
-  if !joined.ok || #len(joined.value) >= 4000 {
+  leaf := paths.basename(path)
+  // join reserves both components plus one separator byte. Leave room for NUL.
+  if length + #len(leaf) + 1 > #len(output) {
     return output[..0]
   }
-  output[#len(joined.value)] = 0
-  return joined.value
+  // Join directly into bounded caller storage: an arena header would consume
+  // part of the promised output capacity and shift the returned bytes.
+  joined_length := length + #len(leaf)
+  separator := length > 0 && absolute[length - 1] != '/' && #len(leaf) > 0 && leaf[0] != '/'
+  if separator {
+    joined_length += 1
+  }
+  if joined_length >= 4000 || joined_length >= #len(output) {
+    return output[..0]
+  }
+  for index in 0..length {
+    output[index] = absolute[index]
+  }
+  at := length
+  if separator {
+    output[at] = '/'
+    at += 1
+  }
+  for byte in leaf {
+    output[at] = byte
+    at += 1
+  }
+  output[at] = 0
+  return output[..at]
 }
 // Path stat must not open a FIFO/device and block the UI.
 pub fn metadata(path: []const u8) fs.Metadata {
   return fs.metadata_nofollow(path)
 }
 // A whole file read into its own reserved mapping, outside the bounded frame
-// scratch. Release with mem.arena_release(&text.arena) once copied.
-pub struct FileText { arena: mem.Arena, data: []const u8, ok: bool, too_large: bool }
+// scratch. Release with release_text once copied; FileText owns its arena.
+pub struct FileText { arena: *mem.Arena, data: []const u8, ok: bool, too_large: bool }
 
 pub fn read_text(path: []const u8) FileText {
-  reserved := mem.arena_create(buffer.Capacity + 1)
+  reserved := mem.arena_create(buffer.Capacity + 1 + mem.ArenaBufferOverhead)
   result := FileText{arena: reserved}
   opened := fs.open(path)
   if !opened.ok {
-    mem.arena_release(&result.arena)
+    mem.arena_release(result.arena)
+    result.arena = nil
     return FileText{}
   }
+  storage := mem.push_bytes_uninit(reserved, buffer.Capacity + 1)
   total: usize = 0
   failed := false
   for {
-    room := #len(result.arena.data) - total
+    room := #len(storage) - total
     if room == 0 {
       // One byte past Capacity proves the file is too large.
       result.too_large = true
@@ -97,7 +127,7 @@ pub fn read_text(path: []const u8) FileText {
     if room > 1048576 {
       room = 1048576
     }
-    part := fs.read(&opened.file, result.arena.data[total..total + room])
+    part := fs.read(&opened.value, storage[total..total + room])
     if !part.ok {
       failed = true
       break
@@ -107,13 +137,14 @@ pub fn read_text(path: []const u8) FileText {
     }
     total += part.transferred
   }
-  closed := fs.close(&opened.file)
+  closed := fs.close(&opened.value)
   if failed || result.too_large || total > buffer.Capacity || !closed.ok {
     too_large := result.too_large || total > buffer.Capacity
-    mem.arena_release(&result.arena)
+    mem.arena_release(result.arena)
+    result.arena = nil
     return FileText{too_large: too_large}
   }
-  result.data = result.arena.data[..total]
+  result.data = storage[..total]
   result.ok = true
   return result
 }
@@ -124,14 +155,14 @@ pub fn read_prefix(arena: *mem.Arena, path: []const u8, maximum: usize) []const 
   if !opened.ok {
     return ""
   }
-  defer _ = fs.close(&opened.file)
+  defer _ = fs.close(&opened.value)
   if maximum > mem.arena_remaining(arena) {
     maximum = mem.arena_remaining(arena)
   }
   storage := mem.push_bytes_uninit(arena, maximum)
   total: usize = 0
   for total < maximum {
-    part := fs.read(&opened.file, storage[total..])
+    part := fs.read(&opened.value, storage[total..])
     if !part.ok {
       return ""
     }
@@ -146,9 +177,8 @@ pub fn read_prefix(arena: *mem.Arena, path: []const u8, maximum: usize) []const 
   return storage[..total]
 }
 pub fn release_text(text: *FileText) {
-  if text.arena.owns_memory {
-    mem.arena_release(&text.arena)
-  }
+  mem.arena_release(text.arena)
+  text.arena = nil
   text.data = text.data[..0]
   text.ok = false
 }
@@ -175,21 +205,23 @@ pub fn open(state: *State, document: *buffer.Document, path: []const u8, scratch
   if !read.ok {
     return "Read failed."
   }
-  if !buffer.valid(read.data) {
+  // Stage the name before loading: load validates once and leaves the old
+  // document untouched on failure. Commit file ownership only after success.
+  candidate := State{}
+  if !set_name(&candidate, path) {
+    return "Invalid file path."
+  }
+  if !buffer.load(document, read.data) {
     return "File is not valid UTF-8 text, or contains NUL bytes."
   }
   discard_recovery(state)
-  if !set_name(state, path) {
-    return "Invalid file path."
-  }
-  _ = buffer.load(document, read.data)
-  state.recovery_owned = false
+  state.* = candidate
   return ""
 }
 fn unchanged(document: *const buffer.Document, path: []const u8, scratch: *mem.Arena) bool {
   read := read_text(path)
   defer release_text(&read)
-  return read.ok && buffer.equal(read.data, document.saved[..document.saved_length])
+  return read.ok && buffer.saved_equal(document, read.data)
 }
 pub fn save(state: *State, document: *buffer.Document, path: []const u8, scratch: *mem.Arena) []const u8 {
   if #len(path) == 0 || #len(path) >= 4000 {
@@ -244,7 +276,7 @@ pub fn save(state: *State, document: *buffer.Document, path: []const u8, scratch
       return "Cannot flush new file."
     }
     destination_storage: [4096]u8 = []
-    destination := c.string_from_bytes(destination_storage[..], path)
+    destination := bounded_string(destination_storage[..], path)
     if !destination.ok {
       return "Invalid destination."
     }
@@ -302,7 +334,7 @@ pub fn discard_recovery(state: *State) {
 
 pub fn directory_path(path: []const u8, output: []u8) usize {
   encoded: [4096]u8 = []
-  name := c.string_from_bytes(encoded[..], path)
+  name := bounded_string(encoded[..], path)
   if #len(output) < 4096 || !name.ok || realpath(name.value, &output[0]) == nil {
     return 0
   }

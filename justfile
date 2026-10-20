@@ -23,6 +23,9 @@ fmt:
 fmt-check:
     find src tests examples -name '*.dyn' -printf '%h\n' | sort -u | xargs -n1 "$DYN" fmt --check
 test:
+    python3 tests/migrate_casts.py
+    python3 tests/host_environment.py
+    python3 tests/json_scratch.py
     python3 scripts/test.py
 # Checks never read your own config, trust store or recovery files: a personal
 # setting such as frontend = "tui" must not change what they exercise.
@@ -71,6 +74,7 @@ _smoke: deps test
     DNA_PERF_COMBINED=1 DNA_PERF_REAL_SYNTAX=1 python3 tests/workflow_performance.py
     python3 scripts/benchmark_editors.py --editors dna --dna build/dna-release --bytes 5280000 --samples 5 --repeats 1 --max-dna-pss-kib 131072 --output build/document-memory-gate.json
     python3 tests/document_memory.py
+    python3 tests/lsp_memory.py
     python3 tests/terminal_review.py
     python3 tests/terminal_boundaries.py
     python3 tests/rpc.py
@@ -87,6 +91,7 @@ _smoke: deps test
     python3 tests/resource_cycles.py
     python3 tests/native_memory.py
     python3 tests/syntax_memory.py
+    python3 tests/syntax_changes.py
     python3 tests/thread_join.py
     python3 tests/picker_index.py
     python3 tests/syntax_faults.py

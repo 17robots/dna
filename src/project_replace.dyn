@@ -5,11 +5,12 @@ struct ProjectReplaceState {
 }
 
 struct ReplaceFile { path: [4096]u8, length: usize, before, after: []u8, count, slot: usize }
-struct ReplacePlan { arena: mem.Arena, files: []ReplaceFile, count, total: usize }
+struct ReplacePlan { arena: *mem.Arena, files: []ReplaceFile, count, total: usize }
 
 fn replace_release(app: *App) {
   if #len(app.replacement.plan.files) != 0 {
-    mem.arena_release(&app.replacement.plan.arena)
+    mem.arena_release(app.replacement.plan.arena)
+    app.replacement.plan.arena = nil
     app.replacement.plan.files = app.replacement.plan.files[..0]
   }
   app.replacement.plan.count = 0
@@ -23,11 +24,12 @@ fn replace_prepare(app: *App, replacement: []const u8) {
   }
   // Each of up to 16 files keeps its text before and after; reserved, so
   // only the bytes read and built occupy memory.
-  allocated := mem.arena_create((buffer.Capacity + 1) * 32 + 65536)
+  allocated := mem.arena_create(((buffer.Capacity + 1) * 32 + 65536) + mem.ArenaBufferOverhead)
   plan := &app.replacement.plan
-  plan.arena = mem.arena_take(&allocated)
+  plan.arena = allocated
+  allocated = nil
   plan.total = 0
-  plan.files = mem.push_array(ReplaceFile, &plan.arena, 16)
+  plan.files = mem.push_array(ReplaceFile, plan.arena, 16)
   compiled := pattern.open_lines(app.project_find.query[..app.project_find.query_length])
   defer pattern.close(&compiled)
   for index in 0..app.project_find.count {
@@ -62,13 +64,13 @@ fn replace_prepare(app: *App, replacement: []const u8) {
         notice(app, "A result is no longer a regular file. Search again.")
         return
       }
-      read := fs.read_all(&plan.arena, full[..length], buffer.Capacity)
-      if !read.ok || !buffer.valid(read.data) {
+      read := fs.read_all(plan.arena, full[..length], buffer.Capacity)
+      if !read.ok || !buffer.valid(read.value) {
         notice(app, "A result file cannot be read as editable text.")
         return
       }
-      new_item.before = read.data
-      new_item.after = mem.push_bytes_uninit(&plan.arena, buffer.Capacity + 1)
+      new_item.before = read.value
+      new_item.after = mem.push_bytes_uninit(plan.arena, buffer.Capacity + 1)
       plan.count += 1
     }
     item := &plan.files[file_index]
@@ -209,12 +211,12 @@ fn draw_replace_preview(renderer: rawptr, app: *App, typography: *Typography, wi
   opening := app.view.animation.panel != Panel.ReplacePreview
   list := ui_sheet_begin(app, ui, typography, "replace preview", width, height, status, title[..used])
   scrolled := &ui.boxes[list]
-  scrolled.scroll_target = #cast(f32) app.prompt_state.selected * line
-  ui_list_scroll(app, ui, list, plan.count, 0, line * #cast(f32) rows, opening, false)
-  app.prompt_state.selected = #cast(usize) (scrolled.scroll_target / line + 0.5)
-  window := ui_list_window(ui, list, plan.count, line * #cast(f32) rows)
+  scrolled.scroll_target = #cast(f32, app.prompt_state.selected) * line
+  ui_list_scroll(app, ui, list, plan.count, 0, line * #cast(f32, rows), opening, false)
+  app.prompt_state.selected = #cast(usize, (scrolled.scroll_target / line + 0.5))
+  window := ui_list_window(ui, list, plan.count, line * #cast(f32, rows))
   ui_push(ui, list)
-  ui_spacer(ui, "above", #cast(f32) window.first * line)
+  ui_spacer(ui, "above", #cast(f32, window.first) * line)
   for index in window.first..window.last {
     item := &plan.files[index]
     label: [8192]u8 = []
@@ -228,7 +230,7 @@ fn draw_replace_preview(renderer: rawptr, app: *App, typography: *Typography, wi
     ui_size(ui, row, UiAxisY, UiSizeKind.Pixels, line / typography.scale, 1.0)
     ui_animate(app, ui, row, false)
   }
-  ui_spacer(ui, "below", #cast(f32) (plan.count - window.last) * line)
+  ui_spacer(ui, "below", #cast(f32, (plan.count - window.last)) * line)
   ui_pop(ui)
   ui_sheet_end(ui, "enter applies to buffers (not disk) • esc cancels • arrows or wheel scroll")
   ui_layout(ui)

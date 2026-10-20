@@ -46,7 +46,8 @@ fn ui_cache_release(typography: *Typography) {
   ui_cache_clear(typography)
 
   if typography.ui_cache != nil {
-    mem.arena_release(&typography.ui_owner)
+    mem.arena_release(typography.ui_owner)
+    typography.ui_owner = nil
 
     if typography.observer != nil {
       allocation_record(typography.observer, "ui_text_cache", #sizeof(UiTextCache) + 16, typography.ui_born, true)
@@ -61,8 +62,9 @@ fn cached_ui_text(typography: *Typography, text: []const u8) rawptr {
   }
 
   if typography.ui_cache == nil {
-    allocated := mem.arena_create(#sizeof(UiTextCache) + 16)
-    typography.ui_owner = mem.arena_take(&allocated)
+    allocated := mem.arena_create((#sizeof(UiTextCache) + 16) + mem.ArenaBufferOverhead)
+    typography.ui_owner = allocated
+    allocated = nil
 
     if typography.observer != nil {
       if typography.observer.render_trace.enabled {
@@ -71,10 +73,11 @@ fn cached_ui_text(typography: *Typography, text: []const u8) rawptr {
       allocation_record(typography.observer, "ui_text_cache", #sizeof(UiTextCache) + 16, typography.ui_born, false)
     }
 
-    created_cache := #cast(*UiTextCache) mem.arena_push_uninit(&typography.ui_owner, #sizeof(UiTextCache), #alignof(UiTextCache))
+    created_cache := #cast(*UiTextCache, mem.arena_push_uninit(typography.ui_owner, #sizeof(UiTextCache), #alignof(UiTextCache)))
 
     if created_cache == nil {
-      mem.arena_release(&typography.ui_owner)
+      mem.arena_release(typography.ui_owner)
+      typography.ui_owner = nil
       if typography.observer != nil {
         allocation_record(typography.observer, "ui_text_cache", #sizeof(UiTextCache) + 16, typography.ui_born, true)
       }
@@ -82,7 +85,7 @@ fn cached_ui_text(typography: *Typography, text: []const u8) rawptr {
     }
 
     // Initialize metadata only; byte slots are initialized when populated.
-    mem.zero((#cast(*u8) created_cache)[..#cast(usize) &created_cache.bytes[0] - #cast(usize) created_cache])
+    mem.zero((#cast(*u8, created_cache))[..#cast(usize, &created_cache.bytes[0]) - #cast(usize, created_cache)])
     for bucket_index in 0..32 {
       created_cache.buckets[bucket_index] = 128
     }
@@ -93,9 +96,9 @@ fn cached_ui_text(typography: *Typography, text: []const u8) rawptr {
   cache.serial += 1
   hash: u64 = 5381
   for byte in text {
-    hash = ((hash * 33) ^ #cast(u64) byte) % 4294967296
+    hash = ((hash * 33) ^ #cast(u64, byte)) % 4294967296
   }
-  bucket := #cast(usize) ((hash ^ (hash >> 16)) % 32)
+  bucket := #cast(usize, ((hash ^ (hash >> 16)) % 32))
   index := cache.buckets[bucket]
 
   for index != 128 {
@@ -124,7 +127,7 @@ fn cached_ui_text(typography: *Typography, text: []const u8) rawptr {
     }
 
     previous := &cache.entries[chosen]
-    old_bucket := #cast(usize) ((previous.hash ^ (previous.hash >> 16)) % 32)
+    old_bucket := #cast(usize, ((previous.hash ^ (previous.hash >> 16)) % 32))
     link := &cache.buckets[old_bucket]
 
     for link.* != 128 && link.* != chosen {

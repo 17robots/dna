@@ -3,6 +3,8 @@
 import ctypes as c
 import os
 from pathlib import Path
+import subprocess
+import sys
 import tempfile
 import time
 root = Path(__file__).resolve().parents[1]
@@ -25,7 +27,7 @@ try:
         (tree/'build').mkdir(); (tree/'build/skip').write_text('needle')
         (tree/'link').symlink_to(tree/'one.txt')
         os.mkfifo(tree/'fifo')
-        def submit(query): lib.dna_search_submit(search, os.fsencode(tree), query)
+        def submit(query, directory=tree): lib.dna_search_submit(search, os.fsencode(directory), query)
         def finish():
             deadline = time.monotonic()+7
             while time.monotonic()<deadline:
@@ -45,6 +47,35 @@ try:
         submit(b'^'); assert len(finish()[1]) == 2
         for i in range(100): submit(b'needle' if i%2 else b'hello')
         submit(b'no match'); assert finish() == (0, [])
+        # Repeated matches must preserve character boundaries and full-file regex semantics.
+        with tempfile.TemporaryDirectory() as isolated:
+            fixture = Path(isolated) / 'utf8.txt'
+            fixture.write_text('é中\né中\n')
+            submit(b'(?=.)', isolated); status, rows = finish()
+            assert status == 0 and [(r.start, r.end) for r in rows] == [(0, 0), (2, 2), (6, 6), (8, 8)]
+            submit('中\né'.encode(), isolated); status, rows = finish()
+            assert status == 0 and [(r.start, r.end, r.line, r.column) for r in rows] == [(2, 8, 1, 3)]
+            # Even a match before malformed UTF must not bypass the initial subject check.
+            fixture.write_bytes(b'needle\nneedle\xff')
+            submit(b'needle', isolated); status, rows = finish()
+            assert status == 3 and not rows
+            # Previously, revalidating the entire subject for each match exhausted
+            # the built-in five-second deadline and returned incomplete results.
+            fixture.write_bytes(b'needle\n' * 1000 + b'x' * (32_000_000 - 7000))
+            submit(b'needle', isolated); status, rows = finish()
+            assert status == 0 and len(rows) == 1000, ('dense search incomplete', status, len(rows))
+            assert [(r.start, r.end, r.line, r.column) for r in rows] == [(7*i, 7*i+6, i+1, 1) for i in range(1000)]
+        # Compare the literal path with equivalent forced-regex matching.
+        with tempfile.TemporaryDirectory() as isolated:
+            fixture = Path(isolated) / 'literal.txt'
+            for text, literal in [(b'aaaaaaa', b'aa'), ('α needle needle\nneedle'.encode(), b'needle'),
+                                  (b'prefix -# value -# suffix', b'-#'),
+                                  (b'needle' + b'x'*65531 + b'needle' + b'x'*65533 + b'needle', b'needle')]:
+                fixture.write_bytes(text)
+                submit(literal, isolated); fast_status, fast = finish()
+                submit(b'(?:'+literal+b')', isolated); regex_status, regex = finish()
+                assert fast_status == regex_status == 0
+                assert [(r.start, r.end, r.line, r.column) for r in fast] == [(r.start, r.end, r.line, r.column) for r in regex]
         # Past buffer.Capacity; sparse, so it costs no disk.
         with open(tree/'large', 'wb') as large: large.truncate(268435456)
         submit(b'hello'); assert finish()[0] == 3
@@ -55,3 +86,4 @@ try:
 finally:
     lib.dna_search_close(search)
 print('PASS cancellable project search, UTF-8, invalid regex, generations, limits, symlinks/FIFO')
+subprocess.run([sys.executable, str(root/'tests/project_search_read.py')], check=True)

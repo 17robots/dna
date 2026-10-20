@@ -9,12 +9,12 @@ fn require_empty(error: []const u8) {
   }
 }
 fn main() {
-  arena := mem.arena_create(#sizeof(buffer.Document) + 2097152)
-  defer mem.arena_release(&arena)
-  doc := buffer.allocate(&arena)
+  arena := mem.arena_create(#sizeof(buffer.Document) + 2097152 + mem.ArenaBufferOverhead)
+  defer mem.arena_release(arena)
+  doc := buffer.allocate(arena)
   _ = buffer.load(doc, "first\n")
   state := files.State{}
-  require_empty(files.save(&state, doc, "sample.txt", &arena))
+  require_empty(files.save(&state, doc, "sample.txt", arena))
   if buffer.dirty(doc) || !fs.metadata("sample.txt").ok {
     #panic("new save")
   }
@@ -24,24 +24,24 @@ fn main() {
   buffer.move_to(doc, doc.length, false)
   _ = buffer.replace(doc, "second\n")
   _ = buffer.replace(doc, "third\n")
-  require_empty(files.save(&state, doc, "sample.txt", &arena))
+  require_empty(files.save(&state, doc, "sample.txt", arena))
   if (fs.metadata("sample.txt").mode & 511) != 448 || fs.metadata("sample.txt.dna-recovery").ok {
     #panic("permissions or recovery cleanup")
   }
   _ = fs.write_all("sample.txt", "external\n")
   _ = buffer.replace(doc, "local\n")
-  if #len(files.save(&state, doc, "sample.txt", &arena)) == 0 {
+  if #len(files.save(&state, doc, "sample.txt", arena)) == 0 {
     #panic("external conflict accepted")
   }
-  check := fs.read_all(&arena, "sample.txt", 100)
-  if !check.ok || !buffer.equal(check.data, "external\n") {
+  check := fs.read_all(arena, "sample.txt", 100)
+  if !check.ok || !buffer.equal(check.value, "external\n") {
     #panic("external content lost")
   }
-  if #len(files.open(&state, doc, "sample.txt", &arena)) == 0 {
+  if #len(files.open(&state, doc, "sample.txt", arena)) == 0 {
     #panic("dirty open accepted")
   }
-  require_empty(files.save(&state, doc, "new.txt", &arena))
-  if #len(files.save(&state, doc, "sample.txt", &arena)) == 0 {
+  require_empty(files.save(&state, doc, "new.txt", arena))
+  if #len(files.save(&state, doc, "sample.txt", arena)) == 0 {
     #panic("save-as overwrite accepted")
   }
   buffer.move_to(doc, doc.length, false)
@@ -52,31 +52,42 @@ fn main() {
   // Simulate a fresh editor after a crash: sidecar exists, original still saved.
   state.recovery_owned = false
   _ = buffer.load(doc, "")
-  require_empty(files.open(&state, doc, "new.txt", &arena))
+  require_empty(files.open(&state, doc, "new.txt", arena))
   if !fs.metadata("new.txt.dna-recovery").ok {
     #panic("unclaimed legacy recovery lost")
   }
-  require_empty(files.recover(&state, doc, &arena))
+  require_empty(files.recover(&state, doc, arena))
   if !buffer.dirty(doc) || !buffer.find(doc, "recover me", false) {
     #panic("recover contents")
   }
   files.discard_recovery(&state)
   _ = buffer.load(doc, "")
-  if #len(files.open(&state, doc, "link.txt", &arena)) == 0 {
+  if #len(files.open(&state, doc, "link.txt", arena)) == 0 {
     #panic("symlink opened")
   }
   _ = buffer.replace(doc, "safe")
-  if #len(files.save(&state, doc, "link.txt", &arena)) == 0 {
+  if #len(files.save(&state, doc, "link.txt", arena)) == 0 {
     #panic("symlink replaced")
   }
   _ = buffer.load(doc, "unchanged")
-  if #len(files.open(&state, doc, "binary.txt", &arena)) == 0 || !buffer.equal(doc.bytes[..doc.length], "unchanged") {
+  if #len(files.open(&state, doc, "binary.txt", arena)) == 0 || !buffer.equal(doc.bytes[..doc.length], "unchanged") {
     #panic("invalid read mutated document")
   }
-  if !buffer.equal(files.open(&state, doc, "large.txt", &arena), "File exceeds the 256 MiB limit.") {
+  before := state
+  revision := doc.revision
+  invalid: [5]u8 = [110, 101, 119, 255, 10]
+  if !fs.write_all("invalid-utf8.txt", invalid[..]).ok || !fs.write_all("new.txt.dna-recovery", "owned recovery").ok {
+    #panic("invalid-open fixture")
+  }
+  state.recovery_owned = true
+  if #len(files.open(&state, doc, "invalid-utf8.txt", arena)) == 0 || doc.revision != revision || !buffer.equal(doc.bytes[..doc.length], "unchanged") || !buffer.equal(files.name(&state), files.name(&before)) || !state.recovery_owned || !fs.metadata("new.txt.dna-recovery").ok {
+    #panic("failed open changed buffer, filename or recovery ownership")
+  }
+  files.discard_recovery(&state)
+  if !buffer.equal(files.open(&state, doc, "large.txt", arena), "File exceeds the 256 MiB limit.") {
     #panic("oversized read accepted")
   }
-  if #len(files.open(&state, doc, "pipe.txt", &arena)) == 0 {
+  if #len(files.open(&state, doc, "pipe.txt", arena)) == 0 {
     #panic("FIFO accepted")
   }
   resolved: [4096]u8 = []

@@ -2,6 +2,8 @@ extern fn syntax_open_named "dna_syntax_open_named"(root: *const u8, name: *cons
 extern fn syntax_name "dna_syntax_name"(syntax: rawptr) *const u8
 extern fn syntax_open "dna_syntax_open"(root: *const u8, filename: *const u8) rawptr
 extern fn syntax_update "dna_syntax_update"(syntax: rawptr, text: *const u8, length: u32, revision: u64)
+struct SyntaxChange { revision: u64, low, old_high, high, old_length, row, column: u32 }
+extern fn syntax_update_changed "dna_syntax_update_changed"(syntax: rawptr, text: *const u8, length: u32, revision: u64, change: *const SyntaxChange)
 extern fn syntax_colors "dna_syntax_colors"(syntax: rawptr, output: *u8, length: u32, revision: u64) i32
 extern fn syntax_close "dna_syntax_close"(syntax: rawptr)
 extern fn syntax_retire "dna_syntax_retire"(syntax: rawptr) i32
@@ -128,8 +130,15 @@ fn syntax_tick(app: *App) bool {
       if slot.syntax != nil && slot.document.length < buffer.LargeFile {
         slot.syntax_used = sdl.ticks()
         doc := slot.document
-        syntax_update(slot.syntax, &doc.bytes[0], #cast(u32) doc.length, doc.revision)
-        if slot.syntax_revision != doc.revision && syntax_colors(slot.syntax, &slot.colors[0], #cast(u32) doc.length, doc.revision) != 0 {
+        change := buffer.changes_since(doc, slot.syntax_revision)
+        if change.found && change.old_length < buffer.LargeFile {
+          row := buffer.row_at(doc, change.low)
+          hint := SyntaxChange{revision: slot.syntax_revision, low: #cast(u32, change.low), old_high: #cast(u32, change.old_high), high: #cast(u32, change.high), old_length: #cast(u32, change.old_length), row: #cast(u32, row), column: #cast(u32, (change.low - buffer.row_start(doc, row)))}
+          syntax_update_changed(slot.syntax, &doc.bytes[0], #cast(u32, doc.length), doc.revision, &hint)
+        } else {
+          syntax_update(slot.syntax, &doc.bytes[0], #cast(u32, doc.length), doc.revision)
+        }
+        if slot.syntax_revision != doc.revision && syntax_colors(slot.syntax, &slot.colors[0], #cast(u32, doc.length), doc.revision) != 0 {
           slot.syntax_revision = doc.revision
           changed = true
         }
@@ -232,10 +241,10 @@ fn draw_syntax(renderer: rawptr, app: *App, typography: *Typography, viewport: T
         }
       }
       if geometry_ready {
-        left := #cast(i32) x + first.x
-        top := #cast(i32) y + first.y
-        right := #cast(i32) x + last.x + last.width
-        bottom := top + #cast(i32) typography.line
+        left := #cast(i32, x) + first.x
+        top := #cast(i32, y) + first.y
+        right := #cast(i32, x) + last.x + last.width
+        bottom := top + #cast(i32, typography.line)
         if left < clipping.x {
           left = clipping.x
         }
@@ -275,7 +284,7 @@ fn draw_syntax(renderer: rawptr, app: *App, typography: *Typography, viewport: T
           }
           // Cached geometry is local to the text. Scroll/clip and theme remain live.
           ttf.italic(span_text, syntax_italic(style))
-          if !sdl.clip(renderer, &clip) || !tint(span_text, syntax_color(style)) || !ttf.draw(span_text, x + #cast(f32) (first.x - span_start.x), y + #cast(f32) (first.y - span_start.y)) {
+          if !sdl.clip(renderer, &clip) || !tint(span_text, syntax_color(style)) || !ttf.draw(span_text, x + #cast(f32, (first.x - span_start.x)), y + #cast(f32, (first.y - span_start.y))) {
             #panic("syntax span draw")
           }
         }
@@ -329,7 +338,7 @@ fn indent_width(app: *App) usize {
     return config.indent_width
   }
   if app.documents.slots[app.documents.active].syntax != nil {
-    return #cast(usize) syntax_indent(app.documents.slots[app.documents.active].syntax)
+    return #cast(usize, syntax_indent(app.documents.slots[app.documents.active].syntax))
   }
   return config.indent_width
 }
@@ -504,15 +513,15 @@ fn syntax_selection(app: *App, mode: u32) {
     }
     start: u32 = 0
     end: u32 = 0
-    if syntax_select(slot.syntax, doc.revision, #cast(u32) low, #cast(u32) high, mode, &start, &end) == 0 {
+    if syntax_select(slot.syntax, doc.revision, #cast(u32, low), #cast(u32, high), mode, &start, &end) == 0 {
       notice(app, "No syntax node available; parsing may still be pending.")
       return
     }
-    selected.anchor = #cast(usize) start
-    selected.cursor = #cast(usize) end
+    selected.anchor = #cast(usize, start)
+    selected.cursor = #cast(usize, end)
     if backward {
-      selected.anchor = #cast(usize) end
-      selected.cursor = #cast(usize) start
+      selected.anchor = #cast(usize, end)
+      selected.cursor = #cast(usize, start)
     }
     index += 1
   }
@@ -561,14 +570,14 @@ fn syntax_textobject(app: *App, key: u8, around: bool, count: usize) bool {
     }
     start: u32 = 0
     end: u32 = 0
-    if syntax_object(slot.syntax, doc.revision, #cast(u32) low, #cast(u32) high, kind, #cast(u32) count, &start, &end) == 0 {
+    if syntax_object(slot.syntax, doc.revision, #cast(u32, low), #cast(u32, high), kind, #cast(u32, count), &start, &end) == 0 {
       return false
     }
-    selected.anchor = #cast(usize) start
-    selected.cursor = #cast(usize) end
+    selected.anchor = #cast(usize, start)
+    selected.cursor = #cast(usize, end)
     if backward {
-      selected.anchor = #cast(usize) end
-      selected.cursor = #cast(usize) start
+      selected.anchor = #cast(usize, end)
+      selected.cursor = #cast(usize, start)
     }
     index += 1
   }

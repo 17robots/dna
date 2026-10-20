@@ -13,11 +13,14 @@ fn native_current_directory(destination: []u8) usize {
 }
 fn native_change_directory(path: []const u8) bool {
   storage: [4096]u8 = []
-  encoded := c.string_from_bytes(storage[..], path)
+  if #len(path) >= #len(storage) {
+    return false
+  }
+  encoded := c.string_into(storage[..], path)
   return encoded.ok && host_chdir(encoded.value) == 0
 }
 fn native_process_id() u32 {
-  return #cast(u32) host_getpid()
+  return #cast(u32, host_getpid())
 }
 fn native_small_pages(memory: []u8) {
   _ = memory
@@ -31,7 +34,10 @@ extern fn host_argument_length "dyn_arguments_length"(value: *const u8) usize
 extern fn host_argument_vector "dyn_arguments_vector"() ***const u8
 fn native_environment(name: []const u8, destination: []u8) EnvironmentResult {
   storage: [4096]u8 = []
-  key := c.string_from_bytes(storage[..], name)
+  if #len(name) >= #len(storage) {
+    return EnvironmentResult{error: -28, kind: errors.Kind.Capacity}
+  }
+  key := c.string_into(storage[..], name)
   if !key.ok {
     return EnvironmentResult{error: -28, kind: errors.Kind.Capacity}
   }
@@ -39,7 +45,7 @@ fn native_environment(name: []const u8, destination: []u8) EnvironmentResult {
   if value == nil {
     return EnvironmentResult{value: destination[..0], ok: true}
   }
-  if #len(destination) == ~#cast(usize) 0 {
+  if #len(destination) == ~#cast(usize, 0) {
     return EnvironmentResult{kind: errors.Kind.Overflow}
   }
   parsed := c.bytes_from_string(value, #len(destination) + 1)
@@ -54,11 +60,11 @@ fn native_arguments(arena: *mem.Arena) ArgumentsResult {
   if count_pointer == nil || count_pointer.* < 0 {
     return ArgumentsResult{kind: errors.Kind.InvalidState}
   }
-  count := #cast(usize) count_pointer.*
+  count := #cast(usize, count_pointer.*)
   if count == 0 {
     return ArgumentsResult{ok: true}
   }
-  if count > (~#cast(usize) 0) / #sizeof([]const u8) {
+  if count > (~#cast(usize, 0)) / #sizeof([]const u8) {
     return ArgumentsResult{kind: errors.Kind.Overflow}
   }
   vector_pointer := host_argument_vector()
@@ -66,7 +72,7 @@ fn native_arguments(arena: *mem.Arena) ArgumentsResult {
     return ArgumentsResult{kind: errors.Kind.InvalidState}
   }
   slots := mem.arena_push_uninit(arena, count * #sizeof([]const u8), #alignof([]const u8))
-  values := (#cast(*[]const u8) slots)[..count]
+  values := (#cast(*[]const u8, slots))[..count]
   vector := vector_pointer.*[..count]
   for index in 0..count {
     source := vector[index]

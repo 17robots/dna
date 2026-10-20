@@ -907,7 +907,7 @@ with tempfile.TemporaryDirectory(prefix='dna-tui-') as directory:
             session.close()
     (root / 'config' / 'dna' / 'config.toml').unlink()
     # Module variants: the tree explorer docks on the left and keeps the
-    # editor usable beside it; the dropdown picker hangs from the top edge.
+    # editor usable beside it; the dropdown picker uses the shared popup anchor.
     (root / 'config' / 'dna').mkdir(parents=True, exist_ok=True)
     (root / 'config' / 'dna' / 'config.toml').write_text('[modules]\nexplorer = "tree"\npicker = "dropdown"\n')
     (root / 'pkg').mkdir()
@@ -957,9 +957,12 @@ with tempfile.TemporaryDirectory(prefix='dna-tui-') as directory:
         session.send(b' ')
         session.send(b'f', 0.6)
         rows = session.text()
-        # Row 0 holds both the tree's corner and the picker's.
-        if rows[0].count('┌') < 2 or '_' not in rows[1]:
-            fail('dropdown picker must hang from the top edge', rows)
+        # The dock starts at row 0. Window popups share the six-percent anchor,
+        # even when their content would otherwise fill the available height.
+        # TUI frames extend one cell above the rounded content origin.
+        popup_top = max(0, int(ROWS * .06 + .5) - 1)
+        if rows[popup_top].rfind('┌') <= 0 or '_' not in rows[popup_top + 2]:
+            fail('dropdown picker must use the shared popup anchor', rows)
     finally:
         session.close()
     # Both explorer variants use glyphs; disabling icons removes the gutter.

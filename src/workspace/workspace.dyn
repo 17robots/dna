@@ -7,6 +7,9 @@ pub struct SavedBuffer {
   path: []const u8,
   text: []const u8,
   saved: []const u8,
+  // Encoding-only borrowed segments; the on-disk format stays contiguous.
+  saved_parts: [3][]const u8,
+  split_saved: bool,
   filetype: []const u8,
   cursor: usize,
   anchor: usize,
@@ -51,7 +54,7 @@ fn number(out: *Writer, value: usize) {
     return
   }
   for offset in 0..8 {
-    out.bytes[out.at + offset] = #cast(u8) ((value >> (offset * 8)) & 255)
+    out.bytes[out.at + offset] = #cast(u8, ((value >> (offset * 8)) & 255))
   }
   out.at += 8
 }
@@ -61,9 +64,9 @@ fn text(out: *Writer, value: []const u8) {
     out.ok = false
     return
   }
-  for byte in value {
-    out.bytes[out.at] = byte
-    out.at += 1
+  if #len(value) > 0 {
+    _ = buffer.copy_bytes(&out.bytes[out.at], &value[0], #len(value))
+    out.at += #len(value)
   }
 }
 fn get_number(input: *Reader) usize {
@@ -73,7 +76,7 @@ fn get_number(input: *Reader) usize {
   }
   value: usize = 0
   for offset in 0..8 {
-    value = value | (#cast(usize) input.bytes[input.at + offset] << (offset * 8))
+    value = value | (#cast(usize, input.bytes[input.at + offset]) << (offset * 8))
   }
   input.at += 8
   return value
@@ -117,7 +120,25 @@ pub fn encode(state: *const State, output: []u8) usize {
     if item.used {
       text(&writer, item.path)
       text(&writer, item.text)
-      text(&writer, item.saved)
+      if item.split_saved {
+        length: usize = 0
+        for part in item.saved_parts {
+          length += #len(part)
+        }
+        number(&writer, length)
+        if length > #len(writer.bytes) - writer.at {
+          writer.ok = false
+        } else {
+          for part in item.saved_parts {
+            if #len(part) > 0 {
+              _ = buffer.copy_bytes(&writer.bytes[writer.at], &part[0], #len(part))
+              writer.at += #len(part)
+            }
+          }
+        }
+      } else {
+        text(&writer, item.saved)
+      }
       text(&writer, item.filetype)
       number(&writer, item.cursor)
       number(&writer, item.anchor)
@@ -148,10 +169,10 @@ pub fn encode(state: *const State, output: []u8) usize {
   return writer.at
 }
 fn tree(state: *const State, index: usize, parent: usize, seen: *u32) bool {
-  if index >= 15 || (seen.* & (#cast(u32) 1 << #cast(u32) index)) != 0 {
+  if index >= 15 || (seen.* & (#cast(u32, 1) << #cast(u32, index))) != 0 {
     return false
   }
-  seen.* = seen.* | (#cast(u32) 1 << #cast(u32) index)
+  seen.* = seen.* | (#cast(u32, 1) << #cast(u32, index))
   pane := &state.panes[index]
   if !pane.used || pane.parent != parent || pane.percent < 10 || pane.percent > 90 {
     return false
@@ -275,7 +296,7 @@ pub fn decode(source: []const u8, state: *State) bool {
     return false
   }
   for index in 0..15 {
-    if state.panes[index].used && (seen & (#cast(u32) 1 << #cast(u32) index)) == 0 {
+    if state.panes[index].used && (seen & (#cast(u32, 1) << #cast(u32, index))) == 0 {
       return false
     }
   }
@@ -290,7 +311,15 @@ pub fn encoded_size(state: *const State) usize {
       size += 32 + #len(item.path) + #len(item.filetype)
     }
     else if item.used {
-      size += 56 + item.secondary.count * 16 + #len(item.path) + #len(item.text) + #len(item.saved) + #len(item.filetype)
+      if item.split_saved {
+        for part in item.saved_parts {
+          size += #len(part)
+        }
+      }
+      size += 56 + item.secondary.count * 16 + #len(item.path) + #len(item.text) + #len(item.filetype)
+      if !item.split_saved {
+        size += #len(item.saved)
+      }
     }
   }
   for index in 0..15 {

@@ -110,13 +110,13 @@ fn plugin_prepare(app: *App, manifest: []const u8) {
     notice(app, "Cannot read plugin manifest (maximum 16 KiB).")
     return
   }
-  parsed := json.parse(app.scratch, read.data)
+  parsed := json.parse(app.scratch, read.value)
   if !parsed.ok || !json.is_object(parsed.root) {
     notice(app, "Plugin manifest must be a JSON object.")
     return
   }
   api := json.object_get(parsed.root, "api_version")
-  if api != nil {
+  if !json.is_missing(api) {
     supported := lsp.number(api)
     if !supported.ok || supported.value != 1 {
       notice(app, "Plugin API version is unsupported; this editor supports version 1.")
@@ -124,7 +124,7 @@ fn plugin_prepare(app: *App, manifest: []const u8) {
     }
   }
   version_value := json.object_get(parsed.root, "version")
-  if version_value != nil && !json.is_string(version_value) {
+  if !json.is_missing(version_value) && !json.is_string(version_value) {
     notice(app, "Plugin version must be a string.")
     return
   }
@@ -242,7 +242,7 @@ fn plugin_start_pending(app: *App) {
   app.plugin_state.slots[index] = plugin.*
   app.plugin_state.slots[index].process = process_handle
   app.plugin_state.slots[index].active = true
-  app.plugin_state.slots[index].deadline = sdl.ticks() + #cast(u64) app.config.plugin_timeout_ms
+  app.plugin_state.slots[index].deadline = sdl.ticks() + #cast(u64, app.config.plugin_timeout_ms)
   greeting: []const u8 = "{\"type\":\"initialize\",\"version\":1}\n"
   _ = plugin_send(process_handle, &greeting[0], #len(greeting))
   app.prompt_state.panel = Panel.None
@@ -264,19 +264,19 @@ fn plugin_run_command(app: *App, command_index: usize) {
     notice(app, "Plugin protocol v1 currently limits document requests to 64 KiB.")
     return
   }
-  allocated := mem.arena_create(1048576)
-  defer mem.arena_release(&allocated)
-  message := mem.push_bytes_uninit(&allocated, 524288)
-  escaped := mem.push_bytes_uninit(&allocated, 524288)
+  allocated := mem.arena_create((1048576) + mem.ArenaBufferOverhead)
+  defer mem.arena_release(allocated)
+  message := mem.push_bytes_uninit(allocated, 524288)
+  escaped := mem.push_bytes_uninit(allocated, 524288)
   used: usize = 0
   add_text(message, &used, "{\"type\":\"command\",\"name\":")
-  add_text(message, &used, json.write_string(escaped, command.name[..command.length]))
+  add_text(message, &used, lsp_json_string(escaped, command.name[..command.length]))
   add_text(message, &used, ",\"buffer\":")
   add_number(message, &used, app.documents.active)
   add_text(message, &used, ",\"revision\":")
-  add_number(message, &used, #cast(usize) app.documents.current.revision)
+  add_number(message, &used, #cast(usize, app.documents.current.revision))
   if plugin.read {
-    encoded := json.write_string(escaped, app.documents.current.bytes[..app.documents.current.length])
+    encoded := lsp_json_string(escaped, app.documents.current.bytes[..app.documents.current.length])
     if #len(encoded) == 0 {
       notice(app, "Buffer contains control characters unsupported by plugin JSON encoding.")
       return
@@ -289,7 +289,7 @@ fn plugin_run_command(app: *App, command_index: usize) {
     plugin_stop(app, command.owner, "Plugin request queue overflow; disabled.")
   }
   else {
-    plugin.deadline = sdl.ticks() + #cast(u64) app.config.plugin_timeout_ms
+    plugin.deadline = sdl.ticks() + #cast(u64, app.config.plugin_timeout_ms)
   }
   app.prompt_state.panel = Panel.None
 }
@@ -302,7 +302,7 @@ fn json_unsigned(value: *const json.Value) usize {
     if byte < 48 || byte > 57 {
       return 18446744073709551615
     }
-    result = result * 10 + #cast(usize) (byte - 48)
+    result = result * 10 + #cast(usize, (byte - 48))
   }
   return result
 }
@@ -397,7 +397,7 @@ fn plugin_message(app: *App, index: usize, source: []const u8) {
     target := json_unsigned(json.object_get(parsed.root, "buffer"))
     revision := json_unsigned(json.object_get(parsed.root, "revision"))
     replacement := json_text(parsed.root, "text")
-    if target >= 16 || target != plugin.command_slot || plugin.command_identity != app.documents.slots[target].identity || plugin.command_revision != #cast(u64) revision || app.documents.slots[target].document == nil || app.documents.slots[target].terminal.handle != nil || app.documents.slots[target].document.revision != #cast(u64) revision || !json.is_string(json.object_get(parsed.root, "text")) || #len(replacement) > 65535 || !buffer.valid(replacement) {
+    if target >= 16 || target != plugin.command_slot || plugin.command_identity != app.documents.slots[target].identity || plugin.command_revision != #cast(u64, revision) || app.documents.slots[target].document == nil || app.documents.slots[target].terminal.handle != nil || app.documents.slots[target].document.revision != #cast(u64, revision) || !json.is_string(json.object_get(parsed.root, "text")) || #len(replacement) > 65535 || !buffer.valid(replacement) {
       plugin_log(app, "Plugin edit rejected: stale buffer/revision or invalid text.")
       return
     }
@@ -407,7 +407,7 @@ fn plugin_message(app: *App, index: usize, source: []const u8) {
     }
     app.plugin_state.edit_length = copy_text(app.plugin_state.edit[..], replacement)
     app.plugin_state.edit_target = target
-    app.plugin_state.edit_revision = #cast(u64) revision
+    app.plugin_state.edit_revision = #cast(u64, revision)
     app.plugin_state.edit_identity = app.documents.slots[target].identity
     app.plugin_state.edit_document = app.documents.slots[target].document
     app.prompt_state.panel = Panel.PluginEdit
@@ -443,7 +443,7 @@ fn plugin_tick(app: *App) bool {
           if result == 0 {
             break
           }
-          plugin_message(app, index, app.plugin_state.incoming[..#cast(usize) result])
+          plugin_message(app, index, app.plugin_state.incoming[..#cast(usize, result)])
           redraw = true
           messages += 1
         }
@@ -476,7 +476,7 @@ fn plugin_event(app: *App, event: []const u8) {
   add_text(message[..], &used, "\",\"buffer\":")
   add_number(message[..], &used, app.documents.active)
   add_text(message[..], &used, ",\"revision\":")
-  add_number(message[..], &used, #cast(usize) app.documents.current.revision)
+  add_number(message[..], &used, #cast(usize, app.documents.current.revision))
   add_text(message[..], &used, "}\n")
   for index in 0..8 {
     plugin := &app.plugin_state.slots[index]
@@ -526,8 +526,8 @@ fn plugin_list(app: *App) {
       }
     }
   }
-  allocated := mem.arena_create(262144)
-  catalog := plugin_catalog(app, &allocated)
+  allocated := mem.arena_create((262144) + mem.ArenaBufferOverhead)
+  catalog := plugin_catalog(app, allocated)
   if catalog != nil {
     add_text(text[..], &used, "\nAvailable from your catalog (not installed):\n")
     candidate := catalog.first
@@ -547,7 +547,7 @@ fn plugin_list(app: *App) {
       candidate = candidate.next
     }
   }
-  mem.arena_release(&allocated)
+  mem.arena_release(allocated)
   add_text(text[..], &used, "\n:plugin-load /path/plugin.json\n:plugin-update <name>\n:plugin-install <catalog name or manifest path>\n:plugin-remove <name>\n:plugins-disable\n:plugin-log")
   notice(app, text[..used])
 }
@@ -631,12 +631,12 @@ fn plugin_update(app: *App, name: []const u8) {
   mark := mem.arena_mark(app.scratch)
   defer mem.arena_rewind(app.scratch, mark)
   read := fs.read_all(app.scratch, path[..length], 4095)
-  if !read.ok || #len(read.data) == 0 {
+  if !read.ok || #len(read.value) == 0 {
     notice(app, "This installation has no recorded source. Use :plugin-install /path/plugin.json first.")
     return
   }
   source: [4096]u8 = []
-  source_length := copy_text(source[..], read.data)
+  source_length := copy_text(source[..], read.value)
   if plugin_install(app, source[..source_length]) {
     plugin_load_named(app, name)
   }
@@ -653,7 +653,7 @@ fn plugin_catalog(app: *App, arena: *mem.Arena) *const json.Value {
   if !read.ok {
     return nil
   }
-  parsed := json.parse(arena, read.data)
+  parsed := json.parse(arena, read.value)
   if !parsed.ok || !json.is_object(parsed.root) {
     return nil
   }
@@ -664,9 +664,9 @@ fn plugin_install_named(app: *App, source: []const u8) {
     _ = plugin_install(app, source)
     return
   }
-  allocated := mem.arena_create(262144)
-  defer mem.arena_release(&allocated)
-  catalog := plugin_catalog(app, &allocated)
+  allocated := mem.arena_create((262144) + mem.ArenaBufferOverhead)
+  defer mem.arena_release(allocated)
+  catalog := plugin_catalog(app, allocated)
   entry := json.object_get(catalog, source)
   if !json.is_string(entry) {
     notice(app, "Plugin name is not in plugin-catalog.json. Use an absolute manifest path, or add a name/path entry to your catalog.")

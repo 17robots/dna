@@ -10,7 +10,7 @@ struct MacroState {
 
 // Lazy storage: at most 1024 events per register, with bounded text payloads.
 struct MacroEvent { key: u32, modifiers: u16, character: u32, text_length: usize, text: [64]u8 }
-struct Macro { arena: mem.Arena, owned: bool, events: []MacroEvent, count: usize }
+struct Macro { arena: *mem.Arena, owned: bool, events: []MacroEvent, count: usize }
 
 fn macro_toggle(app: *App) {
   if app.macro_state.replaying {
@@ -23,10 +23,11 @@ fn macro_toggle(app: *App) {
   }
   slot := &app.macro_state.slots[app.register_state.selected]
   if !slot.owned {
-    allocated := mem.arena_create(1024 * #sizeof(MacroEvent))
-    slot.arena = mem.arena_take(&allocated)
+    allocated := mem.arena_create((1024 * #sizeof(MacroEvent)) + mem.ArenaBufferOverhead)
+    slot.arena = allocated
+    allocated = nil
     slot.owned = true
-    slot.events = mem.push_array(MacroEvent, &slot.arena, 1024)
+    slot.events = mem.push_array(MacroEvent, slot.arena, 1024)
   }
   slot.count = 0
   app.macro_state.slot = app.register_state.selected
@@ -137,7 +138,8 @@ fn macro_tick(app: *App, typography: *Typography) bool {
 fn macros_release(app: *App) {
   for index in 0..27 {
     if app.macro_state.slots[index].owned {
-      mem.arena_release(&app.macro_state.slots[index].arena)
+      mem.arena_release(app.macro_state.slots[index].arena)
+      app.macro_state.slots[index].arena = nil
       app.macro_state.slots[index].owned = false
     }
   }

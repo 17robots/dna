@@ -14,22 +14,39 @@ fn server_package(index: usize) ServerPackage {
   return ServerPackage{}
 }
 fn server_executable(root: []const u8, item: ServerPackage, output: []u8) []u8 {
-  used: usize = 0 add(output, &used, root) add(output, &used, "/.servers/") add(output, &used, item.name) add(output, &used, "/node_modules/.bin/") add(output, &used, item.executable) return output[..used]
+  used: usize = 0 
+add(output, &used, root) 
+add(output, &used, "/.servers/") 
+add(output, &used, item.name) 
+add(output, &used, "/node_modules/.bin/") 
+add(output, &used, item.executable) 
+return output[..used]
 }
 fn server_list(root: []const u8) {
   _ = io.println(io.stdout(), "\nDyn integration: uses dyn lsp from PATH; no separate server install.\n:server-start dyn (automatic for .dyn buffers unless disabled)")
-  installed: [9]bool = [] index: usize = 0
-  for index < 9 { storage: [4096]u8 = [] info := fs.metadata(server_executable(root, server_package(index), storage[..])) installed[index] = info.ok && (info.mode & 73) != 0 index += 1 }
-  _ = io.println(io.stdout(), "\nInstalled language servers:") index = 0 count: usize = 0
-  for index < 9 { if installed[index] { _ = io.println(io.stdout(), "  {}", server_package(index).name) count += 1 } index += 1 }
+  installed: [9]bool = [] 
+index: usize = 0
+  for index < 9 { storage: [4096]u8 = [] 
+info := fs.metadata(server_executable(root, server_package(index), storage[..])) 
+installed[index] = info.ok && (info.mode & 73) != 0 
+index += 1 }
+  _ = io.println(io.stdout(), "\nInstalled language servers:") 
+index = 0 
+count: usize = 0
+  for index < 9 { if installed[index] { _ = io.println(io.stdout(), "  {}", server_package(index).name) 
+count += 1 } 
+index += 1 }
   if count == 0 { _ = io.println(io.stdout(), "  (none)") }
-  _ = io.println(io.stdout(), "\nLanguage servers available to install:") index = 0
-  for index < 9 { if !installed[index] { _ = io.println(io.stdout(), "  {}: {}", server_package(index).name, server_package(index).packages) } index += 1 }
+  _ = io.println(io.stdout(), "\nLanguage servers available to install:") 
+index = 0
+  for index < 9 { if !installed[index] { _ = io.println(io.stdout(), "  {}: {}", server_package(index).name, server_package(index).packages) } 
+index += 1 }
   _ = io.println(io.stdout(), "\n:server-install NAME / :server-update NAME / :server-start NAME\nRequires Node and npm on PATH. Updates use this DNA build's pinned catalogue.\nOther servers: :lsp-start FILETYPE COMMAND or [languages.FILETYPE] server.")
 }
 fn server_command(root: []const u8, verb: []const u8, name: []const u8) bool {
   if !equal(verb, "server-install") && !equal(verb, "server-update") && !equal(verb, "server-run") && !equal(verb, "server-uninstall") { return false }
-  index: usize = 0 for index < 9 && !equal(server_package(index).name, name) { index += 1 }
+  index: usize = 0 
+for index < 9 && !equal(server_package(index).name, name) { index += 1 }
   if index == 9 { #panic("unknown server; use dna-language list") }
   item := server_package(index)
   if equal(verb, "server-uninstall") {
@@ -38,24 +55,54 @@ fn server_command(root: []const u8, verb: []const u8, name: []const u8) bool {
     return true
   }
   if equal(verb, "server-run") {
-    executable_storage: [4096]u8 = [] executable := server_executable(root, item, executable_storage[..])
-    info := fs.metadata(executable) if !info.ok || (info.mode & 73) == 0 { #panic("server not installed; use :server-install NAME") }
-    launch: [8192]u8 = [] launch_length: usize = 0 add(launch[..], &launch_length, "exec ") quote(launch[..], &launch_length, executable)
+    executable_storage: [4096]u8 = [] 
+executable := server_executable(root, item, executable_storage[..])
+    info := fs.metadata(executable) 
+if !info.ok || (info.mode & 73) == 0 { #panic("server not installed; use :server-install NAME") }
+    launch: [8192]u8 = [] 
+launch_length: usize = 0 
+add(launch[..], &launch_length, "exec ") 
+quote(launch[..], &launch_length, executable)
     if equal(name, "bash") { add(launch[..], &launch_length, " start") } else { add(launch[..], &launch_length, " --stdio") }
-    run(launch[..launch_length]) return true
+    run(launch[..launch_length]) 
+return true
   }
-  managed_storage: [4096]u8 = [] managed := append_path(managed_storage[..], root, ".servers")
-  command: [32768]u8 = [] used: usize = 0 add(command[..], &used, "set -eu\ncommand -v node >/dev/null\ncommand -v npm >/dev/null\nmkdir -p -- ") quote(command[..], &used, managed) run(command[..used])
-  temporary_storage: [4096]u8 = [] stage := append_path(temporary_storage[..], managed, ".install-XXXXXX")
+  managed_storage: [4096]u8 = [] 
+managed := append_path(managed_storage[..], root, ".servers")
+  command: [32768]u8 = [] 
+used: usize = 0 
+add(command[..], &used, "set -eu\ncommand -v node >/dev/null\ncommand -v npm >/dev/null\nmkdir -p -- ") 
+quote(command[..], &used, managed) 
+run(command[..used])
+  temporary_storage: [4096]u8 = [] 
+stage := append_path(temporary_storage[..], managed, ".install-XXXXXX")
   if temporary(&temporary_storage[0]) == nil { #panic("cannot create server staging directory") }
   defer cleanup(stage)
-  used = 0 add(command[..], &used, "set -eu\ntimeout 180 npm install --ignore-scripts --engine-strict --no-audit --no-fund --save-exact --prefix ") quote(command[..], &used, stage) add(command[..], &used, " ") add(command[..], &used, item.packages) run(command[..used])
-  probe: [4096]u8 = [] probe_length: usize = 0 add(probe[..], &probe_length, stage) add(probe[..], &probe_length, "/node_modules/.bin/") add(probe[..], &probe_length, item.executable)
-  probe_info := fs.metadata(probe[..probe_length]) if !probe_info.ok || (probe_info.mode & 73) == 0 { #panic("installed server executable is missing") }
-  version_storage: [4096]u8 = [] version_length: usize = 0 add(version_storage[..], &version_length, managed) add(version_storage[..], &version_length, "/.") add(version_storage[..], &version_length, name) add(version_storage[..], &version_length, "-") add(version_storage[..], &version_length, stage[#len(stage) - 6..])
+  used = 0 
+add(command[..], &used, "set -eu\ntimeout 180 npm install --ignore-scripts --engine-strict --no-audit --no-fund --save-exact --prefix ") 
+quote(command[..], &used, stage) 
+add(command[..], &used, " ") 
+add(command[..], &used, item.packages) 
+run(command[..used])
+  probe: [4096]u8 = [] 
+probe_length: usize = 0 
+add(probe[..], &probe_length, stage) 
+add(probe[..], &probe_length, "/node_modules/.bin/") 
+add(probe[..], &probe_length, item.executable)
+  probe_info := fs.metadata(probe[..probe_length]) 
+if !probe_info.ok || (probe_info.mode & 73) == 0 { #panic("installed server executable is missing") }
+  version_storage: [4096]u8 = [] 
+version_length: usize = 0 
+add(version_storage[..], &version_length, managed) 
+add(version_storage[..], &version_length, "/.") 
+add(version_storage[..], &version_length, name) 
+add(version_storage[..], &version_length, "-") 
+add(version_storage[..], &version_length, stage[#len(stage) - 6..])
   if !fs.rename(stage, version_storage[..version_length]).ok { #panic("cannot retain server version") }
-  link_storage: [4096]u8 = [] link := append_path(link_storage[..], version_storage[..version_length], "active-link")
-  destination_storage: [4096]u8 = [] destination := append_path(destination_storage[..], managed, name)
+  link_storage: [4096]u8 = [] 
+link := append_path(link_storage[..], version_storage[..version_length], "active-link")
+  destination_storage: [4096]u8 = [] 
+destination := append_path(destination_storage[..], managed, name)
   if !fs.symbolic_link(version_storage[..version_length], link).ok || !fs.rename(link, destination).ok { #panic("cannot activate server; previous version unchanged") }
   _ = io.println(io.stdout(), "Installed {}. Use :server-start {}. Previous versions are retained; package-lock.json records resolved dependencies.", name, name)
   return true

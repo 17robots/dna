@@ -7,25 +7,37 @@ fn native_current_directory(destination: []u8) usize {
   if result <= 0 {
     return 0
   }
-  return #cast(usize) result - 1
+  return #cast(usize, result) - 1
 }
 fn native_change_directory(path: []const u8) bool {
   storage: [4096]u8 = []
-  encoded := c.string_from_bytes(storage[..], path)
+  if #len(path) >= #len(storage) {
+    return false
+  }
+  encoded := c.string_into(storage[..], path)
   return encoded.ok && #syscall(80, encoded.value) == 0
 }
 fn native_process_id() u32 {
-  return #cast(u32) #syscall(39)
+  return #cast(u32, #syscall(39))
 }
 fn native_small_pages(memory: []u8) {
   _ = #syscall(28, &memory[0], #len(memory), 15)
 }
 
 fn native_environment(name: []const u8, destination: []u8) EnvironmentResult {
-  result := process.environment(name, destination)
+  temporary := mem.arena_create(0)
+  defer mem.arena_release(temporary)
+  result := process.environment(temporary, name)
+  if result.ok && #len(result.value) > #len(destination) {
+    return EnvironmentResult{kind: errors.Kind.Capacity, error: -28}
+  }
+  if result.ok {
+    _ = mem.move(destination, result.value)
+    return EnvironmentResult{value: destination[..#len(result.value)], found: result.found, ok: true}
+  }
   return EnvironmentResult{value: result.value, found: result.found, error: result.error, kind: result.kind, ok: result.ok}
 }
 fn native_arguments(arena: *mem.Arena) ArgumentsResult {
   result := process.arguments(arena)
-  return ArgumentsResult{values: result.values, error: result.error, kind: result.kind, ok: result.ok}
+  return ArgumentsResult{values: result.value, error: result.error, kind: result.kind, ok: result.ok}
 }

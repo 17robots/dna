@@ -18,14 +18,14 @@ struct RecoveryState {
 // interval per 256 KiB of snapshot, at most ten intervals. Limits disk writes
 // while typing in large files; a crash loses at most a few seconds.
 fn recovery_delay(app: *const App) u64 {
-  base := #cast(u64) app.config.recovery_interval_ms
+  base := #cast(u64, app.config.recovery_interval_ms)
   steps := app.recovery.last_size / 262144 + 1
   if steps > 10 {
     steps = 10
   }
-  return base * #cast(u64) steps
+  return base * #cast(u64, steps)
 }
-struct RestoredDocument { arena: mem.Arena, document: *buffer.Document }
+struct RestoredDocument { arena: *mem.Arena, document: *buffer.Document }
 
 extern fn recovery_open "dna_recovery_open"(directory: *const u8) rawptr
 extern fn recovery_submit "dna_recovery_submit"(recovery: rawptr, bytes: *const u8, length: usize) i32
@@ -54,7 +54,7 @@ fn session_capture(app: *App, state: *workspace.State, recovery: bool) bool {
     slot := &app.documents.slots[index]
     if slot.document != nil {
       doc := slot.document
-      state.buffers[index] = workspace.SavedBuffer{used: true, path: files.name(&slot.file), text: doc.bytes[..doc.length], saved: doc.saved[..doc.saved_length], filetype: slot.filetype[..slot.filetype_length], cursor: doc.cursor, anchor: doc.anchor, secondary: doc.secondary}
+      state.buffers[index] = workspace.SavedBuffer{used: true, path: files.name(&slot.file), text: doc.bytes[..doc.length], saved_parts: buffer.saved_parts(doc), split_saved: true, filetype: slot.filetype[..slot.filetype_length], cursor: doc.cursor, anchor: doc.anchor, secondary: doc.secondary}
       if slot.inferred_filetype {
         state.buffers[index].filetype = ""
       }
@@ -78,13 +78,13 @@ fn session_capture(app: *App, state: *workspace.State, recovery: bool) bool {
       }
       percent: usize = 50
       if pane.branch {
-        percent = #cast(usize) (pane.split_fraction * 100.0)
+        percent = #cast(usize, (pane.split_fraction * 100.0))
       }
-      state.panes[index] = workspace.SavedPane{used: true, branch: pane.branch, vertical: pane.vertical, parent: pane.parent, first: pane.first, second: pane.second, slot: pane.slot, cursor: cursor, anchor: anchor, percent: percent, scroll_x: #cast(usize) pane.scroll_x, scroll_y: #cast(usize) pane.scroll_y}
+      state.panes[index] = workspace.SavedPane{used: true, branch: pane.branch, vertical: pane.vertical, parent: pane.parent, first: pane.first, second: pane.second, slot: pane.slot, cursor: cursor, anchor: anchor, percent: percent, scroll_x: #cast(usize, pane.scroll_x), scroll_y: #cast(usize, pane.scroll_y)}
       if !pane.branch && app.documents.slots[pane.slot].terminal.handle == nil {
         state.panes[index].secondary.count = pane.secondary_count
         for selected in 0..pane.secondary_count {
-          offset := #cast(usize) 32 + index * 64 + selected * 2
+          offset := #cast(usize, 32) + index * 64 + selected * 2
           target_doc := app.documents.slots[pane.slot].document
           state.panes[index].secondary.ranges[selected] = buffer.Selection{cursor: target_doc.marks[offset], anchor: target_doc.marks[offset + 1]}
         }
@@ -105,9 +105,9 @@ fn session_save(app: *App, argument: []const u8) bool {
     return false
   }
   snapshot_size := workspace.encoded_size(&state)
-  allocated := mem.arena_create(snapshot_size)
-  defer mem.arena_release(&allocated)
-  bytes := mem.push_bytes_uninit(&allocated, snapshot_size)
+  allocated := mem.arena_create((snapshot_size) + mem.ArenaBufferOverhead)
+  defer mem.arena_release(allocated)
+  bytes := mem.push_bytes_uninit(allocated, snapshot_size)
   length := workspace.encode(&state, bytes)
   if length == 0 {
     notice(app, "Session exceeds snapshot capacity.")
@@ -148,16 +148,16 @@ fn session_restore(app: *App, argument: []const u8) bool {
   path := session_path(app, argument, path_storage[..])
   // Up to 16 documents with their saved text, plus layout and history metadata.
   session_limit: usize = (buffer.Capacity + 1) * 32 + 1048576
-  allocated := mem.arena_create(session_limit)
-  defer mem.arena_release(&allocated)
+  allocated := mem.arena_create((session_limit) + mem.ArenaBufferOverhead)
+  defer mem.arena_release(allocated)
   info := files.metadata(path)
   if !info.ok || (info.mode & 61440) != 32768 {
     notice(app, "Session must be a regular file.")
     return false
   }
-  read := fs.read_all(&allocated, path, session_limit)
+  read := fs.read_all(allocated, path, session_limit)
   state := workspace.State{}
-  if !read.ok || !workspace.decode(read.data, &state) {
+  if !read.ok || !workspace.decode(read.value, &state) {
     notice(app, "Invalid, truncated, or unsupported session. Workspace unchanged.")
     return false
   }
@@ -171,9 +171,10 @@ fn session_restore(app: *App, argument: []const u8) bool {
   for index in 0..16 {
     saved := &state.buffers[index]
     if saved.used {
-      memory := mem.arena_create(#sizeof(buffer.Document) + buffer.Capacity + 129)
-      restored[index].arena = mem.arena_take(&memory)
-      restored[index].document = buffer.allocate(&restored[index].arena)
+      memory := mem.arena_create((#sizeof(buffer.Document) + buffer.Capacity + 129) + mem.ArenaBufferOverhead)
+      restored[index].arena = memory
+      memory = nil
+      restored[index].document = buffer.allocate(restored[index].arena)
       doc := restored[index].document
       if saved.reload {
         disk := files.read_text(saved.path)
@@ -222,7 +223,8 @@ fn session_restore(app: *App, argument: []const u8) bool {
       document_release(app, current)
     }
     current.document = restored[index].document
-    current.arena = mem.arena_take(&restored[index].arena)
+    current.arena = restored[index].arena
+    restored[index].arena = nil
     current.file.length = 0
     current.file.recovery_owned = false
     current.file.path[0] = 0
@@ -240,7 +242,7 @@ fn session_restore(app: *App, argument: []const u8) bool {
         current.arena_born = render_clock()
       }
       allocation_record(app, "document", #sizeof(buffer.Document) + buffer.Capacity + 129, current.arena_born, false)
-      current.colors = mem.push_bytes_uninit(&current.arena, buffer.Capacity + 1)
+      current.colors = mem.push_bytes_uninit(current.arena, buffer.Capacity + 1)
       current.disk_changed = false
       current.diagnostics.count = 0
       app.documents.next_identity += 1
@@ -271,13 +273,13 @@ fn session_restore(app: *App, argument: []const u8) bool {
       pane.first = source.first
       pane.second = source.second
       pane.slot = source.slot
-      pane.split_fraction = #cast(f32) source.percent / 100.0
-      pane.scroll_x = #cast(f32) source.scroll_x
-      pane.scroll_y = #cast(f32) source.scroll_y
+      pane.split_fraction = #cast(f32, source.percent) / 100.0
+      pane.scroll_x = #cast(f32, source.scroll_x)
+      pane.scroll_y = #cast(f32, source.scroll_y)
       if !pane.branch {
         pane.secondary_count = source.secondary.count
         for extra in 0..source.secondary.count {
-          offset := #cast(usize) 32 + index * 64 + extra * 2
+          offset := #cast(usize, 32) + index * 64 + extra * 2
           extra_doc := app.documents.slots[pane.slot].document
           extra_doc.marks[offset] = buffer.boundary(extra_doc, source.secondary.ranges[extra].cursor)
           extra_doc.marks[offset + 1] = buffer.boundary(extra_doc, source.secondary.ranges[extra].anchor)
@@ -301,7 +303,8 @@ fn cleanup_restored(documents: []RestoredDocument) {
   index: usize = 0
   for index < #len(documents) {
     if documents[index].document != nil {
-      mem.arena_release(&documents[index].arena)
+      mem.arena_release(documents[index].arena)
+      documents[index].arena = nil
     }
     index += 1
   }
@@ -357,7 +360,7 @@ fn recovery_tick(app: *App) {
     return
   }
   defer work_finish(app, work, "recovery_encode")
-  bytes := mem.push_bytes_uninit(&work.arena, snapshot_size)
+  bytes := mem.push_bytes_uninit(work.arena, snapshot_size)
   encode_started := operation_begin(app)
   encoded_length := workspace.encode(&state, bytes)
   app.recovery.last_size = encoded_length
