@@ -1,4 +1,79 @@
 use "./lsp"
+use "std/io" lsp_stream
+
+// Preflight the complete encoding and source ranges before touching caller
+// bytes. The second streaming pass writes directly, without an arena/mapping.
+use "std/unicode/utf8" lsp_utf8
+
+struct LspJsonOutput { bytes: []u8, used: usize, writing: bool }
+fn lsp_json_overlap(out: []u8, source: []const u8) bool {
+  if #len(out) == 0 || #len(source) == 0 {
+    return false
+  }
+  destination := #cast(usize, &out[0])
+  input := #cast(usize, &source[0])
+  if input >= destination {
+    return input - destination < #len(out)
+  }
+  return destination - input < #len(source)
+}
+// Raw strings also need checking: escaped bytes may be emitted from SDK
+// constants rather than the original source slice. Protect tree metadata too.
+fn lsp_json_sources(out: []u8, value: *const json.Value, depth: usize) bool {
+  if value == nil || depth > 256 {
+    return false
+  }
+  if value.kind == json.KindMissing || value.kind > json.KindObject {
+    return false
+  }
+  if lsp_json_overlap(out, (#cast(*const u8, value))[..#sizeof(json.Value)]) || lsp_json_overlap(out, value.text) || lsp_json_overlap(out, value.key) {
+    return false
+  }
+  if !lsp_utf8.valid(value.key) {
+    return false
+  }
+  child := value.first
+  for child != nil {
+    if !lsp_json_sources(out, child, depth + 1) {
+      return false
+    }
+    child = child.next
+  }
+  return true
+}
+fn lsp_json_write(data: rawptr, source: []const u8) lsp_stream.Result {
+  output := #cast(*LspJsonOutput, data)
+  if #len(source) > #len(output.bytes) - output.used || (!output.writing && lsp_json_overlap(output.bytes, source)) {
+    return lsp_stream.Result{ error: -28, status: lsp_stream.Status.Error }
+  }
+  if output.writing {
+    _ = mem.move(output.bytes[output.used..], source)
+  }
+  output.used += #len(source)
+  return lsp_stream.Result{ transferred: #len(source), status: lsp_stream.Status.Complete }
+}
+fn lsp_json_encode(out: []u8, value: *const json.Value) []u8 {
+  if !lsp_json_sources(out, value, 0) {
+    return out[..0]
+  }
+  output := LspJsonOutput{ bytes: out }
+  writer := lsp_stream.Writer{ data: #cast(rawptr, &output), write: lsp_json_write }
+  measured := json.write(writer, value)
+  if measured.status == lsp_stream.Status.Error {
+    return out[..0]
+  }
+  output.used = 0
+  output.writing = true
+  encoded := json.write(writer, value)
+  if encoded.status == lsp_stream.Status.Error {
+    return out[..0]
+  }
+  return out[..output.used]
+}
+fn lsp_json_string(out: []u8, source: []const u8) []u8 {
+  value := json.Value{ kind: json.KindString, text: source }
+  return lsp_json_encode(out, &value)
+}
 
 extern fn rpc_open "dna_rpc_open"(command: *const u8, directory: *const u8) rawptr
 extern fn rpc_send "dna_rpc_send"(rpc: rawptr, bytes: *const u8, length: usize) i32
@@ -21,7 +96,7 @@ struct LspDocument {
 // Last text sent to an incremental-sync server, so a change sends only the
 // edited region. Created lazily; freed on close, restart and shutdown.
 struct LspShadow {
-  arena: mem.Arena,
+  arena: *mem.Arena,
   bytes: []u8,
   length: usize,
   owned, ready: bool,
@@ -46,7 +121,7 @@ struct LanguageServer {
 struct LspResults {
   tracked_capacity: usize,
   tracked_born: u64,
-  arena: mem.Arena,
+  arena: *mem.Arena,
   resolved: bool,
   owned: bool,
   insert: bool,
@@ -83,7 +158,7 @@ struct LspEditPlan {
   server: usize,
   count: usize,
   command: *const json.Value,
-  arena: mem.Arena,
+  arena: *mem.Arena,
   owned: bool,
 }
 struct LspState {
@@ -134,7 +209,8 @@ fn lsp_note(app: *App, text: []const u8) {
 }
 fn lsp_results_release(app: *App) {
   if app.lsp.results.owned {
-    mem.arena_release(&app.lsp.results.arena)
+    mem.arena_release(app.lsp.results.arena)
+    app.lsp.results.arena = nil
     if app.lsp.results.tracked_capacity != 0 {
       allocation_record(app, "lsp_results", app.lsp.results.tracked_capacity, app.lsp.results.tracked_born, true)
     }
@@ -144,14 +220,16 @@ fn lsp_results_release(app: *App) {
 fn lsp_edits_release(app: *App) {
   lsp_edit_reply(app, false)
   if app.lsp.edits.owned {
-    mem.arena_release(&app.lsp.edits.arena)
+    mem.arena_release(app.lsp.edits.arena)
+    app.lsp.edits.arena = nil
   }
   mem.clear(&app.lsp.edits)
 }
 fn lsp_shadow_release(app: *App, index: usize, slot: usize) {
   shadow := &app.lsp.shadows[index * 16 + slot]
   if shadow.owned {
-    mem.arena_release(&shadow.arena)
+    mem.arena_release(shadow.arena)
+    shadow.arena = nil
   }
   shadow.* = LspShadow{}
 }
@@ -229,14 +307,14 @@ fn lsp_start(app: *App, language: []const u8, command: []const u8) {
     notice(app, "Could not start language server.")
     return
   }
-  server.deadline = sdl.ticks() + #cast(u64) app.config.lsp_timeout_ms
+  server.deadline = sdl.ticks() + #cast(u64, app.config.lsp_timeout_ms)
   uri: [12288]u8 = []
   encoded: [32768]u8 = []
   message: [65536]u8 = []
   used: usize = 0
   lsp_header(message[..], &used, "initialize", 1)
   add_text(message[..], &used, "{\"processId\":null,\"rootUri\":")
-  add_text(message[..], &used, json.write_string(encoded[..], lsp.uri(server.root[..server.root_length], uri[..])))
+  add_text(message[..], &used, lsp_json_string(encoded[..], lsp.uri(server.root[..server.root_length], uri[..])))
   add_text(message[..], &used, ",\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-16\"]},\"textDocument\":{\"synchronization\":{\"dynamicRegistration\":false},\"completion\":{\"contextSupport\":true,\"completionItem\":{\"snippetSupport\":true}},\"publishDiagnostics\":{\"versionSupport\":true},\"codeAction\":{\"dataSupport\":true,\"resolveSupport\":{\"properties\":[\"edit\",\"command\"]},\"codeActionLiteralSupport\":{\"codeActionKind\":{\"valueSet\":[\"quickfix\",\"refactor\",\"source\"]}}}},\"workspace\":{\"applyEdit\":true,\"workspaceEdit\":{\"documentChanges\":true,\"resourceOperations\":[]}}},\"clientInfo\":{\"name\":\"DNA\",\"version\":\"preview\"}}}")
   _ = lsp_send(app, index, message[..used])
   lsp_note(app, "Language server initializing.")
@@ -255,7 +333,7 @@ fn lsp_for(app: *App) usize {
 fn lsp_document_uri(out: []u8, used: *usize, path: []const u8) {
   uri: [12288]u8 = []
   encoded: [32768]u8 = []
-  add_text(out, used, json.write_string(encoded[..], lsp.uri(path, uri[..])))
+  add_text(out, used, lsp_json_string(encoded[..], lsp.uri(path, uri[..])))
 }
 // The line index skips unchanged preceding lines; only this line needs UTF-16 counting.
 fn lsp_document_position(doc: *const buffer.Document, offset: usize) lsp.Position {
@@ -308,7 +386,7 @@ fn lsp_sync(app: *App, index: usize, force: bool) {
       tracked.observed = doc.revision
       tracked.changed = sdl.ticks()
     }
-    if !force && tracked.identity != 0 && sdl.ticks() - tracked.changed < #cast(u64) app.config.lsp_change_delay_ms {
+    if !force && tracked.identity != 0 && sdl.ticks() - tracked.changed < #cast(u64, app.config.lsp_change_delay_ms) {
       slot_index += 1
       continue
     }
@@ -351,8 +429,8 @@ fn lsp_sync(app: *App, index: usize, force: bool) {
     if !work_acquire(app, work, capacity * 2 + 64, "lsp_send") {
       return
     }
-    message := mem.push_bytes_uninit(&work.arena, capacity)
-    escaped := mem.push_bytes_uninit(&work.arena, capacity)
+    message := mem.push_bytes_uninit(work.arena, capacity)
+    escaped := mem.push_bytes_uninit(work.arena, capacity)
     used: usize = 0
     if opening {
       lsp_header(message, &used, "textDocument/didOpen", 0)
@@ -366,7 +444,7 @@ fn lsp_sync(app: *App, index: usize, force: bool) {
     add_number(message, &used, tracked.version)
     if opening {
       add_text(message, &used, ",\"languageId\":")
-      add_text(message, &used, json.write_string(escaped, protocol_language(server.language[..server.length])))
+      add_text(message, &used, lsp_json_string(escaped, protocol_language(server.language[..server.length])))
       add_text(message, &used, ",\"text\":")
     }
     if !opening {
@@ -393,7 +471,7 @@ fn lsp_sync(app: *App, index: usize, force: bool) {
       }
       add_text(message, &used, "\"text\":")
     }
-    quoted := json.write_string(escaped, sent)
+    quoted := lsp_json_string(escaped, sent)
     if #len(quoted) == 0 {
       work_finish(app, work, "lsp_send")
       lsp_note(app, "Cannot encode document for language server.")
@@ -416,10 +494,13 @@ fn lsp_sync(app: *App, index: usize, force: bool) {
     }
     if server.sync == 2 {
       if !shadow.owned {
-        created := mem.arena_create(buffer.Capacity + 1)
-        shadow.arena = mem.arena_take(&created)
+        created := mem.arena_create((buffer.Capacity + 1) + mem.ArenaBufferOverhead)
+        // This sparse reservation normally touches only a small document prefix.
+        host.small_pages(created.data)
+        shadow.arena = created
+        created = nil
         shadow.owned = true
-        shadow.bytes = mem.push_bytes_uninit(&shadow.arena, buffer.Capacity + 1)
+        shadow.bytes = mem.push_bytes_uninit(shadow.arena, buffer.Capacity + 1)
       }
       shadow.ready = shadow.owned
       if shadow.owned {
@@ -519,7 +600,7 @@ fn lsp_request(app: *App, kind: usize, argument: []const u8) {
   app.lsp.revision = doc.revision
   app.lsp.position = position
   app.lsp.insert = app.view.insert
-  app.lsp.deadline = sdl.ticks() + #cast(u64) app.config.lsp_timeout_ms
+  app.lsp.deadline = sdl.ticks() + #cast(u64, app.config.lsp_timeout_ms)
   message: [65536]u8 = []
   escaped: [32768]u8 = []
   used: usize = 0
@@ -551,7 +632,7 @@ fn lsp_request(app: *App, kind: usize, argument: []const u8) {
   if kind == 1 {
     if #len(argument) != 0 {
       add_text(message[..], &used, ",\"context\":{\"triggerKind\":2,\"triggerCharacter\":")
-      add_text(message[..], &used, json.write_string(escaped[..], argument))
+      add_text(message[..], &used, lsp_json_string(escaped[..], argument))
       add_text(message[..], &used, "}")
     } else {
       add_text(message[..], &used, ",\"context\":{\"triggerKind\":1}")
@@ -567,7 +648,7 @@ fn lsp_request(app: *App, kind: usize, argument: []const u8) {
       return
     }
     add_text(message[..], &used, ",\"newName\":")
-    add_text(message[..], &used, json.write_string(escaped[..], argument))
+    add_text(message[..], &used, lsp_json_string(escaped[..], argument))
   }
   add_text(message[..], &used, "}}")
   _ = lsp_send(app, index, message[..used])
@@ -630,9 +711,9 @@ fn lsp_diagnostics(app: *App, index: usize, params: *const json.Value) {
               length -= 1
             }
           }
-                    if diagnostics.count >= old_count || previous.line != diagnostic.line || previous.character != diagnostic.character || previous.end_line != diagnostic.end_line || previous.end_character != diagnostic.end_character || previous.severity != diagnostic.severity || !buffer.equal(previous.text[..previous.length], text[..length]) {
-                      changed = true
-                    }
+          if diagnostics.count >= old_count || previous.line != diagnostic.line || previous.character != diagnostic.character || previous.end_line != diagnostic.end_line || previous.end_character != diagnostic.end_character || previous.severity != diagnostic.severity || !buffer.equal(previous.text[..previous.length], text[..length]) {
+            changed = true
+          }
           diagnostic.length = copy_text(diagnostic.text[..], text[..length])
           diagnostics.count += 1
         }
@@ -683,14 +764,14 @@ fn lsp_handle(app: *App, index: usize, source: []const u8, arena: *mem.Arena) bo
     else if buffer.equal(method, "window/logMessage") || buffer.equal(method, "window/showMessage") {
       lsp_note(app, json_text(params, "message"))
     }
-    if buffer.equal(method, "workspace/applyEdit") && json.object_get(root, "id") != nil && app.lsp.kind == 8 && app.lsp.server == index && app.lsp.pending != 0 && app.prompt_state.panel == Panel.None {
+    if buffer.equal(method, "workspace/applyEdit") && !json.is_missing(json.object_get(root, "id")) && app.lsp.kind == 8 && app.lsp.server == index && app.lsp.pending != 0 && app.prompt_state.panel == Panel.None {
       lsp_prepare_edit(app, json.object_get(params, "edit"))
       if app.prompt_state.panel != Panel.None {
         render_request(app, RenderLsp)
       }
       if app.prompt_state.panel == Panel.LspEdit {
         reply: [512]u8 = []
-        encoded_reply := json.encode(reply[..], json.object_get(root, "id"))
+        encoded_reply := lsp_json_encode(reply[..], json.object_get(root, "id"))
         if #len(encoded_reply) > 0 {
           app.lsp.edits.reply_length = copy_text(app.lsp.edits.reply[..], encoded_reply)
           app.lsp.edits.server = index
@@ -699,11 +780,11 @@ fn lsp_handle(app: *App, index: usize, source: []const u8, arena: *mem.Arena) bo
         lsp_edits_release(app)
       }
     }
-    if json.object_get(root, "id") != nil {
+    if !json.is_missing(json.object_get(root, "id")) {
       response: [65536]u8 = []
       encoded: [16384]u8 = []
       used := copy_text(response[..], "{\"jsonrpc\":\"2.0\",\"id\":")
-      encoded_id := json.encode(encoded[..], json.object_get(root, "id"))
+      encoded_id := lsp_json_encode(encoded[..], json.object_get(root, "id"))
       if #len(encoded_id) == 0 {
         return false
       }
@@ -740,7 +821,7 @@ fn lsp_handle(app: *App, index: usize, source: []const u8, arena: *mem.Arena) bo
   server := &app.lsp.servers[index]
   result := json.object_get(root, "result")
   if id.value == 1 && !server.ready {
-    if json.object_get(root, "error") != nil || !json.is_object(result) {
+    if !json.is_missing(json.object_get(root, "error")) || !json.is_object(result) {
       lsp_failure(app, "Language server initialization failed.")
       lsp_stop(app, index)
       return false
@@ -780,7 +861,7 @@ fn lsp_handle(app: *App, index: usize, source: []const u8, arena: *mem.Arena) bo
   app.lsp.response_elapsed = sdl.ticks() - app.lsp.request_started
   app.lsp.response_received = true
   app.lsp.pending = 0
-  if json.object_get(root, "error") != nil {
+  if !json.is_missing(json.object_get(root, "error")) {
     lsp_note(app, json_text(json.object_get(root, "error"), "message"))
     if app.prompt_state.panel == Panel.None && !app.lsp.automatic {
       notice(app, app.lsp.log[..app.lsp.log_length])
@@ -847,7 +928,7 @@ fn lsp_handle(app: *App, index: usize, source: []const u8, arena: *mem.Arena) bo
   }
   lsp_results_release(app)
   state := &app.lsp.results
-  state.arena = arena.*
+  state.arena = arena
   state.owned = true
   state.kind = app.lsp.kind
   state.server = index
@@ -963,17 +1044,17 @@ fn lsp_tick(app: *App) bool {
           lsp_stop(app, index)
           break
         }
-        size := #cast(usize) length
+        size := #cast(usize, length)
         work := &app.operations.lsp_receive
         if !work_acquire(app, work, size * 16 + 65536, "lsp_receive") {
           lsp_stop(app, index)
           break
         }
-        bytes := mem.push_bytes_uninit(&work.arena, size + 1)
+        bytes := mem.push_bytes_uninit(work.arena, size + 1)
         taken := rpc_take(server.process, &bytes[0], size + 1)
         retained: bool = false
         if taken > 0 {
-          retained = lsp_handle(app, index, bytes[..size], &work.arena)
+          retained = lsp_handle(app, index, bytes[..size], work.arena)
         }
         lsp_receive_finish(app, work, retained)
         count += 1
@@ -1001,7 +1082,7 @@ fn lsp_result_label(app: *App, item: *const json.Value, output: []u8) usize {
   path: [4096]u8 = []
   used := copy_text(output, lsp.path(uri, path[..]))
   range := json.object_get(item, "range")
-  if range == nil {
+  if json.is_missing(range) {
     range = json.object_get(item, "targetSelectionRange")
   }
   line := lsp.number(json.object_get(json.object_get(range, "start"), "line"))
@@ -1054,9 +1135,9 @@ fn lsp_config(app: *App) {
   }
   length := copy_text(path[..], app.configuration.path[..parent])
   add_text(path[..], &length, "lsp.json")
-  allocated := mem.arena_create(262144)
-  defer mem.arena_release(&allocated)
-  read := fs.read_all(&allocated, path[..length], 32768)
+  allocated := mem.arena_create((262144) + mem.ArenaBufferOverhead)
+  defer mem.arena_release(allocated)
+  read := fs.read_all(allocated, path[..length], 32768)
   if !read.ok && configured_count > 0 {
     return
   }
@@ -1064,7 +1145,7 @@ fn lsp_config(app: *App) {
     notice(app, "Create lsp.json beside config.toml, e.g. {\"dyn\":\"dyn lsp\",\"python\":\"pyright-langserver --stdio\"}. Commands run only when you use :lsp-config.")
     return
   }
-  parsed := json.parse(&allocated, read.data)
+  parsed := json.parse(allocated, read.value)
   if !parsed.ok || !json.is_object(parsed.root) {
     notice(app, "lsp.json must map filetypes to trusted server command strings.")
     return
@@ -1233,10 +1314,10 @@ fn lsp_saved(app: *App, index: usize, slot_index: usize) {
     return
   }
   capacity := slot.document.length * 6 + 65536
-  allocated := mem.arena_create(capacity * 2 + 64)
-  defer mem.arena_release(&allocated)
-  message := mem.push_bytes_uninit(&allocated, capacity)
-  escaped := mem.push_bytes_uninit(&allocated, capacity)
+  allocated := mem.arena_create((capacity * 2 + 64) + mem.ArenaBufferOverhead)
+  defer mem.arena_release(allocated)
+  message := mem.push_bytes_uninit(allocated, capacity)
+  escaped := mem.push_bytes_uninit(allocated, capacity)
   used: usize = 0
   lsp_header(message, &used, "textDocument/didSave", 0)
   add_text(message, &used, "{\"textDocument\":{\"uri\":")
@@ -1244,7 +1325,7 @@ fn lsp_saved(app: *App, index: usize, slot_index: usize) {
   add_text(message, &used, "}")
   if server.save_text {
     add_text(message, &used, ",\"text\":")
-    add_text(message, &used, json.write_string(escaped, slot.document.bytes[..slot.document.length]))
+    add_text(message, &used, lsp_json_string(escaped, slot.document.bytes[..slot.document.length]))
   }
   add_text(message, &used, "}}")
   if lsp_send(app, index, message[..used]) {
@@ -1263,11 +1344,11 @@ fn lsp_wait_ms(app: *App, fallback: i32) i32 {
         slot := &app.documents.slots[slot_index]
         if tracked.identity != 0 && slot.document != nil && tracked.identity == slot.identity && tracked.revision != slot.document.revision {
           remaining: u64 = 0
-          if tracked.changed + #cast(u64) app.config.lsp_change_delay_ms > now {
-            remaining = tracked.changed + #cast(u64) app.config.lsp_change_delay_ms - now
+          if tracked.changed + #cast(u64, app.config.lsp_change_delay_ms) > now {
+            remaining = tracked.changed + #cast(u64, app.config.lsp_change_delay_ms) - now
           }
-          if remaining < #cast(u64) delay {
-            delay = #cast(i32) remaining
+          if remaining < #cast(u64, delay) {
+            delay = #cast(i32, remaining)
           }
         }
       }
@@ -1304,7 +1385,7 @@ fn lsp_auto_start(app: *App) {
   }
   for index < app.config.language_count {
     configured := &app.config.languages[index]
-    bit := #cast(u32) 1 << index
+    bit := #cast(u32, 1) << index
     if configured.auto_start && configured.server_length > 0 && (app.lsp.auto_started & bit) == 0 && buffer.equal(name, configured.name[..configured.name_length]) {
       app.lsp.auto_started = app.lsp.auto_started | bit
       if lsp_for(app) == 8 {
@@ -1331,7 +1412,7 @@ fn lsp_receive_finish(app: *App, work: *WorkArena, retained: bool) {
     // Results now own the arena; never reset or reuse their JSON backing storage.
     app.lsp.results.tracked_capacity = work.capacity
     app.lsp.results.tracked_born = work.born
-    work.arena = mem.Arena{}
+    work.arena = nil
     work.capacity = 0
     work.born = 0
   } else {
@@ -1354,20 +1435,20 @@ fn lsp_status(app: *App) {
     add_text(text[..], &used, "none for this filetype")
   }
   add_text(text[..], &used, "\nCompletion delay: ")
-  add_number(text[..], &used, #cast(usize) app.config.completion_delay_ms)
+  add_number(text[..], &used, #cast(usize, app.config.completion_delay_ms))
   add_text(text[..], &used, " ms; document sync: ")
-  add_number(text[..], &used, #cast(usize) app.config.lsp_change_delay_ms)
+  add_number(text[..], &used, #cast(usize, app.config.lsp_change_delay_ms))
   add_text(text[..], &used, " ms; popup animation: ")
-  add_number(text[..], &used, #cast(usize) app.config.popup_animation_ms)
+  add_number(text[..], &used, #cast(usize, app.config.popup_animation_ms))
   add_text(text[..], &used, " ms\n")
   if app.lsp.pending != 0 {
     add_text(text[..], &used, "Pending request: ")
-    add_number(text[..], &used, #cast(usize) (sdl.ticks() - app.lsp.request_started))
+    add_number(text[..], &used, #cast(usize, (sdl.ticks() - app.lsp.request_started)))
     add_text(text[..], &used, " ms\n")
   }
   else if app.lsp.response_received {
     add_text(text[..], &used, "Last response: ")
-    add_number(text[..], &used, #cast(usize) app.lsp.response_elapsed)
+    add_number(text[..], &used, #cast(usize, app.lsp.response_elapsed))
     add_text(text[..], &used, " ms (request to receipt)\n")
   }
   add_text(text[..], &used, "\n")

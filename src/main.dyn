@@ -2,8 +2,8 @@ use "host"
 
 extern fn notifications_start "dna_notify_start"() i32
 extern fn notifications_stop "dna_notify_stop"()
-
 extern fn handoff_run "dna_handoff_run"()
+
 // The editor returns after all its cleanup; a pending :frontend handoff then
 // replaces this process with the other frontend.
 fn main() {
@@ -11,11 +11,11 @@ fn main() {
   handoff_run()
 }
 fn editor_main() {
-  owned := mem.arena_create(#sizeof(App) + 128)
-  scratch := mem.arena_create(2097152)
+  owned := mem.arena_create((#sizeof(App) + 128) + mem.ArenaBufferOverhead)
+  scratch := mem.arena_create((2097152) + mem.ArenaBufferOverhead)
 
-  defer mem.arena_release(&scratch)
-  defer mem.arena_release(&owned)
+  defer mem.arena_release(scratch)
+  defer mem.arena_release(owned)
 
   // Fresh mappings are already zero. Pushing uninitialized memory and opting
   // out of huge pages keeps untouched state (path buffers, caches, pools) off
@@ -23,12 +23,12 @@ fn editor_main() {
   host.small_pages(owned.data)
   host.small_pages(scratch.data)
   // Uninitialized: App is large and every field is set before use.
-  app := #cast(*App) mem.arena_push_uninit(&owned, #sizeof(App), #alignof(App))
+  app := #cast(*App, mem.arena_push_uninit(owned, #sizeof(App), #alignof(App)))
   render_trace_open(app)
   defer render_trace_close(app)
   defer operations_release(app)
 
-  app.scratch = &scratch
+  app.scratch = scratch
   app.running = true
   app.view.popup_width = 0.64
   app.view.popup_height = 0.56
@@ -56,7 +56,7 @@ fn editor_main() {
   config_location(app)
   language_root(app)
 
-  arguments := host.arguments(&scratch)
+  arguments := host.arguments(scratch)
   if !arguments.ok {
     #panic("arguments unavailable")
   }
@@ -107,7 +107,7 @@ fn editor_main() {
   defer notifications_stop()
 
   title: [64]u8 = []
-  encoded_title := c.string_from_bytes(title[..], "DNA")
+  encoded_title := c.string_into(title[..], "DNA")
   if !encoded_title.ok {
     #panic("title capacity")
   }
@@ -150,14 +150,14 @@ fn editor_main() {
     font_path[#len(configured.value)] = 0
   }
   else {
-    default_font := c.string_from_bytes(font_path[..], "/usr/share/fonts/TTF/ZedMonoNerdFontMono-Regular.ttf")
+    default_font := c.string_into(font_path[..], "/usr/share/fonts/TTF/ZedMonoNerdFontMono-Regular.ttf")
     if !default_font.ok {
       #panic("font path capacity")
     }
   }
   font := ttf.open(&font_path[0], 16.0)
   if font == nil && !configured.found {
-    fallback := c.string_from_bytes(font_path[..], "/usr/share/fonts/noto/NotoSansMono-Regular.ttf")
+    fallback := c.string_into(font_path[..], "/usr/share/fonts/noto/NotoSansMono-Regular.ttf")
     if fallback.ok {
       font = ttf.open(fallback.value, 16.0)
     }
@@ -332,7 +332,7 @@ fn editor_main() {
     redraw: bool = false
 
     for true {
-      kind := #cast(u32) (event.words[0] & 4294967295)
+      kind := #cast(u32, (event.words[0] & 4294967295))
       if app.render_trace.enabled {
         app.render_trace.events += 1
         app.render_trace.last_event = kind
@@ -343,7 +343,7 @@ fn editor_main() {
       if kind == 256 || kind == 528 {
         action(app, &typography, 16)
       } else if kind == 768 {
-        key := #cast(*const sdl.KeyEvent) &event
+        key := #cast(*const sdl.KeyEvent, &event)
         if app.composition.length > 0 {
           if key.key == KeyEscape {
             _ = sdl.clear_composition(window)
@@ -390,11 +390,11 @@ fn editor_main() {
         redraw = true
         render_request(app, RenderText)
       } else if kind == 770 {
-        composition_update(app, #cast(*const sdl.EditingEvent) &event)
+        composition_update(app, #cast(*const sdl.EditingEvent, &event))
       } else if kind == 771 {
-        received := #cast(*const sdl.TextEvent) &event
+        received := #cast(*const sdl.TextEvent, &event)
         typing := sdl.tui_active() || wants_text_input(app)
-        if !sdl.tui_active() && received.text != nil && command_character != 0 && command_character < 128 && c.string_length(received.text, 8) == 1 && received.text[..1][0] == #cast(u8) command_character {
+        if !sdl.tui_active() && received.text != nil && command_character != 0 && command_character < 128 && c.string_length(received.text, 8) == 1 && received.text[..1][0] == #cast(u8, command_character) {
           typing = false
         }
         command_character = 0

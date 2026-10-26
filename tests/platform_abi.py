@@ -30,7 +30,7 @@ for dyn, (native, fields) in EVENTS.items():
         native_field, _, dyn_field = field.partition(':')
         dyn_field = dyn_field or native_field
         c.append(f'printf("%zu ", offsetof({native}, {native_field}));')
-        checks.append((f'#cast(usize) &v{dyn}.{dyn_field} - #cast(usize) &v{dyn}', f'{dyn}.{dyn_field} offset'))
+        checks.append((f'#cast(usize, &v{dyn}.{dyn_field}) - #cast(usize, &v{dyn})', f'{dyn}.{dyn_field} offset'))
 c.append('return 0; }')
 (STAGE / 'probe.c').write_text('\n'.join(c))
 flags = shlex.split(subprocess.check_output(['pkg-config', '--cflags', 'sdl3'], text=True))

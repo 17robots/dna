@@ -102,7 +102,6 @@ fn change_case_one(document: *Document, mode: u8) {
     if byte != document.bytes[at] {
       if !changed {
         before_change(document, low, high)
-        saved_change(document, low, high)
       }
       document.bytes[at] = byte
       changed = true
@@ -115,20 +114,37 @@ fn change_case_one(document: *Document, mode: u8) {
   document.cursor = high
   checkpoint(document)
 }
-// One indentation level is a tab, or `width` spaces.
+// Each level removes a tab or up to `width` spaces.
+fn indentation_removed(document: *const Document, at: usize, count: usize, width: usize) usize {
+  remove: usize = 0
+  for level in 0..count {
+    if at + remove < document.length && document.bytes[at + remove] == 9 {
+      remove += 1
+      continue
+    }
+    removed: usize = 0
+    for at + remove < document.length && removed < width && document.bytes[at + remove] == 32 {
+      remove += 1
+      removed += 1
+    }
+    if removed == 0 {
+      break
+    }
+  }
+  return remove
+}
+// One indentation level is a tab, or `width` spaces. Rewrite each selected
+// byte once; update each index entry only after consuming its source row.
 fn indent_lines_one(document: *Document, unindent: bool, count: usize, width: usize, tabs: bool) bool {
   low := line_start(document, start(document))
   last := end(document)
   if last > low && document.bytes[last - 1] == 10 {
     last -= 1
   }
-  last = line_start(document, last)
-  rows: usize = 1
-  scan := low
-  for scan < last {
-    scan = line_end(document, scan) + 1
-    rows += 1
-  }
+  first_row := row_at(document, low)
+  last_row := row_at(document, last)
+  high := line_end(document, last)
+  rows := last_row - first_row + 1
   if count == 0 || count > 999 || width == 0 || width > 16 {
     return false
   }
@@ -136,54 +152,150 @@ fn indent_lines_one(document: *Document, unindent: bool, count: usize, width: us
   if tabs {
     spaces = count
   }
-  if !unindent && (spaces > Capacity || rows > (Capacity - document.length) / spaces) {
+  if !unindent && rows > (Capacity - document.length) / spaces {
     return false
   }
   checkpoint(document)
-  at := last
-  result_end := line_end(document, last)
-  for true {
-    remove: usize = 0
-    if unindent {
-      // Each level is a tab or up to `width` spaces, whichever the line has.
-      for level in 0..count {
-        if at + remove < document.length && document.bytes[at + remove] == 9 {
-          remove += 1
-          continue
-        }
-        removed: usize = 0
-        for at + remove < document.length && removed < width && document.bytes[at + remove] == 32 {
-          remove += 1
-          removed += 1
-        }
-        if removed == 0 {
-          break
-        }
-      }
+  padding: [16000]u8 = []
+  if !unindent {
+    fill: u8 = 32
+    if tabs {
+      fill = 9
     }
-    document.anchor = at
-    document.cursor = at + remove
+    for index in 0..spaces {
+      padding[index] = fill
+    }
+  }
+  // A single row needs no coordinate mapping. Reuse replace, which already
+  // shifts its suffix and tracked positions efficiently.
+  if rows == 1 {
+    document.anchor = low
+    document.cursor = low
+    result_end := high
     if unindent {
+      remove := indentation_removed(document, low, count, width)
+      document.cursor += remove
       _ = replace(document, "")
       result_end -= remove
-    }
-    else {
-      padding: [16000]u8 = []
-      fill: u8 = 32
-      if tabs {
-        fill = 9
-      }
-      for index in 0..spaces {
-        padding[index] = fill
-      }
+    } else {
       _ = replace(document, padding[..spaces])
       result_end += spaces
     }
-    if at == low {
-      break
-    }
-    at = line_start(document, at - 1)
+    document.anchor = low
+    document.cursor = result_end
+    checkpoint(document)
+    return true
   }
+
+  // Mapping by row avoids collapsing marks or explorer identities inside a
+  // single large replacement. Byte columns preserve even non-boundary marks.
+  positions: [992]TextPosition = []
+  for marker in 0..992 {
+    position := text_position(document, document.marks[marker])
+    if position.row >= first_row && position.row <= last_row {
+      if unindent {
+        remove := indentation_removed(document, row_start(document, position.row), count, width)
+        if position.column < remove {
+          position.column = 0
+        } else {
+          position.column -= remove
+        }
+      } else {
+        position.column += spaces
+      }
+    }
+    positions[marker] = position
+  }
+  identity_rows: [256]usize = []
+  for identity in 0..document.rows.count {
+    identity_rows[identity] = document.line_count
+    if document.rows.offsets[identity] <= document.length {
+      identity_rows[identity] = row_at(document, document.rows.offsets[identity])
+    }
+  }
+  // Preserve the same sparse bounds as the former per-row edits. Including
+  // unchanged final-line text could move the undo delta past equal padding.
+  changed_end := row_start(document, last_row)
+  if unindent {
+    changed_end += indentation_removed(document, changed_end, count, width)
+  }
+  before_change(document, low, changed_end)
+  result_end := high
+  if unindent {
+    write := low
+    for row in first_row..=last_row {
+      at := row_start(document, row)
+      ending := high
+      if row < last_row {
+        ending = row_start(document, row + 1)
+      }
+      remove := indentation_removed(document, at, count, width)
+      if !line_fits(document, row, write) {
+        line_widen(document)
+      }
+      line_write(document, row, write)
+      size := ending - at - remove
+      if size > 0 && write != at + remove {
+        _ = move_bytes(&document.bytes[write], &document.bytes[at + remove], size)
+      }
+      write += size
+    }
+    result_end = write
+    if high < document.length && result_end != high {
+      _ = move_bytes(&document.bytes[result_end], &document.bytes[high], document.length - high)
+    }
+    document.length -= high - result_end
+  } else {
+    added := rows * spaces
+    result_end += added
+    if high < document.length {
+      _ = move_bytes(&document.bytes[result_end], &document.bytes[high], document.length - high)
+    }
+    row := last_row + 1
+    ending := high
+    for row > first_row {
+      row -= 1
+      at := row_start(document, row)
+      destination := at + (row - first_row) * spaces
+      if !line_fits(document, row, destination) {
+        line_widen(document)
+      }
+      line_write(document, row, destination)
+      if ending > at {
+        _ = move_bytes(&document.bytes[destination + spaces], &document.bytes[at], ending - at)
+      }
+      _ = copy_bytes(&document.bytes[destination], &padding[0], spaces)
+      ending = at
+    }
+    document.length += added
+  }
+  document.bytes[document.length] = 0
+  record_text_storage(document)
+  // Newline count and row order are unchanged. Shift the unselected suffix
+  // once, leaving every prefix index untouched. Widen before a packed write
+  // overflows; fixed block bases leave unread source offsets intact.
+  for row in last_row + 1..document.line_count {
+    offset := row_start(document, row)
+    if result_end >= high {
+      offset += result_end - high
+    } else {
+      offset -= high - result_end
+    }
+    if !line_fits(document, row, offset) {
+      line_widen(document)
+    }
+    line_write(document, row, offset)
+  }
+  record_line_storage(document)
+  for marker in 0..992 {
+    document.marks[marker] = row_start(document, positions[marker].row) + positions[marker].column
+  }
+  for identity in 0..document.rows.count {
+    if identity_rows[identity] < document.line_count {
+      document.rows.offsets[identity] = row_start(document, identity_rows[identity])
+    }
+  }
+  document.revision += 1
   document.anchor = low
   document.cursor = result_end
   checkpoint(document)
@@ -224,16 +336,10 @@ fn join_lines_one(document: *Document) {
   checkpoint(document)
 }
 pub fn line_position(document: *const Document, number: usize) usize {
-  row: usize = 1
-  at: usize = 0
-  for row < number && at < document.length {
-    at = line_end(document, at)
-    if at < document.length {
-      at += 1
-    }
-    row += 1
+  if number == 0 {
+    return 0
   }
-  return at
+  return row_start(document, number - 1)
 }
 
 // Plan ranges in the original document before any mutation. Overlapping edits

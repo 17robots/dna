@@ -1,6 +1,6 @@
 // Placement: where palette, picker, menus, dialogs, explorer, terminal,
-// completion and hover show. Each surface computes its natural rectangle
-// as before; place_rect moves or resizes it per [place.NAME] or :place.
+// completion and hover show. Surfaces supply natural sizes; shared defaults
+// and [place.NAME] or :place determine their anchors.
 // Docked surfaces take their strip from the editor panes while visible.
 const SurfacePalette: usize = 0
 const SurfacePicker: usize = 1
@@ -71,7 +71,7 @@ fn dock_strip(place: *const settings.Placement, area: *sdl.Rect, scale: f32) sdl
     if horizontal {
       cell = sdl.CellWidth
     }
-    size = #cast(f32) (#cast(i32) (size / cell)) * cell
+    size = #cast(f32, (#cast(i32, (size / cell)))) * cell
   }
   strip := area.*
   if place.side == 0 {
@@ -98,16 +98,16 @@ fn dock_strip(place: *const settings.Placement, area: *sdl.Rect, scale: f32) sdl
 }
 // Editor panes fill what the visible docks leave, in surface order.
 fn editor_area(app: *const App, width: i32, height: i32, scale: f32) sdl.PixelRect {
-  area := sdl.Rect{width: #cast(f32) width, height: #cast(f32) height}
+  area := sdl.Rect{width: #cast(f32, width), height: #cast(f32, height)}
   for surface in 0..settings.PlaceSurfaces {
     place := place_of(app, surface)
     if place.mode == settings.PlaceDock && surface_visible(app, surface) {
       _ = dock_strip(&place, &area, scale)
     }
   }
-  return sdl.PixelRect{x: #cast(i32) area.x, y: #cast(i32) area.y, width: #cast(i32) area.width, height: #cast(i32) area.height}
+  return sdl.PixelRect{x: #cast(i32, area.x), y: #cast(i32, area.y), width: #cast(i32, area.width), height: #cast(i32, area.height)}
 }
-// Where a surface draws: its natural rectangle unless configured otherwise.
+// Where a surface draws, including shared defaults and explicit overrides.
 // Where each surface drew last frame, so the mouse can grab it, and the
 // grab in progress.
 struct PlaceDrag { surface: usize, dock: bool, grab_x, grab_y, x, y: f32 }
@@ -115,6 +115,10 @@ placed_rects: [8]sdl.Rect = []
 placed_frames: [8]u64 = []
 place_drag: PlaceDrag = PlaceDrag{}
 
+// Shared full-size popup bounds, before per-surface placement overrides.
+fn window_popup_rect(width: i32, height: i32, status: f32) sdl.Rect {
+  return sdl.Rect{x: #cast(f32, width) * 0.05, y: (#cast(f32, height) - status) * 0.06, width: #cast(f32, width) * 0.9, height: (#cast(f32, height) - status) * 0.88}
+}
 fn place_rect(app: *const App, surface: usize, width: i32, height: i32, status: f32, scale: f32, natural: sdl.Rect) sdl.Rect {
   rect := place_rect_for(app, surface, width, height, status, scale, natural)
   // A floating surface being dragged follows the pointer until released.
@@ -132,9 +136,31 @@ fn place_rect_for(app: *const App, surface: usize, width: i32, height: i32, stat
   effective := place_of(app, surface)
   place := &effective
   if place.mode == settings.PlaceDefault {
+    // Window popups share a stable top-center anchor. Caret menus and key
+    // hints keep their contextual anchors; explicit placements remain below.
+    if surface == SurfacePalette || surface == SurfacePicker || surface == SurfaceDialog || surface == SurfaceExplorer || surface == SurfaceTerminal {
+      result := natural
+      available := #cast(f32, height) - status
+      if available < 0.0 {
+        available = 0.0
+      }
+      if result.width > #cast(f32, width) {
+        result.width = #cast(f32, width)
+      }
+      result.x = (#cast(f32, width) - result.width) / 2.0
+      result.y = #cast(f32, height) * 0.06
+      if result.y > available {
+        result.y = available
+      }
+      // More rows shrink the viewport instead of moving its anchor upward.
+      if result.height > available - result.y {
+        result.height = available - result.y
+      }
+      return result
+    }
     return natural
   }
-  window := sdl.Rect{width: #cast(f32) width, height: #cast(f32) height - status}
+  window := sdl.Rect{width: #cast(f32, width), height: #cast(f32, height) - status}
   if place.mode == settings.PlaceDock {
     area := window
     for earlier in 0..surface {
@@ -159,13 +185,13 @@ fn place_rect_for(app: *const App, surface: usize, width: i32, height: i32, stat
     caret_x := app.view.animation.file.cursor_x.value
     caret_y := app.view.animation.file.cursor_y.value
     pane := app.view.panes[app.view.focused].rect
-    result.x = #cast(f32) pane.x + caret_x
-    result.y = #cast(f32) pane.y + caret_y + app.view.animation.line
+    result.x = #cast(f32, pane.x) + caret_x
+    result.y = #cast(f32, pane.y) + caret_y + app.view.animation.line
     if result.x + result.width > window.width {
       result.x = window.width - result.width
     }
     if result.y + result.height > window.height {
-      result.y = #cast(f32) pane.y + caret_y - result.height
+      result.y = #cast(f32, pane.y) + caret_y - result.height
     }
     if result.x < 0.0 {
       result.x = 0.0
@@ -283,7 +309,7 @@ fn place_command(app: *App, argument: []const u8) {
 }
 // A placement as a whole decimal or with four places: 0.45, 312.5.
 fn add_amount(output: []u8, used: *usize, amount: f32) {
-  scaled := #cast(usize) (amount * 10000.0 + 0.5)
+  scaled := #cast(usize, (amount * 10000.0 + 0.5))
   add_number(output, used, scaled / 10000)
   fraction := scaled % 10000
   if fraction == 0 {
@@ -524,17 +550,17 @@ fn place_float_settle(app: *App, surface: usize, width: i32, height: i32) {
   centre_x := rect.x + rect.width * 0.5
   centre_y := rect.y + rect.height * 0.5
   column: u8 = 1
-  if centre_x < #cast(f32) width / 3.0 {
+  if centre_x < #cast(f32, width) / 3.0 {
     column = 0
   }
-  else if centre_x > #cast(f32) width * 2.0 / 3.0 {
+  else if centre_x > #cast(f32, width) * 2.0 / 3.0 {
     column = 2
   }
   row: u8 = 1
-  if centre_y < #cast(f32) height / 3.0 {
+  if centre_y < #cast(f32, height) / 3.0 {
     row = 0
   }
-  else if centre_y > #cast(f32) height * 2.0 / 3.0 {
+  else if centre_y > #cast(f32, height) * 2.0 / 3.0 {
     row = 2
   }
   place := place_of(app, surface)

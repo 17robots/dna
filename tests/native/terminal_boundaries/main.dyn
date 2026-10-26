@@ -1,8 +1,117 @@
 // Stage beside production native sources: test actual private queue ownership,
 // without duplicating Terminal's layout or adding production-only test hooks.
 use "std/fmt" boundary_fmt
+use "std/mem" boundary_mem
 extern fn boundary_memfd "memfd_create"(name: *const u8, flags: u32) i32
+fn boundary_history() {
+  before: [7]u64 = []
+  dna_memory_snapshot(2, &before[0])
+  t := #cast(*Terminal, dna_memory_calloc(1, #sizeof(Terminal), 2))
+  if t == nil {
+    #panic("history test allocation")
+  }
+  t.rows = 2
+  t.cols = 240
+  t.vt = term_new(t.rows, t.cols)
+  t.screen = term_screen(t.vt)
+  term_reset(t.screen, 1)
+  empty: [7]u64 = []
+  dna_memory_snapshot(2, &empty[0])
+  if empty[2] - before[2] != #cast(u64, #sizeof(Terminal)) {
+    #panic("empty terminal allocates no history cells")
+  }
+  cells: [241]TermCell = []
+  for col in 0..241 {
+    cells[col].chars[0] = 65
+    cells[col].width = 1
+    cells[col].attributes = 3
+  }
+  if terminal_pushline(80, &cells[0], #cast(rawptr, t)) != 1 {
+    #panic("push history")
+  }
+  first: [7]u64 = []
+  dna_memory_snapshot(2, &first[0])
+  if first[2] - empty[2] != 80 * #cast(u64, #sizeof(TermCell)) {
+    #panic("history stores actual row width")
+  }
+  dna_terminal_scroll(t, 1)
+  saved1 := terminal_cell_at(t, 0, 79)
+  saved2 := terminal_cell_at(t, 0, 80)
+  if saved1.attributes != 3 || saved2.chars[0] != 0 {
+    #panic("scroll history preserves cells and pads missing columns")
+  }
+  output: [4096]u8 = []
+  length := dna_terminal_log(t, &output[0], 4096)
+  if length < 81 || output[79] != 65 || output[80] != 10 {
+    #panic("log uses padded history")
+  }
+  length = dna_terminal_review(t, &output[0], 4096)
+  if length < 81 || output[79] != 65 || output[80] != 10 {
+    #panic("review uses padded history")
+  }
+  dna_terminal_review_end(t)
+  _ = dna_terminal_resize(t, 40.0, 2.0, 1.0, 1.0)
+  _ = dna_terminal_resize(t, 240.0, 2.0, 1.0, 1.0)
+  saved3 := terminal_history_cell(t, 0, 79)
+  saved4 := terminal_history_cell(t, 0, 239)
+  if saved3.chars[0] != 65 || saved4.chars[0] != 0 {
+    #panic("resize preserves original history width")
+  }
+  for index in 1..2000 {
+    cells[0].chars[0] = #cast(u32, index) + 65
+    _ = terminal_pushline(80, &cells[0], #cast(rawptr, t))
+  }
+  full: [7]u64 = []
+  dna_memory_snapshot(2, &full[0])
+  if full[2] - empty[2] != 2000 * 80 * #cast(u64, #sizeof(TermCell)) || t.history_count != 2000 || t.scroll != 2000 {
+    #panic("full history retains only used widths and anchors scroll")
+  }
+  report: []const u8 = "History bytes (2000 x 80 cells; row metadata): "
+  _ = rec_write(1, &report[0], #len(report))
+  number_bytes: [256]u8 = []
+  number := boundary_fmt.u64_decimal(boundary_mem.arena_from_buffer(number_bytes[..]), full[2] - empty[2])
+  _ = rec_write(1, &number[0], #len(number))
+  separator: []const u8 = "; "
+  _ = rec_write(1, &separator[0], #len(separator))
+  number = boundary_fmt.u64_decimal(boundary_mem.arena_from_buffer(number_bytes[..]), 2000 * #cast(u64, #sizeof(TermHistoryRow)))
+  _ = rec_write(1, &number[0], #len(number))
+  newline: []const u8 = "\n"
+  _ = rec_write(1, &newline[0], 1)
+  reused := t.history[0].cells
+  _ = terminal_pushline(80, &cells[0], #cast(rawptr, t))
+  saved5 := terminal_history_cell(t, 0, 0)
+  if t.history[0].cells != reused || t.history_head != 1 || saved5.chars[0] != 66 {
+    #panic("history ring reuses equal widths and evicts oldest row")
+  }
+  _ = terminal_pushline(2, &cells[0], #cast(rawptr, t))
+  saved6 := terminal_saved_cell(t, 1, 2)
+  if t.history[1].count != 2 || saved6.chars[0] != 0 {
+    #panic("narrow replacement releases old width without stale cells")
+  }
+  _ = terminal_pushline(241, &cells[0], #cast(rawptr, t))
+  saved7 := terminal_saved_cell(t, 2, 239)
+  if t.history[2].count != 240 || saved7.chars[0] != 65 {
+    #panic("history clamps maximum width")
+  }
+  _ = terminal_pushline(0, nil, #cast(rawptr, t))
+  saved8 := terminal_saved_cell(t, 3, 0)
+  if t.history[3].cells != nil || saved8.chars[0] != 0 {
+    #panic("empty replacement releases cells")
+  }
+  if terminal_pushline(-1, nil, #cast(rawptr, t)) != 0 || t.history_head != 4 {
+    #panic("invalid row leaves history unchanged")
+  }
+  terminal_dispose(t)
+  after: [7]u64 = []
+  dna_memory_snapshot(2, &after[0])
+  if after[2] != before[2] || after[6] != before[6] {
+    #panic("history allocations released")
+  }
+}
 fn main() {
+  memory_configured = true
+  memory_enabled = true
+  boundary_history()
   directory: []const u8 = "/tmp\0"
   shell: []const u8 = "/bin/sh\0"
   command: []const u8 = "exit\0"
@@ -35,7 +144,7 @@ fn main() {
   if dna_terminal_needs_poll(terminal) != 0 {
     #panic("reaped terminal must not require polling")
   }
-  _ = dna_terminal_resize(terminal, #cast(f32) 240, #cast(f32) 100, #cast(f32) 1, #cast(f32) 1)
+  _ = dna_terminal_resize(terminal, #cast(f32, 240), #cast(f32, 100), #cast(f32, 1), #cast(f32, 1))
   // Supplementary mathematical digits occupy one terminal cell but four UTF-8
   // bytes. Every row also needs its newline, including the last row.
   digit: []const u8 = "𝟘"
@@ -47,8 +156,8 @@ fn main() {
     sequence: [32]u8 = []
     sequence[0] = 27
     sequence[1] = 91
-    number_bytes: [24]u8 = []
-    number := boundary_fmt.u64_decimal(number_bytes[..], #cast(u64) row + 1)
+    number_bytes: [256]u8 = []
+    number := boundary_fmt.u64_decimal(boundary_mem.arena_from_buffer(number_bytes[..]), #cast(u64, row) + 1)
     _ = copy(&sequence[2], &number[0], #len(number))
     suffix: []const u8 = ";1H"
     _ = copy(&sequence[2 + #len(number)], &suffix[0], 3)
@@ -96,6 +205,6 @@ fn main() {
   if install_fstat(sink, &info) != 0 || info.size != 65536 {
     #panic("queue writes every byte")
   }
-  message: []const u8 = "PASS terminal clipboard UTF-8/newline capacity and full pending-buffer flush\n"
+  message: []const u8 = "PASS terminal compact history ownership, ring, resize, log, review, clipboard and pending-buffer flush\n"
   _ = rec_write(1, &message[0], #len(message))
 }

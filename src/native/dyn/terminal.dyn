@@ -7,19 +7,20 @@ struct TermCell { chars: [6]u32, width: u8, attributes: u32, fg, bg: TermColor }
 struct TermPos { row, col: i32 }
 struct TermCallbacks {
   damage, moverect, movecursor: rawptr,
-  property: *fn(i32, *i32, rawptr) i32,
+  property: fn(i32, *i32, rawptr) i32,
   bell, resize: rawptr,
-  pushline: *fn(i32, *const TermCell, rawptr) i32,
+  pushline: fn(i32, *const TermCell, rawptr) i32,
   popline, clear: rawptr,
 }
 struct TermReviewCell { cell: TermCell, offset: u32 }
 struct TermReviewRow { start, count, offset: u32 }
+struct TermHistoryRow { cells: *TermCell, count: i32 }
 struct Terminal {
   theme_generation, selection_color, cursor_color: u32,
   vt, screen: rawptr,
   pid, fd, exit_fd, rows, cols, exited, status, read_closed: i32,
   pending: [65536]u8, pending_len: usize,
-  history: *TermCell, history_count, history_head, scroll: i32,
+  history: [2000]TermHistoryRow, history_count, history_head, scroll: i32,
   glyphs: *rawptr, font, engine: rawptr, points: f32,
   glyph_chars: *u32, x, y, cw, lh: f32,
   selection_a, selection_b, selected, mouse_mode: i32,
@@ -60,22 +61,37 @@ extern fn term_exit "_exit"(status: i32)
 extern fn term_execve "execve"(path: *const u8, args: **const u8, environment: **const u8) i32
 
 fn terminal_color(rgb: u32) TermColor {
-  return TermColor{ red: #cast(u8) (rgb >> 16), green: #cast(u8) (rgb >> 8), blue: #cast(u8) rgb }
+  return TermColor{ red: #cast(u8, (rgb >> 16)), green: #cast(u8, (rgb >> 8)), blue: #cast(u8, rgb) }
 }
 fn terminal_rgb(color: TermColor) u32 {
-  return (#cast(u32) color.red << 16) | (#cast(u32) color.green << 8) | #cast(u32) color.blue
+  return (#cast(u32, color.red) << 16) | (#cast(u32, color.green) << 8) | #cast(u32, color.blue)
 }
 fn terminal_pushline(cols: i32, cells: *const TermCell, user: rawptr) i32 {
-  t := #cast(*Terminal) user
-  base := #cast(usize) t.history_head * 240
-  for col in 0..240 {
-    t.history[..480000][base + col] = TermCell{}
-  }
+  t := #cast(*Terminal, user)
   count := cols
+  if count < 0 {
+    return 0
+  }
   if count > 240 {
     count = 240
   }
-  _ = copy(#cast(*u8) &t.history[..480000][base], #cast(*const u8) cells, #cast(usize) count * #sizeof(TermCell))
+  row := &t.history[#cast(usize, t.history_head)]
+  if row.count != count {
+    cells_new: *TermCell = nil
+    if count > 0 {
+      cells_new = #cast(*TermCell, dna_memory_alloc(#cast(usize, count) * #sizeof(TermCell), 2))
+      if cells_new == nil {
+        // Keep existing history and scroll position intact on allocation failure.
+        return 0
+      }
+    }
+    dna_memory_free(#cast(rawptr, row.cells))
+    row.cells = cells_new
+    row.count = count
+  }
+  if count > 0 {
+    _ = copy(#cast(*u8, row.cells), #cast(*const u8, cells), #cast(usize, count) * #sizeof(TermCell))
+  }
   t.history_head = (t.history_head + 1) % 2000
   if t.history_count < 2000 {
     t.history_count += 1
@@ -86,7 +102,7 @@ fn terminal_pushline(cols: i32, cells: *const TermCell, user: rawptr) i32 {
   return 1
 }
 fn terminal_property(property: i32, value: *i32, user: rawptr) i32 {
-  t := #cast(*Terminal) user
+  t := #cast(*Terminal, user)
   if property == 1 {
     t.cursor_visible = value.*
   }
@@ -100,15 +116,17 @@ fn terminal_dispose(t: *Terminal) {
   if t.vt != nil {
     term_free(t.vt)
   }
-  dna_memory_free(#cast(rawptr) t.review)
-  dna_memory_free(#cast(rawptr) t.history)
-  dna_memory_free(#cast(rawptr) t.glyphs)
-  dna_memory_free(#cast(rawptr) t.glyph_chars)
-  dna_memory_free(#cast(rawptr) t)
+  dna_memory_free(#cast(rawptr, t.review))
+  for index in 0..2000 {
+    dna_memory_free(#cast(rawptr, t.history[index].cells))
+  }
+  dna_memory_free(#cast(rawptr, t.glyphs))
+  dna_memory_free(#cast(rawptr, t.glyph_chars))
+  dna_memory_free(#cast(rawptr, t))
 }
 fn terminal_prefix(text: *const u8, prefix: []const u8) bool {
   for index in 0..#len(prefix) {
-    if text[..#len(prefix)][#cast(usize) (index)] != prefix[#cast(usize) (index)] {
+    if text[..#len(prefix)][#cast(usize, (index))] != prefix[#cast(usize, (index))] {
       return false
     }
   }
@@ -116,7 +134,7 @@ fn terminal_prefix(text: *const u8, prefix: []const u8) bool {
 }
 pub fn dna_terminal_open(cwd: *const u8, shell: *const u8, command: *const u8) *Terminal {
   native_initialize()
-  t := #cast(*Terminal) dna_memory_calloc(1, #sizeof(Terminal), 2)
+  t := #cast(*Terminal, dna_memory_calloc(1, #sizeof(Terminal), 2))
   if t == nil {
     return nil
   }
@@ -128,25 +146,24 @@ pub fn dna_terminal_open(cwd: *const u8, shell: *const u8, command: *const u8) *
   t.cursor_visible = 1
   t.rows = 24
   t.cols = 80
-  t.history = #cast(*TermCell) dna_memory_calloc(480000, #sizeof(TermCell), 2)
-  t.glyphs = #cast(*rawptr) dna_memory_calloc(24000, #sizeof(rawptr), 2)
-  t.glyph_chars = #cast(*u32) dna_memory_calloc(24000, #sizeof(u32), 2)
+  t.glyphs = #cast(*rawptr, dna_memory_calloc(24000, #sizeof(rawptr), 2))
+  t.glyph_chars = #cast(*u32, dna_memory_calloc(24000, #sizeof(u32), 2))
   t.vt = term_new(t.rows, t.cols)
-  if t.history == nil || t.glyphs == nil || t.glyph_chars == nil || t.vt == nil {
+  if t.glyphs == nil || t.glyph_chars == nil || t.vt == nil {
     terminal_dispose(t)
     return nil
   }
   term_utf8(t.vt, 1)
   t.screen = term_screen(t.vt)
   term_altscreen(t.screen, 1)
-  term_callbacks(t.screen, &terminal_callbacks, #cast(rawptr) t)
+  term_callbacks(t.screen, &terminal_callbacks, #cast(rawptr, t))
   fg := terminal_color(13948116)
   bg := terminal_color(1579032)
   term_default(term_state(t.vt), &fg, &bg)
   term_reset(t.screen, 1)
   size := TtySize{ rows: 24, columns: 80 }
   env_name: []const u8 = "environ\0"
-  env_pointer := #cast(***const u8) proc_symbol(nil, &env_name[0])
+  env_pointer := #cast(***const u8, proc_symbol(nil, &env_name[0]))
   if env_pointer == nil {
     terminal_dispose(t)
     return nil
@@ -156,14 +173,14 @@ pub fn dna_terminal_open(cwd: *const u8, shell: *const u8, command: *const u8) *
   for environment[..count + 1][count] != nil {
     count += 1
   }
-  filtered := #cast(**const u8) dna_memory_calloc(count + 2, #sizeof(rawptr), 2)
+  filtered := #cast(**const u8, dna_memory_calloc(count + 2, #sizeof(rawptr), 2))
   if filtered == nil {
     terminal_dispose(t)
     return nil
   }
   kept: usize = 0
   for index in 0..count {
-    entry := environment[..count][#cast(usize) (index)]
+    entry := environment[..count][#cast(usize, (index))]
     if !terminal_prefix(entry, "TERM=") && !terminal_prefix(entry, "COLUMNS=") && !terminal_prefix(entry, "LINES=") {
       filtered[..count + 2][kept] = entry
       kept += 1
@@ -177,7 +194,7 @@ pub fn dna_terminal_open(cwd: *const u8, shell: *const u8, command: *const u8) *
   command_args: [4]*const u8 = [shell, &execute[0], command, nil]
   t.pid = term_forkpty(&t.fd, nil, nil, &size)
   if t.pid < 0 {
-    dna_memory_free(#cast(rawptr) filtered)
+    dna_memory_free(#cast(rawptr, filtered))
     terminal_dispose(t)
     return nil
   }
@@ -192,9 +209,9 @@ pub fn dna_terminal_open(cwd: *const u8, shell: *const u8, command: *const u8) *
     _ = term_execve(shell, args, filtered)
     term_exit(127)
   }
-  dna_memory_free(#cast(rawptr) filtered)
+  dna_memory_free(#cast(rawptr, filtered))
   // PTY hangup may precede waitpid readiness. Watch child exit independently.
-  t.exit_fd = #cast(i32) #syscall(434, t.pid, 0) // pidfd_open, CLOEXEC
+  t.exit_fd = #cast(i32, #syscall(434, t.pid, 0)) // pidfd_open, CLOEXEC
   _ = proc_fcntl(t.fd, 4, proc_fcntl(t.fd, 3, 0) | 2048)
   _ = proc_fcntl(t.fd, 2, 1)
   return t
@@ -219,9 +236,9 @@ fn terminal_flush(t: *Terminal) {
     if sent <= 0 {
       break
     }
-    t.pending_len -= #cast(usize) sent
+    t.pending_len -= #cast(usize, sent)
     if t.pending_len > 0 {
-      _ = proc_move(&t.pending[0], &t.pending[#cast(usize) sent], t.pending_len)
+      _ = proc_move(&t.pending[0], &t.pending[#cast(usize, sent)], t.pending_len)
     }
   }
 }
@@ -232,7 +249,7 @@ pub fn dna_terminal_poll(t: *Terminal) i32 {
   for attempt in 0..8 {
     received := proc_read_raw(t.fd, &bytes[0], 8192)
     if received > 0 {
-      _ = term_input(t.vt, &bytes[0], #cast(usize) received)
+      _ = term_input(t.vt, &bytes[0], #cast(usize, received))
       changed = 1
     } else {
       if received == 0 || (received < 0 && rec_errno().* == 5) {
@@ -284,7 +301,7 @@ pub fn dna_terminal_text(t: *Terminal, text: *const u8, length: usize) {
   t.scroll = 0
   index: usize = 0
   for index < length {
-    cp := #cast(u32) text[..length][#cast(usize) (index)]
+    cp := #cast(u32, text[..length][#cast(usize, (index))])
     index += 1
     extra: u32 = 0
     if cp >= 240 {
@@ -295,13 +312,13 @@ pub fn dna_terminal_text(t: *Terminal, text: *const u8, length: usize) {
       extra = 1
     }
     if extra > 0 {
-      cp &= (#cast(u32) 1 << (#cast(u32) 6 - extra)) - 1
+      cp &= (#cast(u32, 1) << (#cast(u32, 6) - extra)) - 1
     }
     for part in 0..extra {
       if index >= length {
         break
       }
-      cp = (cp << 6) | #cast(u32) (text[..length][#cast(usize) (index)] & 63)
+      cp = (cp << 6) | #cast(u32, (text[..length][#cast(usize, (index))] & 63))
       index += 1
     }
     term_unicode(t.vt, cp, 0)
@@ -364,7 +381,7 @@ pub fn dna_terminal_key(t: *Terminal, key: u32, mods: u16) {
     code = 14
   }
   if key >= 1073741882 && key <= 1073741893 {
-    code = #cast(i32) (key - 1073741882 + 257)
+    code = #cast(i32, (key - 1073741882 + 257))
   }
   if code != 0 {
     term_key(t.vt, code, modifier)
@@ -387,8 +404,8 @@ fn terminal_cell_at(t: *Terminal, row: i32, col: i32) TermCell {
   if t.review != nil {
     row += t.review_top
     col += t.review_left
-    if row < t.review_rows && col < #cast(i32) t.review_lines[#cast(usize) (row)].count {
-      return t.review[..506100][t.review_lines[#cast(usize) (row)].start + #cast(u32) col].cell
+    if row < t.review_rows && col < #cast(i32, t.review_lines[#cast(usize, (row))].count) {
+      return t.review[..506100][t.review_lines[#cast(usize, (row))].start + #cast(u32, col)].cell
     }
     term_get_default(term_state(t.vt), &cell.fg, &cell.bg)
     return cell
@@ -398,7 +415,7 @@ fn terminal_cell_at(t: *Terminal, row: i32, col: i32) TermCell {
     for index < 0 {
       index += 2000
     }
-    cell = t.history[..480000][#cast(usize) ((index % 2000) * 240 + col)]
+    cell = terminal_saved_cell(t, index % 2000, col)
   } else {
     _ = term_cell(t.screen, TermPos{row: row - t.scroll, col: col}, &cell)
   }
@@ -406,24 +423,24 @@ fn terminal_cell_at(t: *Terminal, row: i32, col: i32) TermCell {
 }
 fn terminal_encode(cp: u32, text: *u8) usize {
   if cp < 128 {
-    text.* = #cast(u8) cp
+    text.* = #cast(u8, cp)
     return 1
   }
   if cp < 2048 {
-    text[..2][0] = #cast(u8) (#cast(u32) 192 | (cp >> 6))
-    text[..2][1] = #cast(u8) (#cast(u32) 128 | (cp & 63))
+    text[..2][0] = #cast(u8, (#cast(u32, 192) | (cp >> 6)))
+    text[..2][1] = #cast(u8, (#cast(u32, 128) | (cp & 63)))
     return 2
   }
   if cp < 65536 {
-    text[..3][0] = #cast(u8) (#cast(u32) 224 | (cp >> 12))
-    text[..3][1] = #cast(u8) (#cast(u32) 128 | ((cp >> 6) & 63))
-    text[..3][2] = #cast(u8) (#cast(u32) 128 | (cp & 63))
+    text[..3][0] = #cast(u8, (#cast(u32, 224) | (cp >> 12)))
+    text[..3][1] = #cast(u8, (#cast(u32, 128) | ((cp >> 6) & 63)))
+    text[..3][2] = #cast(u8, (#cast(u32, 128) | (cp & 63)))
     return 3
   }
-  text[..4][0] = #cast(u8) (#cast(u32) 240 | (cp >> 18))
-  text[..4][1] = #cast(u8) (#cast(u32) 128 | ((cp >> 12) & 63))
-  text[..4][2] = #cast(u8) (#cast(u32) 128 | ((cp >> 6) & 63))
-  text[..4][3] = #cast(u8) (#cast(u32) 128 | (cp & 63))
+  text[..4][0] = #cast(u8, (#cast(u32, 240) | (cp >> 18)))
+  text[..4][1] = #cast(u8, (#cast(u32, 128) | ((cp >> 12) & 63)))
+  text[..4][2] = #cast(u8, (#cast(u32, 128) | ((cp >> 6) & 63)))
+  text[..4][3] = #cast(u8, (#cast(u32, 128) | (cp & 63)))
   return 4
 }
 pub fn dna_terminal_copy(t: *Terminal, text: *u8, capacity: usize) usize {
@@ -456,25 +473,25 @@ pub fn dna_terminal_copy(t: *Terminal, text: *u8, capacity: usize) usize {
       if cp == 0 {
         cp = 32
       }
-      used += terminal_encode(cp, &text[..#cast(usize) capacity][used])
+      used += terminal_encode(cp, &text[..#cast(usize, capacity)][used])
     }
-    for used > start && text[..#cast(usize) capacity][used - 1] == 32 {
+    for used > start && text[..#cast(usize, capacity)][used - 1] == 32 {
       used -= 1
     }
     if used > start {
-      text[..#cast(usize) capacity][used] = 10
+      text[..#cast(usize, capacity)][used] = 10
       used += 1
     }
   }
-  text[..#cast(usize) capacity][used] = 0
+  text[..#cast(usize, capacity)][used] = 0
   return used
 }
 pub fn dna_terminal_resize(t: *Terminal, width: f32, height: f32, cw: f32, lh: f32) i32 {
   if cw <= 0.0 || lh <= 0.0 {
     return 0
   }
-  cols := #cast(i32) (width / cw)
-  rows := #cast(i32) (height / lh)
+  cols := #cast(i32, (width / cw))
+  rows := #cast(i32, (height / lh))
   if cols < 2 {
     cols = 2
   }
@@ -491,8 +508,8 @@ pub fn dna_terminal_resize(t: *Terminal, width: f32, height: f32, cw: f32, lh: f
     t.cols = cols
     t.rows = rows
     term_size(t.vt, rows, cols)
-    size := TtySize{rows: #cast(u16) rows, columns: #cast(u16) cols}
-    _ = tty_ioctl(t.fd, 21524, #cast(rawptr) &size)
+    size := TtySize{rows: #cast(u16, rows), columns: #cast(u16, cols)}
+    _ = tty_ioctl(t.fd, 21524, #cast(rawptr, &size))
     return 1
   }
   return 0
@@ -517,8 +534,8 @@ fn terminal_styled_cell(t: *Terminal, row: i32, col: i32) TermCell {
   rr := row + t.review_top
   rc := col + t.review_left
   selected := false
-  if t.review != nil && rr < t.review_rows && rc < #cast(i32) t.review_lines[#cast(usize) (rr)].count {
-    offset := #cast(usize) t.review[..506100][t.review_lines[#cast(usize) (rr)].start + #cast(u32) rc].offset
+  if t.review != nil && rr < t.review_rows && rc < #cast(i32, t.review_lines[#cast(usize, (rr))].count) {
+    offset := #cast(usize, t.review[..506100][t.review_lines[#cast(usize, (rr))].start + #cast(u32, rc)].offset)
     selected = offset >= t.review_low && offset < t.review_high
   }
   if selected || (t.review == nil && t.selected != 0 && row * t.cols + col >= start && row * t.cols + col <= end) {
@@ -561,9 +578,9 @@ pub fn dna_terminal_cells(t: *Terminal, output: *u32, capacity: i32, width: f32,
         cp |= 1 << 27
       }
       index := (row * t.cols + col) * 3
-      output[..#cast(usize) capacity][#cast(usize) (index)] = cp
-      output[..#cast(usize) capacity][#cast(usize) (index + 1)] = terminal_rgb(cell.fg)
-      output[..#cast(usize) capacity][#cast(usize) (index + 2)] = terminal_rgb(cell.bg)
+      output[..#cast(usize, capacity)][#cast(usize, (index))] = cp
+      output[..#cast(usize, capacity)][#cast(usize, (index + 1))] = terminal_rgb(cell.fg)
+      output[..#cast(usize, capacity)][#cast(usize, (index + 2))] = terminal_rgb(cell.bg)
     }
   }
   return t.cols | (t.rows << 16)
@@ -592,8 +609,8 @@ pub fn dna_terminal_mouse(t: *Terminal, x: f32, y: f32, dragging: i32) {
   if t.cw <= 0.0 || t.lh <= 0.0 {
     return
   }
-  col := #cast(i32) ((x - t.x) / t.cw)
-  row := #cast(i32) ((y - t.y) / t.lh)
+  col := #cast(i32, ((x - t.x) / t.cw))
+  row := #cast(i32, ((y - t.y) / t.lh))
   if col < 0 {
     col = 0
   }
@@ -634,15 +651,15 @@ pub fn dna_terminal_snapshot(t: *Terminal, output: *u8, capacity: usize) usize {
       if cp == 0 {
         cp = 32
       }
-      used += terminal_encode(cp, &output[..#cast(usize) capacity][used])
+      used += terminal_encode(cp, &output[..#cast(usize, capacity)][used])
     }
     if used + 2 >= capacity {
       return used
     }
-    output[..#cast(usize) capacity][used] = 10
+    output[..#cast(usize, capacity)][used] = 10
     used += 1
   }
-  output[..#cast(usize) capacity][used] = 0
+  output[..#cast(usize, capacity)][used] = 0
   return used
 }
 pub fn dna_terminal_log(t: *Terminal, output: *u8, capacity: usize) usize {
@@ -654,35 +671,35 @@ pub fn dna_terminal_log(t: *Terminal, output: *u8, capacity: usize) usize {
       cell := TermCell{}
       if row < 0 {
         index := (t.history_head + row + 2000) % 2000
-        cell = t.history[..480000][#cast(usize) (index * 240 + col)]
+        cell = terminal_saved_cell(t, index, col)
       } else {
-          _ = term_cell(t.screen, TermPos{row: row, col: col}, &cell)
-        }
+        _ = term_cell(t.screen, TermPos{row: row, col: col}, &cell)
+      }
       cp := cell.chars[0]
       if cp == 4294967295 {
         continue
       }
       if used + 5 >= capacity {
-        output[..#cast(usize) capacity][used] = 0
+        output[..#cast(usize, capacity)][used] = 0
         return used
       }
       if cp == 0 {
         cp = 32
       }
-      used += terminal_encode(cp, &output[..#cast(usize) capacity][used])
+      used += terminal_encode(cp, &output[..#cast(usize, capacity)][used])
     }
-    for used > start && output[..#cast(usize) capacity][used - 1] == 32 {
+    for used > start && output[..#cast(usize, capacity)][used - 1] == 32 {
       used -= 1
     }
     if used + 2 >= capacity {
-      output[..#cast(usize) capacity][used] = 0
+      output[..#cast(usize, capacity)][used] = 0
       return used
     }
-    output[..#cast(usize) capacity][used] = 10
+    output[..#cast(usize, capacity)][used] = 10
     used += 1
     row += 1
   }
-  output[..#cast(usize) capacity][used] = 0
+  output[..#cast(usize, capacity)][used] = 0
   return used
 }
 pub fn dna_terminal_theme(t: *Terminal, foreground: u32, background: u32, selection: u32, cursor: u32) {
@@ -698,20 +715,20 @@ pub fn dna_terminal_theme(t: *Terminal, foreground: u32, background: u32, select
   term_screen_default(t.screen, &fg, &bg)
   defaults: [16]u32 = [1842204, 11820895, 8035173, 11901792, 7180469, 10584499, 6661027, 13948116, 7368816, 14256264, 10862987, 13811074, 9811159, 12755410, 9618885, 15790320]
   for index in 0..16 {
-    color := dna_theme_override(#cast(u32) index + 14)
+    color := dna_theme_override(#cast(u32, index) + 14)
     if color > 16777215 {
-      color = defaults[#cast(usize) (index)]
+      color = defaults[#cast(usize, (index))]
     }
     value := terminal_color(color)
-    term_palette(term_state(t.vt), #cast(i32) index, &value)
+    term_palette(term_state(t.vt), #cast(i32, index), &value)
   }
 }
 pub fn dna_terminal_application_mouse(t: *Terminal, x: f32, y: f32, event: i32, mods: u32) i32 {
   if t.mouse_mode == 0 || t.scroll != 0 || (mods & 3) != 0 || t.cw <= 0.0 || t.lh <= 0.0 {
     return 0
   }
-  col := #cast(i32) ((x - t.x) / t.cw)
-  row := #cast(i32) ((y - t.y) / t.lh)
+  col := #cast(i32, ((x - t.x) / t.cw))
+  row := #cast(i32, ((y - t.y) / t.lh))
   if col < 0 {
     col = 0
   }
@@ -740,16 +757,25 @@ pub fn dna_terminal_application_mouse(t: *Terminal, x: f32, y: f32, event: i32, 
   return 1
 }
 pub fn dna_terminal_review_end(t: *Terminal) {
-  dna_memory_free(#cast(rawptr) t.review)
+  dna_memory_free(#cast(rawptr, t.review))
   t.review = nil
   t.review_length = 0
   t.selected = 0
+}
+// Rows retain their original width across resizes. Missing columns read as the
+// same zero cell previously stored in the fixed-width history allocation.
+fn terminal_saved_cell(t: *Terminal, index: i32, col: i32) TermCell {
+  row := &t.history[#cast(usize, index)]
+  if col < 0 || col >= row.count {
+    return TermCell{}
+  }
+  return row.cells[..#cast(usize, row.count)][#cast(usize, col)]
 }
 fn terminal_history_cell(t: *Terminal, row: i32, col: i32) TermCell {
   cell := TermCell{}
   if row < t.history_count {
     index := (t.history_head - t.history_count + row + 2000) % 2000
-    cell = t.history[..480000][#cast(usize) (index * 240 + col)]
+    cell = terminal_saved_cell(t, index, col)
   } else {
     _ = term_cell(t.screen, TermPos{row: row - t.history_count, col: col}, &cell)
   }
@@ -761,10 +787,10 @@ fn terminal_cell_text(cell: TermCell, text: *u8) usize {
   }
   length: usize = 0
   for index in 0..6 {
-    if cell.chars[#cast(usize) (index)] == 0 {
+    if cell.chars[#cast(usize, (index))] == 0 {
       break
     }
-    length += terminal_encode(cell.chars[#cast(usize) (index)], &text[..32][length])
+    length += terminal_encode(cell.chars[#cast(usize, (index))], &text[..32][length])
   }
   if length == 0 {
     text.* = 32
@@ -796,56 +822,56 @@ pub fn dna_terminal_review(t: *Terminal, output: *u8, capacity: usize) usize {
     if row == t.history_count + position.row && width <= position.col {
       width = position.col + 1
     }
-    widths[#cast(usize) (row)] = width
-    lengths[#cast(usize) (row)] = 1
+    widths[#cast(usize, (row))] = width
+    lengths[#cast(usize, (row))] = 1
     for col in 0..width {
       text: [32]u8 = []
-      lengths[#cast(usize) (row)] += terminal_cell_text(terminal_history_cell(t, row, col), &text[0])
+      lengths[#cast(usize, (row))] += terminal_cell_text(terminal_history_cell(t, row, col), &text[0])
     }
-    bytes += lengths[#cast(usize) (row)]
-    count += #cast(usize) (width + 1)
+    bytes += lengths[#cast(usize, (row))]
+    count += #cast(usize, (width + 1))
   }
   first: i32 = 0
   for bytes >= capacity && first < rows {
-    bytes -= lengths[#cast(usize) (first)]
-    count -= #cast(usize) (widths[#cast(usize) (first)] + 1)
+    bytes -= lengths[#cast(usize, (first))]
+    count -= #cast(usize, (widths[#cast(usize, (first))] + 1))
     first += 1
   }
   if first == rows {
     output.* = 0
     return 0
   }
-  cells := #cast(*TermReviewCell) dna_memory_alloc(count * #sizeof(TermReviewCell), 2)
+  cells := #cast(*TermReviewCell, dna_memory_alloc(count * #sizeof(TermReviewCell), 2))
   if cells == nil {
     return 0
   }
   used: usize = 0
   at: usize = 0
   for row in first..rows {
-    line := &t.review_lines[#cast(usize) (row - first)]
-    line.start = #cast(u32) at
-    line.count = #cast(u32) (widths[#cast(usize) (row)] + 1)
-    line.offset = #cast(u32) used
-    for col in 0..widths[#cast(usize) (row)] {
+    line := &t.review_lines[#cast(usize, (row - first))]
+    line.start = #cast(u32, at)
+    line.count = #cast(u32, (widths[#cast(usize, (row))] + 1))
+    line.offset = #cast(u32, used)
+    for col in 0..widths[#cast(usize, (row))] {
       cells[..count][at].cell = terminal_history_cell(t, row, col)
-      cells[..count][at].offset = #cast(u32) used
+      cells[..count][at].offset = #cast(u32, used)
       text: [32]u8 = []
       length := terminal_cell_text(cells[..count][at].cell, &text[0])
       if length == 0 && col != 0 {
         cells[..count][at].offset = cells[..count][at - 1].offset
       }
-      _ = copy(&output[..#cast(usize) capacity][used], &text[0], length)
+      _ = copy(&output[..#cast(usize, capacity)][used], &text[0], length)
       used += length
       at += 1
     }
     cells[..count][at].cell = TermCell{}
-    cells[..count][at].offset = #cast(u32) used
+    cells[..count][at].offset = #cast(u32, used)
     term_get_default(term_state(t.vt), &cells[..count][at].cell.fg, &cells[..count][at].cell.bg)
     at += 1
-    output[..#cast(usize) capacity][used] = 10
+    output[..#cast(usize, capacity)][used] = 10
     used += 1
   }
-  output[..#cast(usize) capacity][used] = 0
+  output[..#cast(usize, capacity)][used] = 0
   t.review = cells
   t.review_length = used
   t.review_rows = rows - first
@@ -872,12 +898,12 @@ pub fn dna_terminal_review_head(t: *Terminal) usize {
   if t.review == nil {
     return 0
   }
-  line := t.review_lines[#cast(usize) (t.review_cursor_row)]
-  col := #cast(u32) t.review_cursor_col
+  line := t.review_lines[#cast(usize, (t.review_cursor_row))]
+  col := #cast(u32, t.review_cursor_col)
   if col >= line.count {
     col = line.count - 1
   }
-  return #cast(usize) t.review[..506100][line.start + col].offset
+  return #cast(usize, t.review[..506100][line.start + col].offset)
 }
 pub fn dna_terminal_review_select(t: *Terminal, low: usize, high: usize, head: usize) {
   if t.review == nil {
@@ -889,18 +915,18 @@ pub fn dna_terminal_review_select(t: *Terminal, low: usize, high: usize, head: u
   last := t.review_rows
   for first + 1 < last {
     middle := (first + last) / 2
-    if #cast(usize) t.review_lines[#cast(usize) (middle)].offset <= head {
+    if #cast(usize, t.review_lines[#cast(usize, (middle))].offset) <= head {
       first = middle
     } else {
       last = middle
     }
   }
-  line := t.review_lines[#cast(usize) (first)]
+  line := t.review_lines[#cast(usize, (first))]
   col: i32 = 0
   for index in 0..line.count {
     cell := &t.review[..506100][line.start + index]
-    if #cast(usize) cell.offset <= head && cell.cell.chars[0] != 4294967295 {
-      col = #cast(i32) index
+    if #cast(usize, cell.offset) <= head && cell.cell.chars[0] != 4294967295 {
+      col = #cast(i32, index)
     }
   }
   t.review_cursor_row = first
@@ -940,8 +966,8 @@ pub fn dna_terminal_review_point(t: *Terminal, x: f32, y: f32) usize {
   if t.review == nil || t.cw <= 0.0 || t.lh <= 0.0 {
     return 0
   }
-  col := #cast(i32) ((x - t.x) / t.cw)
-  row := #cast(i32) ((y - t.y) / t.lh)
+  col := #cast(i32, ((x - t.x) / t.cw))
+  row := #cast(i32, ((y - t.y) / t.lh))
   if col < 0 {
     col = 0
   }
@@ -953,9 +979,9 @@ pub fn dna_terminal_review_point(t: *Terminal, x: f32, y: f32) usize {
   if row >= t.review_rows {
     row = t.review_rows - 1
   }
-  line := t.review_lines[#cast(usize) (row)]
-  if col >= #cast(i32) line.count {
-    col = #cast(i32) line.count - 1
+  line := t.review_lines[#cast(usize, (row))]
+  if col >= #cast(i32, line.count) {
+    col = #cast(i32, line.count) - 1
   }
-  return #cast(usize) t.review[..506100][line.start + #cast(u32) col].offset
+  return #cast(usize, t.review[..506100][line.start + #cast(u32, col)].offset)
 }

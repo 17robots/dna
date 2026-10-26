@@ -22,75 +22,7 @@ fn sync_thread_join(thread: usize, result: rawptr) i32 {
   return actual_join(thread, result)
 }''')
 (STAGE / 'sync.dyn').write_text(source)
-fixture = r'''
-use "std/sync" native_atomic
-#link("c")
-extern fn allocate "malloc"(size: usize) rawptr
-extern fn heap_free "free"(pointer: rawptr)
- 
-struct State { alive: native_atomic.AtomicU32, done: native_atomic.AtomicU32 }
-live_records: u64 = 0
-fn rec_malloc(size: usize) rawptr {
-  pointer := allocate(size)
-  if pointer != nil { live_records += 1 }
-  return pointer
-}
-fn rec_free(pointer: rawptr) {
-  live_records -= 1
-  heap_free(pointer)
-}
-fn worker(pointer: rawptr) i32 {
-  state := #cast(*State) pointer
-  delay := NativeTimespec{nanoseconds: 20000000}
-  _ = #syscall(35, &delay, 0)
-  if native_atomic.load_u32(&state.alive) != 1 { #panic("worker state released before completion") }
-  native_atomic.store_u32(&state.done, 1)
-  return 37
-}
-pub fn test_join() {
-  for fault in [0, 1, -1] {
-    failures = fault
-    state := State{}
-    native_atomic.store_u32(&state.alive, 1)
-    thread := dna_thread_create(&worker, #cast(rawptr) &state)
-    if thread == nil { #panic("create failed") }
-    result: i32 = 0
-    dna_thread_join(thread, &result)
-    native_atomic.store_u32(&state.alive, 0)
-    if result != 37 || native_atomic.load_u32(&state.done) != 1 { #panic("join returned while worker still owns state") }
-    expected: u64 = 0
-    if fault == -1 { expected = 1 }
-    if live_records != expected { #panic("unjoined record lost or successful join leaked") }
-  }
-  // A later create retries persistent failures, reclaiming the original record.
-  failures = 0
-  state := State{}
-  native_atomic.store_u32(&state.alive, 1)
-  thread := dna_thread_create(&worker, #cast(rawptr) &state)
-  if thread == nil || live_records != 1 { #panic("retired record was not collected") }
-  dna_thread_join(thread, nil)
-  if live_records != 0 || sync_retired_threads != nil { #panic("thread storage leaked") }
-}
-
-struct SelfState { thread: rawptr, ready: native_atomic.AtomicU32 }
-fn self_worker(pointer: rawptr) i32 {
-  state := #cast(*SelfState) pointer
-  for native_atomic.load_u32(&state.ready) == 0 {
-    delay := NativeTimespec{nanoseconds: 1000000}
-    _ = #syscall(35, &delay, 0)
-  }
-  dna_thread_join(state.thread, nil)
-  #panic("self join returned")
-}
-pub fn test_self_join() {
-  state := SelfState{}
-  state.thread = dna_thread_create(&self_worker, #cast(rawptr) &state)
-  if state.thread == nil { #panic("create failed") }
-  native_atomic.store_u32(&state.ready, 1)
-  dna_thread_join(state.thread, nil)
-}
-
-'''
+fixture = '\nuse "std/sync" native_atomic\n#link("c")\nextern fn allocate "malloc"(size: usize) rawptr\nextern fn heap_free "free"(pointer: rawptr)\n \nstruct State { alive: native_atomic.AtomicU32, done: native_atomic.AtomicU32 }\nlive_records: u64 = 0\nfn rec_malloc(size: usize) rawptr {\n  pointer := allocate(size)\n  if pointer != nil { live_records += 1 }\n  return pointer\n}\nfn rec_free(pointer: rawptr) {\n  live_records -= 1\n  heap_free(pointer)\n}\nfn worker(pointer: rawptr) i32 {\n  state := #cast(*State, pointer)\n  delay := NativeTimespec{nanoseconds: 20000000}\n  _ = #syscall(35, &delay, 0)\n  if native_atomic.load_u32(&state.alive) != 1 { #panic("worker state released before completion") }\n  native_atomic.store_u32(&state.done, 1)\n  return 37\n}\npub fn test_join() {\n  for fault in [0, 1, -1] {\n    failures = fault\n    state := State{}\n    native_atomic.store_u32(&state.alive, 1)\n    thread := dna_thread_create(worker, #cast(rawptr, &state))\n    if thread == nil { #panic("create failed") }\n    result: i32 = 0\n    dna_thread_join(thread, &result)\n    native_atomic.store_u32(&state.alive, 0)\n    if result != 37 || native_atomic.load_u32(&state.done) != 1 { #panic("join returned while worker still owns state") }\n    expected: u64 = 0\n    if fault == -1 { expected = 1 }\n    if live_records != expected { #panic("unjoined record lost or successful join leaked") }\n  }\n  // A later create retries persistent failures, reclaiming the original record.\n  failures = 0\n  state := State{}\n  native_atomic.store_u32(&state.alive, 1)\n  thread := dna_thread_create(worker, #cast(rawptr, &state))\n  if thread == nil || live_records != 1 { #panic("retired record was not collected") }\n  dna_thread_join(thread, nil)\n  if live_records != 0 || sync_retired_threads != nil { #panic("thread storage leaked") }\n}\n\nstruct SelfState { thread: rawptr, ready: native_atomic.AtomicU32 }\nfn self_worker(pointer: rawptr) i32 {\n  state := #cast(*SelfState, pointer)\n  for native_atomic.load_u32(&state.ready) == 0 {\n    delay := NativeTimespec{nanoseconds: 1000000}\n    _ = #syscall(35, &delay, 0)\n  }\n  dna_thread_join(state.thread, nil)\n  #panic("self join returned")\n}\npub fn test_self_join() {\n  state := SelfState{}\n  state.thread = dna_thread_create(self_worker, #cast(rawptr, &state))\n  if state.thread == nil { #panic("create failed") }\n  native_atomic.store_u32(&state.ready, 1)\n  dna_thread_join(state.thread, nil)\n}\n\n'
 (STAGE / 'fixture.dyn').write_text(fixture)
 for mode in ('debug', 'release'):
     binary = STAGE / mode

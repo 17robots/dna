@@ -35,11 +35,12 @@ pub struct Document {
   saved_prefix, saved_suffix: usize,
   checkpoint_prefix, checkpoint_suffix: usize,
   changes: [128]TextChange,
-  // Borrowed views, invalidated by mutations including save/checkpoint. They
-  // share current or saved bytes until differing baselines require owned copies.
-  saved, checkpoint_bytes: []u8,
+  // Internal sparse baseline storage: only changed ranges are readable here.
+  // Use saved_text/checkpoint_text when a full contiguous baseline is needed.
+  saved_view, checkpoint_view: []u8,
   saved_storage_used, checkpoint_storage_used: usize,
   text_storage_used, line_storage_used, history_storage_used: usize,
+  line_width, line_blocks: usize,
   secondary: SelectionSet,
   length, cursor, anchor, saved_length, history_next, history_count, history_at, line_count, goal_column, goal_cursor, goal_anchor: usize,
   history: [64]Snapshot,
@@ -49,7 +50,7 @@ pub struct Document {
   // Keep byte storage after metadata. Only initialized prefixes are ever read.
   // Capacity + 1 each; undo history holds four documents' worth of deltas.
   bytes: [268435456]u8, saved_storage: [268435456]u8, history_storage: [1073741824]u8,
-  line_offsets: [268435456]u32, checkpoint_storage: [268435456]u8,
+  line_storage: [1073741824]u8, checkpoint_storage: [268435456]u8,
 }
 
 // The Dyn runtime links its own byte-at-a-time memcpy/memmove into every
@@ -76,9 +77,9 @@ pub fn allocate(arena: *mem.Arena) *Document {
   if arena.owns_memory {
     _ = #syscall(28, &arena.data[0], #len(arena.data), 15)
   }
-  document := #cast(*Document) mem.arena_push_uninit(arena, #sizeof(Document), #alignof(Document))
-  memory := #cast(*u8) document
-  metadata := #cast(usize) &document.bytes[0] - #cast(usize) memory
+  document := #cast(*Document, mem.arena_push_uninit(arena, #sizeof(Document), #alignof(Document)))
+  memory := #cast(*u8, document)
+  metadata := #cast(usize, &document.bytes[0]) - #cast(usize, memory)
   mem.zero(memory[..metadata])
   _ = load(document, "")
   return document
@@ -101,8 +102,8 @@ pub fn valid(text: []const u8) bool {
   }
   at: usize = 0
   for at < length {
-    if length - at >= 8 && (#cast(usize) &text[at] & 7) == 0 {
-      word := (#cast(*const u64) &text[at]).*
+    if length - at >= 8 && (#cast(usize, &text[at]) & 7) == 0 {
+      word := (#cast(*const u64, &text[at])).*
       // No high bits means every byte is ASCII; adding 0x7f to each byte then
       // sets its high bit exactly when the byte is nonzero, without carries.
       if (word & 0x8080808080808080) == 0 && ((word + 0x7f7f7f7f7f7f7f7f) & 0x8080808080808080) == 0x8080808080808080 {
@@ -136,20 +137,20 @@ fn snapshot(document: *Document, index: usize) {
   entry.length = document.length
   entry.cursor = document.cursor
   entry.anchor = document.anchor
-  document.checkpoint_bytes = document.bytes[..]
+  document.checkpoint_view = document.bytes[..]
   release_clean_baselines(document)
 }
 pub fn mark_saved(document: *Document) {
   document.saved_epoch += 1
   document.saved_rows = document.rows
   document.saved_length = document.length
-  document.saved = document.bytes[..]
+  document.saved_view = document.bytes[..]
   document.saved_prefix = document.length
   document.saved_suffix = document.length
   // A completed checkpoint mirror contains this exact revision. Saving can
   // borrow current text and reclaim both copies without changing undo history.
   if document.checkpoint_revision == document.revision {
-    document.checkpoint_bytes = document.bytes[..]
+    document.checkpoint_view = document.bytes[..]
   }
   release_clean_baselines(document)
 }
@@ -158,9 +159,9 @@ fn release_storage_tail(storage: *u8, used: *usize, keep: usize) {
   if used.* <= keep {
     return
   }
-  page := #cast(usize) snapshot_page_size()
+  page := #cast(usize, snapshot_page_size())
   // The arrays need not be page-aligned. Never discard adjacent live bytes.
-  address := #cast(usize) storage
+  address := #cast(usize, storage)
   first := ((address + keep + page - 1) / page) * page
   last := ((address + used.*) / page) * page
   if last > first && #syscall(28, first, last - first, 4) < 0 {
@@ -169,13 +170,12 @@ fn release_storage_tail(storage: *u8, used: *usize, keep: usize) {
   used.* = keep
 }
 fn release_clean_baselines(document: *Document) {
-  if #len(document.checkpoint_bytes) == 0 || &document.saved[0] != &document.bytes[0] || &document.checkpoint_bytes[0] != &document.bytes[0] {
-    return
+  if &document.saved_view[0] == &document.bytes[0] {
+    release_storage_tail(&document.saved_storage[0], &document.saved_storage_used, 0)
   }
-  // Keep hot snapshot storage while editing. Once saved and checkpointed,
-  // neither view needs it; undo deltas live in separate history storage.
-  release_storage_tail(&document.saved_storage[0], &document.saved_storage_used, 0)
-  release_storage_tail(&document.checkpoint_storage[0], &document.checkpoint_storage_used, 0)
+  if #len(document.checkpoint_view) > 0 && &document.checkpoint_view[0] == &document.bytes[0] {
+    release_storage_tail(&document.checkpoint_storage[0], &document.checkpoint_storage_used, 0)
+  }
 }
 fn record_text_storage(document: *Document) {
   if document.length + 1 > document.text_storage_used {
@@ -183,63 +183,25 @@ fn record_text_storage(document: *Document) {
   }
 }
 fn record_line_storage(document: *Document) {
-  used := document.line_count * #sizeof(u32)
+  used := line_index_bytes(document)
   if used > document.line_storage_used {
     document.line_storage_used = used
   }
 }
+// Baselines preserve only original bytes inside the changed range. Equal
+// prefixes/suffixes remain borrowed from current text, including shifted suffixes.
 fn saved_change(document: *Document, low: usize, high: usize) {
-  if low < document.saved_prefix {
-    document.saved_prefix = low
-  }
-  suffix := document.length - high
-  if suffix < document.saved_suffix {
-    document.saved_suffix = suffix
-  }
-}
-// Saved and checkpoint baselines share one preserved copy while identical.
-// Split them only when saving within an edit group makes their text diverge.
-fn preserve_saved(document: *Document, keep_checkpoint: bool) {
-  if &document.saved[0] == &document.bytes[0] {
-    if keep_checkpoint && &document.checkpoint_bytes[0] == &document.saved_storage[0] {
-      // A save inside an edit group can make the saved and undo baselines
-      // diverge. Preserve the older shared checkpoint before reusing storage.
-      length := document.history[document.history_at].length + 1
-      _ = copy_bytes(&document.checkpoint_storage[0], &document.saved_storage[0], length)
-      if length > document.checkpoint_storage_used {
-        document.checkpoint_storage_used = length
-      }
-      document.checkpoint_bytes = document.checkpoint_storage[..]
-    }
-    _ = copy_bytes(&document.saved_storage[0], &document.bytes[0], document.length + 1)
-    if document.length + 1 > document.saved_storage_used {
-      document.saved_storage_used = document.length + 1
-    }
-    document.saved = document.saved_storage[..]
-  }
+  preserve_baseline(document, document.saved_length, &document.saved_prefix, &document.saved_suffix,
+    &document.saved_storage[0], &document.saved_storage_used, low, high)
+  document.saved_view = document.saved_storage[..]
 }
 fn before_change(document: *Document, low: usize, high: usize) {
   note_change(document, low, high)
-  if low < document.checkpoint_prefix {
-    document.checkpoint_prefix = low
-  }
-  suffix := document.length - high
-  if suffix < document.checkpoint_suffix {
-    document.checkpoint_suffix = suffix
-  }
-  shared := &document.saved[0] == &document.bytes[0]
-  preserve_saved(document, true)
-  if &document.checkpoint_bytes[0] == &document.bytes[0] {
-    if shared {
-      document.checkpoint_bytes = document.saved
-    } else {
-      _ = copy_bytes(&document.checkpoint_storage[0], &document.bytes[0], document.length + 1)
-      if document.length + 1 > document.checkpoint_storage_used {
-        document.checkpoint_storage_used = document.length + 1
-      }
-      document.checkpoint_bytes = document.checkpoint_storage[..]
-    }
-  }
+  saved_change(document, low, high)
+  preserve_baseline(document, document.history[document.history_at].length,
+    &document.checkpoint_prefix, &document.checkpoint_suffix,
+    &document.checkpoint_storage[0], &document.checkpoint_storage_used, low, high)
+  document.checkpoint_view = document.checkpoint_storage[..]
 }
 pub fn load(document: *Document, text: []const u8) bool {
   // Storage is fixed; larger text would overrun the byte arrays.
@@ -278,7 +240,7 @@ pub fn load(document: *Document, text: []const u8) bool {
   // Reload deliberately resets undo history. Consume aliased input first,
   // then reclaim only pages beyond the newly live text/index/history prefixes.
   release_storage_tail(&document.bytes[0], &document.text_storage_used, document.length + 1)
-  release_storage_tail(#cast(*u8) &document.line_offsets[0], &document.line_storage_used, document.line_count * #sizeof(u32))
+  release_storage_tail(&document.line_storage[0], &document.line_storage_used, line_index_bytes(document))
   release_storage_tail(&document.history_storage[0], &document.history_storage_used, 1)
   return true
 }
@@ -354,7 +316,7 @@ fn saved_text_changed(document: *const Document) bool {
   if low >= high {
     return false
   }
-  return !equal(document.bytes[low..high], document.saved[low..high])
+  return !equal(document.bytes[low..high], document.saved_view[low..high])
 }
 pub fn start(document: *const Document) usize {
   if document.cursor < document.anchor {
@@ -415,7 +377,6 @@ pub fn replace(document: *Document, text: []const u8) bool {
     return false
   }
   before_change(document, low, high)
-  saved_change(document, low, high)
   move_marks(document, low, high, #len(text))
   // Whole-row deletion removes its identity; filename replacement retains it.
   // Inserting at a row start moves its identity with the original text.
@@ -475,8 +436,8 @@ pub fn checkpoint(document: *Document) {
     document.checkpoint_prefix = document.length
     document.checkpoint_suffix = document.length
     // Retain an already synchronized mirror while editing.
-    if &document.saved[0] == &document.bytes[0] {
-      document.checkpoint_bytes = document.bytes[..]
+    if &document.saved_view[0] == &document.bytes[0] {
+      document.checkpoint_view = document.bytes[..]
     }
     release_clean_baselines(document)
     return
@@ -494,12 +455,12 @@ pub fn checkpoint(document: *Document) {
   // Compare unchanged runs in libc with shrinking blocks, then locate the
   // exact changed bytes; a large file costs a few thousand calls, not millions.
   for block in Blocks {
-    for prefix + block <= old_end && prefix + block <= new_end && equal(document.checkpoint_bytes[prefix..prefix + block], document.bytes[prefix..prefix + block]) {
+    for prefix + block <= old_end && prefix + block <= new_end && equal(document.checkpoint_view[prefix..prefix + block], document.bytes[prefix..prefix + block]) {
       prefix += block
     }
   }
   for block in Blocks {
-    for old_end >= prefix + block && new_end >= prefix + block && equal(document.checkpoint_bytes[old_end - block..old_end], document.bytes[new_end - block..new_end]) {
+    for old_end >= prefix + block && new_end >= prefix + block && equal(document.checkpoint_view[old_end - block..old_end], document.bytes[new_end - block..new_end]) {
       old_end -= block
       new_end -= block
     }
@@ -548,7 +509,7 @@ pub fn checkpoint(document: *Document) {
   target.removed = removed
   target.inserted = inserted
   if removed > 0 {
-    _ = copy_bytes(&target.bytes[0], &document.checkpoint_bytes[prefix], removed)
+    _ = copy_bytes(&target.bytes[0], &document.checkpoint_view[prefix], removed)
   }
   if inserted > 0 {
     _ = copy_bytes(&target.bytes[removed], &document.bytes[prefix], inserted)
@@ -560,11 +521,10 @@ pub fn checkpoint(document: *Document) {
   if document.history_next > document.history_storage_used {
     document.history_storage_used = document.history_next
   }
-  advance_checkpoint(document, prefix, old_end, new_end, old_length)
+  snapshot(document, document.history_at)
 }
 fn restore(document: *Document, delta: *const Snapshot, forward: bool) {
   // Restore replaces the checkpoint using an owned undo delta below.
-  preserve_saved(document, false)
   retained_positions: [992]TextPosition = []
   if delta.line_positions {
     for saved_mark in 0..992 {
@@ -599,7 +559,7 @@ fn restore(document: *Document, delta: *const Snapshot, forward: bool) {
   document.anchor = entry.anchor
   document.bytes[document.length] = 0
   record_text_storage(document)
-  document.checkpoint_bytes = document.bytes[..]
+  document.checkpoint_view = document.bytes[..]
   document.revision += 1
   index_lines(document)
   document.checkpoint_revision = document.revision
@@ -782,7 +742,7 @@ fn word_class(document: *const Document, at: usize, big: bool) u8 {
   }
   if byte >= 128 && !big {
     rune := utf8.decode(document.bytes[..document.length], at)
-    category := unicode_category(#cast(i32) rune.codepoint)
+    category := unicode_category(#cast(i32, rune.codepoint))
     if category >= 23 && category <= 25 {
       return 0
     }
@@ -887,7 +847,7 @@ pub fn row_at(document: *const Document, position: usize) usize {
   high := document.line_count
   for low + 1 < high {
     middle := (low + high) / 2
-    if #cast(usize) document.line_offsets[middle] <= position {
+    if line_offset(document, middle) <= position {
       low = middle
     } else {
       high = middle
@@ -899,11 +859,14 @@ pub fn row_start(document: *const Document, row: usize) usize {
   if row >= document.line_count {
     return document.length
   }
-  return #cast(usize) document.line_offsets[row]
+  return line_offset(document, row)
 }
 fn index_lines(document: *Document) {
   document.line_count = 1
-  document.line_offsets[0] = 0
+  document.line_width = 2
+  document.line_blocks = 0
+  _ = line_fits(document, 0, 0)
+  line_write(document, 0, 0)
   // libc memchr scans many bytes per step; this runs on every load and undo.
   at: usize = 0
   for at < document.length {
@@ -911,8 +874,11 @@ fn index_lines(document: *Document) {
     if found == nil {
       break
     }
-    at = #cast(usize) found - #cast(usize) &document.bytes[0] + 1
-    document.line_offsets[document.line_count] = #cast(u32) at
+    at = #cast(usize, found) - #cast(usize, &document.bytes[0]) + 1
+    if !line_fits(document, document.line_count, at) {
+      line_widen(document)
+    }
+    line_write(document, document.line_count, at)
     document.line_count += 1
   }
   record_line_storage(document)
@@ -922,15 +888,51 @@ fn replace_lines(document: *Document, low: usize, high: usize, text: []const u8)
   last := row_at(document, high) + 1
   added := count_newlines(text)
   tail := document.line_count - last
+  // Preflight compressed writes before changing any live offsets. A fallback
+  // must decode the old index, including source rows about to move.
+  if document.line_width == 2 && (first + added != last || #len(text) != high - low) {
+    fits := true
+    scan: usize = 0
+    for scan < tail {
+      destination := first + added + scan
+      count := LineBlock - destination % LineBlock
+      if count > tail - scan {
+        count = tail - scan
+      }
+      low_value := line_offset(document, last + scan) - (high - low) + #len(text)
+      high_value := line_offset(document, last + scan + count - 1) - (high - low) + #len(text)
+      if !line_fits(document, destination, low_value) || !line_fits(document, destination + count - 1, high_value) {
+        fits = false
+        break
+      }
+      scan += count
+    }
+    offset: usize = 0
+    inserted: usize = 0
+    for fits && offset < #len(text) {
+      found := find_byte(&text[offset], 10, #len(text) - offset)
+      if found == nil {
+        break
+      }
+      offset = #cast(usize, found) - #cast(usize, &text[0]) + 1
+      fits = line_fits(document, first + inserted, low + offset)
+      inserted += 1
+    }
+    if !fits {
+      line_widen(document)
+    }
+  }
   // Skip suffix writes when its line indexes and byte offsets stay unchanged.
   // Newline positions inside the replacement are still rebuilt below.
-  if first + added > last {
+  if document.line_width == 2 && first + added == last {
+    line_shift(document, first + added, high - low, #len(text))
+  } else if first + added > last {
     for back in #reverse(0..tail) {
-      document.line_offsets[first + added + back] = #cast(u32) (#cast(usize) document.line_offsets[last + back] - (high - low) + #len(text))
+      line_write(document, first + added + back, line_offset(document, last + back) - (high - low) + #len(text))
     }
   } else if first + added < last || #len(text) != high - low {
     for forward in 0..tail {
-      document.line_offsets[first + added + forward] = #cast(u32) (#cast(usize) document.line_offsets[last + forward] - (high - low) + #len(text))
+      line_write(document, first + added + forward, line_offset(document, last + forward) - (high - low) + #len(text))
     }
   }
   inserted: usize = 0
@@ -940,8 +942,11 @@ fn replace_lines(document: *Document, low: usize, high: usize, text: []const u8)
     if found == nil {
       break
     }
-    offset = #cast(usize) found - #cast(usize) &text[0] + 1
-    document.line_offsets[first + inserted] = #cast(u32) (low + offset)
+    offset = #cast(usize, found) - #cast(usize, &text[0]) + 1
+    if !line_fits(document, first + inserted, low + offset) {
+      line_widen(document)
+    }
+    line_write(document, first + inserted, low + offset)
     inserted += 1
   }
   document.line_count = first + added + tail
@@ -955,7 +960,7 @@ fn count_newlines(text: []const u8) usize {
     if found == nil {
       break
     }
-    offset = #cast(usize) found - #cast(usize) &text[0] + 1
+    offset = #cast(usize, found) - #cast(usize, &text[0]) + 1
     count += 1
   }
   return count

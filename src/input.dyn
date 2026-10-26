@@ -16,7 +16,7 @@ struct InputState {
 }
 
 struct Clipboard {
-  arena: mem.Arena,
+  arena: *mem.Arena,
   owned: bool,
   text: []const u8,
   count: usize,
@@ -34,7 +34,8 @@ fn selected_clipboard(app: *App) *Clipboard {
 }
 fn clipboard_release(app: *App) {
   if app.register_state.clipboard.owned {
-    mem.arena_release(&app.register_state.clipboard.arena)
+    mem.arena_release(app.register_state.clipboard.arena)
+    app.register_state.clipboard.arena = nil
   }
   app.register_state.clipboard.owned = false
   app.register_state.clipboard.count = 0
@@ -118,7 +119,7 @@ fn text_input(app: *App, text: []const u8) {
   if app.register_state.pending {
     app.register_state.pending = false
     if #len(text) == 1 && text[0] >= 97 && text[0] <= 122 {
-      app.register_state.selected = #cast(usize) (text[0] - 97) + 1
+      app.register_state.selected = #cast(usize, (text[0] - 97)) + 1
     }
     else {
       app.register_state.selected = 0
@@ -193,8 +194,8 @@ fn clipboard_copy(app: *App) bool {
   if total == count {
     return true
   }
-  allocated := mem.arena_create(total + 1)
-  storage := mem.push_bytes_uninit(&allocated, total + 1)
+  allocated := mem.arena_create((total + 1) + mem.ArenaBufferOverhead)
+  storage := mem.push_bytes_uninit(allocated, total + 1)
   offsets: [32]usize = []
   lengths: [32]usize = []
   used: usize = 0
@@ -210,14 +211,16 @@ fn clipboard_copy(app: *App) bool {
   storage[used] = 0
   if app.register_state.selected == 0 && !sdl.clipboard_set(&storage[0]) {
     notice(app, "Clipboard copy failed.")
-    mem.arena_release(&allocated)
+    mem.arena_release(allocated)
     return false
   }
   slot := selected_clipboard(app)
   if slot.owned {
-    mem.arena_release(&slot.arena)
+    mem.arena_release(slot.arena)
+    slot.arena = nil
   }
-  slot.arena = mem.arena_take(&allocated)
+  slot.arena = allocated
+  allocated = nil
   slot.owned = true
   slot.text = storage[..used]
   slot.linewise = false
@@ -274,7 +277,7 @@ fn clipboard_paste(app: *App) {
     notice(app, "Clipboard unavailable.")
     return
   }
-  defer sdl.free(#cast(rawptr) incoming)
+  defer sdl.free(#cast(rawptr, incoming))
   length := c.string_length(incoming, buffer.Capacity + 1)
   if length > buffer.Capacity {
     notice(app, "Clipboard exceeds document capacity.")
@@ -299,9 +302,9 @@ fn key_trace(app: *App, key: u32, modifiers: u16) {
   line: [512]u8 = []
   used: usize = 0
   add_text(line[..], &used, "key ")
-  add_number(line[..], &used, #cast(usize) key)
+  add_number(line[..], &used, #cast(usize, key))
   add_text(line[..], &used, " mods ")
-  add_number(line[..], &used, #cast(usize) modifiers)
+  add_number(line[..], &used, #cast(usize, modifiers))
   add_text(line[..], &used, " panel ")
   add_text(line[..], &used, render_panel(app.prompt_state.panel))
   add_text(line[..], &used, " active ")
@@ -352,6 +355,9 @@ fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
   if terminal_target(app) != nil && terminal_mode(app).input {
     _ = terminal_input_key(app, key, modifiers)
     return
+  }
+  if key == KeyEscape && app.lsp.kind == 1 {
+    completion_cancel_refresh(app)
   }
   if dialog_key(app, typography, key, modifiers) {
     return
@@ -445,8 +451,9 @@ fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
   }
   if app.prompt_state.panel == Panel.LspResults || app.prompt_state.panel == Panel.LspEdit || app.prompt_state.panel == Panel.Diagnostics {
     if key == KeyEscape {
-      if completion_visible(app) {
+      if app.prompt_state.panel == Panel.LspResults && app.lsp.results.kind == 1 {
         completion_cancel_refresh(app)
+        lsp_results_release(app)
       }
       if app.prompt_state.panel == Panel.LspEdit {
         lsp_edits_release(app)
@@ -611,6 +618,10 @@ fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
     return
   }
   if key == KeyEscape {
+    if app.prompt_state.panel == Panel.ProjectSearch {
+      project_search_close(app)
+      return
+    }
     if app.prompt_state.panel == Panel.Open {
       app.resource_state.fonts = false
       app.resource_state.kind = 0
@@ -700,7 +711,7 @@ fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
         close_clean(app)
       }
       else {
-        _ = buffer.load(doc, doc.saved[..doc.saved_length])
+        _ = buffer.load(doc, buffer.saved_text(doc)[..doc.saved_length])
         request_quit(app)
       }
     }
@@ -738,7 +749,7 @@ fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
     for index in 0..12 {
       id := leader_command(index)
       info := command_info(id)
-      if #len(info.key) == 1 && normalized == #cast(u32) info.key[0] {
+      if #len(info.key) == 1 && normalized == #cast(u32, info.key[0]) {
         chosen = id
         break
       }
@@ -758,7 +769,7 @@ fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
   if app.prompt_state.panel == Panel.Message {
     if app.prompt_state.selected == 15 && key == KeyD {
       files.discard_recovery(app.documents.file)
-      _ = buffer.load(doc, doc.saved[..doc.saved_length])
+      _ = buffer.load(doc, buffer.saved_text(doc)[..doc.saved_length])
       app.prompt_state.panel = Panel.None
       app.view.extend = false
     } else if app.prompt_state.selected != 15 && key == KeyReturn {
@@ -910,7 +921,8 @@ fn registers_release(app: *App) {
   for index in 0..26 {
     register := &app.register_state.named[index]
     if register.owned {
-      mem.arena_release(&register.arena)
+      mem.arena_release(register.arena)
+      register.arena = nil
       register.owned = false
     }
   }

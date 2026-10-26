@@ -31,7 +31,17 @@ for key in ('DYN_LIBRARY_PATH', 'LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH'):
 links = []
 if sys.platform == 'darwin':
     sdk = Path(subprocess.check_output(['xcrun', '--show-sdk-path'], text=True).strip())
-    # Dyn bundles a minimal libSystem stub, not every API DNA uses.
+    # These tests use APIs beyond Dyn's minimal libSystem stub. Select native
+    # SDK linking explicitly; the built-in linker does not consume -syslibroot.
+    environment['DYN_LINKER'] = 'external'
+    linker_directory = stage / 'linker'
+    linker_directory.mkdir(exist_ok=True)
+    linker = linker_directory / 'ld64.lld'
+    if linker.is_symlink():
+        linker.unlink()
+    native_linker = subprocess.check_output(['xcrun', '--find', 'ld'], text=True).strip()
+    linker.symlink_to(native_linker)
+    environment['PATH'] = str(linker_directory) + os.pathsep + environment.get('PATH', '')
     links = ['--link', str(sdk / 'usr/lib/libSystem.tbd'), '--link', '-syslibroot', '--link', str(sdk)]
 elif os.name == 'nt':
     # Use the installed Windows SDK import library. Dyn's #link lookup expects

@@ -41,7 +41,7 @@ struct Slot {
   syntax_revision: u64,
   syntax_used: u64,
   colors: []u8,
-  arena: mem.Arena,
+  arena: *mem.Arena,
   document: *buffer.Document,
   file: files.State,
   scroll_x: f32,
@@ -60,9 +60,10 @@ fn new_buffer(app: *App) bool {
     notice(app, "Buffer limit reached (16). Close a buffer first.")
     return false
   }
-  allocated := mem.arena_create(#sizeof(buffer.Document) + buffer.Capacity + 129)
+  allocated := mem.arena_create((#sizeof(buffer.Document) + buffer.Capacity + 129) + mem.ArenaBufferOverhead)
   slot := &app.documents.slots[index]
-  slot.arena = mem.arena_take(&allocated)
+  slot.arena = allocated
+  allocated = nil
   app.documents.next_identity += 1
   slot.identity = app.documents.next_identity
   if app.render_trace.enabled {
@@ -73,8 +74,8 @@ fn new_buffer(app: *App) bool {
   slot.terminal = TerminalState{}
   mem.clear(&slot.diagnostics)
   slot.disk_changed = false
-  slot.document = buffer.allocate(&slot.arena)
-  slot.colors = mem.push_bytes_uninit(&slot.arena, buffer.Capacity + 1)
+  slot.document = buffer.allocate(slot.arena)
+  slot.colors = mem.push_bytes_uninit(slot.arena, buffer.Capacity + 1)
   _ = buffer.load(slot.document, "")
   app.documents.count += 1
   activate(app, index)
@@ -97,7 +98,8 @@ fn document_release(app: *App, slot: *Slot) {
   if slot.document == nil {
     return
   }
-  mem.arena_release(&slot.arena)
+  mem.arena_release(slot.arena)
+  slot.arena = nil
   allocation_record(app, "document", #sizeof(buffer.Document) + buffer.Capacity + 129, slot.arena_born, true)
   slot.document = nil
   slot.colors = slot.colors[..0]

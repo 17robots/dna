@@ -1,0 +1,91 @@
+// Capture newly overwritten original bytes. Existing middle bytes already live
+// in storage; unchanged prefix/suffix bytes still come from the current text.
+fn preserve_baseline(document: *Document, length: usize, prefix: *usize, suffix: *usize, storage: *u8, used: *usize, low: usize, high: usize) {
+  old_prefix := prefix.*
+  old_end := length - suffix.*
+  if low < prefix.* {
+    prefix.* = low
+  }
+  remaining := document.length - high
+  if remaining < suffix.* {
+    suffix.* = remaining
+  }
+  end := length - suffix.*
+  first := prefix.*
+  prefix_end := old_prefix
+  if prefix_end > end {
+    prefix_end = end
+  }
+  if prefix_end > first {
+    _ = copy_bytes(&storage[..length][first], &document.bytes[first], prefix_end - first)
+  }
+  suffix_start := old_end
+  if suffix_start < first {
+    suffix_start = first
+  }
+  if suffix_start < prefix_end {
+    suffix_start = prefix_end
+  }
+  if end > suffix_start {
+    source := document.length - (length - suffix_start)
+    _ = copy_bytes(&storage[..length][suffix_start], &document.bytes[source], end - suffix_start)
+  }
+  if end > first && end > used.* {
+    used.* = end
+  }
+}
+// Materialization is explicit and rare (e.g. reload saved text). Ordinary dirty
+// checks and checkpoint diffs read only preserved changed ranges.
+fn materialize_baseline(document: *Document, length: usize, prefix: usize, suffix: usize, storage: *u8, used: *usize) []u8 {
+  if prefix > 0 {
+    _ = copy_bytes(storage, &document.bytes[0], prefix)
+  }
+  if suffix > 0 {
+    _ = copy_bytes(&storage[..length + 1][length - suffix], &document.bytes[document.length - suffix], suffix)
+  }
+  storage[..length + 1][length] = 0
+  if length + 1 > used.* {
+    used.* = length + 1
+  }
+  return storage[..length + 1]
+}
+pub fn saved_text(document: *Document) []u8 {
+  if &document.saved_view[0] == &document.bytes[0] {
+    return document.bytes[..document.saved_length + 1]
+  }
+  document.saved_view = materialize_baseline(document, document.saved_length, document.saved_prefix, document.saved_suffix,
+    &document.saved_storage[0], &document.saved_storage_used)
+  return document.saved_view
+}
+pub fn checkpoint_text(document: *Document) []u8 {
+  length := document.history[document.history_at].length
+  if &document.checkpoint_view[0] == &document.bytes[0] {
+    return document.bytes[..length + 1]
+  }
+  document.checkpoint_view = materialize_baseline(document, length, document.checkpoint_prefix, document.checkpoint_suffix,
+    &document.checkpoint_storage[0], &document.checkpoint_storage_used)
+  return document.checkpoint_view
+}
+// Three borrowed spans reconstruct the saved baseline without a full copy.
+// Invalidated by document mutation, saving, checkpointing, undo/redo or reload.
+pub fn saved_parts(document: *const Document) [3][]const u8 {
+  end := document.saved_length - document.saved_suffix
+  prefix := document.saved_prefix
+  if prefix > end {
+    prefix = end
+  }
+  return [document.bytes[..prefix], document.saved_view[prefix..end], document.bytes[document.length - document.saved_suffix..document.length]]
+}
+pub fn saved_equal(document: *const Document, text: []const u8) bool {
+  if #len(text) != document.saved_length {
+    return false
+  }
+  at: usize = 0
+  for part in saved_parts(document) {
+    if !equal(part, text[at..at + #len(part)]) {
+      return false
+    }
+    at += #len(part)
+  }
+  return true
+}

@@ -1,5 +1,6 @@
 #target(kernel: windows)
 use "std/process" process
+use "std/unicode/utf8" name_utf8
 #link("kernel32")
 
 extern fn host_getcwd "GetCurrentDirectoryW"(capacity: u32, output: *u16) u32
@@ -13,24 +14,24 @@ fn native_current_directory(destination: []u8) usize {
   if length == 0 || length >= 32768 || #len(destination) > 2147483647 {
     return 0
   }
-  used := host_utf8(65001, 128, &wide[0], #cast(i32) length, &destination[0], #cast(i32) #len(destination) - 1, nil, nil)
+  used := host_utf8(65001, 128, &wide[0], #cast(i32, length), &destination[0], #cast(i32, #len(destination)) - 1, nil, nil)
   if used <= 0 {
     destination[0] = 0
     return 0
   }
-  destination[#cast(usize) used] = 0
-  return #cast(usize) used
+  destination[#cast(usize, used)] = 0
+  return #cast(usize, used)
 }
 fn native_change_directory(path: []const u8) bool {
   if #len(path) > 2147483647 {
     return false
   }
   wide: [32768]u16 = []
-  used := host_utf16(65001, 8, &path[0], #cast(i32) #len(path), &wide[0], 32767)
+  used := host_utf16(65001, 8, &path[0], #cast(i32, #len(path)), &wide[0], 32767)
   if used <= 0 {
     return false
   }
-  wide[#cast(usize) used] = 0
+  wide[#cast(usize, used)] = 0
   return host_chdir(&wide[0]) != 0
 }
 fn native_process_id() u32 {
@@ -41,12 +42,38 @@ fn native_small_pages(memory: []u8) {
 }
 
 fn native_environment(name: []const u8, destination: []u8) EnvironmentResult {
-  result := process.environment(name, destination)
+  // The allocating SDK wrapper retries Capacity, including permanent name errors.
+  units: usize = 0
+  at: usize = 0
+  for at < #len(name) {
+    decoded := name_utf8.decode(name, at)
+    if !decoded.ok {
+      return EnvironmentResult{kind: errors.Kind.Capacity, error: -28}
+    }
+    units += 1
+    if decoded.codepoint > 65535 {
+      units += 1
+    }
+    if units > 32767 {
+      return EnvironmentResult{kind: errors.Kind.Capacity, error: -28}
+    }
+    at += decoded.width
+  }
+  temporary := mem.arena_create(0)
+  defer mem.arena_release(temporary)
+  result := process.environment(temporary, name)
+  if result.ok && #len(result.value) > #len(destination) {
+    return EnvironmentResult{kind: errors.Kind.Capacity, error: -28}
+  }
+  if result.ok {
+    _ = mem.move(destination, result.value)
+    return EnvironmentResult{value: destination[..#len(result.value)], found: result.found, ok: true}
+  }
   return EnvironmentResult{value: result.value, found: result.found, error: result.error, kind: result.kind, ok: result.ok}
 }
 fn native_arguments(arena: *mem.Arena) ArgumentsResult {
   result := process.arguments(arena)
-  return ArgumentsResult{values: result.values, error: result.error, kind: result.kind, ok: result.ok}
+  return ArgumentsResult{values: result.value, error: result.error, kind: result.kind, ok: result.ok}
 }
 
 // Keep one foreign declaration per Win32 conversion symbol across adapters.

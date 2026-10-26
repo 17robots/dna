@@ -1,6 +1,11 @@
 #target(kernel: linux)
 use "std/c"
 
+// Borrow caller storage; invalid input/capacity failure leaves it unchanged.
+fn bounded_string(storage: []u8, source: []const u8) c.StringResult {
+  return c.string_into(storage, source)
+}
+
 pub type Directory = base.Directory
 fn linux_metadata(info: base.Metadata) Metadata {
   return Metadata{size: info.size, inode: info.inode, device: info.device, mode: info.mode, error: info.error, kind: info.kind, ok: info.ok}
@@ -10,7 +15,7 @@ fn linux_result(code: isize) Result {
 }
 fn path_metadata(path: []const u8, flags: usize) Metadata {
   storage: [4096]u8 = []
-  encoded := c.string_from_bytes(storage[..], path)
+  encoded := bounded_string(storage[..], path)
   if !encoded.ok || #len(path) == 0 {
     return Metadata{error: -22, kind: errors.Kind.InvalidInput}
   }
@@ -22,7 +27,7 @@ fn path_metadata(path: []const u8, flags: usize) Metadata {
   if (raw[0] & 769) != 769 {
     return Metadata{error: -5, kind: errors.Kind.System}
   }
-  return Metadata{size: raw[5], inode: raw[4], device: raw[17], mode: #cast(u16) (raw[3] >> 32), ok: true}
+  return Metadata{size: raw[5], inode: raw[4], device: raw[17], mode: #cast(u16, (raw[3] >> 32)), ok: true}
 }
 pub fn metadata(path: []const u8) Metadata {
   return path_metadata(path, 0)
@@ -34,8 +39,11 @@ pub fn file_metadata(file: *const File) Metadata {
   return linux_metadata(base.file_metadata(file))
 }
 pub fn open_directory(path: []const u8, storage: []u8) DirectoryResult {
+  if #len(path) >= 4096 {
+    return DirectoryResult{error: -36, kind: errors.linux(-36)}
+  }
   result := base.open_directory(path, storage)
-  return DirectoryResult{directory: result.directory, error: result.error, kind: result.kind, ok: result.ok}
+  return DirectoryResult{directory: result.value, error: result.error, kind: result.kind, ok: result.ok}
 }
 pub fn directory_next(directory: *Directory) DirectoryEntry {
   result := base.directory_next(directory)
@@ -50,8 +58,8 @@ pub fn rename(old_path: []const u8, new_path: []const u8) Result {
 pub fn rename_noreplace(old_path: []const u8, new_path: []const u8) Result {
   old_storage: [4096]u8 = []
   new_storage: [4096]u8 = []
-  old := c.string_from_bytes(old_storage[..], old_path)
-  target := c.string_from_bytes(new_storage[..], new_path)
+  old := bounded_string(old_storage[..], old_path)
+  target := bounded_string(new_storage[..], new_path)
   if !old.ok || !target.ok || #len(old_path) == 0 || #len(new_path) == 0 {
     return linux_result(-22)
   }
@@ -67,8 +75,20 @@ pub fn remove_directory(path: []const u8) Result {
   return base.remove_directory(path)
 }
 pub fn read_link(path: []const u8, destination: []u8) PathResult {
-  result := base.read_link(path, destination)
-  return PathResult{path: result.path, error: result.error, kind: result.kind, ok: result.ok}
+  storage: [4096]u8 = []
+  encoded := bounded_string(storage[..], path)
+  if !encoded.ok || #len(path) == 0 {
+    return PathResult{path: destination[..0], error: -36, kind: errors.linux(-36)}
+  }
+  if #len(destination) == 0 {
+    return PathResult{path: destination[..0], error: -22, kind: errors.linux(-22)}
+  }
+  // The arena SDK wrapper reserves 4096 bytes, but DNA accepts any output size.
+  result := #syscall(267, -100, encoded.value, &destination[0], #len(destination))
+  if result < 0 {
+    return PathResult{path: destination[..0], error: result, kind: errors.linux(result)}
+  }
+  return PathResult{path: destination[..#cast(usize, result)], ok: true}
 }
 pub fn set_permissions(file: *File, mode: usize) Result {
   if !base.is_open(file) {
@@ -79,7 +99,7 @@ pub fn set_permissions(file: *File, mode: usize) Result {
 
 pub fn open_nofollow(path: []const u8) FileResult {
   storage: [4096]u8 = []
-  encoded := c.string_from_bytes(storage[..], path)
+  encoded := bounded_string(storage[..], path)
   if !encoded.ok || #len(path) == 0 {
     return FileResult{error: -22, kind: errors.Kind.InvalidInput}
   }
@@ -87,7 +107,7 @@ pub fn open_nofollow(path: []const u8) FileResult {
   if descriptor < 0 {
     return FileResult{error: descriptor, kind: errors.linux(descriptor)}
   }
-  return FileResult{file: base.adopt_handle(descriptor), ok: true}
+  return FileResult{value: base.adopt_handle(descriptor), ok: true}
 }
 
 fn atomic_create_exclusive(path: []const u8) FileResult {
@@ -95,7 +115,7 @@ fn atomic_create_exclusive(path: []const u8) FileResult {
 }
 pub fn create_private_exclusive(path: []const u8) FileResult {
   storage: [4096]u8 = []
-  encoded := c.string_from_bytes(storage[..], path)
+  encoded := bounded_string(storage[..], path)
   if !encoded.ok || #len(path) == 0 {
     return FileResult{error: -22, kind: errors.Kind.InvalidInput}
   }
@@ -103,12 +123,12 @@ pub fn create_private_exclusive(path: []const u8) FileResult {
   if descriptor < 0 {
     return FileResult{error: descriptor, kind: errors.linux(descriptor)}
   }
-  return FileResult{file: base.adopt_handle(descriptor), ok: true}
+  return FileResult{value: base.adopt_handle(descriptor), ok: true}
 }
 pub fn preserve_permissions(file: *File, source: []const u8) Result {
   info := metadata(source)
   if !info.ok {
     return Result{error: info.error, kind: info.kind}
   }
-  return set_permissions(file, #cast(usize) (info.mode & 511))
+  return set_permissions(file, #cast(usize, (info.mode & 511)))
 }

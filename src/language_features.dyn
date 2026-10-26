@@ -40,8 +40,9 @@ fn lsp_prepare_format(app: *App, result: *const json.Value) {
     notice(app, "No formatting changes.")
     return
   }
-  allocated := mem.arena_create((buffer.Capacity + 1) * 2 + 65536)
-  app.lsp.edits.arena = mem.arena_take(&allocated)
+  allocated := mem.arena_create(((buffer.Capacity + 1) * 2 + 65536) + mem.ArenaBufferOverhead)
+  app.lsp.edits.arena = allocated
+  allocated = nil
   app.lsp.edits.owned = true
   uri: [16384]u8 = []
   encoded := lsp.uri(files.name(app.documents.file), uri[..])
@@ -169,7 +170,7 @@ fn completion_character(text: []const u8) u32 {
     if index > 0 && (text[index] & 192) != 128 {
       return 0
     }
-    character |= #cast(u32) text[index] << #cast(u32) (index * 8)
+    character |= #cast(u32, text[index]) << #cast(u32, (index * 8))
   }
   return character
 }
@@ -253,7 +254,7 @@ fn completion_tick(app: *App) {
     state.completion_identity = slot.identity
     state.completion_revision = doc.revision
     state.completion_position = doc.cursor
-    state.completion_due = sdl.ticks() + #cast(u64) app.config.completion_delay_ms
+    state.completion_due = sdl.ticks() + #cast(u64, app.config.completion_delay_ms)
     if #len(trigger) != 0 {
       state.completion_due = sdl.ticks()
       if state.completion_due == 0 {
@@ -382,7 +383,7 @@ fn completion_collect(state: *LspResults, doc: *buffer.Document) {
   for item != nil {
     // Backspacing before the response position invalidates explicit edit ranges.
     // Keep simple insertions usable; refresh richer edits from the server.
-    if (state.narrowed && json.object_get(item, "textEdit") != nil) || ((state.narrowed || state.position != state.origin) && json.object_get(item, "additionalTextEdits") != nil) {
+    if (state.narrowed && !json.is_missing(json.object_get(item, "textEdit"))) || ((state.narrowed || state.position != state.origin) && !json.is_missing(json.object_get(item, "additionalTextEdits"))) {
       state.incomplete = true
       item = item.next
       continue

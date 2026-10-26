@@ -10,6 +10,7 @@ No web runtime. [DESIGN.md](DESIGN.md) records the broader product direction.
 The Linux x86-64 preview requires **glibc 2.43 or newer**, a system monospace
 font, and desktop display libraries for GUI mode. It does not run on Ubuntu
 24.04's glibc 2.39. See [PRERELEASE.md](PRERELEASE.md) before installing.
+Upcoming preview.7 changes are recorded in [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
 ```sh
 mise use -g 'github:17robots/dna[prerelease=true,strip_components=1,bin_path=.]@0.1.0-preview.6'
@@ -28,31 +29,41 @@ no separate mise plugin or registry entry is required.
 
 ## Dyn SDK migration
 
-DNA now targets Dyn 0.1.0-preview.23. Run `mise install`, then `just deps` to
-rebuild native adapters and the language installer with the matching runtime.
-Existing language installations have independent pins: run
-`build/deps/install/bin/dna-language install dyn`, then `:language-reload` in an
-open editor. The registry pins the allocator-capable grammar and DNA bundles
-its matching highlight query, including `Allocator`, `#allocator`, `#AllocResult`
-and all typed allocation forms.
+Current working source uses the published Dyn preview.27 SDK pinned in
+`mise.toml`, including verified checksums for Linux, macOS and Windows. Run
+`mise install`, then confirm `mise exec -- dyn version` reports
+`dyn 0.1.0-preview.27`. Keep the complete SDK so the compiler, standard library,
+runtime and language server stay together.
 
-Allocation calls preserve their earlier failure policy: required allocations use
-`_or_panic`, and recoverable scratch allocations still check their result. Arena
-ownership transfers use `mem.arena_take`; allocator handles are created only
-at the destination owner. Sparse document/App storage stays explicitly
-uninitialized, with the existing initialization and page-reclamation contracts.
-No generic allocator replaces concrete arenas that need reset, rewind or release.
+To build and open an isolated local preview:
 
-The [SDK migration guide](https://github.com/17robots/dyn/blob/v0.1.0-preview.23/docs/migrations/0.1.0-preview.19.md)
-links the preview 16 allocation changes. To roll this migration back, revert its
-source, SDK and grammar/query changes together and rebuild the native adapters;
-document, session and configuration formats are unchanged.
+```sh
+python3 scripts/preview_sdk.py
+# Or open another file with the same compiler and language server:
+python3 scripts/preview_sdk.py path/to/file.dyn
+```
+
+The helper rebuilds native adapters and the editor with the matching runtime,
+uses separate settings/state under `build/sdk-preview`, and opens the real GUI.
+The helper uses the selected mise compiler by default. Set `DYN` to select
+another compiler; for a development build, also set `DYN_SDK` to its source SDK.
+The example in `examples/sdk-preview` also compiles and runs with that SDK.
+
+Source now uses `#cast(type, value)`, function-value types, arena-first SDK
+producers, current result fields, and JSON missing-value stubs. Required arena
+allocations panic; bounded DNA adapters still return their existing capacity
+failures. Ownership transfers use `mem.arena_take`. Sparse document/App storage
+stays explicitly uninitialized, with its existing initialization and reclamation
+contracts. Document, session, and configuration formats are unchanged.
+
+See [SDK-MIGRATION-20261024.md](SDK-MIGRATION-20261024.md) for validation,
+measurements, limits, and the preserved local baseline.
 
 ## Run
 
 Requirements: Linux x86-64, a working Dyn SDK, SDL3 development/runtime libraries,
 FreeType, HarfBuzz, PCRE2, utf8proc, libvterm, Tree-sitter (0.25+), and Fontconfig development libraries, CMake, Python 3.12+, a C compiler,
-and `just`. Tested with Dyn 0.1.0-preview.23, SDL 3.4.16 and SDL_ttf 3.2.2.
+and `just`. This migration is tested with the local development Dyn SDK, SDL 3.4.16 and SDL_ttf 3.2.2.
 `just build` downloads and builds pinned SDL_ttf into ignored `build/deps`.
 The build applies a small fix to avoid repeatedly shaping remaining lines when
 wrapping is disabled; its fingerprint also upgrades existing local builds.
@@ -63,16 +74,15 @@ are also Dyn. External libraries and the Dyn runtime retain their own implementa
 languages; this is not a dependency-free build. The C compiler builds external
 dependencies and generated header ABI probes, and links Dyn objects.
 The helper does not install system packages. After changing native dependencies,
-use `dyn build src --release --no-cache` for a direct static rebuild: the pinned
-SDK does not invalidate its executable cache when an external archive changes.
+use the development compiler with `--no-cache` for a direct static rebuild;
+external archive changes need an explicit rebuild.
 `just build` uses the freshly rebuilt shared adapter. Regex selection uses the system PCRE2 library
 (`libpcre2-dev` on Debian/Ubuntu, `pcre2-devel` on Fedora, `pcre2` on Arch).
 
-Use the tested **Dyn 0.1.0-preview.23** version pinned in `mise.toml`. For daily development, `just run` uses
+Use the tested **Dyn 0.1.0-preview.27** version pinned in `mise.toml`. For daily development, `just run` uses
 cached debug builds and the 2 GiB memory guard. `dyn run src/` also reuses
-unchanged modules. Preview 7 fixes cache lookup through PATH and large aggregate
-code generation; this editor's full release build now completes in about seven
-seconds on the development machine.
+unchanged modules. Build times depend on the machine, dependencies and cache;
+use the measurements below for the workflow you want to compare.
 
 To measure compilation plus editor startup through the first rendered frame:
 `mise exec -- python3 scripts/compile.py python3 tests/startup_latency.py dyn run src/ --timings`.
@@ -274,8 +284,12 @@ for `:session-restore`. It is removed only after a successful handoff restore.
 
 ### Placement
 
-Each surface (`palette`, `picker`, `menu`, `dialog`, `explorer`, `terminal`,
-`completion`, `hover`) keeps its usual place unless configured:
+Window popups (`palette`, `picker`, `dialog`, floating `explorer`, and popup
+`terminal`) share a top-center anchor, six percent down the window. Opening does
+not slide their contents away from that anchor, and dismissal removes the popup
+on the next frame. Completion and hover remain near the caret, key menus keep
+their contextual position, and a docked explorer stays docked. Each surface can
+still override its placement:
 
 ```toml
 [place.picker]
@@ -931,6 +945,9 @@ not a replacement for backups or version control.
   `build`, `target`, and `node_modules` are skipped; symlinks are not followed.
   Limits: 1,024 results, 20,000 entries, 16 levels, five seconds, and the editable
   file-size limit. Partial/invalid results are labelled; this is not gitignore-aware.
+  Plain printable ASCII patterns without regex syntax use a cancellable byte-search
+  path after the first checked match validates UTF-8. Other patterns use PCRE2.
+  File reads and binary scans check cancellation at bounded intervals.
 - **Project replacement:** finish a search, Escape, then
   `:replace-preview literal replacement`. The preview lists affected files/counts.
   Enter applies to undoable buffers; Escape cancels. Save each with `:write`.
@@ -1273,10 +1290,12 @@ version; `build/packages/container-check.json` records the tested image digest.
 ## Explorer columns and icons
 
 The editable explorer uses a mini.files-inspired parent/current/preview layout on
-wide windows. Short listings use a compact popup height; narrow windows show the
-current directory alone. Folders sort before files, then names sort by UTF-8 byte
-order. Enter opens the selected entry; Backspace goes to the parent and reselects
-the directory you came from. `h`/`l` retain Helix filename movement.
+wide windows. Its default frame matches the full picker and stays fixed while
+folders open and close. Columns share the available width; the oldest ancestor
+columns disappear first, and narrow windows hide the preview when it cannot fit.
+Folders sort before files, then names sort by UTF-8 byte order. Enter opens the
+selected entry; Backspace goes to the parent and reselects the directory you came
+from. `h`/`l` retain Helix filename movement.
 
 File and folder icons are drawn natively in a separate gutter, with file-type
 colors from the theme. GUI icons work with ordinary fonts; TUI icons use Nerd
@@ -1379,7 +1398,9 @@ plain text; function signatures and snippets arrive with the server response.
 No matches hide the list; backspace can restore cached matches immediately.
 The completion menu reserves eight rows (clipped to the pane), so filtering and
 server updates do not change its height. Unused rows remain empty.
-Arrows select, Enter or Tab accepts, Escape dismisses.
+Arrows select, Enter or Tab accepts, and Escape dismisses immediately.
+Enter also dismisses an empty result popup without inserting text. Dismissal
+cancels pending completion refreshes, so late replies cannot reopen it.
 Hover, cursor diagnostics, signatures, and completion appear beside the cursor
 inside its pane. Hover flips above the cursor near the bottom edge; Up/Down scroll
 long hover text and Escape dismisses it.
@@ -1448,6 +1469,9 @@ selection, retaining its direction.
 
 `K` keeps selections matching a regex; `Alt-K` removes matching selections.
 Both preview changes and restore the original selection set on Escape.
+Enter also closes an empty or unmatched search without changing selections;
+invalid patterns remain open for correction. Project-search dismissal cancels
+outstanding worker work; completed results remain available for replacement.
 Hover is available through `Space-k` or `:hover`.
 
 ### Track redraws
@@ -1538,16 +1562,37 @@ parsers remain bounded by the document slots plus one retiring parser. Shutdown
 joins disposal before releasing editor state.
 Closed panes release their text layouts on the next draw. Evicting an inactive
 syntax parser preserves the document and undo history; syntax rebuilds on revisit.
-Terminal history retains its existing 2,000-row limit (240 columns), and terminal
-review snapshots remain limited by document capacity. Search results remain
+Terminal history retains its existing 2,000-row limit (240 columns). Rows allocate
+only their stored width as history grows; resizing preserves older rows and pads
+missing columns when read. Terminal review snapshots remain limited by document capacity. Search results remain
 limited to 1,024 rows. No automatic eviction discards open text or unsaved edits.
 File-picker traversal runs on a cancellable background worker. Directory watches
 refresh cached results without losing the selected filename; incomplete watch
 coverage uses periodic refresh. Syntax buffers shrink after eight consecutive
 small revisions. Undo checkpoints and incremental LSP updates use changed ranges
-to avoid repeated full-document scans and copies.
+to avoid repeated full-document scans and copies. Saved and checkpoint baselines
+borrow unchanged prefixes and suffixes from current text; only the original bytes
+inside the changed range need separate storage. Distant edits can expand that
+range. Session/recovery encoding reads the saved baseline as three spans without
+materializing another full copy; session bytes and save-conflict checks retain
+their existing behavior. Buffer consumers use `saved_parts`/`saved_equal`, or
+`saved_text`/`checkpoint_text` when a contiguous baseline is required. Those
+borrowed views expire on mutation, save, checkpoint, undo/redo or reload.
+Incremental LSP shadows also use sparse small pages, so a small document does
+not commit a huge page merely because its maximum capacity is reserved.
+Line indexes normally use blocks of 256 two-byte offsets plus a fixed four-byte
+base, roughly halving index residency. Long spans and edits exceeding a block's
+headroom widen the index to four-byte absolute offsets before changing it; load
+and undo rebuilds can compact it again. Ordinary insert/delete updates shift
+packed offsets in place. The sparse virtual reservation remains unchanged.
 Dirty text equality is cached by document revision and saved-baseline epoch;
 explorer row identities are checked independently.
+Numeric line jumps read the line index directly. Bulk indentation rewrites the
+selected text once and updates line offsets, preserving marks, explorer identities
+and undo behavior. Syntax workers transfer owned text and color buffers instead
+of copying between worker stages. Document revision ranges bypass full-text diff
+scans only when they match the retained parse; missing or stale ranges fall back
+to comparison. Published results still require the current document revision.
 
 `src/documents.dyn` owns document allocation/release; `src/lifecycle.dyn` coordinates
 subsystem cleanup. Session switching is in `src/session.dyn`. Command metadata in
@@ -1568,6 +1613,11 @@ Manual CI dispatch also runs this extended check. Normal `just smoke` includes
 shorter versions, syntax buffer growth and allocation-failure recovery checks,
 plus an idle process-CPU budget. Syntax lifecycle checks require the JSON test
 grammar and verify completed parsing, stale revisions, and cancellation at teardown.
+The document memory gate also retains 4,000 distant edits without saving, checks
+all text after undo/redo, bounds snapshot growth, and verifies that reloading a
+small file releases the dirty baseline and undo storage.
+The LSP memory gate opens eight small documents with an incremental test server
+and checks that retained memory follows their size without adding huge pages.
 
 For desktop measurements, run:
 

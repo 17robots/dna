@@ -1,0 +1,155 @@
+// Window-level popups share an anchor; caret menus retain caret placement.
+fn popup_interaction_smoke(app: *App, typography: *Typography, renderer: rawptr, window: rawptr) {
+  saved_config := app.config
+  saved_motion := app.view.reduced_motion
+  saved_insert := app.view.insert
+  original := app.documents.active
+  app.config = settings.Settings{}
+  surfaces: [5]usize = [SurfacePalette, SurfacePicker, SurfaceDialog, SurfaceExplorer, SurfaceTerminal]
+  for surface in surfaces {
+    rect := place_rect(app, surface, 1000, 800, 24.0, 1.0, sdl.Rect{x: 10.0, y: 100.0, width: 300.0, height: 200.0})
+    if rect.x != 350.0 || rect.y != 48.0 {
+      #panic("window popups must share their relative anchor")
+    }
+  }
+  for surface in surfaces {
+    rect := place_rect(app, surface, 640, 480, 32.0, 2.0, sdl.Rect{width: 240.0, height: 160.0})
+    if rect.x != 200.0 || distance(rect.y, 28.8) > 0.01 {
+      #panic("popup anchor follows resize and scale")
+    }
+  }
+  tall := place_rect(app, SurfacePicker, 1000, 800, 24.0, 1.0, sdl.Rect{width: 300.0, height: 1000.0})
+  if tall.y != 48.0 || tall.height != 728.0 {
+    #panic("tall content must not move the popup anchor")
+  }
+  caret := sdl.Rect{x: 22.0, y: 33.0, width: 180.0, height: 100.0}
+  if place_rect(app, SurfaceCompletion, 1000, 800, 24.0, 1.0, caret).y != caret.y {
+    #panic("completion keeps its caret anchor")
+  }
+  if !new_buffer(app) {
+    #panic("popup interaction fixture")
+  }
+  doc := app.documents.current
+  _ = buffer.load(doc, "alpha beta\n")
+  buffer.move_to(doc, 3, false)
+  app.view.insert = false
+  search_open(app, Panel.Search, false)
+  text_input(app, "no_such_text")
+  key_input(app, typography, KeyReturn, 0)
+  if app.prompt_state.panel != Panel.None || doc.cursor != 3 {
+    #panic("Enter must dismiss an unmatched search without moving the cursor")
+  }
+  search_open(app, Panel.Search, false)
+  key_input(app, typography, KeyReturn, 0)
+  if app.prompt_state.panel != Panel.None {
+    #panic("Enter dismisses an empty search")
+  }
+  search_open(app, Panel.Search, false)
+  text_input(app, "[")
+  key_input(app, typography, KeyReturn, 0)
+  if app.prompt_state.panel != Panel.Search {
+    #panic("invalid regex remains editable")
+  }
+  key_input(app, typography, KeyEscape, 0)
+  app.view.insert = true
+  app.lsp.results.kind = 1
+  app.lsp.results.count = 0
+  app.lsp.completion_due = 1
+  app.lsp.completion_retry = true
+  app.prompt_state.panel = Panel.LspResults
+  key_input(app, typography, KeyReturn, 0)
+  if app.prompt_state.panel != Panel.None || app.lsp.completion_due != 0 || app.lsp.completion_retry || doc.length != 11 {
+    #panic("Enter must dismiss an empty completion without inserting text")
+  }
+  app.view.insert = false
+  app.lsp.results.kind = 1
+  app.lsp.completion_due = 1
+  app.prompt_state.panel = Panel.LspResults
+  key_input(app, typography, KeyEscape, 0)
+  if app.prompt_state.panel != Panel.None || app.lsp.completion_due != 0 {
+    #panic("Escape dismisses normal-mode completion")
+  }
+  app.view.reduced_motion = false
+  app.config.popup_animation_ms = 500.0
+  panel(app, Panel.Open)
+  draw(renderer, window, app, typography)
+  picker := ui_make_lookup(&app.ui, ui_hash(0, "picker"))
+  if picker == 0 || app.ui.boxes[picker].floating[1] != placed_rects[SurfacePicker].y {
+    #panic("picker first frame uses its final anchor")
+  }
+  picker_y := app.ui.boxes[picker].floating[1]
+  panel(app, Panel.Commands)
+  draw(renderer, window, app, typography)
+  palette := ui_make_lookup(&app.ui, ui_hash(0, "palette"))
+  if palette == 0 || app.ui.boxes[palette].floating[1] != picker_y {
+    #panic("palette and picker share first-frame anchors")
+  }
+  search_open(app, Panel.Search, false)
+  draw(renderer, window, app, typography)
+  dialog := ui_make_lookup(&app.ui, ui_hash(0, "dialog"))
+  if dialog == 0 || app.ui.boxes[dialog].floating[1] != picker_y {
+    #panic("dialog and picker share first-frame anchors")
+  }
+  key_input(app, typography, KeyEscape, 0)
+  draw(renderer, window, app, typography)
+  if app.view.animation.popup.value != 0.0 || app.view.animation.popup.active {
+    #panic("dismissed popup must disappear on the next frame without a fade")
+  }
+  app.config = saved_config
+  app.view.reduced_motion = saved_motion
+  app.view.insert = saved_insert
+  close_clean(app)
+  activate(app, original)
+}
+
+// The rendered frame stays aligned with the full picker through both sides
+// of folder navigation, resize, preview toggles and reopening.
+fn explorer_geometry_smoke(app: *App, typography: *Typography, renderer: rawptr) {
+  saved_config := app.config
+  saved_anchor := app.explorer.context.anchor_length
+  saved_trail := app.explorer.context.trail_count
+  app.config = settings.Settings{}
+  for small in 0..2 {
+    width: i32 = 1100
+    height: i32 = 760
+    if small == 1 {
+      width = 360
+      height = 300
+    }
+    status: f32 = 0.0
+    if app.view.status_line {
+      status = typography.line
+    }
+    expected := picker_geometry(app, typography, width, height, status, 0).rect
+    for previews in 0..2 {
+      app.config.explorer_preview = previews == 1
+      for step in 0..14 {
+        depth := step
+        if depth > 6 {
+          depth = 13 - step
+        }
+        app.explorer.context.trail_count = depth
+        if step == 13 {
+          explorer_context_restart(app)
+        }
+        draw_explorer(renderer, app, typography, width, height)
+        root := ui_make_lookup(&app.ui, ui_hash(0, "explorer"))
+        actual := app.ui.boxes[root].rect
+        if distance(actual.x, expected.x) > 0.1 || distance(actual.y, expected.y) > 0.1 || distance(actual.width, expected.width) > 0.1 || distance(actual.height, expected.height) > 0.1 {
+          #panic("explorer frame must match picker through folder navigation")
+        }
+        child := app.ui.boxes[root].first
+        for child != 0 {
+          area := app.ui.boxes[child].rect
+          if area.x < actual.x - 0.1 || area.x + area.width > actual.x + actual.width + 0.1 {
+            #panic("explorer columns must fit inside the stable frame")
+          }
+          child = app.ui.boxes[child].next
+        }
+      }
+    }
+  }
+  app.explorer.context.anchor_length = saved_anchor
+  app.explorer.context.trail_count = saved_trail
+  app.config = saved_config
+}

@@ -2,6 +2,7 @@ stage: u32 = 0
 frames: u32 = 0
 animation_waits: u32 = 0
 fades: u32 = 0
+popup_texture: rawptr = nil
 reduced: bool = false
 typed_during_fade: bool = false
 received_during_fade: bool = false
@@ -11,10 +12,10 @@ pub fn SDL_WaitEventTimeout(event: rawptr, milliseconds: i32) bool {
     animation_waits += 1
     if stage == 3 && fades != 0 && !typed_during_fade {
       input := ProbeEvent{}
-      pointer := #cast(rawptr) &input
+      pointer := #cast(rawptr, &input)
       probe_kind(pointer).* = 771
       text: []const u8 = "write\0"
-      (#cast(**const u8) (#cast(usize) pointer + 24)).* = &text[0]
+      (#cast(**const u8, (#cast(usize, pointer) + 24))).* = &text[0]
       probe_check(probe_push(pointer), "text push failed")
       typed_during_fade = true
     }
@@ -43,29 +44,33 @@ pub fn SDL_WaitEventTimeout(event: rawptr, milliseconds: i32) bool {
         probe_log("on")
       }
       probe_log(": ")
-      probe_number(#cast(u64) frames)
+      probe_number(#cast(u64, frames))
       probe_log(" frames, ")
-      probe_number(#cast(u64) animation_waits)
+      probe_number(#cast(u64, animation_waits))
       probe_log(" timed waits, ")
-      probe_number(#cast(u64) fades)
+      probe_number(#cast(u64, fades))
       probe_log(" fade frames; returned to idle\n")
       probe_exit(0)
     }
     stage += 1
   }
-  next := #cast(*fn(rawptr, i32) bool) probe_next("SDL_WaitEventTimeout\0")
+  next := #cast(fn(rawptr, i32) bool, probe_next("SDL_WaitEventTimeout\0"))
   return next(event, milliseconds)
 }
 pub fn SDL_SetTextureAlphaMod(texture: rawptr, alpha: u8) bool {
+  if stage == 4 && popup_texture != nil && texture == popup_texture {
+    probe_check(alpha == 0, "FAIL: dismissed popup still composites a fade frame")
+  }
   if alpha > 0 && alpha < 255 {
+    popup_texture = texture
     fades += 1
   }
-  next := #cast(*fn(rawptr, u8) bool) probe_next("SDL_SetTextureAlphaMod\0")
+  next := #cast(fn(rawptr, u8) bool, probe_next("SDL_SetTextureAlphaMod\0"))
   return next(texture, alpha)
 }
 pub fn SDL_RenderPresent(renderer: rawptr) bool {
   frames += 1
-  next := #cast(*fn(rawptr) bool) probe_next("SDL_RenderPresent\0")
+  next := #cast(fn(rawptr) bool, probe_next("SDL_RenderPresent\0"))
   return next(renderer)
 }
 pub fn TTF_SetTextString(text: rawptr, string: *const u8, length: usize) bool {
@@ -81,6 +86,6 @@ pub fn TTF_SetTextString(text: rawptr, string: *const u8, length: usize) bool {
       received_during_fade = true
     }
   }
-  next := #cast(*fn(rawptr, *const u8, usize) bool) probe_next("TTF_SetTextString\0")
+  next := #cast(fn(rawptr, *const u8, usize) bool, probe_next("TTF_SetTextString\0"))
   return next(text, string, length)
 }

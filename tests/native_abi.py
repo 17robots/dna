@@ -96,7 +96,7 @@ for dyn, native, fields in LAYOUTS:
         native_field, _, dyn_field = item.partition(':')
         dyn_field = dyn_field or native_field
         code.append(f'printf("%zu ", offsetof({native},{native_field}));')
-        checks.append((f'#cast(usize) &v{dyn}.{dyn_field} - #cast(usize) &v{dyn}', dyn+'.'+dyn_field))
+        checks.append((f'#cast(usize, &v{dyn}.{dyn_field}) - #cast(usize, &v{dyn})', dyn+'.'+dyn_field))
 code += ['VTermScreenCell cell = {0}; unsigned bits; cell.attrs.bold=1; memcpy(&bits,&cell.attrs,4); if(bits!=1)return 1;',
          'memset(&cell.attrs,0,4); cell.attrs.underline=3; memcpy(&bits,&cell.attrs,4); if(bits!=6)return 1;',
          'memset(&cell.attrs,0,4); cell.attrs.italic=1; memcpy(&bits,&cell.attrs,4); if(bits!=8)return 1;',

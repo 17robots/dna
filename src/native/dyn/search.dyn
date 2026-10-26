@@ -19,16 +19,20 @@ struct SearchScan {
   code, data, context: rawptr,
   deadline: NativeTimespec,
   partial: bool,
+  literal: bool,
+  query: *const u8,
+  query_length: usize,
 }
 fn search_alloc(size: usize, kind: i32) *u8 {
-  return #cast(*u8) dna_memory_alloc(size, #cast(u32) kind)
+  return #cast(*u8, dna_memory_alloc(size, #cast(u32, kind)))
 }
 fn search_calloc(count: usize, size: usize, kind: i32) rawptr {
-  return dna_memory_calloc(count, size, #cast(u32) kind)
+  return dna_memory_calloc(count, size, #cast(u32, kind))
 }
 fn search_free(value: rawptr) {
   dna_memory_free(value)
 }
+extern fn search_byte "memchr"(bytes: *const u8, value: i32, length: usize) rawptr
 extern fn search_dirfd "dirfd"(directory: rawptr) i32
 extern fn search_compare "strcmp"(a: *const u8, b: *const u8) i32
 extern fn search_compile "pcre2_compile_8"(pattern: *const u8, length: usize, options: u32, error: *i32, offset: *usize, context: rawptr) rawptr
@@ -37,7 +41,7 @@ extern fn search_context "pcre2_match_context_create_8"(context: rawptr) rawptr
 extern fn search_match_limit "pcre2_set_match_limit_8"(context: rawptr, limit: u32) i32
 extern fn search_depth_limit "pcre2_set_depth_limit_8"(context: rawptr, limit: u32) i32
 extern fn search_heap_limit "pcre2_set_heap_limit_8"(context: rawptr, limit: u32) i32
-extern fn search_set_callout "pcre2_set_callout_8"(context: rawptr, callback: *fn(rawptr, rawptr) i32, data: rawptr) i32
+extern fn search_set_callout "pcre2_set_callout_8"(context: rawptr, callback: fn(rawptr, rawptr) i32, data: rawptr) i32
 extern fn search_match "pcre2_match_8"(code: rawptr, bytes: *const u8, length: usize, offset: usize, options: u32, data: rawptr, context: rawptr) i32
 extern fn search_range "pcre2_get_ovector_pointer_8"(data: rawptr) *usize
 extern fn search_context_free "pcre2_match_context_free_8"(context: rawptr)
@@ -54,7 +58,7 @@ fn search_cancelled(scan: *SearchScan) bool {
   return native_atomic.load_u32(&scan.owner.stop) != 0 || native_atomic.load_u64(&scan.owner.generation) != scan.generation
 }
 fn search_callout(block: rawptr, data: rawptr) i32 {
-  if search_cancelled(#cast(*SearchScan) data) {
+  if search_cancelled(#cast(*SearchScan, data)) {
     return -37
   }
   return 0
@@ -67,11 +71,50 @@ fn search_copy_text(output: []u8, input: *const u8) {
   _ = copy(&output[0], input, length)
   output[length] = 0
 }
+// Accept only nonempty printable ASCII without regex syntax. Unicode, escapes,
+// flags, anchors and all other patterns retain the existing PCRE2 path.
+fn search_plain_literal(query: *const u8, length: usize) bool {
+  if length == 0 {
+    return false
+  }
+  syntax: []const u8 = "\\.^$|?*+()[]{}"
+  for i in 0..length {
+    byte := query[..length][i]
+    if byte < 32 || byte > 126 {
+      return false
+    }
+    for special in syntax {
+      if byte == special {
+        return false
+      }
+    }
+  }
+  return true
+}
+fn search_literal_match(scan: *SearchScan, bytes: *const u8, length: usize, start: usize) rawptr {
+  at := start
+  for at < length && !search_cancelled(scan) {
+    chunk := length - at
+    limit := 65536 + scan.query_length - 1
+    if chunk > limit {
+      chunk = limit
+    }
+    found := pred_find(&bytes[..length][at], chunk, scan.query, scan.query_length)
+    if found != nil {
+      return found
+    }
+    if chunk < limit {
+      break
+    }
+    at += 65536
+  }
+  return nil
+}
 fn search_file(scan: *SearchScan, parent: i32, leaf: *const u8, path: *const u8) {
   fd := install_openat(parent, leaf, 655360 | 2048, 0)
   if fd < 0 {
     scan.partial = true
-return
+    return
   }
   stat := InstallStat{}
   if install_fstat(fd, &stat) != 0 || (stat.mode & 61440) != 32768 || stat.size > 268435455 {
@@ -79,55 +122,93 @@ return
     scan.partial = true
     return
   }
-  room := #cast(usize) stat.size + 1
+  if search_cancelled(scan) {
+    _ = rec_close(fd)
+    return
+  }
+  room := #cast(usize, stat.size) + 1
   bytes := search_alloc(room, 1)
   if bytes == nil {
     scan.partial = true
-_ = rec_close(fd)
-return
+    _ = rec_close(fd)
+    return
   }
-  defer search_free(#cast(rawptr) bytes)
+  defer search_free(#cast(rawptr, bytes))
   length: usize = 0
   for length < room {
-    count := proc_read_raw(fd, &bytes[..room][length], room - length)
+    if search_cancelled(scan) {
+      _ = rec_close(fd)
+      return
+    }
+    // Bound work between cancellation checks; this does not interrupt blocked I/O.
+    chunk := room - length
+    if chunk > 65536 {
+      chunk = 65536
+    }
+    count := proc_read_raw(fd, &bytes[..room][length], chunk)
     if count < 0 {
       scan.partial = true
-_ = rec_close(fd)
-return
+      _ = rec_close(fd)
+      return
     }
     if count == 0 {
       break
     }
-    length += #cast(usize) count
+    length += #cast(usize, count)
   }
   _ = rec_close(fd)
   if length > 268435455 || length == room {
     scan.partial = true
-return
+    return
   }
-  for i in 0..length {
-    if bytes[..room][i] == 0 {
+  binary_at: usize = 0
+  for binary_at < length {
+    if search_cancelled(scan) {
       return
     }
+    chunk := length - binary_at
+    if chunk > 65536 {
+      chunk = 65536
+    }
+    if search_byte(&bytes[..room][binary_at], 0, chunk) != nil {
+      return
+    }
+    binary_at += chunk
   }
   at: usize = 0
   previous: usize = 0
   line: usize = 1
   line_start: usize = 0
+  match_options: u32 = 0
   for at <= length && !search_cancelled(scan) {
-    result := search_match(scan.code, bytes, length, at, 0, scan.data, scan.context)
-    if result == -1 {
-      break
+    range: [2]usize = []
+    if scan.literal && match_options != 0 {
+      found := search_literal_match(scan, bytes, length, at)
+      if found == nil {
+        break
+      }
+      range[0] = #cast(usize, found) - #cast(usize, bytes)
+      range[1] = range[0] + scan.query_length
+    } else {
+      result := search_match(scan.code, bytes, length, at, match_options, scan.data, scan.context)
+      if result == -1 {
+        break
+      }
+      if result < 0 {
+        scan.partial = true
+        break
+      }
+      // The first successful checked match validates this immutable subject.
+      // Plain ASCII literals can then use byte search without splitting UTF-8.
+      match_options = 1073741824 // PCRE2_NO_UTF_CHECK
+      matched := search_range(scan.data)[..2]
+      range[0] = matched[0]
+      range[1] = matched[1]
     }
-    if result < 0 {
-      scan.partial = true
-break
-    }
-    range := search_range(scan.data)[..2]
     for previous < range[0] {
       if bytes[..room][previous] == 10 {
         line += 1
-line_start = previous + 1
+        line_start = previous + 1
       }
       previous += 1
     }
@@ -155,7 +236,7 @@ line_start = previous + 1
     rec_unlock(scan.owner.lock)
     if full {
       scan.partial = true
-break
+      break
     }
     at = range[1]
     if range[0] == range[1] {
@@ -185,15 +266,15 @@ fn search_valid_name(name: *const u8) bool {
     value: u32 = 0
     if first >= 194 && first <= 223 {
       count = 1
-value = #cast(u32) (first & 31)
+      value = #cast(u32, (first & 31))
     }
     else if first >= 224 && first <= 239 {
       count = 2
-value = #cast(u32) (first & 15)
+      value = #cast(u32, (first & 15))
     }
     else if first >= 240 && first <= 244 {
       count = 3
-value = #cast(u32) (first & 7)
+      value = #cast(u32, (first & 7))
     }
     else {
       return false
@@ -207,7 +288,7 @@ value = #cast(u32) (first & 7)
       if (byte & 192) != 128 {
         return false
       }
-      value = (value << 6) | #cast(u32) (byte & 63)
+      value = (value << 6) | #cast(u32, (byte & 63))
     }
     if (count == 2 && value < 2048) || (count == 3 && value < 65536) || value > 1114111 || (value >= 55296 && value <= 57343) {
       return false
@@ -222,8 +303,8 @@ fn search_walk(scan: *SearchScan, fd: i32, prefix: *const u8, depth: usize) {
   directory := install_fdopendir(fd)
   if directory == nil {
     _ = rec_close(fd)
-scan.partial = true
-return
+    scan.partial = true
+    return
   }
   defer {
     _ = install_closedir(directory)
@@ -236,12 +317,12 @@ return
     scan.visited += 1
     if scan.visited > 20000 {
       scan.partial = true
-break
+      break
     }
     name := &entry.name[0]
     if !search_valid_name(name) {
       scan.partial = true
-continue
+      continue
     }
     if name.* == 46 || search_compare(name, &skip_build[0]) == 0 || search_compare(name, &skip_target[0]) == 0 || search_compare(name, &skip_modules[0]) == 0 {
       continue
@@ -255,7 +336,7 @@ continue
     }
     if length + separator + name_length >= 4096 {
       scan.partial = true
-continue
+      continue
     }
     _ = copy(&path[0], prefix, length)
     if separator > 0 {
@@ -266,12 +347,12 @@ continue
     parent := search_dirfd(directory)
     if install_fstatat(parent, name, &stat, 256) != 0 {
       scan.partial = true
-continue
+      continue
     }
     if (stat.mode & 61440) == 16384 {
       if depth == 16 {
         scan.partial = true
-continue
+        continue
       }
       child := install_openat(parent, name, 720896, 0)
       if child >= 0 {
@@ -288,12 +369,12 @@ continue
     rec_unlock(scan.owner.lock)
     if full || scan.visited > 20000 {
       scan.partial = true
-break
+      break
     }
   }
 }
 fn search_worker(opaque: rawptr) i32 {
-  search := #cast(*SearchWorker) opaque
+  search := #cast(*SearchWorker, opaque)
   completed: u64 = 0
   for native_atomic.load_u32(&search.stop) == 0 {
     rec_lock(search.lock)
@@ -302,18 +383,19 @@ fn search_worker(opaque: rawptr) i32 {
     }
     if native_atomic.load_u32(&search.stop) != 0 {
       rec_unlock(search.lock)
-break
+      break
     }
     completed = native_atomic.load_u64(&search.generation)
     root := search.root
     query := search.query
     rec_unlock(search.lock)
-    scan := SearchScan{owner: search, generation: completed}
+    scan := SearchScan{owner: search, generation: completed, query: &query[0], query_length: string_length(&query[0])}
+    scan.literal = search_plain_literal(scan.query, scan.query_length)
     error: i32 = 0
     offset: usize = 0
     _ = sync_clock(1, &scan.deadline)
     scan.deadline.seconds += 5
-    scan.code = search_compile(&query[0], #cast(usize) -1, 1704964, &error, &offset, nil)
+    scan.code = search_compile(&query[0], #cast(usize, -1), 1704964, &error, &offset, nil)
     status: i32 = 0
     if query[0] != 0 && scan.code == nil {
       status = 2
@@ -325,7 +407,7 @@ break
         _ = search_match_limit(scan.context, 10000)
         _ = search_depth_limit(scan.context, 128)
         _ = search_heap_limit(scan.context, 4096)
-        _ = search_set_callout(scan.context, &search_callout, #cast(rawptr) &scan)
+        _ = search_set_callout(scan.context, search_callout, #cast(rawptr, &scan))
         empty: []const u8 = "\0"
         fd := rec_open(&root[0], 589824, 0)
         if fd >= 0 {
@@ -360,10 +442,10 @@ fn search_release(search: *SearchWorker) {
   if search.lock != nil {
     rec_mutex_free(search.lock)
   }
-  search_free(#cast(rawptr) search)
+  search_free(#cast(rawptr, search))
 }
 pub fn dna_search_open() *SearchWorker {
-  search := #cast(*SearchWorker) search_calloc(1, #sizeof(SearchWorker), 1)
+  search := #cast(*SearchWorker, search_calloc(1, #sizeof(SearchWorker), 1))
   if search == nil {
     return nil
   }
@@ -371,12 +453,12 @@ pub fn dna_search_open() *SearchWorker {
   search.wake = rec_condition()
   if search.lock == nil || search.wake == nil {
     search_release(search)
-return nil
+    return nil
   }
-  search.thread = rec_thread(&search_worker, #cast(rawptr) search)
+  search.thread = rec_thread(search_worker, #cast(rawptr, search))
   if search.thread == nil {
     search_release(search)
-return nil
+    return nil
   }
   return search
 }
@@ -396,7 +478,7 @@ pub fn dna_search_submit(search: *SearchWorker, root: *const u8, query: *const u
 pub fn dna_search_count(search: *SearchWorker, status: *i32) usize {
   if search == nil {
     status.* = 0
-return 0
+    return 0
   }
   rec_lock(search.lock)
   count := search.count
