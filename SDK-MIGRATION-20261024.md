@@ -3,8 +3,8 @@
 The working DNA source now uses the published Dyn preview.27 SDK pinned in
 `mise.toml`. Global and project mise settings select the same verified package;
 the preview helper uses its compiler and language server. Preview.25 remains
-installed for rollback. This updates the working DNA checkout, not a published
-DNA binary release.
+installed for rollback. This migration is included in the published Linux
+[DNA preview.7](https://github.com/17robots/dna/releases/tag/v0.1.0-preview.7).
 
 The development-SDK migration evidence below is historical. Fresh installed-SDK
 qualification is recorded under `build/preview27-installed`; it clears
@@ -27,8 +27,9 @@ latency.
 
 Evidence: `build/preview27-installed/environment.json`, `status.json`,
 `full-smoke.log`, and `report.json` with compiler/output hashes. Previous SDKs
-remain installed for rollback. Existing working changes are preserved and no
-DNA source commit or application release was created.
+remain installed for rollback. At the time of this qualification, working changes were preserved and no
+DNA source commit or application release had been created. The tested state was
+subsequently reviewed, qualified by CI, merged, and published as preview.7.
 
 ## Try it
 
