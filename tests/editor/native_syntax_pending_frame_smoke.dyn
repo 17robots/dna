@@ -1,0 +1,230 @@
+// Draw uses only the presence/revision of this deterministic syntax handle;
+// parser calls and background services never run during this fixture.
+fn native_syntax_pending_frame_smoke(app: *App, typography: *Typography, renderer: rawptr, window: rawptr, probe: NativeTypingFrameProbe) {
+  slot := app.documents.slots[app.documents.active]
+  saved_syntax := slot.syntax
+  saved_colors := slot.colors
+  saved_revision := slot.syntax_revision
+  defer slot.syntax = saved_syntax
+  defer slot.colors = saved_colors
+  defer slot.syntax_revision = saved_revision
+  app.prompt_state.panel = Panel.None
+  app.view.reduced_motion = true
+  app.view.insert = true
+  app.view.line_numbers = false
+  app.view.status_line = false
+  app.view.highlight_line = false
+  app.config.syntax_enabled = true
+  app.config.vim_keys = false
+  probe.resize(960, 640)
+  doc := app.documents.current
+  _ = buffer.load(doc, "fn untouched() { return 123 }\nlet middle = 456\nfn changing() { value }\n")
+  buffer.move_to(doc, doc.length - 2, false)
+  owner := arena_owner.create(960 * 640 * 4 + 4096)
+  defer arena_owner.release(owner)
+  slot.colors = mem.push_bytes_uninit(owner, 256)
+  mem.zero(slot.colors)
+  // The first line is a stable colored region, remote from the edit/caret.
+  slot.colors[0] = 1
+  slot.colors[1] = 1
+  slot.syntax = #cast(rawptr, 1)
+  slot.syntax_revision = doc.revision
+  draw(renderer, window, app, typography)
+  pixels := probe.pixels()
+  before := mem.push_bytes_uninit(owner, #len(pixels))
+  _ = mem.copy(before, pixels)
+  // Prove this region really contains colored ink rather than just background.
+  app.config.syntax_enabled = false
+  draw(renderer, window, app, typography)
+  plain := probe.pixels()
+  region := #cast(usize, (app.config.document_padding * typography.scale + typography.line)) * 960 * 4
+  colored: bool = false
+  for at in 0..region {
+    if before[at] != plain[at] {
+      colored = true
+      break
+    }
+  }
+  if !colored {
+    #panic("pending syntax fixture must have visible colored keyword")
+  }
+  app.config.syntax_enabled = true
+  text_input(app, "x")
+  if slot.syntax_revision == doc.revision {
+    #panic("pending syntax fixture unexpectedly parsed")
+  }
+  draw(renderer, window, app, typography)
+  pending := probe.pixels()
+  for at in 0..region {
+    if before[at] != pending[at] {
+      #panic("editing a distant line erased unchanged keyword color while parsing")
+    }
+  }
+  // Inserting and deleting in a middle line shifts the unchanged suffix's
+  // source offsets. Its colored ink must remain at the same screen position.
+  for deleting in 0..2 {
+    _ = buffer.load(doc, "fn untouched() { return 123 }\nlet middle = 456\nfn changing() { value }\n")
+    mem.zero(slot.colors)
+    slot.colors[0] = 1
+    slot.colors[1] = 1
+    middle := buffer.row_start(doc, 1)
+    suffix := buffer.row_start(doc, 2)
+    for offset in 0..3 {
+      slot.colors[middle + offset] = 1
+    }
+    slot.colors[suffix] = 1
+    slot.colors[suffix + 1] = 1
+    slot.syntax_revision = doc.revision
+    app.view.scroll_x = 0.0
+    app.view.scroll_y = 0.0
+    if deleting == 0 {
+      buffer.move_to(doc, middle + 1, false)
+    }
+    else {
+      buffer.move_to(doc, middle + 2, false)
+    }
+    draw(renderer, window, app, typography)
+    _ = mem.copy(before, probe.pixels())
+    if deleting == 0 {
+      text_input(app, "X")
+    }
+    else {
+      key_input(app, typography, KeyBackspace, 0)
+    }
+    draw(renderer, window, app, typography)
+    pending = probe.pixels()
+    // Prefix pixels and the complete suffix line are unchanged by this edit.
+    for at in 0..region {
+      if before[at] != pending[at] {
+        #panic("pending syntax prefix ink changed on middle edit")
+      }
+    }
+    top := #cast(usize, app.config.document_padding * typography.scale + typography.line * 2.0 + 5.0)
+    bottom := #cast(usize, app.config.document_padding * typography.scale + typography.line * 3.0)
+    for at in top * 960 * 4..bottom * 960 * 4 {
+      if before[at] != pending[at] {
+        #panic("pending syntax suffix ink lost after byte offset shift")
+      }
+    }
+    if deleting == 0 {
+      // The newly inserted byte has no old style. Compare its glyph cell with
+      // an explicitly plain draw while keeping the logical caret unchanged.
+      _ = mem.copy(before, pending)
+      hit := measure_position(doc, typography, middle + 1)
+      next := measure_position(doc, typography, middle + 2)
+      left := #cast(usize, app.config.document_padding * typography.scale + #cast(f32, hit.x))
+      right := #cast(usize, app.config.document_padding * typography.scale + #cast(f32, next.x))
+      top = #cast(usize, app.config.document_padding * typography.scale + typography.line)
+      bottom = #cast(usize, app.config.document_padding * typography.scale + typography.line * 2.0)
+      app.config.syntax_enabled = false
+      draw(renderer, window, app, typography)
+      plain = probe.pixels()
+      for row in top..bottom {
+        for column in left..right {
+          for channel in 0..4 {
+            at := (row * 960 + column) * 4 + channel
+            if before[at] != plain[at] {
+              #panic("pending syntax invented a color for edited byte")
+            }
+          }
+        }
+      }
+      app.config.syntax_enabled = true
+    }
+  }
+  // Missing journal history provides no proof that the old colors still map.
+  // It must use the plain fallback rather than indexing stale offsets.
+  slot.syntax_revision = doc.revision
+  for step in 0..129 {
+    text_input(app, "x")
+  }
+  buffer.move_to(doc, doc.length - 2, false)
+  app.view.scroll_x = 0.0
+  draw(renderer, window, app, typography)
+  _ = mem.copy(before, probe.pixels())
+  app.config.syntax_enabled = false
+  draw(renderer, window, app, typography)
+  for at in 0..region {
+    if before[at] != probe.pixels()[at] {
+      #panic("expired syntax history must use plain fallback")
+    }
+  }
+  app.config.syntax_enabled = true
+  slot.syntax_revision = doc.revision
+  draw(renderer, window, app, typography)
+  colored = false
+  for at in 0..region {
+    if before[at] != probe.pixels()[at] {
+      colored = true
+    }
+  }
+  if !colored {
+    #panic("completed syntax revision must restore current colors")
+  }
+  // Undo/redo can identify only the changed continuation byte of two scalars
+  // with the same UTF-8 prefix. Provisional spans must cover whole scalars.
+  _ = buffer.load(doc, "fn é() { return 123 }\nlet middle = 456\nfn changing() { value }\n")
+  buffer.checkpoint(doc)
+  doc.anchor = 3
+  doc.cursor = 5
+  if !buffer.replace(doc, "ê") {
+    #panic("Unicode syntax fixture replace")
+  }
+  buffer.checkpoint(doc)
+  mem.zero(slot.colors)
+  slot.colors[0] = 1
+  slot.colors[1] = 1
+  slot.colors[3] = 2
+  slot.colors[4] = 2
+  for action in 0..2 {
+    buffer.move_to(doc, doc.length - 2, false)
+    slot.syntax_revision = doc.revision
+    draw(renderer, window, app, typography)
+    _ = mem.copy(before, probe.pixels())
+    if action == 0 {
+      buffer.undo(doc)
+    }
+    else {
+      buffer.redo(doc)
+    }
+    delta := buffer.changes_since(doc, slot.syntax_revision)
+    if !delta.found || delta.low != 4 {
+      #panic("Unicode undo fixture must split a shared UTF-8 encoding")
+    }
+    buffer.move_to(doc, doc.length - 2, false)
+    draw(renderer, window, app, typography)
+    pending = probe.pixels()
+    left := #cast(usize, app.config.document_padding * typography.scale)
+    right := #cast(usize, app.config.document_padding * typography.scale + typography.cell * 2.0)
+    for row in 0..region / (960 * 4) {
+      for column in left..right {
+        for channel in 0..4 {
+          at := (row * 960 + column) * 4 + channel
+          if before[at] != pending[at] {
+            #panic("Unicode pending syntax erased unchanged keyword")
+          }
+        }
+      }
+    }
+    _ = mem.copy(before, pending)
+    hit := measure_position(doc, typography, 3)
+    next := measure_position(doc, typography, 5)
+    left = #cast(usize, app.config.document_padding * typography.scale + #cast(f32, hit.x))
+    right = #cast(usize, app.config.document_padding * typography.scale + #cast(f32, next.x))
+    app.config.syntax_enabled = false
+    draw(renderer, window, app, typography)
+    plain = probe.pixels()
+    for row in 0..region / (960 * 4) {
+      for column in left..right {
+        for channel in 0..4 {
+          at := (row * 960 + column) * 4 + channel
+          if before[at] != plain[at] {
+            #panic("Unicode pending syntax must suppress whole edited scalar")
+          }
+        }
+      }
+    }
+    app.config.syntax_enabled = true
+  }
+  app.running = false
+}

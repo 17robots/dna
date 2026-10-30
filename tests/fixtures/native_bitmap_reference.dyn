@@ -1,0 +1,43 @@
+// Frozen glyph raster reference before clipped span rendering.
+fn reference_blend(surface: *software.Surface, x, y: i32, r, g, b, a: u8) {
+  if a==0 {
+    return
+  }
+  clip:=native_clip(surface.*)
+  if !ui.contains(clip, x, y) {
+    return
+  }
+  at:=#cast(usize, y)*surface.stride+#cast(usize, x)*4
+  if a==255 {
+    surface.pixels[at]=r
+    surface.pixels[at+1]=g
+    surface.pixels[at+2]=b
+    surface.pixels[at+3]=255
+    return
+  }
+  alpha:=#cast(u32, a)
+  old:=#cast(u32, surface.pixels[at+3])
+  denominator:=alpha*255+old*(255-alpha)
+  channels:[3]u8=[r, g, b]
+  for i in 0..3 {
+    surface.pixels[at+i]=#cast(u8, (#cast(u32, channels[i])*alpha*255+#cast(u32, surface.pixels[at+i])*old*(255-alpha)+denominator/2)/denominator)
+  }
+  surface.pixels[at+3]=#cast(u8, (denominator+127)/255)
+}
+pub fn reference_bitmap(renderer:rawptr, pixels:*const u8, width, height:i32, x, y:f32, r, g, b, a:u8) bool {
+  if width<0 || height<0 || width>16384 || height>16384 || (pixels==nil && width!=0 && height!=0) {
+    return false
+  }
+  surface:=native_surface()
+  scaled_width:=#cast(i32, #cast(f32, width)*native_gui.sx)
+  scaled_height:=#cast(i32, #cast(f32, height)*native_gui.sy)
+  for row in 0..scaled_height {
+    for col in 0..scaled_width {
+      source_row:=#cast(usize, #cast(f32, row)/native_gui.sy)
+      source_col:=#cast(usize, #cast(f32, col)/native_gui.sx)
+      coverage:=pixels[..#cast(usize, width)*#cast(usize, height)][source_row*#cast(usize, width)+source_col]
+      reference_blend(&surface, native_gui.viewport.x+#cast(i32, x*native_gui.sx)+col, native_gui.viewport.y+#cast(i32, y*native_gui.sy)+row, r, g, b, #cast(u8, (#cast(u32, a)*#cast(u32, coverage)+127)/255))
+    }
+  }
+  return true
+}

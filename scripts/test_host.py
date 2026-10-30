@@ -19,7 +19,7 @@ if not compiler:
     raise SystemExit('Install the pinned Dyn SDK first.')
 stage = ROOT / ('build/test-' + suite)
 stage.mkdir(parents=True, exist_ok=True)
-for module in ('host', 'filesystem'):
+for module in ('owned_arena', 'cstring', 'host', 'filesystem'):
     shutil.copytree(ROOT / 'src' / module, stage / module, dirs_exist_ok=True)
 (stage / 'main.dyn').write_text((ROOT / 'tests' / suite / 'main.dyn').read_text().replace('../../src/', './'))
 # mise merges parent configuration. Do not leak Linux library paths into a

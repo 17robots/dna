@@ -1,0 +1,93 @@
+use "vendor/window/native" window
+use "vendor/window/events"
+use "std/ui/software"
+use "std/mem"
+use "std/errors"
+use "./presenter" presenter
+
+fn check(ok:bool, message:[]const u8) {
+  if !ok {
+    #panic(message)
+  }
+}
+fn render(renderer:*presenter.Presenter, surface:software.Surface) {
+  check(presenter.draw(renderer, surface).ok, "desktop upload")
+  pixel:[4]u8=[]
+  renderer.api.pixel_store_i(3333, 1)
+  renderer.api.read_pixels(0, surface.height-1, 1, 1, 6408, 5121, #cast(rawptr, &pixel[0]))
+  check(pixel[0]==17 && pixel[1]==83 && pixel[2]==201 && pixel[3]==255, "desktop GL pixel readback")
+  renderer.api.read_pixels(surface.width-1, 0, 1, 1, 6408, 5121, #cast(rawptr, &pixel[0]))
+  check(pixel[0]==201 && pixel[1]==31 && pixel[2]==19 && pixel[3]==255, "desktop upload orientation")
+}
+fn main() {
+  host:=window.Window{}
+  check(window.open(&host, "DNA isolated desktop", 96, 64).ok, "desktop open")
+  defer window.close(&host)
+  window.listen_events(&host, true)
+  title_result:=window.set_title(&host, "DNA isolated desktop updated")
+  check(title_result.ok || title_result.kind==errors.Kind.Unsupported, "desktop title")
+  check(!window.set_size(&host, 0, 64).ok, "invalid desktop size")
+  resized:=window.set_size(&host, 112, 80)
+  check(resized.ok || resized.kind==errors.Kind.Unsupported, "desktop size request")
+  for attempt in 0..100 {
+    check(window.poll(&host).ok, "desktop resize poll")
+    if !resized.ok || (host.width==112 && host.height==80) {
+      break
+    }
+    window.wait(&host, 10)
+  }
+  check(!resized.ok || (host.width==112 && host.height==80), "desktop resized dimensions")
+  check(!window.set_swap_interval(&host, -1).ok, "invalid desktop pacing")
+  // Vsync control is optional on a valid desktop context.
+  pacing:=window.set_swap_interval(&host, 0)
+  check(pacing.ok || pacing.kind==errors.Kind.Unsupported, "desktop pacing control")
+  event:=events.Event{}
+  for window.next_event(&host, &event) {}
+  check(window.wake(&host).ok, "desktop wake")
+  saved:=events.Event{}
+  found:=false
+  for attempt in 0..100 {
+    check(window.poll(&host).ok, "desktop wake poll")
+    for window.next_event(&host, &event) {
+      if event.kind==events.Kind.Wake {
+        saved=event
+        found=true
+      }
+    }
+    if found {
+      break
+    }
+    window.wait(&host, 10)
+  }
+  check(found, "desktop ordered wake")
+  event.kind=events.Kind.Close
+  check(saved.kind==events.Kind.Wake, "desktop owned event copy")
+  renderer:=presenter.Presenter{}
+  check(presenter.open(&renderer).ok, "desktop presenter open")
+  check(!presenter.open(&renderer).ok, "desktop duplicate presenter open")
+  owner:=mem.arena_create(0)
+  defer mem.arena_release(owner)
+  pixels:=mem.push_bytes_uninit(owner, #cast(usize, host.width)*#cast(usize, host.height)*4)
+  for i in 0..#len(pixels)/4 {
+    pixels[i*4]=17
+    pixels[i*4+1]=83
+    pixels[i*4+2]=201
+    pixels[i*4+3]=255
+  }
+  last:=#len(pixels)-4
+  pixels[last]=201
+  pixels[last+1]=31
+  pixels[last+2]=19
+  surface:=software.Surface{pixels:pixels, width:host.width, height:host.height, stride:#cast(usize, host.width)*4}
+  render(&renderer, surface)
+  check(window.swap(&host).ok, "desktop present")
+  presenter.close(&renderer)
+  check(renderer.program==0 && renderer.texture==0, "desktop presenter invalidated")
+  check(!presenter.draw(&renderer, surface).ok, "closed desktop presenter rejects draw")
+  presenter.close(&renderer)
+  check(presenter.open(&renderer).ok, "desktop presenter recreate")
+  render(&renderer, surface)
+  presenter.close(&renderer)
+  window.close(&host)
+  check(!window.set_title(&host, "closed").ok && !window.set_size(&host, 112, 80).ok, "closed desktop controls")
+}

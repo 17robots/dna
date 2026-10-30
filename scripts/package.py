@@ -18,8 +18,10 @@ ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT/'build/packages'
 OUT.mkdir(parents=True, exist_ok=True)
 PREFIX = ROOT/'build/deps/install'
-ENV = dict(os.environ, LD_LIBRARY_PATH=str(PREFIX/'lib'))
+ENV = dict(os.environ, LD_LIBRARY_PATH=os.pathsep.join(str(path) for path in
+           (PREFIX/'lib', ROOT/'build/native-wayland', ROOT/'build/native-gui')))
 NAME = 'dna-preview-linux-x86_64'
+VERSION = re.search(r'const DnaVersion: \[\]const u8 = "([^"]+)"', (ROOT/'src/version.dyn').read_text())[1]
 GLIBC = re.compile(r'^(libc|libm|libpthread|librt|libdl|libresolv|libutil)\.so\.')
 def sha(path): return hashlib.sha256(path.read_bytes()).hexdigest()
 def dependencies(binary):
@@ -38,7 +40,8 @@ def dependencies(binary):
 with tempfile.TemporaryDirectory(prefix='dna-package-') as temporary:
     tree = Path(temporary)/NAME
     (tree/'bin').mkdir(parents=True); (tree/'lib').mkdir(); (tree/'share/dna').mkdir(parents=True)
-    shutil.copy2(ROOT/'build/dna-release', tree/'bin/dna')
+    shutil.copy2(ROOT/'build/dna-native-wayland-release', tree/'bin/dna-wayland')
+    shutil.copy2(ROOT/'build/dna-native-release', tree/'bin/dna-x11')
     shutil.copy2(PREFIX/'bin/dna-language', tree/'bin/dna-language')
     shutil.copytree(PREFIX/'share/dna', tree/'share/dna', dirs_exist_ok=True)
     for directory in ('themes', 'layouts'):
@@ -47,9 +50,11 @@ with tempfile.TemporaryDirectory(prefix='dna-package-') as temporary:
     (tree/'README.md').write_text("""# DNA Linux preview
 
 Run `./dna [file-or-directory]` from this directory, or add this directory to PATH.
+Use `./dna --version` or `./dna version` to print the application version.
 Keep `bin`, `lib`, and `share` beside the launcher. No Dyn SDK or Python is
 required to run the editor. A system monospace font, compatible glibc, and
-Linux display/graphics-driver libraries are required.
+Linux display/graphics-driver libraries are required. The launcher selects Wayland
+when WAYLAND_DISPLAY is set, otherwise X11. Both binaries also support --tui.
 
 - `i`: insert; Escape: normal mode; `:write`: save; `:`: command palette.
 - Space f: file picker; Space b: buffer picker; Space e: editable explorer.
@@ -76,7 +81,7 @@ See PLUGINS.md for the experimental process API. The uppercase example lives
 in examples/plugins/uppercase. Plugins require explicit loading and permission
 review; editor API permissions are not an OS sandbox.
 
-This is an experimental preview: 16 buffers, 268,435,455 text bytes per buffer,
+This is an experimental preview: dynamically allocated buffers, 268,435,455 text bytes per buffer,
 8 views. LSP clients are included; install language servers separately.
 See PRERELEASE.md for known limitations and the validation scope.
 Other platform ports are not included. `build-info.json`
@@ -91,10 +96,22 @@ system-wide by extracting or running this archive.
     for example in ('lsp.example.json','plugin-catalog.example.json'):
         shutil.copy2(ROOT/example,tree/'share/dna'/example)
     libraries = {}
-    for binary in (tree/'bin/dna', tree/'bin/dna-language', PREFIX/'lib/libdna_native.so'):
+    # Text providers are loaded dynamically by the native shaper. Bundle them
+    # and their dependencies as well as the ELF-linked window/runtime libraries.
+    providers=[]
+    for library in ('harfbuzz', 'fribidi', 'freetype'):
+        path=Path(subprocess.check_output(['cc', '-print-file-name=lib'+library+'.so'], text=True).strip()).resolve()
+        if not path.is_file(): raise SystemExit('Missing native text provider: '+library)
+        soname=re.search(r'\(SONAME\).*?\[(.*?)\]', subprocess.check_output(['readelf','-d',str(path)], text=True))
+        if not soname: raise SystemExit('Missing text provider SONAME: '+str(path))
+        libraries[soname[1]]=path
+        providers.append(path)
+
+    for binary in (tree/'bin/dna-wayland', tree/'bin/dna-x11', tree/'bin/dna-language', PREFIX/'lib/libdna_native.so', *providers):
         for name, source in dependencies(binary):
             if name in libraries and libraries[name] != source.resolve(): raise SystemExit(f'Conflicting {name}')
             libraries[name] = source.resolve()
+    if any('SDL' in name for name in libraries): raise SystemExit('Package contains an SDL dependency')
     libraries['libdna_native.so'] = (PREFIX/'lib/libdna_native.so').resolve()
     inventory=[]
     for name, source in sorted(libraries.items()):
@@ -106,7 +123,7 @@ system-wide by extracting or running this archive.
                 owner=package.stdout.strip();record['package']=subprocess.check_output(['pacman','-Q',owner],text=True).strip()
                 license_dir=Path('/usr/share/licenses')/owner
                 if license_dir.is_dir():shutil.copytree(license_dir,tree/'licenses'/owner,dirs_exist_ok=True)
-                # License directories do not always use the package name (SDL3).
+                # License directories do not always use the package name.
                 listing=subprocess.check_output(['pacman','-Ql',owner],text=True)
                 for entry in listing.splitlines():
                     _,_,filename=entry.partition(' ')
@@ -118,27 +135,27 @@ system-wide by extracting or running this archive.
         inventory.append(record)
     common=Path('/usr/share/licenses/common')
     if common.is_dir():shutil.copytree(common,tree/'licenses/common',dirs_exist_ok=True)
-    sdl_license=ROOT/'build/deps/SDL3_ttf-3.2.2/LICENSE.txt'
-    if not sdl_license.exists():raise SystemExit('Missing SDL_ttf license; rebuild dependencies from pinned source')
-    (tree/'licenses/SDL_ttf').mkdir(parents=True,exist_ok=True);shutil.copy2(sdl_license,tree/'licenses/SDL_ttf/LICENSE.txt')
     # This entrypoint works from any cwd and does not require a Dyn SDK.
     launcher='''#!/bin/sh
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 export LD_LIBRARY_PATH="$root/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-exec "$root/bin/dna" "$@"
+if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    exec "$root/bin/dna-wayland" "$@"
+fi
+exec "$root/bin/dna-x11" "$@"
 '''
     (tree/'dna').write_text(launcher);(tree/'dna').chmod(0o755)
-    symbols=''.join(subprocess.check_output(['readelf','--version-info',str(binary)],text=True) for binary in [tree/'bin/dna',tree/'bin/dna-language',*sorted((tree/'lib').iterdir())])
+    symbols=''.join(subprocess.check_output(['readelf','--version-info',str(binary)],text=True) for binary in [tree/'bin/dna-wayland',tree/'bin/dna-x11',tree/'bin/dna-language',*sorted((tree/'lib').iterdir())])
     glibc=max(set(re.findall(r'GLIBC_([0-9]+(?:\.[0-9]+)+)',symbols)),key=lambda v:tuple(map(int,v.split('.'))))
-    metadata={'minimum_glibc':glibc,'format':1,'target':'linux-x86_64','dyn':subprocess.check_output([os.environ.get('DYN','dyn'),'--version'],text=True).strip(),'libraries':inventory,'runtime_requirements':['glibc compatible with this build','installed monospace font','Linux desktop display/backend and graphics-driver libraries'],'scope':'Local preview; no publication performed.'}
+    metadata={'dna':VERSION,'minimum_glibc':glibc,'format':1,'target':'linux-x86_64','dyn':subprocess.check_output([os.environ.get('DYN','dyn'),'--version'],text=True).strip(),'libraries':inventory,'runtime_requirements':['glibc compatible with this build','installed monospace font','Linux desktop display/backend and graphics-driver libraries'],'scope':'Local preview; no publication performed.'}
     (tree/'build-info.json').write_text(json.dumps(metadata,indent=2,sort_keys=True)+'\n')
     records=[]
     for path in sorted(tree.rglob('*')):
         if path.is_file():records.append(f'{sha(path)}  {path.relative_to(tree)}')
     (tree/'SHA256SUMS').write_text('\n'.join(records)+'\n')
     # Relocation check: SDK/repository paths must not be needed to start or exit.
-    env=dict(PATH='/usr/bin:/bin',HOME=temporary,LD_LIBRARY_PATH=str(tree/'lib'),SDL_VIDEODRIVER='dummy',DYN_EDITOR_SMOKE='1',DNA_RECOVERY='0',DNA_CONFIG=str(Path(temporary)/'missing.toml'),DNA_LANGUAGE_DIR=str(Path(temporary)/'languages'))
+    env=dict(os.environ, PATH='/usr/bin:/bin',HOME=temporary,LD_LIBRARY_PATH=str(tree/'lib'),DYN_EDITOR_SMOKE='1',DNA_RECOVERY='0',DNA_CONFIG=str(Path(temporary)/'missing.toml'),DNA_LANGUAGE_DIR=str(Path(temporary)/'languages'))
     env.pop('DYN_LIBRARY_PATH',None);env.pop('DNA_WORKFLOW_TEST',None)
     subprocess.run([str(tree/'dna')],cwd=temporary,env=env,check=True,timeout=20)
     destination=OUT/(NAME+'.tar.gz')

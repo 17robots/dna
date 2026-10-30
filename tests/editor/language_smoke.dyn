@@ -1,4 +1,73 @@
-extern fn language_test_delay "SDL_Delay"(milliseconds: u32)
+// More than the former sixteen tracking records and eighty buffer UI rows.
+fn language_many_documents(app:*App) {
+  original:=app.documents.active
+  if !app.lsp.servers[0].ready || app.lsp.servers[0].process==nil || original>=#len(app.lsp.servers[0].documents) {
+    #panic("many LSP requires attached live peer")
+  }
+  first_shadow:=app.lsp.servers[0].documents[original].shadow.arena
+  identities:[84]u64=[]
+  indices:[84]usize=[]
+  for i in 0..84 {
+    if !new_buffer(app) {
+      #panic("many LSP buffer allocation")
+    }
+    indices[i]=app.documents.active
+    slot:=app.documents.slots[app.documents.active]
+    identities[i]=slot.identity
+    name:[4096]u8=[]
+    used:=copy_text(name[..], app.workspace.project[..app.workspace.project_length])
+    add_text(name[..], &used, "/tracking-")
+    add_number(name[..], &used, i)
+    add_text(name[..], &used, ".dyn")
+    if !files.set_name(&slot.file, name[..used]) || !buffer.load(slot.document, "tracked é😀\n") {
+      #panic("many LSP document fixture")
+    }
+    slot.filetype_length=copy_text(slot.filetype[..], "dyn")
+    lsp_sync(app, 0, true)
+    if !app.lsp.servers[0].ready {
+      #panic("many LSP sync stopped")
+    }
+    if app.lsp.servers[0].documents[original].shadow.arena!=first_shadow {
+      #panic("LSP growth lost prior shadow owner")
+    }
+    if i%8==0 {
+      _=lsp_tick(app)
+    }
+  }
+  for i in 0..84 {
+    activate(app, indices[83-i])
+    doc:=app.documents.current
+    buffer.move_to(doc, doc.length, false)
+    if !buffer.replace(doc, "change") {
+      #panic("many LSP incremental edit")
+    }
+    lsp_sync(app, 0, true)
+    tracked:=&app.lsp.servers[0].documents[app.documents.active]
+    if tracked.identity!=identities[83-i] || tracked.revision!=doc.revision || !tracked.shadow.ready || !buffer.equal(tracked.shadow.bytes[..tracked.shadow.length], doc.bytes[..doc.length]) {
+      #panic("many LSP identity/version/shadow mismatch")
+    }
+    if i%8==0 {
+      _=lsp_tick(app)
+    }
+  }
+  // A didSave send failure stops/frees metadata in the middle of lsp_sync.
+  // Detach the real transport so the native nil-send fault is deterministic,
+  // then release that detached transport explicitly after the failing call.
+  buffer.mark_saved(app.documents.current)
+  process:=app.lsp.servers[0].process
+  app.lsp.servers[0].process=nil
+  lsp_sync(app, 0, true)
+  rpc_close(process)
+  server:=&app.lsp.servers[0]
+  if server.ready || server.process!=nil || #len(server.documents)!=0 || server.documents_arena!=nil {
+    #panic("LSP send failure did not release dynamic tracking")
+  }
+  activate(app, original)
+}
+use "std/time"
+fn language_test_delay(milliseconds:u32) {
+  _ = time.sleep(#cast(i64, milliseconds)*time.Millisecond)
+}
 fn language_wait(app: *App) {
   deadline := sdl.ticks() + 3000
   for sdl.ticks() < deadline {
@@ -52,7 +121,7 @@ fn language_incremental_budget(app: *App) {
     _ = buffer.replace(doc, "x")
   }
   lsp_sync(app, 0, true)
-  if !buffer.equal(app.lsp.shadows[0].bytes[..app.lsp.shadows[0].length], doc.bytes[..doc.length]) {
+  if !buffer.equal(app.lsp.servers[0].documents[0].shadow.bytes[..app.lsp.servers[0].documents[0].shadow.length], doc.bytes[..doc.length]) {
     #panic("incremental shadow diverged")
   }
   app.lsp.log_length = 0
@@ -72,7 +141,7 @@ fn language_incremental_budget(app: *App) {
   _ = buffer.replace(doc, "é\n😀")
   lsp_sync(app, 0, true)
   app.lsp.servers[0].sync = 2
-  app.lsp.shadows[0].ready = false
+  app.lsp.servers[0].documents[0].shadow.ready = false
   buffer.move_to(doc, doc.length, false)
   _ = buffer.replace(doc, "Z")
   lsp_sync(app, 0, true)
@@ -101,10 +170,10 @@ fn language_smoke() {
   if !root.found {
     return
   }
-  owned := mem.arena_create(#sizeof(App) + 128 + mem.ArenaBufferOverhead)
-  scratch := mem.arena_create(2097152)
-  defer mem.arena_release(owned)
-  defer mem.arena_release(scratch)
+  owned := arena_owner.create(#sizeof(App) + 128)
+  scratch := arena_owner.create(2097152)
+  defer arena_owner.release(owned)
+  defer arena_owner.release(scratch)
   app := #cast(*App, mem.arena_push(owned, #sizeof(App), #alignof(App)))
   app.scratch = scratch
   app.config = settings.Settings{}
@@ -125,7 +194,7 @@ fn language_smoke() {
   if #len(files.open(app.documents.file, app.documents.current, path[..length], app.scratch)) != 0 {
     #panic("language open")
   }
-  slot := &app.documents.slots[app.documents.active]
+  slot := app.documents.slots[app.documents.active]
   slot.filetype_length = copy_text(slot.filetype[..], "dyn")
   lsp_start(app, "dyn", configured.value)
   language_wait(app)
@@ -179,7 +248,7 @@ fn language_smoke() {
   incremental.cursor = incremental.length
   _ = buffer.replace(incremental, "\nend é")
   lsp_sync(app, 0, true)
-  if !app.lsp.shadows[0].ready || app.lsp.shadows[0].length != incremental.length {
+  if !app.lsp.servers[0].documents[0].shadow.ready || app.lsp.servers[0].documents[0].shadow.length != incremental.length {
     #panic("incremental sync keeps the sent text")
   }
   app.lsp.log_length = 0
@@ -292,8 +361,8 @@ fn language_smoke() {
   }
   lsp_request(app, 1, "")
   key_input(app, nil, KeyEscape, 0)
-  if app.lsp.pending != 0 || app.prompt_state.panel != Panel.None {
-    #panic("Escape must dismiss completion and cancel its refresh")
+  if app.lsp.pending != 0 || app.prompt_state.panel != Panel.None || app.view.insert {
+    #panic("Escape must dismiss completion, cancel its refresh and enter normal mode")
   }
   _ = lsp_tick(app)
   completion_tick(app)
@@ -302,11 +371,18 @@ fn language_smoke() {
   }
   buffer.erase(app.documents.current, true)
   buffer.erase(app.documents.current, true)
+  // Escape now commits insert mode. Start the next completion scenarios from
+  // their own baseline rather than undoing back across that mode boundary.
+  buffer.checkpoint(app.documents.current)
+  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "al é😀\n") {
+    #panic("completion scenarios must restore their initial prefix")
+  }
   lsp_status(app)
   if !contains(app.prompt_state.message[..app.prompt_state.message_length], configured.value) || !contains(app.prompt_state.message[..app.prompt_state.message_length], "Completion delay: 25 ms") || !contains(app.prompt_state.message[..app.prompt_state.message_length], "Last response:") {
     #panic("language status must identify server and timings")
   }
   // A transient panel must not permanently suppress automatic completion.
+  app.view.insert = true
   app.prompt_state.panel = Panel.None
   lsp_request(app, 1, "")
   app.lsp.automatic = true
@@ -506,6 +582,8 @@ fn language_smoke() {
   if app.prompt_state.panel != Panel.None {
     #panic("stale hover opened popup")
   }
+  lsp_sync(app, 0, true)
+  language_many_documents(app)
 }
 fn disk_smoke() {
   directory: [4096]u8 = []
@@ -513,10 +591,10 @@ fn disk_smoke() {
   if !root.found {
     return
   }
-  owned := mem.arena_create(#sizeof(App) + 128 + mem.ArenaBufferOverhead)
-  scratch := mem.arena_create(2097152)
-  defer mem.arena_release(owned)
-  defer mem.arena_release(scratch)
+  owned := arena_owner.create(#sizeof(App) + 128)
+  scratch := arena_owner.create(2097152)
+  defer arena_owner.release(owned)
+  defer arena_owner.release(scratch)
   app := #cast(*App, mem.arena_push(owned, #sizeof(App), #alignof(App)))
   app.scratch = scratch
   app.config = settings.Settings{}
@@ -572,8 +650,8 @@ fn disk_smoke() {
 }
 
 fn clipboard_smoke() {
-  owned := mem.arena_create(#sizeof(App) + 128 + mem.ArenaBufferOverhead)
-  defer mem.arena_release(owned)
+  owned := arena_owner.create(#sizeof(App) + 128)
+  defer arena_owner.release(owned)
   app := #cast(*App, mem.arena_push(owned, #sizeof(App), #alignof(App)))
   defer release_editor_state(app)
   if !new_buffer(app) {
@@ -612,10 +690,10 @@ fn formatting_wait(app: *App) {
   }
 }
 fn formatting_smoke() {
-  owned := mem.arena_create(#sizeof(App) + 128 + mem.ArenaBufferOverhead)
-  scratch := mem.arena_create(2097152)
-  defer mem.arena_release(owned)
-  defer mem.arena_release(scratch)
+  owned := arena_owner.create(#sizeof(App) + 128)
+  scratch := arena_owner.create(2097152)
+  defer arena_owner.release(owned)
+  defer arena_owner.release(scratch)
   app := #cast(*App, mem.arena_push(owned, #sizeof(App), #alignof(App)))
   app.scratch = scratch
   defer release_editor_state(app)
@@ -624,7 +702,7 @@ fn formatting_smoke() {
     #panic("formatter test setup")
   }
   app.directory_state.length = copy_text(app.directory_state.path[..], "/tmp")
-  slot := &app.documents.slots[app.documents.active]
+  slot := app.documents.slots[app.documents.active]
   slot.filetype_length = copy_text(slot.filetype[..], "text")
   doc := app.documents.current
   _ = buffer.load(doc, "hello")
@@ -665,7 +743,7 @@ fn composition_smoke(app: *App, typography: *Typography) {
   app.prompt_state.panel = Panel.None
   app.view.insert = true
   text: [32]u8 = []
-  encoded := c.string_into(text[..], "にほん")
+  encoded := cstring.bounded(text[..], "にほん")
   if !encoded.ok {
     #panic("IME fixture string capacity")
   }
@@ -693,10 +771,10 @@ fn format_save_smoke() {
   if !fixture.ok || !fixture.found {
     return
   }
-  owned := mem.arena_create(#sizeof(App) + 128 + mem.ArenaBufferOverhead)
-  scratch := mem.arena_create(2097152)
-  defer mem.arena_release(owned)
-  defer mem.arena_release(scratch)
+  owned := arena_owner.create(#sizeof(App) + 128)
+  scratch := arena_owner.create(2097152)
+  defer arena_owner.release(owned)
+  defer arena_owner.release(scratch)
   app := #cast(*App, mem.arena_push(owned, #sizeof(App), #alignof(App)))
   app.scratch = scratch
   defer release_editor_state(app)
@@ -705,7 +783,7 @@ fn format_save_smoke() {
     #panic("format save setup")
   }
   app.directory_state.length = copy_text(app.directory_state.path[..], fixture.value)
-  slot := &app.documents.slots[app.documents.active]
+  slot := app.documents.slots[app.documents.active]
   slot.filetype_length = copy_text(slot.filetype[..], "text")
   _ = buffer.load(app.documents.current, "hello")
   path: [4096]u8 = []
@@ -734,8 +812,8 @@ fn format_save_smoke() {
 }
 
 fn settings_inspector_smoke(typography: *Typography) {
-  owned := mem.arena_create(#sizeof(App) + 128 + mem.ArenaBufferOverhead)
-  defer mem.arena_release(owned)
+  owned := arena_owner.create(#sizeof(App) + 128)
+  defer arena_owner.release(owned)
   app := #cast(*App, mem.arena_push(owned, #sizeof(App), #alignof(App)))
   if !settings.parse("terminal_escape = \"alt-x\"\n[keys.normal]\n\"f2\" = \"write\"\n[languages.dyn]\nindent_width = 2\nformatter = \"dyn fmt\"\n", &app.config) {
     #panic("inspector config")
@@ -768,10 +846,10 @@ fn settings_inspector_smoke(typography: *Typography) {
 
 // Picker rows hit-test the last drawn frame, so each click follows a draw.
 fn picker_mouse_smoke(renderer: rawptr, typography: *Typography) {
-  owned := mem.arena_create(#sizeof(App) + 128 + mem.ArenaBufferOverhead)
-  defer mem.arena_release(owned)
-  scratch := mem.arena_create(2097152)
-  defer mem.arena_release(scratch)
+  owned := arena_owner.create(#sizeof(App) + 128)
+  defer arena_owner.release(owned)
+  scratch := arena_owner.create(2097152)
+  defer arena_owner.release(scratch)
   app := #cast(*App, mem.arena_push(owned, #sizeof(App), #alignof(App)))
   app.scratch = scratch
   settings.defaults(&app.config)
@@ -898,10 +976,10 @@ fn dyn_language_smoke(renderer: rawptr, typography: *Typography) {
   if !root.found {
     return
   }
-  owned := mem.arena_create(#sizeof(App) + 128 + mem.ArenaBufferOverhead)
-  scratch := mem.arena_create(2097152)
-  defer mem.arena_release(owned)
-  defer mem.arena_release(scratch)
+  owned := arena_owner.create(#sizeof(App) + 128)
+  scratch := arena_owner.create(2097152)
+  defer arena_owner.release(owned)
+  defer arena_owner.release(scratch)
   app := #cast(*App, mem.arena_push(owned, #sizeof(App), #alignof(App)))
   app.scratch = scratch
   settings.defaults(&app.config)

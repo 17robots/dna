@@ -4,6 +4,7 @@ import os, shutil, subprocess
 from pathlib import Path
 root=Path(__file__).resolve().parents[1]; stage=root/'build/buffer-performance';stage.mkdir(exist_ok=True)
 shutil.copytree(root/'src/buffer',stage/'buffer',dirs_exist_ok=True)
+shutil.copytree(root/'src/owned_arena',stage/'owned_arena',dirs_exist_ok=True)
 shutil.copyfile(root/'tests/buffer_performance/main.dyn',stage/'main.dyn')
 for mode in ('debug','release'):
     binary=stage/mode

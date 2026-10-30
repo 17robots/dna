@@ -14,19 +14,27 @@ fn native_change_directory(path: []const u8) bool {
   if #len(path) >= #len(storage) {
     return false
   }
-  encoded := c.string_into(storage[..], path)
+  encoded := cstring.bounded(storage[..], path)
   return encoded.ok && #syscall(80, encoded.value) == 0
 }
 fn native_process_id() u32 {
   return #cast(u32, #syscall(39))
 }
 fn native_small_pages(memory: []u8) {
-  _ = #syscall(28, &memory[0], #len(memory), 15)
+  // Static arrays need not start on a page boundary. Advise only the pages
+  // containing this valid span; both endpoint pages already belong to it.
+  address := #cast(usize, &memory[0])
+  prefix := address % 4096
+  if #len(memory) > #cast(usize, -1) - prefix - 4095 {
+    return
+  }
+  length := (#len(memory) + prefix + 4095) / 4096 * 4096
+  _ = #syscall(28, address - prefix, length, 15)
 }
 
 fn native_environment(name: []const u8, destination: []u8) EnvironmentResult {
-  temporary := mem.arena_create(0)
-  defer mem.arena_release(temporary)
+  temporary := arena_owner.create(0)
+  defer arena_owner.release(temporary)
   result := process.environment(temporary, name)
   if result.ok && #len(result.value) > #len(destination) {
     return EnvironmentResult{kind: errors.Kind.Capacity, error: -28}

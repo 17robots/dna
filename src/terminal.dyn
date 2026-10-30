@@ -1,6 +1,7 @@
 #link("dna_native")
 
 struct TerminalUiState {
+  first: *Slot,
   task_error_offset: usize,
   commands: bool,
   slot: usize,
@@ -45,62 +46,98 @@ fn terminal_target(app: *App) rawptr {
   }
   return nil
 }
+// Terminal ownership is independent of the number of open file buffers.
+fn terminal_track(app: *App, slot: *Slot) {
+  if slot.terminal.handle == nil || slot.terminal.owner != nil {
+    return
+  }
+  slot.terminal.owner = app
+  slot.terminal.previous = nil
+  slot.terminal.next = app.terminal_state.first
+  if slot.terminal.next != nil {
+    slot.terminal.next.terminal.previous = slot
+  }
+  app.terminal_state.first = slot
+}
+fn terminal_untrack(slot: *Slot) {
+  owner := slot.terminal.owner
+  if owner == nil {
+    return
+  }
+  if slot.terminal.previous != nil {
+    slot.terminal.previous.terminal.next = slot.terminal.next
+  }
+  else {
+    owner.terminal_state.first = slot.terminal.next
+  }
+  if slot.terminal.next != nil {
+    slot.terminal.next.terminal.previous = slot.terminal.previous
+  }
+  slot.terminal.owner = nil
+  slot.terminal.previous = nil
+  slot.terminal.next = nil
+}
 fn release_terminals(app: *App) {
-  for index in 0..16 {
-    slot := &app.documents.slots[index]
-    if slot.terminal.handle != nil {
-      terminal_close(slot.terminal.handle)
-      slot.terminal.handle = nil
-    }
+  for app.terminal_state.first != nil {
+    slot := app.terminal_state.first
+    terminal_untrack(slot)
+    terminal_close(slot.terminal.handle)
+    slot.terminal.handle = nil
   }
 }
 fn terminal_tick(app: *App) bool {
   changed: bool = false
-  for index in 0..16 {
-    slot := &app.documents.slots[index]
-    if slot.terminal.handle != nil {
-      if terminal_poll(slot.terminal.handle) != 0 && !slot.terminal.review && slot_visible(app, index) {
-        changed = true
-      }
-      if terminal_alive(slot.terminal.handle) == 0 && slot.terminal.keep_output && slot.terminal.input {
-        slot.terminal.input = false
-        if slot_visible(app, index) || app.prompt_state.panel == Panel.Buffers {
-          changed = true
-        }
-      }
-      if terminal_alive(slot.terminal.handle) == 0 && !slot.terminal.keep_output {
-        if app.prompt_state.panel == Panel.Terminal && app.terminal_state.slot == index {
-          slot.terminal.input = false
-          app.prompt_state.panel = Panel.None
-        }
-        picker_finished := app.picker_state.closing && app.picker_state.close_target == index
-        close_finished := app.prompt_state.panel == Panel.TerminalClose && !app.terminal_state.closing_all && app.documents.active == index
-        close_slot(app, index)
-        if picker_finished {
-          finish_picker_close(app)
-        } else if close_finished {
-          cancel_buffer_close(app)
-        }
+  slot := app.terminal_state.first
+  for slot != nil {
+    next := slot.terminal.next
+    index := slot.index
+    if terminal_poll(slot.terminal.handle) != 0 && !slot.terminal.review && slot_visible(app, index) {
+      changed = true
+    }
+    alive := terminal_alive(slot.terminal.handle) != 0
+    if !alive && slot.terminal.keep_output && slot.terminal.input {
+      slot.terminal.input = false
+      if slot_visible(app, index) || app.prompt_state.panel == Panel.Buffers {
         changed = true
       }
     }
+    if !alive && !slot.terminal.keep_output {
+      if app.prompt_state.panel == Panel.Terminal && app.terminal_state.slot == index {
+        slot.terminal.input = false
+        app.prompt_state.panel = Panel.None
+      }
+      picker_finished := app.picker_state.closing && app.picker_state.close_target == index
+      close_finished := app.prompt_state.panel == Panel.TerminalClose && !app.terminal_state.closing_all && app.documents.active == index
+      close_slot(app, index)
+      if picker_finished {
+        finish_picker_close(app)
+      }
+      else if close_finished {
+        cancel_buffer_close(app)
+      }
+      changed = true
+    }
+    slot = next
   }
   return changed
 }
 fn terminals_running(app: *App) bool {
-  for index in 0..16 {
-    if app.documents.slots[index].terminal.handle != nil && terminal_alive(app.documents.slots[index].terminal.handle) != 0 {
+  slot := app.terminal_state.first
+  for slot != nil {
+    if terminal_alive(slot.terminal.handle) != 0 {
       return true
     }
+    slot = slot.terminal.next
   }
   return false
 }
 fn terminals_waiting_for_exit(app: *App) bool {
-  for index in 0..16 {
-    handle := app.documents.slots[index].terminal.handle
-    if handle != nil && terminal_needs_poll(handle) != 0 {
+  slot := app.terminal_state.first
+  for slot != nil {
+    if terminal_needs_poll(slot.terminal.handle) != 0 {
       return true
     }
+    slot = slot.terminal.next
   }
   return false
 }
@@ -135,13 +172,15 @@ fn terminal_popup(app: *App, fresh: bool, command: []const u8) {
   created := terminal_open(&app.workspace.project[0], &shell[0], &command_storage[0])
 
   if created == nil {
-    close_clean(app)
+    failed := app.documents.active
     activate(app, previous)
+    close_slot(app, failed)
     notice(app, "Cannot create terminal process.")
     return
   }
   app.terminal_state.slot = app.documents.active
   app.documents.slots[app.documents.active].terminal.handle = created
+  terminal_track(app, app.documents.slots[app.documents.active])
   app.documents.slots[app.documents.active].terminal.keep_output = #len(command) > 0
   app.documents.slots[app.documents.active].terminal.directory_length = copy_text(app.documents.slots[app.documents.active].terminal.directory[..], app.workspace.project[..app.workspace.project_length])
   app.terminal_state.task_error_offset = 0
@@ -170,7 +209,7 @@ fn terminal_place(app: *App, vertical: bool) {
     // pane, or logical pixels.
     height: f32 = 0.25
     size := app.config.places[SurfaceTerminal].size
-    rect_height := #cast(f32, app.view.panes[parent].rect.height)
+    rect_height := #cast(f32, app.view.panes[parent].target_rect.height)
     if size > 0.0 && size <= 1.0 {
       height = size
     } else if size > 1.0 && rect_height > 0.0 {
@@ -182,7 +221,7 @@ fn terminal_place(app: *App, vertical: bool) {
       height = 0.8
     }
     app.view.panes[parent].split_fraction = 1.0 - height
-    pane_layout(app, parent, app.view.panes[parent].rect)
+    pane_layout(app, parent, app.view.panes[parent].target_rect)
   }
   activate(app, app.terminal_state.slot)
 }
@@ -388,7 +427,16 @@ fn draw_terminal(renderer: rawptr, app: *App, typography: *Typography, width: i3
   slot := terminal_review_slot(app, target)
   owner := terminal_size_owner(app, typography, target, popup, focused)
 
-  if owner && terminal_resize(target, w, h - typography.line, typography.cell, typography.line) != 0 {
+  resize_w := w
+  resize_h := h
+  if !popup && app.view.pane_ready {
+    pane := &app.view.panes[typography.current_pane]
+    if pane.geometry.active {
+      resize_w = #cast(f32, pane.target_rect.width) - 16.0
+      resize_h = #cast(f32, pane.target_rect.height) - 16.0
+    }
+  }
+  if owner && terminal_resize(target, resize_w, resize_h - typography.line, typography.cell, typography.line) != 0 {
     slot.terminal.cursor_x.ready = false
     slot.terminal.cursor_y.ready = false
   }
@@ -406,9 +454,9 @@ fn draw_terminal(renderer: rawptr, app: *App, typography: *Typography, width: i3
   column: i32 = 0
   row: i32 = 0
   terminal_cursor(target, &column, &row)
-  terminal_snap := app.view.animation.reset || !app.config.smooth_cursor || cursor_step_snaps(&slot.terminal.cursor_x, &slot.terminal.cursor_y, #cast(f32, column) * typography.cell, #cast(f32, row) * typography.line, typography.cell, typography.line)
-  cursor_x := animated_follow(app, &slot.terminal.cursor_x, #cast(f32, column) * typography.cell, app.config.cursor_animation_ms, terminal_snap)
-  cursor_y := animated_follow(app, &slot.terminal.cursor_y, #cast(f32, row) * typography.line, app.config.cursor_animation_ms, terminal_snap)
+  // Remote program/review cursor updates are feedback, not a scroll tween.
+  cursor_x := animated_follow(app, &slot.terminal.cursor_x, #cast(f32, column) * typography.cell, app.config.cursor_animation_ms, true)
+  cursor_y := animated_follow(app, &slot.terminal.cursor_y, #cast(f32, row) * typography.line, app.config.cursor_animation_ms, true)
   cursor_width := typography.cell
 
   if slot.terminal.input {
@@ -452,17 +500,19 @@ fn draw_terminal(renderer: rawptr, app: *App, typography: *Typography, width: i3
   }
 }
 fn terminal_fonts_changed(app: *App) {
-  for index in 0..16 {
-    if app.documents.slots[index].terminal.handle != nil {
-      terminal_invalidate_font(app.documents.slots[index].terminal.handle)
-    }
+  slot := app.terminal_state.first
+  for slot != nil {
+    terminal_invalidate_font(slot.terminal.handle)
+    slot = slot.terminal.next
   }
 }
 fn terminal_review_slot(app: *App, target: rawptr) *Slot {
-  for index in 0..16 {
-    if app.documents.slots[index].terminal.handle == target {
-      return &app.documents.slots[index]
+  slot := app.terminal_state.first
+  for slot != nil {
+    if slot.terminal.handle == target {
+      return slot
     }
+    slot = slot.terminal.next
   }
   return nil
 }
@@ -538,11 +588,9 @@ fn terminal_escape_send(app: *App, state: *TerminalState) {
     return
   }
   state.escape_pending = false
-  for index in 0..16 {
-    if app.documents.slots[index].document != nil && app.documents.slots[index].terminal.handle == state.escape_target && state.escape_target != nil {
-      terminal_key(state.escape_target, KeyEscape, 0)
-      return
-    }
+  slot := terminal_review_slot(app, state.escape_target)
+  if slot != nil && state.escape_target != nil {
+    terminal_key(state.escape_target, KeyEscape, 0)
   }
 }
 fn terminal_escape_flush(app: *App) {
@@ -551,22 +599,26 @@ fn terminal_escape_flush(app: *App) {
 fn terminal_escape_tick(app: *App) bool {
   now := sdl.ticks()
   sent := false
-  for index in 0..16 {
-    state := &app.documents.slots[index].terminal
+  slot := app.terminal_state.first
+  for slot != nil {
+    state := &slot.terminal
     if state.escape_pending && now - state.escape_time > 500 {
       terminal_escape_send(app, state)
       sent = true
     }
+    slot = slot.terminal.next
   }
   return sent
 }
 fn terminal_escape_due(app: *const App) u64 {
   due: u64 = 0
-  for index in 0..16 {
-    state := &app.documents.slots[index].terminal
+  slot := app.terminal_state.first
+  for slot != nil {
+    state := &slot.terminal
     if state.escape_pending && (due == 0 || state.escape_time + 501 < due) {
       due = state.escape_time + 501
     }
+    slot = slot.terminal.next
   }
   return due
 }

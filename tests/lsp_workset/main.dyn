@@ -1,0 +1,182 @@
+use "std/time"
+workset_visits:usize
+fn workset_check(ok:bool) {
+  if !ok {
+    #panic("LSP targeted workset contract")
+  }
+}
+fn workset_wait(app:*App) {
+  deadline:=sdl.ticks()+3000
+  for !app.lsp.servers[0].ready && sdl.ticks()<deadline {
+    _=lsp_tick(app)
+    _=time.sleep(time.Millisecond)
+  }
+  workset_check(app.lsp.servers[0].ready)
+}
+fn workset_report(label:[]const u8, value:usize) {
+  output:[128]u8=[]
+  used:=copy_text(output[..], label)
+  add_number(output[..], &used, value)
+  add_text(output[..], &used, "\n")
+  host.write_error(output[..used])
+}
+fn workset_stale_diagnostics(app:*App, slot:*Slot, version:usize) {
+  message:[16384]u8=[]
+  used:=copy_text(message[..], "{\"uri\":")
+  lsp_document_uri(message[..], &used, files.name(&slot.file))
+  add_text(message[..], &used, ",\"version\":")
+  add_number(message[..], &used, version)
+  add_text(message[..], &used, ",\"diagnostics\":[]}")
+  parsed:=json.parse(app.scratch, message[..used])
+  workset_check(parsed.ok)
+  slot.diagnostics.count=1
+  _=lsp_diagnostics(app, 0, parsed.root)
+  workset_check(slot.diagnostics.count==1)
+}
+fn main() {
+  workset_check(sdl.init(0))
+  defer sdl.quit()
+  owner:=arena_owner.create(#sizeof(App)+128)
+  scratch:=arena_owner.create(2097152)
+  defer arena_owner.release(owner)
+  defer arena_owner.release(scratch)
+  app:=mem.push(App, owner)
+  app.scratch=scratch
+  app.config=settings.Settings{}
+  defer operations_release(app)
+  defer release_editor_state(app)
+  defer lsp_release(app)
+  root:[4096]u8=[]
+  directory:=host.environment("DNA_WORKSET_DIR", root[..])
+  command:[4096]u8=[]
+  peer:=host.environment("DNA_WORKSET_LSP", command[..])
+  workset_check(directory.ok && directory.found && peer.ok && peer.found)
+  app.workspace.project_length=copy_text(app.workspace.project[..], directory.value)
+  for i in 0..80 {
+    workset_check(new_buffer(app))
+    slot:=app.documents.slots[app.documents.active]
+    path:[4096]u8=[]
+    used:=copy_text(path[..], directory.value)
+    add_text(path[..], &used, "/workset-")
+    add_number(path[..], &used, i)
+    add_text(path[..], &used, ".dyn")
+    workset_check(files.set_name(&slot.file, path[..used]))
+    workset_check(buffer.load(slot.document, "alpha\n"))
+    slot.filetype_length=copy_text(slot.filetype[..], "dyn")
+  }
+  lsp_start(app, "dyn", peer.value)
+  workset_wait(app)
+  server:=&app.lsp.servers[0]
+  workset_check(#len(server.documents)>=80)
+  for i in 0..80 {
+    workset_check(server.documents[i].identity==app.documents.slots[i].identity)
+  }
+  workset_visits=0
+  for i in 0..20 {
+    lsp_sync(app, 0, false)
+    workset_check(lsp_wait_ms(app, 1000)==1000)
+  }
+  idle:=workset_visits
+  workset_report("LSP idle record visits: ", idle)
+  app.config.lsp_change_delay_ms=2000.0
+  doc:=app.documents.current
+  buffer.move_to(doc, doc.length, false)
+  workset_check(buffer.replace(doc, "x"))
+  workset_visits=0
+  lsp_sync(app, 0, false)
+  edited:=workset_visits
+  workset_report("LSP single-edit record visits: ", edited)
+  workset_check(lsp_wait_ms(app, 5000)>0 && lsp_wait_ms(app, 5000)<=2000)
+  workset_visits=0
+  lsp_sync(app, 0, true)
+  workset_check(server.documents[app.documents.active].revision==doc.revision)
+  // A request for the active file must not flush another file's debounce.
+  other:=app.documents.slots[1].document
+  buffer.move_to(other, other.length, false)
+  workset_check(buffer.replace(other, "other"))
+  other_revision:=server.documents[1].revision
+  lsp_sync(app, 0, true)
+  workset_check(server.documents[1].revision==other_revision)
+  app.config.lsp_change_delay_ms=0.0
+  lsp_sync(app, 0, false)
+  workset_check(server.documents[1].revision==other.revision)
+  // Input may request a feature before the queued filetype background phase.
+  // Resolve just this new extension before selecting its already-running peer.
+  app.config.language_count=1
+  configured:=&app.config.languages[0]
+  configured.name_length=copy_text(configured.name[..], "dyn")
+  configured.extensions_length=copy_text(configured.extensions[..], ".qzxbench")
+  workset_check(new_buffer(app))
+  custom:=app.documents.slots[app.documents.active]
+  custom_path:[4096]u8=[]
+  custom_used:=copy_text(custom_path[..], directory.value)
+  add_text(custom_path[..], &custom_used, "/immediate.qzxbench")
+  workset_check(files.set_name(&custom.file, custom_path[..custom_used]))
+  workset_check(buffer.load(custom.document, "custom\n") && custom.filetype_length==0)
+  lsp_request(app, 2, "")
+  workset_check(app.lsp.pending!=0 && app.lsp.server==0 && buffer.equal(custom.filetype[..custom.filetype_length], "dyn"))
+  request_deadline:=sdl.ticks()+3000
+  for app.lsp.pending!=0 && sdl.ticks()<request_deadline {
+    _=lsp_tick(app)
+    _=time.sleep(time.Millisecond)
+  }
+  workset_check(app.lsp.pending==0 && server.ready)
+  // Closing/reusing a slot leaves no stale queue links or old attached owner.
+  old_identity:=server.documents[40].identity
+  old_version:=server.documents[40].version
+  close_slot(app, 40)
+  workset_check(new_buffer(app) && app.documents.active==40)
+  replacement:=app.documents.slots[40]
+  path:[4096]u8=[]
+  used:=copy_text(path[..], directory.value)
+  add_text(path[..], &used, "/workset-40.dyn")
+  workset_check(files.set_name(&replacement.file, path[..used]))
+  workset_check(buffer.load(replacement.document, "new\n"))
+  replacement.filetype_length=copy_text(replacement.filetype[..], "dyn")
+  workset_stale_diagnostics(app, replacement, old_version)
+  lsp_sync(app, 0, true)
+  workset_check(server.documents[40].identity==replacement.identity && replacement.identity!=old_identity)
+  workset_check(server.documents[40].version>old_version)
+  workset_stale_diagnostics(app, replacement, old_version)
+  // The same URI can move to a different slot on this connection. Its old
+  // version must not be reused merely because the destination slot was empty.
+  uri_version:=server.documents[0].version
+  close_slot(app, 0)
+  lsp_sync(app, 0, false)
+  workset_check(new_buffer(app) && app.documents.active==0)
+  occupant:=app.documents.slots[0]
+  used=copy_text(path[..], directory.value)
+  add_text(path[..], &used, "/occupant.dyn")
+  workset_check(files.set_name(&occupant.file, path[..used]))
+  workset_check(buffer.load(occupant.document, "occupant\n"))
+  occupant.filetype_length=copy_text(occupant.filetype[..], "dyn")
+  lsp_sync(app, 0, true)
+  close_slot(app, 39)
+  lsp_sync(app, 0, false)
+  workset_check(server.documents[39].identity==0)
+  workset_check(new_buffer(app) && app.documents.active==39)
+  moved:=app.documents.slots[39]
+  used=copy_text(path[..], directory.value)
+  add_text(path[..], &used, "/workset-0.dyn")
+  workset_check(files.set_name(&moved.file, path[..used]))
+  workset_check(buffer.load(moved.document, "moved\n"))
+  moved.filetype_length=copy_text(moved.filetype[..], "dyn")
+  lsp_sync(app, 0, true)
+  workset_check(server.documents[39].version>uri_version)
+  workset_stale_diagnostics(app, moved, uri_version)
+  server.next_document_version=2147483647
+  workset_check(buffer.replace(moved.document, "exhaustion"))
+  lsp_sync(app, 0, true)
+  workset_check(!server.ready && server.process==nil && server.documents_arena==nil)
+  lsp_start(app, "dyn", peer.value)
+  workset_wait(app)
+  workset_check(server.next_document_version<2147483647 && server.documents[39].identity==moved.identity)
+  lsp_stop(app, 0)
+  workset_check(server.dirty_first==nil && server.attached_first==nil)
+  for i in 0..#len(app.documents.slots) {
+    slot:=app.documents.slots[i]
+    workset_check(slot.lsp_dirty_mask==0 && slot.lsp_attached_mask==0)
+  }
+  // State the input-size-independent contract after reporting the baseline.
+  workset_check(idle==0 && edited==1)
+}

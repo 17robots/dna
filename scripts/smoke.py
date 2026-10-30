@@ -8,6 +8,27 @@ import sys as _sys
 _sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parents[1] / 'scripts'))
 from dyn_path import with_real_dyn
 ROOT = Path(__file__).resolve().parents[1]
+backend = os.environ.get("DNA_SMOKE_BACKEND", "auto")
+if backend not in ("auto", "native", "native-wayland"):
+    raise SystemExit("DNA_SMOKE_BACKEND must be auto, native or native-wayland; SDL was removed")
+# Nested native compositors can throttle hidden surfaces to about one frame per
+# second. Permit a bounded functional-test deadline override without changing
+# product pacing or treating that run as a latency measurement.
+try:
+    smoke_timeout = float(os.environ.get("DNA_SMOKE_TIMEOUT_SECONDS", "20"))
+except ValueError:
+    raise SystemExit("DNA_SMOKE_TIMEOUT_SECONDS must be a number in (0, 120]")
+if not 0 < smoke_timeout <= 120:
+    raise SystemExit("DNA_SMOKE_TIMEOUT_SECONDS must be a number in (0, 120]")
+# Clipboard operations need a compositor-issued seat serial. Supply one inside
+# the SDK's private nested compositor instead of using the desktop clipboard.
+if (backend == "native-wayland" or (backend in ("auto", "native") and os.environ.get("WAYLAND_DISPLAY"))) and not os.environ.get("DNA_TEST_WAYLAND_INPUT"):
+    runner = ROOT / 'tests/wayland_runner.py'
+    for mode in os.environ.get("DNA_SMOKE_MODES", "debug release").split():
+        subprocess.run([_sys.executable, str(runner), "--run", _sys.executable, __file__],
+                       env=dict(os.environ, DNA_SMOKE_MODES=mode), check=True)
+    raise SystemExit(0)
+
 for mode in os.environ.get("DNA_SMOKE_MODES", "debug release").split():
     with tempfile.TemporaryDirectory(prefix="dna-ui-") as directory:
         fixtures = Path(directory)
@@ -41,8 +62,8 @@ for mode in os.environ.get("DNA_SMOKE_MODES", "debug release").split():
         env = with_real_dyn(dict(base_env, DNA_TEST_LSP="python3 " + str(ROOT / "tests/fake_lsp.py"), DYN_EDITOR_SMOKE="1", DNA_WORKFLOW_TEST=directory, DNA_TEST_PLUGIN=str(ROOT/"examples/plugins/uppercase/plugin.json"), XDG_CONFIG_HOME=str(fixtures / "config"), XDG_STATE_HOME=str(fixtures / "state"), DNA_CONFIG=str(fixtures / "startup-config.toml"), DNA_LANGUAGE_DIR=str(fixtures / "languages")))
         if (ROOT / "build/test-languages/python/parser.so").exists() and (ROOT / "build/test-languages/json/parser.so").exists():
             env["DNA_TEST_LANGUAGE_DIR"] = str(ROOT / "build/test-languages")
-        env.setdefault("SDL_VIDEODRIVER", "dummy")
-        subprocess.run([str(ROOT / "build" / f"dna-smoke-{mode}")], env=env, check=True, timeout=20)
+        prefix = {"auto": "dna", "native": "dna-native", "native-wayland": "dna-native-wayland"}[backend]
+        subprocess.run([str(ROOT / "build" / f"{prefix}-smoke-{mode}")], env=env, check=True, timeout=smoke_timeout)
         assert (fixtures / "save-first.txt").read_text() == "Afirst"
         assert (fixtures / "save-second.txt").read_text() == "Bsecond"
         assert (fixtures / "save-unnamed.txt").read_text() == "unnamed"
@@ -60,4 +81,4 @@ for mode in os.environ.get("DNA_SMOKE_MODES", "debug release").split():
         assert (fixtures / "explorer" / ".dna-trash" / "keep" / "child.txt").read_text() == "child contents"
         assert (fixtures / "explorer" / "collision.txt").read_text() == "external"
         assert not (fixtures / "accidental.txt").exists()
-        print(f"PASS native workflow ({mode}, {env['SDL_VIDEODRIVER']})", flush=True)
+        print(f"PASS native workflow ({mode}, {backend})", flush=True)

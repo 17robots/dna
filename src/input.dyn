@@ -34,7 +34,7 @@ fn selected_clipboard(app: *App) *Clipboard {
 }
 fn clipboard_release(app: *App) {
   if app.register_state.clipboard.owned {
-    mem.arena_release(app.register_state.clipboard.arena)
+    arena_owner.release(app.register_state.clipboard.arena)
     app.register_state.clipboard.arena = nil
   }
   app.register_state.clipboard.owned = false
@@ -57,6 +57,9 @@ fn prompting(app: *const App) bool {
 }
 // Keep text input enabled both while waiting and while draining queued events.
 fn wants_text_input(app: *App) bool {
+  if app.prompt_state.panel==Panel.Tree && app.tree.searching {
+    return true
+  }
   if app.prompt_state.panel == Panel.Open && app.resource_state.kind == 6 {
     return app.language_manager.searching
   }
@@ -74,6 +77,8 @@ fn changed(app: *App, text: []const u8) {
   }
 }
 fn text_input(app: *App, text: []const u8) {
+  explorer_borrow:=explorer_vim_begin(app)
+  defer explorer_vim_end(app, &explorer_borrow)
   if app.prompt_state.panel == Panel.Open && app.resource_state.kind == 6 && !app.language_manager.searching {
     return
   }
@@ -106,6 +111,10 @@ fn text_input(app: *App, text: []const u8) {
   }
   if !buffer.valid(text) {
     notice(app, "Input must be UTF-8 text without NUL bytes.")
+    return
+  }
+  if app.prompt_state.panel==Panel.Tree && app.tree.searching {
+    tree_search_text(app, text)
     return
   }
   target := terminal_target(app)
@@ -194,7 +203,7 @@ fn clipboard_copy(app: *App) bool {
   if total == count {
     return true
   }
-  allocated := mem.arena_create((total + 1) + mem.ArenaBufferOverhead)
+  allocated := arena_owner.create((total + 1))
   storage := mem.push_bytes_uninit(allocated, total + 1)
   offsets: [32]usize = []
   lengths: [32]usize = []
@@ -211,12 +220,12 @@ fn clipboard_copy(app: *App) bool {
   storage[used] = 0
   if app.register_state.selected == 0 && !sdl.clipboard_set(&storage[0]) {
     notice(app, "Clipboard copy failed.")
-    mem.arena_release(allocated)
+    arena_owner.release(allocated)
     return false
   }
   slot := selected_clipboard(app)
   if slot.owned {
-    mem.arena_release(slot.arena)
+    arena_owner.release(slot.arena)
     slot.arena = nil
   }
   slot.arena = allocated
@@ -309,7 +318,7 @@ fn key_trace(app: *App, key: u32, modifiers: u16) {
   add_text(line[..], &used, render_panel(app.prompt_state.panel))
   add_text(line[..], &used, " active ")
   add_number(line[..], &used, app.documents.active)
-  slot := &app.documents.slots[app.documents.active]
+  slot := app.documents.slots[app.documents.active]
   if slot.terminal.handle != nil {
     add_text(line[..], &used, " terminal")
     if slot.terminal.input {
@@ -330,15 +339,47 @@ fn key_trace(app: *App, key: u32, modifiers: u16) {
   host.write_error(line[..used])
 }
 fn key_input(app: *App, typography: *Typography, key: u32, modifiers: u16) {
-  // SDL sends modifier presses separately from the modified character.
+  // The native backend sends modifier presses separately from the modified character.
   // They are not commands: e.g. Shift between vi and { must not cancel i.
   // Ignore them before prefix dispatch, completion/snippet handling, or recording.
   if (key >= 1073742048 && key <= 1073742055) || key == 1073742081 {
     return
   }
+  explorer_borrow:=explorer_vim_begin(app)
+  defer explorer_vim_end(app, &explorer_borrow)
+  recorded_panel:=app.prompt_state.panel
+  if app.explorer.vim_borrowed {
+    app.prompt_state.panel=Panel.None
+  }
   vim_record_key(app, key, modifiers)
+  app.prompt_state.panel=recorded_panel
   key_dispatch(app, typography, key, modifiers)
   vim_settle(app)
+  explorer_vim_finish(app, typography, &explorer_borrow)
+}
+// Enter normal mode through the same path whether completion is open or not.
+fn input_normal_mode(app: *App) {
+  doc := app.documents.current
+  app.input_state.repeat_count = 0
+  app.input_state.pending = 0
+  app.register_state.pending = false
+  app.register_state.selected = 0
+  if snippet_valid(app) {
+    app.lsp.snippet.active = false
+    doc.secondary.count = 0
+  }
+  if app.config.vim_keys && app.view.insert {
+    vim_insert_finish(app)
+  }
+  buffer.checkpoint(doc)
+  if app.view.insert {
+    buffer.leave_insert(doc)
+  }
+  app.view.insert = false
+  app.view.extend = false
+  if app.config.vim_keys {
+    vim_escape(app)
+  }
 }
 fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
   key_trace(app, key, modifiers)
@@ -454,6 +495,9 @@ fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
       if app.prompt_state.panel == Panel.LspResults && app.lsp.results.kind == 1 {
         completion_cancel_refresh(app)
         lsp_results_release(app)
+        app.prompt_state.panel = Panel.None
+        input_normal_mode(app)
+        return
       }
       if app.prompt_state.panel == Panel.LspEdit {
         lsp_edits_release(app)
@@ -674,18 +718,7 @@ fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
       cancel_buffer_close(app)
     }
     else {
-      if app.config.vim_keys && app.view.insert {
-        vim_insert_finish(app)
-      }
-      buffer.checkpoint(doc)
-      if app.view.insert {
-        buffer.leave_insert(doc)
-      }
-      app.view.insert = false
-      app.view.extend = false
-      if app.config.vim_keys {
-        vim_escape(app)
-      }
+      input_normal_mode(app)
     }
     return
   }
@@ -921,7 +954,7 @@ fn registers_release(app: *App) {
   for index in 0..26 {
     register := &app.register_state.named[index]
     if register.owned {
-      mem.arena_release(register.arena)
+      arena_owner.release(register.arena)
       register.arena = nil
       register.owned = false
     }

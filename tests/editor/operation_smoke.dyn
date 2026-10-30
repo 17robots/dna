@@ -1,9 +1,9 @@
 // Exercise production ownership, invalidation, and deadlines through their callers.
 fn operations_smoke() {
-  owner := mem.arena_create((#sizeof(App) + 128) + mem.ArenaBufferOverhead)
-  scratch := mem.arena_create((2097152) + mem.ArenaBufferOverhead)
-  defer mem.arena_release(owner)
-  defer mem.arena_release(scratch)
+  owner := arena_owner.create((#sizeof(App) + 128))
+  scratch := arena_owner.create((2097152))
+  defer arena_owner.release(owner)
+  defer arena_owner.release(scratch)
   app := #cast(*App, mem.arena_push(owner, #sizeof(App), #alignof(App)))
   app.scratch = scratch
   settings.defaults(&app.config)
@@ -19,7 +19,20 @@ fn operations_smoke() {
   if !files.set_name(app.documents.file, "/tmp/dna-operation.dyn") {
     #panic("operation path")
   }
-  app.lsp.servers[0].documents[0].revision = app.documents.current.revision
+  if !lsp_documents_ensure(&app.lsp.servers[0], #len(app.documents.slots)) {
+    #panic("LSP fixture document tracking")
+  }
+  server:=&app.lsp.servers[0]
+  server.length=copy_text(server.language[..], "dyn")
+  server.next_document_version=1
+  slot:=app.documents.slots[0]
+  slot.filetype_length=copy_text(slot.filetype[..], "dyn")
+  tracked:=&server.documents[0]
+  tracked.identity=slot.identity
+  tracked.revision=slot.document.revision
+  tracked.version=1
+  tracked.length=copy_text(tracked.path[..], files.name(&slot.file))
+  lsp_attach_slot(app, 0, slot)
   work := &app.operations.lsp_receive
   // Dropping and growing workspaces must account for each owner exactly once.
   reserved := app.operations.reserved
@@ -53,7 +66,7 @@ fn operations_smoke() {
   if app.operations.allocations != baseline_allocations + 1 || app.operations.reused != 99 {
     #panic("receive arena not reused")
   }
-  diagnostic: []const u8 = "{\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"file:///tmp/dna-operation.dyn\",\"diagnostics\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"severity\":1,\"message\":\"error\"}]}}"
+  diagnostic: []const u8 = "{\"method\":\"textDocument/publishDiagnostics\",\"params\":{\"uri\":\"file:///tmp/dna-operation.dyn\",\"version\":1,\"diagnostics\":[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":0}},\"severity\":1,\"message\":\"error\"}]}}"
   _ = work_acquire(app, work, 131072, "lsp_receive")
   _ = lsp_handle(app, 0, diagnostic, work.arena)
   work_finish(app, work, "lsp_receive")
@@ -232,8 +245,8 @@ fn syntax_budget_smoke() {
   if !configured.ok || !configured.found {
     return
   }
-  owned := mem.arena_create((#sizeof(App) + 128) + mem.ArenaBufferOverhead)
-  defer mem.arena_release(owned)
+  owned := arena_owner.create((#sizeof(App) + 128))
+  defer arena_owner.release(owned)
   app := #cast(*App, mem.arena_push(owned, #sizeof(App), #alignof(App)))
   defer release_editor_state(app)
   defer syntax_release(app)
@@ -243,11 +256,12 @@ fn syntax_budget_smoke() {
     if !new_buffer(app) {
       #panic("syntax budget document")
     }
-    slot := &app.documents.slots[app.documents.active]
+    slot := app.documents.slots[app.documents.active]
     slot.syntax = syntax_open_named(&root[0], &name[0])
     if slot.syntax == nil {
       #panic("syntax budget parser")
     }
+    syntax_track(app, slot)
     slot.syntax_used = #cast(u64, index) + 1
     _ = buffer.load(slot.document, "{}")
     buffer.move_to(slot.document, 2, false)

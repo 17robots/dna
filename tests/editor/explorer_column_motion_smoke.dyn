@@ -1,0 +1,121 @@
+struct ExplorerColumnProbe { time:fn(u64), resize:fn(i32, i32) }
+fn explorer_column_probe_draw(app:*App, typography:*Typography, renderer, window:rawptr, probe:ExplorerColumnProbe, now:u64, cause:u32) sdl.Rect {
+  probe.time(now)
+  app.render_trace.pending=cause
+  draw(renderer, window, app, typography)
+  root:=ui_make_lookup(&app.ui, ui_hash(0, "explorer"))
+  main:=ui_make_lookup(&app.ui, ui_child_key("explorer", "main"))
+  if root==0 || main==0 {
+    #panic("explorer column fixture missing layout")
+  }
+  rect:=app.ui.boxes[main].rect
+  if distance(app.ui.explorer_body.x, rect.x)>0.1 {
+    #panic("editable explorer hit bounds diverge from moving column")
+  }
+  if rect.width<0.0 || rect.x<app.ui.boxes[root].rect.x-0.1 || rect.x+rect.width>app.ui.boxes[root].rect.x+app.ui.boxes[root].rect.width+0.1 {
+    #panic("animated explorer column escaped its root")
+  }
+  return rect
+}
+fn explorer_column_motion_smoke(app:*App, typography:*Typography, renderer, window:rawptr, probe:ExplorerColumnProbe) {
+  app.config.explorer_preview=false
+  app.config.explorer_icons=false
+  app.config.popup_transitions=true
+  app.config.popup_animation_ms=40.0
+  app.view.reduced_motion=false
+  probe.resize(960, 640)
+  probe.time(1000)
+  draw(renderer, window, app, typography)
+  explorer_buffer_open(app)
+  _=explorer_column_probe_draw(app, typography, renderer, window, probe, 1100, RenderKey)
+  before:=explorer_column_probe_draw(app, typography, renderer, window, probe, 1500, 0)
+  app.explorer.context.trail_count=1
+  column:=&app.explorer.context.trail[0]
+  column.count=1
+  column.entries[0].length=copy_text(column.entries[0].name[..], "ancestor")
+  first:=explorer_column_probe_draw(app, typography, renderer, window, probe, 1516, RenderKey)
+  if first.x<=before.x+before.width*0.5 || first.x>=before.x+before.width {
+    #panic("new right pane must grow beside the anchored parent")
+  }
+  next:=explorer_column_probe_draw(app, typography, renderer, window, probe, 1532, 0)
+  if next.x>=first.x {
+    #panic("editable column motion must continue")
+  }
+  // All clickable ancestor rows use their current clipped geometry.
+  root:=ui_make_lookup(&app.ui, ui_hash(0, "explorer"))
+  ancestor:=app.ui.boxes[root].first
+  row:=app.ui.boxes[ancestor].first
+  for row!=0 && (app.ui.boxes[row].flags&UiClickable)==0 {
+    row=app.ui.boxes[row].next
+  }
+  if row==0 {
+    #panic("explorer ancestor row missing")
+  }
+  if app.view.line_numbers && app.ui.boxes[row].padding[0]!=typography.cell*7.0 {
+    #panic("parent pane must retain the editable gutter spacing")
+  }
+  if (app.ui.boxes[row].flags&UiMuted)!=0 {
+    #panic("parent pane must retain normal text contrast")
+  }
+  bounds:=app.ui.boxes[row].rect
+  hit:=ui_hit(&app.ui, bounds.x+bounds.width*0.5, bounds.y+bounds.height*0.5)
+  if hit!=row {
+    #panic("moving ancestor row hit does not match paint")
+  }
+  snapped:=explorer_column_probe_draw(app, typography, renderer, window, probe, 1548, RenderText)
+  if distance(snapped.x, before.x+(before.width+8.0*typography.scale)*0.5)>0.2 {
+    #panic("editing must finish explorer column motion immediately")
+  }
+  app.explorer.context.trail_count=0
+  back:=explorer_column_probe_draw(app, typography, renderer, window, probe, 1564, RenderKey)
+  if distance(back.x, before.x)>0.1 || back.width<=snapped.width || back.width>=before.width {
+    #panic("closing ancestor group must preserve moving boundary")
+  }
+
+  settled:=explorer_column_probe_draw(app, typography, renderer, window, probe, 2000, 0)
+  if distance(settled.x, before.x)>0.1 || app.explorer.columns_geometry.active {
+    #panic("explorer columns failed to settle")
+  }
+  app.explorer.context.trail_count=1
+  app.view.reduced_motion=true
+  reduced:=explorer_column_probe_draw(app, typography, renderer, window, probe, 2016, RenderKey)
+  if distance(reduced.x, snapped.x)>0.1 || app.explorer.columns_geometry.active {
+    #panic("reduced motion must use final explorer column geometry")
+  }
+  // With previews enabled, the old preview becomes the editable column and
+  // only the new rightmost preview starts narrow. Existing columns stay left.
+  app.view.reduced_motion=false
+  app.config.explorer_preview=true
+  app.explorer.context.trail_count=0
+  app.explorer.context.preview_ready=true
+  app.explorer.context.preview_revision=app.explorer.document.revision
+  app.explorer.context.preview_row=buffer.row_at(app.explorer.document, buffer.head(app.explorer.document))
+  app.explorer.context.preview_directory=true
+  app.explorer.context.child_count=1
+  app.explorer.context.children[0].length=copy_text(app.explorer.context.children[0].name[..], "child")
+  _=explorer_column_probe_draw(app, typography, renderer, window, probe, 2200, RenderKey)
+  prior:=explorer_column_probe_draw(app, typography, renderer, window, probe, 2500, 0)
+  app.explorer.context.trail_count=1
+  current:=explorer_column_probe_draw(app, typography, renderer, window, probe, 2516, RenderKey)
+  ancestor_box:=ui_make_lookup(&app.ui, ui_child_key("explorer", "trail 0"))
+  child_box:=ui_make_lookup(&app.ui, ui_child_key("explorer", "contents"))
+  if ancestor_box==0 || child_box==0 {
+    #panic("preview column fixture missing boxes")
+  }
+  parent_rect:=app.ui.boxes[ancestor_box].rect
+  child_rect:=app.ui.boxes[child_box].rect
+  if distance(parent_rect.x, prior.x)>0.1 || distance(parent_rect.width, current.width)>0.2 {
+    #panic("existing explorer columns must remain anchored on the left")
+  }
+  if child_rect.width<=0.0 || child_rect.width>=current.width || child_rect.x<=current.x {
+    #panic("only the new rightmost preview must grow from zero")
+  }
+  _=explorer_column_probe_draw(app, typography, renderer, window, probe, 2800, 0)
+  app.explorer.context.trail_count=0
+  _=explorer_column_probe_draw(app, typography, renderer, window, probe, 2816, RenderKey)
+  retiring:=ui_make_lookup(&app.ui, ui_child_key("explorer", "retiring right pane"))
+  if retiring==0 || app.ui.boxes[retiring].rect.width<=0.0 {
+    #panic("outgoing right pane must retain visible geometry while retracting")
+  }
+  app.running=false
+}

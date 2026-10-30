@@ -16,3 +16,8 @@ with tempfile.TemporaryDirectory() as tmp:
     subprocess.run(['python3',str(ROOT/'scripts/native_test.py'),'disk_fallback',str(probe)],check=True)
     subprocess.run(['python3',str(ROOT/'tests/disk.py')],env=dict(os.environ,LD_PRELOAD=str(probe)),check=True,timeout=15)
     print('PASS disk polling fallback when inotify is unavailable')
+
+    subprocess.run(['python3',str(ROOT/'tests/disk.py')],
+                   env=dict(os.environ,LD_PRELOAD=str(probe),DNA_TEST_DISK_NO_CONTROL='1'),
+                   check=True,timeout=15)
+    print('PASS disk timed-condition fallback when inotify and control pipe are unavailable')

@@ -1,0 +1,97 @@
+// Drive the actual asynchronous Dyn worker, then require visible ink for each
+// settled token, not merely a nonzero worker capture byte.
+fn native_syntax_settled_frame_smoke(app:*App, typography:*Typography, renderer:rawptr, window:rawptr, probe:NativeTypingFrameProbe) {
+  app.prompt_state.panel=Panel.None
+  app.view.reduced_motion=true
+  app.view.insert=true
+  app.view.line_numbers=false
+  app.view.status_line=false
+  app.view.highlight_line=false
+  app.config.syntax_enabled=true
+  app.config.document_padding=18.0
+  probe.resize(960, 640)
+  doc:=app.documents.current
+  source:[]const u8="fn mainthing() { print(\"hello\") }\n\n"
+  slot:=app.documents.slots[app.documents.active]
+  slot.filetype_length=copy_text(slot.filetype[..], "dyn")
+  for trajectory in 0..2 {
+    if trajectory==0 {
+      _=buffer.load(doc, source)
+    }
+    else {
+      _=buffer.load(doc, "fn ")
+      buffer.move_to(doc, doc.length, false)
+      initial_deadline:=sdl.ticks()+3000
+      for slot.syntax_revision!=doc.revision {
+        _=syntax_slot_tick(app, slot)
+        if sdl.ticks()>initial_deadline {
+          #panic("typed syntax initial parse timeout")
+        }
+      }
+      draw(renderer, window, app, typography)
+      for at in 3..#len(source) {
+        text_input(app, source[at..at+1])
+        _=syntax_slot_tick(app, slot)
+        draw(renderer, window, app, typography)
+      }
+    }
+    buffer.move_to(doc, doc.length, false)
+    deadline:=sdl.ticks()+3000
+    for slot.syntax_revision!=doc.revision {
+      _=syntax_slot_tick(app, slot)
+      if sdl.ticks()>deadline {
+        #panic("settled syntax parser timeout")
+      }
+    }
+    starts:[4]usize=[0, 3, 17, 23]
+    ends:[4]usize=[2, 12, 22, 28]
+    styles:[4]u8=[3, 4, 4, 2]
+    for index in 0..4 {
+      if slot.colors[starts[index]]!=styles[index] {
+        #panic("tiny Dyn worker token color missing")
+      }
+    }
+    draw(renderer, window, app, typography)
+    owner:=arena_owner.create(960*640*4+4096)
+    defer arena_owner.release(owner)
+    colored:=mem.push_bytes_uninit(owner, #len(probe.pixels()))
+    _=mem.copy(colored, probe.pixels())
+    app.config.syntax_enabled=false
+    draw(renderer, window, app, typography)
+    plain:=probe.pixels()
+    for index in 0..4 {
+      first:=ttf.Substring{}
+      last:=ttf.Substring{}
+      if !layout_substring(typography.layout, doc, starts[index], &first) || !layout_substring(typography.layout, doc, ends[index]-1, &last) {
+        #panic("tiny Dyn token geometry missing")
+      }
+      left:=#cast(usize, first.x)+18
+      right:=#cast(usize, last.x+last.width)+18
+      top:usize=18
+      bottom:=top+#cast(usize, typography.line)
+      changed:usize=0
+      for y in top..bottom {
+        for x in left..right {
+          at:=(y*960+x)*4
+          if colored[at]!=plain[at] || colored[at+1]!=plain[at+1] || colored[at+2]!=plain[at+2] {
+            changed+=1
+          }
+        }
+      }
+      if changed==0 {
+        if index==0 {
+          #panic("settled fn keyword has no visible highlighting")
+        }
+        if index==1 {
+          #panic("settled mainthing function name has no visible highlighting")
+        }
+        if index==2 {
+          #panic("settled print call has no visible highlighting")
+        }
+        #panic("settled string has no visible highlighting")
+      }
+    }
+    app.config.syntax_enabled=true
+  }
+  app.running=false
+}

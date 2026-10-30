@@ -15,8 +15,8 @@ extern fn tty_setenv "setenv"(key: *const u8, value: *const u8, overwrite: i32) 
 extern fn tty_execv "execv"(path: *const u8, arguments: **const u8) i32
 
 tty_saved: TtyTermios = TtyTermios{}
-tty_active: native_atomic.AtomicU32 = native_atomic.AtomicU32{}
-tty_resize_pending: native_atomic.AtomicU32 = native_atomic.AtomicU32{}
+tty_active: sync.AtomicU32 = sync.AtomicU32{}
+tty_resize_pending: sync.AtomicU32 = sync.AtomicU32{}
 tty_input: i32 = 0
 tty_output: i32 = 0
 tty_wake_descriptor: i32 = 0
@@ -39,7 +39,7 @@ fn tty_write_all(bytes: *const u8, length: usize) {
   }
 }
 pub fn dna_tty_leave() {
-  if native_atomic.exchange_u32(&tty_active, 0) == 0 {
+  if sync.exchange_u32(&tty_active, 0) == 0 {
     return
   }
   sequence: []const u8 = "\x1b[<u\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[0 q\x1b[0m\x1b[?25h\x1b[?1049l"
@@ -56,11 +56,11 @@ fn tty_fatal(number: i32) {
 }
 fn tty_resize(number: i32) {
   _ = number
-  native_atomic.store_u32(&tty_resize_pending, 1)
+  sync.store_u32(&tty_resize_pending, 1)
 }
 pub fn dna_tty_enter() i32 {
   native_initialize()
-  if native_atomic.load_u32(&tty_active) != 0 {
+  if sync.load_u32(&tty_active) != 0 {
     return 1
   }
   tty_input = 0
@@ -78,7 +78,7 @@ pub fn dna_tty_enter() i32 {
   if tty_setattr(tty_input, 2, &raw) != 0 {
     return 0
   }
-  native_atomic.store_u32(&tty_active, 1)
+  sync.store_u32(&tty_active, 1)
   if tty_wake_descriptor < 0 {
     tty_wake_descriptor = notify_eventfd(0, 526336)
   }
@@ -111,7 +111,7 @@ pub fn dna_tty_size(columns: *i32, rows: *i32) i32 {
   return 1
 }
 pub fn dna_tty_resized() i32 {
-  if native_atomic.exchange_u32(&tty_resize_pending, 0) != 0 {
+  if sync.exchange_u32(&tty_resize_pending, 0) != 0 {
     return 1
   }
   return 0
@@ -215,7 +215,7 @@ pub fn dna_tui_free(pointer: rawptr) {
   rec_free(pointer)
 }
 pub fn dna_tty_suspend() i32 {
-  if native_atomic.load_u32(&tty_active) == 0 {
+  if sync.load_u32(&tty_active) == 0 {
     return 0
   }
   dna_tty_leave()

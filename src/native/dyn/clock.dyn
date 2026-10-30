@@ -1,0 +1,46 @@
+use "std/time"
+use "std/sync"
+
+// Clock ownership is independent of pthreads and platform clock identifiers.
+// Failed or regressing samples retain the last elapsed value. A separate flag
+// allows a genuine zero monotonic origin without reinitializing the epoch.
+native_clock_lock: sync.Mutex = sync.Mutex{}
+native_clock_origin: time.Instant = time.Instant{}
+native_clock_started: bool = false
+native_clock_elapsed: u64 = 0
+fn native_clock_sample() time.ClockResult {
+  return time.monotonic_now()
+}
+fn native_elapsed_locked() u64 {
+  sample := native_clock_sample()
+  if !sample.ok {
+    return native_clock_elapsed
+  }
+  if !native_clock_started {
+    native_clock_origin = sample.value
+    native_clock_started = true
+    return 0
+  }
+  elapsed := time.elapsed(native_clock_origin, sample.value)
+  if elapsed.ok && elapsed.value >= 0 && #cast(u64, elapsed.value) > native_clock_elapsed {
+    native_clock_elapsed = #cast(u64, elapsed.value)
+  }
+  return native_clock_elapsed
+}
+fn native_elapsed_nanoseconds() u64 {
+  sync.lock(&native_clock_lock)
+  defer sync.unlock(&native_clock_lock)
+  return native_elapsed_locked()
+}
+native_ticks_started: bool = false
+native_ticks_origin: u64 = 0
+pub fn dna_ticks() u64 {
+  sync.lock(&native_clock_lock)
+  defer sync.unlock(&native_clock_lock)
+  now := native_elapsed_locked() / #cast(u64, time.Millisecond)
+  if !native_ticks_started {
+    native_ticks_origin = now
+    native_ticks_started = true
+  }
+  return now - native_ticks_origin
+}

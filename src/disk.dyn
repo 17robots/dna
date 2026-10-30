@@ -1,11 +1,13 @@
-struct DiskWatch { identity, epoch: u64, path: [4096]u8, length: usize }
-struct DiskState { worker: rawptr, watches: [16]DiskWatch }
+struct DiskWatch { identity, epoch: u64, path: [4096]u8, length: usize, dirty, ready: bool, next: *Slot }
+struct DiskState { worker: rawptr, retry, initialized: bool, first, last: *Slot }
+struct DiskReady { index: usize, identity: u64 }
+extern fn disk_next "dna_disk_next_ready"(disk: rawptr, output: *DiskReady) i32
 
 extern fn disk_open "dna_disk_open"() rawptr
 extern fn disk_close "dna_disk_close"(disk: rawptr)
-extern fn disk_watch "dna_disk_watch"(disk: rawptr, index: u32, identity: u64, path: *const u8, saved: *const u8, length: usize)
-extern fn disk_pending "dna_disk_pending"(disk: rawptr, index: u32, identity: u64) isize
-extern fn disk_take "dna_disk_take"(disk: rawptr, index: u32, identity: u64, bytes: *u8, capacity: usize) i32
+extern fn disk_watch "dna_disk_watch_checked"(disk: rawptr, index: usize, identity: u64, path: *const u8, saved: *const u8, length: usize) i32
+extern fn disk_pending "dna_disk_pending_at"(disk: rawptr, index: usize, identity: u64) isize
+extern fn disk_take "dna_disk_take_at"(disk: rawptr, index: usize, identity: u64, bytes: *u8, capacity: usize) i32
 
 fn disk_release(app: *App) {
   if app.disk.worker != nil {
@@ -46,56 +48,127 @@ fn disk_replace(doc: *buffer.Document, bytes: []const u8) {
     doc.marks[index] = position
   }
 }
-fn disk_tick(app: *App) bool {
-  changed: bool = false
-  for index in 0..16 {
-    slot := &app.documents.slots[index]
-    watched := &app.disk.watches[index]
-    if slot.document == nil || slot.file.length == 0 || slot.terminal.handle != nil {
-      if watched.identity != 0 {
-        blank: [1]u8 = [0]
-        disk_watch(app.disk.worker, #cast(u32, index), 0, &blank[0], &blank[0], 0)
-        watched.identity = 0
-      }
-      continue
-    }
-    if app.disk.worker == nil {
-      app.disk.worker = disk_open()
-      if app.disk.worker == nil {
+// Only registration changes and worker-published results enter this workset.
+fn disk_dirty_slot(app: *App, index: usize) {
+  if index >= #len(app.documents.slots) {
+    return
+  }
+  slot := app.documents.slots[index]
+  if slot.watch.dirty {
+    return
+  }
+  slot.watch.dirty = true
+  slot.watch.next = nil
+  if app.disk.last == nil {
+    app.disk.first = slot
+  }
+  else {
+    app.disk.last.watch.next = slot
+  }
+  app.disk.last = slot
+}
+fn disk_register(app: *App, slot: *Slot) bool {
+  watched := &slot.watch
+  if slot.document == nil || slot.file.length == 0 || slot.terminal.handle != nil {
+    if watched.identity != 0 {
+      blank: [1]u8 = [0]
+      if disk_watch(app.disk.worker, slot.index, 0, &blank[0], &blank[0], 0) == 0 {
         return false
       }
+      watched.identity = 0
     }
-    if watched.identity != slot.identity || watched.epoch != slot.document.saved_epoch || !buffer.equal(watched.path[..watched.length], files.name(&slot.file)) {
-      disk_watch(app.disk.worker, #cast(u32, index), slot.identity, &slot.file.path[0], &buffer.saved_text(slot.document)[0], slot.document.saved_length)
-      watched.identity = slot.identity
-      watched.epoch = slot.document.saved_epoch
-      watched.length = copy_text(watched.path[..], files.name(&slot.file))
+    watched.ready = false
+    return true
+  }
+  if app.disk.worker == nil {
+    app.disk.worker = disk_open()
+    if app.disk.worker == nil {
+      return false
     }
-    pending := disk_pending(app.disk.worker, #cast(u32, index), slot.identity)
-    if pending != 0 {
-      if pending < 0 {
-        empty: [1]u8 = [0]
-        status := disk_take(app.disk.worker, #cast(u32, index), slot.identity, &empty[0], 1)
-        slot.disk_changed = status != 5
-        changed = true
-      } else {
-        allocated := mem.arena_create((#cast(usize, pending)) + mem.ArenaBufferOverhead)
-        bytes := mem.push_bytes_uninit(allocated, #cast(usize, pending))
-        if disk_take(app.disk.worker, #cast(u32, index), slot.identity, &bytes[0], #len(bytes)) == 1 {
-          content := bytes[..#len(bytes) - 1]
-          if app.config.reload_clean_buffers && !buffer.dirty_cached(slot.document) && #len(content) <= buffer.Capacity && buffer.valid(content) {
-            disk_replace(slot.document, content)
-            slot.disk_changed = false
-          }
-          else {
-            slot.disk_changed = true
-          }
-          changed = true
-        }
-        mem.arena_release(allocated)
+  }
+  if watched.identity != slot.identity || watched.epoch != slot.document.saved_epoch || !buffer.equal(watched.path[..watched.length], files.name(&slot.file)) {
+    if disk_watch(app.disk.worker, slot.index, slot.identity, &slot.file.path[0], &buffer.saved_text(slot.document)[0], slot.document.saved_length) == 0 {
+      return false
+    }
+    watched.identity = slot.identity
+    watched.epoch = slot.document.saved_epoch
+    watched.length = copy_text(watched.path[..], files.name(&slot.file))
+    watched.ready = false
+  }
+  return true
+}
+fn disk_process(app: *App, slot: *Slot) bool {
+  pending := disk_pending(app.disk.worker, slot.index, slot.identity)
+  if pending == 0 {
+    slot.watch.ready = false
+    return false
+  }
+  if pending < 0 {
+    empty: [1]u8 = [0]
+    status := disk_take(app.disk.worker, slot.index, slot.identity, &empty[0], 1)
+    slot.watch.ready = false
+    slot.disk_changed = status != 5
+    return true
+  }
+  allocated := arena_owner.try_create(#cast(usize, pending))
+  if allocated == nil {
+    app.disk.retry = true
+    disk_dirty_slot(app, slot.index)
+    return false
+  }
+  defer arena_owner.release(allocated)
+  bytes := mem.push_bytes_uninit(allocated, #cast(usize, pending))
+  changed := false
+  if disk_take(app.disk.worker, slot.index, slot.identity, &bytes[0], #len(bytes)) == 1 {
+    content := bytes[..#len(bytes) - 1]
+    if app.config.reload_clean_buffers && !buffer.dirty_cached(slot.document) && #len(content) <= buffer.Capacity && buffer.valid(content) {
+      disk_replace(slot.document, content)
+      slot.disk_changed = false
+      disk_dirty_slot(app, slot.index)
+    } else {
+      slot.disk_changed = true
+    }
+    changed = true
+  }
+  slot.watch.ready = false
+  return changed
+}
+fn disk_tick(app: *App) bool {
+  // Bootstrap supports restored/manual fixtures; mutations maintain the queue.
+  if !app.disk.initialized {
+    app.disk.initialized = true
+    for index in 0..#len(app.documents.slots) {
+      disk_dirty_slot(app, index)
+    }
+  }
+  ready := DiskReady{}
+  for disk_next(app.disk.worker, &ready) != 0 {
+    if ready.index < #len(app.documents.slots) {
+      slot := app.documents.slots[ready.index]
+      if slot.document != nil && slot.identity == ready.identity {
+        slot.watch.ready = true
+        disk_dirty_slot(app, ready.index)
       }
     }
-    index += 1
+  }
+  first := app.disk.first
+  app.disk.first = nil
+  app.disk.last = nil
+  app.disk.retry = false
+  changed := false
+  for first != nil {
+    slot := first
+    first = slot.watch.next
+    slot.watch.next = nil
+    slot.watch.dirty = false
+    if !disk_register(app, slot) {
+      app.disk.retry = true
+      disk_dirty_slot(app, slot.index)
+      continue
+    }
+    if slot.watch.ready && disk_process(app, slot) {
+      changed = true
+    }
   }
   return changed
 }
@@ -123,6 +196,7 @@ fn disk_reload(app: *App, confirmed: bool) {
     return
   }
   disk_replace(app.documents.current, read.data)
+  document_lifecycle_changed(app, app.documents.active)
   app.documents.slots[app.documents.active].disk_changed = false
   app.prompt_state.panel = Panel.None
 }

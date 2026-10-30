@@ -1,6 +1,40 @@
 // Completion list at the cursor, built with the immediate-mode UI. Rows show
 // the label with the server's detail (usually a type or signature) muted on
 // the right; clicking a row accepts it.
+fn completion_kind(item: *const json.Value) []const u8 {
+  kind := lsp.number(json.object_get(item, "kind")).value
+  if kind == 2 || kind == 3 || kind == 4 {
+    return "fn"
+  }
+  if kind == 5 || kind == 10 {
+    return "field"
+  }
+  if kind == 6 {
+    return "var"
+  }
+  if kind == 7 || kind == 8 || kind == 13 || kind == 22 || kind == 25 {
+    return "type"
+  }
+  if kind == 9 {
+    return "mod"
+  }
+  if kind == 14 {
+    return "key"
+  }
+  if kind == 15 {
+    return "snip"
+  }
+  if kind == 17 {
+    return "file"
+  }
+  if kind == 19 {
+    return "dir"
+  }
+  if kind == 20 || kind == 21 {
+    return "const"
+  }
+  return "word"
+}
 fn draw_completion(renderer: rawptr, app: *App, typography: *Typography, width: i32, height: i32) {
   state := &app.lsp.results
   ui := &app.ui
@@ -10,15 +44,30 @@ fn draw_completion(renderer: rawptr, app: *App, typography: *Typography, width: 
   padding := app.config.popup_padding * scale
   count := state.count
   selected := app.prompt_state.selected
-  // Reserve the full viewport even while filtering or awaiting server
-  // results. A changing height can also flip the popup across the caret.
-  shown: usize = 8
+  opening := app.view.animation.panel != Panel.LspResults || ui.completion_frame + 1 < ui.frame || ui.completion_identity != app.documents.slots[app.documents.active].identity
+  shown := count
+  if shown > 8 {
+    shown = 8
+  }
+  if shown < 1 {
+    shown = 1
+  }
+  // Start compact, then retain the session's size while results narrow.
+  if opening {
+    ui.completion_rows = shown
+  }
+  if shown > ui.completion_rows {
+    ui.completion_rows = shown
+  }
+  shown = ui.completion_rows
   // Size to the widest visible label and detail, within the pane.
   widest: f32 = 0.0
+  result_hash: u64 = 0
   for measured in 0..count {
     item := state.items[measured]
-    span := ui_text_width(ui, json_text(item, "label")) + typography.cell * 3.0
+    span := ui_text_width(ui, json_text(item, "label")) + typography.cell * 8.0
     detail := json_text(item, "detail")
+    result_hash = ui_hash(ui_hash(result_hash, json_text(item, "label")), detail)
     if #len(detail) > 0 {
       span += ui_text_width(ui, detail) + typography.cell * 2.0
     }
@@ -33,9 +82,61 @@ fn draw_completion(renderer: rawptr, app: *App, typography: *Typography, width: 
   if widest < 160.0 * scale {
     widest = 160.0 * scale
   }
+  if opening {
+    ui.completion_width = widest
+  }
+  if widest > ui.completion_width {
+    ui.completion_width = widest
+  }
   bounds := app.view.panes[app.view.focused].rect
-  place := place_rect(app, SurfaceCompletion, width, height, line, scale, language_popup_rect(bounds, app.view.animation.file.cursor_x.value, app.view.animation.file.cursor_y.value, widest + padding * 2.0, line * #cast(f32, shown) + padding * 2.0, line, scale))
-  opening := app.view.animation.panel != Panel.LspResults
+  edge := 4.0 * scale
+  caret_y := #cast(f32, bounds.y) + app.view.animation.file.cursor_y.value
+  top := #cast(f32, bounds.y) + edge
+  bottom := #cast(f32, bounds.y + bounds.height) - line - edge
+  below := bottom - caret_y - line
+  above := caret_y - top
+  desired := line * #cast(f32, shown) + padding * 2.0
+  if opening {
+    ui.completion_above = below < desired && above > below
+  }
+  room := below
+  if ui.completion_above {
+    room = above
+  }
+  rows := #cast(usize, 1)
+  if room > padding * 2.0 + line {
+    rows = #cast(usize, (room - padding * 2.0) / line)
+  }
+  if rows > shown {
+    rows = shown
+  }
+  popup_height := line * #cast(f32, rows) + padding * 2.0
+  anchor_x := app.view.animation.file.cursor_x.value
+  doc := app.documents.current
+  if state.prefix_start <= doc.cursor && state.prefix_start <= doc.length && buffer.line_start(doc, state.prefix_start) == buffer.line_start(doc, doc.cursor) {
+    prefix := measure_position(doc, typography, state.prefix_start)
+    caret := measure_position(doc, typography, doc.cursor)
+    anchor_x += text_caret_x(&prefix, true) - text_caret_x(&caret, true)
+  }
+  natural := language_popup_rect(bounds, anchor_x, app.view.animation.file.cursor_y.value, ui.completion_width + padding * 2.0, popup_height, line, scale)
+  if ui.completion_above {
+    natural.y = caret_y - natural.height
+  }
+  else {
+    natural.y = caret_y + line
+  }
+  if natural.y < top {
+    natural.y = top
+  }
+  if natural.y + natural.height > bottom {
+    natural.y = bottom - natural.height
+  }
+  if natural.y < top {
+    natural.y = top
+  }
+  place := place_rect(app, SurfaceCompletion, width, height, line, scale, natural)
+  ui.completion_frame = ui.frame
+  ui.completion_identity = app.documents.slots[app.documents.active].identity
   frame := ui_make(ui, ui_hash(0, "completion"), UiFloating | UiBackground | UiBorder | UiClip)
   ui.boxes[frame].floating[0] = place.x
   ui.boxes[frame].floating[1] = place.y
@@ -52,7 +153,7 @@ fn draw_completion(renderer: rawptr, app: *App, typography: *Typography, width: 
   if viewport < 1.0 {
     viewport = 1.0
   }
-  changed := count != ui.completion_count
+  changed := count != ui.completion_count || result_hash != ui.completion_hash
   // Refiltering replaces the row set: discard its old scroll offset now.
   ui_list_scroll(app, ui, list, count, selected, viewport, opening || changed, opening || selected != ui.completion_selected || changed)
   window := ui_list_window(ui, list, count, viewport)
@@ -61,13 +162,15 @@ fn draw_completion(renderer: rawptr, app: *App, typography: *Typography, width: 
   for row in window.first..window.last {
     item := state.items[row]
     label := json_text(item, "label")
-    entry := ui_make(ui, ui_hash(ui.boxes[list].key, label), UiClickable | UiHover)
+    entry := ui_make(ui, ui_hash_number(ui.boxes[list].key, row), UiClickable | UiHover | UiClip)
     ui.boxes[entry].axis = UiAxisX
     ui.boxes[entry].value = row
     ui.boxes[entry].padding[0] = typography.cell * 0.5
     ui_size(ui, entry, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
     ui_size(ui, entry, UiAxisY, UiSizeKind.Pixels, line / scale, 1.0)
     ui_push(ui, entry)
+    badge := ui_label(ui, "kind", completion_kind(item), UiMuted | UiClip)
+    ui_size(ui, badge, UiAxisX, UiSizeKind.Pixels, typography.cell * 6.0 / scale, 1.0)
     _ = ui_label(ui, "label", label, UiClip)
     fill := ui_make(ui, ui_key(ui, "fill"), 0)
     ui_size(ui, fill, UiAxisX, UiSizeKind.Pixels, 16.0, 0.0)
@@ -85,6 +188,7 @@ fn draw_completion(renderer: rawptr, app: *App, typography: *Typography, width: 
   ui_pop(ui)
   ui.completion_selected = selected
   ui.completion_count = count
+  ui.completion_hash = result_hash
   ui_layout(ui)
   ui_render(renderer, ui, typography, width, height)
 }

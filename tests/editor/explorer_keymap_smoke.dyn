@@ -1,0 +1,158 @@
+// Borrowing the editable explorer must never leak Vim state into the file.
+fn explorer_keymap_smoke(typography:*Typography) {
+  owner:=arena_owner.create(#sizeof(App)+128)
+  scratch:=arena_owner.create(2097152)
+  defer arena_owner.release(owner)
+  defer arena_owner.release(scratch)
+  app:=#cast(*App, mem.arena_push(owner, #sizeof(App), #alignof(App)))
+  app.scratch=scratch
+  app.running=true
+  settings.defaults(&app.config)
+  app.config.vim_keys=true
+  defer release_editor_state(app)
+  if !new_buffer(app) {
+    #panic("explorer keymap file fixture")
+  }
+  app.view.insert=false
+  file:=app.documents.current
+  if !buffer.load(file, "keep this file\n") {
+    #panic("explorer keymap file text")
+  }
+  app.explorer.arena=arena_owner.create(0)
+  app.explorer.document=buffer.allocate(app.explorer.arena)
+  draft:=app.explorer.document
+  if !buffer.load(draft, "alpha.txt\nbeta.txt\n") {
+    #panic("explorer keymap draft")
+  }
+  buffer.track_rows(draft, 2)
+  app.prompt_state.panel=Panel.Directory
+  app.vim.pending='g'
+  app.vim.count=7
+  key_input(app, typography, KeyG, 0)
+  if app.documents.current!=file || app.vim.pending!='g' || app.vim.count!=7 || app.explorer.vim.pending!='g' {
+    #panic("explorer isolates pending Vim prefix")
+  }
+  app.config.bindings[0]=settings.Binding{scope:1, key:KeyX, command:"move-down"}
+  app.config.binding_count=1
+  if configured_key(app, typography, KeyX, 0) {
+    #panic("explorer override must not steal pending prefix")
+  }
+  key_input(app, typography, KeyEscape, 0)
+  if app.prompt_state.panel!=Panel.Directory || app.explorer.vim.pending!=0 {
+    #panic("explorer Escape clears local prefix")
+  }
+  app.input_state.character='x'
+  if !configured_key(app, typography, KeyX, 0) || buffer.row_at(draft, buffer.head(draft))!=1 || app.vim.pending!='g' || app.vim.count!=7 {
+    #panic("explorer bindings use draft state not file state")
+  }
+  app.input_state.character=0
+  buffer.select_to(draft, 0, false)
+  app.explorer.vim=VimState{}
+  key_input(app, typography, KeyD, 0)
+  key_input(app, typography, KeyD, 0)
+  if !buffer.equal(draft.bytes[..draft.length], "beta.txt\n") || !buffer.equal(file.bytes[..file.length], "keep this file\n") {
+    #panic("explorer Vim dd edits only draft")
+  }
+  key_input(app, typography, KeyS, ModShift)
+  if !app.explorer.insert {
+    #panic("explorer Vim S enters edit mode")
+  }
+  text_input(app, "renamed.txt")
+  key_input(app, typography, KeyEscape, 0)
+  if app.explorer.insert || !buffer.equal(draft.bytes[..draft.length], "renamed.txt\n") || app.view.insert {
+    #panic("explorer Vim insert Escape keeps staged edit isolated")
+  }
+  app.config.binding_count=0
+  app.explorer.vim=VimState{}
+  key_input(app, typography, KeyG, 0)
+  key_input(app, typography, KeyT, 0)
+  if app.documents.current!=file || app.prompt_state.panel!=Panel.Directory {
+    #panic("explorer gt cannot switch file slots")
+  }
+  key_input(app, typography, KeyG, 0)
+  key_input(app, typography, KeyD, 0)
+  if app.documents.current!=file || app.lsp.kind!=0 {
+    #panic("explorer gd cannot request file LSP")
+  }
+  app.explorer.stale=true
+  app.explorer.commands=true
+  key_input(app, typography, KeyZ, ModShift)
+  key_input(app, typography, KeyZ, ModShift)
+  if app.explorer.commands || app.documents.current!=file || !app.running || !buffer.equal(file.bytes[..file.length], "keep this file\n") || !buffer.equal(draft.bytes[..draft.length], "renamed.txt\n") {
+    #panic("explorer ZZ only previews staged edits")
+  }
+  // Enter must leave the draft borrow before activate stores the real file's
+  // pane/view and publishes the new active/file/current ownership tuple.
+  directory:[4096]u8=[]
+  root:=host.environment("DNA_WORKFLOW_TEST", directory[..4095])
+  if !root.ok || !root.found {
+    #panic("explorer activation fixture root")
+  }
+  app.explorer.path_length=copy_text(app.explorer.path[..], root.value)
+  app.directory_state.length=copy_text(app.directory_state.path[..], root.value)
+  app.directory_state.count=1
+  app.directory_state.entries[0].length=copy_text(app.directory_state.entries[0].name[..], "input.txt")
+  app.directory_state.entries[0].directory=false
+  if !buffer.load(draft, "input.txt\n") {
+    #panic("explorer activation listing")
+  }
+  buffer.track_rows(draft, 1)
+  buffer.mark_saved(draft)
+  buffer.move_to(draft, 0, false)
+  app.explorer.vim=VimState{}
+  app.explorer.insert=false
+  app.explorer.extend=false
+  app.explorer.stale=false
+  app.explorer.scroll_x=3.0
+  app.explorer.scroll_y=5.0
+  app.view.scroll_x=31.0
+  app.view.scroll_y=47.0
+  app.view.insert=true
+  app.view.extend=true
+  buffer.move_to(file, 4, false)
+  pane_init(app)
+  app.view.panes[1]=Pane{used:true, slot:app.documents.active, scroll_x:73.0, scroll_y:89.0, extend:true}
+  original_slot:=app.documents.slots[app.documents.active]
+  app.prompt_state.panel=Panel.Directory
+  key_input(app, typography, KeyReturn, 0)
+  opened:=app.documents.slots[app.documents.active]
+  if opened.document==file || app.documents.current!=opened.document || app.documents.file!=&opened.file || app.explorer.vim_borrowed || app.explorer.dispatch_pending!=0 {
+    #panic("explorer Enter publishes coherent active document")
+  }
+  if original_slot.document!=file || original_slot.scroll_x!=31.0 || original_slot.scroll_y!=47.0 || !original_slot.insert || !original_slot.extend || file.marks[0]!=4 {
+    #panic("explorer Enter stored draft view in old file slot")
+  }
+  if app.view.panes[1].scroll_x!=73.0 || app.view.panes[1].scroll_y!=89.0 || !app.view.panes[1].extend || app.view.panes[1].slot==app.documents.active {
+    #panic("explorer Enter changed unrelated file pane")
+  }
+  // @a starts playback while the outer explorer key still owns its draft.
+  // Enter must yield playback, activate outside that borrow, then let the
+  // next main tick send i + X to the opened file rather than the listing.
+  app.vim=VimState{}
+  app.explorer.vim=VimState{}
+  app.explorer.insert=false
+  app.explorer.extend=false
+  app.prompt_state.panel=Panel.Directory
+  buffer.move_to(opened.document, 0, false)
+  events:[3]MacroEvent=[]
+  events[0]=MacroEvent{key:KeyReturn}
+  events[1]=MacroEvent{key:KeyI, character:'i'}
+  events[2].text[0]='X'
+  events[2].text_length=1
+  app.macro_state.slots[1].events=events[..]
+  app.macro_state.slots[1].count=3
+  app.input_state.character=0
+  key_input(app, typography, '@', 0)
+  key_input(app, typography, KeyA, 0)
+  if app.macro_state.remaining!=2 || app.macro_state.index!=1 || app.explorer.vim_borrowed || app.explorer.dispatch_pending!=0 || app.prompt_state.panel!=Panel.None || app.documents.current!=opened.document {
+    #panic("explorer macro Enter yields at ownership boundary")
+  }
+  for tick in 0..3 {
+    if app.macro_state.remaining>0 {
+      _=macro_tick(app, typography)
+    }
+  }
+  if app.macro_state.remaining!=0 || app.documents.current!=opened.document || opened.document.bytes[0]!='X' || !buffer.equal(draft.bytes[..draft.length], "input.txt\n") {
+    #panic("explorer macro resumes remaining text in opened file")
+  }
+}

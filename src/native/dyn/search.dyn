@@ -5,8 +5,8 @@
 struct SearchRow { path: [4096]u8, text: [256]u8, start, end, line, column: usize }
 struct SearchWorker {
   thread, lock, wake: rawptr,
-  generation: native_atomic.AtomicU64,
-  stop: native_atomic.AtomicU32,
+  generation: sync.AtomicU64,
+  stop: sync.AtomicU32,
   root, query: [4096]u8,
   rows: [1024]SearchRow,
   count: usize,
@@ -17,7 +17,7 @@ struct SearchScan {
   generation: u64,
   visited: usize,
   code, data, context: rawptr,
-  deadline: NativeTimespec,
+  deadline: time.Instant, deadline_valid: bool,
   partial: bool,
   literal: bool,
   query: *const u8,
@@ -49,13 +49,21 @@ extern fn search_data_free "pcre2_match_data_free_8"(data: rawptr)
 extern fn search_code_free "pcre2_code_free_8"(code: rawptr)
 
 fn search_cancelled(scan: *SearchScan) bool {
-  now := NativeTimespec{}
-  _ = sync_clock(1, &now)
+  if !scan.deadline_valid {
+    scan.partial = true
+    return true
+  }
+  sample := time.monotonic_now()
+  if !sample.ok {
+    scan.partial = true
+    return true
+  }
+  now := sample.value
   if now.seconds > scan.deadline.seconds || (now.seconds == scan.deadline.seconds && now.nanoseconds >= scan.deadline.nanoseconds) {
     scan.partial = true
     return true
   }
-  return native_atomic.load_u32(&scan.owner.stop) != 0 || native_atomic.load_u64(&scan.owner.generation) != scan.generation
+  return sync.load_u32(&scan.owner.stop) != 0 || sync.load_u64(&scan.owner.generation) != scan.generation
 }
 fn search_callout(block: rawptr, data: rawptr) i32 {
   if search_cancelled(#cast(*SearchScan, data)) {
@@ -229,7 +237,7 @@ fn search_file(scan: *SearchScan, parent: i32, leaf: *const u8, path: *const u8)
     }
     rec_lock(scan.owner.lock)
     full := scan.owner.count == 1024
-    if native_atomic.load_u64(&scan.owner.generation) == scan.generation && !full {
+    if sync.load_u64(&scan.owner.generation) == scan.generation && !full {
       scan.owner.rows[scan.owner.count] = row
       scan.owner.count += 1
     }
@@ -376,16 +384,16 @@ fn search_walk(scan: *SearchScan, fd: i32, prefix: *const u8, depth: usize) {
 fn search_worker(opaque: rawptr) i32 {
   search := #cast(*SearchWorker, opaque)
   completed: u64 = 0
-  for native_atomic.load_u32(&search.stop) == 0 {
+  for sync.load_u32(&search.stop) == 0 {
     rec_lock(search.lock)
-    for native_atomic.load_u32(&search.stop) == 0 && completed == native_atomic.load_u64(&search.generation) {
+    for sync.load_u32(&search.stop) == 0 && completed == sync.load_u64(&search.generation) {
       rec_wait(search.wake, search.lock)
     }
-    if native_atomic.load_u32(&search.stop) != 0 {
+    if sync.load_u32(&search.stop) != 0 {
       rec_unlock(search.lock)
       break
     }
-    completed = native_atomic.load_u64(&search.generation)
+    completed = sync.load_u64(&search.generation)
     root := search.root
     query := search.query
     rec_unlock(search.lock)
@@ -393,8 +401,14 @@ fn search_worker(opaque: rawptr) i32 {
     scan.literal = search_plain_literal(scan.query, scan.query_length)
     error: i32 = 0
     offset: usize = 0
-    _ = sync_clock(1, &scan.deadline)
-    scan.deadline.seconds += 5
+    deadline := time.deadline_after(5 * time.Second)
+    if deadline.ok {
+      scan.deadline = deadline.value.at
+      scan.deadline_valid = true
+    }
+    else {
+      scan.partial = true
+    }
     scan.code = search_compile(&query[0], #cast(usize, -1), 1704964, &error, &offset, nil)
     status: i32 = 0
     if query[0] != 0 && scan.code == nil {
@@ -427,7 +441,7 @@ fn search_worker(opaque: rawptr) i32 {
     search_data_free(scan.data)
     search_code_free(scan.code)
     rec_lock(search.lock)
-    if completed == native_atomic.load_u64(&search.generation) {
+    if completed == sync.load_u64(&search.generation) {
       search.status = status
     }
     rec_unlock(search.lock)
@@ -471,7 +485,7 @@ pub fn dna_search_submit(search: *SearchWorker, root: *const u8, query: *const u
   search_copy_text(search.query[..], query)
   search.count = 0
   search.status = 1
-  _ = native_atomic.fetch_add_u64(&search.generation, 1)
+  _ = sync.fetch_add_u64(&search.generation, 1)
   rec_signal(search.wake)
   rec_unlock(search.lock)
 }
@@ -506,7 +520,7 @@ pub fn dna_search_close(search: *SearchWorker) {
     return
   }
   rec_lock(search.lock)
-  native_atomic.store_u32(&search.stop, 1)
+  sync.store_u32(&search.stop, 1)
   rec_signal(search.wake)
   rec_unlock(search.lock)
   rec_join(search.thread, nil)

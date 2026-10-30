@@ -7,17 +7,94 @@ struct PromptState {
   matches: [512]usize,
   match_count: usize,
   panel: Panel,
+  // Session-local recent commands; bounded independently of document storage.
+  history: [32][4096]u8,
+  history_lengths: [32]usize,
+  history_count, history_next, history_depth: usize,
+  history_draft: [4096]u8,
+  history_draft_length: usize,
 }
 
+fn command_history_remember(app: *App) {
+  prompt := &app.prompt_state
+  if prompt.length == 0 {
+    return
+  }
+  text := prompt.text[..prompt.length]
+  if prompt.history_count > 0 {
+    previous := (prompt.history_next + 31) % 32
+    if buffer.equal(text, prompt.history[previous][..prompt.history_lengths[previous]]) {
+      return
+    }
+  }
+  at := prompt.history_next
+  prompt.history_lengths[at] = copy_text(prompt.history[at][..], text)
+  prompt.history_next = (at + 1) % 32
+  if prompt.history_count < 32 {
+    prompt.history_count += 1
+  }
+  prompt.history_depth = 0
+}
+fn command_history_move(app: *App, older: bool) bool {
+  prompt := &app.prompt_state
+  if prompt.history_count == 0 {
+    return false
+  }
+  // Editing a recalled command creates a new draft rather than overwriting it.
+  if prompt.history_depth > 0 {
+    at := (prompt.history_next + 32 - prompt.history_depth) % 32
+    if !buffer.equal(prompt.text[..prompt.length], prompt.history[at][..prompt.history_lengths[at]]) {
+      prompt.history_depth = 0
+    }
+  }
+  if older {
+    if prompt.history_depth == 0 {
+      prompt.history_draft_length = copy_text(prompt.history_draft[..], prompt.text[..prompt.length])
+    }
+    if prompt.history_depth < prompt.history_count {
+      prompt.history_depth += 1
+    }
+  } else if prompt.history_depth > 0 {
+    prompt.history_depth -= 1
+  } else {
+    return true
+  }
+  if prompt.history_depth == 0 {
+    prompt.length = copy_text(prompt.text[..], prompt.history_draft[..prompt.history_draft_length])
+  } else {
+    at := (prompt.history_next + 32 - prompt.history_depth) % 32
+    prompt.length = copy_text(prompt.text[..], prompt.history[at][..prompt.history_lengths[at]])
+  }
+  prompt.selected = 0
+  return true
+}
+fn command_palette_move(app: *App, older: bool) {
+  matches(app)
+  if older {
+    if app.prompt_state.selected > 0 {
+      app.prompt_state.selected -= 1
+    }
+  } else if app.prompt_state.selected + 1 < app.prompt_state.match_count {
+    app.prompt_state.selected += 1
+  }
+}
 // Prompt/picker input never falls through to editing commands.
 fn prompt_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
   control := (modifiers & ModCtrl) != 0
   // Picker/prompt navigation aliases do not fall through to document commands.
   if control && (key == KeyN || key == KeyJ) {
+    if app.prompt_state.panel == Panel.Commands {
+      command_palette_move(app, false)
+      return
+    }
     key_input(app, typography, KeyDown, 0)
     return
   }
   if control && (key == KeyP || key == KeyK) {
+    if app.prompt_state.panel == Panel.Commands {
+      command_palette_move(app, true)
+      return
+    }
     key_input(app, typography, KeyUp, 0)
     return
   }
@@ -54,6 +131,11 @@ fn prompt_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
   if key == KeyReturn {
     submit(app, typography)
     return
+  }
+  if app.prompt_state.panel == Panel.Commands && !control && (key == KeyUp || key == KeyDown) {
+    if command_history_move(app, key == KeyUp) {
+      return
+    }
   }
   if (app.prompt_state.panel == Panel.Open || app.prompt_state.panel == Panel.Buffers) && (key == KeyPageDown || key == KeyPageUp) {
     count := app.completion.count

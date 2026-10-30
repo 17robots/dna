@@ -1,6 +1,8 @@
 use "../../src/workspace" workspace
 use "../../src/buffer" buffer
 fn main() {
+  dynamic_workspace_checks()
+  legacy_workspace_checks()
   state := workspace.State{project: "/tmp"}
   state.buffers[0] = workspace.SavedBuffer{used: true, path: "/tmp/a", text: "new\nα", saved: "old", cursor: 4, anchor: 0, filetype: "dyn"}
   state.panes[0] = workspace.SavedPane{used: true, percent: 50}
@@ -68,5 +70,98 @@ fn main() {
   length = workspace.encode(&state, bytes[..])
   if workspace.decode(bytes[..length], &decoded) {
     #panic("invalid slot accepted")
+  }
+}
+
+fn dynamic_workspace_checks() {
+  state := workspace.State{project: "/tmp", active: 79}
+  defer workspace.release(&state)
+  if !workspace.prepare(&state, 80) || workspace.buffer_count(&state) != 80 {
+    #panic("dynamic workspace allocation")
+  }
+  for index in 0..80 {
+    item := workspace.buffer_mut(&state, index)
+    item.* = workspace.SavedBuffer{used: true, text: "body", saved: "old", cursor: index % 5, filetype: "txt"}
+  }
+  workspace.buffer_mut(&state, 79).path = "/tmp/last"
+  workspace.buffer_mut(&state, 78).* = workspace.SavedBuffer{used: true, reload: true, path: "/tmp/reload", cursor: 900}
+  state.panes[0] = workspace.SavedPane{used: true, slot: 79, cursor: 2, percent: 50}
+  bytes: [32768]u8 = []
+  length := workspace.encode(&state, bytes[..])
+  if length == 0 || length != workspace.encoded_size(&state) {
+    #panic("dynamic sizing")
+  }
+  decoded := workspace.State{}
+  defer workspace.release(&decoded)
+  for iteration in 0..32 {
+    if !workspace.decode(bytes[..length], &decoded) || workspace.buffer_count(&decoded) != 80 || decoded.active != 79 || decoded.panes[0].slot != 79 {
+      #panic("eighty buffer session roundtrip")
+    }
+    for index in 0..80 {
+      item := workspace.buffer_at(&decoded, index)
+      if !item.used {
+        #panic("session lost a buffer")
+      }
+      if index == 78 {
+        if !item.reload || item.cursor != 900 {
+          #panic("dynamic recovery entry")
+        }
+      } else if !buffer.equal(item.text, "body") || item.cursor != index % 5 {
+        #panic("dynamic buffer content")
+      }
+    }
+  }
+  if workspace.prepare(&state, #cast(usize, -1)) || workspace.buffer_count(&state) != 80 || !buffer.equal(workspace.buffer_at(&state, 79).path, "/tmp/last") {
+    #panic("failed growth preserves snapshot")
+  }
+  if !workspace.prepare(&state, 128) || !buffer.equal(workspace.buffer_at(&state, 79).text, "body") {
+    #panic("snapshot growth preserves records")
+  }
+  // V3's count follows version, project, active and focused fields.
+  count_offset: usize = 8 + 13 + 8 + 4 + 8 + 8
+  invalid_counts: [4]usize = [0, 16, 100000000, #cast(usize, -1)]
+  for count in invalid_counts {
+    for offset in 0..8 {
+      bytes[count_offset + offset] = #cast(u8, (count >> (offset * 8)))
+    }
+    if workspace.decode(bytes[..length], &decoded) || workspace.buffer_count(&decoded) != 16 {
+      #panic("malformed dynamic count accepted or retained metadata")
+    }
+  }
+  for offset in 0..8 {
+    bytes[count_offset + offset] = #cast(u8, (#cast(usize, 80) >> (offset * 8)))
+  }
+  for cut in [0, 20, 48, 56, 60] {
+    if workspace.decode(bytes[..cut], &decoded) {
+      #panic("dynamic header truncation")
+    }
+  }
+  if workspace.decode(bytes[..length-1], &decoded) {
+    #panic("dynamic payload truncation")
+  }
+  if !workspace.decode(bytes[..length], &decoded) {
+    #panic("dynamic decoder reusable after failure")
+  }
+  workspace.release(&decoded)
+  workspace.release(&decoded)
+}
+
+// Frozen v1 layout: empty named workspace, one empty buffer, one leaf pane.
+// V1 has no selection-count fields and must remain readable after v3 growth.
+fn legacy_workspace_checks() {
+  bytes: [433]u8 = []
+  bytes[0] = 13
+  version: []const u8 = "DNA session 1"
+  _ = buffer.copy_bytes(&bytes[8], &version[0], #len(version))
+  bytes[21] = 4
+  project: []const u8 = "/tmp"
+  _ = buffer.copy_bytes(&bytes[29], &project[0], #len(project))
+  bytes[49] = 1
+  bytes[225] = 1
+  bytes[297] = 50
+  state := workspace.State{}
+  defer workspace.release(&state)
+  if !workspace.decode(bytes[..], &state) || workspace.buffer_count(&state) != 16 || !state.buffers[0].used || state.panes[0].branch {
+    #panic("legacy v1 compatibility")
   }
 }

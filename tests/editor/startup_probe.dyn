@@ -13,11 +13,38 @@ fn startup_probe(app: *App, typography: *Typography, renderer: rawptr, window: r
   if launch_smoke(app) {
     return
   }
+  // The isolated Wayland harness supplies real seat input before clipboard tests.
+  input_gate_storage: [8]u8 = []
+  input_gate := host.environment("DNA_TEST_WAYLAND_INPUT", input_gate_storage[..])
+  if input_gate.ok && input_gate.found {
+    if !sdl.present(renderer) {
+      #panic("Wayland input gate presentation")
+    }
+    input_deadline := sdl.ticks() + 5000
+    input_ready := false
+    input_event := sdl.Event{}
+    for !input_ready && sdl.ticks() < input_deadline {
+      if sdl.wait_timeout(&input_event, 20) && input_event.words[0] == 768 {
+        input_ready = true
+      }
+    }
+    if !input_ready {
+      #panic("Wayland input gate timed out")
+    }
+  }
   app.view.reduced_motion = true
   if #sizeof(sdl.Event) != 128 || #sizeof(sdl.KeyEvent) != 40 || #sizeof(sdl.TextEvent) != 32 || #sizeof(ttf.Substring) != 36 {
     #panic("unexpected ABI")
   }
+  text_hit_smoke()
+  selection_geometry_smoke(typography)
+  ui_layout_smoke()
+  ui_cache_smoke()
+  ui_text_working_set_smoke(typography)
+  render_reuse_smoke(app, typography, renderer, window)
+  edit_visibility_smoke(app, typography, renderer)
   save_sequence_smoke()
+  buffer_growth_smoke()
   operations_smoke()
   regression_smoke(app)
   hover_scroll_smoke(app, typography, renderer)
@@ -26,6 +53,8 @@ fn startup_probe(app: *App, typography: *Typography, renderer: rawptr, window: r
   gutter_select_smoke(app, typography, renderer, window)
   helix_keys_smoke(app, typography, renderer, window)
   vim_smoke(app, typography)
+  usability_prompt_smoke(typography, renderer)
+  tree_usability_smoke(app, typography)
   object_keys_smoke(app, typography)
   project_config_smoke(app, typography)
   file_config_smoke()
@@ -42,6 +71,7 @@ fn startup_probe(app: *App, typography: *Typography, renderer: rawptr, window: r
   workflow_smoke(app, typography)
   completion_smoke(app, typography)
   session_smoke(app, typography)
+  explorer_keymap_smoke(typography)
   explorer_smoke(app, typography)
   if app.explorer.document != nil {
     app.prompt_state.panel = Panel.Directory
@@ -101,7 +131,7 @@ fn startup_probe(app: *App, typography: *Typography, renderer: rawptr, window: r
   simulated := sdl.Event{}
   incoming := #cast(*sdl.TextEvent, &simulated)
   incoming.kind = 771
-  input_text := c.string_into(input_storage, "aé中")
+  input_text := cstring.bounded(input_storage, "aé中")
   if !input_text.ok {
     #panic("startup fixture string capacity")
   }
@@ -420,7 +450,7 @@ fn helix_keys_smoke(app: *App, typography: *Typography, renderer: rawptr, window
   }
   doc.secondary.count = 0
   // :comment toggles line comments for the filetype.
-  slot := &app.documents.slots[app.documents.active]
+  slot := app.documents.slots[app.documents.active]
   saved_filetype := slot.filetype_length
   slot.filetype_length = copy_text(slot.filetype[..], "dyn")
   _ = buffer.load(doc, "fn a() {\n  b()\n}\n")

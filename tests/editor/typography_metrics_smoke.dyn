@@ -1,0 +1,64 @@
+// Glyphs must fit their row even with a tall default monospace face and at
+// fractional display scales. The driver observes actual native glyph bounds.
+fn typography_metrics_case(typography:*Typography, source:[]const u8, reset:fn(), bottom:fn()f32, uses_fallback:fn(rawptr)bool, fallback:bool) {
+  text := ttf.create(typography.engine, typography.font, &source[0], #len(source))
+  if text == nil {
+    #panic("typography metrics text")
+  }
+  defer ttf.destroy(text)
+  for points in [8.0, 16.0, 23.0] {
+    for scale in [1.0, 1.25, 1.5] {
+      for leading in [1.0, 1.25, 1.6] {
+        typography.points = points
+        typography.scale = scale
+        typography.line_height = leading
+        resize_font(typography)
+        reset()
+        if !ttf.draw(text, 0.0, 0.0) {
+          #panic("typography metrics draw")
+        }
+        if fallback && !uses_fallback(text) {
+          #panic("typography fallback was not exercised")
+        }
+        if bottom() > typography.line {
+          #panic("native descenders extend below their clipped row")
+        }
+        if typography.line < points * scale * leading {
+          #panic("fractional line spacing rounds below configured height")
+        }
+        // Returning to an earlier size must not retain a previous large row.
+        minimum := ttf.font_height(typography.font)
+        if typography.fallback_font != nil {
+          other := ttf.font_height(typography.fallback_font)
+          if minimum < other {
+            minimum = other
+          }
+        }
+        if typography.line > points * scale * leading + 1.0 && typography.line != #cast(f32, minimum) {
+          #panic("font resize retained stale line height")
+        }
+      }
+    }
+  }
+}
+fn typography_metrics_smoke(app:*App, typography:*Typography, renderer:rawptr, reset:fn(), bottom:fn()f32, uses_fallback:fn(rawptr)bool, fallback_name:[]const u8) {
+  typography_metrics_case(typography, "Agjpqy", reset, bottom, uses_fallback, false)
+  if #len(fallback_name)>0 {
+    path:[4096]u8=[]
+    _=copy_text(path[..], fallback_name)
+    fallback:=ttf.open(&path[0], 16.0)
+    if fallback==nil {
+      #panic("typography fallback open")
+    }
+    defer ttf.close(fallback)
+    if !ttf.add_fallback(typography.font, fallback) {
+      #panic("typography fallback attach")
+    }
+    defer ttf.remove_fallback(typography.font, fallback)
+    saved:=typography.fallback_font
+    typography.fallback_font=fallback
+    defer typography.fallback_font=saved
+    typography_metrics_case(typography, "Agjpqyضيج", reset, bottom, uses_fallback, true)
+  }
+  app.running = false
+}

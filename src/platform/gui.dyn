@@ -1,0 +1,1028 @@
+// Native GUI backend. The public platform wrapper keeps terminal dispatch.
+use "vendor/window/wayland" window_api
+use "vendor/window/events"
+use "std/ui"
+use "std/ui/software"
+use "std/c"
+use "std/time"
+use "./native_present" native_present
+use "./backend" native_backend
+
+struct NativeTexture { owner: *mem.Arena, pixels: []u8, width, height: i32, alpha: u8 = 255 }
+struct NativeClipboard { owner: *mem.Arena, bytes: []u8, next: *NativeClipboard }
+struct NativeGui {
+  window: window_api.Window,
+  presenter: native_present.Presenter,
+  pixels: *mem.Arena,
+  surface: software.Surface,
+  target: *NativeTexture,
+  color: ui.Color,
+  draw_alpha: u8 = 255,
+  viewport: PixelRect,
+  clip: PixelRect,
+  clipped: bool,
+  sx: f32 = 1.0,
+  sy: f32 = 1.0,
+  listening: bool,
+  requested_width: i32,
+  requested_height: i32,
+  injected: [128]Event,
+  injected_text: [128][4097]u8,
+  injected_count: usize,
+  deferred: [128]events.Event,
+  deferred_count: usize,
+  deferred_overflow: bool,
+  clipboards: *NativeClipboard,
+  modifiers: u16,
+  mouse_buttons: u32,
+  click_button: u32,
+  click_x: i32,
+  click_y: i32,
+  click_count: u8,
+  click_at: time.Instant,
+  click_valid: bool,
+  character: u32,
+  payload: [65537]u8,
+}
+native_gui: NativeGui
+pub fn init(flags: u32) bool {
+  return true
+}
+pub fn quit() {}
+fn sdl_create_window(title: *const u8, width, height: i32, flags: u64) rawptr {
+  if native_gui.listening || title == nil {
+    return nil
+  }
+  if native_gui.presenter.program!=0 {
+    return nil
+  }
+  native_gui=NativeGui{}
+  result := window_api.open(&native_gui.window, title[..c.string_length(title, 4096)], width, height)
+  if !result.ok {
+    return nil
+  }
+  window_api.listen_events(&native_gui.window, true)
+  native_gui.listening = true
+  native_gui_attach(native_gui_wake, #cast(rawptr, &native_gui.window))
+  native_gui.sx = 1.0
+  native_gui.sy = 1.0
+  return #cast(rawptr, &native_gui)
+}
+fn sdl_destroy_window(window: rawptr) {
+  native_gui_attach(nil, nil)
+  for native_gui.clipboards!=nil {
+    saved:=native_gui.clipboards
+    native_gui.clipboards=saved.next
+    owner:=saved.owner
+    mem.arena_release(owner)
+  }
+  window_api.close(&native_gui.window)
+  native_gui.listening = false
+}
+fn sdl_create_renderer(window: rawptr, name: *const u8) rawptr {
+  if window == nil || !native_present.open(&native_gui.presenter).ok {
+    return nil
+  }
+  if !native_resize() {
+    native_present.close(&native_gui.presenter)
+    return nil
+  }
+  native_gui.draw_alpha = 255
+  _=window_api.set_swap_interval(&native_gui.window, 0)
+  return #cast(rawptr, &native_gui)
+}
+fn sdl_destroy_renderer(renderer: rawptr) {
+  native_present.close(&native_gui.presenter)
+  mem.arena_release(native_gui.pixels)
+  native_gui.pixels = nil
+  native_gui.surface=software.Surface{}
+  native_gui.viewport=PixelRect{}
+  native_gui.target=nil
+  native_gui.draw_alpha=255
+}
+fn native_resize() bool {
+  width := native_gui.window.width
+  height := native_gui.window.height
+  if width <= 0 || height <= 0 || width > 16384 || height > 16384 {
+    return false
+  }
+  if native_gui.surface.width == width && native_gui.surface.height == height {
+    return true
+  }
+  if native_gui.pixels == nil {
+    native_gui.pixels = mem.arena_create(0)
+  }
+  else {
+    mem.arena_reset(native_gui.pixels)
+  }
+  pixels := mem.push_bytes_uninit(native_gui.pixels, #cast(usize, width)*#cast(usize, height)*4)
+  native_gui.surface = software.Surface{pixels:pixels, width:width, height:height, stride:#cast(usize, width)*4}
+  native_gui.viewport = PixelRect{width:width, height:height}
+  return true
+}
+fn native_surface() software.Surface {
+  if native_gui.target != nil {
+    t := native_gui.target
+    return software.Surface{pixels:t.pixels, width:t.width, height:t.height, stride:#cast(usize, t.width)*4}
+  }
+  return native_gui.surface
+}
+fn native_clip(surface: software.Surface) ui.Rect {
+  viewport := ui.Rect{x:native_gui.viewport.x, y:native_gui.viewport.y, width:native_gui.viewport.width, height:native_gui.viewport.height}
+  result := ui.intersect(viewport, ui.Rect{width:surface.width, height:surface.height})
+  if native_gui.clipped {
+    c := native_gui.clip
+    result = ui.intersect(result, ui.Rect{x:viewport.x+c.x, y:viewport.y+c.y, width:c.width, height:c.height})
+  }
+  return result
+}
+fn sdl_color(renderer: rawptr, r, g, b, a: u8) bool {
+  native_gui.color = ui.Color{r:r, g:g, b:b, a:a}
+  return true
+}
+fn sdl_draw_opacity(renderer: rawptr, alpha: u8) bool {
+  native_gui.draw_alpha = alpha
+  return true
+}
+// Cached targets retain their original pixels. Only drawing/compositing into
+// the window applies the current pane's opacity, exactly once.
+fn native_draw_alpha(alpha: u8) u8 {
+  if native_gui.target != nil || native_gui.draw_alpha == 255 {
+    return alpha
+  }
+  return #cast(u8, (#cast(u32, alpha) * #cast(u32, native_gui.draw_alpha) + 127) / 255)
+}
+#link("c")
+extern fn native_span_copy "__mempcpy_chk"(destination:*u8, source:*const u8, length, capacity:usize) rawptr
+extern fn native_span_fill "__memset_chk"(destination:*u8, value:i32, length, capacity:usize) rawptr
+// Paint one row, then copy its complete RGBA span. Surfaces are owned native
+// buffers; clipping is resolved once before entering this bulk transfer.
+// A one-byte-larger check bound preserves the optimized libc entry points
+// instead of folding these calls into the runtime's byte-loop intrinsics.
+fn native_fill_span(surface:*software.Surface, bounds:ui.Rect, color:ui.Color) {
+  if bounds.width<=0 || bounds.height<=0 {
+    return
+  }
+  bytes:=#cast(usize, bounds.width)*4
+  first:=#cast(usize, bounds.y)*surface.stride+#cast(usize, bounds.x)*4
+  if color.r==color.g && color.g==color.b && color.b==color.a {
+    if bounds.x==0 && bytes==surface.stride {
+      length:=bytes*#cast(usize, bounds.height)
+      _=native_span_fill(&surface.pixels[first], #cast(i32, color.r), length, length+1)
+      return
+    }
+    _=native_span_fill(&surface.pixels[first], #cast(i32, color.r), bytes, bytes+1)
+  } else {
+    for x in 0..bounds.width {
+      at:=first+#cast(usize, x)*4
+      surface.pixels[at]=color.r
+      surface.pixels[at+1]=color.g
+      surface.pixels[at+2]=color.b
+      surface.pixels[at+3]=color.a
+    }
+  }
+  for y in 1..bounds.height {
+    at:=first+#cast(usize, y)*surface.stride
+    _=native_span_copy(&surface.pixels[at], &surface.pixels[first], bytes, bytes+1)
+  }
+}
+fn sdl_clear(renderer:rawptr) bool {
+  surface:=native_surface()
+  native_fill_span(&surface, ui.Rect{width:surface.width, height:surface.height}, native_gui.color)
+  return true
+}
+
+fn sdl_present(renderer: rawptr) bool {
+  if !native_present.draw(&native_gui.presenter, native_gui.surface).ok {
+    return false
+  }
+  return window_api.swap(&native_gui.window).ok
+}
+fn sdl_scale(renderer: rawptr, x, y: f32) bool {
+  if !(x>0.0 && y>0.0) || x>16.0 || y>16.0 {
+    return false
+  }
+  native_gui.sx=x
+  native_gui.sy=y
+  return true
+}
+fn sdl_fill(renderer: rawptr, rect: *const Rect) bool {
+  if rect == nil {
+    return false
+  }
+  surface := native_surface()
+  color := native_gui.color
+  color.a = native_draw_alpha(color.a)
+  command := ui.Command{kind:ui.Kind.Rectangle, color:color, clip:native_clip(surface), bounds:ui.Rect{x:native_gui.viewport.x+#cast(i32, rect.x*native_gui.sx), y:native_gui.viewport.y+#cast(i32, rect.y*native_gui.sy), width:#cast(i32, rect.width*native_gui.sx), height:#cast(i32, rect.height*native_gui.sy)}}
+  if color.a==255 {
+    bounds:=ui.intersect(command.clip, command.bounds)
+    native_fill_span(&surface, bounds, color)
+    return true
+  }
+  return software.render(&surface, &command, software.Font{}).ok
+}
+fn sdl_size(renderer: rawptr, width, height: *i32) bool {
+  width.*=native_gui.surface.width
+  height.*=native_gui.surface.height
+  return true
+}
+fn sdl_window_size(window: rawptr, width, height: *i32) bool {
+  return sdl_size(window, width, height)
+}
+fn sdl_clip(renderer: rawptr, rect: *const PixelRect) bool {
+  native_gui.clipped=rect!=nil
+  if rect!=nil {
+    native_gui.clip=rect.*
+  }
+  return true
+}
+fn sdl_viewport(renderer: rawptr, rect: *const PixelRect) bool {
+  surface := native_surface()
+  native_gui.viewport=PixelRect{width:surface.width, height:surface.height}
+  if rect!=nil {
+    native_gui.viewport=rect.*
+  }
+  native_gui.clipped=false
+  return true
+}
+fn sdl_create_texture(renderer: rawptr, format: u32, access, width, height: i32) rawptr {
+  if width<=0 || height<=0 || width>16384 || height>16384 {
+    return nil
+  }
+  owner := mem.arena_create(0)
+  t := mem.push(NativeTexture, owner)
+  t.*=NativeTexture{owner:owner, width:width, height:height}
+  t.pixels=mem.push_bytes_uninit(t.owner, #cast(usize, width)*#cast(usize, height)*4)
+  return #cast(rawptr, t)
+}
+fn sdl_destroy_texture(texture: rawptr) {
+  if texture!=nil {
+    t:=#cast(*NativeTexture, texture)
+    owner:=t.owner
+    mem.arena_release(owner)
+  }
+}
+fn sdl_texture_blend(texture: rawptr, mode: u32) bool {
+  return mode==1
+}
+fn sdl_texture_alpha(texture: rawptr, alpha: u8) bool {
+  if texture==nil {
+    return false
+  }
+  #cast(*NativeTexture, texture).alpha=alpha
+  return true
+}
+fn sdl_target(renderer: rawptr, texture: rawptr) bool {
+  native_gui.target=#cast(*NativeTexture, texture)
+  return sdl_viewport(renderer, nil)
+}
+fn native_blend(surface: *software.Surface, x, y: i32, r, g, b, a: u8) {
+  if a==0 {
+    return
+  }
+  clip:=native_clip(surface.*)
+  if !ui.contains(clip, x, y) {
+    return
+  }
+  at:=#cast(usize, y)*surface.stride+#cast(usize, x)*4
+  native_blend_at(surface, at, r, g, b, a)
+}
+// Caller has already clipped this pixel and removed zero-alpha samples.
+fn native_blend_at(surface:*software.Surface, at:usize, r, g, b, a:u8) {
+  if a==255 {
+    surface.pixels[at]=r
+    surface.pixels[at+1]=g
+    surface.pixels[at+2]=b
+    surface.pixels[at+3]=255
+    return
+  }
+  alpha:=#cast(u32, a)
+  old:=#cast(u32, surface.pixels[at+3])
+  // The window framebuffer is opaque. Preserve the general straight-alpha
+  // path for transparent render targets, but avoid three variable divisions
+  // for the common window/glyph case.
+  if old==255 {
+    inverse:=255-alpha
+    surface.pixels[at]=#cast(u8, (#cast(u32, r)*alpha+#cast(u32, surface.pixels[at])*inverse+127)/255)
+    surface.pixels[at+1]=#cast(u8, (#cast(u32, g)*alpha+#cast(u32, surface.pixels[at+1])*inverse+127)/255)
+    surface.pixels[at+2]=#cast(u8, (#cast(u32, b)*alpha+#cast(u32, surface.pixels[at+2])*inverse+127)/255)
+    return
+  }
+  denominator:=alpha*255+old*(255-alpha)
+  channels:[3]u8=[r, g, b]
+  for i in 0..3 {
+    surface.pixels[at+i]=#cast(u8, (#cast(u32, channels[i])*alpha*255+#cast(u32, surface.pixels[at+i])*old*(255-alpha)+denominator/2)/denominator)
+  }
+  surface.pixels[at+3]=#cast(u8, (denominator+127)/255)
+}
+fn sdl_render_texture(renderer: rawptr, texture: rawptr, source, destination: *const Rect) bool {
+  if texture==nil {
+    return false
+  }
+  t:=#cast(*NativeTexture, texture)
+  draw_alpha:=native_draw_alpha(t.alpha)
+  src:=Rect{width:#cast(f32, t.width), height:#cast(f32, t.height)}
+  dst:=Rect{width:#cast(f32, native_gui.viewport.width)/native_gui.sx, height:#cast(f32, native_gui.viewport.height)/native_gui.sy}
+  if source!=nil {
+    src=source.*
+  }
+  if destination!=nil {
+    dst=destination.*
+  }
+  if src.width<=0.0 || src.height<=0.0 || dst.width<=0.0 || dst.height<=0.0 {
+    return false
+  }
+  surface:=native_surface()
+  width:=#cast(i32, dst.width*native_gui.sx)
+  height:=#cast(i32, dst.height*native_gui.sy)
+  if width<=0 || height<=0 || draw_alpha==0 {
+    return true
+  }
+  left:=native_gui.viewport.x+#cast(i32, dst.x*native_gui.sx)
+  top:=native_gui.viewport.y+#cast(i32, dst.y*native_gui.sy)
+  bounds:=ui.Rect{x:left, y:top, width:width, height:height}
+  clip:=ui.intersect(native_clip(surface), bounds)
+  if clip.width<=0 || clip.height<=0 {
+    return true
+  }
+  // Integer one-to-one sampling avoids divisions for cached popup textures.
+  // Fractional source origins retain the original truncation arithmetic.
+  source_x:=#cast(i32, src.x)
+  source_y:=#cast(i32, src.y)
+  unit_x:=src.width==#cast(f32, width) && src.x==#cast(f32, source_x)
+  unit_y:=src.height==#cast(f32, height) && src.y==#cast(f32, source_y)
+  // Bulk copies require separate buffers; overlapping self-blits keep their
+  // original sequential sampling and blending behavior.
+  texture_begin:=#cast(usize, &t.pixels[0])
+  target_begin:=#cast(usize, &surface.pixels[0])
+  distinct:=texture_begin+#len(t.pixels)<=target_begin || target_begin+#len(surface.pixels)<=texture_begin
+  copy_opaque:=unit_x && unit_y && draw_alpha==255 && distinct
+  for row in 0..clip.height {
+    y:=clip.y-top+row
+    ty:=source_y+y
+    if !unit_y {
+      ty=#cast(i32, src.y+#cast(f32, y)*src.height/#cast(f32, height))
+    }
+    if ty<0 || ty>=t.height {
+      continue
+    }
+    source_row:=#cast(usize, ty)*#cast(usize, t.width)*4
+    target_row:=#cast(usize, clip.y+row)*surface.stride+#cast(usize, clip.x)*4
+    if copy_opaque {
+      first_source:=source_x+clip.x-left
+      first_col:=0
+      last_col:=clip.width
+      if first_source<0 {
+        first_col=-first_source
+      }
+      if first_source+last_col>t.width {
+        last_col=t.width-first_source
+      }
+      col:=first_col
+      for col<last_col {
+        at:=source_row+#cast(usize, first_source+col)*4
+        alpha:=t.pixels[at+3]
+        if alpha==255 {
+          run_start:=col
+          col+=1
+          for col<last_col && t.pixels[source_row+#cast(usize, first_source+col)*4+3]==255 {
+            col+=1
+          }
+          bytes:=#cast(usize, col-run_start)*4
+          _=native_span_copy(&surface.pixels[target_row+#cast(usize, run_start)*4], &t.pixels[at], bytes, bytes+1)
+        } else {
+          if alpha!=0 {
+            native_blend_at(&surface, target_row+#cast(usize, col)*4, t.pixels[at], t.pixels[at+1], t.pixels[at+2], alpha)
+          }
+          col+=1
+        }
+      }
+      continue
+    }
+    for col in 0..clip.width {
+      x:=clip.x-left+col
+      tx:=source_x+x
+      if !unit_x {
+        tx=#cast(i32, src.x+#cast(f32, x)*src.width/#cast(f32, width))
+      }
+      if tx<0 || tx>=t.width {
+        continue
+      }
+      at:=source_row+#cast(usize, tx)*4
+      alpha:=#cast(u8, (#cast(u32, t.pixels[at+3])*#cast(u32, draw_alpha)+127)/255)
+      if alpha!=0 {
+        native_blend_at(&surface, target_row+#cast(usize, col)*4, t.pixels[at], t.pixels[at+1], t.pixels[at+2], alpha)
+      }
+    }
+  }
+  return true
+}
+pub fn native_text_bitmap(renderer:rawptr, pixels:*const u8, width, height:i32, x, y:f32, r, g, b, a:u8) bool {
+  if width<0 || height<0 || width>16384 || height>16384 || (pixels==nil && width!=0 && height!=0) {
+    return false
+  }
+  a=native_draw_alpha(a)
+  if width==0 || height==0 || a==0 {
+    return true
+  }
+  surface:=native_surface()
+  scaled_width:=#cast(i32, #cast(f32, width)*native_gui.sx)
+  scaled_height:=#cast(i32, #cast(f32, height)*native_gui.sy)
+  left:=native_gui.viewport.x+#cast(i32, x*native_gui.sx)
+  top:=native_gui.viewport.y+#cast(i32, y*native_gui.sy)
+  bounds:=ui.Rect{x:left, y:top, width:scaled_width, height:scaled_height}
+  clip:=ui.intersect(native_clip(surface), bounds)
+  if clip.width<=0 || clip.height<=0 {
+    return true
+  }
+  mask:=pixels[..#cast(usize, width)*#cast(usize, height)]
+  unit_x:=native_gui.sx==1.0
+  for row in 0..clip.height {
+    source_row:=#cast(usize, #cast(f32, clip.y-top+row)/native_gui.sy)
+    source_start:=source_row*#cast(usize, width)
+    target:=#cast(usize, clip.y+row)*surface.stride+#cast(usize, clip.x)*4
+    for col in 0..clip.width {
+      source_col:=#cast(usize, clip.x-left+col)
+      if !unit_x {
+        source_col=#cast(usize, #cast(f32, clip.x-left+col)/native_gui.sx)
+      }
+      coverage:=mask[source_start+source_col]
+      alpha:=#cast(u8, (#cast(u32, a)*#cast(u32, coverage)+127)/255)
+      if alpha!=0 {
+        native_blend_at(&surface, target+#cast(usize, col)*4, r, g, b, alpha)
+      }
+    }
+  }
+  return true
+}
+
+fn native_key(key:u32) u32 {
+  if key<events.Escape {
+    return key
+  }
+  if key>=events.F1 && key<=events.F24 {
+    if key>=events.F1+12 {
+      return 1073741928+key-events.F1-12
+    }
+    return 1073741882+key-events.F1
+  }
+  if key==events.Escape {
+    return 27
+  }
+  if key==events.Enter {
+    return 13
+  }
+  if key==events.Tab {
+    return 9
+  }
+  if key==events.Backspace {
+    return 8
+  }
+  if key==events.Delete {
+    return 127
+  }
+  if key==events.Left {
+    return 1073741904
+  }
+  if key==events.Right {
+    return 1073741903
+  }
+  if key==events.Up {
+    return 1073741906
+  }
+  if key==events.Down {
+    return 1073741905
+  }
+  if key==events.Home {
+    return 1073741898
+  }
+  if key==events.End {
+    return 1073741901
+  }
+  if key==events.PageUp {
+    return 1073741899
+  }
+  if key==events.PageDown {
+    return 1073741902
+  }
+  return 0
+}
+fn native_event(source:*const events.Event, event:*Event) bool {
+  event.*=Event{}
+  mods:u16=0
+  if (source.modifiers&events.Shift)!=0 {
+    mods|=3
+  }
+  if (source.modifiers&events.Control)!=0 {
+    mods|=192
+  }
+  if (source.modifiers&events.Alt)!=0 {
+    mods|=768
+  }
+  if (source.modifiers&events.CapsLock)!=0 {
+    mods|=8192
+  }
+  if (source.modifiers&events.NumLock)!=0 {
+    mods|=4096
+  }
+  if (source.modifiers&events.Super)!=0 {
+    mods|=3072
+  }
+  if source.kind==events.Kind.KeyDown || source.kind==events.Kind.KeyUp {
+    native_gui.modifiers=mods
+    native_gui.character=events.character(source)
+    target:=#cast(*KeyEvent, event)
+    target.kind=768
+    if source.kind==events.Kind.KeyUp {
+      target.kind=769
+    }
+    target.key=native_key(source.key)
+    target.scancode=source.scancode
+    target.modifiers=mods
+    target.repeated=source.repeated!=0
+    target.down=source.kind==events.Kind.KeyDown
+    return true
+  }
+  if source.kind==events.Kind.Text || source.kind==events.Kind.Composition {
+    n:=#cast(usize, source.text_length)
+    _=mem.copy(native_gui.payload[..n], source.text[..n])
+    native_gui.payload[n]=0
+    if source.kind==events.Kind.Text {
+      target:=#cast(*TextEvent, event)
+      target.kind=771
+      target.text=&native_gui.payload[0]
+    }
+    else {
+      target:=#cast(*EditingEvent, event)
+      target.kind=770
+      target.text=&native_gui.payload[0]
+      target.start=source.x
+      target.length=source.y-source.x
+    }
+    return true
+  }
+  if source.kind==events.Kind.PointerMove {
+    native_gui.modifiers=mods
+    target:=#cast(*MouseMotion, event)
+    target.kind=1024
+    target.state=native_gui.mouse_buttons
+    target.x=#cast(f32, source.x)
+    target.y=#cast(f32, source.y)
+    return true
+  }
+  if source.kind==events.Kind.PointerDown || source.kind==events.Kind.PointerUp {
+    native_gui.modifiers=mods
+    target:=#cast(*MouseButton, event)
+    target.kind=1025
+    if source.kind==events.Kind.PointerUp {
+      target.kind=1026
+    }
+    target.button=#cast(u8, source.button)
+    target.down=source.kind==events.Kind.PointerDown
+    if source.button>0 && source.button<=32 {
+      bit:u32=1 << (source.button-1)
+      if target.down {
+        native_gui.mouse_buttons|=bit
+      }
+      else {
+        native_gui.mouse_buttons&=~bit
+      }
+    }
+    if target.down {
+      now:=time.monotonic_now()
+      delta:=time.elapsed(native_gui.click_at, now.value)
+      same:=native_gui.click_valid && now.ok && delta.ok && delta.value>=0 && delta.value<=500*time.Millisecond && native_gui.click_button==source.button && source.x>=native_gui.click_x-4 && source.x<=native_gui.click_x+4 && source.y>=native_gui.click_y-4 && source.y<=native_gui.click_y+4
+      if same && native_gui.click_count<3 {
+        native_gui.click_count+=1
+      }
+      else {
+        native_gui.click_count=1
+      }
+      native_gui.click_button=source.button
+      native_gui.click_x=source.x
+      native_gui.click_y=source.y
+      native_gui.click_at=now.value
+      native_gui.click_valid=now.ok
+    }
+    target.clicks=native_gui.click_count
+    target.x=#cast(f32, source.x)
+    target.y=#cast(f32, source.y)
+    return true
+  }
+  if source.kind==events.Kind.Wheel {
+    native_gui.modifiers=mods
+    target:=#cast(*MouseWheel, event)
+    target.kind=1027
+    step:=48.0*window_api.scale(&native_gui.window)
+    if step<=0.0 {
+      step=48.0
+    }
+    target.x=source.scroll_x/step
+    target.y=0.0-source.scroll_y/step
+    target.mouse_x=#cast(f32, source.x)
+    target.mouse_y=#cast(f32, source.y)
+    return true
+  }
+  if source.kind==events.Kind.Close {
+    event.words[0]=256
+    return true
+  }
+  if source.kind==events.Kind.Resize {
+    if !native_resize() {
+      #panic("native framebuffer capacity")
+    }
+    event.words[0]=513
+    return true
+  }
+  if source.kind==events.Kind.FocusGained {
+    event.words[0]=524
+    return true
+  }
+  if source.kind==events.Kind.FocusLost {
+    native_gui.modifiers=0
+    native_gui.mouse_buttons=0
+    native_gui.click_valid=false
+    event.words[0]=525
+    return true
+  }
+  if source.kind==events.Kind.Overflow {
+    native_gui.modifiers=0
+    native_gui.mouse_buttons=0
+    native_gui.click_valid=false
+    event.words[0]=#cast(u64, InputOverflowEvent)
+    return true
+  }
+  if source.kind==events.Kind.Wake {
+    event.words[0]=#cast(u64, WorkerWakeEvent)
+    return true
+  }
+  return false
+}
+fn sdl_poll(event:*Event) bool {
+  if native_gui.injected_count!=0 {
+    event.*=native_gui.injected[0]
+    kind:=#cast(u32, event.words[0]&4294967295)
+    if kind==770 || kind==771 {
+      n:=c.string_length(&native_gui.injected_text[0][0], 4097)
+      _=mem.copy(native_gui.payload[..n+1], native_gui.injected_text[0][..n+1])
+      #cast(*TextEvent, event).text=&native_gui.payload[0]
+    }
+    native_gui.injected_count-=1
+    for i in 0..native_gui.injected_count {
+      native_gui.injected[i]=native_gui.injected[i+1]
+      native_gui.injected_text[i]=native_gui.injected_text[i+1]
+    }
+    return true
+  }
+  for native_gui.deferred_count!=0 {
+    deferred:=native_gui.deferred[0]
+    native_gui.deferred_count-=1
+    for i in 0..native_gui.deferred_count {
+      native_gui.deferred[i]=native_gui.deferred[i+1]
+    }
+    if native_event(&deferred, event) {
+      return true
+    }
+  }
+  if native_gui.deferred_overflow {
+    native_gui.deferred_overflow=false
+    lost:=events.Event{kind:events.Kind.Overflow, dropped:1}
+    return native_event(&lost, event)
+  }
+  source:=events.Event{}
+  for window_api.next_event(&native_gui.window, &source) {
+    if native_event(&source, event) {
+      return true
+    }
+  }
+  if !window_api.poll(&native_gui.window).ok {
+    return false
+  }
+  for window_api.next_event(&native_gui.window, &source) {
+    if native_event(&source, event) {
+      return true
+    }
+  }
+  return false
+}
+fn sdl_wait_timeout(event:*Event, milliseconds:i32) bool {
+  if sdl_poll(event) {
+    return true
+  }
+  window_api.wait(&native_gui.window, milliseconds)
+  return sdl_poll(event)
+}
+fn sdl_wait(event:*Event) bool {
+  return sdl_wait_timeout(event, -1)
+}
+fn sdl_push(event:*Event) bool {
+  if event==nil || native_gui.injected_count>=128 {
+    return false
+  }
+  at:=native_gui.injected_count
+  native_gui.injected[at]=event.*
+  kind:=#cast(u32, event.words[0]&4294967295)
+  if kind==770 || kind==771 {
+    text:=#cast(*TextEvent, event).text
+    if text==nil {
+      return false
+    }
+    n:=c.string_length(text, 4097)
+    if n>4096 {
+      return false
+    }
+    _=mem.copy(native_gui.injected_text[at][..n], text[..n])
+    native_gui.injected_text[at][n]=0
+  }
+  native_gui.injected_count+=1
+  return window_api.wake(&native_gui.window).ok
+}
+fn sdl_start_text(window:rawptr) bool {
+  window_api.set_text_input(&native_gui.window, true, 0, 0, 1, 1)
+  return true
+}
+fn sdl_stop_text(window:rawptr) bool {
+  window_api.set_text_input(&native_gui.window, false, 0, 0, 1, 1)
+  return true
+}
+fn sdl_text_area(window:rawptr, area:*const PixelRect, cursor:i32) bool {
+  if area==nil {
+    return false
+  }
+  window_api.set_text_input(&native_gui.window, true, area.x+cursor, area.y, area.width, area.height)
+  return true
+}
+fn sdl_display_scale(window:rawptr) f32 {
+  return window_api.scale(&native_gui.window)
+}
+fn sdl_modifiers() u16 {
+  return native_gui.modifiers
+}
+fn sdl_key_from_scancode(scancode:u32, modifiers:u16, key_event:bool) u32 {
+  return native_backend.character(&native_gui.window, scancode, modifiers, native_gui.character)
+}
+
+fn sdl_render_vsync(renderer:rawptr, vsync:i32) bool {
+  return window_api.set_swap_interval(&native_gui.window, vsync).ok
+}
+fn sdl_window_display(window:rawptr) u32 {
+  return 0
+}
+fn sdl_display_mode(display:u32) *const DisplayMode {
+  return nil
+}
+fn sdl_system_cursor(id:u32) rawptr {
+  return #cast(rawptr, #cast(usize, id)+1)
+}
+fn sdl_destroy_cursor(cursor:rawptr) {}
+fn native_cursor(id:usize) window_api.Cursor {
+  if id==2 {
+    return window_api.Cursor.Text
+  }
+  if id==12 {
+    return window_api.Cursor.Hand
+  }
+  if id==8 {
+    return window_api.Cursor.ResizeX
+  }
+  if id==9 {
+    return window_api.Cursor.ResizeY
+  }
+  return window_api.Cursor.Arrow
+}
+fn sdl_set_cursor(cursor:rawptr) bool {
+  window_api.set_cursor(&native_gui.window, native_cursor(#cast(usize, cursor)))
+  return true
+}
+
+fn sdl_clipboard_set(text:*const u8) bool {
+  if text==nil {
+    return false
+  }
+  length:=c.string_length(text, 16777217)
+  if length>16777216 {
+    return false
+  }
+  return window_api.try_set_clipboard(&native_gui.window, text[..length]).ok
+}
+fn sdl_clipboard_get() *const u8 {
+  window_api.request_paste_snapshot(&native_gui.window)
+  started:=time.monotonic_now()
+  if !started.ok {
+    return nil
+  }
+  // The SDK ends stalled transfers after five seconds without progress.
+  // Bound the synchronous adapter as well, without counting input wakeups.
+  for {
+    now:=time.monotonic_now()
+    elapsed:=time.elapsed(started.value, now.value)
+    if !now.ok || !elapsed.ok || elapsed.value<0 || elapsed.value>=30*time.Second {
+      return nil
+    }
+    if !window_api.poll(&native_gui.window).ok {
+      return nil
+    }
+    source:=events.Event{}
+    for window_api.next_event(&native_gui.window, &source) {
+      // Snapshot requests do not enqueue Clipboard chunks. Preserve every
+      // unrelated input/overflow event while awaiting protocol completion.
+      if source.kind!=events.Kind.Clipboard {
+        if native_gui.deferred_count>=128 {
+          native_gui.deferred_overflow=true
+          return nil
+        }
+        native_gui.deferred[native_gui.deferred_count]=source
+        native_gui.deferred_count+=1
+      }
+    }
+    if !window_api.paste_pending(&native_gui.window) {
+      if !window_api.paste_status(&native_gui.window).ok {
+        return nil
+      }
+      text:=window_api.clipboard(&native_gui.window)
+      owner:=mem.arena_create(0)
+      copied:=mem.push(NativeClipboard, owner)
+      copied.*=NativeClipboard{owner:owner, next:native_gui.clipboards}
+      copied.bytes=mem.push_bytes_uninit(copied.owner, #len(text)+1)
+      _=mem.copy(copied.bytes[..#len(text)], text)
+      copied.bytes[#len(text)]=0
+      native_gui.clipboards=copied
+      return &copied.bytes[0]
+    }
+    window_api.wait(&native_gui.window, 10)
+  }
+  return nil
+}
+
+fn sdl_free(pointer:rawptr) {
+  previous:*NativeClipboard=nil
+  item:=native_gui.clipboards
+  for item!=nil {
+    if #cast(rawptr, &item.bytes[0])==pointer {
+      if previous==nil {
+        native_gui.clipboards=item.next
+      }
+      else {
+        previous.next=item.next
+      }
+      owner:=item.owner
+      mem.arena_release(owner)
+      return
+    }
+    previous=item
+    item=item.next
+  }
+}
+fn sdl_title(window:rawptr, title:*const u8) bool {
+  return title!=nil && window_api.set_title(&native_gui.window, title[..c.string_length(title, 4096)]).ok
+}
+fn sdl_clear_composition(window:rawptr) bool {
+  window_api.set_text_input(&native_gui.window, false, 0, 0, 1, 1)
+  window_api.set_text_input(&native_gui.window, true, 0, 0, 1, 1)
+  return true
+}
+fn sdl_set_window_size(window:rawptr, width, height:i32) bool {
+  native_gui.requested_width=width
+  native_gui.requested_height=height
+  return window_api.set_size(&native_gui.window, width, height).ok
+}
+fn sdl_sync_window(window:rawptr) bool {
+  for attempt in 0..100 {
+    if !window_api.poll(&native_gui.window).ok {
+      return false
+    }
+    if native_gui.window.width==native_gui.requested_width && native_gui.window.height==native_gui.requested_height {
+      break
+    }
+    window_api.wait(&native_gui.window, 10)
+  }
+  return native_resize()
+}
+fn native_edge(a, b:Vertex, x, y:f32) f32 {
+  return (x-a.x)*(b.y-a.y)-(y-a.y)*(b.x-a.x)
+}
+fn sdl_geometry(renderer, texture:rawptr, vertices:*const Vertex, count:i32, indices:*const i32, index_count:i32) bool {
+  if texture!=nil || count<0 || index_count<0 || index_count%3!=0 {
+    return false
+  }
+  surface:=native_surface()
+  clip:=native_clip(surface)
+  opacity:=#cast(f32, native_draw_alpha(255))/255.0
+  for triangle in 0..index_count/3 {
+    ia:=indices[..#cast(usize, index_count)][#cast(usize, triangle*3)]
+    ib:=indices[..#cast(usize, index_count)][#cast(usize, triangle*3+1)]
+    ic:=indices[..#cast(usize, index_count)][#cast(usize, triangle*3+2)]
+    if ia<0 || ib<0 || ic<0 || ia>=count || ib>=count || ic>=count {
+      return false
+    }
+    a:=vertices[..#cast(usize, count)][#cast(usize, ia)]
+    b:=vertices[..#cast(usize, count)][#cast(usize, ib)]
+    c:=vertices[..#cast(usize, count)][#cast(usize, ic)]
+    a.alpha=a.alpha*opacity
+    b.alpha=b.alpha*opacity
+    c.alpha=c.alpha*opacity
+    a.x=a.x*native_gui.sx+#cast(f32, native_gui.viewport.x)
+    a.y=a.y*native_gui.sy+#cast(f32, native_gui.viewport.y)
+    b.x=b.x*native_gui.sx+#cast(f32, native_gui.viewport.x)
+    b.y=b.y*native_gui.sy+#cast(f32, native_gui.viewport.y)
+    c.x=c.x*native_gui.sx+#cast(f32, native_gui.viewport.x)
+    c.y=c.y*native_gui.sy+#cast(f32, native_gui.viewport.y)
+    area:=native_edge(a, b, c.x, c.y)
+    if area<0.0 {
+      temporary:=b
+      b=c
+      c=temporary
+      area=0.0-area
+    }
+    if area==0.0 || area!=area || clip.width<=0 || clip.height<=0 {
+      continue
+    }
+    // Bound work by the triangle, not the whole pane. Intersect in floating
+    // point before integer conversion so large/offscreen coordinates stay safe.
+    low_x := a.x
+    low_y := a.y
+    high_x := a.x
+    high_y := a.y
+    if b.x < low_x {
+      low_x = b.x
+    }
+    if c.x < low_x {
+      low_x = c.x
+    }
+    if b.y < low_y {
+      low_y = b.y
+    }
+    if c.y < low_y {
+      low_y = c.y
+    }
+    if b.x > high_x {
+      high_x = b.x
+    }
+    if c.x > high_x {
+      high_x = c.x
+    }
+    if b.y > high_y {
+      high_y = b.y
+    }
+    if c.y > high_y {
+      high_y = c.y
+    }
+    clip_right := clip.x + clip.width
+    clip_bottom := clip.y + clip.height
+    if high_x <= #cast(f32, clip.x) || high_y <= #cast(f32, clip.y) || low_x >= #cast(f32, clip_right) || low_y >= #cast(f32, clip_bottom) {
+      continue
+    }
+    if low_x < #cast(f32, clip.x) {
+      low_x = #cast(f32, clip.x)
+    }
+    if low_y < #cast(f32, clip.y) {
+      low_y = #cast(f32, clip.y)
+    }
+    if high_x > #cast(f32, clip_right) {
+      high_x = #cast(f32, clip_right)
+    }
+    if high_y > #cast(f32, clip_bottom) {
+      high_y = #cast(f32, clip_bottom)
+    }
+    // Clip coordinates are nonnegative surface positions. Truncation floors
+    // the lower edges; round upper edges up to include every pixel center.
+    left := #cast(i32, low_x)
+    top := #cast(i32, low_y)
+    right := #cast(i32, high_x)
+    bottom := #cast(i32, high_y)
+    if #cast(f32, right) < high_x {
+      right += 1
+    }
+    if #cast(f32, bottom) < high_y {
+      bottom += 1
+    }
+    for y in top..bottom {
+      for x in left..right {
+        wa:=native_edge(b, c, #cast(f32, x)+0.5, #cast(f32, y)+0.5)/area
+        wb:=native_edge(c, a, #cast(f32, x)+0.5, #cast(f32, y)+0.5)/area
+        wc:=1.0-wa-wb
+        if (wa>0.0 || (wa==0.0 && native_top_left(b, c))) && (wb>0.0 || (wb==0.0 && native_top_left(c, a))) && (wc>0.0 || (wc==0.0 && native_top_left(a, b))) {
+          native_blend(&surface, x, y, #cast(u8, (a.red*wa+b.red*wb+c.red*wc)*255.0), #cast(u8, (a.green*wa+b.green*wb+c.green*wc)*255.0), #cast(u8, (a.blue*wa+b.blue*wb+c.blue*wc)*255.0), #cast(u8, (a.alpha*wa+b.alpha*wb+c.alpha*wc)*255.0))
+        }
+      }
+    }
+  }
+  return true
+}
+pub fn native_color(renderer:rawptr, r, g, b, a:u8) bool {
+  return sdl_color(renderer, r, g, b, a)
+}
+pub fn native_fill(renderer:rawptr, x, y, width, height:f32) bool {
+  rect:=Rect{x:x, y:y, width:width, height:height}
+  return sdl_fill(renderer, &rect)
+}
+extern fn native_gui_attach "dna_native_gui_attach"(callback:fn(rawptr), data:rawptr)
+fn native_gui_wake(data:rawptr) {
+  _=window_api.wake(#cast(*window_api.Window, data))
+}
+
+fn native_top_left(a, b:Vertex) bool {
+  return b.y>a.y || (b.y==a.y && b.x<a.x)
+}
+
+

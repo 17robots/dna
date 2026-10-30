@@ -1,3 +1,4 @@
+use "../../src/owned_arena" arena_owner
 use "../../src/buffer" buffer
 use "std/mem"
 
@@ -16,12 +17,12 @@ fn uniform(text: []const u8, byte: u8, scratch: []u8) bool {
   return buffer.equal(text, scratch[..#len(text)])
 }
 fn main() {
-  arena := mem.arena_create(#sizeof(buffer.Document) + mem.ArenaBufferOverhead)
-  defer mem.arena_release(arena)
-  large := mem.arena_create(buffer.Capacity + mem.ArenaBufferOverhead)
-  check := mem.arena_create(buffer.Capacity + mem.ArenaBufferOverhead)
-  defer mem.arena_release(large)
-  defer mem.arena_release(check)
+  arena := arena_owner.create(#sizeof(buffer.Document))
+  defer arena_owner.release(arena)
+  large := arena_owner.create(buffer.Capacity)
+  check := arena_owner.create(buffer.Capacity)
+  defer arena_owner.release(large)
+  defer arena_owner.release(check)
   full := mem.arena_push_uninit(large, buffer.Capacity, 1)[..buffer.Capacity]
   check_bytes := mem.arena_push_uninit(check, buffer.Capacity, 1)[..buffer.Capacity]
   // Allocation must also work on dirty/reused backing: poison the metadata
@@ -45,6 +46,7 @@ fn main() {
   if document.history_storage[#len(document.history_storage) - 1] != 165 || document.bytes[buffer.Capacity] != 165 || document.saved_storage[buffer.Capacity] != 165 {
     #panic("unused document storage touched")
   }
+  observer_checks(document)
   snapshot_baseline_checks(document)
   compact_index_checks(document)
   same_size_line_checks(document)
@@ -1125,8 +1127,8 @@ fn batch_failure_checks(doc: *buffer.Document) {
   if !buffer.open_lines_count(doc, false, 2) || !buffer.equal(doc.bytes[..doc.length], "a\n\n\nb\n\n") || doc.secondary.count != 1 {
     #panic("counted multi open")
   }
-  large := mem.arena_create(buffer.Capacity + mem.ArenaBufferOverhead)
-  defer mem.arena_release(large)
+  large := arena_owner.create(buffer.Capacity)
+  defer arena_owner.release(large)
   full := mem.arena_push_uninit(large, buffer.Capacity, 1)[..buffer.Capacity]
   fill(full, 97)
   _ = buffer.load(doc, full)
@@ -1382,8 +1384,8 @@ fn compact_index_checks(document: *buffer.Document) {
 // Compare the bulk edit with the established per-line edit semantics. This
 // checks every byte position as a tracked mark, row identities and undo deltas.
 fn indentation_equivalence_checks(document: *buffer.Document) {
-  owner := mem.arena_create(#sizeof(buffer.Document) + mem.ArenaBufferOverhead)
-  defer mem.arena_release(owner)
+  owner := arena_owner.create(#sizeof(buffer.Document))
+  defer arena_owner.release(owner)
   reference := buffer.allocate(owner)
   samples: [5][]const u8 = ["", "a", " a\n\t b\n  \t  c\n\n tail\n", "\t\tα\n   β\n z", "a\n\n"]
   for sample in samples {
@@ -1570,4 +1572,85 @@ fn reference_indentation(document: *buffer.Document, unindent: bool, count: usiz
   document.cursor = result_end
   buffer.checkpoint(document)
   return true
+}
+
+struct ObserverProbe { document: *buffer.Document, calls: usize, revision, saved_epoch: u64 }
+fn observer_notice(context: rawptr) {
+  probe := #cast(*ObserverProbe, context)
+  probe.calls += 1
+  probe.revision = probe.document.revision
+  probe.saved_epoch = probe.document.saved_epoch
+  if probe.document.cursor > probe.document.length || probe.document.anchor > probe.document.length {
+    #panic("observer before cursor update")
+  }
+}
+fn observer_checks(document: *buffer.Document) {
+  first := ObserverProbe{document: document}
+  second := ObserverProbe{document: document}
+  buffer.observe(document, #cast(rawptr, &first), observer_notice)
+  if first.calls != 0 {
+    #panic("binding must not notify")
+  }
+  _ = buffer.load(document, "one\ntwo")
+  if first.calls != 1 || first.revision != document.revision || first.saved_epoch != document.saved_epoch {
+    #panic("completed load observer")
+  }
+  buffer.move_to(document, 3, false)
+  _ = buffer.replace(document, "!")
+  if first.calls != 2 || first.revision != document.revision {
+    #panic("edit observer")
+  }
+  buffer.checkpoint(document)
+  buffer.undo(document)
+  if first.calls != 3 || first.revision != document.revision {
+    #panic("undo observer")
+  }
+  buffer.redo(document)
+  if first.calls != 4 || first.revision != document.revision {
+    #panic("redo observer")
+  }
+  buffer.mark_saved(document)
+  if first.calls != 5 || first.saved_epoch != document.saved_epoch {
+    #panic("save observer")
+  }
+  buffer.track_rows(document, 2)
+  if first.calls != 6 || first.saved_epoch != document.saved_epoch {
+    #panic("saved row observer")
+  }
+  before := first.calls
+  buffer.move_to(document, 0, false)
+  document.anchor = document.length
+  buffer.change_case(document, 2)
+  if first.calls != before + 1 {
+    #panic("in-place case observer")
+  }
+  before = first.calls
+  if !buffer.indent_lines_by(document, false, 1, 2, false) || first.calls != before + 1 {
+    #panic("in-place indentation observer")
+  }
+  before = first.calls
+  if !buffer.transform(document, "formatted\ntext") || first.calls != before + 1 {
+    #panic("compound transformation observer")
+  }
+  before = first.calls
+  if buffer.load(document, "bad\0text") || buffer.replace(document, "\0") || first.calls != before {
+    #panic("failed changes must not notify")
+  }
+  buffer.checkpoint(document)
+  buffer.move_to(document, 0, false)
+  if first.calls != before {
+    #panic("unchanged state must not notify")
+  }
+  buffer.observe(document, #cast(rawptr, &second), observer_notice)
+  _ = buffer.load(document, "replacement")
+  if first.calls != before || second.calls != 1 {
+    #panic("observer rebinding")
+  }
+  buffer.clear_observer(document)
+  _ = buffer.load(document, "detached")
+  buffer.mark_saved(document)
+  if first.calls != before || second.calls != 1 || document.on_change != nil || document.change_context != nil {
+    #panic("observer detach")
+  }
+  _ = buffer.load(document, "")
 }

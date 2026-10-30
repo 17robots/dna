@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 
 from dyn_path import real_dyn
+from sdk_check import require_ui_sdk
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -21,6 +22,7 @@ def main():
     compiler = real_dyn()
     if compiler is None:
         parser.error('install the pinned Dyn SDK with mise install, or set DYN explicitly')
+    require_ui_sdk(compiler)
     explicit_sdk = os.environ.get('DYN_SDK')
     sdk = Path(explicit_sdk).resolve() if explicit_sdk else None
     if sdk is not None and not (sdk / 'std').is_dir():
@@ -48,7 +50,6 @@ def main():
     else:
         environment.pop('DYN_SDK', None)
     # Keep this a real desktop preview, independent of headless test settings.
-    environment.pop('SDL_VIDEODRIVER', None)
     environment.pop('LD_PRELOAD', None)
     environment.pop('DYN_EDITOR_SMOKE', None)
     grammar = ROOT / 'build/test-languages/dyn/parser.so'

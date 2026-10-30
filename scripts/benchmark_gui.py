@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare GUI launch-to-first-buffer and idle memory in isolated Gamescope.
 
-This deliberately does not compare SDL presentation with Neovim RPC completion.
+This deliberately does not compare editor presentation with Neovim RPC completion.
 The common endpoint is the first non-null buffer commit on the toplevel Wayland
 surface. It does not prove file content was drawn, compositor presentation, or
 physical display latency. Memory includes each editor's complete process tree;
@@ -112,12 +112,12 @@ def worker(args):
         config = Path(temporary)
         fixture = config / 'fixture.txt'
         fixture.write_text('This is a line of text to edit in the document.\n' * 1100)
-        env = dict(os.environ, WAYLAND_DEBUG='client', SDL_VIDEODRIVER='wayland',
+        env = dict(os.environ, WAYLAND_DEBUG='client',
                    DNA_DEFAULT_SERVERS='0', DNA_RECOVERY='0', DNA_CONFIG=str(config / 'none'),
                    XDG_CONFIG_HOME=str(config), XDG_DATA_HOME=str(config / 'data'),
                    XDG_CACHE_HOME=str(config / 'cache'), WINIT_UNIX_BACKEND='wayland')
         for variable in list(env):
-            if variable.startswith('NEOVIDE_') or variable in ('LD_PRELOAD', 'DYN_EDITOR_SMOKE', 'SDL_RENDER_DRIVER', 'NEOVIM_BIN'):
+            if variable.startswith('NEOVIDE_') or variable in ('LD_PRELOAD', 'DYN_EDITOR_SMOKE', 'NEOVIM_BIN'):
                 env.pop(variable, None)
         commands = {
             'dna': [str(args.dna.resolve()), str(fixture)],

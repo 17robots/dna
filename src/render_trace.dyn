@@ -14,6 +14,9 @@ struct RenderTrace {
   started: u64,
   panes_finished: u64,
   present_started: u64,
+  event_seen, input_first_seen, input_last_seen: u64,
+  previous_present: u64,
+  previous_animation: bool,
   document_updates: u64,
   ui_updates, ui_hits, ui_creations: u64,
   palette_updates: u64,
@@ -24,7 +27,7 @@ struct RenderTrace {
   used: usize,
   written: usize,
 }
-// SDL resets its tick epoch on shutdown; tracing outlives SDL cleanup.
+// The platform tick epoch resets on shutdown; tracing outlives platform cleanup.
 fn render_clock() u64 {
   time := ThreadTime{}
   if thread_clock(1, &time) != 0 {
@@ -85,8 +88,34 @@ fn render_trace_open(app: *App) {
   add_text(trace.bytes[..], &trace.used, "{\"type\":\"schema\",\"version\":1,\"reasons\":{\"1\":\"startup\",\"2\":\"key\",\"4\":\"text\",\"8\":\"mouse\",\"16\":\"window\",\"32\":\"ime\",\"64\":\"animation\",\"128\":\"config\",\"256\":\"syntax\",\"512\":\"plugin\",\"1024\":\"disk\",\"2048\":\"lsp\",\"4096\":\"format\",\"8192\":\"search\",\"16384\":\"macro\",\"32768\":\"terminal\",\"65536\":\"hover\",\"131072\":\"explicit\"},\"time_unit\":\"us\",\"limit_bytes\":67108864}\n")
   render_trace_flush(trace)
 }
+// Event timestamps use this trace clock, avoiding incompatible platform/trace epochs.
+// This measures dequeue-to-present-return, not OS queueing or display scanout.
+fn render_trace_event(app: *App, event: *const sdl.Event) {
+  if !app.render_trace.enabled {
+    return
+  }
+  kind := #cast(u32, event.words[0] & 4294967295)
+  app.render_trace.event_seen = 0
+  if kind == 256 || (kind >= 512 && kind <= 540) || kind == 768 || kind == 770 || kind == 771 || (kind >= 1024 && kind <= 1027) || kind == sdl.PasteEvent {
+    app.render_trace.event_seen = render_clock()
+  }
+}
+fn render_trace_poll(app: *App, event: *sdl.Event) bool {
+  ready := sdl.poll(event)
+  if ready {
+    render_trace_event(app, event)
+  }
+  return ready
+}
 fn render_request(app: *App, reason: u32) {
-  app.render_trace.pending |= reason
+  trace := &app.render_trace
+  trace.pending |= reason
+  if trace.enabled && trace.event_seen != 0 && (reason & (RenderKey | RenderText | RenderMouse | RenderWindow | RenderIme)) != 0 {
+    if trace.input_first_seen == 0 {
+      trace.input_first_seen = trace.event_seen
+    }
+    trace.input_last_seen = trace.event_seen
+  }
 }
 fn render_trace_begin(app: *App, typography: *Typography) {
   trace := &app.render_trace
@@ -149,6 +178,21 @@ fn render_trace_end(app: *App, typography: *Typography) {
     render_field(trace.bytes[..], &trace.used, "total_us", elapsed)
     render_field(trace.bytes[..], &trace.used, "panes_us", #cast(usize, ((trace.panes_finished - trace.started) / 1000)))
     render_field(trace.bytes[..], &trace.used, "present_us", #cast(usize, ((finished - trace.present_started) / 1000)))
+    if trace.input_first_seen != 0 {
+      render_field(trace.bytes[..], &trace.used, "dequeue_to_present_us", operation_delta(trace.input_first_seen, finished))
+      render_field(trace.bytes[..], &trace.used, "latest_input_to_present_us", operation_delta(trace.input_last_seen, finished))
+    }
+    refresh_budget: usize = 0
+    if app.view.refresh_ms > 0.0 {
+      refresh_budget = #cast(usize, app.view.refresh_ms * 1000.0)
+    }
+    render_field(trace.bytes[..], &trace.used, "refresh_budget_us", refresh_budget)
+    if trace.previous_present != 0 && trace.previous_animation {
+      interval := operation_delta(trace.previous_present, finished)
+      render_field(trace.bytes[..], &trace.used, "animation_interval_us", interval)
+      // A submission interval is late; this is not compositor presentation feedback.
+      render_field(trace.bytes[..], &trace.used, "late_animation_interval", render_bool(refresh_budget > 0 && interval > refresh_budget + refresh_budget / 2))
+    }
     render_field(trace.bytes[..], &trace.used, "document_updates", #cast(usize, (typography.document_updates - trace.document_updates)))
     render_field(trace.bytes[..], &trace.used, "palette_updates", #cast(usize, (typography.palette_updates - trace.palette_updates)))
     render_field(trace.bytes[..], &trace.used, "ui_updates", #cast(usize, (typography.ui_updates - trace.ui_updates)))
@@ -161,6 +205,10 @@ fn render_trace_end(app: *App, typography: *Typography) {
     add_text(trace.bytes[..], &trace.used, "}\n")
   }
   trace.events = 0
+  trace.input_first_seen = 0
+  trace.input_last_seen = 0
+  trace.previous_present = finished
+  trace.previous_animation = app.view.animation.active
 }
 fn render_trace_close(app: *App) {
   trace := &app.render_trace

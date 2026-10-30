@@ -1,0 +1,277 @@
+// Native clock/readback hooks exist only in the standalone test driver.
+struct PopupSurfaceProbe { time:fn(u64), pixels:fn()[]const u8, resize:fn(i32, i32) }
+fn popup_surface_draw(app:*App, typography:*Typography, renderer, window:rawptr, probe:PopupSurfaceProbe, now:u64, cause:u32) {
+  probe.time(now)
+  app.render_trace.pending=cause
+  draw(renderer, window, app, typography)
+}
+fn popup_surface_rect(app:*App, kind:usize) sdl.Rect {
+  key:[]const u8="picker"
+  if kind==SurfacePalette {
+    key="palette"
+  }
+  if kind==SurfaceMenu {
+    key="key menu"
+  }
+  if kind==SurfaceExplorer {
+    key="explorer"
+    if app.prompt_state.panel==Panel.Tree {
+      key="tree"
+    }
+  }
+  index:=ui_make_lookup(&app.ui, ui_hash(0, key))
+  if index==0 {
+    #panic("popup motion fixture missing UI frame")
+  }
+  return app.ui.boxes[index].rect
+}
+fn popup_surface_picker_setup(app:*App, style:u8) {
+  app.prompt_state.panel=Panel.Open
+  app.config.picker_style=style
+  app.resource_state.kind=1
+  app.completion.count=24
+  app.completion.selected=23
+  for row in 0..24 {
+    entry:=&app.completion.entries[row]
+    entry.length=copy_text(entry.name[..], "candidate ")
+    add_number(entry.name[..], &entry.length, row)
+  }
+}
+fn popup_surface_same(a, b:sdl.Rect) bool {
+  return distance(a.x, b.x)<1.1 && distance(a.y, b.y)<1.1 && distance(a.width, b.width)<1.1 && distance(a.height, b.height)<1.1
+}
+fn popup_surface_bounds(app:*App, kind:usize, rect:sdl.Rect) {
+  if !popup_surface_same(placed_rects[kind], rect) {
+    #panic("popup drawn geometry differs from placement hit cache")
+  }
+  if rect.width<=0.0 || rect.height<=0.0 {
+    #panic("popup motion produced unusable geometry")
+  }
+}
+fn popup_surface_selection(app:*App, typography:*Typography) {
+  for i in 1..UiCapacity {
+    item:=&app.ui.boxes[i]
+    if item.touched==app.ui.frame && (item.flags&UiScroll)!=0 {
+      top:=#cast(f32, app.completion.selected)*typography.line
+      if top<item.scroll.value-0.1 || top+typography.line>item.scroll.value+item.rect.height+0.1 {
+        #panic("popup animation clips the selected picker row")
+      }
+      return
+    }
+  }
+  #panic("popup motion fixture missing picker list")
+}
+fn popup_surface_hit(app:*App, kind:usize) {
+  key:[]const u8="picker"
+  if kind==SurfacePalette {
+    key="palette"
+  }
+  if kind==SurfaceMenu {
+    key="key menu"
+  }
+  if kind==SurfaceExplorer {
+    key="explorer"
+    if app.prompt_state.panel==Panel.Tree {
+      key="tree"
+    }
+  }
+  frame:=ui_make_lookup(&app.ui, ui_hash(0, key))
+  bounds:=app.ui.boxes[frame].rect
+  for i in 1..UiCapacity {
+    item:=&app.ui.boxes[i]
+    if item.touched!=app.ui.frame || (item.flags&UiClickable)==0 || item.rect.height<=0.0 {
+      continue
+    }
+    parent:=item.parent
+    for parent!=0 && parent!=frame {
+      parent=app.ui.boxes[parent].parent
+    }
+    if parent!=frame {
+      continue
+    }
+    x:=item.rect.x+item.rect.width*0.5
+    y:=item.rect.y+item.rect.height*0.5
+    if x<=bounds.x || x>=bounds.x+bounds.width || y<=bounds.y || y>=bounds.y+bounds.height {
+      continue
+    }
+    parent=item.parent
+    visible:=true
+    for parent!=0 {
+      ancestor:=&app.ui.boxes[parent]
+      if (ancestor.flags&UiClip)!=0 && !ui_contains(ancestor.rect, x, y) {
+        visible=false
+      }
+      parent=ancestor.parent
+    }
+    if !visible {
+      continue
+    }
+    hit:=ui_hit(&app.ui, x, y)
+    for hit!=0 && hit!=i {
+      hit=app.ui.boxes[hit].parent
+    }
+    if hit!=i {
+      #panic("popup click does not hit its drawn row during motion")
+    }
+    return
+  }
+  #panic("popup motion fixture lacks visible clickable row")
+}
+fn popup_surface_motion_smoke(app:*App, typography:*Typography, renderer, window:rawptr, probe:PopupSurfaceProbe) {
+  app.prompt_state.panel=Panel.None
+  app.view.reduced_motion=false
+  app.config.popup_transitions=true
+  app.config.popup_animation_ms=40.0
+  app.config.smooth_cursor=false
+  app.config.smooth_scroll=false
+  app.config.picker_preview=false
+  app.config.explorer_icons=false
+  app.config.explorer_preview=false
+  probe.resize(960, 640)
+  popup_surface_draw(app, typography, renderer, window, probe, 1000, 0)
+  for extra in 0..3 {
+    if !new_buffer(app) {
+      #panic("popup buffer fixture allocation")
+    }
+  }
+  popup_surface_draw(app, typography, renderer, window, probe, 1500, 0)
+  pixels:=probe.pixels()
+  owner:=arena_owner.create(#len(pixels)+128)
+  defer arena_owner.release(owner)
+  saved:=mem.push_bytes_uninit(owner, #len(pixels))
+  for variant in 0..9 {
+    base:=#cast(u64, 2000+variant*1000)
+    app.prompt_state.panel=Panel.None
+    app.view.insert=false
+    app.config.vim_keys=false
+    app.vim.pending=0
+    app.tree.open=false
+    app.resource_state.kind=0
+    popup_surface_draw(app, typography, renderer, window, probe, base, 0)
+    kind:=SurfacePicker
+    if variant<3 {
+      popup_surface_picker_setup(app, #cast(u8, variant))
+    } else if variant==3 {
+      app.prompt_state.panel=Panel.Buffers
+      app.prompt_state.length=0
+      app.prompt_state.selected=0
+    } else if variant==4 {
+      app.config.picker_style=0
+      app.prompt_state.panel=Panel.Commands
+      app.prompt_state.length=0
+      app.prompt_state.selected=0
+      kind=SurfacePalette
+    } else if variant==5 {
+      app.prompt_state.panel=Panel.Leader
+      kind=SurfaceMenu
+    } else if variant==6 {
+      app.config.vim_keys=true
+      app.vim.pending='g'
+      kind=SurfaceMenu
+    } else if variant==7 {
+      app.config.explorer_style=0
+      explorer_buffer_open(app)
+      kind=SurfaceExplorer
+    } else {
+      app.config.explorer_style=1
+      app.config.places[SurfaceExplorer]=settings.Placement{mode:settings.PlaceFloat, width:500.0, height:350.0}
+      app.tree=TreeState{}
+      app.tree.open=true
+      app.tree.loaded=true
+      app.tree.root_length=copy_text(app.tree.root[..], "/popup-fixture")
+      app.tree.names_used=copy_text(app.tree.names[..], "example.dyn")
+      app.tree.nodes[0]=TreeNode{offset:0, length:11}
+      app.tree.count=1
+      app.prompt_state.panel=Panel.Tree
+      kind=SurfaceExplorer
+    }
+    popup_surface_draw(app, typography, renderer, window, probe, base+100, RenderKey)
+    first:=popup_surface_rect(app, kind)
+    popup_surface_bounds(app, kind, first)
+    if variant!=7 {
+      popup_surface_hit(app, kind)
+    }
+    if variant<3 {
+      popup_surface_selection(app, typography)
+    }
+    popup_surface_draw(app, typography, renderer, window, probe, base+116, RenderAnimation)
+    middle:=popup_surface_rect(app, kind)
+    popup_surface_bounds(app, kind, middle)
+    popup_surface_draw(app, typography, renderer, window, probe, base+500, RenderAnimation)
+    final:=popup_surface_rect(app, kind)
+    popup_surface_bounds(app, kind, final)
+    if first.width>=final.width && first.height>=final.height {
+      #panic("popup opening must grow spatially")
+    }
+    if middle.width<first.width-0.1 || middle.height<first.height-0.1 {
+      #panic("popup spatial motion reversed or restarted")
+    }
+    if first.x<final.x-0.1 || first.y<final.y-0.1 || first.x+first.width>final.x+final.width+0.1 || first.y+first.height>final.y+final.height+0.1 {
+      #panic("popup seed escapes final bounds")
+    }
+    _=mem.copy(saved, probe.pixels())
+    app.view.reduced_motion=true
+    popup_surface_draw(app, typography, renderer, window, probe, base+500, 0)
+    if !buffer.equal(saved, probe.pixels()) {
+      #panic("settled popup pixels differ from immediate reference")
+    }
+    app.view.reduced_motion=false
+  }
+  // Navigation during an opening is effective immediately and ends decoration.
+  app.prompt_state.panel=Panel.None
+  app.tree.open=false
+  app.vim.pending=0
+  app.config.vim_keys=false
+  popup_surface_draw(app, typography, renderer, window, probe, 12000, 0)
+  popup_surface_picker_setup(app, 0)
+  popup_surface_draw(app, typography, renderer, window, probe, 12100, RenderKey)
+  key_input(app, typography, KeyUp, 0)
+  if app.completion.selected!=22 {
+    #panic("popup animation delayed picker navigation")
+  }
+  popup_surface_draw(app, typography, renderer, window, probe, 12101, RenderKey)
+  actual:=popup_surface_rect(app, SurfacePicker)
+  target:=picker_geometry(app, typography, 960, 640, typography.line, app.completion.count).rect
+  if !popup_surface_same(actual, target) {
+    #panic("picker input must immediately finish spatial motion")
+  }
+  popup_surface_selection(app, typography)
+  text_input(app, "candidate")
+  popup_surface_draw(app, typography, renderer, window, probe, 12102, RenderText)
+  if !buffer.equal(app.prompt_state.text[..app.prompt_state.length], "candidate") {
+    #panic("popup animation delayed query input")
+  }
+  key_input(app, typography, KeyEscape, 0)
+  popup_surface_draw(app, typography, renderer, window, probe, 12103, RenderKey)
+  if app.prompt_state.panel!=Panel.None || app.view.animation.popup.value!=0.0 {
+    #panic("popup dismissal must remain immediate")
+  }
+  for mode in 0..5 {
+    app.prompt_state.panel=Panel.None
+    app.view.reduced_motion=mode==0
+    app.config.popup_transitions=mode!=1
+    app.config.popup_animation_ms=40.0
+    if mode==2 {
+      app.config.popup_animation_ms=0.0
+    }
+    app.pointer.dragging=mode==3
+    probe.resize(960, 640)
+    popup_surface_draw(app, typography, renderer, window, probe, 13000+#cast(u64, mode)*1000, 0)
+    popup_surface_picker_setup(app, 0)
+    width:i32=960
+    height:i32=640
+    if mode==4 {
+      width=1000
+      height=700
+      probe.resize(width, height)
+    }
+    popup_surface_draw(app, typography, renderer, window, probe, 13100+#cast(u64, mode)*1000, RenderKey)
+    actual=popup_surface_rect(app, SurfacePicker)
+    target=picker_geometry(app, typography, width, height, typography.line, app.completion.count).rect
+    if !popup_surface_same(actual, target) {
+      #panic("disabled motion or resize still animates popup geometry")
+    }
+  }
+  app.pointer.dragging=false
+  app.running=false
+}

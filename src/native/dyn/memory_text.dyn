@@ -1,16 +1,39 @@
-#link("SDL3_ttf")
-extern fn memory_text_create "TTF_CreateText"(engine: rawptr, font: rawptr, text: *const u8, length: usize) rawptr
-extern fn memory_text_destroy "TTF_DestroyText"(text: rawptr)
+// Staged in place of src/native/dyn/memory_text.dyn. GUI-thread callbacks keep
+// text implementation in the executable and preserve native memory counters.
+struct NativeTextCallbacks {
+  create: fn(rawptr, rawptr, *const u8, usize) rawptr,
+  destroy: fn(rawptr),
+  set: fn(rawptr, *const u8, usize) bool,
+  color: fn(rawptr, u8, u8, u8, u8) bool,
+  draw: fn(rawptr, f32, f32) bool,
+  font_size: fn(rawptr) f32,
+  renderer_color: fn(rawptr, u8, u8, u8, u8) bool,
+  fill: fn(rawptr, f32, f32, f32, f32) bool,
+}
+native_text_callbacks: NativeTextCallbacks
+pub fn dna_native_text_attach(callbacks: *const NativeTextCallbacks) bool {
+  if callbacks==nil || callbacks.create==nil || callbacks.destroy==nil || callbacks.set==nil || callbacks.color==nil || callbacks.draw==nil || callbacks.font_size==nil || callbacks.renderer_color==nil || callbacks.fill==nil {
+    return false
+  }
+  native_text_callbacks = callbacks.*
+  return true
+}
 pub fn dna_text_create(engine: rawptr, font: rawptr, text: *const u8, length: usize) rawptr {
-  result := memory_text_create(engine, font, text, length)
-  if result != nil && memory_active() {
+  if native_text_callbacks.create==nil {
+    return nil
+  }
+  result := native_text_callbacks.create(engine, font, text, length)
+  if result!=nil && memory_active() {
     memory_record(5, 0, 0, false)
   }
   return result
 }
 pub fn dna_text_destroy(text: rawptr) {
-  if text != nil && memory_active() {
+  if text==nil || native_text_callbacks.destroy==nil {
+    return
+  }
+  if memory_active() {
     memory_record(5, 0, 0, true)
   }
-  memory_text_destroy(text)
+  native_text_callbacks.destroy(text)
 }

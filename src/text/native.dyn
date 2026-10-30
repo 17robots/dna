@@ -1,0 +1,721 @@
+// Native GUI text backend.
+// HarfBuzz glyph shaping and FriBidi paragraph ordering preserve UTF-8 source
+// offsets. Fonts, native libraries and cached bitmaps stay on the GUI thread.
+use "std/mem"
+use "std/fs" std_fs
+use "std/font" font_api
+use "vendor/text/layout" text_layout
+use "vendor/harfbuzz" hb
+use "vendor/fribidi" bidi
+use "vendor/freetype" ft
+use "std/dynlib"
+use "std/unicode/utf8"
+use "std/c"
+use "std/math"
+use "std/errors"
+use "../platform" sdl
+
+struct NativeTextCallbacks {
+  create: fn(rawptr, rawptr, *const u8, usize) rawptr,
+  destroy: fn(rawptr),
+  set: fn(rawptr, *const u8, usize) bool,
+  color: fn(rawptr, u8, u8, u8, u8) bool,
+  draw: fn(rawptr, f32, f32) bool,
+  font_size: fn(rawptr) f32,
+  renderer_color: fn(rawptr, u8, u8, u8, u8) bool,
+  fill: fn(rawptr, f32, f32, f32, f32) bool,
+}
+extern fn native_text_attach "dna_native_text_attach"(callbacks:*const NativeTextCallbacks) bool
+extern fn native_tracked_create "dna_text_create"(engine:rawptr, font:rawptr, text:*const u8, length:usize) rawptr
+extern fn native_tracked_destroy "dna_text_destroy"(text:rawptr)
+fn native_font_points(handle:rawptr) f32 {
+  if handle==nil {
+    return 0.0
+  }
+  return #cast(*NativeFont, handle).points
+}
+struct NativeGlyph { bitmap: font_api.Bitmap }
+struct NativeFont {
+  owner: *mem.Arena,
+  file: *mem.Arena,
+  face: font_api.Face,
+  freetype: ft.Font,
+  metrics: ft.FaceMetrics,
+  line_units: i32,
+  shaped: rawptr,
+  space: f64,
+  points: f32,
+  line: i32,
+  revision: u64,
+  fallbacks: [16]*NativeFont,
+  fallback_count: usize,
+  glyph_memory: *mem.Arena,
+  glyphs: [65536]*NativeGlyph,
+}
+struct NativeText {
+  owner: *mem.Arena,
+  payload: *mem.Arena,
+  font: *NativeFont,
+  renderer: rawptr,
+  layout: text_layout.Layout,
+  revision: u64,
+  fallback_count: usize,
+  fallback_revisions: [16]u64,
+  wrap: i32,
+  red: u8 = 255, green: u8 = 255, blue: u8 = 255, alpha: u8 = 255,
+}
+struct NativeLibraries {
+  harfbuzz: dynlib.Handle,
+  bidi: dynlib.Handle,
+  freetype: dynlib.Handle,
+  hb: hb.Api,
+  fb: bidi.Api,
+  ft: ft.Api,
+  fonts: usize,
+  closing: bool,
+}
+native_libraries: NativeLibraries
+fn native_library(names: []const []const u8) dynlib.Handle {
+  for name in names {
+    loaded:=dynlib.open(name, dynlib.Now|dynlib.Local)
+    if loaded.ok {
+      return loaded.value
+    }
+  }
+  return nil
+}
+pub fn init() bool {
+  if native_libraries.closing {
+    native_library_close()
+    if native_libraries.closing {
+      return false
+    }
+  }
+  if native_libraries.harfbuzz!=nil {
+    return !native_libraries.closing
+  }
+  hb_names: [4][]const u8=["libharfbuzz.so.0", "libharfbuzz.so", "libharfbuzz.0.dylib", "libharfbuzz-0.dll"]
+  fb_names: [4][]const u8=["libfribidi.so.0", "libfribidi.so", "libfribidi.0.dylib", "libfribidi-0.dll"]
+  hb_handle:=native_library(hb_names[..])
+  if hb_handle==nil {
+    return false
+  }
+  hb:=hb.load(hb_handle)
+  if !hb.ok {
+    _=dynlib.close(&hb_handle)
+    return false
+  }
+  fb_handle:=native_library(fb_names[..])
+  if fb_handle==nil {
+    _=dynlib.close(&hb_handle)
+    return false
+  }
+  fb:=bidi.load(fb_handle)
+  if !fb.ok {
+    _=dynlib.close(&fb_handle)
+    _=dynlib.close(&hb_handle)
+    return false
+  }
+  ft_names:[4][]const u8=["libfreetype.so.6", "libfreetype.so", "libfreetype.6.dylib", "libfreetype-6.dll"]
+  ft_handle:=native_library(ft_names[..])
+  if ft_handle==nil {
+    _=dynlib.close(&fb_handle)
+    _=dynlib.close(&hb_handle)
+    return false
+  }
+  ft:=ft.load(ft_handle)
+  if !ft.ok {
+    _=dynlib.close(&ft_handle)
+    _=dynlib.close(&fb_handle)
+    _=dynlib.close(&hb_handle)
+    return false
+  }
+  native_libraries=NativeLibraries{harfbuzz:hb_handle, bidi:fb_handle, freetype:ft_handle, hb:hb.api, fb:fb.api, ft:ft.api}
+  return true
+}
+fn native_library_close() {
+  if native_libraries.fonts!=0 {
+    return
+  }
+  if native_libraries.freetype!=nil {
+    _=dynlib.close(&native_libraries.freetype)
+  }
+  if native_libraries.bidi!=nil {
+    _=dynlib.close(&native_libraries.bidi)
+  }
+  if native_libraries.harfbuzz!=nil {
+    _=dynlib.close(&native_libraries.harfbuzz)
+  }
+  if native_libraries.freetype==nil && native_libraries.bidi==nil && native_libraries.harfbuzz==nil {
+    native_libraries=NativeLibraries{}
+  }
+}
+pub fn quit() {
+  native_libraries.closing=true
+  native_library_close()
+}
+fn native_points(points: f32) bool {
+  return points == points && points >= 1.0 && points <= 256.0
+}
+fn native_em(font: *const NativeFont) u16 {
+  return #cast(u16, math.floor64(#cast(f64, font.points) + 0.5))
+}
+fn native_line(font: *const NativeFont) i32 {
+  if font.line > 0 {
+    return font.line
+  }
+  units:=font.line_units
+  if units<=0 {
+    units=#cast(i32, font.metrics.ascent)-#cast(i32, font.metrics.descent)
+  }
+  height := #cast(i32, math.ceil64(#cast(f64, units)*#cast(f64, native_em(font))/#cast(f64, font.metrics.units_per_em)))
+  ink := ttf_font_height(#cast(rawptr, font))
+  if height < ink {
+    height = ink
+  }
+  return height
+}
+// Ink rows are independent of an explicit line-skip override. The renderer
+// rounds the baseline upward, so ascent and descent must be rounded separately.
+fn ttf_font_height(handle: rawptr) i32 {
+  if handle == nil {
+    return 0
+  }
+  font := #cast(*NativeFont, handle)
+  scale := #cast(f64, native_em(font)) / #cast(f64, font.metrics.units_per_em)
+  ascent := math.ceil64(#cast(f64, font.metrics.ascent) * scale)
+  descent := math.ceil64(0.0 - #cast(f64, font.metrics.descent) * scale)
+  if descent < 0.0 {
+    descent = 0.0
+  }
+  return #cast(i32, ascent + descent)
+}
+fn ttf_open(path: *const u8, points: f32) rawptr {
+  if path == nil || !native_points(points) || !init() {
+    return nil
+  }
+  length := c.string_length(path, 4096)
+  if length == 0 || length == 4096 {
+    return nil
+  }
+  file := mem.arena_create(0)
+  loaded := std_fs.read_all(file, path[..length], 67108864)
+  if !loaded.ok {
+    mem.arena_release(file)
+    return nil
+  }
+  face := font_api.open(loaded.value)
+  owner := mem.arena_create(0)
+  font := mem.push(NativeFont, owner)
+  font.owner = owner
+  font.file = file
+  font.face = face.value
+  font.points = points
+  font.revision = 1
+  if face.ok {
+    font.metrics=ft.FaceMetrics{units_per_em:face.value.units_per_em, ascent:face.value.ascent, descent:face.value.descent}
+    font.line_units=#cast(i32, face.value.ascent)-#cast(i32, face.value.descent)+#cast(i32, face.value.line_gap)
+  } else {
+    opened:=ft.open(&font.freetype, native_libraries.ft, loaded.value, 0, #cast(u32, native_em(font)))
+    if !opened.ok {
+      mem.arena_release(font.file)
+      mem.arena_release(owner)
+      return nil
+    }
+    metrics:=ft.face_metrics(font.freetype.face)
+    if !metrics.ok {
+      ft.close(&font.freetype)
+      mem.arena_release(font.file)
+      mem.arena_release(owner)
+      return nil
+    }
+    font.metrics=metrics.value
+    font.line_units=#cast(i32, metrics.value.height)
+  }
+  shaped:=hb.font_owned(&native_libraries.hb, loaded.value, 0)
+  if !shaped.ok {
+    if font.freetype.face!=nil {
+      ft.close(&font.freetype)
+    }
+    mem.arena_release(font.file)
+    mem.arena_release(owner)
+    return nil
+  }
+  font.shaped=shaped.value
+  native_shape_size(font)
+  native_libraries.fonts+=1
+  return #cast(rawptr, font)
+}
+fn ttf_close(handle: rawptr) {
+  if handle == nil {
+    return
+  }
+  font := #cast(*NativeFont, handle)
+  mem.arena_release(font.glyph_memory)
+  native_libraries.hb.font_destroy(font.shaped)
+  if font.freetype.face!=nil {
+    ft.close(&font.freetype)
+  }
+  mem.arena_release(font.file)
+  owner := font.owner
+  mem.arena_release(owner)
+  native_libraries.fonts-=1
+  if native_libraries.closing {
+    native_library_close()
+  }
+}
+fn ttf_font_size(handle: rawptr, points: f32) bool {
+  if handle == nil || !native_points(points) {
+    return false
+  }
+  font := #cast(*NativeFont, handle)
+  if font.points != points {
+    if font.freetype.face!=nil {
+      pixels:=#cast(u32, math.floor64(#cast(f64, points)+0.5))
+      if font.freetype.api.set_pixel_sizes(font.freetype.face, 0, pixels)!=0 {
+        return false
+      }
+    }
+    font.points = points
+    native_shape_size(font)
+    mem.arena_release(font.glyph_memory)
+    font.glyph_memory = nil
+    for i in 0..65536 {
+      font.glyphs[i] = nil
+    }
+    font.revision += 1
+  }
+  return true
+}
+fn ttf_line_skip(handle: rawptr, pixels: i32) {
+  if handle == nil || pixels <= 0 {
+    return
+  }
+  font := #cast(*NativeFont, handle)
+  if font.line != pixels {
+    font.line = pixels
+    font.revision += 1
+  }
+}
+fn native_shape_size(font:*NativeFont) {
+  em:=#cast(i32, native_em(font))
+  native_libraries.hb.font_set_scale(font.shaped, em*64, em*64)
+  native_libraries.hb.font_set_ppem(font.shaped, #cast(u32, em), #cast(u32, em))
+  scratch:=mem.arena_create(0)
+  defer mem.arena_release(scratch)
+  features:[0]hb.Feature=[]
+  shape:=hb.shape(scratch, &native_libraries.hb, font.shaped, " ", hb.LeftToRight, features[..])
+  font.space=#cast(f64, em)/2.0
+  if shape.ok && #len(shape.value)==1 {
+    font.space=#cast(f64, shape.value[0].x_advance)/64.0
+  }
+}
+fn native_covered(font:*NativeFont, grapheme:[]const u8) bool {
+  at:usize=0
+  for at<#len(grapheme) {
+    scalar:=utf8.decode(grapheme, at)
+    if !scalar.ok {
+      return false
+    }
+    cp:=scalar.codepoint
+    ignorable:=cp==0x200c || cp==0x200d || (cp>=0xfe00 && cp<=0xfe0f) || (cp>=0xe0100 && cp<=0xe01ef)
+    if !ignorable && native_index(font, cp)==0 {
+      return false
+    }
+    at+=scalar.width
+  }
+  return true
+}
+fn native_select(data:rawptr, grapheme:[]const u8) text_layout.Face {
+  primary:=#cast(*NativeFont, data)
+  selected:=primary
+  if !native_covered(primary, grapheme) {
+    for i in 0..primary.fallback_count {
+      candidate:=primary.fallbacks[i]
+      if native_covered(candidate, grapheme) {
+        selected=candidate
+        break
+      }
+    }
+  }
+  return text_layout.Face{data:#cast(rawptr, selected), font:selected.shaped}
+}
+fn native_index(font:*const NativeFont, cp:u32) u32 {
+  if font.freetype.face!=nil {
+    return font.freetype.api.char_index(font.freetype.face, #cast(ft.ULong, cp))
+  }
+  return #cast(u32, font_api.glyph_index(&font.face, cp))
+}
+fn native_bitmap(font:*NativeFont, index:u16) *NativeGlyph {
+  if font.glyphs[index]!=nil {
+    return font.glyphs[index]
+  }
+  if font.glyph_memory == nil {
+    font.glyph_memory = mem.arena_create(0)
+  }
+  mark:=mem.arena_mark(font.glyph_memory)
+  bitmap:=font_api.Bitmap{}
+  if font.freetype.face==nil {
+    raster:=font_api.raster(font.glyph_memory, &font.face, index, native_em(font))
+    if !raster.ok {
+      mem.arena_rewind(font.glyph_memory, mark)
+      return nil
+    }
+    bitmap=raster.value
+  } else {
+    if font.freetype.api.load_glyph(font.freetype.face, #cast(u32, index), ft.LoadRender)!=0 {
+      return nil
+    }
+    rendered:=ft.bitmap(font.freetype.face)
+    if !rendered.ok {
+      return nil
+    }
+    value:=rendered.value
+    pixels:=mem.push_bytes_uninit(font.glyph_memory, #cast(usize, value.width)*#cast(usize, value.height))
+    for row in 0..value.height {
+      _=mem.copy(pixels[#cast(usize, row)*#cast(usize, value.width)..#cast(usize, row+1)*#cast(usize, value.width)], value.pixels[#cast(usize, row)*value.stride..#cast(usize, row)*value.stride+#cast(usize, value.width)])
+    }
+    bitmap=font_api.Bitmap{pixels:pixels, width:value.width, height:value.height, x_offset:value.left, y_offset:0-value.top, advance:#cast(i32, value.advance_x/64)}
+  }
+  glyph:=mem.push(NativeGlyph, font.glyph_memory)
+  glyph.bitmap=bitmap
+  font.glyphs[index]=glyph
+  return glyph
+}
+fn native_build(arena:*mem.Arena, font:*NativeFont, text:[]const u8, wrap:i32) text_layout.Result {
+  if !utf8.valid(text) || #len(text)>2147483647 {
+    return text_layout.Result{kind:errors.Kind.InvalidInput}
+  }
+  return text_layout.build(arena, text, text_layout.Font{data:#cast(rawptr, font), select:native_select, line_height:native_line(font), space_advance:font.space}, &native_libraries.hb, &native_libraries.fb, text_layout.Options{width:wrap, wrap:wrap>0})
+}
+fn native_update(text: *NativeText, font: *NativeFont, source: []const u8, wrap: i32) bool {
+  if !utf8.valid(source) || #len(source)>2147483647 || wrap<0 {
+    return false
+  }
+  payload := mem.arena_create(0)
+  result := native_build(payload, font, source, wrap)
+  if !result.ok {
+    mem.arena_release(payload)
+    return false
+  }
+  mem.arena_release(text.payload)
+  text.payload = payload
+  text.layout = result.value
+  text.font = font
+  text.wrap = wrap
+  text.revision = font.revision
+  text.fallback_count = font.fallback_count
+  for i in 0..font.fallback_count {
+    text.fallback_revisions[i] = font.fallbacks[i].revision
+  }
+  return true
+}
+fn native_current(text: *NativeText) bool {
+  changed := text.revision != text.font.revision || text.fallback_count != text.font.fallback_count
+  for i in 0..text.font.fallback_count {
+    if text.fallback_revisions[i] != text.font.fallbacks[i].revision {
+      changed = true
+    }
+  }
+  if !changed {
+    return true
+  }
+  return native_update(text, text.font, text.layout.text, text.wrap)
+}
+fn ttf_measure(handle: rawptr, bytes: *const u8, length: usize, width: *i32, height: *i32) bool {
+  if handle == nil || (bytes==nil && length!=0) {
+    return false
+  }
+  arena := mem.arena_create(0)
+  defer mem.arena_release(arena)
+  result := native_build(arena, #cast(*NativeFont, handle), bytes[..length], 0)
+  if !result.ok {
+    return false
+  }
+  if width != nil {
+    width.* = #cast(i32, math.ceil64(result.value.width))
+  }
+  if height != nil {
+    height.* = #cast(i32, math.ceil64(result.value.height))
+  }
+  return true
+}
+fn ttf_engine(renderer: rawptr) rawptr {
+  callbacks:=NativeTextCallbacks{create:native_create, destroy:native_destroy, set:ttf_set, color:ttf_color, draw:ttf_draw, font_size:native_font_points, renderer_color:sdl.native_color, fill:sdl.native_fill}
+  if !native_text_attach(&callbacks) {
+    return nil
+  }
+  return renderer
+}
+fn ttf_create(engine:rawptr, font:rawptr, bytes:*const u8, length:usize) rawptr {
+  return native_tracked_create(engine, font, bytes, length)
+}
+fn ttf_destroy(text:rawptr) {
+  native_tracked_destroy(text)
+}
+fn ttf_destroy_engine(engine: rawptr) {}
+fn native_create(engine: rawptr, handle: rawptr, bytes: *const u8, length: usize) rawptr {
+  if engine == nil || handle == nil || (bytes == nil && length != 0) {
+    return nil
+  }
+  owner := mem.arena_create(0)
+  text := mem.push(NativeText, owner)
+  text.owner = owner
+  text.renderer = engine
+  text.red = 255
+  text.green = 255
+  text.blue = 255
+  text.alpha = 255
+  if !native_update(text, #cast(*NativeFont, handle), bytes[..length], 0) {
+    mem.arena_release(owner)
+    return nil
+  }
+  return #cast(rawptr, text)
+}
+fn native_destroy(handle: rawptr) {
+  if handle == nil {
+    return
+  }
+  text := #cast(*NativeText, handle)
+  mem.arena_release(text.payload)
+  owner := text.owner
+  mem.arena_release(owner)
+}
+fn ttf_set(handle: rawptr, bytes: *const u8, length: usize) bool {
+  if handle == nil || (bytes==nil && length!=0) {
+    return false
+  }
+  text := #cast(*NativeText, handle)
+  return native_update(text, text.font, bytes[..length], text.wrap)
+}
+fn ttf_wrap(handle: rawptr, pixels: i32) bool {
+  if handle == nil || pixels < 0 {
+    return false
+  }
+  text := #cast(*NativeText, handle)
+  if text.wrap == pixels {
+    return native_current(text)
+  }
+  return native_update(text, text.font, text.layout.text, pixels)
+}
+fn ttf_color(handle: rawptr, red, green, blue, alpha: u8) bool {
+  if handle == nil {
+    return false
+  }
+  text := #cast(*NativeText, handle)
+  text.red=red
+  text.green=green
+  text.blue=blue
+  text.alpha=alpha
+  return true
+}
+fn ttf_size(handle: rawptr, width, height: *i32) bool {
+  if handle==nil {
+    return false
+  }
+  text:=#cast(*NativeText, handle)
+  if !native_current(text) {
+    return false
+  }
+  if width!=nil {
+    width.*=#cast(i32, math.ceil64(text.layout.width))
+  }
+  if height!=nil {
+    height.*=#cast(i32, math.ceil64(text.layout.height))
+  }
+  return true
+}
+fn native_hit(text:*const NativeText, hit:text_layout.Hit, output:*Substring) bool {
+  if !hit.ok || hit.line>=#len(text.layout.lines) {
+    return false
+  }
+  line:=text.layout.lines[hit.line]
+  left:=#cast(i32, math.floor64(hit.x+0.5))
+  right:=#cast(i32, math.floor64(hit.x+hit.width+0.5))
+  output.*=Substring{offset:#cast(i32, hit.start), length:#cast(i32, hit.end-hit.start), line:#cast(i32, hit.line), x:left, y:#cast(i32, hit.y), width:right-left, height:#cast(i32, hit.height)}
+  output.flags=4
+  if hit.rtl {
+    output.flags=5
+  }
+  for i in line.glyph_start..line.glyph_start+line.glyph_count {
+    glyph:=text.layout.glyphs[i]
+    if glyph.start==hit.start && glyph.end==hit.end {
+      output.cluster=#cast(i32, i)
+      break
+    }
+  }
+  if hit.start==0 {
+    output.flags|=256
+  }
+  if hit.start==line.start {
+    output.flags|=512
+  }
+  if hit.start==hit.end && hit.start>=line.end {
+    output.flags|=1024
+  }
+  if hit.start>=#len(text.layout.text) {
+    output.flags|=2048
+  }
+  return true
+}
+fn ttf_substring(handle:rawptr, offset:i32, output:*Substring) bool {
+  if handle==nil || output==nil {
+    return false
+  }
+  text:=#cast(*NativeText, handle)
+  if !native_current(text) {
+    return false
+  }
+  if offset<0 {
+    output.*=Substring{flags:256, height:text.layout.line_height}
+    return true
+  }
+  at:=#cast(usize, offset)
+  if at>#len(text.layout.text) {
+    at=#len(text.layout.text)
+  }
+  return native_hit(text, text_layout.cluster_at(&text.layout, at), output)
+}
+fn ttf_at_point(handle:rawptr, x, y:i32, output:*Substring) bool {
+  if handle==nil || output==nil {
+    return false
+  }
+  text:=#cast(*NativeText, handle)
+  if !native_current(text) {
+    return false
+  }
+  return native_hit(text, text_layout.at_point(&text.layout, #cast(f64, x), #cast(f64, y)), output)
+}
+fn ttf_whitespace_visible(handle: rawptr, visible: bool) bool {
+  // Layout retains whitespace in both modes
+  // Callers use visible=true.
+  return handle!=nil && visible
+}
+fn ttf_set_font(handle, font:rawptr) bool {
+  if handle==nil || font==nil {
+    return false
+  }
+  text:=#cast(*NativeText, handle)
+  return native_update(text, #cast(*NativeFont, font), text.layout.text, text.wrap)
+}
+fn ttf_add_fallback(handle, other:rawptr) bool {
+  if handle==nil || other==nil || handle==other {
+    return false
+  }
+  font:=#cast(*NativeFont, handle)
+  fallback:=#cast(*NativeFont, other)
+  for i in 0..font.fallback_count {
+    if font.fallbacks[i]==fallback {
+      return true
+    }
+  }
+  if font.fallback_count==16 {
+    return false
+  }
+  font.fallbacks[font.fallback_count]=fallback
+  font.fallback_count+=1
+  font.revision+=1
+  return true
+}
+fn ttf_remove_fallback(handle, other:rawptr) {
+  if handle==nil || other==nil {
+    return
+  }
+  font:=#cast(*NativeFont, handle)
+  for i in 0..font.fallback_count {
+    if #cast(rawptr, font.fallbacks[i])==other {
+      for j in i+1..font.fallback_count {
+        font.fallbacks[j-1]=font.fallbacks[j]
+      }
+      font.fallback_count-=1
+      font.revision+=1
+      return
+    }
+  }
+}
+fn ttf_draw(handle:rawptr, x, y:f32) bool {
+  return ttf_draw_colored(handle, x, y, nil, nil)
+}
+// Color complete shaped glyph clusters without rebuilding their surrounding
+// layout. The callback's byte offset refers to this text object's UTF-8 source.
+fn ttf_draw_colored(handle:rawptr, x, y:f32, color:fn(rawptr, usize)u32, data:rawptr) bool {
+  if handle==nil {
+    return false
+  }
+  text:=#cast(*NativeText, handle)
+  if !native_current(text) {
+    return false
+  }
+  for glyph in text.layout.glyphs {
+    if glyph.hidden || glyph.font==nil {
+      continue
+    }
+    if glyph.id>65535 {
+      return false
+    }
+    font:=#cast(*NativeFont, glyph.font)
+    bitmap:=native_bitmap(font, #cast(u16, glyph.id))
+    if bitmap==nil {
+      return false
+    }
+    value:=bitmap.bitmap
+    if value.width==0 || value.height==0 {
+      continue
+    }
+    red:=text.red
+    green:=text.green
+    blue:=text.blue
+    if color!=nil {
+      ink:=color(data, glyph.start)
+      red=#cast(u8, (ink>>16)&255)
+      green=#cast(u8, (ink>>8)&255)
+      blue=#cast(u8, ink&255)
+    }
+    baseline:=math.ceil64(#cast(f64, text.font.metrics.ascent)*#cast(f64, native_em(text.font))/#cast(f64, text.font.metrics.units_per_em))
+    if !sdl.native_text_bitmap(text.renderer, &value.pixels[0], value.width, value.height, x+#cast(f32, glyph.x+glyph.x_offset)+#cast(f32, value.x_offset), y+#cast(f32, glyph.y+glyph.y_offset+baseline)+#cast(f32, value.y_offset), red, green, blue, text.alpha) {
+      return false
+    }
+  }
+  return true
+}
+
+fn native_selection_rect(rect:*const text_layout.SelectionRect, output:*Substring) bool {
+  left:=math.floor64(rect.x+0.5)
+  top:=math.floor64(rect.y+0.5)
+  right:=math.floor64(rect.x+rect.width+0.5)
+  bottom:=math.floor64(rect.y+rect.height+0.5)
+  if right-left<0.0 || right-left>2147483647.0 || bottom-top<0.0 || bottom-top>2147483647.0 || rect.line>2147483647 || rect.end>2147483647 {
+    return false
+  }
+  output.*=Substring{offset:#cast(i32, rect.start), length:#cast(i32, rect.end-rect.start), line:#cast(i32, rect.line), cluster:-1, x:#cast(i32, left), y:#cast(i32, top), width:#cast(i32, right-left), height:#cast(i32, bottom-top)}
+  return true
+}
+fn ttf_selection(handle:rawptr, start, end:usize, callback:fn(rawptr, *const Substring)bool, data:rawptr) bool {
+  if handle==nil || callback==nil || start>end || end>2147483647 {
+    return false
+  }
+  text:=#cast(*NativeText, handle)
+  if !native_current(text) {
+    return false
+  }
+  arena:=mem.arena_create(0)
+  defer mem.arena_release(arena)
+  regions:=text_layout.selection(arena, &text.layout, start, end)
+  if !regions.ok {
+    return false
+  }
+  // Validate the integer renderer boundary before invoking any callbacks.
+  region:=Substring{}
+  for rect in regions.value {
+    if !native_selection_rect(&rect, &region) {
+      return false
+    }
+  }
+  for rect in regions.value {
+    _=native_selection_rect(&rect, &region)
+    if region.width>0 && region.height>0 && !callback(data, &region) {
+      return false
+    }
+  }
+  return true
+}

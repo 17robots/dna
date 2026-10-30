@@ -34,6 +34,10 @@ def main():
         from dyn_path import real_dyn
         executable = str(real_dyn() or executable)
     command[0] = executable
+    if (len(command) > 2 and command[1] in ('build', 'run', 'check')
+            and Path(command[2]).resolve() == ROOT / 'src'):
+        from sdk_check import require_ui_sdk
+        require_ui_sdk(executable)
     if len(command) > 1 and command[1] in ('build', 'run') and '--jobs' not in command:
         command.extend(['--jobs', '1'])
     (ROOT / 'build').mkdir(exist_ok=True)

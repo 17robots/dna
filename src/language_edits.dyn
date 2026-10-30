@@ -14,11 +14,14 @@ fn lsp_edit_file(app: *App, uri: []const u8, edits: *const json.Value, version: 
     }
   }
   item := &plan.files[plan.count]
-  item.slot = 16
+  item.slot = #cast(usize, -1)
   item.length = copy_text(item.path[..], decoded)
-  for slot_index in 0..16 {
-    slot := &app.documents.slots[slot_index]
+  for slot_index in 0..#len(app.documents.slots) {
+    slot := app.documents.slots[slot_index]
     if slot.document != nil && buffer.equal(files.name(&slot.file), decoded) {
+      if slot_index >= #len(app.lsp.servers[app.lsp.results.server].documents) {
+        return false
+      }
       tracked := &app.lsp.servers[app.lsp.results.server].documents[slot_index]
       if tracked.identity != slot.identity || tracked.revision != slot.document.revision {
         return false
@@ -36,7 +39,7 @@ fn lsp_edit_file(app: *App, uri: []const u8, edits: *const json.Value, version: 
       break
     }
   }
-  if item.slot == 16 {
+  if item.slot == #cast(usize, -1) {
     if !json.is_missing(version) && !json.is_null(version) {
       return false
     }
@@ -65,7 +68,7 @@ fn lsp_prepare_edit(app: *App, edit: *const json.Value) {
     notice(app, "Language server supplied no edit.")
     return
   }
-  allocated := mem.arena_create(((buffer.Capacity + 1) * 32 + 262144) + mem.ArenaBufferOverhead)
+  allocated := arena_owner.create(((buffer.Capacity + 1) * 32 + 262144))
   app.lsp.edits.arena = allocated
   allocated = nil
   app.lsp.edits.owned = true
@@ -124,19 +127,18 @@ fn lsp_preview_edits(app: *App) {
 }
 fn lsp_apply(app: *App) {
   plan := &app.lsp.edits
-  required: usize = 0
   for index in 0..plan.count {
     item := &plan.files[index]
-    if item.slot < 16 {
-      slot := &app.documents.slots[item.slot]
+    if item.slot < #len(app.documents.slots) {
+      slot := app.documents.slots[item.slot]
       if slot.document == nil || slot.identity != item.identity || slot.document.revision != item.revision {
         notice(app, "Buffer changed after preview. Nothing applied.")
         return
       }
     } else {
       // A newly opened buffer must not be silently bypassed by the edit plan.
-      for scan in 0..16 {
-        candidate := &app.documents.slots[scan]
+      for scan in 0..#len(app.documents.slots) {
+        candidate := app.documents.slots[scan]
         if candidate.document != nil && buffer.equal(files.name(&candidate.file), item.path[..item.length]) {
           notice(app, "Target opened after preview. Request the edit again.")
           return
@@ -150,21 +152,21 @@ fn lsp_apply(app: *App) {
         notice(app, "File changed after preview. Nothing applied.")
         return
       }
-      required += 1
     }
   }
-  if app.documents.count + required > 16 {
-    notice(app, "Close buffers to make room before applying this edit.")
-    return
-  }
   original := app.documents.active
+  created: [16]usize = []
+  created_count: usize = 0
   for index in 0..plan.count {
     missing := &plan.files[index]
-    if missing.slot == 16 {
+    if missing.slot == #cast(usize, -1) {
       if !new_buffer(app) {
+        documents_rollback_new(app, created[..created_count], original)
         return
       }
       missing.slot = app.documents.active
+      created[created_count] = missing.slot
+      created_count += 1
       _ = buffer.load(app.documents.current, missing.before)
       _ = files.set_name(app.documents.file, missing.path[..missing.length])
     }
@@ -191,7 +193,7 @@ fn lsp_apply(app: *App) {
 }
 fn lsp_completion(app: *App, item: *const json.Value) {
   state := &app.lsp.results
-  slot := &app.documents.slots[state.slot]
+  slot := app.documents.slots[state.slot]
   if app.documents.active != state.slot || slot.document == nil || slot.identity != state.identity || slot.document.revision != state.revision {
     notice(app, "Completion is stale. Request again.")
     return
@@ -206,8 +208,8 @@ fn lsp_completion(app: *App, item: *const json.Value) {
     return
   }
   format := lsp.number(json.object_get(item, "insertTextFormat"))
-  allocated := mem.arena_create(((buffer.Capacity + 1) * 24) + mem.ArenaBufferOverhead)
-  defer mem.arena_release(allocated)
+  allocated := arena_owner.create(((buffer.Capacity + 1) * 24))
+  defer arena_owner.release(allocated)
   capacity := (buffer.Capacity + 1) * 6
   message := mem.push_bytes_uninit(allocated, capacity)
   encoded := mem.push_bytes_uninit(allocated, capacity)
@@ -394,7 +396,7 @@ fn lsp_accept(app: *App) {
 }
 fn lsp_action_request(app: *App, item: *const json.Value, resolve: bool) {
   state := &app.lsp.results
-  slot := &app.documents.slots[state.slot]
+  slot := app.documents.slots[state.slot]
   if slot.document == nil || slot.identity != state.identity || slot.document.revision != state.revision {
     notice(app, "Code action is stale. Request again.")
     return

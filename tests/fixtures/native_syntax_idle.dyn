@@ -1,0 +1,63 @@
+// Force completion notification immediately after the syntax service phase,
+// then let the actual event loop decide whether another pass is needed.
+syntax_idle_app:*App
+syntax_idle_released:bool=false
+syntax_idle_hold_ack:bool=true
+syntax_idle_checks:usize=0
+fn syntax_idle_phase(app:*App, phase:usize) {
+  if phase!=2 || syntax_idle_released {
+    return
+  }
+  slot:=app.documents.slots[app.documents.active]
+  deadline:=sdl.ticks()+3000
+  bytes:[128]u8=[]
+  for syntax_colors(slot.syntax, &bytes[0], #cast(u32, slot.document.length), slot.document.revision)==0 {
+    if sdl.ticks()>deadline {
+      #panic("idle fixture worker completion timeout")
+    }
+  }
+  if bytes[3]!=4 || bytes[17]!=4 || bytes[23]!=2 {
+    #panic("idle fixture missing settled token captures")
+  }
+  syntax_idle_hold_ack=false
+  syntax_idle_released=true
+  event:=sdl.Event{}
+  event.words[0]=32768
+  if !sdl.push(&event) {
+    #panic("idle fixture wake queue")
+  }
+}
+fn syntax_idle_wait(milliseconds:i32) {
+  syntax_idle_checks+=1
+  if syntax_idle_checks>100 {
+    #panic("idle fixture failed to reach quiescence")
+  }
+  if milliseconds<100 {
+    return
+  }
+  slot:=syntax_idle_app.documents.slots[syntax_idle_app.documents.active]
+  if syntax_idle_released && slot.syntax_revision!=slot.document.revision {
+    #panic("completed syntax notification stranded after syntax phase: idle would keep only old highlights")
+  }
+  if syntax_idle_released && slot.syntax_revision==slot.document.revision && syntax_idle_app.render_trace.pending==0 {
+    syntax_idle_app.running=false
+  }
+}
+fn startup_probe(app:*App, typography:*Typography, renderer:rawptr, window:rawptr, input_storage:[]u8) {
+  syntax_idle_app=app
+  app.prompt_state.panel=Panel.None
+  app.view.reduced_motion=true
+  app.view.insert=true
+  app.config.reload_config=false
+  app.config.syntax_enabled=true
+  _=buffer.load(app.documents.current, "fn mainthing() { print(\"hello\") }\n\n")
+  buffer.move_to(app.documents.current, app.documents.current.length, false)
+  slot:=app.documents.slots[app.documents.active]
+  slot.filetype_length=copy_text(slot.filetype[..], "dyn")
+  sdl.syntax_idle_setup(syntax_idle_wait)
+}
+fn finish_probe(app:*App) {
+  if !syntax_idle_released || app.documents.slots[app.documents.active].syntax_revision!=app.documents.current.revision {
+    #panic("idle syntax completion not consumed")
+  }
+}

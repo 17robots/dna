@@ -1,0 +1,158 @@
+use "vendor/opengl" gl
+use "std/ui"
+use "std/ui/software"
+use "vendor/window/wayland" window_api
+use "std/errors"
+// Explicit GL ownership; create/render/close on the current owning context.
+// Rendering owns GL state: viewport, program, VAO, VBO, texture unit zero,
+// blending, scissor, depth/cull/stencil and unpack state. Caller resets as needed.
+// Target framebuffer must be opaque for conventional straight-alpha blending.
+pub struct Presenter { api: gl.Api, program: u32, vao: u32, buffer: u32, texture: u32, viewport: i32, tint: i32, sampler: i32, max_texture: i32, texture_width: i32, texture_height: i32 }
+pub struct Result { kind: errors.Kind, ok: bool }
+// Drains the context error flags. Preexisting errors also fail the operation.
+fn healthy(api: *const gl.Api) bool {
+  ok := true
+  error := api.get_error()
+  for error != 0 {
+    ok = false
+    error = api.get_error()
+  }
+  return ok
+}
+fn shader(api: *const gl.Api, kind: u32, source: []const u8) u32 {
+  id := api.create_shader(kind)
+  pointer := &source[0]
+  length := #cast(i32, #len(source))
+  if id == 0 {
+    return 0
+  }
+  api.shader_source(id, 1, &pointer, &length)
+  api.compile_shader(id)
+  valid: i32 = 0
+  api.get_shader_iv(id, gl.CompileStatus, &valid)
+  if valid == 0 {
+    api.delete_shader(id)
+    return 0
+  }
+  return id
+}
+pub fn open(renderer: *Presenter) Result {
+  loaded := gl.load(window_api.gl_proc)
+  if !loaded.ok {
+    return Result{kind:errors.Kind.System}
+  }
+  api := loaded.api
+  if renderer.program != 0 {
+    return Result{kind:errors.Kind.InvalidState}
+  }
+  // Pass a successfully loaded GL 3.3 table from vendor/opengl.load.
+  if !healthy(&api) {
+    return Result{kind:errors.Kind.System}
+  }
+  vertex := shader(&api, gl.VertexShader, "#version 330 core\nlayout(location=0) in vec2 p; layout(location=1) in vec2 t; uniform vec2 viewport; out vec2 uv; void main(){uv=t;gl_Position=vec4(p.x/viewport.x*2.-1.,1.-p.y/viewport.y*2.,0.,1.);}")
+  fragment := shader(&api, gl.FragmentShader, "#version 330 core\nin vec2 uv; uniform sampler2D image; uniform vec4 tint; out vec4 color; void main(){color=texture(image,uv);}")
+  if vertex == 0 || fragment == 0 {
+    if vertex != 0 {
+      api.delete_shader(vertex)
+    }
+    if fragment != 0 {
+      api.delete_shader(fragment)
+    }
+    return Result{kind:errors.Kind.System}
+  }
+  renderer.api = api
+  api.get_integer(gl.MaxTextureSize, &renderer.max_texture)
+  renderer.program = api.create_program()
+  api.attach_shader(renderer.program, vertex)
+  api.attach_shader(renderer.program, fragment)
+  api.link_program(renderer.program)
+  api.delete_shader(vertex)
+  api.delete_shader(fragment)
+  valid: i32 = 0
+  api.get_program_iv(renderer.program, gl.LinkStatus, &valid)
+  if valid == 0 {
+    close(renderer)
+    return Result{kind:errors.Kind.System}
+  }
+  viewport_name := "viewport\x00"
+  renderer.viewport = api.get_uniform_location(renderer.program, &viewport_name[0])
+  tint_name := "tint\x00"
+  renderer.tint = api.get_uniform_location(renderer.program, &tint_name[0])
+  sampler_name := "image\x00"
+  renderer.sampler = api.get_uniform_location(renderer.program, &sampler_name[0])
+  api.gen_vertex_arrays(1, &renderer.vao)
+  api.gen_buffers(1, &renderer.buffer)
+  api.gen_textures(1, &renderer.texture)
+  api.bind_vertex_array(renderer.vao)
+  api.bind_buffer(gl.ArrayBuffer, renderer.buffer)
+  api.enable_vertex_attribute(0)
+  api.enable_vertex_attribute(1)
+  api.vertex_attribute(0, 2, gl.Float, 0, 16, nil)
+  api.vertex_attribute(1, 2, gl.Float, 0, 16, #cast(rawptr, 8))
+  valid_resources := renderer.vao != 0 && renderer.buffer != 0 && renderer.texture != 0 && renderer.max_texture > 0
+  valid_api := healthy(&api)
+  if !valid_resources || !valid_api {
+    close(renderer)
+    return Result{kind:errors.Kind.System}
+  }
+  return Result{ok:true}
+}
+pub fn close(renderer: *Presenter) {
+  if renderer.program == 0 {
+    return
+  }
+  renderer.api.delete_program(renderer.program)
+  renderer.api.delete_vertex_arrays(1, &renderer.vao)
+  renderer.api.delete_buffers(1, &renderer.buffer)
+  renderer.api.delete_textures(1, &renderer.texture)
+  renderer.* = Presenter{}
+}
+fn quad(renderer: *Presenter, x, y, right, bottom: f32, tint: ui.Color) {
+  vertices: [24]f32 = [x, y, 0.0, 0.0, right, y, 1.0, 0.0, right, bottom, 1.0, 1.0, x, y, 0.0, 0.0, right, bottom, 1.0, 1.0, x, bottom, 0.0, 1.0]
+  renderer.api.uniform_4f(renderer.tint, #cast(f32, tint.r)/255.0, #cast(f32, tint.g)/255.0, #cast(f32, tint.b)/255.0, #cast(f32, tint.a)/255.0)
+  renderer.api.buffer_data(gl.ArrayBuffer, #cast(isize, #sizeof(vertices)), &vertices[0], gl.DynamicDraw)
+  renderer.api.draw_arrays(gl.Triangles, 0, 6)
+}
+pub fn draw(renderer: *Presenter, surface: software.Surface) Result {
+  if renderer.program==0 || surface.width<=0 || surface.height<=0 || surface.width>renderer.max_texture || surface.height>renderer.max_texture {
+    return Result{kind:errors.Kind.InvalidState}
+  }
+  api:=&renderer.api
+  api.viewport(0, 0, surface.width, surface.height)
+  api.use_program(renderer.program)
+  api.bind_vertex_array(renderer.vao)
+  api.bind_buffer(gl.ArrayBuffer, renderer.buffer)
+  api.active_texture(gl.Texture0)
+  api.bind_sampler(0, 0)
+  api.bind_texture(gl.Texture2d, renderer.texture)
+  api.bind_buffer(gl.PixelUnpackBuffer, 0)
+  api.pixel_store_i(gl.UnpackAlignment, 1)
+  api.pixel_store_i(gl.UnpackRowLength, 0)
+  api.pixel_store_i(gl.UnpackSkipRows, 0)
+  api.pixel_store_i(gl.UnpackSkipPixels, 0)
+  api.tex_parameter_i(gl.Texture2d, gl.TextureMinFilter, #cast(i32, gl.Nearest))
+  api.tex_parameter_i(gl.Texture2d, gl.TextureMagFilter, #cast(i32, gl.Nearest))
+  api.tex_parameter_i(gl.Texture2d, gl.TextureWrapS, #cast(i32, gl.ClampToEdge))
+  api.tex_parameter_i(gl.Texture2d, gl.TextureWrapT, #cast(i32, gl.ClampToEdge))
+  api.disable(gl.Blend)
+  api.disable(gl.DepthTest)
+  api.disable(gl.CullFace)
+  api.disable(gl.ScissorTest)
+  api.clear_color(0.0, 0.0, 0.0, 1.0)
+  api.clear(gl.ColorBufferBit)
+  api.uniform_2f(renderer.viewport, #cast(f32, surface.width), #cast(f32, surface.height))
+  api.uniform_1i(renderer.sampler, 0)
+  // Retain storage across frames; only changing dimensions need allocation.
+  // Commit dimensions after checking GL so an allocation failure is retryable.
+  if renderer.texture_width != surface.width || renderer.texture_height != surface.height {
+    api.tex_image_2d(gl.Texture2d, 0, #cast(i32, gl.Rgba8), surface.width, surface.height, 0, gl.Rgba, gl.UnsignedByte, nil)
+    if !healthy(api) {
+      return Result{kind:errors.Kind.System}
+    }
+    renderer.texture_width = surface.width
+    renderer.texture_height = surface.height
+  }
+  api.tex_sub_image_2d(gl.Texture2d, 0, 0, 0, surface.width, surface.height, gl.Rgba, gl.UnsignedByte, #cast(rawptr, &surface.pixels[0]))
+  quad(renderer, 0.0, 0.0, #cast(f32, surface.width), #cast(f32, surface.height), ui.Color{a:255})
+  return Result{ok:healthy(api)}
+}

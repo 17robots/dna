@@ -1,0 +1,48 @@
+// A 1440p pane and picker together use 137 UI labels. Moving through relative
+// line numbers adds changing status text without invalidating unchanged labels.
+fn ui_text_working_set_smoke(typography: *Typography) {
+  ui_cache_clear(typography)
+  for frame in 0..40 {
+    before := typography.ui_updates
+    for row in 0..137 {
+      label: [128]u8 = []
+      used := copy_text(label[..], "pane/picker label ")
+      add_number(label[..], &used, row)
+      if cached_ui_text(typography, label[..used]) == nil {
+        #panic("UI text working set allocation")
+      }
+    }
+    if frame > 0 && typography.ui_updates != before {
+      #panic("unchanged pane/picker labels must survive a frame and status churn")
+    }
+    status: [128]u8 = []
+    status_used := copy_text(status[..], "moving cursor status ")
+    add_number(status[..], &status_used, frame)
+    if cached_ui_text(typography, status[..status_used]) == nil {
+      #panic("UI status text allocation")
+    }
+  }
+  // Font changes clear this cache; the first new layout is built once and then
+  // reused, independently of the prior font's working set.
+  ui_cache_clear(typography)
+  before := typography.ui_updates
+  first := cached_ui_text(typography, "after font invalidation")
+  second := cached_ui_text(typography, "after font invalidation")
+  if first == nil || second != first || typography.ui_updates != before + 1 {
+    #panic("UI text rebuild after invalidation")
+  }
+  // Arbitrary changing content remains bounded and evicts the least recently
+  // used layouts; repeatedly querying the newest label stays a hit.
+  for row in 0..600 {
+    label: [128]u8 = []
+    used := copy_text(label[..], "eviction label ")
+    add_number(label[..], &used, row)
+    first = cached_ui_text(typography, label[..used])
+    before = typography.ui_updates
+    second = cached_ui_text(typography, label[..used])
+    if first == nil || second != first || typography.ui_updates != before {
+      #panic("UI text eviction preserves newest layout")
+    }
+  }
+  ui_cache_clear(typography)
+}

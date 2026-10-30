@@ -14,7 +14,9 @@ reliability or compatibility with every Linux distribution.
   first and filters cached results locally; these plain-word suggestions do not
   include the signatures or snippets supplied later by the server.
 - Completion reserves eight rows, clipped to the pane; unused rows remain empty.
-- Limits include 16 buffers, 8 views, and 268,435,455 text bytes per buffer.
+- Buffers grow as needed; limits include 8 views and 268,435,455 text bytes per buffer.
+  Sessions above 16 slots use format 3, which older DNA releases cannot read.
+  Formats 1 and 2 remain readable; keep a separate session file for rollback.
   Large-file support does not imply every operation has constant latency.
 - Complex mixed-direction text, desktop IME integration, and different GPU,
   display, and terminal combinations need broader real-world coverage.
@@ -41,7 +43,7 @@ alone does not make DNA portable. The current blockers are in this repository:
 - `scripts/deps.py` and `scripts/package.py` produce ELF shared libraries,
   GNU linker scripts, and Linux runtime paths. macOS needs Mach-O dependency
   packaging; Windows needs PE/DLL packaging and a portable build wrapper
-  (`scripts/compile.py` currently imports Unix-only Python modules).
+  and platform-specific linker validation.
 - `installer/main.dyn` still calls Linux syscall 79 directly for the working
   directory. Editor working-directory operations now use `src/host` adapters.
 - The language installer uses POSIX shell commands, symlinks, executable mode
@@ -55,17 +57,14 @@ in debug and release on Linux, macOS ARM64, and Windows x64, including paths
 with spaces and non-ASCII characters. This workflow validates host adapters;
 it does **not** build or qualify a complete editor release.
 
-Further investigation found two prerequisites beyond native-service adapters:
+Two editor prerequisites remain beyond native-service adapters:
 
-- The pinned Dyn SDK exposes metadata, directory enumeration, atomic file
-  replacement, and recursive removal only on Linux (`std/fs/linux_extra.dyn`
-  and `std/fs/remove_tree.dyn`). Full editor type checking on macOS reports
-  these missing APIs. Equivalent filesystem operations must preserve DNA's
-  no-follow, no-overwrite, and recovery guarantees.
-- Document storage reserves multiple GiB of sparse address space. The current
-  Linux mappings cannot be replaced with Windows `arena_create`: the SDK
-  commits the entire allocation on Windows. Explicit commitment and reclamation
-  are needed at document and scratch-buffer write boundaries.
+- The preview.28 SDK provides portable filesystem operations, but DNA's complete
+  filesystem, save/recovery and installer paths still require native validation
+  on macOS and Windows.
+- Document storage reserves multiple GiB of sparse address space and currently
+  uses Linux mappings. Other platforms need explicit commitment and reclamation
+  at document and scratch-buffer write boundaries, with matching resource tests.
 
 The first published macOS and Windows builds must include **both GUI and TUI**.
 Host-adapter tests or a GUI-only build do not satisfy that release requirement.
@@ -78,6 +77,7 @@ matrix alone would produce failing builds, not usable releases.
 ## Launch
 
 ```
+./dna --version
 ./dna path/to/file.dyn
 ./dna path/to/project
 ./dna --tui path/to/project

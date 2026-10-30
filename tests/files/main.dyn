@@ -1,7 +1,8 @@
+use "../../src/owned_arena" arena_owner
 use "../../src/files" files
 use "../../src/buffer" buffer
-use "std/fs" fs
-use "std/mem" mem
+use "std/fs" std_fs
+use "std/mem"
 use "std/process" process
 fn require_empty(error: []const u8) {
   if #len(error) != 0 {
@@ -9,13 +10,13 @@ fn require_empty(error: []const u8) {
   }
 }
 fn main() {
-  arena := mem.arena_create(#sizeof(buffer.Document) + 2097152 + mem.ArenaBufferOverhead)
-  defer mem.arena_release(arena)
+  arena := arena_owner.create(#sizeof(buffer.Document) + 2097152)
+  defer arena_owner.release(arena)
   doc := buffer.allocate(arena)
   _ = buffer.load(doc, "first\n")
   state := files.State{}
   require_empty(files.save(&state, doc, "sample.txt", arena))
-  if buffer.dirty(doc) || !fs.metadata("sample.txt").ok {
+  if buffer.dirty(doc) || !std_fs.metadata("sample.txt").ok {
     #panic("new save")
   }
   if #syscall(90, &state.path[0], 448) != 0 {
@@ -25,15 +26,15 @@ fn main() {
   _ = buffer.replace(doc, "second\n")
   _ = buffer.replace(doc, "third\n")
   require_empty(files.save(&state, doc, "sample.txt", arena))
-  if (fs.metadata("sample.txt").mode & 511) != 448 || fs.metadata("sample.txt.dna-recovery").ok {
+  if (std_fs.metadata("sample.txt").mode & 511) != 448 || std_fs.metadata("sample.txt.dna-recovery").ok {
     #panic("permissions or recovery cleanup")
   }
-  _ = fs.write_all("sample.txt", "external\n")
+  _ = std_fs.write_all("sample.txt", "external\n")
   _ = buffer.replace(doc, "local\n")
   if #len(files.save(&state, doc, "sample.txt", arena)) == 0 {
     #panic("external conflict accepted")
   }
-  check := fs.read_all(arena, "sample.txt", 100)
+  check := std_fs.read_all(arena, "sample.txt", 100)
   if !check.ok || !buffer.equal(check.value, "external\n") {
     #panic("external content lost")
   }
@@ -46,14 +47,14 @@ fn main() {
   }
   buffer.move_to(doc, doc.length, false)
   _ = buffer.replace(doc, "recover me\n")
-  if !fs.write_all("new.txt.dna-recovery", doc.bytes[..doc.length]).ok {
+  if !std_fs.write_all("new.txt.dna-recovery", doc.bytes[..doc.length]).ok {
     #panic("legacy recovery fixture")
   }
   // Simulate a fresh editor after a crash: sidecar exists, original still saved.
   state.recovery_owned = false
   _ = buffer.load(doc, "")
   require_empty(files.open(&state, doc, "new.txt", arena))
-  if !fs.metadata("new.txt.dna-recovery").ok {
+  if !std_fs.metadata("new.txt.dna-recovery").ok {
     #panic("unclaimed legacy recovery lost")
   }
   require_empty(files.recover(&state, doc, arena))
@@ -76,11 +77,11 @@ fn main() {
   before := state
   revision := doc.revision
   invalid: [5]u8 = [110, 101, 119, 255, 10]
-  if !fs.write_all("invalid-utf8.txt", invalid[..]).ok || !fs.write_all("new.txt.dna-recovery", "owned recovery").ok {
+  if !std_fs.write_all("invalid-utf8.txt", invalid[..]).ok || !std_fs.write_all("new.txt.dna-recovery", "owned recovery").ok {
     #panic("invalid-open fixture")
   }
   state.recovery_owned = true
-  if #len(files.open(&state, doc, "invalid-utf8.txt", arena)) == 0 || doc.revision != revision || !buffer.equal(doc.bytes[..doc.length], "unchanged") || !buffer.equal(files.name(&state), files.name(&before)) || !state.recovery_owned || !fs.metadata("new.txt.dna-recovery").ok {
+  if #len(files.open(&state, doc, "invalid-utf8.txt", arena)) == 0 || doc.revision != revision || !buffer.equal(doc.bytes[..doc.length], "unchanged") || !buffer.equal(files.name(&state), files.name(&before)) || !state.recovery_owned || !std_fs.metadata("new.txt.dna-recovery").ok {
     #panic("failed open changed buffer, filename or recovery ownership")
   }
   files.discard_recovery(&state)

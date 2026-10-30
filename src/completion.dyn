@@ -1,3 +1,4 @@
+use "./owned_arena" arena_owner
 struct CompletionState {
   entries: [128]Entry,
   count: usize,
@@ -77,7 +78,7 @@ fn completion_refresh(app: *App) {
   }
   fragment := path[split..]
   if app.picker_state.index == nil {
-    allocated := mem.arena_create((#sizeof(PickerIndex) + #alignof(Entry) + #sizeof(Entry) * 2048) + mem.ArenaBufferOverhead)
+    allocated := arena_owner.create((#sizeof(PickerIndex) + #alignof(Entry) + #sizeof(Entry) * 2048))
     app.picker_state.arena = allocated
     allocated = nil
     // A fresh mapping is already zero; only touched entries become resident.
@@ -86,12 +87,17 @@ fn completion_refresh(app: *App) {
     app.picker_state.index.entries = entries[..2048]
   }
   index := app.picker_state.index
-  if !buffer.equal(directory, index.root[..index.root_length]) || !app.picker_state.watching {
-    index.root_length = copy_text(index.root[..], directory)
-    index.count = 0
-    index.visited = 0
-    index.error = false
-    index.limited = false
+  changed_root := !buffer.equal(directory, index.root[..index.root_length])
+  if changed_root || !app.picker_state.watching {
+    if changed_root {
+      index.root_length = copy_text(index.root[..], directory)
+      index.count = 0
+      index.visited = 0
+      index.error = false
+      index.limited = false
+    }
+    // Reopening the same root can draw its last complete list immediately.
+    // Refresh asynchronously because watches are released while hidden.
     picker_index_submit(app)
   }
   _ = picker_index_receive(app)
@@ -162,6 +168,7 @@ fn command_submit(app: *App, typography: *Typography) {
   if palette_enter(app) {
     return
   }
+  command_history_remember(app)
   command_execute(app, typography)
 }
 // Run the palette text exactly as written (key bindings run theirs this way).

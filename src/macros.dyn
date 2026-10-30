@@ -23,7 +23,7 @@ fn macro_toggle(app: *App) {
   }
   slot := &app.macro_state.slots[app.register_state.selected]
   if !slot.owned {
-    allocated := mem.arena_create((1024 * #sizeof(MacroEvent)) + mem.ArenaBufferOverhead)
+    allocated := arena_owner.create((1024 * #sizeof(MacroEvent)))
     slot.arena = allocated
     allocated = nil
     slot.owned = true
@@ -128,6 +128,12 @@ fn macro_tick(app: *App, typography: *Typography) bool {
     }
     app.macro_state.remaining -= 1
     processed += 1
+    // A nested explorer event may queue activation until its outer draft
+    // borrow ends. Yield at that completed event, retaining the next event;
+    // otherwise later macro input would still target the old draft.
+    if app.explorer.dispatch_pending!=0 {
+      break
+    }
     if sdl.ticks() >= deadline {
       break
     }
@@ -138,7 +144,7 @@ fn macro_tick(app: *App, typography: *Typography) bool {
 fn macros_release(app: *App) {
   for index in 0..27 {
     if app.macro_state.slots[index].owned {
-      mem.arena_release(app.macro_state.slots[index].arena)
+      arena_owner.release(app.macro_state.slots[index].arena)
       app.macro_state.slots[index].arena = nil
       app.macro_state.slots[index].owned = false
     }

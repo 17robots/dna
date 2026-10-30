@@ -1,111 +1,121 @@
-#link("fontconfig")
+use "std/font/system" fonts
+use "std/mem"
+use "std/bytes" byte_ops
 
-const spacing: []const u8 = "spacing\0"
-const file_key: []const u8 = "file\0"
-const family_key: []const u8 = "family\0"
-const mono: []const u8 = "monospace\0"
+// The C ABI stays unchanged while discovery moves to the shared Dyn layer.
+// Only TrueType faces supported by std/font are listed: CFF and TTC fonts
+// are skipped. Platform directories are scanned, without Fontconfig aliases,
+// configuration or registry lookup. Explicit family misses return failure.
+const font_scan_limit: usize = 4096
 
-struct FontSet { count, capacity: i32, fonts: *rawptr }
+fn font_entries(arena: *mem.Arena) []fonts.Entry {
+  entries := fonts.scan(arena, font_scan_limit)
+  used: usize = 0
+  for i in 0..#len(entries) {
+    if entries[i].monospace {
+      entries[used] = entries[i]
+      used += 1
+    }
+  }
+  return entries[..used]
+}
 
-extern fn initialize "FcInit"() i32
-extern fn pattern_create "FcPatternCreate"() rawptr
-extern fn pattern_destroy "FcPatternDestroy"(pattern: rawptr)
-extern fn add_integer "FcPatternAddInteger"(pattern: rawptr, name: *const u8, value: i32) i32
-extern fn add_string "FcPatternAddString"(pattern: rawptr, name: *const u8, value: *const u8) i32
-extern fn object_create "FcObjectSetCreate"() rawptr
-extern fn object_add "FcObjectSetAdd"(objects: rawptr, name: *const u8) i32
-extern fn object_destroy "FcObjectSetDestroy"(objects: rawptr)
-extern fn font_list "FcFontList"(config: rawptr, pattern: rawptr, objects: rawptr) *FontSet
-extern fn font_set_destroy "FcFontSetDestroy"(fonts: *FontSet)
-extern fn get_string "FcPatternGetString"(pattern: rawptr, name: *const u8, index: i32, output: **u8) i32
-extern fn substitute "FcConfigSubstitute"(config: rawptr, pattern: rawptr, kind: i32) i32
-extern fn default_substitute "FcDefaultSubstitute"(pattern: rawptr)
-extern fn font_match "FcFontMatch"(config: rawptr, pattern: rawptr, result: *i32) rawptr
 pub fn dna_fonts(output: *u8, capacity: usize) usize {
-  return font_values(output, capacity, &file_key[0])
+  return font_values(output, capacity, false)
 }
+
 pub fn dna_font_families(output: *u8, capacity: usize) usize {
-  return font_values(output, capacity, &family_key[0])
+  return font_values(output, capacity, true)
 }
-fn font_values(output: *u8, capacity: usize, property: *const u8) usize {
+
+fn font_values(output: *u8, capacity: usize, families: bool) usize {
   if output == nil || capacity == 0 {
     return 0
   }
   output.* = 0
-  if initialize() == 0 {
-    return 0
-  }
-  pattern := pattern_create()
-  if pattern == nil {
-    return 0
-  }
-  defer pattern_destroy(pattern)
-  if add_integer(pattern, &spacing[0], 100) == 0 {
-    return 0
-  }
-  objects := object_create()
-  if objects == nil {
-    return 0
-  }
-  defer object_destroy(objects)
-  if object_add(objects, property) == 0 {
-    return 0
-  }
-  fonts := font_list(nil, pattern, objects)
-  if fonts == nil {
-    return 0
-  }
-  defer font_set_destroy(fonts)
+  arena := mem.arena_create(0)
+  defer mem.arena_release(arena)
+  entries := font_entries(arena)
   used: usize = 0
-  for index in 0..fonts.count {
-    path: *u8 = nil
-    if get_string(fonts.fonts[..#cast(usize, fonts.count)][#cast(usize, index)], property, 0, &path) == 0 && path != nil {
-      length := string_length(path)
-      if capacity - used < 2 || length > capacity - used - 2 {
-        break
-      }
-      _ = copy(&output[..capacity][used], path, length)
-      used += length
-      output[..capacity][used] = 10
-      used += 1
+  for i in 0..#len(entries) {
+    text := entries[i].path
+    if families {
+      text = entries[i].family
     }
+    // One entry per line. Family queries list each family once, regardless
+    // of the number of weights/styles installed under that name.
+    duplicate: bool = false
+    if families {
+      for j in 0..i {
+        if byte_ops.equal(entries[j].family, text) {
+          duplicate = true
+          break
+        }
+      }
+    }
+    for byte in text {
+      if byte == 10 || byte == 13 {
+        duplicate = true
+      }
+    }
+    if duplicate {
+      continue
+    }
+    length := #len(text)
+    if capacity - used < 2 || length > capacity - used - 2 {
+      break
+    }
+    _ = mem.copy(output[..capacity][used..used + length], text)
+    used += length
+    output[..capacity][used] = 10
+    used += 1
   }
   output[..capacity][used] = 0
   return used
 }
+
 pub fn dna_default_font(output: *u8, capacity: usize) i32 {
-  return dna_match_font(&mono[0], output, capacity)
+  generic: []const u8 = "monospace\0"
+  return dna_match_font(&generic[0], output, capacity)
 }
+
+fn font_generic_monospace(family: []const u8) bool {
+  generic: []const u8 = "monospace"
+  if #len(family) != #len(generic) {
+    return false
+  }
+  for i in 0..#len(generic) {
+    byte := family[i]
+    if byte >= 65 && byte <= 90 {
+      byte += 32
+    }
+    if byte != generic[i] {
+      return false
+    }
+  }
+  return true
+}
+
 pub fn dna_match_font(family: *const u8, output: *u8, capacity: usize) i32 {
-  if family == nil || family.* == 0 || output == nil || capacity < 2 || initialize() == 0 {
+  if family == nil || family.* == 0 || output == nil || capacity < 2 {
     return 0
   }
-  pattern := pattern_create()
-  if pattern == nil {
+  arena := mem.arena_create(0)
+  defer mem.arena_release(arena)
+  entries := font_entries(arena)
+  requested := family[..string_length(family)]
+  matched: *const fonts.Entry = &fonts.nil_entry
+  if font_generic_monospace(requested) {
+    matched = fonts.monospace(entries)
+  }
+  else {
+    matched = fonts.find(entries, requested, 400, false)
+  }
+  length := #len(matched.path)
+  if length == 0 || length >= capacity {
     return 0
   }
-  defer pattern_destroy(pattern)
-  if add_string(pattern, &family_key[0], family) == 0 || add_integer(pattern, &spacing[0], 100) == 0 {
-    return 0
-  }
-  if substitute(nil, pattern, 0) == 0 {
-    return 0
-  }
-  default_substitute(pattern)
-  result: i32 = 0
-  matched := font_match(nil, pattern, &result)
-  if matched == nil {
-    return 0
-  }
-  defer pattern_destroy(matched)
-  path: *u8 = nil
-  if get_string(matched, &file_key[0], 0, &path) != 0 || path == nil {
-    return 0
-  }
-  length := string_length(path)
-  if length >= capacity {
-    return 0
-  }
-  _ = copy(output, path, length + 1)
+  _ = mem.copy(output[..length], matched.path)
+  output[..capacity][length] = 0
   return 1
 }

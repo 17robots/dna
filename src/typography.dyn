@@ -22,7 +22,9 @@ struct DisplayCounts {
   high: usize,
   selected: usize,
 }
+struct CaretGeometry {value:ttf.Substring, text:rawptr, position:usize, ready:bool}
 struct PaneText {
+  caret_geometry:CaretGeometry,
   counts: DisplayCounts,
   caret: rawptr,
   caret_document: *const buffer.Document,
@@ -48,6 +50,8 @@ struct Typography {
   // The focused pane's line layout while it draws.
   layout: *LineLayout,
   caret_document: *const buffer.Document,
+  caret_geometry:CaretGeometry,
+  caret_queries:u64,
   points: f32,
   scale: f32,
   cell: f32,
@@ -91,6 +95,10 @@ struct Typography {
 }
 
 fn resize_font(typography: *Typography) {
+  typography.caret_document=nil
+  for pane_index in 0..15 {
+    typography.pane_text[pane_index].caret_document=nil
+  }
   ui_cache_clear(typography)
   // Terminal cells are fixed: an 8-wide, 16-tall unit per cell, and a font
   // size whose cursor height (size + 5) fills exactly one cell.
@@ -114,7 +122,24 @@ fn resize_font(typography: *Typography) {
     _ = ttf.font_size(typography.fallback_font, typography.points * typography.scale)
   }
 
-  typography.line = #cast(f32, (#cast(i32, (typography.points * typography.scale * typography.line_height))))
+  requested := typography.points * typography.scale * typography.line_height
+  pixels := #cast(i32, requested)
+  if #cast(f32, pixels) < requested {
+    pixels += 1
+  }
+  // Tall faces need more than nominal em height. In particular, forcing Noto
+  // Sans Mono into a 1.25-em row clips descenders in status bars and lists.
+  minimum := ttf.font_height(typography.font)
+  if typography.fallback_font != nil {
+    fallback_minimum := ttf.font_height(typography.fallback_font)
+    if minimum < fallback_minimum {
+      minimum = fallback_minimum
+    }
+  }
+  if pixels < minimum {
+    pixels = minimum
+  }
+  typography.line = #cast(f32, pixels)
   if sdl.tui_active() {
     typography.line = sdl.CellHeight
   }

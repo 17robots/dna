@@ -1,0 +1,129 @@
+// Session history and Vim guides go through the production input dispatch.
+fn usability_prompt_check(ok:bool) {
+  if !ok {
+    #panic("prompt history / Vim guide usability")
+  }
+}
+fn usability_prompt_text(app:*App, text:[]const u8) {
+  app.prompt_state.length=copy_text(app.prompt_state.text[..], text)
+}
+fn usability_prompt_equals(app:*App, text:[]const u8) bool {
+  return buffer.equal(app.prompt_state.text[..app.prompt_state.length], text)
+}
+fn usability_prompt_smoke(typography:*Typography, renderer:rawptr) {
+  owner:=arena_owner.create(#sizeof(App)+128)
+  scratch:=arena_owner.create(2097152)
+  defer arena_owner.release(owner)
+  defer arena_owner.release(scratch)
+  app:=mem.push(App, owner)
+  app.scratch=scratch
+  app.config=settings.Settings{}
+  app.view.reduced_motion=true
+  defer release_editor_state(app)
+  usability_prompt_check(new_buffer(app))
+  // Unknown submitted commands remain useful history, and adjacent repeats
+  // should not displace another recent command.
+  panel(app, Panel.Commands)
+  usability_prompt_text(app, "history-probe-alpha")
+  command_submit(app, typography)
+  panel(app, Panel.Commands)
+  usability_prompt_text(app, "history-probe-beta")
+  command_submit(app, typography)
+  panel(app, Panel.Commands)
+  usability_prompt_text(app, "history-probe-beta")
+  command_submit(app, typography)
+  usability_prompt_check(app.prompt_state.history_count==2)
+  panel(app, Panel.Commands)
+  usability_prompt_text(app, "write é draft")
+  prompt_key(app, typography, KeyUp, 0)
+  usability_prompt_check(usability_prompt_equals(app, "history-probe-beta"))
+  prompt_key(app, typography, KeyUp, 0)
+  usability_prompt_check(usability_prompt_equals(app, "history-probe-alpha"))
+  prompt_key(app, typography, KeyUp, 0)
+  usability_prompt_check(usability_prompt_equals(app, "history-probe-alpha"))
+  prompt_key(app, typography, KeyDown, 0)
+  usability_prompt_check(usability_prompt_equals(app, "history-probe-beta"))
+  prompt_key(app, typography, KeyDown, 0)
+  usability_prompt_check(usability_prompt_equals(app, "write é draft"))
+  // A recalled command can become an independent editable draft.
+  prompt_key(app, typography, KeyUp, 0)
+  text_input(app, " edited")
+  prompt_key(app, typography, KeyUp, 0)
+  prompt_key(app, typography, KeyDown, 0)
+  usability_prompt_check(usability_prompt_equals(app, "history-probe-beta edited"))
+  panel(app, Panel.Commands)
+  prompt_key(app, typography, KeyN, ModCtrl)
+  usability_prompt_check(app.prompt_state.selected==1 && app.prompt_state.length==0)
+  prompt_key(app, typography, KeyP, ModCtrl)
+  usability_prompt_check(app.prompt_state.selected==0)
+  // Open-picker and search arrows must not recall command text.
+  app.prompt_state.panel=Panel.Open
+  app.completion.count=3
+  app.completion.selected=1
+  prompt_key(app, typography, KeyUp, 0)
+  usability_prompt_check(app.completion.selected==0 && app.prompt_state.history_depth==0)
+  app.prompt_state.panel=Panel.Search
+  usability_prompt_text(app, "search draft")
+  prompt_key(app, typography, KeyUp, 0)
+  usability_prompt_check(usability_prompt_equals(app, "search draft"))
+  app.prompt_state.history_count=0
+  app.prompt_state.history_next=0
+  app.prompt_state.history_depth=0
+  for i in 0..40 {
+    app.prompt_state.text[0]=#cast(u8, 33+i)
+    app.prompt_state.length=1
+    command_history_remember(app)
+  }
+  panel(app, Panel.Commands)
+  usability_prompt_text(app, "retained draft")
+  for i in 0..40 {
+    prompt_key(app, typography, KeyUp, 0)
+  }
+  usability_prompt_check(app.prompt_state.history_count==32 && app.prompt_state.text[0]==41)
+  for i in 0..32 {
+    prompt_key(app, typography, KeyDown, 0)
+  }
+  usability_prompt_check(usability_prompt_equals(app, "retained draft"))
+  // A guide observes Vim's prefix; it must not open a Helix goto panel or
+  // change the count/operator while the next physical key is pending.
+  if !profile_includes(ProfileKeymaps, "vim") {
+    return
+  }
+  app.config.vim_keys=true
+  vim_start(app, "one two\nthree four\nfive six\n")
+  vim_type(app, typography, "wg")
+  usability_prompt_check(vim_menu_active(app) && app.prompt_state.panel==Panel.None && key_menu_count(app)==19)
+  usability_prompt_check(buffer.equal(key_menu_hint(app, 1).label, "previous word end"))
+  draw_key_menu(renderer, app, typography, 640, 480, typography.line)
+  clicked:=false
+  for i in 1..#len(app.ui.boxes) {
+    item:=&app.ui.boxes[i]
+    if item.touched==app.ui.frame && item.flags&UiClickable!=0 && item.value==1 {
+      key_menu_mouse(app, typography, item.rect.x+item.rect.width/2.0, item.rect.y+item.rect.height/2.0, true, false)
+      clicked=true
+      break
+    }
+  }
+  usability_prompt_check(clicked)
+  usability_prompt_check(buffer.head(app.documents.current)==2 && !vim_menu_active(app))
+  vim_type(app, typography, "2g")
+  usability_prompt_check(vim_menu_active(app) && app.vim.count==2)
+  vim_type(app, typography, "g")
+  usability_prompt_check(buffer.row_at(app.documents.current, buffer.head(app.documents.current))==1)
+  vim_type(app, typography, "2dg")
+  usability_prompt_check(key_menu_count(app)==7 && app.vim.operator=='d' && app.vim.operator_count==2)
+  vim_type(app, typography, "\x1b")
+  usability_prompt_check(!vim_menu_active(app) && app.vim.operator==0 && app.vim.count==0)
+  usability_prompt_check(buffer.equal(app.documents.current.bytes[..app.documents.current.length], "one two\nthree four\nfive six\n"))
+  vim_start(app, "one two\n")
+  vim_type(app, typography, "di")
+  usability_prompt_check(vim_menu_active(app) && key_menu_count(app)==10)
+  vim_type(app, typography, "w")
+  usability_prompt_check(buffer.equal(app.documents.current.bytes[..app.documents.current.length], " two\n"))
+  vim_type(app, typography, "z")
+  usability_prompt_check(key_menu_count(app)==3)
+  vim_type(app, typography, "\x1b")
+  vim_type(app, typography, "Z")
+  usability_prompt_check(key_menu_count(app)==2)
+  vim_type(app, typography, "\x1b")
+}

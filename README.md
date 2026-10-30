@@ -10,15 +10,15 @@ No web runtime. [DESIGN.md](DESIGN.md) records the broader product direction.
 The Linux x86-64 preview requires **glibc 2.43 or newer**, a system monospace
 font, and desktop display libraries for GUI mode. It does not run on Ubuntu
 24.04's glibc 2.39. See [PRERELEASE.md](PRERELEASE.md) before installing.
-Preview.7 changes are recorded in [RELEASE_NOTES.md](RELEASE_NOTES.md).
+Preview.8 changes are recorded in [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
 ```sh
-mise use -g 'github:17robots/dna[prerelease=true,strip_components=1,bin_path=.]@0.1.0-preview.7'
+mise use -g 'github:17robots/dna[prerelease=true,strip_components=1,bin_path=.]@0.1.0-preview.8'
 dna path/to/file.dyn
 dna path/to/project
 ```
 
-Use `mise exec github:17robots/dna@0.1.0-preview.7 -- dna path/to/project`
+Use `mise exec github:17robots/dna@0.1.0-preview.8 -- dna path/to/project`
 if mise is not activated in your shell. The explicit `bin_path=.` selects the
 archive's launcher, which loads its bundled libraries. The Dyn SDK is needed to
 build DNA, but is not required to run this package. Language servers are
@@ -29,11 +29,20 @@ no separate mise plugin or registry entry is required.
 
 ## Dyn SDK migration
 
-Current working source uses the published Dyn preview.27 SDK pinned in
-`mise.toml`, including verified checksums for Linux, macOS and Windows. Run
-`mise install`, then confirm `mise exec -- dyn version` reports
-`dyn 0.1.0-preview.27`. Keep the complete SDK so the compiler, standard library,
-runtime and language server stay together.
+Current source uses **Dyn 0.1.0-preview.28**, pinned with verified platform
+checksums in `mise.toml`. Its installed SDK includes the required `std/ui/box`,
+native window bridge sources, and runtime objects; a sibling checkout is optional.
+
+```sh
+mise install
+mise exec -- dyn --version
+mise exec -- just run
+# Build and run the optimized editor instead:
+mise exec -- just run-release
+```
+
+For compiler development, set `DYN` to your matching compiler executable and
+`DYN_SDK` to its source SDK directory. Leave both unset to use the installed SDK.
 
 To build and open an isolated local preview:
 
@@ -45,28 +54,44 @@ python3 scripts/preview_sdk.py path/to/file.dyn
 
 The helper rebuilds native adapters and the editor with the matching runtime,
 uses separate settings/state under `build/sdk-preview`, and opens the real GUI.
-The helper uses the selected mise compiler by default. Set `DYN` to select
-another compiler; for a development build, also set `DYN_SDK` to its source SDK.
+The helper uses `DYN` when set and otherwise the selected compiler. It rejects SDKs missing the
+required UI modules before building dependencies.
 The example in `examples/sdk-preview` also compiles and runs with that SDK.
 
 Source now uses `#cast(type, value)`, function-value types, arena-first SDK
 producers, current result fields, and JSON missing-value stubs. Required arena
 allocations panic; bounded DNA adapters still return their existing capacity
-failures. Ownership transfers use `mem.arena_take`. Sparse document/App storage
+failures. Owned arenas use pointer handles and chained blocks. Sparse document/App storage
 stays explicitly uninitialized, with its existing initialization and reclamation
-contracts. Document, session, and configuration formats are unchanged.
+contracts. Document and configuration formats are unchanged. Sessions with more than 16
+slots use format 3; older formats remain readable, but older DNA releases cannot
+read format 3. Keep a separate session file when testing or rolling back.
 
 See [SDK-MIGRATION-20261024.md](SDK-MIGRATION-20261024.md) for validation,
 measurements, limits, and the preserved local baseline.
 
 ## Run
 
-Requirements: Linux x86-64, a working Dyn SDK, SDL3 development/runtime libraries,
-FreeType, HarfBuzz, PCRE2, utf8proc, libvterm, Tree-sitter (0.25+), and Fontconfig development libraries, CMake, Python 3.12+, a C compiler,
-and `just`. This migration is tested with the local development Dyn SDK, SDL 3.4.16 and SDL_ttf 3.2.2.
-`just build` downloads and builds pinned SDL_ttf into ignored `build/deps`.
-The build applies a small fix to avoid repeatedly shaping remaining lines when
-wrapping is disabled; its fingerprint also upgrades existing local builds.
+`dna --version` (or `dna version`) prints the application version and exits
+without opening the editor. Use `dna -- version` to open a file named `version`.
+
+`just build`, `just run`, and `just run-release` now use the native Linux GUI:
+Dyn `std/ui` windowing/rendering and native HarfBuzz/FreeType/FriBidi text.
+Wayland is selected when `WAYLAND_DISPLAY` is set; otherwise X11 is used.
+These binaries do not link SDL or SDL_ttf. Dyn preview.28 or newer is required. To explicitly select a backend, run
+`python3 scripts/build_native.py --backend wayland --release` (or `x11`).
+Native runtime libraries remain under `build/native-wayland` or `build/native-gui`;
+keep these directories with the local build.
+
+All GUI builds, including module profiles and direct `dyn build src` / `dyn run src`,
+use the native implementation. The SDL compatibility backend and dependency
+builder have been removed. Direct source builds select Wayland; use the build
+helper's `--backend x11` option for X11.
+
+Requirements: Linux x86-64, Dyn preview.28 or newer, Wayland/EGL or X11,
+FreeType, HarfBuzz, FriBidi, PCRE2, utf8proc, libvterm, Tree-sitter (0.25+), and Fontconfig development libraries, CMake, Python 3.12+, a C compiler,
+GNU binutils (`nm`, `ar`, `objcopy`), and `just`. Native dependencies are built locally with `just deps`; graphics and text
+providers come from the selected SDK and system packages.
 All DNA-owned editor code and native adapters are written in Dyn, including
 PTY/libvterm integration, Tree-sitter workers, filesystem operations, search,
 synchronization and memory accounting. Native test executables and interposers
@@ -74,20 +99,16 @@ are also Dyn. External libraries and the Dyn runtime retain their own implementa
 languages; this is not a dependency-free build. The C compiler builds external
 dependencies and generated header ABI probes, and links Dyn objects.
 The helper does not install system packages. After changing native dependencies,
-use the development compiler with `--no-cache` for a direct static rebuild;
+use the selected compiler with `--no-cache` for a direct static rebuild;
 external archive changes need an explicit rebuild.
 `just build` uses the freshly rebuilt shared adapter. Regex selection uses the system PCRE2 library
 (`libpcre2-dev` on Debian/Ubuntu, `pcre2-devel` on Fedora, `pcre2` on Arch).
 
-Use the tested **Dyn 0.1.0-preview.27** version pinned in `mise.toml`. For daily development, `just run` uses
+Use the installed compiler and SDK selected above for this working source.
+For daily development, `just run` uses
 cached debug builds and the 2 GiB memory guard. `dyn run src/` also reuses
 unchanged modules. Build times depend on the machine, dependencies and cache;
 use the measurements below for the workflow you want to compare.
-
-To measure compilation plus editor startup through the first rendered frame:
-`mise exec -- python3 scripts/compile.py python3 tests/startup_latency.py dyn run src/ --timings`.
-This runs three times with SDL's dummy driver and closes each editor normally;
-it measures CPU startup, not desktop GPU/display latency.
 
 ```sh
 just run                 # empty buffer
@@ -97,7 +118,7 @@ just run README.md       # open an existing file
 With mise activated in your shell, direct Dyn commands work too:
 
 ```sh
-just deps                # once after cloning, builds the local font library
+just deps                # once after cloning, builds native support and the window bridge
 mise trust               # trust this repository's mise.toml
 # Let the shell refresh its environment (or leave and re-enter the directory).
 dyn run src
@@ -105,17 +126,10 @@ dyn run src
 
 `mise.toml` supplies the local native-library search paths for both the compiler
 and runtime. Without shell activation, use `mise exec -- dyn run src` instead.
-The SDL_ttf dependency is declared in the font bindings; no manual `--link` flag
-is needed with this environment. `just smoke-direct` checks this direct-run path
-without inheriting the library paths from `just`.
-
-Direct `dyn build src` and `dyn run src` link SDL3, SDL_ttf and DNA's native
-library statically (through linker scripts in `build/deps/static`), so the
-resulting binary starts from any directory, without `LD_LIBRARY_PATH` and without
-SDL installed. It still uses the system FreeType, HarfBuzz, Fontconfig, libvterm,
-Tree-sitter, PCRE2 and utf8proc. `just build` keeps shared libraries so the test
-harness can intercept SDL calls; `just smoke` checks the standalone binary in a
-sandbox that hides the build directory and system SDL.
+No SDL libraries are built or linked. Direct builds use the native support
+archive and shared SDK window bridge. Keep `build/deps/install/lib` available at
+runtime (mise supplies its library path); packaged builds carry their native
+libraries beside the executable.
 
 Start in normal mode. Press `i` to type, Escape to return to normal mode,
 `:write` then Enter to save, and `:` for searchable commands. Space opens a shortcut guide;
@@ -189,9 +203,9 @@ stay in every profile; a profile needs at least one frontend.
 
 `just build-profile terminal` ([profiles/terminal.toml](profiles/terminal.toml))
 builds `build/dna-terminal` with only the terminal frontend. The GUI backend
-(`src/platform/sdl.dyn`, `src/text/ttf.dyn`) is replaced by generated stubs and
-the native library is built without SDL or Fontconfig, so the binary links
-none of SDL, SDL_ttf or Fontconfig and runs where there is no display or graphics stack (servers,
+(`src/platform/gui.dyn`, `src/text/native.dyn`) is replaced by concrete native interface stubs and
+the native library is built without GUI or Fontconfig code, so the binary links
+no graphics libraries or Fontconfig and runs where there is no display or graphics stack (servers,
 containers, SSH). It always starts in the terminal.
 
 ### Explorer and picker styles
@@ -204,7 +218,8 @@ focus returns to the editor; Space e or a click moves focus back to it.
 
 | Key | Tree action |
 | --- | --- |
-| `j` `k` / arrows, `g` `G`, PageUp/PageDown, Ctrl+d/u | move |
+| `j` `k` / arrows, `g` `G` (Vim: `gg` / `G` and counts), PageUp/PageDown, Ctrl+d/u | move |
+| `/`, Enter; `n` / `N` | search visible filenames; confirm, then next / previous match |
 | Enter | open a file, or fold/unfold a folder |
 | `l` / Right | unfold, then step into a folder; open a file |
 | `h` / Left | fold, or go to the parent folder |
@@ -219,6 +234,11 @@ focus returns to the editor; Space e or a click moves focus back to it.
 | Esc | back to the editor (a floating tree closes) |
 | `q` / Escape | close the tree (Space e opens it again) |
 
+Tree search jumps through visible rows without changing folder expansion; Escape
+cancels an active query and restores the prior selection. While entering a query,
+Up/Down and Ctrl-N/P/J/K browse matches without leaving search. Normal key overrides
+also apply in the tree.
+
 The tree opens on the current file, keeps open folders across reloads and
 hides `.git`. While it is open it watches its root and every open folder, so
 files created, renamed or deleted by anything (a shell, git, the editable
@@ -229,6 +249,8 @@ buffer and resource pickers like the command palette (query and matches only,
 up to 12 rows). `dropdown` does the same but hangs pickers and the command
 palette from the top edge of the window. `[place.picker]` and
 `[place.palette]` still override where they go.
+Picker rows fit the final placed height, and resizing keeps the selected match
+visible even when the query and selection have not changed.
 
 Launch with a file or directory: `./dna src/main.dyn` opens the file;
 `./dna ./src` uses that directory as the project and opens the explorer.
@@ -285,9 +307,12 @@ for `:session-restore`. It is removed only after a successful handoff restore.
 ### Placement
 
 Window popups (`palette`, `picker`, `dialog`, floating `explorer`, and popup
-`terminal`) share a top-center anchor, six percent down the window. Opening does
-not slide their contents away from that anchor, and dismissal removes the popup
-on the next frame. Completion and hover remain near the caret, key menus keep
+`terminal`) share a top-center anchor, six percent down the window. Pickers,
+the command palette and key menus settle into their anchors from a small
+centered opening shape. The editable explorer expands from its left edge. Click
+bounds follow the painted frame; dismissal releases input immediately while
+the editable explorer briefly retracts its retained visual layer. Completion and
+hover remain near the caret, key menus keep
 their contextual position, and a docked explorer stays docked. Each surface can
 still override its placement:
 
@@ -351,14 +376,20 @@ edit the config to persist them. `:set font_family` suggests installed family
 names. In the TUI, the terminal emulator controls font family and size; `:font`
 explains this instead of opening an ineffective picker.
 
+GUI row spacing rounds up to a physical pixel and never falls below the primary
+or configured fallback font's baseline plus descender height. This keeps status
+labels and clipped menu rows legible at fractional scales; larger configured
+line spacing is preserved.
+
 This is a deliberately restricted TOML reader: flat assignments, decimal numbers,
 booleans, quoted strings without escapes, full-line comments, and `[keys.normal]`
 / `[keys.space]` tables. Unknown/duplicate settings and invalid values report a
 line number and preserve working settings. Up to 16 key overrides map key names
 (single characters, F1–F12, `space`, `backslash`, optionally prefixed with
-`ctrl-`, `alt-`, or `shift-`) to palette commands. Normal overrides do not run
-while typing, selecting, or entering text into a terminal. This does not add a Vim
-editing engine; Helix-inspired editing remains the implemented mode.
+`ctrl-`, `alt-`, or `shift-`) to palette commands or the shared navigation actions
+`move-up`, `move-down`, `move-left`, `move-right`, `page-up`, and `page-down`.
+Navigation overrides work in documents and both explorers. Normal overrides do
+not run while typing, selecting, completing a Vim prefix, or entering terminal text.
 
 Layout files remain separate. Existing layout files containing font/display
 settings remain compatible; loading one can override those settings until config
@@ -497,6 +528,21 @@ Terminal defaults, selection, cursor, and ANSI colours follow the selected theme
 Applications emitting explicit truecolour RGB retain those colours.
 
 ## Language installation and highlighting
+
+Typing keeps the last parsed colors on text that the revision journal proves
+unchanged, including suffixes shifted by insertions/deletions. Edited bytes stay
+plain until fresh highlighting arrives. If history is unavailable, rendering
+falls back to plain text rather than using unrelated offsets. Structural syntax
+operations still require the parser's current revision; provisional display
+colors never authorize syntax selections or text objects.
+
+Parser completion wakes schedule a full service pass before idle, so finished
+colors appear without another keypress. GUI highlighting colors the existing
+shaped glyphs once, preserving contextual shaping and avoiding normal-text
+overdraw. Highlight queries complete on the worker thread with cooperative
+yielding and cancellation; capture counts and elapsed time do not silently
+publish a partially colored document as finished.
+
 
 Nothing downloads on startup. `:languages` opens a searchable package manager in
 both the GUI and TUI. Rows distinguish **grammar** packages from language
@@ -655,7 +701,7 @@ character, so `x` never highlights the first character of the following line. Wo
 | Save all / save all and exit | `:wa` / `:xa` |
 | Directory buffer | `Space e`; `Ctrl E` |
 | Font larger/smaller/reset | `Ctrl +` / `Ctrl -` / `Ctrl 0` |
-| Close active view | `:q` / `:quit` |
+| Close active buffer and its split | `:q` / `:quit` |
 | Close shared buffer | `:bd` (prompts if dirty) |
 | Quit whole editor | `:qa` / `:quit-all`, `Ctrl Q`, or close window |
 
@@ -683,18 +729,21 @@ to keep them. `:theme`, `:keymap`, `:module` and placement changes (`:place` or
 the mouse) are session values too, so `:config-reload` or a later `:set` keeps
 them.
 
-`:q` closes the focused split when multiple views are open, preserving buffers
-and unsaved edits, including the same file in another split. With one view, it
-closes the current buffer (prompting if dirty). The final buffer becomes an empty
-scratch buffer; `:q` on that final empty scratch view exits the editor.
-`:bd` closes the shared buffer across views.
+`:q` closes the focused split when another split shows the same file, preserving
+the shared buffer and its unsaved edits. Otherwise it closes the active buffer
+(prompting if dirty) and removes its split rather than filling it with another
+file. Splits showing other files keep their buffers. `:bd` uses the same active
+view behavior; closing a selected buffer in the buffer picker explicitly removes
+that buffer and all its views. Use `:wclose` to close only a view in all cases.
 
 Closing the last buffer follows `[files] close_last_buffer`: `"auto"` (the
 default) quits in the terminal frontend, where an empty editor has nothing to
 show, and keeps an empty buffer in a window; `"quit"` and `"keep"` pick one
 behaviour everywhere. Unsaved text and running terminal panes still ask first.
 `:quit-all` checks every dirty buffer and staged explorer edit before exiting.
-`:x` saves and closes the active buffer, including its other views. `:wa` saves
+`:x` saves modified text and closes the focused view; another view of the same
+file keeps the saved buffer open. With no other view it closes the buffer too.
+Clean buffers close directly. `:wa` saves
 modified file buffers and restores focus; `:xa` saves them before exiting.
 Unnamed modified buffers ask for a destination. Escape or a save/formatter error
 stops the sequence and keeps remaining buffers open; earlier successful saves
@@ -746,13 +795,19 @@ is a compact panel near the bottom with up to four visible results. It filters
 case-insensitively, prioritizes prefixes, and caches unchanged queries/text layouts;
 arrows select a command. Document search accepts case-sensitive regular expressions and wraps. Insert-mode Tab inserts four spaces.
 
+In the `:` command palette, Up/Down recalls the last 32 submitted commands
+and restores the current draft when returning to the newest entry. Ctrl-n/p
+and Ctrl-j/k continue to select palette suggestions. History lasts for the session.
+
 ## Vim keys
 
 `[modules] keymap = "vim"` (or `:keymap vim` for the session) switches normal
 mode to Vim's grammar: operator, then motion or text object, with counts on
 either (`d3w`, `3dd`, `2d2w`). Insert mode keeps DNA's insert keys plus Vim's
 Ctrl-w and Ctrl-u; Escape steps the cursor back one character. Space still
-opens DNA's leader menu and `:` the command palette.
+opens DNA's leader menu and `:` the command palette. Pending `g`, `z`, `Z`,
+and operator text-object prefixes show guides for the available Vim commands;
+keys and clickable guide entries follow the same Vim dispatch.
 
 | Kind | Keys |
 | --- | --- |
@@ -779,13 +834,20 @@ not `a\|b`). Ctrl-x closes the buffer only in the Helix keymap.
 
 `Space e` opens an editable directory popup that works like mini.files. It
 starts as one column on the current folder, with a preview of the selected
-entry beside it. `l` (or Enter, or Right) on a folder walks into it and keeps
+entry beside it. With Helix keys, `l` (or Enter, or Right) on a folder walks into it and keeps
 the folder you came from as a column on the left, so the explorer grows as you
 go deeper; on a file it opens it. `h` (or Backspace, or Left) walks back out.
 When columns no longer fit, the oldest drop off the left. `q` or Escape (in
 normal mode) closes it; staged edits stay until applied or discarded. Every
 explorer closes the same way, and a cancelled file prompt returns to the
 explorer that opened it.
+
+The explorer follows the selected Helix or Vim keymap, with its own editing
+state. In Vim mode, Enter opens the selected entry, Backspace or `-` moves to
+the parent, and `h/l` move within filenames. Operators, counts, and visual
+selections work on the filename buffer;
+`ZZ` previews its staged changes. Explorer navigation and file previews remain
+explicit.
 
 The column you are in is an editable buffer and shares the document editing
 keys: `j/k`, `w/b/e`, motion counts, `i`, `a`, `o`, `v`, `x`, `d`, `c`,
@@ -914,8 +976,9 @@ not a replacement for backups or version control.
 
 ## Current limits
 
-- Up to **16 open documents**, each up to **1,048,575 UTF-8 bytes**; NUL/binary files
-  are refused. Document storage is bounded; unused text, line-index, and undo pages are not eagerly touched.
+- Open-document storage grows with available memory; there is no fixed buffer-count limit.
+  Each document supports up to **268,435,455 UTF-8 bytes**; NUL/binary files are
+  refused. Unused text, line-index, and undo pages are not eagerly touched.
 - Up to 64 undo states within a 4 MiB changed-byte budget per document; large replacements retain
   fewer states. Insert runs group until movement/mode changes.
 - Movement/deletion follows Unicode grapheme clusters, including combining marks,
@@ -934,7 +997,7 @@ not a replacement for backups or version control.
   are available (see Vim keys for its gaps). A TUI and SSH remain unimplemented. An experimental process-based plugin
   API and persistent sessions are available.
 - File operations currently target Linux x86-64. Windows/macOS are not supported
-  by this prototype yet, despite the portable SDL rendering layer.
+  by this prototype yet, despite the native rendering layer.
 
 ## Project tools, sessions, and extensions
 
@@ -1013,33 +1076,47 @@ just smoke  # modules, native UI, PTY and optional grammar checks, debug and rel
 # Enable the offline grammar checks after this explicit download/build:
 DNA_LANGUAGE_DIR="$PWD/build/test-languages" mise exec -- ./build/deps/install/bin/dna-language install dyn
 # Exercise the real desktop driver with isolated test files too:
-LD_LIBRARY_PATH="$PWD/build/deps/install/lib" SDL_VIDEODRIVER=wayland python3 scripts/smoke.py
+LD_LIBRARY_PATH="$PWD/build/deps/install/lib" python3 scripts/smoke.py
+# Only when an isolated nested compositor throttles hidden windows:
+# DNA_SMOKE_TIMEOUT_SECONDS=90 ... python3 scripts/smoke.py
 ```
 
 Tests cover UTF-8 edits, selections, bounded undo/redo, search, capacity rollback,
 file conflicts, permission preservation, recovery, symlink/FIFO rejection, layout
 validation, multi-buffer undo/view restoration, close/quit cancellation, path
 completion, staged explorer edits, preview cancellation, external-source/destination
-changes, palette caching, and the native open/edit/save/create/rename/trash workflow. Synthetic
-SDL input passes through the actual event loop. Font geometry and ABI checks run
-against the installed headers. A native input-burst test verifies that all text
-arrives without a frame per key/text event or redundant title updates; its timings
-are not measurements of human input latency. Physical keyboard and IME testing
+changes, palette caching, and the native open/edit/save/create/rename/trash workflow. Synthetic native input exercises the actual event loop. Native platform tests
+check pixel output, event translation, texture ownership and renderer recreation.
+Text tests check shaping, selection, UTF-8 source offsets and lifetime.
+Physical keyboard and IME testing
 remain separate.
 
 The document owns its text, saved/checkpoint baselines, line index, and bounded undo deltas in an arena.
 Unused text and undo capacity is reserved without eagerly initializing its pages.
 File/prompt/event bytes are copied before their source expires. Temporary file
-reads use a rewindable scratch arena. SDL text objects die before their font,
+reads use a rewindable scratch arena. Native text objects die before their font,
 engine, and renderer. Queued events are processed in bounded batches before drawing, and unchanged
 window titles are not resubmitted. Idle waits do not redraw. Trailing spaces
 and indentation retain their layout width, including in cursor/selection geometry.
-The editing, file, and layout modules do not depend on SDL.
+The editing, file, and layout modules are independent of the GUI backend.
 
 Non-colocated jj, local only. No remote or publication. The project name DNA is
 provisional; the extension architecture in DESIGN.md is not implemented yet.
 
 ## Rendering and latency checks
+
+Native CPU rendering can be measured with `just bench-native-frames`, or
+`python3 scripts/benchmark_native_frames.py --scenario document`. The isolated
+probe draws production code at 960×640, 1920×1080 and 2560×1440; it excludes file
+scanning, GPU work, presentation and physical input/display latency. Use a quiet
+machine; `--cpu N` pins the measured child and `--budget-ms N` applies an optional
+local p95 budget. Native raster tests compare exact pixels against frozen
+references. Textures reuse storage between same-size frames; opaque fills and
+one-to-one texture spans use bulk transfers. UI text layouts use a bounded
+256-entry cache so common document gutters and picker labels fit together.
+The file picker retains same-root rows while refreshing and publishes growing
+cold-scan prefixes; generation checks still reject stale roots.
+
 
 Reproducible local comparisons with Neovim, Helix, and Neovide are recorded in
 [IMPLEMENTATION.md](IMPLEMENTATION.md#local-editor-comparison-2026-10-04), including
@@ -1054,29 +1131,12 @@ Document and explorer rendering shape only the visible complete lines. Selection
 are clipped to that range. Very long individual lines still require full-line
 layout; this is not a large-file editor yet.
 
-`just smoke` includes a 50 KB fixture with individual typing and movement events.
-The test gates on bounded layout work and reports input-to-SDL-present timings,
-not physical keyboard-to-display latency. To measure the native Wayland backend
-after building debug and release:
-
-```sh
-LD_LIBRARY_PATH="$PWD/build/deps/install/lib" SDL_VIDEODRIVER=wayland python3 scripts/latency.py
-```
-
-The search/open/edit regression check (`python3 tests/workflow_performance.py`)
-opens twelve files twice and bounds resident-memory growth and text submitted
-per frame. Total-memory budgets use the dummy backend; both backends check that
-reopening the same files reaches a stable memory footprint. Syntax overlays draw only their spans, with pixel checks against a
-full-document reference for Unicode, tabs, and glyph bearings. The default uses
-fixture highlight spans so no grammar download is needed. Set
-`DNA_PERF_REAL_SYNTAX=1` to use the JSON grammar in `build/test-languages`,
-`DNA_PERF_MODE=debug` for the debug build, or `SDL_VIDEODRIVER=wayland` for the
-real window backend. This check is included in `just smoke`.
-
-`python3 tests/jump_latency.py` replays `gg`/`ge` on `tests/editor/smoke.dyn` in both
-build modes. It checks that jumps reach both file boundaries and bounds shaping
-input to linear viewport work, while reporting frame timings. Set
-`SDL_VIDEODRIVER=wayland` to measure the real window. This is also in `just smoke`.
+`tests/editor/render_reuse_smoke.dyn` checks unchanged multi-pane work and
+invalidation; `edit_visibility_smoke.dyn` checks first-frame caret visibility.
+The old SDL interposition timing drivers have been retired. Saved comparisons
+in dated reports describe their original backend and are historical evidence,
+not native performance claims. Native desktop input/display latency still needs
+separate measurement; present-return traces do not include compositor scanout.
 
 ## Go-to menu
 
@@ -1157,7 +1217,7 @@ Each split retains its viewport layout; cursor-only redraws reuse caret-line sha
 Recovery snapshots allocate only their encoded size and cursor-only movement does not
 reserialize buffer contents. Undo stores changed-byte deltas within 64 states / 4 MiB, reusing discarded redo storage;
 checkpointing an unchanged revision skips text comparison, and bulk copies/moves use libc.
-Terminal/plugin readiness and syntax/search completion wake SDL instead of polling at 60 Hz.
+Terminal/plugin readiness and syntax/search completion wake the native event loop instead of polling at 60 Hz.
 A 500 ms fallback handles maintenance and notification failure; animation frames run only while active.
 
 Terminal normal mode uses a stable, read-only snapshot of retained scrollback and the current screen. `h/j/k/l`, `w/b/e`,
@@ -1165,8 +1225,6 @@ Terminal normal mode uses a stable, read-only snapshot of retained scrollback an
 browse scrollback; `gg`/`ge` jump to oldest/latest output; `gh`/`gl`/`gs` move within a line.
 `i` resumes the live terminal. The themed cursor uses the editor's smooth movement,
 with a bar in input mode and a block in normal mode; reduced-motion settings apply.
-Run `DNA_PERF_ROUNDS=10 python3 tests/workflow_performance.py` after building for a
-120-search/open/edit/undo replay with a resident-memory growth check.
 
 Rendering caches are owned by each pane: viewport text, caret-line geometry, and
 up to 128 syntax spans. Unchanged redraws reuse shaping; long-line rendering
@@ -1265,27 +1323,12 @@ loads and edits, highlighting near 1 MB, large Unicode selections, file I/O,
 undo, search limits, and recovery. Document storage is reserved address space
 that opts out of transparent huge pages, so a small file costs only its pages.
 
-Local headless release measurements (not portable timing guarantees): 12 files
-with real Tree-sitter highlighting, 120 search/open/edit cycles, about 77 MiB
-final RSS and 1.3 MiB growth after warming; input-to-render mean about 4.3 ms.
-With split views and a busy terminal, the shorter replay measured about 83 MiB
-RSS and 5.2 ms mean. Run these on your machine:
-
-```sh
-DNA_PERF_REAL_SYNTAX=1 DNA_PERF_ROUNDS=10 python3 tests/workflow_performance.py
-DNA_PERF_REAL_SYNTAX=1 DNA_PERF_COMBINED=1 python3 tests/workflow_performance.py
-just bench-buffer
-just package
-# Optional clean-container check, using an already-present compatible image:
-DNA_PACKAGE_IMAGE=archlinux:base python3 tests/package.py
-```
-
-The package check compares two archive hashes, verifies extracted checksums, and
-can run the extracted editor in a read-only, network-disabled container with
-only a font mounted. It does not validate real GPU/display drivers or every
-Linux distribution. `build-info.json` records the minimum required glibc symbol
-version; `build/packages/container-check.json` records the tested image digest.
-
+Native validation uses a real Wayland or X11 session. `just smoke` runs the
+editor workflow and service ownership checks; `just soak` repeats native
+resource checks. `just bench-buffer` measures the document engine independently
+of the GUI. `python3 tests/package.py` verifies deterministic archive checksums
+and relocated native startup on the current desktop; it does not qualify every
+Linux distribution or physical display latency.
 
 ## Explorer columns and icons
 
@@ -1386,8 +1429,10 @@ Completion defaults to a 25 ms typing pause; `[lsp] completion_delay_ms` accepts
 10–2000 ms. Server-advertised trigger characters request completion immediately,
 including Unicode triggers, and include the trigger context in the LSP request.
 The configured pause still applies to ordinary typing. Explicit settings retain
-their value. Document-sync delays,
-cursor/scroll/popup animations, and diagnostic mouse hover default to 50 ms. Language-server computation adds to that delay.
+their value. Document sync and diagnostic mouse hover default to 50 ms.
+Cursor and scroll transitions default to 35 ms; popup transitions use 40 ms.
+Panel scrolling and sheet transitions use the configured duration directly.
+Language-server computation adds to the request delay.
 `:lsp-log` shows the active server command, configured delays, and request-to-response
 time. Complete candidate lists filter locally, including backspace, without
 repeating server analysis. Requests remain usable while only word characters are
@@ -1396,9 +1441,14 @@ If an automatic request takes more than 20 ms, DNA can show matching words from 
 bounded region of the current file. These entries say “word from file” and insert
 plain text; function signatures and snippets arrive with the server response.
 No matches hide the list; backspace can restore cached matches immediately.
-The completion menu reserves eight rows (clipped to the pane), so filtering and
-server updates do not change its height. Unused rows remain empty.
-Arrows select, Enter or Tab accepts, and Escape dismisses immediately.
+The completion menu opens with up to eight rows, sized to the initial result set
+and the available space beside the caret. Its width and row capacity can grow
+within a completion session, but filtering does not shrink them. The menu anchors
+to the word's start and retains its above/below placement while typing. Kind
+badges distinguish functions, variables, types and other suggestions; signatures
+remain secondary to labels. Same-named overloads have independent clickable rows.
+Arrows select, Enter or Tab accepts, and Escape dismisses immediately and returns
+to normal mode in either keymap.
 Enter also dismisses an empty result popup without inserting text. Dismissal
 cancels pending completion refreshes, so late replies cannot reopen it.
 Hover, cursor diagnostics, signatures, and completion appear beside the cursor
@@ -1492,22 +1542,35 @@ python3 scripts/render_report.py /tmp/dna-frames-1.jsonl --json
 ```
 
 Every presented frame records its cause(s), relative timestamp, number of events
-since the previous frame, last SDL event kind, draw wall time, pane-render/setup time,
-SDL present time, document/palette text updates, popup type, and animation state.
+since the previous frame, last event kind, draw wall time, pane-render/setup time,
+native present time, document/palette text updates, popup type, and animation state.
 Causes include input, window events, animation, diagnostic hover, configuration,
 syntax, LSP, plugins, disk updates, formatting, search, macros, and terminals.
 Direct draws outside the event loop are marked `explicit`. Multiple causes may
 share a frame. Counts of document/palette updates cover those caches, not every
-SDL_ttf operation. No file contents, filenames, or typed text are recorded.
+native text operation. No file contents, filenames, or typed text are recorded.
+
+Input-bearing frames also record the time from event dequeue to present return,
+for both the earliest and latest event coalesced into the frame. The report shows
+p50/p95/p99 and worst-case latency and draw time using bounded histograms (bucket
+width at most 1.6%). Animation intervals longer than 1.5 known display periods
+are counted as late submissions. These measurements exclude OS input queueing,
+GPU completion, compositor presentation and physical display scanout; they are
+not hardware input-to-photon or exact missed-refresh measurements.
 
 Tracing is off by default. Enabled tracing uses a fixed 16 KiB buffer and caps
 output at 64 MiB; after that, frame totals continue and the final summary marks
 truncation. Buffered records flush while idle and on normal shutdown. A crash or
 forced kill can lose the pending buffer and final summary. Write failures print a
 warning. The report reads logs with bounded memory and highlights slow frames.
-Timing excludes trace serialization/writes, and `present_us` measures the SDL
+Timing excludes trace serialization/writes, and `present_us` measures the native
 call—not GPU completion or compositor latency. Compare normal runs separately
 because tracing itself adds work.
+
+Shutdown records named `shutdown_search`, `shutdown_languages`,
+`shutdown_format`, `shutdown_plugins`, `shutdown_recovery`, `shutdown_tree`,
+`shutdown_disk`, `shutdown_lsp`, `shutdown_syntax`, and `shutdown_terminals`
+identify service cleanup and join delays.
 
 The same trace also records main-thread operation wall/CPU time, whole-process CPU
 (including concurrent workers), wakeup reasons and requested deadlines, recovery
@@ -1522,9 +1585,9 @@ Arena accounting covers document storage (including bounded undo history), reusa
 LSP receive arenas and transferred results, recovery encoding, and UI text storage.
 Native tracing also counts syntax-adapter, search-result, terminal, disk-worker,
 and Tree-sitter allocations, with live/peak bytes and maximum released lifetime.
-Text layouts report object counts because SDL_ttf/GPU allocation sizes are opaque.
+Text layouts report object counts because native text/GPU allocation sizes are opaque.
 These are requested/reserved sizes, not RSS; native profiling headers, allocator
-bookkeeping, other SDL allocations, plugins, and temporary session-reader arenas
+bookkeeping, other native GUI allocations, plugins, and temporary session-reader arenas
 are not included. Native allocation instrumentation is enabled only when
 `DNA_RENDER_TRACE` is set at process startup. Large one-off receive/encoding
 arenas are released above 2 MiB; smaller ones are reused. Recovery's worker also
@@ -1546,16 +1609,72 @@ fixed 500 ms wakeup.
 
 ### Performance and ownership maintenance
 
+Ready input is handled and painted before background maintenance. Maintenance
+keeps its ordered service phases, yields to queued input between phases, and
+checks a 2 ms cooperative budget. One phase progresses after each input paint
+so sustained input cannot starve services; a single phase can exceed the budget
+while completing its own transaction. Input event order is preserved.
+
+Disk registrations, filetype resolution, and language-server document updates
+use maintained worksets. Buffer observers only mark work after complete edits;
+load, save, undo/redo and compound edits participate. Recovery checks compare a
+workspace generation instead of scanning every buffer while idle. Visible
+syntax work is bounded by pane count, and terminal polling follows terminal
+owners rather than all file buffers. Full session capture and native disk audits
+after filesystem events still perform the necessary workspace-wide work.
+
+Cursor position and selection highlights update immediately. Optional cursor
+trails are decorative; scrolling retargets without moving away from its new
+target or overshooting. Popup hit geometry follows its painted frame.
+Split and docked explorer edges settle spatially using RAD-style exponential
+motion: the new pane grows from its shared boundary while the existing pane
+shrinks, and closing expands the surviving pane. Code stays fully opaque;
+there is no whole-document fade or background flash. Painted rectangles and
+pointer hit targets agree during motion, while keyboard navigation and caret
+scroll targets use the final layout. Further input finishes existing geometry
+motion immediately. Startup, window resizing, divider dragging, reduced motion,
+disabled popup transitions, zero duration and the terminal frontend remain
+immediate. The default response is `1 - 2^(-70 * dt_seconds)`; popup duration
+scales its speed. Unchanged redraws do not restart motion, and settled panels
+stop requesting animation frames.
+Pickers, the command palette, floating explorers and key menus share the same
+spatial settling response. Their selected row stays visible during opening,
+and typing or navigation finishes the opening motion immediately. Floating
+explorer columns retain their set while the outer frame settles. Popup opacity
+remains a short decoration; other popups dismiss immediately.
+The editable explorer opens from its left edge and retracts on dismissal. The
+closing layer is decorative: the explorer releases input immediately, and further
+input finishes its exit. File text stays stationary when switching buffers.
+Parent and directory-preview panes retain the editable listing’s padding, row
+height, line-number gutter, directory markers and text contrast. Their headers
+identify their parent or preview role; numbering follows the editor settings.
+Existing explorer columns stay anchored on the left during folder navigation.
+New columns grow on the right; outgoing right columns retract while retaining
+a bounded snapshot of their text. Further input finishes the motion immediately.
+Page scrolling and cursor-jump decoration continue across unchanged targets;
+small navigation steps still land immediately. Presentation pacing uses the
+current frame's animation state. When a native display mode is unavailable,
+timer-only animation uses a conservative 60 Hz fallback; synchronized animation
+continues to follow the display. Input frames retain immediate presentation.
+Per-pane caret geometry and unchanged visible line layouts are reused with
+font, revision, viewport, identity and journal invalidation checks.
+
 DNA still draws the entire screen whenever a frame is needed. There is no retained
 UI tree diff or partial-pane framebuffer. Cached text layouts avoid shaping the
 same text again; events and background work determine when a full draw is needed.
+The optional native rasterizer clips triangle work to each triangle’s bounding
+box, preserving the same edge coverage and alpha blend rules.
 
 UI label lookup uses collision chains with a shared least-recently-used pool;
 colliding labels can use free entries rather than evicting each other from a small
 fixed bucket. This caches text shaping, not screen regions.
 
-The cache budgets are explicit: 128 UI layouts, 128 syntax-span layouts per pane,
-15 pane records, a target of two inactive syntax parsers, and 16 open documents.
+The cache budgets are explicit: 256 UI layouts, 128 syntax-span layouts per pane,
+15 pane records and a target of two inactive syntax parsers. Open documents use
+a growable directory of stable owners; growth preserves file and asynchronous
+request identities. File watching, language-server tracking, recovery, and buffer
+picker results grow with that directory. Sessions with more than 16 slots use
+format 3; formats 1 and 2 remain readable.
 Parser eviction uses one background disposal slot so switching files does not
 wait for tree destruction. While that slot is busy, further eviction waits;
 parsers remain bounded by the document slots plus one retiring parser. Shutdown
@@ -1605,28 +1724,8 @@ production sources with the test startup adapter and builds separate
 compiler memory limit. `DYN_EDITOR_SMOKE=1` on the normal binary only validates
 startup, one full presentation, and shutdown; it does not run the behavioral suite.
 
-Run `mise exec -- just soak` for 20 rounds of editing/search/opening, four rounds
-with real syntax and background terminal output, and 300 native resource
-lifecycles. It gates memory stabilization, submitted text work, native
-allocation balance, descriptor/thread cleanup, and idle redraw/stat behavior.
-Manual CI dispatch also runs this extended check. Normal `just smoke` includes
-shorter versions, syntax buffer growth and allocation-failure recovery checks,
-plus an idle process-CPU budget. Syntax lifecycle checks require the JSON test
-grammar and verify completed parsing, stale revisions, and cancellation at teardown.
-The document memory gate also retains 4,000 distant edits without saving, checks
-all text after undo/redo, bounds snapshot growth, and verifies that reloading a
-small file releases the dirty baseline and undo storage.
-The LSP memory gate opens eight small documents with an incremental test server
-and checks that retained memory follows their size without adding huge pages.
-
-For desktop measurements, run:
-
-```sh
-SDL_VIDEODRIVER=wayland DNA_PERF_REAL_SYNTAX=1 mise exec -- python3 tests/workflow_performance.py
-```
-
-This opens a real editor window and replays a temporary project using the installed
-JSON grammar under `build/test-languages` (override with `DNA_LANGUAGE_DIR`). Use `x11` instead
-when appropriate. Input timings end at SDL present, not the compositor or physical
-display. For a retained trace, set `DNA_RENDER_TRACE` to a new absolute filename;
-use `scripts/render_report.py` afterward. Profiling itself adds overhead.
+Run `just soak` for repeated native resource lifecycle checks. Syntax lifecycle
+checks require the JSON test grammar and verify completed parsing, stale
+revisions, and cancellation at teardown. Retained render traces can be inspected
+with `scripts/render_report.py`; trace timings end at native present return,
+not compositor completion or physical display scanout.

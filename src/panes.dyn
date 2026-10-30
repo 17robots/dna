@@ -37,6 +37,8 @@ struct Pane {
   slot: usize,
   secondary_count: usize,
   rect: sdl.PixelRect,
+  target_rect: sdl.PixelRect,
+  geometry: motion.Rectangle,
 }
 
 fn pane_init(app: *App) {
@@ -71,7 +73,7 @@ fn pane_store(app: *App) {
 }
 fn pane_load(app: *App, index: usize) {
   pane := &app.view.panes[index]
-  slot := &app.documents.slots[pane.slot]
+  slot := app.documents.slots[pane.slot]
   app.documents.active = pane.slot
   app.documents.current = slot.document
   app.documents.file = &slot.file
@@ -120,6 +122,16 @@ fn pane_split(app: *App, vertical: bool) {
   original := app.view.panes[parent]
   app.view.panes[first] = original
   app.view.panes[second] = original
+  // The old view shrinks from its current rectangle; the new sibling grows
+  // from that same edge, so the moving boundary stays shared.
+  collapsed := original.geometry.current
+  if vertical {
+    collapsed[0] = collapsed[2]
+  }
+  else {
+    collapsed[1] = collapsed[3]
+  }
+  motion.rectangle_seed(&app.view.panes[second].geometry, collapsed, original.geometry.sampled)
   app.view.panes[first].parent = parent
   app.view.panes[second].parent = parent
   app.view.panes[parent].branch = true
@@ -134,7 +146,7 @@ fn pane_split(app: *App, vertical: bool) {
   app.documents.current.marks[first * 2 + 1] = app.documents.current.anchor
   app.documents.current.marks[second * 2] = app.documents.current.cursor
   app.documents.current.marks[second * 2 + 1] = app.documents.current.anchor
-  pane_layout(app, parent, original.rect)
+  pane_layout(app, parent, original.target_rect)
   if app.config.equalize_splits {
     pane_balance(app)
   }
@@ -174,7 +186,7 @@ fn pane_remove(app: *App, closing: usize) {
   if sibling == closing {
     sibling = app.view.panes[parent].second
   }
-  parent_rect := app.view.panes[parent].rect
+  parent_rect := app.view.panes[parent].target_rect
   grandparent := app.view.panes[parent].parent
   app.view.panes[parent] = app.view.panes[sibling]
   app.view.panes[parent].parent = grandparent
@@ -214,7 +226,11 @@ fn pane_remove(app: *App, closing: usize) {
 }
 fn pane_layout(app: *App, index: usize, rect: sdl.PixelRect) {
   pane := &app.view.panes[index]
-  pane.rect = rect
+  pane.target_rect = rect
+  if !surface_motion_enabled(app) || !app.view.animation.surfaces_ready || !pane.geometry.ready {
+    motion.rectangle_seed(&pane.geometry, rectangle_edges(rect), app.view.animation.now)
+    pane.rect = rect
+  }
   if !pane.branch {
     return
   }
@@ -241,9 +257,19 @@ fn pane_layout(app: *App, index: usize, rect: sdl.PixelRect) {
   pane_layout(app, pane.first, first)
   pane_layout(app, pane.second, second)
 }
+fn pane_animate_layout(app: *App, index: usize) {
+  pane := &app.view.panes[index]
+  pane.rect = animated_rectangle(app, &pane.geometry, pane.target_rect)
+  if pane.branch {
+    pane_animate_layout(app, pane.first)
+    pane_animate_layout(app, pane.second)
+  }
+}
 fn pane_direction(app: *App, key: u32) {
   pane_init(app)
-  current := app.view.panes[app.view.focused].rect
+  // Keyboard direction follows the logical split topology even when another
+  // command in this event batch created it before its first animated paint.
+  current := app.view.panes[app.view.focused].target_rect
   cx := current.x + current.width / 2
   cy := current.y + current.height / 2
   chosen := app.view.focused
@@ -252,8 +278,8 @@ fn pane_direction(app: *App, key: u32) {
   for index < 15 {
     pane := &app.view.panes[index]
     if pane.used && !pane.branch && index != app.view.focused {
-      x := pane.rect.x + pane.rect.width / 2
-      y := pane.rect.y + pane.rect.height / 2
+      x := pane.target_rect.x + pane.target_rect.width / 2
+      y := pane.target_rect.y + pane.target_rect.height / 2
       dx := x - cx
       dy := y - cy
       eligible := (key == KeyH && dx < 0) || (key == KeyL && dx > 0) || (key == KeyK && dy < 0) || (key == KeyJ && dy > 0)
@@ -353,10 +379,6 @@ fn window_hint(index: usize) KeyHint {
 
 // Split the view, then give the new view its own empty document.
 fn pane_new(app: *App, vertical: bool) {
-  if app.documents.count >= 16 {
-    notice(app, "Buffer limit reached (16). Close a buffer first.")
-    return
-  }
   pane_init(app)
   previous := app.view.focused
   pane_split(app, vertical)
@@ -369,7 +391,7 @@ fn pane_new(app: *App, vertical: bool) {
   }
 }
 
-fn pane_remove_terminal(app: *App, slot: usize) {
+fn pane_remove_slot(app: *App, slot: usize) {
   if !app.view.pane_ready {
     return
   }
@@ -403,7 +425,7 @@ fn pane_resize(app: *App, percent: f32) {
     fraction = 1.0 - fraction
   }
   app.view.panes[parent].split_fraction = fraction
-  pane_layout(app, parent, app.view.panes[parent].rect)
+  pane_layout(app, parent, app.view.panes[parent].target_rect)
   app.prompt_state.panel = Panel.None
   app.view.revision += 1
 }
@@ -445,7 +467,7 @@ fn pane_balance(app: *App) {
       pane.split_fraction = #cast(f32, first) / #cast(f32, (first + second))
     }
   }
-  pane_layout(app, 0, app.view.panes[0].rect)
+  pane_layout(app, 0, app.view.panes[0].target_rect)
 }
 fn pane_equalize(app: *App) {
   pane_init(app)

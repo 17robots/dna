@@ -16,6 +16,7 @@ args = parser.parse_args()
 stage = ROOT / 'build/document-memory'
 stage.mkdir(parents=True, exist_ok=True)
 shutil.copytree(ROOT / 'src/buffer', stage / 'buffer', dirs_exist_ok=True)
+shutil.copytree(ROOT/'src/owned_arena',stage/'owned_arena',dirs_exist_ok=True)
 shutil.copyfile(ROOT / 'tests/document_memory/main.dyn', stage / 'main.dyn')
 binary = stage / 'check'
 subprocess.run(['python3', str(ROOT / 'scripts/compile.py'), os.environ.get('DYN', 'dyn'),
