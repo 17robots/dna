@@ -1,0 +1,396 @@
+use "std/ui"
+// Direct window drawing: bounded vertex batches and a bounded, single-channel
+// glyph atlas. Popup targets live in framebuffer textures; no window or popup
+// CPU image is retained during normal GPU rendering. Targets store premultiplied
+// alpha so overlapping transparent drawing composes without read/modify/write.
+pub struct GpuVertex { x, y, u, v, r, g, b, a: f32 }
+struct GlyphSlot { key: u64, x, y, width, height: i32 }
+pub struct Gpu {
+  api: gl.Api,
+  program, vao, buffer, atlas, scratch: u32,
+  viewport, mode, sampler: i32,
+  width, height, max_texture: i32,
+  sub_data: fn(u32, isize, isize, rawptr),
+  gen_framebuffers: fn(i32, *u32),
+  bind_framebuffer: fn(u32, u32),
+  attach_texture: fn(u32, u32, u32, u32, i32),
+  framebuffer_status: fn(u32)u32,
+  delete_framebuffers: fn(i32, *const u32),
+  framebuffer, window_framebuffer: u32,
+  vertices: [6144]GpuVertex,
+  count: usize,
+  texture: u32,
+  mask, premultiplied: bool,
+  clip: ui.Rect,
+  slots: [2048]GlyphSlot,
+  slot_count: usize,
+  atlas_x, atlas_y, atlas_row: i32,
+  failed: bool,
+}
+pub fn gpu_open(gpu: *Gpu) bool {
+  if gpu.program!=0 {
+    return false
+  }
+  loaded:=gl.load(window_api.gl_proc)
+  if !loaded.ok {
+    return false
+  }
+  gpu.api=loaded.api
+  name:="glBufferSubData\x00"
+  gpu.sub_data=#cast(fn(u32, isize, isize, rawptr), window_api.gl_proc(&name[0]))
+  if gpu.sub_data==nil || !gpu_load_framebuffers(gpu) || !healthy(&gpu.api) {
+    return false
+  }
+  api:=&gpu.api
+  vertex:=shader(api, gl.VertexShader, "#version 330 core\nlayout(location=0) in vec2 p;layout(location=1) in vec2 t;layout(location=2) in vec4 c;uniform vec2 viewport;out vec2 uv;out vec4 color;void main(){uv=t;color=c;gl_Position=vec4(p.x/viewport.x*2.-1.,1.-p.y/viewport.y*2.,0.,1.);}")
+  fragment:=shader(api, gl.FragmentShader, "#version 330 core\nin vec2 uv;in vec4 color;uniform sampler2D image;uniform int mode;out vec4 pixel;void main(){vec4 c=color;vec4 sampleColor=vec4(1.);if(mode!=0){vec2 tc=uv-.5*dFdx(uv)+.5*dFdy(uv);ivec2 at=ivec2(tc*vec2(textureSize(image,0))+vec2(.0001));if(mode==3){at.y=textureSize(image,0).y-1-at.y;}sampleColor=texelFetch(image,at,0);}if(mode==1){c.a=floor(c.a*sampleColor.r*255.+.5)/255.;}else if(mode==2){vec4 t=sampleColor;c.rgb*=t.rgb;c.a=floor(c.a*t.a*255.+.5)/255.;}if(mode==3){pixel=vec4(sampleColor.rgb*color.rgb*color.a,floor(sampleColor.a*color.a*255.+.5)/255.);}else{pixel=vec4(c.rgb*c.a,c.a);}}")
+  if vertex==0 || fragment==0 {
+    if vertex!=0 {
+      api.delete_shader(vertex)
+    }
+    if fragment!=0 {
+      api.delete_shader(fragment)
+    }
+    return false
+  }
+  gpu.program=api.create_program()
+  if gpu.program==0 {
+    api.delete_shader(vertex)
+    api.delete_shader(fragment)
+    return false
+  }
+  api.attach_shader(gpu.program, vertex)
+  api.attach_shader(gpu.program, fragment)
+  api.link_program(gpu.program)
+  api.delete_shader(vertex)
+  api.delete_shader(fragment)
+  valid:i32=0
+  api.get_program_iv(gpu.program, gl.LinkStatus, &valid)
+  if valid==0 {
+    gpu_close(gpu)
+    return false
+  }
+  viewport_name:="viewport\x00"
+  mode_name:="mode\x00"
+  sampler_name:="image\x00"
+  gpu.viewport=api.get_uniform_location(gpu.program, &viewport_name[0])
+  gpu.mode=api.get_uniform_location(gpu.program, &mode_name[0])
+  gpu.sampler=api.get_uniform_location(gpu.program, &sampler_name[0])
+  api.get_integer(gl.MaxTextureSize, &gpu.max_texture)
+  api.gen_vertex_arrays(1, &gpu.vao)
+  api.gen_buffers(1, &gpu.buffer)
+  api.gen_textures(1, &gpu.atlas)
+  api.gen_textures(1, &gpu.scratch)
+  api.bind_vertex_array(gpu.vao)
+  api.bind_buffer(gl.ArrayBuffer, gpu.buffer)
+  api.buffer_data(gl.ArrayBuffer, #cast(isize, 6144*#sizeof(GpuVertex)), nil, gl.DynamicDraw)
+  api.enable_vertex_attribute(0)
+  api.enable_vertex_attribute(1)
+  api.enable_vertex_attribute(2)
+  api.vertex_attribute(0, 2, gl.Float, 0, 32, nil)
+  api.vertex_attribute(1, 2, gl.Float, 0, 32, #cast(rawptr, 8))
+  api.vertex_attribute(2, 4, gl.Float, 0, 32, #cast(rawptr, 16))
+  gpu_unpack(gpu)
+  gpu_texture_setup(gpu, gpu.atlas)
+  api.tex_image_2d(gl.Texture2d, 0, #cast(i32, gl.R8), 1024, 1024, 0, gl.Red, gl.UnsignedByte, nil)
+  gpu_texture_setup(gpu, gpu.scratch)
+  if gpu.vao==0 || gpu.buffer==0 || gpu.atlas==0 || gpu.scratch==0 || gpu.max_texture<1024 || !healthy(api) {
+    gpu_close(gpu)
+    return false
+  }
+  return true
+}
+pub fn gpu_close(gpu:*Gpu) {
+  if gpu.program!=0 {
+    gpu.api.delete_program(gpu.program)
+    gpu.api.delete_vertex_arrays(1, &gpu.vao)
+    gpu.api.delete_buffers(1, &gpu.buffer)
+    gpu.api.delete_textures(1, &gpu.atlas)
+    gpu.api.delete_textures(1, &gpu.scratch)
+  }
+  gpu.*=Gpu{}
+}
+fn gpu_unpack(gpu:*Gpu) {
+  api:=&gpu.api
+  api.active_texture(gl.Texture0)
+  api.bind_sampler(0, 0)
+  api.bind_buffer(gl.PixelUnpackBuffer, 0)
+  api.pixel_store_i(gl.UnpackAlignment, 1)
+  api.pixel_store_i(gl.UnpackRowLength, 0)
+  api.pixel_store_i(gl.UnpackSkipRows, 0)
+  api.pixel_store_i(gl.UnpackSkipPixels, 0)
+}
+pub fn gpu_texture_setup(gpu:*Gpu, texture:u32) {
+  api:=&gpu.api
+  api.bind_texture(gl.Texture2d, texture)
+  api.tex_parameter_i(gl.Texture2d, gl.TextureMinFilter, #cast(i32, gl.Nearest))
+  api.tex_parameter_i(gl.Texture2d, gl.TextureMagFilter, #cast(i32, gl.Nearest))
+  api.tex_parameter_i(gl.Texture2d, gl.TextureWrapS, #cast(i32, gl.ClampToEdge))
+  api.tex_parameter_i(gl.Texture2d, gl.TextureWrapT, #cast(i32, gl.ClampToEdge))
+}
+pub fn gpu_flush(gpu:*Gpu) bool {
+  if gpu.failed {
+    return false
+  }
+  if gpu.count==0 {
+    return true
+  }
+  api:=&gpu.api
+  api.viewport(0, 0, gpu.width, gpu.height)
+  api.use_program(gpu.program)
+  api.bind_vertex_array(gpu.vao)
+  api.bind_buffer(gl.ArrayBuffer, gpu.buffer)
+  api.active_texture(gl.Texture0)
+  api.bind_sampler(0, 0)
+  api.bind_texture(gl.Texture2d, gpu.texture)
+  api.uniform_2f(gpu.viewport, #cast(f32, gpu.width), #cast(f32, gpu.height))
+  api.uniform_1i(gpu.sampler, 0)
+  mode:i32=0
+  if gpu.texture!=0 {
+    mode=2
+  }
+  if gpu.mask {
+    mode=1
+  }
+  if gpu.premultiplied {
+    mode=3
+  }
+  api.uniform_1i(gpu.mode, mode)
+  api.color_mask(1, 1, 1, 1)
+  api.polygon_mode(gl.FrontAndBack, gl.Fill)
+  api.disable(gl.ColorLogicOp)
+  api.disable(gl.RasterizerDiscard)
+  api.disable(gl.DepthTest)
+  api.disable(gl.CullFace)
+  api.disable(gl.StencilTest)
+  api.disable(gl.FramebufferSrgb)
+  api.disable(gl.Dither)
+  api.enable(gl.ScissorTest)
+  api.scissor(gpu.clip.x, gpu.height-gpu.clip.y-gpu.clip.height, gpu.clip.width, gpu.clip.height)
+  api.enable(gl.Blend)
+  api.blend_equation_separate(gl.FuncAdd, gl.FuncAdd)
+  api.blend_func_separate(gl.One, gl.OneMinusSrcAlpha, gl.One, gl.OneMinusSrcAlpha)
+  gpu.sub_data(gl.ArrayBuffer, 0, #cast(isize, gpu.count*#sizeof(GpuVertex)), #cast(rawptr, &gpu.vertices[0]))
+  api.draw_arrays(gl.Triangles, 0, #cast(i32, gpu.count))
+  gpu.count=0
+  gpu.failed=!healthy(api)
+  return !gpu.failed
+}
+pub fn gpu_clear(gpu:*Gpu, width, height:i32, color:ui.Color) bool {
+  if !gpu_flush(gpu) || width<=0 || height<=0 {
+    return false
+  }
+  gpu.width=width
+  gpu.height=height
+  gpu.api.color_mask(1, 1, 1, 1)
+  gpu.api.disable(gl.ScissorTest)
+  alpha:=#cast(f32, color.a)/255.0
+  gpu.api.clear_color(#cast(f32, color.r)/255.0*alpha, #cast(f32, color.g)/255.0*alpha, #cast(f32, color.b)/255.0*alpha, alpha)
+  gpu.api.clear(gl.ColorBufferBit)
+  return healthy(&gpu.api)
+}
+fn gpu_batch(gpu:*Gpu, texture:u32, mask, premultiplied:bool, clip:ui.Rect, needed:usize) bool {
+  if gpu.failed {
+    return false
+  }
+  if gpu.texture!=texture || gpu.mask!=mask || gpu.premultiplied!=premultiplied || gpu.clip.x!=clip.x || gpu.clip.y!=clip.y || gpu.clip.width!=clip.width || gpu.clip.height!=clip.height || gpu.count+needed>#len(gpu.vertices) {
+    if !gpu_flush(gpu) {
+      return false
+    }
+    gpu.texture=texture
+    gpu.mask=mask
+    gpu.premultiplied=premultiplied
+    gpu.clip=clip
+  }
+  return true
+}
+pub fn gpu_triangle(gpu:*Gpu, a, b, c:GpuVertex, clip:ui.Rect) bool {
+  if clip.width<=0 || clip.height<=0 {
+    return true
+  }
+  if !gpu_batch(gpu, 0, false, false, clip, 3) {
+    return false
+  }
+  gpu.vertices[gpu.count]=a
+  gpu.vertices[gpu.count+1]=b
+  gpu.vertices[gpu.count+2]=c
+  gpu.count+=3
+  return true
+}
+pub fn gpu_quad(gpu:*Gpu, bounds:ui.Rect, clip:ui.Rect, color:ui.Color, texture:u32, mask, premultiplied:bool, u, v, right, bottom:f32) bool {
+  if bounds.width<=0 || bounds.height<=0 || clip.width<=0 || clip.height<=0 {
+    return true
+  }
+  if !gpu_batch(gpu, texture, mask, premultiplied, clip, 6) {
+    return false
+  }
+  a:=GpuVertex{x:#cast(f32, bounds.x), y:#cast(f32, bounds.y), u:u, v:v, r:#cast(f32, color.r)/255.0, g:#cast(f32, color.g)/255.0, b:#cast(f32, color.b)/255.0, a:#cast(f32, color.a)/255.0}
+  b:=a
+  b.x+=#cast(f32, bounds.width)
+  b.u=right
+  c:=b
+  c.y+=#cast(f32, bounds.height)
+  c.v=bottom
+  d:=a
+  d.y=c.y
+  d.v=bottom
+  gpu.vertices[gpu.count]=a
+  gpu.vertices[gpu.count+1]=b
+  gpu.vertices[gpu.count+2]=c
+  gpu.vertices[gpu.count+3]=a
+  gpu.vertices[gpu.count+4]=c
+  gpu.vertices[gpu.count+5]=d
+  gpu.count+=6
+  return true
+}
+pub fn gpu_upload(gpu:*Gpu, texture:*u32, pixels:*const u8, width, height:i32, create:bool) bool {
+  if width<=0 || height<=0 || width>gpu.max_texture || height>gpu.max_texture || !gpu_flush(gpu) {
+    return false
+  }
+  gpu_unpack(gpu)
+  if texture.*==0 {
+    gpu.api.gen_textures(1, texture)
+    if texture.*==0 {
+      return false
+    }
+    gpu_texture_setup(gpu, texture.*)
+  } else {
+    gpu.api.bind_texture(gl.Texture2d, texture.*)
+  }
+  if create {
+    gpu.api.tex_image_2d(gl.Texture2d, 0, #cast(i32, gl.Rgba8), width, height, 0, gl.Rgba, gl.UnsignedByte, #cast(rawptr, pixels))
+  }
+  else {
+    gpu.api.tex_sub_image_2d(gl.Texture2d, 0, 0, 0, width, height, gl.Rgba, gl.UnsignedByte, #cast(rawptr, pixels))
+  }
+  return healthy(&gpu.api)
+}
+pub fn gpu_glyph(gpu:*Gpu, key:u64, pixels:*const u8, width, height:i32, bounds, clip:ui.Rect, color:ui.Color, sx, sy:f32) bool {
+  if bounds.width<=0 || bounds.height<=0 || ui.intersect(bounds, clip).width<=0 || ui.intersect(bounds, clip).height<=0 {
+    return true
+  }
+  slot:=GlyphSlot{}
+  found:=false
+  if key!=0 {
+    for i in 0..gpu.slot_count {
+      candidate:=gpu.slots[i]
+      if candidate.key==key && candidate.width==width && candidate.height==height {
+        slot=candidate
+        found=true
+        break
+      }
+    }
+  }
+  texture:=gpu.atlas
+  divisor_x:f32=1024.0
+  divisor_y:f32=1024.0
+  if !found {
+    if width>1024 || height>1024 || key==0 {
+      // Scratch storage is overwritten, so queued users must finish first.
+      if !gpu_flush(gpu) {
+        return false
+      }
+      gpu_unpack(gpu)
+      texture=gpu.scratch
+      divisor_x=#cast(f32, width)
+      divisor_y=#cast(f32, height)
+      gpu.api.bind_texture(gl.Texture2d, texture)
+      gpu.api.tex_image_2d(gl.Texture2d, 0, #cast(i32, gl.R8), width, height, 0, gl.Red, gl.UnsignedByte, #cast(rawptr, pixels))
+    } else {
+      if gpu.atlas_x+width>1024 {
+        gpu.atlas_y+=gpu.atlas_row
+        gpu.atlas_x=0
+        gpu.atlas_row=0
+      }
+      if gpu.atlas_y+height>1024 || gpu.slot_count==#len(gpu.slots) {
+        // Flush before overwriting texels still referenced by pending vertices.
+        if !gpu_flush(gpu) {
+          return false
+        }
+        gpu.slot_count=0
+        gpu.atlas_x=0
+        gpu.atlas_y=0
+        gpu.atlas_row=0
+      }
+      slot=GlyphSlot{key:key, x:gpu.atlas_x, y:gpu.atlas_y, width:width, height:height}
+      gpu_unpack(gpu)
+      // A new atlas region cannot overlap a queued glyph. Uploading it does
+      // not require flushing otherwise compatible vertices.
+      gpu.api.bind_texture(gl.Texture2d, texture)
+      gpu.api.tex_sub_image_2d(gl.Texture2d, 0, slot.x, slot.y, width, height, gl.Red, gl.UnsignedByte, #cast(rawptr, pixels))
+      gpu.slots[gpu.slot_count]=slot
+      gpu.slot_count+=1
+      gpu.atlas_x+=width
+      if height>gpu.atlas_row {
+        gpu.atlas_row=height
+      }
+    }
+    if !healthy(&gpu.api) {
+      gpu.failed=true
+      return false
+    }
+  }
+  return gpu_quad(gpu, bounds, clip, color, texture, true, false, #cast(f32, slot.x)/divisor_x, #cast(f32, slot.y)/divisor_y, (#cast(f32, slot.x)+#cast(f32, bounds.width)/sx)/divisor_x, (#cast(f32, slot.y)+#cast(f32, bounds.height)/sy)/divisor_y)
+}
+
+fn gpu_load_framebuffers(gpu:*Gpu)bool {
+  gen:="glGenFramebuffers\x00"
+  bind:="glBindFramebuffer\x00"
+  attach:="glFramebufferTexture2D\x00"
+  status:="glCheckFramebufferStatus\x00"
+  remove:="glDeleteFramebuffers\x00"
+  gpu.gen_framebuffers=#cast(fn(i32, *u32), window_api.gl_proc(&gen[0]))
+  gpu.bind_framebuffer=#cast(fn(u32, u32), window_api.gl_proc(&bind[0]))
+  gpu.attach_texture=#cast(fn(u32, u32, u32, u32, i32), window_api.gl_proc(&attach[0]))
+  gpu.framebuffer_status=#cast(fn(u32)u32, window_api.gl_proc(&status[0]))
+  gpu.delete_framebuffers=#cast(fn(i32, *const u32), window_api.gl_proc(&remove[0]))
+  return gpu.gen_framebuffers!=nil && gpu.bind_framebuffer!=nil && gpu.attach_texture!=nil && gpu.framebuffer_status!=nil && gpu.delete_framebuffers!=nil
+}
+pub fn gpu_bind(gpu:*Gpu, framebuffer:u32, width, height:i32)bool {
+  if !gpu_flush(gpu) {
+    return false
+  }
+  gpu.bind_framebuffer(36160, framebuffer)
+  if !healthy(&gpu.api) {
+    return false
+  }
+  gpu.framebuffer=framebuffer
+  gpu.width=width
+  gpu.height=height
+  return true
+}
+pub fn gpu_target_create(gpu:*Gpu, texture, framebuffer:*u32, pixels:*const u8, width, height:i32)bool {
+  if !gpu_upload(gpu, texture, pixels, width, height, true) {
+    return false
+  }
+  gpu.gen_framebuffers(1, framebuffer)
+  gpu.bind_framebuffer(36160, framebuffer.*)
+  gpu.attach_texture(36160, 36064, gl.Texture2d, texture.*, 0)
+  complete:=gpu.framebuffer_status(36160)==36053
+  gpu.bind_framebuffer(36160, gpu.framebuffer)
+  valid:=healthy(&gpu.api)
+  if framebuffer.*==0 || !complete || !valid {
+    gpu.delete_framebuffers(1, framebuffer)
+    gpu.api.delete_textures(1, texture)
+    framebuffer.*=0
+    texture.*=0
+    return false
+  }
+  return true
+}
+// Called only when renderer recreation needs a CPU backup; ordinary popup
+// rendering never allocates readback storage or waits for GPU pixels.
+pub fn gpu_target_read(gpu:*Gpu, framebuffer:u32, pixels:*u8, width, height:i32)bool {
+  if !gpu_flush(gpu) {
+    return false
+  }
+  gpu.bind_framebuffer(36160, framebuffer)
+  gpu.api.bind_buffer(35051, 0)
+  gpu.api.pixel_store_i(gl.PackAlignment, 1)
+  gpu.api.pixel_store_i(3330, 0)
+  gpu.api.pixel_store_i(3331, 0)
+  gpu.api.pixel_store_i(3332, 0)
+  gpu.api.read_pixels(0, 0, width, height, gl.Rgba, gl.UnsignedByte, #cast(rawptr, pixels))
+  gpu.bind_framebuffer(36160, gpu.framebuffer)
+  return healthy(&gpu.api)
+}

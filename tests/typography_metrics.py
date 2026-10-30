@@ -16,7 +16,7 @@ with tempfile.TemporaryDirectory(prefix='dna-typography-',dir=ROOT/'build') as t
     work=Path(temporary);stage=work/'src';shutil.copytree(ROOT/'src',stage)
     shutil.copyfile(ROOT/'tests/editor/typography_metrics_smoke.dyn',stage/'typography_metrics_smoke.dyn')
     gui=stage/'platform/gui.dyn';source=gui.read_text()
-    at=source.index('pub fn native_text_bitmap(')
+    at=source.index('pub fn native_text_cached_bitmap(')
     body=source.index('{',at)
     source=source[:body+1]+'\n if y+#cast(f32,height)>typography_probe_ink_bottom {typography_probe_ink_bottom=y+#cast(f32,height)}\n'+source[body+1:]
     source+='''\ntypography_probe_ink_bottom:f32

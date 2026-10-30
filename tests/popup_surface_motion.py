@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import shutil,subprocess,sys,tempfile
+from native_gpu_probe import install as gpu_probe
 ROOT=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='dna-popup-motion-',dir=ROOT/'build') as temporary:
     work=Path(temporary);stage=work/'src';shutil.copytree(ROOT/'src',stage)
@@ -15,7 +16,7 @@ with tempfile.TemporaryDirectory(prefix='dna-popup-motion-',dir=ROOT/'build') as
 pub fn popup_probe_resize(width,height:i32){native_gui.window.width=width
  native_gui.window.height=height
  if !native_resize(){#panic("popup motion resize")}}
-''';gui.write_text(s)
+''';gui.write_text(gpu_probe(s))
     if '--negative-control' in sys.argv:
         animation=stage/'animation.dyn';source=animation.read_text()
         start=source.index('fn animated_surface(');body=source.index('{',start)

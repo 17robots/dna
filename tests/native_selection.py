@@ -41,7 +41,7 @@ int main(int argc,char**argv){
 SUBSTRING='pub struct Substring {flags:u32,offset:i32,length:i32,line:i32,cluster:i32,x:i32,y:i32,width:i32,height:i32}\n'
 PLATFORM=r'''pub fn native_color(renderer:rawptr,r,g,b,a:u8)bool{return renderer!=nil}
 pub fn native_fill(renderer:rawptr,x,y,w,h:f32)bool{return renderer!=nil}
-pub fn native_text_bitmap(renderer:rawptr,pixels:*const u8,width,height:i32,x,y:f32,r,g,b,a:u8)bool{return renderer!=nil}
+pub fn native_text_cached_bitmap(renderer:rawptr,key:u64,pixels:*const u8,width,height:i32,x,y:f32,r,g,b,a:u8)bool{return renderer!=nil}
 '''
 NATIVE=r'''fn check(ok:bool){if !ok{#panic("native selection adapter")}}
 struct Captured {regions:[64]Substring,count:usize,stop:bool}

@@ -2,6 +2,7 @@
 // HarfBuzz glyph shaping and FriBidi paragraph ordering preserve UTF-8 source
 // offsets. Fonts, native libraries and cached bitmaps stay on the GUI thread.
 use "std/mem"
+use "std/bytes" byte_ops
 use "std/fs" std_fs
 use "std/font" font_api
 use "vendor/text/layout" text_layout
@@ -34,10 +35,13 @@ fn native_font_points(handle:rawptr) f32 {
   }
   return #cast(*NativeFont, handle).points
 }
-struct NativeGlyph { bitmap: font_api.Bitmap }
+native_glyph_serial: u64
+struct NativeGlyph { key: u64, bitmap: font_api.Bitmap }
+struct NativeGlyphPage { values: [256]*NativeGlyph }
 struct NativeFont {
   owner: *mem.Arena,
   file: *mem.Arena,
+  mapping: std_fs.Mapping,
   face: font_api.Face,
   freetype: ft.Font,
   metrics: ft.FaceMetrics,
@@ -50,11 +54,19 @@ struct NativeFont {
   fallbacks: [16]*NativeFont,
   fallback_count: usize,
   glyph_memory: *mem.Arena,
-  glyphs: [65536]*NativeGlyph,
+  glyphs: [256]*NativeGlyphPage,
+  measure: *mem.Arena,
+  measure_text: []const u8,
+  measure_width, measure_height: i32,
+  measure_revision: u64,
+  measure_fallback_count: usize,
+  measure_fallback_revisions: [16]u64,
+  measure_valid: bool,
 }
 struct NativeText {
   owner: *mem.Arena,
   payload: *mem.Arena,
+  spare: *mem.Arena,
   font: *NativeFont,
   renderer: rawptr,
   layout: text_layout.Layout,
@@ -190,6 +202,73 @@ fn ttf_font_height(handle: rawptr) i32 {
   }
   return #cast(i32, ascent + descent)
 }
+// HarfBuzz borrows the immutable bytes retained by NativeFont.file. Destroy
+// its font before releasing file storage; HB_MEMORY_MODE_READONLY is 1.
+fn native_shaping_font(bytes: []const u8) rawptr {
+  if #len(bytes)==0 || #cast(u64, #len(bytes))>0xffffffff {
+    return nil
+  }
+  api:=&native_libraries.hb
+  blob:=api.blob_create(&bytes[0], #cast(u32, #len(bytes)), 1, nil, nil)
+  if blob==nil {
+    return nil
+  }
+  if api.blob_length(blob)!=#cast(u32, #len(bytes)) {
+    api.blob_destroy(blob)
+    return nil
+  }
+  face:=api.face_create(blob, 0)
+  api.blob_destroy(blob)
+  if face==nil {
+    return nil
+  }
+  if face==api.face_get_empty() || api.face_glyph_count(face)==0 {
+    api.face_destroy(face)
+    return nil
+  }
+  font:=api.font_create(face)
+  api.face_destroy(face)
+  if font==nil {
+    return nil
+  }
+  if font==api.font_get_empty() {
+    api.font_destroy(font)
+    return nil
+  }
+  api.ot_font_set_funcs(font)
+  return font
+}
+// Package-managed fonts are mapped read-only: only touched tables and glyph
+// outlines become resident, as clean page-cache pages the kernel can drop.
+// Other fonts are copied, because truncating a mapped file would turn shaping
+// or rasterization into a mapping fault; read_all sizes regular files exactly.
+// Packages replace system fonts by rename, which leaves a mapping intact.
+fn native_font_mappable(path:[]const u8) bool {
+  if byte_ops.contains(path, "/../") || byte_ops.contains(path, "/./") {
+    return false
+  }
+  return byte_ops.starts_with(path, "/usr/share/fonts/") || byte_ops.starts_with(path, "/usr/lib/fonts/")
+}
+fn native_font_map(path:[]const u8) std_fs.Mapping {
+  opened:=std_fs.open(path)
+  if !opened.ok {
+    return std_fs.Mapping{error:opened.error, kind:opened.kind}
+  }
+  mapping:=std_fs.Mapping{kind:errors.Kind.InvalidInput}
+  info:=std_fs.file_metadata(&opened.value)
+  // Regular, non-empty, bounded, and not writable by group or others.
+  if info.ok && (info.mode & 61440) == 32768 && (info.mode & 18) == 0 && info.size != 0 && info.size <= 67108864 {
+    mapping=std_fs.map(&opened.value)
+  }
+  _=std_fs.close(&opened.value)
+  return mapping
+}
+fn native_font_release(font:*NativeFont) {
+  if #len(font.mapping.value) != 0 {
+    _=std_fs.unmap(&font.mapping)
+  }
+  mem.arena_release(font.file)
+}
 fn ttf_open(path: *const u8, points: f32) rawptr {
   if path == nil || !native_points(points) || !init() {
     return nil
@@ -198,17 +277,27 @@ fn ttf_open(path: *const u8, points: f32) rawptr {
   if length == 0 || length == 4096 {
     return nil
   }
-  file := mem.arena_create(0)
-  loaded := std_fs.read_all(file, path[..length], 67108864)
-  if !loaded.ok {
-    mem.arena_release(file)
-    return nil
+  mapping := std_fs.Mapping{}
+  if native_font_mappable(path[..length]) {
+    mapping = native_font_map(path[..length])
   }
-  face := font_api.open(loaded.value)
-  owner := mem.arena_create(0)
+  file: *mem.Arena = nil
+  contents: []const u8 = mapping.value
+  if #len(contents) == 0 {
+    file = mem.arena_create(65536)
+    copied := std_fs.read_all(file, path[..length], 67108864)
+    if !copied.ok || #len(copied.value) == 0 {
+      mem.arena_release(file)
+      return nil
+    }
+    contents = copied.value
+  }
+  face := font_api.open(contents)
+  owner := mem.arena_create(4096)
   font := mem.push(NativeFont, owner)
   font.owner = owner
   font.file = file
+  font.mapping = mapping
   font.face = face.value
   font.points = points
   font.revision = 1
@@ -216,32 +305,32 @@ fn ttf_open(path: *const u8, points: f32) rawptr {
     font.metrics=ft.FaceMetrics{units_per_em:face.value.units_per_em, ascent:face.value.ascent, descent:face.value.descent}
     font.line_units=#cast(i32, face.value.ascent)-#cast(i32, face.value.descent)+#cast(i32, face.value.line_gap)
   } else {
-    opened:=ft.open(&font.freetype, native_libraries.ft, loaded.value, 0, #cast(u32, native_em(font)))
+    opened:=ft.open(&font.freetype, native_libraries.ft, contents, 0, #cast(u32, native_em(font)))
     if !opened.ok {
-      mem.arena_release(font.file)
+      native_font_release(font)
       mem.arena_release(owner)
       return nil
     }
     metrics:=ft.face_metrics(font.freetype.face)
     if !metrics.ok {
       ft.close(&font.freetype)
-      mem.arena_release(font.file)
+      native_font_release(font)
       mem.arena_release(owner)
       return nil
     }
     font.metrics=metrics.value
     font.line_units=#cast(i32, metrics.value.height)
   }
-  shaped:=hb.font_owned(&native_libraries.hb, loaded.value, 0)
-  if !shaped.ok {
+  shaped:=native_shaping_font(contents)
+  if shaped==nil {
     if font.freetype.face!=nil {
       ft.close(&font.freetype)
     }
-    mem.arena_release(font.file)
+    native_font_release(font)
     mem.arena_release(owner)
     return nil
   }
-  font.shaped=shaped.value
+  font.shaped=shaped
   native_shape_size(font)
   native_libraries.fonts+=1
   return #cast(rawptr, font)
@@ -252,11 +341,12 @@ fn ttf_close(handle: rawptr) {
   }
   font := #cast(*NativeFont, handle)
   mem.arena_release(font.glyph_memory)
+  mem.arena_release(font.measure)
   native_libraries.hb.font_destroy(font.shaped)
   if font.freetype.face!=nil {
     ft.close(&font.freetype)
   }
-  mem.arena_release(font.file)
+  native_font_release(font)
   owner := font.owner
   mem.arena_release(owner)
   native_libraries.fonts-=1
@@ -280,7 +370,7 @@ fn ttf_font_size(handle: rawptr, points: f32) bool {
     native_shape_size(font)
     mem.arena_release(font.glyph_memory)
     font.glyph_memory = nil
-    for i in 0..65536 {
+    for i in 0..256 {
       font.glyphs[i] = nil
     }
     font.revision += 1
@@ -301,7 +391,7 @@ fn native_shape_size(font:*NativeFont) {
   em:=#cast(i32, native_em(font))
   native_libraries.hb.font_set_scale(font.shaped, em*64, em*64)
   native_libraries.hb.font_set_ppem(font.shaped, #cast(u32, em), #cast(u32, em))
-  scratch:=mem.arena_create(0)
+  scratch:=mem.arena_create(4096)
   defer mem.arena_release(scratch)
   features:[0]hb.Feature=[]
   shape:=hb.shape(scratch, &native_libraries.hb, font.shaped, " ", hb.LeftToRight, features[..])
@@ -347,11 +437,14 @@ fn native_index(font:*const NativeFont, cp:u32) u32 {
   return #cast(u32, font_api.glyph_index(&font.face, cp))
 }
 fn native_bitmap(font:*NativeFont, index:u16) *NativeGlyph {
-  if font.glyphs[index]!=nil {
-    return font.glyphs[index]
+  page_index:=#cast(usize, index)>>8
+  offset:=#cast(usize, index)&255
+  page:=font.glyphs[page_index]
+  if page!=nil && page.values[offset]!=nil {
+    return page.values[offset]
   }
   if font.glyph_memory == nil {
-    font.glyph_memory = mem.arena_create(0)
+    font.glyph_memory = mem.arena_create(65536)
   }
   mark:=mem.arena_mark(font.glyph_memory)
   bitmap:=font_api.Bitmap{}
@@ -377,9 +470,18 @@ fn native_bitmap(font:*NativeFont, index:u16) *NativeGlyph {
     }
     bitmap=font_api.Bitmap{pixels:pixels, width:value.width, height:value.height, x_offset:value.left, y_offset:0-value.top, advance:#cast(i32, value.advance_x/64)}
   }
+  if page==nil {
+    page=mem.push(NativeGlyphPage, font.glyph_memory)
+    font.glyphs[page_index]=page
+  }
   glyph:=mem.push(NativeGlyph, font.glyph_memory)
+  native_glyph_serial+=1
+  if native_glyph_serial==0 {
+    #panic("glyph identity exhausted")
+  }
+  glyph.key=native_glyph_serial
   glyph.bitmap=bitmap
-  font.glyphs[index]=glyph
+  page.values[offset]=glyph
   return glyph
 }
 fn native_build(arena:*mem.Arena, font:*NativeFont, text:[]const u8, wrap:i32) text_layout.Result {
@@ -388,17 +490,47 @@ fn native_build(arena:*mem.Arena, font:*NativeFont, text:[]const u8, wrap:i32) t
   }
   return text_layout.build(arena, text, text_layout.Font{data:#cast(rawptr, font), select:native_select, line_height:native_line(font), space_advance:font.space}, &native_libraries.hb, &native_libraries.fb, text_layout.Options{width:wrap, wrap:wrap>0})
 }
-fn native_update(text: *NativeText, font: *NativeFont, source: []const u8, wrap: i32) bool {
-  if !utf8.valid(source) || #len(source)>2147483647 || wrap<0 {
+fn native_revisions_match(text: *const NativeText, font: *const NativeFont) bool {
+  if text.font!=font || text.revision!=font.revision || text.fallback_count!=font.fallback_count {
     return false
   }
-  payload := mem.arena_create(0)
+  for i in 0..font.fallback_count {
+    if text.fallback_revisions[i]!=font.fallbacks[i].revision {
+      return false
+    }
+  }
+  return true
+}
+fn native_update(text: *NativeText, font: *NativeFont, source: []const u8, wrap: i32) bool {
+  if #len(source)>2147483647 || wrap<0 {
+    return false
+  }
+  if text.wrap==wrap && native_revisions_match(text, font) && byte_ops.equal(text.layout.text, source) {
+    return true
+  }
+  if !utf8.valid(source) {
+    return false
+  }
+  payload:=text.spare
+  text.spare=nil
+  if payload==nil {
+    payload=mem.arena_create(65536)
+  }
+  else {
+    mem.arena_reset(payload)
+  }
   result := native_build(payload, font, source, wrap)
   if !result.ok {
     mem.arena_release(payload)
     return false
   }
-  mem.arena_release(text.payload)
+  // Keep only one small work arena. Large old layouts are released promptly.
+  if text.payload!=nil && text.payload.backing<=65536 {
+    text.spare=text.payload
+  }
+  else {
+    mem.arena_release(text.payload)
+  }
   text.payload = payload
   text.layout = result.value
   text.font = font
@@ -411,13 +543,7 @@ fn native_update(text: *NativeText, font: *NativeFont, source: []const u8, wrap:
   return true
 }
 fn native_current(text: *NativeText) bool {
-  changed := text.revision != text.font.revision || text.fallback_count != text.font.fallback_count
-  for i in 0..text.font.fallback_count {
-    if text.fallback_revisions[i] != text.font.fallbacks[i].revision {
-      changed = true
-    }
-  }
-  if !changed {
+  if native_revisions_match(text, text.font) {
     return true
   }
   return native_update(text, text.font, text.layout.text, text.wrap)
@@ -426,17 +552,46 @@ fn ttf_measure(handle: rawptr, bytes: *const u8, length: usize, width: *i32, hei
   if handle == nil || (bytes==nil && length!=0) {
     return false
   }
-  arena := mem.arena_create(0)
-  defer mem.arena_release(arena)
-  result := native_build(arena, #cast(*NativeFont, handle), bytes[..length], 0)
-  if !result.ok {
-    return false
+  font:=#cast(*NativeFont, handle)
+  current:=font.measure_valid && font.measure_revision==font.revision && font.measure_fallback_count==font.fallback_count
+  for i in 0..font.fallback_count {
+    if font.measure_fallback_revisions[i]!=font.fallbacks[i].revision {
+      current=false
+    }
   }
-  if width != nil {
-    width.* = #cast(i32, math.ceil64(result.value.width))
+  if !current || !byte_ops.equal(font.measure_text, bytes[..length]) {
+    if font.measure==nil {
+      font.measure=mem.arena_create(65536)
+    }
+    arena:=font.measure
+    font.measure_valid=false
+    mem.arena_reset(arena)
+    result:=native_build(arena, font, bytes[..length], 0)
+    if !result.ok {
+      mem.arena_reset(arena)
+      return false
+    }
+    font.measure_width=#cast(i32, math.ceil64(result.value.width))
+    font.measure_height=#cast(i32, math.ceil64(result.value.height))
+    if arena.backing<=65536 {
+      font.measure_text=result.value.text
+      font.measure_revision=font.revision
+      font.measure_fallback_count=font.fallback_count
+      for i in 0..font.fallback_count {
+        font.measure_fallback_revisions[i]=font.fallbacks[i].revision
+      }
+      font.measure_valid=true
+    } else {
+      // Large one-off measurements do not become a retained cache.
+      mem.arena_reset(arena)
+      font.measure_text=""
+    }
   }
-  if height != nil {
-    height.* = #cast(i32, math.ceil64(result.value.height))
+  if width!=nil {
+    width.*=font.measure_width
+  }
+  if height!=nil {
+    height.*=font.measure_height
   }
   return true
 }
@@ -458,7 +613,7 @@ fn native_create(engine: rawptr, handle: rawptr, bytes: *const u8, length: usize
   if engine == nil || handle == nil || (bytes == nil && length != 0) {
     return nil
   }
-  owner := mem.arena_create(0)
+  owner := mem.arena_create(4096)
   text := mem.push(NativeText, owner)
   text.owner = owner
   text.renderer = engine
@@ -478,6 +633,7 @@ fn native_destroy(handle: rawptr) {
   }
   text := #cast(*NativeText, handle)
   mem.arena_release(text.payload)
+  mem.arena_release(text.spare)
   owner := text.owner
   mem.arena_release(owner)
 }
@@ -672,7 +828,7 @@ fn ttf_draw_colored(handle:rawptr, x, y:f32, color:fn(rawptr, usize)u32, data:ra
       blue=#cast(u8, ink&255)
     }
     baseline:=math.ceil64(#cast(f64, text.font.metrics.ascent)*#cast(f64, native_em(text.font))/#cast(f64, text.font.metrics.units_per_em))
-    if !sdl.native_text_bitmap(text.renderer, &value.pixels[0], value.width, value.height, x+#cast(f32, glyph.x+glyph.x_offset)+#cast(f32, value.x_offset), y+#cast(f32, glyph.y+glyph.y_offset+baseline)+#cast(f32, value.y_offset), red, green, blue, text.alpha) {
+    if !sdl.native_text_cached_bitmap(text.renderer, bitmap.key, &value.pixels[0], value.width, value.height, x+#cast(f32, glyph.x+glyph.x_offset)+#cast(f32, value.x_offset), y+#cast(f32, glyph.y+glyph.y_offset+baseline)+#cast(f32, value.y_offset), red, green, blue, text.alpha) {
       return false
     }
   }
@@ -698,7 +854,7 @@ fn ttf_selection(handle:rawptr, start, end:usize, callback:fn(rawptr, *const Sub
   if !native_current(text) {
     return false
   }
-  arena:=mem.arena_create(0)
+  arena:=mem.arena_create(65536)
   defer mem.arena_release(arena)
   regions:=text_layout.selection(arena, &text.layout, start, end)
   if !regions.ok {

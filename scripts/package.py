@@ -47,6 +47,8 @@ with tempfile.TemporaryDirectory(prefix='dna-package-') as temporary:
     for directory in ('themes', 'layouts'):
         shutil.copytree(ROOT/directory, tree/'share/dna'/directory)
     shutil.copy2(ROOT/'config.example.toml', tree/'share/dna/config.example.toml')
+    shutil.copytree(ROOT/'packaging/linux/share/applications', tree/'share/applications')
+    shutil.copy2(ROOT/'packaging/linux/dna-install-desktop', tree/'dna-install-desktop')
     (tree/'README.md').write_text("""# DNA Linux preview
 
 Run `./dna [file-or-directory]` from this directory, or add this directory to PATH.
@@ -55,6 +57,11 @@ Keep `bin`, `lib`, and `share` beside the launcher. No Dyn SDK or Python is
 required to run the editor. A system monospace font, compatible glibc, and
 Linux display/graphics-driver libraries are required. The launcher selects Wayland
 when WAYLAND_DISPLAY is set, otherwise X11. Both binaries also support --tui.
+
+Run `./dna-install-desktop` to register DNA and DNA (Terminal) in your app
+launcher. It writes per-user desktop entries, respecting XDG_DATA_HOME. Run it
+again after moving or upgrading this extracted package. Terminal mode uses the
+terminal configured by your desktop launcher. No root access is needed.
 
 - `i`: insert; Escape: normal mode; `:write`: save; `:`: command palette.
 - Space f: file picker; Space b: buffer picker; Space e: editable explorer.

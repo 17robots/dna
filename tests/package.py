@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 from dyn_path import real_dyn
 archive = ROOT / 'build/packages/dna-preview-linux-x86_64.tar.gz'
+subprocess.run([sys.executable, str(ROOT/'tests/desktop_install.py')], check=True)
 subprocess.run(['python3', str(ROOT / 'scripts/package.py')], check=True)
 first = hashlib.sha256(archive.read_bytes()).hexdigest()
 subprocess.run(['python3', str(ROOT / 'scripts/package.py')], check=True)
@@ -35,6 +36,16 @@ with tempfile.TemporaryDirectory(prefix='dna-clean-package-') as temporary:
                     DNA_LANGUAGE_DIR=str(directory/'languages'))
     for variable in ('LD_LIBRARY_PATH', 'DYN_LIBRARY_PATH', 'LD_PRELOAD', 'DNA_WORKFLOW_TEST', 'DYN_SDK'):
         host_env.pop(variable, None)
+    desktop_data = directory/'desktop-data'
+    subprocess.run([str(package/'dna-install-desktop')],
+                   env=dict(host_env, XDG_DATA_HOME=str(desktop_data)), check=True)
+    for name, mode, terminal in (('dna', '--gui', 'false'), ('dna-tui', '--tui', 'true')):
+        entry = desktop_data/'applications'/(name+'.desktop')
+        subprocess.run(['desktop-file-validate', str(entry)], check=True)
+        content = entry.read_text()
+        assert str(package/'dna') in content and str(ROOT) not in content, content
+        assert mode+' %f' in content and 'Terminal='+terminal in content, content
+    print('PASS packaged desktop registration: relocated GUI/TUI entries')
     library_env = dict(host_env, LD_LIBRARY_PATH=str(package / 'lib'))
     for binary in [*(package / 'bin').iterdir(), *(package / 'lib').iterdir()]:
         paths = subprocess.check_output(['ldd', str(binary)], env=library_env, text=True)

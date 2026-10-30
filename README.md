@@ -27,9 +27,45 @@ installed separately.
 This uses [mise's GitHub backend](https://mise.jdx.dev/dev-tools/backends/github.html);
 no separate mise plugin or registry entry is required.
 
+### Desktop launchers (next package)
+
+Packages built from this source include `dna-install-desktop` and standard
+entries under `share/applications`. This is newer than the published preview.8
+archive. Run the helper after extracting a package that includes it:
+
+```sh
+./dna-install-desktop
+```
+
+It registers **DNA** (`--gui`) and **DNA (Terminal)** (`--tui`, `Terminal=true`)
+in `$XDG_DATA_HOME/applications`, defaulting to `~/.local/share/applications`.
+The entries use the package launcher's absolute path; fuzzel and other desktop
+menus need no mise environment or PATH changes. The terminal entry uses the
+terminal configured by your desktop launcher. Run the helper again after moving
+or upgrading the extracted package. Setup needs a POSIX shell and `awk`.
+
+For mise releases that include the helper, add this to the existing DNA tool
+section of your global mise config to refresh the entries after each install:
+
+```toml
+[tools."github:17robots/dna"]
+# Keep your existing version, asset and checksum settings.
+postinstall = '"$MISE_TOOL_INSTALL_PATH/dna-install-desktop"'
+```
+
+To register an existing installation from this checkout, including preview.8:
+
+```sh
+./packaging/linux/dna-install-desktop --launcher "$(mise which dna)"
+```
+
+To remove the menu entries, delete `dna.desktop` and `dna-tui.desktop` from that
+applications directory. Setup registers launchers; choose default file
+associations separately in your desktop settings.
+
 ## Dyn SDK migration
 
-Current source uses **Dyn 0.1.0-preview.28**, pinned with verified platform
+Current source uses **Dyn 0.1.0-preview.29**, pinned with verified platform
 checksums in `mise.toml`. Its installed SDK includes the required `std/ui/box`,
 native window bridge sources, and runtime objects; a sibling checkout is optional.
 
@@ -80,6 +116,19 @@ Dyn `std/ui` windowing/rendering and native HarfBuzz/FreeType/FriBidi text.
 Wayland is selected when `WAYLAND_DISPLAY` is set; otherwise X11 is used.
 These binaries do not link SDL or SDL_ttf. Dyn preview.28 or newer is required. To explicitly select a backend, run
 `python3 scripts/build_native.py --backend wayland --release` (or `x11`).
+The GUI draws rectangles, selections, triangles, and text directly through
+OpenGL 3.3. Glyph masks use a bounded 1 MiB atlas; vertices use a fixed-size
+batch buffer. It does not allocate or upload a full-window CPU framebuffer.
+Popup targets also render directly into GPU framebuffer textures, using
+premultiplied alpha for transparent composition. Normal drawing retains no
+CPU popup image and performs no popup readback/upload. A temporary CPU backup
+preserves live textures only when recreating the renderer. Set `DNA_RENDERER=software` to use
+the previous full-frame software renderer for comparison or troubleshooting.
+Both paths retain the same HarfBuzz/FreeType/FriBidi shaping and font metrics.
+Font files use a single bounded owned allocation, preserving their bytes if the
+file is later replaced or truncated. Large icon fonts still retain their file
+contents for shaping and glyph rasterization.
+
 Native runtime libraries remain under `build/native-wayland` or `build/native-gui`;
 keep these directories with the local build.
 
@@ -1087,12 +1136,21 @@ validation, multi-buffer undo/view restoration, close/quit cancellation, path
 completion, staged explorer edits, preview cancellation, external-source/destination
 changes, palette caching, and the native open/edit/save/create/rename/trash workflow. Synthetic native input exercises the actual event loop. Native platform tests
 check pixel output, event translation, texture ownership and renderer recreation.
+Direct GPU tests compare pixels against the software reference, allowing one
+8-bit rounding step, and exercise batching, atlas eviction, failed texture
+allocation/retry, framebuffer failure/retry, CPU-free popup targets, atlas
+rollover ordering, cold/warm glyph batching and renderer recreation on Wayland
+and X11.
+Editor frame tests use test-only GPU readback for typing, syntax and motion.
 Text tests check shaping, selection, UTF-8 source offsets and lifetime.
 Physical keyboard and IME testing
 remain separate.
 
 The document owns its text, saved/checkpoint baselines, line index, and bounded undo deltas in an arena.
 Unused text and undo capacity is reserved without eagerly initializing its pages.
+Pane typography metadata is allocated when a pane is drawn and released when
+the pane closes or becomes a split branch. Font changes invalidate existing
+caches without allocating unused pane slots.
 File/prompt/event bytes are copied before their source expires. Temporary file
 reads use a rewindable scratch arena. Native text objects die before their font,
 engine, and renderer. Queued events are processed in bounded batches before drawing, and unchanged

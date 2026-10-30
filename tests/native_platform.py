@@ -236,7 +236,7 @@ with tempfile.TemporaryDirectory(prefix='dna-native-platform-') as directory:
     library=ROOT/('build/native-wayland' if BACKEND=='wayland' else 'build/native-gui')
     if not (library/'libdna_native.so').exists():
         raise SystemExit(f'Run scripts/build_native.py --backend {BACKEND} before native platform tests')
-    environment=dict(os.environ,DYN_LIBRARY_PATH=str(library),LD_LIBRARY_PATH=str(library))
+    environment=dict(os.environ,DNA_RENDERER='software',DYN_LIBRARY_PATH=str(library),LD_LIBRARY_PATH=str(library))
     if BACKEND=='x11': environment.pop('WAYLAND_DISPLAY',None)
     for flags in (['--debug'],['--release']):
         output=work/'test'

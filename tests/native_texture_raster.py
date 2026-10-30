@@ -9,14 +9,8 @@ import tempfile
 ROOT=Path(__file__).resolve().parents[1]
 SOURCE=ROOT/'src/platform/gui.dyn'
 REFERENCE=ROOT/'tests/fixtures/native_texture_reference.dyn'
-def function(path,name):
-    text=path.read_text();start=text.index(('pub ' if 'pub fn '+name+'(' in text else '')+'fn '+name+'(')
-    end=text.index('{',start)+1;depth=1
-    while depth:
-        if text[end]=='{':depth+=1
-        elif text[end]=='}':depth-=1
-        end+=1
-    return text[start:end]
+from native_software_source import function
+
 HEADER='''use "std/ui"
 use "std/ui/software"
 struct PixelRect {x,y,width,height:i32}

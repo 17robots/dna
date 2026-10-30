@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import shutil,subprocess,sys,tempfile
+from native_gpu_probe import install as gpu_probe
 ROOT=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='dna-explorer-window-native-',dir=ROOT/'build') as temporary:
     work=Path(temporary);stage=work/'src';shutil.copytree(ROOT/'src',stage)
@@ -15,7 +16,7 @@ with tempfile.TemporaryDirectory(prefix='dna-explorer-window-native-',dir=ROOT/'
 pub fn popup_probe_resize(width,height:i32){native_gui.window.width=width
  native_gui.window.height=height
  if !native_resize(){#panic("popup motion resize")}}
-''';gui.write_text(s)
+''';gui.write_text(gpu_probe(s))
     (stage/'startup_probe.dyn').write_text('''fn startup_probe(app:*App,typography:*Typography,renderer:rawptr,window:rawptr,input_storage:[]u8){
  explorer_window_motion_smoke(app,typography,renderer,window,ExplorerWindowProbe{time:sdl.popup_probe_time,resize:sdl.popup_probe_resize,pixels:sdl.popup_probe_pixels})
 }

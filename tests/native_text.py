@@ -23,6 +23,32 @@ fn main() {
  first_height:=ttf_font_height(font)
  check(first_height>0)
  check(native_libraries.fonts==1)
+ if #sizeof(NativeFont)>16384 {#panic("font metadata startup budget")}
+ // Verify the real HarfBuzz blob shares the font bytes we retain, rather than
+ // silently copying an entire font file again.
+ get_face:=#cast(fn(rawptr)rawptr,dynlib.symbol(native_libraries.harfbuzz,"hb_font_get_face").value)
+ reference_blob:=#cast(fn(rawptr)rawptr,dynlib.symbol(native_libraries.harfbuzz,"hb_face_reference_blob").value)
+ get_data:=#cast(fn(rawptr,*u32)*const u8,dynlib.symbol(native_libraries.harfbuzz,"hb_blob_get_data").value)
+ real_font:=#cast(*NativeFont,font)
+ blob:=reference_blob(get_face(real_font.shaped))
+ blob_length:u32=0
+ blob_bytes:=get_data(blob,&blob_length)
+ check(blob_bytes==&real_font.face.data[0] && #cast(usize,blob_length)==#len(real_font.face.data))
+ native_libraries.hb.blob_destroy(blob)
+ large_name:="LARGE_FONT_FILE\x00"
+ large:=ttf_open(&large_name[0],16.0)
+ check(large!=nil)
+ large_font:=#cast(*NativeFont,large)
+ if large_font.file.backing>#len(large_font.face.data)+131072 {#panic("font reader retained geometric growth copies")}
+ replacement:=std_fs.create(large_name[..#len(large_name)-1])
+ check(replacement.ok && std_fs.close(&replacement.value).ok)
+ a_text_for_large:[1]u8=[97]
+ large_width:i32=0
+ check(ttf_measure(large,&a_text_for_large[0],1,&large_width,nil))
+ check(large_width==EXPECTED_A)
+ ttf_close(large)
+ oversized_name:="OVERSIZED_FONT_FILE\x00"
+ check(ttf_open(&oversized_name[0],16.0)==nil)
  check(ttf_open(&path[0],0.0)==nil)
  check(ttf_open(&path[0],257.0)==nil)
  a_text: [1]u8=[97]
@@ -33,7 +59,27 @@ fn main() {
  bytes: [8]u8 = ['a',0xc3,0xa9,0xf0,0x9f,0x98,0x80,'z']
  text := ttf_create(renderer,font,&bytes[0],8)
  check(text!=nil)
+ owned:=#cast(*NativeText,text)
+ if mem.arena_capacity(owned.owner)>1048576 || mem.arena_capacity(owned.payload)>1048576 {#panic("text arena startup budget")}
+ build_count:=native_build_count
+ payload_before:=owned.payload
+ check(ttf_set(text,&bytes[0],8) && ttf_set_font(text,font) && ttf_wrap(text,0))
+ if native_build_count!=build_count || owned.payload!=payload_before {#panic("unchanged text reshaped")}
  check(tracked_texts==1)
+ first_value:[]const u8="a"
+ next_value:[]const u8="b"
+ check(ttf_set(text,&first_value[0],1) && ttf_set(text,&next_value[0],1))
+ warmed_allocations:=native_arena_count
+ for iteration in 0..32 {
+  check(ttf_set(text,&first_value[0],1) && ttf_set(text,&next_value[0],1))
+ }
+ if native_arena_count!=warmed_allocations {#panic("small text edits keep allocating owner arenas")}
+ check(ttf_set(text,&bytes[0],8))
+ measurement_allocations:=native_arena_count
+ measurement_builds:=native_build_count
+ for iteration in 0..16 {check(ttf_measure(font,&a_text[0],1,&a_width,nil))}
+ if native_arena_count!=measurement_allocations {#panic("font measurements keep allocating scratch arenas")}
+ if native_build_count!=measurement_builds {#panic("identical font measurement reshaped")}
  bytes[0]='x'
  check(byte_ops.equal(#cast(*NativeText,text).layout.text,"aé😀z"))
  hit := Substring{}
@@ -53,7 +99,9 @@ fn main() {
  invalid: [1]u8=[0xff]
  check(!ttf_set(text,&invalid[0],1))
  check(ttf_size(text,&width,&height) && width==before)
+ old_a_width:=a_width
  check(ttf_font_size(font,32.0))
+ check(ttf_measure(font,&a_text[0],1,&a_width,nil) && a_width>old_a_width)
  resized_height:=ttf_font_height(font)
  check(resized_height>=first_height*2-1)
  check(ttf_size(text,&width,&height) && width>before)
@@ -81,6 +129,12 @@ fn main() {
  check(fallback!=nil)
  check(ttf_add_fallback(font,fallback) && ttf_add_fallback(font,fallback))
  check(#cast(*NativeFont,font).fallback_count==1)
+ fallback_measurements:=native_build_count
+ check(ttf_measure(font,&a_text[0],1,&a_width,nil))
+ check(native_build_count==fallback_measurements+1)
+ check(ttf_font_size(fallback,20.0))
+ check(ttf_measure(font,&a_text[0],1,&a_width,nil))
+ check(native_build_count==fallback_measurements+2)
  ttf_remove_fallback(font,fallback)
  check(#cast(*NativeFont,font).fallback_count==0)
  ttf_close(fallback)
@@ -89,6 +143,16 @@ fn main() {
  spaced := "a\nb"
  check(ttf_set(text,&spaced[0],3))
  check(ttf_substring(text,2,&hit) && hit.y==50 && hit.height==50)
+ // A large one-off layout/measurement must not remain as reusable scratch.
+ large_memory:=mem.arena_create(65536)
+ large_bytes:=mem.push_bytes_uninit(large_memory,20000)
+ for index in 0..#len(large_bytes) {large_bytes[index]=120}
+ check(ttf_set(text,&large_bytes[0],#len(large_bytes)))
+ check(ttf_measure(font,&large_bytes[0],#len(large_bytes),&a_width,nil))
+ check(real_font.measure.backing<=65536)
+ check(ttf_set(text,&a_text[0],1))
+ check(owned.spare==nil || owned.spare.backing<=65536)
+ mem.arena_release(large_memory)
  ttf_destroy(text)
  check(tracked_texts==0)
  OTHER_FORMATS
@@ -107,7 +171,7 @@ fn main() {
 '''
 PLATFORM = r'''pub fn native_color(renderer:rawptr,r,g,b,a:u8) bool { return renderer!=nil }
 pub fn native_fill(renderer:rawptr,x,y,w,h:f32) bool { return renderer!=nil }
-pub fn native_text_bitmap(renderer:rawptr,pixels:*const u8,width,height:i32,x,y:f32,r,g,b,a:u8) bool {
+pub fn native_text_cached_bitmap(renderer:rawptr,key:u64,pixels:*const u8,width,height:i32,x,y:f32,r,g,b,a:u8) bool {
  return renderer!=nil && pixels!=nil && width>0 && height>0 && x==x && y==y && r==255 && g==255 && b==255 && a==255
 }
 '''
@@ -156,6 +220,10 @@ with tempfile.TemporaryDirectory(prefix='dna-native-text-') as directory:
     platform=work/'platform';platform.mkdir()
     (platform/'platform.dyn').write_text(PLATFORM)
     shutil.copyfile(font,work/'font.ttf')
+    (work/'large.ttf').write_bytes(font.read_bytes()+bytes(4*1024*1024))
+    SOURCE=SOURCE.replace('LARGE_FONT_FILE',str(work/'large.ttf'))
+    with (work/'oversized.ttf').open('wb') as output:output.truncate(67108865)
+    SOURCE=SOURCE.replace('OVERSIZED_FONT_FILE',str(work/'oversized.ttf'))
     backend=(ROOT/'src/text/native.dyn').read_text().replace('use "../platform" sdl','use "./platform" sdl')
     backend=re.sub(r'extern fn native_text_attach[^\n]+','fn native_text_attach(callbacks:*const NativeTextCallbacks) bool { return dna_native_text_attach(callbacks) }',backend)
     backend=re.sub(r'extern fn native_tracked_create[^\n]+','fn native_tracked_create(engine:rawptr,font:rawptr,text:*const u8,length:usize) rawptr { return dna_text_create(engine,font,text,length) }',backend)
@@ -163,6 +231,17 @@ with tempfile.TemporaryDirectory(prefix='dna-native-text-') as directory:
     bridge=(ROOT/'src/native/dyn/memory_text.dyn').read_text()
     bridge=bridge[bridge.index('native_text_callbacks:'):]
     (module/'bridge.dyn').write_text(bridge+'\ntracked_texts:usize\nfn memory_active() bool { return true }\nfn memory_record(category:u32,size:usize,lifetime:u64,release:bool) { if release { tracked_texts-=1 } else { tracked_texts+=1 } }\n')
+    backend=backend.replace('fn native_build(', 'fn native_build_actual(',1)
+    backend=backend.replace('mem.arena_create(', 'native_probe_arena_create(')
+    backend+='''\nnative_arena_count:usize
+fn native_probe_arena_create(capacity:usize)*mem.Arena {native_arena_count+=1
+ return mem.arena_create(capacity)}
+native_build_count:usize
+fn native_build(arena:*mem.Arena,font:*NativeFont,text:[]const u8,wrap:i32)text_layout.Result {
+ native_build_count+=1
+ return native_build_actual(arena,font,text,wrap)
+}
+'''
     (module/'text.dyn').write_text(backend)
     # A one-face collection exercises the FreeType fallback with the same data.
     original=bytearray(font.read_bytes())
@@ -207,6 +286,7 @@ with tempfile.TemporaryDirectory(prefix='dna-native-text-') as directory:
     for flags in (['--debug'],['--release']):
         output=work/'test'
         subprocess.run([DYN,'build',str(module),*flags,'--quiet','--output',str(output)],check=True,timeout=180)
+        (work/'large.ttf').write_bytes(font.read_bytes()+bytes(4*1024*1024))
         subprocess.run([str(output)],check=True,timeout=60)
     for target in ('x86_64-linux','aarch64-linux','riscv64-linux','x86_64-macos','aarch64-macos','x86_64-windows','aarch64-windows'):
         subprocess.run([DYN,'build',str(module),'--release','--target',target,'--no-link','--emit-object','--quiet','--output',str(work/(target+'.o'))],check=True,timeout=180)
