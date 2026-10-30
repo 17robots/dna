@@ -3,6 +3,8 @@
 // search for selection (*), shrink to lines (Alt-x), align selections (&)
 // and line-comment toggling (:comment).
 
+use "std/time"
+
 // Rows visible in the focused document pane.
 fn view_rows(app: *App, typography: *Typography) usize {
   pane_init(app)
@@ -272,27 +274,43 @@ fn blank_line(app: *App, below: bool) {
   doc.secondary.count = secondary
 }
 
-// *: search for the primary selection's text (regex-escaped).
-fn search_selection(app: *App) {
+// *: search for the primary selection's text (regex-escaped), adding \\b
+// where the selection starts or ends on a word edge. Alt-*: no boundaries.
+fn word_byte(byte: u8) bool {
+  return (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || (byte >= '0' && byte <= '9') || byte == '_'
+}
+fn search_selection(app: *App, boundaries: bool) {
   doc := app.documents.current
   low := buffer.start(doc)
   high := buffer.end(doc)
   if high <= low {
     high = buffer.next(doc, low)
   }
+  text := app.search_history.text[..]
+  capacity := #len(app.search_history.text)
   used: usize = 0
+  if boundaries && high > low && word_byte(doc.bytes[low]) && (low == 0 || !word_byte(doc.bytes[low - 1])) {
+    text[0] = '\\'
+    text[1] = 'b'
+    used = 2
+  }
   at := low
-  for at < high && used + 2 < #len(app.search_history.text) {
+  for at < high && used + 5 < capacity {
     byte := doc.bytes[at]
     if byte == '\\' || byte == '.' || byte == '^' || byte == '$' || byte == '*' || byte == '+' || byte == '?' || byte == '(' || byte == ')' || byte == '[' || byte == ']' || byte == '{' || byte == '}' || byte == '|' {
-      app.search_history.text[used] = '\\'
+      text[used] = '\\'
       used += 1
     }
-    app.search_history.text[used] = byte
+    text[used] = byte
     used += 1
     at += 1
   }
-  app.search_history.text[used] = 0
+  if boundaries && at == high && high > low && word_byte(doc.bytes[high - 1]) && (high >= doc.length || !word_byte(doc.bytes[high])) {
+    text[used] = '\\'
+    text[used + 1] = 'b'
+    used += 2
+  }
+  text[used] = 0
   app.search_history.length = used
 }
 // Alt-x: shrink each selection to the whole lines it fully covers.
@@ -485,4 +503,331 @@ fn comment_toggle(app: *App) {
   last_end := buffer.line_end(doc, buffer.row_start(doc, last))
   doc.anchor = first_start
   doc.cursor = last_end
+}
+// Ctrl-a / :increment, :decrement: add to the number in (or after the head
+// of) each selection on its line, then select the result. Ctrl-x stays
+// buffer close, so decrement is the command.
+fn number_range(doc: *const buffer.Document, selection: buffer.Selection) buffer.Selection {
+  low := selection.anchor
+  high := selection.cursor
+  if low > high {
+    low = selection.cursor
+    high = selection.anchor
+  }
+  ending := buffer.line_end(doc, low)
+  at := low
+  for at > buffer.line_start(doc, low) && at < doc.length && digit(doc.bytes[at]) && digit(doc.bytes[at - 1]) {
+    at -= 1
+  }
+  for at < ending && !digit(doc.bytes[at]) {
+    at += 1
+  }
+  if at >= ending {
+    return buffer.Selection{anchor: 0, cursor: 0}
+  }
+  start := at
+  for at < ending && digit(doc.bytes[at]) {
+    at += 1
+  }
+  if start > 0 && doc.bytes[start - 1] == '-' {
+    start -= 1
+  }
+  return buffer.Selection{anchor: start, cursor: at}
+}
+fn digit(byte: u8) bool {
+  return byte >= '0' && byte <= '9'
+}
+// Formats value +/- amount for the digits in doc.bytes[low..high].
+fn number_text(doc: *const buffer.Document, low: usize, high: usize, amount: usize, decrease: bool, out: []u8) []const u8 {
+  negative := doc.bytes[low] == '-'
+  value: usize = 0
+  at := low
+  if negative {
+    at += 1
+  }
+  for at < high && value < 100000000000000 {
+    value = value * 10 + #cast(usize, (doc.bytes[at] - '0'))
+    at += 1
+  }
+  down := decrease != negative
+  if down && amount > value {
+    value = amount - value
+    negative = !negative
+  }
+  else if down {
+    value -= amount
+  }
+  else {
+    value += amount
+  }
+  if value == 0 {
+    negative = false
+  }
+  length: usize = 0
+  for {
+    out[23 - length] = #cast(u8, (value % 10)) + '0'
+    length += 1
+    value /= 10
+    if value == 0 {
+      break
+    }
+  }
+  if negative {
+    out[23 - length] = '-'
+    length += 1
+  }
+  return out[24 - length..24]
+}
+fn increment_selections(app: *App, amount: usize, decrease: bool) {
+  doc := app.documents.current
+  buffer.checkpoint(doc)
+  selections := buffer.collect(doc)
+  digits: [24]u8 = []
+  for index in 0..selections.count {
+    range := number_range(doc, selections.items[index])
+    if range.cursor <= range.anchor {
+      continue
+    }
+    text := number_text(doc, range.anchor, range.cursor, amount, decrease, digits[..])
+    if buffer.replace_range(doc, range.anchor, range.cursor, text, &selections) {
+      selections.items[index] = buffer.Selection{anchor: range.anchor, cursor: range.anchor + #len(text)}
+    }
+  }
+  buffer.store(doc, &selections)
+  buffer.checkpoint(doc)
+}
+
+// | Alt-| ! Alt-!: open the command prompt with the matching shell command.
+fn shell_prompt(app: *App, verb: []const u8) {
+  panel(app, Panel.Commands)
+  app.prompt_state.length = copy_text(app.prompt_state.text[..], verb)
+}
+// :pipe (mode 0) replaces each selection with the command's output for it,
+// :pipe-to (1) only feeds it, :insert-output (2) and :append-output (3)
+// insert the output before or after each selection. Commands run through
+// sh in the editor's working directory, one at a time, bounded by lsp_timeout_ms.
+fn shell_command(app: *App, mode: u8, command: []const u8) {
+  app.prompt_state.panel = Panel.None
+  doc := app.documents.current
+  if #len(command) == 0 || #len(command) >= 4096 {
+    notice(app, "Shell command required.")
+    return
+  }
+  command_text: [4096]u8 = []
+  _ = copy_text(command_text[..4095], command)
+  directory: [4096]u8 = []
+  if host.current_directory(directory[..4095]) == 0 {
+    directory[0] = '/'
+  }
+  reserved := arena_owner.create((buffer.Capacity + 1))
+  defer arena_owner.release(reserved)
+  output := mem.push_bytes_uninit(reserved, buffer.Capacity + 1)
+  buffer.checkpoint(doc)
+  selections := buffer.collect(doc)
+  for index in 0..selections.count {
+    range := buffer.ordered(selections.items[index])
+    low := range.anchor
+    high := range.cursor
+    input: []const u8 = ""
+    if mode < 2 {
+      input = doc.bytes[low..high]
+    }
+    empty: [1]u8 = []
+    source := &empty[0]
+    if #len(input) > 0 {
+      source = &doc.bytes[low]
+    }
+    job := job_open(&command_text[0], &directory[0], source, #len(input), #cast(u32, app.config.lsp_timeout_ms))
+    if job == nil {
+      notice(app, "Could not start the shell command.")
+      break
+    }
+    status := job_status(job)
+    for status == 1 {
+      _ = time.sleep(time.Millisecond)
+      status = job_status(job)
+    }
+    if status != 2 {
+      error: [4096]u8 = []
+      error_length := job_error(job, &error[0], 4096)
+      job_close(job)
+      if error_length > 0 {
+        notice(app, error[..error_length])
+      } else if status == 5 {
+        notice(app, "Shell command timed out.")
+      } else {
+        notice(app, "Shell command failed.")
+      }
+      break
+    }
+    length := job_output(job, &output[0], #len(output))
+    job_close(job)
+    if mode == 1 {
+      continue
+    }
+    if !buffer.valid(output[..length]) {
+      notice(app, "Shell command produced invalid text.")
+      break
+    }
+    // :pipe replaces the selection; the output commands insert beside it.
+    at := low
+    end := high
+    if mode == 2 {
+      end = low
+    } else if mode == 3 {
+      at = high
+    }
+    if !buffer.replace_range(doc, at, end, output[..length], &selections) {
+      notice(app, "Shell output exceeds document capacity.")
+      break
+    }
+    if mode == 0 {
+      selections.items[index] = buffer.Selection{anchor: at, cursor: at + length}
+    } else if mode == 2 {
+      selections.items[index] = buffer.Selection{anchor: low + length, cursor: high + length}
+    } else {
+      selections.items[index] = buffer.Selection{anchor: low, cursor: high}
+    }
+  }
+  buffer.store(doc, &selections)
+  buffer.checkpoint(doc)
+}
+// Alt-J: join lines inside each selection like J, then select the inserted
+// spaces (up to 32 selections).
+fn join_select_spaces(app: *App) {
+  doc := app.documents.current
+  buffer.checkpoint(doc)
+  selections := buffer.collect_ordered(doc)
+  spaces := buffer.Selections{}
+  for index in 0..selections.count {
+    low := selections.items[index].anchor
+    high := selections.items[index].cursor
+    at := buffer.line_end(doc, low)
+    if high <= at {
+      high = at
+      if high < doc.length {
+        high = buffer.line_end(doc, high + 1)
+      }
+    }
+    // Join bottom-up so earlier newline offsets stay valid.
+    joins: [32]usize = []
+    join_count: usize = 0
+    for at < high && at < doc.length && join_count < 32 {
+      if doc.bytes[at] == 10 {
+        joins[join_count] = at
+        join_count += 1
+      }
+      at = buffer.next(doc, at)
+    }
+    for join_count > 0 {
+      join_count -= 1
+      newline := joins[join_count]
+      after := newline + 1
+      for after < doc.length && (doc.bytes[after] == 32 || doc.bytes[after] == 9) {
+        after += 1
+      }
+      length := doc.length
+      if !buffer.replace_range(doc, newline, after, " ", &selections) {
+        continue
+      }
+      buffer.shift(&spaces, newline, after, 1, length)
+      if spaces.count < buffer.SelectionCapacity {
+        spaces.items[spaces.count] = buffer.Selection{anchor: newline, cursor: newline + 1}
+        spaces.count += 1
+      }
+    }
+  }
+  if spaces.count > 0 {
+    buffer.sort(&spaces)
+    buffer.store(doc, &spaces)
+  } else {
+    buffer.store(doc, &selections)
+  }
+  buffer.checkpoint(doc)
+}
+// Jump list: Ctrl-o back, Ctrl-i (Tab in most terminals) forward, Ctrl-s
+// saves the current position. Large motions record the position they leave.
+// Entry k keeps its offset in mark 992 + k of its document, so edits shift it.
+const JumpCapacity: usize = 32
+const JumpMarkBase: usize = 992
+struct JumpList {
+  slots: [32]usize,
+  identities: [32]u64,
+  // Ring storage: oldest entry at `first`; `at` is the logical position
+  // (count when not traveling).
+  first, count, at: usize,
+}
+fn jump_entry(app: *App, logical: usize) usize {
+  return (app.jumps.first + logical) % JumpCapacity
+}
+fn jump_push(app: *App) {
+  jumps := &app.jumps
+  // A new jump drops the entries ahead of the current position.
+  jumps.count = jumps.at
+  slot := app.documents.active
+  doc := app.documents.current
+  if slot >= #len(app.documents.slots) || app.documents.slots[slot].document != doc {
+    return
+  }
+  head := buffer.head(doc)
+  if jumps.count > 0 {
+    last := jump_entry(app, jumps.count - 1)
+    if jumps.slots[last] == slot && jumps.identities[last] == app.documents.slots[slot].identity && doc.marks[JumpMarkBase + last] == head {
+      jumps.at = jumps.count
+      return
+    }
+  }
+  if jumps.count == JumpCapacity {
+    jumps.first = (jumps.first + 1) % JumpCapacity
+    jumps.count -= 1
+  }
+  entry := jump_entry(app, jumps.count)
+  jumps.slots[entry] = slot
+  jumps.identities[entry] = app.documents.slots[slot].identity
+  doc.marks[JumpMarkBase + entry] = head
+  jumps.count += 1
+  jumps.at = jumps.count
+}
+fn jump_go(app: *App, logical: usize) bool {
+  entry := jump_entry(app, logical)
+  slot := app.jumps.slots[entry]
+  if slot >= #len(app.documents.slots) || app.documents.slots[slot].document == nil || app.documents.slots[slot].identity != app.jumps.identities[entry] {
+    return false
+  }
+  if slot != app.documents.active {
+    activate(app, slot)
+  }
+  doc := app.documents.slots[slot].document
+  position := doc.marks[JumpMarkBase + entry]
+  if position > doc.length {
+    position = doc.length
+  }
+  doc.secondary.count = 0
+  buffer.move_to(doc, position, false)
+  app.jumps.at = logical
+  return true
+}
+fn jump_back(app: *App) {
+  jumps := &app.jumps
+  if jumps.at == jumps.count {
+    jump_push(app)
+    jumps.at = jumps.count - 1
+  }
+  for jumps.at > 0 {
+    if jump_go(app, jumps.at - 1) {
+      return
+    }
+    jumps.at -= 1
+  }
+  notice(app, "At the start of the jump list.")
+}
+fn jump_forward(app: *App) {
+  jumps := &app.jumps
+  for jumps.at + 1 < jumps.count {
+    if jump_go(app, jumps.at + 1) {
+      return
+    }
+    jumps.at += 1
+  }
+  notice(app, "At the end of the jump list.")
 }

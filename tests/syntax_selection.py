@@ -31,13 +31,23 @@ try:
     assert select(6,11,1)==(7,8)
     assert select(7,8,3)==(9,10)
     assert select(9,10,2)==(7,8)
+    # Alt-a / Alt-I walk: parent -> first child -> next siblings.
+    def walk(low,high):
+        found=[select(low,high,1)]
+        while found[-1] is not None and len(found)<32:
+            following=select(*found[-1],3)
+            if following is None or following in found: break
+            found.append(following)
+        return found
+    assert walk(*select(7,8,0))==[(7,8),(9,10)], walk(*select(7,8,0))
+    assert walk(6,11)==[(7,8),(9,10)]
     assert select(7,8,0,2) is None
     assert select(0,len(text)+1,0) is None
     assert select(8,7,0) is None
     lib.dna_syntax_update(state,b'[]',2,2)
     assert select(7,8,0,1) is None
 finally: lib.dna_syntax_close(state)
-print('PASS syntax parent/child/siblings, invalid ranges, stale revisions')
+print('PASS syntax parent/child/siblings, all-siblings/children walk, invalid ranges, stale revisions')
 
 # Queries are optional per language; exercise shipped Dyn captures in isolation.
 import tempfile, shutil

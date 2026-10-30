@@ -6,6 +6,8 @@ use "std/mem"
 // Largest document in bytes. Storage is reserved address space (see
 // reserve), so only the text actually present occupies memory.
 pub const Capacity: usize = 268435455
+// Position marks that follow edits: pane views use 0-989, the jump list 992-1023.
+pub const MarkCount: usize = 1024
 // Documents of this size or larger skip syntax highlighting and language servers.
 pub const LargeFile: usize = 16777216
 
@@ -51,7 +53,7 @@ pub struct Document {
   length, cursor, anchor, saved_length, history_next, history_count, history_at, line_count, goal_column, goal_cursor, goal_anchor: usize,
   history: [64]Snapshot,
   saved_epoch, checkpoint_revision, revision, goal_revision: u64,
-  marks: [992]usize,
+  marks: [MarkCount]usize,
   rows, saved_rows: RowAnchors,
   // Keep byte storage after metadata. Only initialized prefixes are ever read.
   // Capacity + 1 each; undo history holds four documents' worth of deltas.
@@ -262,7 +264,7 @@ pub fn load(document: *Document, text: []const u8) bool {
   if #len(text) > Capacity || !valid(text) {
     return false
   }
-  for marker in 0..992 {
+  for marker in 0..MarkCount {
     document.marks[marker] = 0
   }
   document.secondary.count = 0
@@ -388,7 +390,7 @@ pub fn end(document: *const Document) usize {
 }
 // Retained view positions follow edits, including changes applied by undo/redo.
 fn move_marks(document: *Document, low: usize, high: usize, inserted: usize) {
-  for mark in 0..992 {
+  for mark in 0..MarkCount {
     offset := document.marks[mark]
     if offset > document.length {
       offset = document.length
@@ -582,9 +584,9 @@ pub fn checkpoint(document: *Document) {
 }
 fn restore(document: *Document, delta: *const Snapshot, forward: bool) {
   // Restore replaces the checkpoint using an owned undo delta below.
-  retained_positions: [992]TextPosition = []
+  retained_positions: [MarkCount]TextPosition = []
   if delta.line_positions {
-    for saved_mark in 0..992 {
+    for saved_mark in 0..MarkCount {
       retained_positions[saved_mark] = text_position(document, document.marks[saved_mark])
     }
   }
@@ -623,7 +625,7 @@ fn restore(document: *Document, delta: *const Snapshot, forward: bool) {
   document.checkpoint_prefix = document.length
   document.checkpoint_suffix = document.length
   if delta.line_positions {
-    for restored_mark in 0..992 {
+    for restored_mark in 0..MarkCount {
       document.marks[restored_mark] = position_offset(document, retained_positions[restored_mark])
     }
   }

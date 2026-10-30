@@ -74,7 +74,7 @@ fn animated_rectangle(app: *App, state: *motion.Rectangle, target: sdl.PixelRect
       changed = true
     }
   }
-  answering := (app.render_trace.pending & (RenderKey | RenderText | RenderMouse | RenderIme | RenderWindow)) != 0
+  answering := answering_input(app)
   immediate := !surface_motion_enabled(app) || !app.view.animation.surfaces_ready || app.view.animation.resized || (state.active && !changed && !app.view.animation.geometry_retargeted && answering)
   rate: f32 = 70.0
   if app.config.popup_animation_ms > 0.0 {
@@ -149,7 +149,7 @@ fn animated_surface(app: *App, surface: usize, target: sdl.Rect, scale: f32) sdl
     motion.rectangle_seed(state, initial, animation.now)
   }
   animation.surface_seen[surface] = app.ui.frame
-  answering := (app.render_trace.pending & (RenderKey | RenderText | RenderMouse | RenderIme | RenderWindow)) != 0
+  answering := answering_input(app)
   immediate := !enabled || (!opening && seen != app.ui.frame && answering)
   rate: f32 = 70.0
   if app.config.popup_animation_ms > 0.0 {
@@ -329,57 +329,42 @@ fn animated_scroll(app: *App, view: *AnimatedView, x: f32, y: f32, height: f32, 
 fn measure_position(doc: *const buffer.Document, typography: *Typography, position: usize) ttf.Substring {
   beginning := buffer.line_start(doc, position)
   ending := buffer.line_end(doc, position)
-  geometry:=&typography.caret_geometry
-  owner:*PaneText=nil
-  if typography.current_pane<15 && typography.pane_text[typography.current_pane]!=nil && typography.pane_text[typography.current_pane].caret==typography.caret_text {
-    owner=typography.pane_text[typography.current_pane]
-    geometry=&owner.caret_geometry
-  }
-  if geometry.ready && geometry.text==typography.caret_text && typography.caret_document==doc && typography.caret_revision!=doc.revision && typography.caret_start==beginning && typography.caret_end==ending && (owner==nil || (owner.caret_document==doc && owner.caret_revision==typography.caret_revision && owner.caret_start==beginning && owner.caret_end==ending)) {
-    changed_line:=buffer.changes_since(doc, typography.caret_revision)
-    if changed_line.found && changed_line.low>ending {
-      typography.caret_revision=doc.revision
-      if owner!=nil {
-        owner.caret_revision=doc.revision
-      }
+  // The caret object holds one shaped line; reuse it while that line is
+  // unchanged, including when edits only touched lines after it.
+  pane := current_pane_text(typography)
+  geometry := &pane.caret_geometry
+  same_line := geometry.ready && geometry.text == pane.caret && pane.caret_document == doc && pane.caret_start == beginning && pane.caret_end == ending
+  if same_line && pane.caret_revision != doc.revision {
+    changed_line := buffer.changes_since(doc, pane.caret_revision)
+    if changed_line.found && changed_line.low > ending {
+      pane.caret_revision = doc.revision
     }
   }
-  changed:=!geometry.ready || geometry.text!=typography.caret_text || typography.caret_document!=doc || typography.caret_revision!=doc.revision || typography.caret_start!=beginning || typography.caret_end!=ending
-  if owner!=nil && (owner.caret_document!=doc || owner.caret_revision!=doc.revision || owner.caret_start!=beginning || owner.caret_end!=ending) {
-    changed=true
-  }
-  if !changed && geometry.position==position {
+  changed := !same_line || pane.caret_revision != doc.revision
+  if !changed && geometry.position == position {
     return geometry.value
   }
-  // the native text backend interprets length 0 as strlen; use a real empty string for blank lines.
-  empty: [1]u8 = [0]
-  bytes := &doc.bytes[beginning]
-  if beginning == ending {
-    bytes = &empty[0]
-  }
   if changed {
-    if !ttf.set(typography.caret_text, bytes, ending - beginning) {
+    // The native text backend reads length 0 as strlen; blank lines need a real empty string.
+    empty: [1]u8 = [0]
+    bytes := &doc.bytes[beginning]
+    if beginning == ending {
+      bytes = &empty[0]
+    }
+    if !ttf.set(pane.caret, bytes, ending - beginning) {
       #panic("caret line update")
     }
-    typography.caret_document = doc
-    typography.caret_revision = doc.revision
-    typography.caret_start = beginning
-    typography.caret_end = ending
+    pane.caret_document = doc
+    pane.caret_revision = doc.revision
+    pane.caret_start = beginning
+    pane.caret_end = ending
   }
   caret := ttf.Substring{}
-  typography.caret_queries+=1
-  if !ttf.substring(typography.caret_text, #cast(i32, (position - beginning)), &caret) {
+  typography.caret_queries += 1
+  if !ttf.substring(pane.caret, #cast(i32, (position - beginning)), &caret) {
     #panic("caret geometry")
   }
-  geometry.*=CaretGeometry{value:caret, text:typography.caret_text, position:position, ready:true}
-  if owner!=nil {
-    // The explorer can temporarily measure through the focused caret object.
-    // Record its actual source so restoring a pane cannot assume stale text.
-    owner.caret_document=typography.caret_document
-    owner.caret_revision=typography.caret_revision
-    owner.caret_start=typography.caret_start
-    owner.caret_end=typography.caret_end
-  }
+  geometry.* = CaretGeometry{value: caret, text: pane.caret, position: position, ready: true}
   return caret
 }
 fn popup_begin(renderer: rawptr, app: *App) {
@@ -417,7 +402,7 @@ fn explorer_exit(app: *App, showing: bool) sdl.PixelRect {
   }
   edges := state.target
   edges[2] = edges[0]
-  answering := (app.render_trace.pending & (RenderKey | RenderText | RenderMouse | RenderIme | RenderWindow)) != 0
+  answering := answering_input(app)
   rate: f32 = 70.0
   if app.config.popup_animation_ms > 0.0 {
     rate = 2800.0 / app.config.popup_animation_ms

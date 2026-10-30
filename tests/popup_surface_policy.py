@@ -20,15 +20,15 @@ struct Config {popup_animation_ms:f32=40.0,popup_transitions:bool=true,placement
 struct Animation {now:f32,active,surfaces_ready,resized,geometry_active:bool,geometry_elapsed:f32=8.0,surface_geometry:[8]motion.Rectangle,surface_seen:[8]u64}
 struct View {animation:Animation,reduced_motion:bool}
 struct Pointer {dragging:bool}
-struct Trace {pending:u32}
 struct Ui {frame:u64}
-struct App {config:Config,view:View,pointer:Pointer,render_trace:Trace,ui:Ui}
+struct App {config:Config,view:View,pointer:Pointer,render_pending:u32,ui:Ui}
 const SurfaceExplorer:usize=4
 const RenderKey:u32=2
 const RenderText:u32=4
 const RenderMouse:u32=8
 const RenderIme:u32=32
 const RenderWindow:u32=16
+fn answering_input(app:*const App)bool{return (app.render_pending&(RenderKey|RenderText|RenderMouse|RenderIme|RenderWindow))!=0}
 placed_rects:[8]sdl.Rect
 placed_frames:[8]u64
 fn place_of(app:*const App,surface:usize)settings.Placement{return app.config.placement}
@@ -76,24 +76,24 @@ fn main() {
  if !equal(animated_surface(&app,0,target,1.0),target) {#panic("startup surface must retain exact placement")}
  app.view.animation.surfaces_ready=true
  app.ui.frame=2
- app.render_trace.pending=RenderKey
+ app.render_pending=RenderKey
  first:=animated_surface(&app,1,target,1.0)
  if first.width>=target.width || first.height>=target.height || !app.view.animation.active {#panic("new surface must settle spatially despite its opening key")}
  if !equal(first,placed_rects[1]) || placed_frames[1]!=2 {#panic("placement hit bounds must match drawn popup")}
  // Sizing queries may request the same surface twice while building one frame.
  repeated:=animated_surface(&app,1,target,1.0)
  if !equal(first,repeated) {#panic("same-frame sizing query advanced surface twice")}
- app.render_trace.pending=0
+ app.render_pending=0
  app.ui.frame=3
  app.view.animation.now=16.0
  app.view.animation.geometry_elapsed=16.0
  next:=animated_surface(&app,1,target,1.0)
  if next.width<=first.width || next.width>=target.width {#panic("unchanged surface restarted or snapped")}
  app.ui.frame=4
- app.render_trace.pending=RenderText
+ app.render_pending=RenderText
  if !equal(animated_surface(&app,1,target,1.0),target) {#panic("typing must immediately finish an open popup")}
  // Hidden for one drawn frame, then reopened: a fresh entrance starts.
- app.render_trace.pending=0
+ app.render_pending=0
  app.ui.frame=6
  if equal(animated_surface(&app,1,target,1.0),target) {#panic("reopened surface failed to animate")}
  for frame in 7..100 {

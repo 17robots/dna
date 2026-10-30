@@ -122,64 +122,43 @@ fn search_range(doc: *const buffer.Document, original: buffer.Selection, match: 
   return buffer.Selection{anchor: fixed, cursor: destination}
 }
 fn search_apply(doc: *buffer.Document, compiled: *pattern.Pattern, extending: bool, backwards: bool) u8 {
-  primary := buffer.Selection{cursor: doc.cursor, anchor: doc.anchor}
-  secondary := doc.secondary
-  main_match := search_step(doc, compiled, primary, backwards)
-  if main_match.error {
-    return 3
-  }
-  if !main_match.found {
-    return 1
-  }
-  updated := search_range(doc, primary, main_match, extending, backwards)
-  index: usize = 0
-  for index < secondary.count {
-    original := secondary.ranges[index]
+  // The primary must match; secondaries without a match stay where they are.
+  selections := buffer.collect(doc)
+  for index in 0..selections.count {
+    original := selections.items[index]
     result := search_step(doc, compiled, original, backwards)
     if result.error {
       return 3
     }
     if result.found {
-      secondary.ranges[index] = search_range(doc, original, result, extending, backwards)
+      selections.items[index] = search_range(doc, original, result, extending, backwards)
+    } else if index == 0 {
+      return 1
     }
-    index += 1
   }
-  doc.cursor = updated.cursor
-  doc.anchor = updated.anchor
-  doc.secondary = secondary
+  buffer.store(doc, &selections)
   return 0
 }
-fn selection_add(output: []buffer.Selection, count: *usize, low: usize, high: usize) bool {
-  for index in 0..count.* {
-    if output[index].anchor == low && output[index].cursor == high {
+fn selection_add(output: *buffer.Selections, low: usize, high: usize) bool {
+  for index in 0..output.count {
+    if output.items[index].anchor == low && output.items[index].cursor == high {
       return true
     }
   }
-  if count.* == #len(output) {
+  if output.count == buffer.SelectionCapacity {
     return false
   }
-  output[count.*] = buffer.Selection{anchor: low, cursor: high}
-  count.* += 1
+  output.items[output.count] = buffer.Selection{anchor: low, cursor: high}
+  output.count += 1
   return true
 }
 fn select_matches(doc: *buffer.Document, compiled: *pattern.Pattern, split: bool) u8 {
-  originals: [32]buffer.Selection = []
-  originals[0] = buffer.Selection{cursor: doc.cursor, anchor: doc.anchor}
-  for index in 0..doc.secondary.count {
-    originals[index + 1] = doc.secondary.ranges[index]
-  }
-  output: [32]buffer.Selection = []
-  count: usize = 0
-  current: usize = 0
-  for current <= doc.secondary.count {
-    original := originals[current]
-    low := original.anchor
-    high := original.cursor
-    if low > high {
-      swap := low
-      low = high
-      high = swap
-    }
+  originals := buffer.collect(doc)
+  output := buffer.Selections{}
+  for current in 0..originals.count {
+    range := buffer.ordered(originals.items[current])
+    low := range.anchor
+    high := range.cursor
     text := doc.bytes[low..high]
     at: usize = 0
     segment: usize = 0
@@ -197,11 +176,11 @@ fn select_matches(doc: *buffer.Document, compiled: *pattern.Pattern, split: bool
         break
       }
       if split {
-        if found.start > segment && !selection_add(output[..], &count, low + segment, low + found.start) {
+        if found.start > segment && !selection_add(&output, low + segment, low + found.start) {
           return 4
         }
         segment = found.end
-      } else if !selection_add(output[..], &count, low + found.start, low + found.end) {
+      } else if !selection_add(&output, low + found.start, low + found.end) {
         return 4
       }
       if found.end > at {
@@ -214,20 +193,14 @@ fn select_matches(doc: *buffer.Document, compiled: *pattern.Pattern, split: bool
         at = buffer.next(doc, low + found.end) - low
       }
     }
-    if split && segment < #len(text) && !selection_add(output[..], &count, low + segment, high) {
+    if split && segment < #len(text) && !selection_add(&output, low + segment, high) {
       return 4
     }
-    current += 1
   }
-  if count == 0 {
+  if output.count == 0 {
     return 1
   }
-  doc.anchor = output[0].anchor
-  doc.cursor = output[0].cursor
-  doc.secondary.count = count - 1
-  for index in 1..count {
-    doc.secondary.ranges[index - 1] = output[index]
-  }
+  buffer.store(doc, &output)
   return 0
 }
 fn search_preview(app: *App) {
@@ -279,6 +252,9 @@ fn search_repeat(app: *App, backwards: bool, explorer: bool) {
   }
   doc := app.documents.current
   extending := app.view.extend
+  if !explorer {
+    jump_push(app)
+  }
   if explorer {
     doc = app.explorer.document
     extending = app.explorer.extend
@@ -313,45 +289,22 @@ fn search_label(app: *const App) []const u8 {
 }
 
 fn filter_selections(doc: *buffer.Document, compiled: *pattern.Pattern, remove: bool) u8 {
-  originals: [32]buffer.Selection = []
-  originals[0] = buffer.Selection{cursor: doc.cursor, anchor: doc.anchor}
-  index: usize = 0
-  for index < doc.secondary.count {
-    originals[index + 1] = doc.secondary.ranges[index]
-    index += 1
-  }
-  output: [32]buffer.Selection = []
-  count: usize = 0
-  index = 0
-  for index <= doc.secondary.count {
-    selected := originals[index]
-    low := selected.anchor
-    high := selected.cursor
-    if low > high {
-      low = selected.cursor
-      high = selected.anchor
-    }
-    found := pattern.find(compiled, doc.bytes[low..high], 0)
+  originals := buffer.collect(doc)
+  output := buffer.Selections{}
+  for index in 0..originals.count {
+    range := buffer.ordered(originals.items[index])
+    found := pattern.find(compiled, doc.bytes[range.anchor..range.cursor], 0)
     if found.error {
       return 3
     }
     if found.found != remove {
-      output[count] = selected
-      count += 1
+      output.items[output.count] = originals.items[index]
+      output.count += 1
     }
-    index += 1
   }
-  if count == 0 {
+  if output.count == 0 {
     return 1
   }
-  doc.cursor = output[0].cursor
-  doc.anchor = output[0].anchor
-  doc.secondary.count = count - 1
-  doc.goal_valid = false
-  index = 1
-  for index < count {
-    doc.secondary.ranges[index - 1] = output[index]
-    index += 1
-  }
+  buffer.store(doc, &output)
   return 0
 }

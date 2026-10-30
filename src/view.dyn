@@ -1,7 +1,7 @@
 // Animation frames wait for vertical blank (even pacing, no tearing); frames
 // answering input present immediately, so typing never waits for a refresh.
 fn present_pacing(app: *App, renderer: rawptr) {
-  answering := (app.render_trace.pending & (RenderKey | RenderText | RenderMouse | RenderIme | RenderWindow)) != 0
+  answering := answering_input(app)
   wanted := app.view.vsync_supported && app.view.animation.active && !answering
   if wanted != app.view.vsync {
     interval: i32 = 0
@@ -226,16 +226,17 @@ fn draw_document(renderer: rawptr, app: *App, typography: *Typography, width: i3
   scroll_y := visual.y.value
   viewport := visible_viewport(doc, typography.line, visible_height, visual.y.value)
 
-  shaped := line_layout_update(typography, typography.layout, doc, app.documents.slots[app.documents.active].identity, viewport)
+  shaped := line_layout_update(typography, &typography.pane.layout, doc, app.documents.slots[app.documents.active].identity, viewport)
   if shaped > 0 {
     typography.document_updates += 1
   }
-  if typography.rendered_revision != doc.revision || typography.rendered_document != doc || typography.rendered_view_revision != app.view.revision || typography.document_start != viewport.start || typography.document_end != viewport.end {
-    typography.rendered_revision = doc.revision
-    typography.rendered_document = doc
+  rendered := typography.pane
+  if rendered.revision != doc.revision || rendered.document != doc || typography.rendered_view_revision != app.view.revision || rendered.start != viewport.start || rendered.end != viewport.end {
+    rendered.revision = doc.revision
+    rendered.document = doc
     typography.rendered_view_revision = app.view.revision
-    typography.document_start = viewport.start
-    typography.document_end = viewport.end
+    rendered.start = viewport.start
+    rendered.end = viewport.end
   }
 
   clipping_document := sdl.PixelRect{x: #cast(i32, origin), y: 0, width: width - #cast(i32, origin), height: height - #cast(i32, status_height)}
@@ -256,7 +257,7 @@ fn draw_document(renderer: rawptr, app: *App, typography: *Typography, width: i3
     }
   }
 
-  draw_selection(renderer, doc, typography.layout, viewport, typography, origin, margin, scroll_x, scroll_y, #cast(f32, width))
+  draw_selection(renderer, doc, &typography.pane.layout, viewport, typography, origin, margin, scroll_x, scroll_y, #cast(f32, width))
   cursor_width := typography.cell
   if app.view.insert {
     cursor_width = app.config.cursor_thickness * typography.scale
@@ -278,13 +279,13 @@ fn draw_document(renderer: rawptr, app: *App, typography: *Typography, width: i3
     }
   }
   if focused {
-    draw_extra_cursors(renderer, doc, typography.layout, viewport, typography, origin, margin, scroll_x, scroll_y, app.view.insert)
+    draw_extra_cursors(renderer, doc, &typography.pane.layout, viewport, typography, origin, margin, scroll_x, scroll_y, app.view.insert)
   }
   if sdl.tui_active() {
-    line_layout_draw(typography.layout, theme().text, origin - scroll_x, margin + viewport.y - scroll_y)
+    line_layout_draw(&typography.pane.layout, theme().text, origin - scroll_x, margin + viewport.y - scroll_y)
     _ = draw_syntax(renderer, app, typography, viewport, origin - scroll_x, margin + viewport.y - scroll_y, clipping_document)
   } else if !draw_syntax(renderer, app, typography, viewport, origin - scroll_x, margin + viewport.y - scroll_y, clipping_document) {
-    line_layout_draw(typography.layout, theme().text, origin - scroll_x, margin + viewport.y - scroll_y)
+    line_layout_draw(&typography.pane.layout, theme().text, origin - scroll_x, margin + viewport.y - scroll_y)
   }
   _ = draw_diagnostics(renderer, app, typography, viewport, origin - scroll_x, margin - scroll_y)
 
@@ -345,65 +346,20 @@ fn draw_panes(renderer: rawptr, app: *App, typography: *Typography, width: i32, 
           #panic("pane viewport")
         }
 
-        cached := pane_text_get(typography, index)
-
-        if cached.text == nil {
-          if index == 0 {
-            cached.text = typography.primary_document
-          } else {
-            blank: [1]u8 = [0]
-            cached.text = ttf.create(typography.engine, typography.font, &blank[0], 0)
-          }
-          if cached.text == nil || !ttf.whitespace_visible(cached.text, true) || !ttf.wrap(cached.text, 0) {
-            #panic("pane text allocation")
-          }
-        }
-        if cached.caret == nil {
-          if index == 0 {
-            cached.caret = typography.primary_caret
-          } else {
-            caret_blank: [1]u8 = [0]
-            cached.caret = ttf.create(typography.engine, typography.font, &caret_blank[0], 0)
-          }
-          if cached.caret == nil || !ttf.whitespace_visible(cached.caret, true) || !ttf.wrap(cached.caret, 0) {
-            #panic("pane caret allocation")
-          }
-        }
-
+        cached := pane_text_ready(typography, index)
         typography.current_pane = index
-        typography.caret_text = cached.caret
-        typography.caret_document = cached.caret_document
-        typography.caret_revision = cached.caret_revision
-        typography.caret_start = cached.caret_start
-        typography.caret_end = cached.caret_end
-        typography.document = cached.text
-        typography.layout = &cached.layout
-        typography.rendered_document = cached.document
-        typography.rendered_revision = cached.revision
-        typography.document_start = cached.start
-        typography.document_end = cached.end
-
+        typography.pane = cached
         // Identity protects against arena addresses reused by another buffer.
         if cached.identity != app.documents.slots[app.documents.active].identity {
-          typography.rendered_document = nil
-          typography.caret_document = nil
+          cached.document = nil
+          cached.caret_document = nil
         }
-
         typography.rendered_view_revision = app.view.revision
-
-        if !tint(typography.document, theme().text) {
+        if !tint(cached.text, theme().text) {
           #panic("pane text color")
         }
 
         draw_document(renderer, app, typography, pane.rect.width, pane.rect.height, focused)
-        cached.caret_document = typography.caret_document
-        cached.caret_revision = typography.caret_revision
-        cached.caret_start = typography.caret_start
-        cached.caret_end = typography.caret_end
-        cached.document = typography.rendered_document
-        cached.revision = typography.rendered_revision
-        cached.start = typography.document_start
-        cached.end = typography.document_end
         cached.identity = app.documents.slots[app.documents.active].identity
         pane.scroll_x = app.view.scroll_x
         pane.scroll_y = app.view.scroll_y
@@ -467,7 +423,6 @@ fn pane_text_font(typography: *Typography, font: rawptr) {
   }
   _ = ttf.set_font(typography.primary_document, font)
   _ = ttf.set_font(typography.primary_caret, font)
-  typography.caret_document = nil
 }
 fn release_pane_cache(typography: *Typography, index: usize) {
   cached := typography.pane_text[index]
@@ -488,8 +443,8 @@ fn release_pane_cache(typography: *Typography, index: usize) {
     }
   }
   line_layout_release(&cached.layout)
-  if typography.layout==&cached.layout {
-    typography.layout=nil
+  if typography.pane==cached {
+    typography.pane=nil
   }
   owner:=cached.owner
   if typography.observer!=nil {
@@ -504,6 +459,5 @@ fn release_pane_text(typography: *Typography) {
     release_pane_cache(typography, index)
   }
   line_layout_release(&typography.directory_layout)
-  typography.document = typography.primary_document
-  typography.caret_text = typography.primary_caret
+  typography.pane = nil
 }

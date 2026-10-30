@@ -313,7 +313,7 @@ fn draw_syntax(renderer: rawptr, app: *App, typography: *Typography, viewport: T
     for style in 1..7 {
       state.palette[style]=rgb_value(syntax_color(#cast(u8, style)))
     }
-    layout:=typography.layout
+    layout:=&current_pane_text(typography).layout
     for index in 0..layout.count {
       state.offset=buffer.row_start(doc, layout.first_row+index)
       text:=layout.lines[layout.rows[index]].text
@@ -365,7 +365,7 @@ fn draw_syntax(renderer: rawptr, app: *App, typography: *Typography, viewport: T
         geometry_ready = true
       }
       else {
-        geometry_ready = layout_substring(typography.layout, doc, at, &first) && layout_substring(typography.layout, doc, buffer.previous(doc, end), &last)
+        geometry_ready = layout_substring(&current_pane_text(typography).layout, doc, at, &first) && layout_substring(&current_pane_text(typography).layout, doc, buffer.previous(doc, end), &last)
         if cached != nil && geometry_ready {
           cached.first = first
           cached.last = last
@@ -652,45 +652,14 @@ fn syntax_selection(app: *App, mode: u32) {
     notice(app, "Install a grammar for syntax selections.")
     return
   }
-  selections: [32]buffer.Selection = []
-  selections[0] = buffer.Selection{anchor: doc.anchor, cursor: doc.cursor}
-  index: usize = 0
-  for index < doc.secondary.count {
-    selections[index + 1] = doc.secondary.ranges[index]
-    index += 1
-  }
-  index = 0
-  for index <= doc.secondary.count {
-    selected := &selections[index]
-    low := selected.anchor
-    high := selected.cursor
-    backward := low > high
-    if backward {
-      low = selected.cursor
-      high = selected.anchor
-    }
-    start: u32 = 0
-    end: u32 = 0
-    if syntax_select(slot.syntax, doc.revision, #cast(u32, low), #cast(u32, high), mode, &start, &end) == 0 {
+  selections := buffer.collect(doc)
+  for index in 0..selections.count {
+    if !syntax_range(&selections.items[index], slot.syntax, doc.revision, mode, 0, 0, false) {
       notice(app, "No syntax node available; parsing may still be pending.")
       return
     }
-    selected.anchor = #cast(usize, start)
-    selected.cursor = #cast(usize, end)
-    if backward {
-      selected.anchor = #cast(usize, end)
-      selected.cursor = #cast(usize, start)
-    }
-    index += 1
   }
-  doc.goal_valid = false
-  doc.anchor = selections[0].anchor
-  doc.cursor = selections[0].cursor
-  index = 0
-  for index < doc.secondary.count {
-    doc.secondary.ranges[index] = selections[index + 1]
-    index += 1
-  }
+  buffer.store(doc, &selections)
 }
 fn syntax_textobject(app: *App, key: u8, around: bool, count: usize) bool {
   slot := app.documents.slots[app.documents.active]
@@ -699,53 +668,94 @@ fn syntax_textobject(app: *App, key: u8, around: bool, count: usize) bool {
     return false
   }
   kind: u32 = 0
-  if key == 116 {
+  if key == 't' {
     kind = 2
-  } else if key == 97 {
+  } else if key == 'a' {
     kind = 4
-  } else if key == 99 {
+  } else if key == 'c' {
     kind = 6
   }
   if around {
     kind += 1
   }
-  selections: [32]buffer.Selection = []
-  selections[0] = buffer.Selection{anchor: doc.anchor, cursor: doc.cursor}
-  index: usize = 0
-  for index < doc.secondary.count {
-    selections[index + 1] = doc.secondary.ranges[index]
-    index += 1
-  }
-  index = 0
-  for index <= doc.secondary.count {
-    selected := &selections[index]
-    low := selected.anchor
-    high := selected.cursor
-    backward := low > high
-    if backward {
-      low = selected.cursor
-      high = selected.anchor
-    }
-    start: u32 = 0
-    end: u32 = 0
-    if syntax_object(slot.syntax, doc.revision, #cast(u32, low), #cast(u32, high), kind, #cast(u32, count), &start, &end) == 0 {
+  selections := buffer.collect(doc)
+  for index in 0..selections.count {
+    if !syntax_range(&selections.items[index], slot.syntax, doc.revision, 0, kind, count, true) {
       return false
     }
-    selected.anchor = #cast(usize, start)
-    selected.cursor = #cast(usize, end)
-    if backward {
-      selected.anchor = #cast(usize, end)
-      selected.cursor = #cast(usize, start)
-    }
-    index += 1
   }
-  doc.goal_valid = false
-  doc.anchor = selections[0].anchor
-  doc.cursor = selections[0].cursor
-  index = 0
-  for index < doc.secondary.count {
-    doc.secondary.ranges[index] = selections[index + 1]
-    index += 1
+  buffer.store(doc, &selections)
+  return true
+}
+// Replaces one selection with a syntax node (select mode) or text object
+// (kind/count), keeping its direction.
+fn syntax_range(selected: *buffer.Selection, syntax: rawptr, revision: u64, mode: u32, kind: u32, count: usize, object: bool) bool {
+  range := buffer.ordered(selected.*)
+  start: u32 = 0
+  end: u32 = 0
+  found: i32 = 0
+  if object {
+    found = syntax_object(syntax, revision, #cast(u32, range.anchor), #cast(u32, range.cursor), kind, #cast(u32, count), &start, &end)
+  } else {
+    found = syntax_select(syntax, revision, #cast(u32, range.anchor), #cast(u32, range.cursor), mode, &start, &end)
+  }
+  if found == 0 {
+    return false
+  }
+  if selected.anchor > selected.cursor {
+    selected.* = buffer.Selection{anchor: #cast(usize, end), cursor: #cast(usize, start)}
+  } else {
+    selected.* = buffer.Selection{anchor: #cast(usize, start), cursor: #cast(usize, end)}
   }
   return true
+}
+// Alt-a: select every sibling of each selection's node, including itself.
+// Alt-I: select every child of each selection's node. Up to 32 selections.
+fn syntax_select_all(app: *App, children: bool) {
+  slot := app.documents.slots[app.documents.active]
+  doc := app.documents.current
+  if slot.syntax == nil {
+    notice(app, "Install a grammar for syntax selections.")
+    return
+  }
+  sources := buffer.collect(doc)
+  results := buffer.Selections{}
+  for index in 0..sources.count {
+    source := buffer.ordered(sources.items[index])
+    low := #cast(u32, source.anchor)
+    high := #cast(u32, source.cursor)
+    start: u32 = 0
+    end: u32 = 0
+    if !children {
+      if syntax_select(slot.syntax, doc.revision, low, high, 0, &start, &end) == 0 {
+        continue
+      }
+      low = start
+      high = end
+    }
+    if syntax_select(slot.syntax, doc.revision, low, high, 1, &start, &end) == 0 {
+      continue
+    }
+    for results.count < buffer.SelectionCapacity {
+      duplicate := false
+      for seen in 0..results.count {
+        if results.items[seen].anchor == #cast(usize, start) && results.items[seen].cursor == #cast(usize, end) {
+          duplicate = true
+        }
+      }
+      if duplicate {
+        break
+      }
+      results.items[results.count] = buffer.Selection{anchor: #cast(usize, start), cursor: #cast(usize, end)}
+      results.count += 1
+      if syntax_select(slot.syntax, doc.revision, start, end, 3, &start, &end) == 0 {
+        break
+      }
+    }
+  }
+  if results.count == 0 {
+    notice(app, "No syntax node available; parsing may still be pending.")
+    return
+  }
+  buffer.store(doc, &results)
 }

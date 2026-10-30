@@ -21,13 +21,13 @@ base = '''use "./sdl" sdl
 struct Animation {active:bool}
 struct View {vsync,vsync_supported:bool,refresh_ms:f32,animation:Animation}
 struct Config {frame_interval_ms:f32=4.0}
-struct Trace {pending:u64}
-struct App {view:View,config:Config,render_trace:Trace}
+struct App {view:View,config:Config,render_pending:u64}
 const RenderKey:u64=1
 const RenderText:u64=2
 const RenderMouse:u64=4
 const RenderIme:u64=8
 const RenderWindow:u64=16
+fn answering_input(app:*const App)bool{return (app.render_pending&(RenderKey|RenderText|RenderMouse|RenderIme|RenderWindow))!=0}
 '''
 cases = '''fn main(){
  app:=App{config:Config{}}
@@ -42,10 +42,10 @@ cases = '''fn main(){
  present_pacing(&app,nil)
  if !app.view.vsync || sdl.last!=1 {#panic("animation not synchronized")}
  if animation_interval(&app)!=20 {#panic("vsync floor ignored")}
- app.render_trace.pending=RenderText
+ app.render_pending=RenderText
  present_pacing(&app,nil)
  if app.view.vsync || sdl.last!=0 {#panic("input delayed by animation vsync")}
- app.render_trace.pending=0
+ app.render_pending=0
  app.view.animation.active=false
  present_pacing(&app,nil)
  if app.view.vsync {#panic("settled frame retains animation pacing")}

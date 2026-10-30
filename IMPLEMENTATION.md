@@ -15,24 +15,26 @@ Do not replace the user's explicit DNA shortcuts to imitate Helix defaults.
 
 ## Work queue
 
+Reviewed 2026-10-30 against the source tree.
+
 - [x] Multi-selection ASCII case conversion, indentation, joining and open-line commands.
 - [x] Primary selection rotation and content rotation.
 - [x] Named registers and bounded macro recording/playback.
 - [x] Syntax-node selections and query-backed language text objects (Dyn starter queries; other languages need queries).
 - [ ] Binding-by-binding compatibility inventory and input-level behavior tests.
-- [ ] Process/PTY API: working directory, environment, nonblocking transport, cancellation and child cleanup.
-- [ ] Worker API: synchronization, bounded queues, wakeups, explicit ownership.
-- [ ] Filesystem: directories, metadata, watching and atomic replacement contracts.
-- [ ] Complete bindings used by terminal, syntax, font and event adapters.
+- [x] Process/PTY API: working directory, nonblocking transport, cancellation and child cleanup (`process.dyn`, `tty.dyn`; `tests/process_transport.py`, `tests/process_close.py`). Children inherit `environ`; per-spawn environment overrides are not implemented.
+- [x] Worker API: synchronization, bounded queues, wakeups, explicit ownership (`sync.dyn`, `job.dyn`, `notify.dyn`; `tests/native_sync.py`).
+- [x] Filesystem: directories, metadata, watching and atomic replacement contracts on Linux (`src/filesystem`, `disk.dyn` inotify, `recovery.dyn`). Other platforms: see PRERELEASE.md.
+- [x] Complete bindings used by terminal, syntax, font and event adapters (all in `src/native/dyn`; layouts checked by `tests/native_abi.py`).
 - [x] Port theme/font and recovery adapters to Dyn.
-- [ ] Port jobs/RPC/plugins, disk/search, syntax workers and terminal to Dyn.
+- [x] Port jobs/RPC/plugins, disk/search, syntax workers and terminal to Dyn (see Native implementation in Dyn; no `.c`/`.h` remain in `src/` or `tests/`).
 - [ ] Compiler regression coverage for callbacks, C layouts, threading, cleanup and editor-sized builds.
 - [ ] Ownership tests and documentation: borrowed views, transfer, double-close, lifetime violations.
 
 ## Compatibility source and intentional differences
 
 Baseline: https://docs.helix-editor.com/keymap.html (checked 2026-09-27).
-DNA retains Ctrl-X buffer-close, Ctrl-S save, Ctrl-O open, Space-T/t terminal,
+DNA retains Ctrl-X buffer-close, Space-T/t terminal,
 its editable explorer, palette and popup layout decisions. These are intentional
 product choices, not claims of identical default keymaps. Full compatibility is
 not yet implemented. Selection capacity is currently 32; case conversion is ASCII.
@@ -99,16 +101,16 @@ not a claim of complete parity. Remaining families to audit/implement:
 
 | Family | Remaining gaps |
 | --- | --- |
-| Registers/macros | Special/search registers, append registers, text/macro interchange, last-insert repeat |
-| Selection | Alignment &, Alt-J selected join spaces, Alt-x shrink-to-lines |
-| Syntax | All-siblings/all-children, parent boundary motions, more language text-object queries |
-| View/jumps | z/Z view commands, jump-list traversal, screen-relative goto commands |
-| Changes | Numeric increment/decrement, comment toggling, per-selection shell filtering |
-| Search | Search-selection * and Alt-*, register-aware search |
-| Navigation | Bracket-prefixed navigation, repeat-last-motion, alternate/last-modified locations |
+| Registers/macros | Text/macro interchange, last-insert repeat. Done 2026-10-30: `_` `+` `*` `"` `/` `%` `#` `.` |
+| Selection | Done: `&`, `Alt-x`, `Alt-J` (joins and selects the inserted spaces) |
+| Syntax | More language text-object queries. Done: `Alt-a` all siblings, `Alt-I` all children |
+| View/jumps | Done: jump list (`Ctrl-o`, `Ctrl-i`/`Tab`, `Ctrl-s`; recorded by `gg`, `ge`, `G`, search, LSP goto, diagnostics), `z`/`Z`, `gt`/`gc`/`gb`, `ga` |
+| Changes | Done: `Ctrl-a` and `:increment`/`:decrement` on every selection (`Ctrl-x` stays buffer close), `:comment`, `\|` `Alt-\|` `!` `Alt-!` via `:pipe`, `:pipe-to`, `:insert-output`, `:append-output` |
+| Search | Register-aware search. Done: `*` (word boundaries), `Alt-*` |
+| Navigation | Done: `]`/`[` families, `Alt-.` repeats the last f/t/F/T |
 | Modes | Complete Vim profile and per-binding cross-profile tests |
 
-DNA intentionally retains Ctrl-X buffer close, Ctrl-S save, Ctrl-O open,
+DNA intentionally retains Ctrl-X buffer close,
 Space-t terminal and its own explorer/picker decisions. K/Alt-K now filter
 selections; hover moved to Space-k and remains available through :hover.
 

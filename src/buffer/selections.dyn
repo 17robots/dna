@@ -1,6 +1,78 @@
 pub struct Selection { cursor, anchor: usize }
 pub struct SelectionSet { count: usize, ranges: [31]Selection }
 struct EditRange { low, high, inserted: usize, primary, reversed: bool }
+// Every selection as a value: the primary first, then the secondaries, with
+// their direction kept. Pair with store() to write changed ranges back.
+pub const SelectionCapacity: usize = 32
+pub struct Selections { count: usize, items: [32]Selection }
+pub fn collect(document: *const Document) Selections {
+  result := Selections{count: document.secondary.count + 1}
+  result.items[0] = Selection{cursor: document.cursor, anchor: document.anchor}
+  for index in 0..document.secondary.count {
+    result.items[index + 1] = document.secondary.ranges[index]
+  }
+  return result
+}
+// Like collect(), but forward (anchor <= cursor) and sorted by start.
+pub fn collect_ordered(document: *const Document) Selections {
+  result := collect(document)
+  for index in 0..result.count {
+    result.items[index] = ordered(result.items[index])
+  }
+  sort(&result)
+  return result
+}
+// Sorts by start; the first range becomes the primary when stored.
+pub fn sort(selections: *Selections) {
+  for index in 1..selections.count {
+    moving := selections.items[index]
+    at := index
+    for at > 0 && selections.items[at - 1].anchor > moving.anchor {
+      selections.items[at] = selections.items[at - 1]
+      at -= 1
+    }
+    selections.items[at] = moving
+  }
+}
+// Makes items[0] the primary and the rest secondaries. count must be >= 1.
+pub fn store(document: *Document, selections: *const Selections) {
+  document.goal_valid = false
+  document.cursor = selections.items[0].cursor
+  document.anchor = selections.items[0].anchor
+  for index in 1..selections.count {
+    document.secondary.ranges[index - 1] = selections.items[index]
+  }
+  document.secondary.count = selections.count - 1
+}
+// Moves every range past an edit that replaced [low, high) with `inserted`
+// bytes; ranges inside it collapse to the edit's end.
+pub fn shift(selections: *Selections, low: usize, high: usize, inserted: usize, length: usize) {
+  for index in 0..selections.count {
+    item := &selections.items[index]
+    item.cursor = shifted_mark(item.cursor, low, high, inserted, length)
+    item.anchor = shifted_mark(item.anchor, low, high, inserted, length)
+  }
+}
+// Replaces [low, high) and shifts `selections` to match. Clears the
+// document's secondary selections; callers store() their set afterwards.
+pub fn replace_range(document: *Document, low: usize, high: usize, text: []const u8, selections: *Selections) bool {
+  document.secondary.count = 0
+  document.anchor = low
+  document.cursor = high
+  length := document.length
+  if !replace(document, text) {
+    return false
+  }
+  shift(selections, low, high, #len(text), length)
+  return true
+}
+// The same range with anchor <= cursor.
+pub fn ordered(selection: Selection) Selection {
+  if selection.anchor > selection.cursor {
+    return Selection{anchor: selection.cursor, cursor: selection.anchor}
+  }
+  return selection
+}
 
 pub fn head(document: *const Document) usize {
   if document.cursor > document.anchor {
