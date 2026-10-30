@@ -24,6 +24,8 @@ struct DisplayCounts {
 }
 struct CaretGeometry {value:ttf.Substring, text:rawptr, position:usize, ready:bool}
 struct PaneText {
+  owner:*mem.Arena,
+  born:u64,
   caret_geometry:CaretGeometry,
   counts: DisplayCounts,
   caret: rawptr,
@@ -46,7 +48,7 @@ struct Typography {
   ui_born: u64,
   ui_owner: *mem.Arena,
   ui_hits, ui_updates, ui_creations: u64,
-  pane_text: [15]PaneText,
+  pane_text: [15]*PaneText,
   // The focused pane's line layout while it draws.
   layout: *LineLayout,
   caret_document: *const buffer.Document,
@@ -97,7 +99,9 @@ struct Typography {
 fn resize_font(typography: *Typography) {
   typography.caret_document=nil
   for pane_index in 0..15 {
-    typography.pane_text[pane_index].caret_document=nil
+    if typography.pane_text[pane_index]!=nil {
+      typography.pane_text[pane_index].caret_document=nil
+    }
   }
   ui_cache_clear(typography)
   // Terminal cells are fixed: an 8-wide, 16-tall unit per cell, and a font
@@ -108,6 +112,9 @@ fn resize_font(typography: *Typography) {
     typography.line_height = 1.0
   }
   for pane_index in 0..15 {
+    if typography.pane_text[pane_index]==nil {
+      continue
+    }
     for span_index in 0..128 {
       span := &typography.pane_text[pane_index].spans[span_index]
       span.geometry_ready = false
@@ -153,4 +160,25 @@ fn resize_font(typography: *Typography) {
   }
 
   typography.cell = #cast(f32, width)
+}
+
+// Each rendered pane owns its metadata and line/span cache. Closed, branch and
+// never-drawn panes need no backing storage. Font invalidation never creates it.
+fn pane_text_get(typography:*Typography, index:usize)*PaneText {
+  if index>=15 {
+    #panic("invalid typography pane")
+  }
+  if typography.pane_text[index]==nil {
+    owner:=arena_owner.create(#sizeof(PaneText)+16)
+    cached:=mem.push(PaneText, owner)
+    cached.owner=owner
+    if typography.observer!=nil {
+      if typography.observer.render_trace.enabled {
+        cached.born=render_clock()
+      }
+      allocation_record(typography.observer, "pane_text", #sizeof(PaneText)+16, cached.born, false)
+    }
+    typography.pane_text[index]=cached
+  }
+  return typography.pane_text[index]
 }

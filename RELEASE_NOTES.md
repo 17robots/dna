@@ -1,36 +1,27 @@
-# DNA 0.1.0-preview.8
+# DNA 0.1.0-preview.9
 
 Experimental Linux x86-64 preview built with the published Dyn
-0.1.0-preview.28 compiler, SDK and runtime.
+0.1.0-preview.29 compiler, SDK and runtime.
 
 ## Changes
 
-- Add `dna --version` and `dna version`, available without a display or terminal.
-- Replace the SDL GUI and text backends with Dyn's native Wayland/X11 windowing,
-  rendering, font discovery and HarfBuzz/FreeType/FriBidi text layout.
-- Use shared persistent UI boxes for identities, layout, hit testing and owned
-  frame text; retain DNA's configurable editor geometry and motion.
-- Improve native input, clipboard handling, popup geometry and render reuse.
-- Grow the document directory beyond 16 buffers while preserving stable owners,
-  asynchronous identities and bounded allocation-failure behavior.
-- Reduce idle work and reuse text, syntax and terminal storage, with regression
-  checks for resource lifetimes, rendering and editing workflows.
-- Pin verified Dyn preview.28 packages in mise and CI. Installed SDK builds no
-  longer require a sibling compiler checkout or its private test harness.
-- Include both Wayland and X11 GUI binaries in the Linux archive; the launcher
-  selects Wayland when WAYLAND_DISPLAY is set, otherwise X11. Both support TUI.
+- Draw the native GUI through a GPU presenter with one glyph atlas and
+  framebuffer-backed popups. Set `DNA_RENDERER=software` for the software
+  presenter.
+- Lower idle memory. Panes allocate storage only when used, fonts under
+  `/usr/share/fonts` and `/usr/lib/fonts` are mapped read-only instead of
+  copied, and Dyn preview.29 sizes file reads exactly and keeps small arenas
+  off transparent huge pages. On the reference machine, idle private memory
+  fell from 43.8 MiB to 30.0 MiB with an 8 MB Nerd Font.
+- Install desktop entries for the GUI and TUI with `dna-install-desktop`.
+- Pin verified Dyn preview.29 packages in mise and CI.
 
 ## Compatibility
 
-The application target remains Linux x86-64. The archive includes native
-libraries but requires compatible host glibc, a monospace font, and desktop
-libraries/graphics drivers for GUI operation. `build-info.json` records the
-archive's actual minimum glibc version. Windows/macOS host and cross-object
-checks do not qualify a full editor release on those platforms.
-
-Configuration and document formats remain compatible. Sessions above 16 slots
-use format 3; formats 1 and 2 remain readable. Older DNA releases cannot read
-format 3. Use a separate session file when testing or rolling back.
+Unchanged from preview.8. The application target remains Linux x86-64 and
+needs compatible host glibc, a monospace font, and desktop libraries/graphics
+drivers for GUI operation. Fonts outside the system font directories are still
+copied into memory, so later changes to those files cannot fault the editor.
 
 ## Qualification
 

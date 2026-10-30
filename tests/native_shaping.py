@@ -25,7 +25,7 @@ int main(int argc,char**argv){
 '''
 PLATFORM=r'''pub fn native_color(renderer:rawptr,r,g,b,a:u8)bool{return renderer!=nil}
 pub fn native_fill(renderer:rawptr,x,y,w,h:f32)bool{return renderer!=nil}
-pub fn native_text_bitmap(renderer:rawptr,pixels:*const u8,width,height:i32,x,y:f32,r,g,b,a:u8)bool{return renderer!=nil && pixels!=nil && width>0 && height>0}
+pub fn native_text_cached_bitmap(renderer:rawptr,key:u64,pixels:*const u8,width,height:i32,x,y:f32,r,g,b,a:u8)bool{return renderer!=nil && pixels!=nil && width>0 && height>0}
 '''
 SOURCE=r'''pub struct Substring {flags:u32,offset:i32,length:i32,line:i32,cluster:i32,x:i32,y:i32,width:i32,height:i32}
 fn check(ok:bool){if !ok{#panic("native shaping oracle")}}

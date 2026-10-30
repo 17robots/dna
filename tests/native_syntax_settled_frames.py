@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from native_gpu_probe import install as gpu_probe
 ROOT=Path(__file__).resolve().parents[1]
 roots=[ROOT/'build/test-languages']
 # Standalone runs and clean CI must provision this before starting the worker.
@@ -30,7 +31,7 @@ pub fn typing_probe_resize(width,height:i32) {
  if !native_resize() {#panic("settled frame resize")}
 }
 '''
- gui.write_text(source)
+ gui.write_text(gpu_probe(source))
  (stage/'startup_probe.dyn').write_text('''fn startup_probe(app:*App,typography:*Typography,renderer:rawptr,window:rawptr,input_storage:[]u8){
  native_syntax_settled_frame_smoke(app,typography,renderer,window,NativeTypingFrameProbe{pixels:sdl.typing_probe_pixels,resize:sdl.typing_probe_resize})
 }

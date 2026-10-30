@@ -20,9 +20,12 @@ def function(source,name):
 
 FIXTURE=r'''use "std/testing" testing
 images:u32
+buffers:u32
+parameters:u32
 updates:u32
 quads:u32
 pending_error:u32
+fail_buffer:bool
 fail_image:bool
 fail_update:bool
 image_width:i32
@@ -52,13 +55,15 @@ fn disable(value:u32){
  if value==gl.CullFace{state|=128}
  if value==gl.ScissorTest{state|=256}
 }
-fn texture_parameter(target,key:u32,value:i32){}
+fn texture_parameter(target,key:u32,value:i32){parameters+=1}
 fn viewport(x,y,width,height:i32){testing.expect(x==0 && y==0 && width>0 && height>0,"viewport")}
 fn uniform_one(location,value:i32){}
 fn uniform_two(location:i32,x,y:f32){}
 fn uniform_four(location:i32,x,y,z,w:f32){}
 fn color(r,g,b,a:f32){}
-fn buffer_data(target:u32,size:isize,bytes:rawptr,usage:u32){}
+fn buffer_data(target:u32,size:isize,bytes:rawptr,usage:u32){buffers+=1
+ if fail_buffer{pending_error=1285
+ fail_buffer=false}}
 fn image(target:u32,level,internal,width,height,border:i32,format,kind:u32,bytes:rawptr){
  images+=1
  image_width=width
@@ -92,11 +97,14 @@ fn main(){
  // This is the red-cap: the old presenter reallocates 64 times here.
  testing.expect(images==1,"same-size frames must allocate texture once")
  testing.expect(updates==64 && quads==64,"each frame updates and draws")
+ testing.expect(buffers==1,"same-size frames must allocate vertices once")
+ testing.expect(parameters==4,"private texture parameters set once")
  surface.width=24
 surface.height=10
 surface.stride=96
  testing.expect(draw(&present,surface).ok,"resize present")
  testing.expect(images==2 && updates==65 && image_width==24 && image_height==10 && update_width==24 && update_height==10,"resize storage and full update")
+ testing.expect(buffers==1,"resize must keep static vertex storage")
  surface.width=32
 surface.height=12
 surface.stride=128
@@ -120,6 +128,16 @@ surface.stride=128
 surface.height=8
 surface.stride=64
  testing.expect(draw(&present,surface).ok && images==before+1,"recreated presenter allocates fresh storage")
+ // A failed vertex allocation must retry even when texture storage succeeded.
+ close(&present)
+ present=renderer()
+ surface.width=20
+ surface.stride=80
+ before=quads
+ vertex_attempts:=buffers
+ fail_buffer=true
+ testing.expect(!draw(&present,surface).ok && quads==before,"vertex allocation error surfaced before drawing")
+ testing.expect(draw(&present,surface).ok && buffers==vertex_attempts+2,"vertex allocation retried")
  close(&present)
 }
 '''

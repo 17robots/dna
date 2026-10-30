@@ -21,15 +21,7 @@ parser.add_argument('--output',type=Path,default=ROOT/'build/rad-feel-20261027/t
 args=parser.parse_args()
 current=args.candidate
 
-def function(path,name):
-    source=path.read_text()
-    start=source.index(('pub ' if 'pub fn '+name+'(' in source else '')+'fn '+name+'(')
-    begin=source.index('{',start);end=begin+1;depth=1
-    while depth:
-        if source[end]=='{':depth+=1
-        elif source[end]=='}':depth-=1
-        end+=1
-    return source[start:end]
+from native_software_source import function
 
 HEADER='''use "std/ui"
 use "std/ui/software"

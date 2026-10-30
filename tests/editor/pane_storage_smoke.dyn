@@ -1,0 +1,64 @@
+fn pane_storage_count(typography:*const Typography)usize {
+  count:usize=0
+  for i in 0..15 {
+    if typography.pane_text[i]!=nil {
+      count+=1
+    }
+  }
+  return count
+}
+fn pane_storage_check(ok:bool, reason:[]const u8) {
+  if !ok {
+    #panic(reason)
+  }
+}
+fn pane_storage_smoke(app:*App, typography:*Typography, renderer, window:rawptr) {
+  if #sizeof(Typography)>131072 {
+    #panic("unused pane typography committed eagerly")
+  }
+  pane_storage_check(pane_storage_count(typography)==0, "startup allocated unused pane caches")
+  app.prompt_state.panel=Panel.None
+  app.view.reduced_motion=true
+  pane_only(app)
+  draw(renderer, window, app, typography)
+  pane_storage_check(pane_storage_count(typography)==1, "one pane allocated more than one cache")
+  for i in 1..15 {
+    pane_storage_check(typography.pane_text[i]==nil, "unused pane has backing")
+  }
+  // Metadata can exist before text handles do. It still owns storage which
+  // close must release; invalidation must not allocate the remaining panes.
+  _=pane_text_get(typography, 14)
+  pane_storage_check(pane_storage_count(typography)==2, "explicit cache allocation")
+  resize_font(typography)
+  pane_storage_check(pane_storage_count(typography)==2, "font invalidation allocated inactive panes")
+  release_pane_cache(typography, 14)
+  pane_storage_check(typography.pane_text[14]==nil, "metadata-only pane cache leaked")
+  pane_split(app, true)
+  draw(renderer, window, app, typography)
+  pane_storage_check(pane_storage_count(typography)==2 && typography.pane_text[0]==nil, "branch kept a pane cache")
+  for i in 0..15 {
+    if typography.pane_text[i]!=nil {
+      pane_storage_check(app.view.panes[i].used && !app.view.panes[i].branch, "cache belongs to closed/branch pane")
+    }
+  }
+  pane_only(app)
+  draw(renderer, window, app, typography)
+  pane_storage_check(pane_storage_count(typography)==1, "closing split retained unused metadata")
+  points:=typography.points
+  typography.points=points+1.0
+  resize_font(typography)
+  pane_storage_check(pane_storage_count(typography)==1, "font change allocated unused caches")
+  draw(renderer, window, app, typography)
+  typography.points=points
+  resize_font(typography)
+  release_pane_text(typography)
+  pane_storage_check(pane_storage_count(typography)==0 && typography.layout==nil, "cache release left owner/layout aliases")
+  // The primary text objects survive releasing pane metadata and may be
+  // attached to a newly allocated pane cache on the next draw.
+  draw(renderer, window, app, typography)
+  pane_storage_check(pane_storage_count(typography)==1 && typography.pane_text[0]!=nil, "released pane failed to reconstruct")
+  release_pane_text(typography)
+  release_pane_text(typography)
+  pane_storage_check(pane_storage_count(typography)==0, "repeated cleanup allocated or retained pane metadata")
+  app.running=false
+}

@@ -30,6 +30,7 @@ test:
     python3 tests/host_environment.py
     python3 tests/json_scratch.py
     python3 tests/owned_arena.py
+    python3 tests/font_startup.py
     python3 scripts/test.py
 # Checks never read your own config, trust store or recovery files: a personal
 # setting such as frontend = "tui" must not change what they exercise.
@@ -45,6 +46,7 @@ _smoke: deps test
     python3 tests/static_native.py
     python3 tests/dyn_support.py
     python3 tests/native_fonts.py
+    python3 tests/native_text.py
     python3 tests/clipboard_deadline.py
     python3 tests/native_foundation.py
     python3 tests/native_triangle_bounds.py
@@ -59,6 +61,7 @@ _smoke: deps test
     python3 tests/native_syntax_idle.py
     python3 tests/native_frame_sequence.py
     python3 tests/ui_text_working_set.py
+    python3 tests/pane_storage.py
     python3 tests/native_sync.py
     python3 tests/native_clock.py
     python3 tests/tui_storage.py
@@ -128,6 +131,7 @@ _smoke: deps test
     DNA_SMOKE_TIMEOUT_SECONDS="${DNA_SMOKE_TIMEOUT_SECONDS:-90}" python3 scripts/smoke.py
     python3 tests/launch.py
     DNA_NATIVE_BACKEND=wayland python3 tests/native_platform.py
+    DNA_NATIVE_BACKEND=wayland python3 tests/native_gpu.py
     python3 tests/native_shaping.py
     python3 tests/native_selection.py
     python3 scripts/profile.py minimal release

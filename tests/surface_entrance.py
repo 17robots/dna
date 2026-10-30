@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import shutil,subprocess,sys,tempfile
+from native_gpu_probe import install as gpu_probe
 ROOT=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='dna-panel-geometry-',dir=ROOT/'build') as temporary:
     work=Path(temporary);stage=work/'src';shutil.copytree(ROOT/'src',stage)
@@ -15,7 +16,7 @@ with tempfile.TemporaryDirectory(prefix='dna-panel-geometry-',dir=ROOT/'build') 
 pub fn geometry_probe_resize(width,height:i32){native_gui.window.width=width
  native_gui.window.height=height
  if !native_resize(){#panic("geometry resize")}}
-''';gui.write_text(s)
+''';gui.write_text(gpu_probe(s))
     if '--negative-control' in sys.argv:
         view=stage/'view.dyn';s=view.read_text().replace('  pane_animate_layout(app, 0)','  app.view.animation.resized=true\n  pane_animate_layout(app, 0)');view.write_text(s)
     (stage/'startup_probe.dyn').write_text('''fn startup_probe(app:*App,typography:*Typography,renderer:rawptr,window:rawptr,input_storage:[]u8){

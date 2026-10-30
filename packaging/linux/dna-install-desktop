@@ -1,0 +1,92 @@
+#!/bin/sh
+# Register this package with XDG application launchers for the current user.
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+launcher="$root/dna"
+case "$#" in
+    0) ;;
+    1)
+        if [ "$1" = --help ]; then
+            printf '%s\n' 'Usage: dna-install-desktop [--launcher /absolute/path/to/dna]'
+            exit 0
+        fi
+        printf '%s\n' 'Expected --launcher followed by an absolute executable path' >&2
+        exit 1 ;;
+    2)
+        if [ "$1" != --launcher ]; then
+            printf '%s\n' 'Expected --launcher followed by an absolute executable path' >&2
+            exit 1
+        fi
+        launcher=$2 ;;
+    *) printf '%s\n' 'Usage: dna-install-desktop [--launcher /absolute/path/to/dna]' >&2; exit 1 ;;
+esac
+case "$launcher" in
+    /*) ;;
+    *) printf '%s\n' 'Launcher path must be absolute' >&2; exit 1 ;;
+esac
+if [ ! -f "$launcher" ] || [ ! -x "$launcher" ]; then
+    printf 'DNA launcher is not executable: %s\n' "$launcher" >&2
+    exit 1
+fi
+data=${XDG_DATA_HOME:-${HOME:?HOME or XDG_DATA_HOME must be set}/.local/share}
+case "$data" in
+    /*) ;;
+    *) printf '%s\n' 'XDG_DATA_HOME must be absolute' >&2; exit 1 ;;
+esac
+applications="$data/applications"
+mkdir -p "$applications"
+gui_temp=
+tui_temp=
+cleanup() {
+    [ -z "$gui_temp" ] || rm -f "$gui_temp"
+    [ -z "$tui_temp" ] || rm -f "$tui_temp"
+}
+trap cleanup 0
+trap 'exit 1' HUP INT TERM
+gui_temp=$(mktemp "$applications/.dna.desktop.XXXXXX")
+tui_temp=$(mktemp "$applications/.dna-tui.desktop.XXXXXX")
+render() {
+    DNA_DESKTOP_LAUNCHER="$launcher" awk '
+    BEGIN {
+        path = ENVIRON["DNA_DESKTOP_LAUNCHER"]
+        if (path ~ /[\r\n\t]/) {
+            print "Launcher path cannot contain control whitespace" > "/dev/stderr"
+            exit 1
+        }
+        bs = sprintf("%c", 92)
+        quote = sprintf("%c", 34)
+        command = quote
+        value = ""
+        for (i = 1; i <= length(path); i++) {
+            character = substr(path, i, 1)
+            if (character == bs) {
+                command = command bs bs bs bs
+                value = value bs bs
+            } else {
+                value = value character
+                if (character == quote || character == "$" || character == "`")
+                    command = command bs bs character
+                else if (character == "%")
+                    command = command "%%"
+                else
+                    command = command character
+            }
+        }
+        command = command quote
+    }
+    # env avoids GLib checking the %% encoding as a literal executable name
+    # before it expands desktop field codes. TryExec checks the actual path.
+    /^Exec=dna / { print "Exec=/usr/bin/env " command substr($0, length("Exec=dna") + 1); next }
+    /^TryExec=dna$/ { print "TryExec=" value; next }
+    { print }
+    ' "$1" > "$2"
+}
+render "$root/share/applications/dna.desktop" "$gui_temp"
+render "$root/share/applications/dna-tui.desktop" "$tui_temp"
+chmod 644 "$gui_temp" "$tui_temp"
+mv -f "$gui_temp" "$applications/dna.desktop"
+mv -f "$tui_temp" "$applications/dna-tui.desktop"
+if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$applications"
+fi
+printf 'Registered DNA and DNA (Terminal) in %s\n' "$applications"
