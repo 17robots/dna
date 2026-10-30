@@ -1,6 +1,16 @@
 // Shared document editing semantics for file text and explorer drafts.
 fn edit_key(app: *App, key: u32, modifiers: u16) {
   if !app.view.insert && (modifiers & ModAlt) != 0 {
+    if key == KeyPeriod && (modifiers & ModShift) == 0 {
+      doc := app.documents.current
+      extending := app.view.extend
+      if app.prompt_state.panel == Panel.Directory {
+        doc = app.explorer.document
+        extending = app.explorer.extend
+      }
+      repeat_find(app, doc, extending)
+      return
+    }
     if key == KeyMinus || key == KeyUnderscore {
       buffer.merge_selections(app.documents.current, key == KeyUnderscore || (modifiers & ModShift) != 0)
       return
@@ -9,6 +19,10 @@ fn edit_key(app: *App, key: u32, modifiers: u16) {
       buffer.forward_selections(app.documents.current)
       return
     }
+  }
+  if !app.view.insert && (modifiers & ModAlt) != 0 && (modifiers & ModCtrl) == 0 && (key == KeyA && (modifiers & ModShift) == 0 || key == KeyI && (modifiers & ModShift) != 0) && app.prompt_state.panel != Panel.Directory {
+    syntax_select_all(app, key == KeyI)
+    return
   }
   if !app.view.insert && (modifiers & ModAlt) != 0 && (key == KeyO || key == KeyI || key == KeyP || key == KeyN) {
     mode: u32 = 0
@@ -116,6 +130,7 @@ fn edit_key(app: *App, key: u32, modifiers: u16) {
     return
   }
   if !app.view.insert && key == KeyG && (modifiers & ModShift) != 0 {
+    jump_push(app)
     destination := app.documents.current.length
     if counted {
       destination = buffer.line_position(app.documents.current, count)
@@ -203,6 +218,10 @@ fn edit_key_once(app: *App, key: u32, modifiers: u16) {
       line_key = KeyL
     }
     goto_motion(doc, line_key, 0, app.view.extend)
+    return
+  }
+  if !app.view.insert && key == KeyJ && shift && (modifiers & ModAlt) != 0 && doc == app.documents.current {
+    join_select_spaces(app)
     return
   }
   if !app.view.insert && key == KeyJ && shift {
@@ -431,19 +450,18 @@ fn goto_key(app: *App, typography: *Typography, key: u32) {
     if app.input_state.goto_explorer {
       extend = app.explorer.extend
     }
-    goto_motion(doc, key, app.input_state.goto_count, extend)
-    primary := buffer.Selection{cursor: doc.cursor, anchor: doc.anchor}
-    index: usize = 0
-    for index < doc.secondary.count {
-      selection := doc.secondary.ranges[index]
-      doc.cursor = selection.cursor
-      doc.anchor = selection.anchor
-      goto_motion(doc, key, app.input_state.goto_count, extend)
-      doc.secondary.ranges[index] = buffer.Selection{cursor: doc.cursor, anchor: doc.anchor}
-      index += 1
+    if !app.input_state.goto_explorer && (key == KeyG || key == KeyE) {
+      jump_push(app)
     }
-    doc.cursor = primary.cursor
-    doc.anchor = primary.anchor
+    selections := buffer.collect(doc)
+    doc.secondary.count = 0
+    for index in 0..selections.count {
+      doc.cursor = selections.items[index].cursor
+      doc.anchor = selections.items[index].anchor
+      goto_motion(doc, key, app.input_state.goto_count, extend)
+      selections.items[index] = buffer.Selection{cursor: doc.cursor, anchor: doc.anchor}
+    }
+    buffer.store(doc, &selections)
     app.prompt_state.panel = Panel.None
     if app.input_state.goto_explorer {
       app.prompt_state.panel = Panel.Directory

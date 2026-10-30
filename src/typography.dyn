@@ -49,17 +49,15 @@ struct Typography {
   ui_owner: *mem.Arena,
   ui_hits, ui_updates, ui_creations: u64,
   pane_text: [15]*PaneText,
-  // The focused pane's line layout while it draws.
-  layout: *LineLayout,
-  caret_document: *const buffer.Document,
-  caret_geometry:CaretGeometry,
+  // The cache of the pane being drawn (or last drawn): its text, caret line,
+  // layout and what they currently hold.
+  pane: *PaneText,
   caret_queries:u64,
   points: f32,
   scale: f32,
   cell: f32,
   line: f32,
   line_height: f32 = 1.25,
-  rendered_document: *buffer.Document,
   primary_caret: rawptr,
   engine: rawptr,
   primary_document: rawptr,
@@ -71,25 +69,17 @@ struct Typography {
   explorer_preview: rawptr,
   explorer_preview_hash: u64,
   picker_spans, explorer_spans, hover_spans: PreviewSpans,
-  caret_text: rawptr,
   font: rawptr,
-  document: rawptr,
   palette: rawptr,
   chrome: rawptr,
   directory_text: rawptr,
   directory_layout: LineLayout,
   palette_bytes: [16384]u8,
-  caret_start: usize,
-  caret_end: usize,
-  document_start: usize,
-  document_end: usize,
   directory_start: usize,
   directory_end: usize,
   current_pane: usize,
   palette_length: usize,
   document_updates: u64,
-  caret_revision: u64,
-  rendered_revision: u64,
   rendered_view_revision: u64,
   directory_revision: u64,
   palette_updates: u64,
@@ -97,7 +87,6 @@ struct Typography {
 }
 
 fn resize_font(typography: *Typography) {
-  typography.caret_document=nil
   for pane_index in 0..15 {
     if typography.pane_text[pane_index]!=nil {
       typography.pane_text[pane_index].caret_document=nil
@@ -181,4 +170,39 @@ fn pane_text_get(typography:*Typography, index:usize)*PaneText {
     typography.pane_text[index]=cached
   }
   return typography.pane_text[index]
+}
+// The pane's cache with its text and caret objects created. Pane 0 uses the
+// primary objects made at startup.
+fn pane_text_ready(typography:*Typography, index:usize)*PaneText {
+  cached:=pane_text_get(typography, index)
+  if cached.text==nil {
+    if index==0 {
+      cached.text=typography.primary_document
+    } else {
+      blank:[1]u8=[0]
+      cached.text=ttf.create(typography.engine, typography.font, &blank[0], 0)
+    }
+    if cached.text==nil || !ttf.whitespace_visible(cached.text, true) || !ttf.wrap(cached.text, 0) {
+      #panic("pane text allocation")
+    }
+  }
+  if cached.caret==nil {
+    if index==0 {
+      cached.caret=typography.primary_caret
+    } else {
+      caret_blank:[1]u8=[0]
+      cached.caret=ttf.create(typography.engine, typography.font, &caret_blank[0], 0)
+    }
+    if cached.caret==nil || !ttf.whitespace_visible(cached.caret, true) || !ttf.wrap(cached.caret, 0) {
+      #panic("pane caret allocation")
+    }
+  }
+  return cached
+}
+// The current pane cache, falling back to pane 0 before any pane has drawn.
+fn current_pane_text(typography:*Typography)*PaneText {
+  if typography.pane==nil {
+    typography.pane=pane_text_ready(typography, 0)
+  }
+  return typography.pane
 }

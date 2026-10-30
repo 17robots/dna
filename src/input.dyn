@@ -13,6 +13,10 @@ struct InputState {
   // The typed character for the current key event (layout and Shift
   // applied), or 0 when unknown; the Vim profile reads commands from it.
   character: u32,
+  // Last f/t/F/T motion (pending 1-4) for Alt-. repeat.
+  last_find, last_find_length: u8,
+  last_find_count: usize,
+  last_find_text: [4]u8,
 }
 
 struct Clipboard {
@@ -26,8 +30,37 @@ struct Clipboard {
   linewise: bool,
 }
 
+// a-z are 1-26; " + * are the system clipboard (0); 32 means invalid.
+fn register_code(text: []const u8) usize {
+  if #len(text) != 1 {
+    return 32
+  }
+  byte := text[0]
+  if byte >= 'a' && byte <= 'z' {
+    return #cast(usize, (byte - 'a')) + 1
+  }
+  if byte == '"' || byte == '+' || byte == '*' {
+    return 0
+  }
+  if byte == '_' {
+    return RegisterBlackHole
+  }
+  if byte == '/' {
+    return RegisterSearch
+  }
+  if byte == '%' {
+    return RegisterFile
+  }
+  if byte == '#' {
+    return RegisterIndices
+  }
+  if byte == '.' {
+    return RegisterSelections
+  }
+  return 32
+}
 fn selected_clipboard(app: *App) *Clipboard {
-  if app.register_state.selected > 0 {
+  if app.register_state.selected > 0 && app.register_state.selected <= 26 {
     return &app.register_state.named[app.register_state.selected - 1]
   }
   return &app.register_state.clipboard
@@ -127,12 +160,10 @@ fn text_input(app: *App, text: []const u8) {
   }
   if app.register_state.pending {
     app.register_state.pending = false
-    if #len(text) == 1 && text[0] >= 97 && text[0] <= 122 {
-      app.register_state.selected = #cast(usize, (text[0] - 97)) + 1
-    }
-    else {
+    app.register_state.selected = register_code(text)
+    if app.register_state.selected > 31 {
       app.register_state.selected = 0
-      notice(app, "Register must be a-z.")
+      notice(app, "Register must be a-z, \", +, *, _, /, %, # or .")
     }
     return
   }
@@ -173,6 +204,13 @@ fn text_input(app: *App, text: []const u8) {
   }
 }
 fn clipboard_copy(app: *App) bool {
+  if app.register_state.selected == RegisterBlackHole {
+    return true
+  }
+  if app.register_state.selected > 26 {
+    notice(app, "Register is read-only.")
+    return false
+  }
   doc := app.documents.current
   selections: [32]buffer.Selection = []
   selections[0] = buffer.Selection{anchor: buffer.start(doc), cursor: buffer.end(doc)}
@@ -518,6 +556,7 @@ fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
           item := &diagnostics.items[app.prompt_state.selected]
           position := lsp.offset(app.documents.current.bytes[..app.documents.current.length], lsp.Position{line: item.line, character: item.character})
           if position.ok {
+            jump_push(app)
             buffer.move_to(app.documents.current, position.value, false)
             buffer.select_current(app.documents.current)
           }
@@ -830,11 +869,15 @@ fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
     if key == KeyW {
       panel(app, Panel.Windows)
     }
-    else if key == KeyO {
-      action(app, typography, 0)
+    else if key == KeyO && !app.view.insert {
+      jump_back(app)
     }
-    else if key == KeyS {
-      action(app, typography, 1)
+    else if key == KeyI && !app.view.insert {
+      jump_forward(app)
+    }
+    else if key == KeyS && !app.view.insert {
+      jump_push(app)
+      notice(app, "Saved the selection to the jump list.")
     }
     else if key == KeyP {
       panel(app, Panel.Commands)
@@ -857,6 +900,14 @@ fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
     }
     else if key == KeyY {
       buffer.redo(doc)
+    }
+    else if key == KeyA && !app.view.insert {
+      amount := app.input_state.repeat_count
+      if amount == 0 {
+        amount = 1
+      }
+      app.input_state.repeat_count = 0
+      increment_selections(app, amount, false)
     }
     else if key == KeyA {
       doc.anchor = 0
@@ -936,10 +987,27 @@ fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
     bracket_open(app, key == KeyRightBracket)
   }
   else if !app.view.insert && (key == KeyAsterisk || (key == Key8 && shift)) {
-    search_selection(app)
+    search_selection(app, (modifiers & ModAlt) == 0)
   }
   else if !app.view.insert && (key == KeyAmpersand || (key == Key7 && shift)) {
     align_selections(app)
+  }
+  else if !app.view.insert && key == KeyTab && modifiers == 0 {
+    jump_forward(app)
+  }
+  else if !app.view.insert && (modifiers & ModCtrl) == 0 && (key == KeyBar || (key == KeyBackslash && shift)) {
+    if (modifiers & ModAlt) != 0 {
+      shell_prompt(app, "pipe-to ")
+    } else {
+      shell_prompt(app, "pipe ")
+    }
+  }
+  else if !app.view.insert && (modifiers & ModCtrl) == 0 && (key == KeyExclaim || (key == Key1 && shift)) {
+    if (modifiers & ModAlt) != 0 {
+      shell_prompt(app, "append-output ")
+    } else {
+      shell_prompt(app, "insert-output ")
+    }
   }
   else if !app.view.insert && key == KeyX && (modifiers & ModAlt) != 0 {
     buffer.checkpoint(doc)

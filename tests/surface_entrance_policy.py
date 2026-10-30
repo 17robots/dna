@@ -19,20 +19,20 @@ struct Config {popup_animation_ms:f32=40.0,popup_transitions:bool=true}
 struct Animation {now,geometry_elapsed:f32,active,surfaces_ready,resized,geometry_active,geometry_retargeted:bool}
 struct View {animation:Animation,reduced_motion:bool}
 struct Pointer {dragging:bool}
-struct Trace {pending:u32}
-struct App {config:Config,view:View,pointer:Pointer,render_trace:Trace}
+struct App {config:Config,view:View,pointer:Pointer,render_pending:u32}
 const RenderKey:u32=2
 const RenderText:u32=4
 const RenderMouse:u32=8
 const RenderIme:u32=32
 const RenderWindow:u32=16
+fn answering_input(app:*const App)bool{return (app.render_pending&(RenderKey|RenderText|RenderMouse|RenderIme|RenderWindow))!=0}
 fn frame(app:*App,now,elapsed:f32,cause:u32,changed:bool){
  app.view.animation.now=now
  app.view.animation.geometry_elapsed=elapsed
  app.view.animation.geometry_retargeted=changed
  app.view.animation.active=false
  app.view.animation.geometry_active=false
- app.render_trace.pending=cause
+ app.render_pending=cause
 }
 '''
 cases='''fn main() {

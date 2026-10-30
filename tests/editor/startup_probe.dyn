@@ -426,9 +426,151 @@ fn helix_keys_smoke(app: *App, typography: *Typography, renderer: rawptr, window
   _ = buffer.load(doc, "a.b(c)*\n")
   doc.anchor = 0
   doc.cursor = 7
-  search_selection(app)
+  search_selection(app, false)
   if !buffer.equal(app.search_history.text[..app.search_history.length], "a\\.b\\(c\\)\\*") {
-    #panic("* searches for the escaped selection")
+    #panic("Alt-* searches for the escaped selection")
+  }
+  _ = buffer.load(doc, "foo foobar\n")
+  doc.anchor = 0
+  doc.cursor = 3
+  search_selection(app, true)
+  if !buffer.equal(app.search_history.text[..app.search_history.length], "\\bfoo\\b") {
+    #panic("* adds word boundaries for a whole word")
+  }
+  doc.anchor = 4
+  doc.cursor = 7
+  search_selection(app, true)
+  if !buffer.equal(app.search_history.text[..app.search_history.length], "\\bfoo") {
+    #panic("* omits the boundary inside a word")
+  }
+  // Alt-. repeats the last f/t motion.
+  _ = buffer.load(doc, "a,b,c,d\n")
+  buffer.move_to(doc, 0, false)
+  app.input_state.pending = 1
+  app.input_state.pending_count = 1
+  character_input(app, ",")
+  if doc.cursor != 2 {
+    #panic("f, finds the first comma")
+  }
+  edit_key(app, KeyPeriod, ModAlt)
+  if doc.cursor != 4 || doc.anchor != 2 {
+    #panic("Alt-. repeats f,")
+  }
+  edit_key(app, KeyPeriod, ModAlt)
+  if doc.cursor != 6 {
+    #panic("Alt-. repeats f, again")
+  }
+  // Ctrl-a and :decrement change the number in every selection.
+  _ = buffer.load(doc, "x = 9\ny = -1\nz = 42\n")
+  doc.anchor = 0
+  doc.cursor = 1
+  doc.secondary.count = 2
+  doc.secondary.ranges[0] = buffer.Selection{anchor: 6, cursor: 7}
+  doc.secondary.ranges[1] = buffer.Selection{anchor: 17, cursor: 18}
+  app.input_state.repeat_count = 0
+  increment_selections(app, 1, false)
+  if !buffer.equal(doc.bytes[..doc.length], "x = 10\ny = 0\nz = 43\n") {
+    #panic("Ctrl-a increments every selection")
+  }
+  if doc.anchor != 4 || doc.cursor != 6 || doc.secondary.ranges[0].anchor != 11 || doc.secondary.ranges[0].cursor != 12 || doc.secondary.ranges[1].anchor != 17 || doc.secondary.ranges[1].cursor != 19 {
+    #panic("increment selects each result")
+  }
+  increment_selections(app, 5, true)
+  if !buffer.equal(doc.bytes[..doc.length], "x = 5\ny = -5\nz = 38\n") {
+    #panic(":decrement crosses zero")
+  }
+  doc.secondary.count = 0
+  // | pipes each selection through sh; ! and Alt-! insert output.
+  _ = buffer.load(doc, "ab cd ef\n")
+  doc.anchor = 0
+  doc.cursor = 2
+  doc.secondary.count = 1
+  doc.secondary.ranges[0] = buffer.Selection{anchor: 6, cursor: 8}
+  shell_command(app, 0, "tr a-z A-Z")
+  if !buffer.equal(doc.bytes[..doc.length], "AB cd EF\n") || doc.anchor != 0 || doc.cursor != 2 || doc.secondary.ranges[0].anchor != 6 || doc.secondary.ranges[0].cursor != 8 {
+    #panic(":pipe replaces every selection")
+  }
+  doc.secondary.count = 0
+  doc.anchor = 3
+  doc.cursor = 5
+  shell_command(app, 2, "printf '<'")
+  shell_command(app, 3, "printf '>'")
+  if !buffer.equal(doc.bytes[..doc.length], "AB <cd> EF\n") || doc.anchor != 4 || doc.cursor != 6 {
+    #panic(":insert-output and :append-output wrap the selection")
+  }
+  shell_command(app, 0, "exit 3")
+  if !buffer.equal(doc.bytes[..doc.length], "AB <cd> EF\n") {
+    #panic("failed :pipe leaves the buffer unchanged")
+  }
+  // Special registers: _ discards, # numbers selections, . copies them, / is the search.
+  if register_code("_") != RegisterBlackHole || register_code("+") != 0 || register_code("a") != 1 || register_code("!") != 32 {
+    #panic("register names map to codes")
+  }
+  _ = buffer.load(doc, "aa bb\n")
+  doc.anchor = 0
+  doc.cursor = 2
+  doc.secondary.count = 1
+  doc.secondary.ranges[0] = buffer.Selection{anchor: 3, cursor: 5}
+  app.register_state.selected = RegisterIndices
+  paste_selection(app, true, false)
+  if !buffer.equal(doc.bytes[..doc.length], "1aa 2bb\n") {
+    #panic("# pastes selection numbers")
+  }
+  doc.anchor = 1
+  doc.cursor = 3
+  doc.secondary.ranges[0] = buffer.Selection{anchor: 5, cursor: 7}
+  app.register_state.selected = RegisterSelections
+  paste_selection(app, false, false)
+  if !buffer.equal(doc.bytes[..doc.length], "1aaaa 2bbbb\n") {
+    #panic(". pastes each selection's text")
+  }
+  doc.secondary.count = 0
+  app.register_state.selected = RegisterBlackHole
+  if !clipboard_copy(app) || app.register_state.clipboard.owned && buffer.equal(app.register_state.clipboard.text, "aa") {
+    #panic("_ discards yanks")
+  }
+  app.register_state.selected = 0
+  app.search_history.length = copy_text(app.search_history.text[..], "needle")
+  _ = buffer.load(doc, "x\n")
+  doc.anchor = 0
+  doc.cursor = 1
+  app.register_state.selected = RegisterSearch
+  paste_selection(app, false, true)
+  if !buffer.equal(doc.bytes[..doc.length], "needle\n") || app.register_state.selected != 0 {
+    #panic("/ pastes the last search")
+  }
+  // Alt-J joins lines and selects the inserted spaces.
+  _ = buffer.load(doc, "a\n  b\n\tc\nd\n")
+  doc.anchor = 0
+  doc.cursor = 6
+  doc.secondary.count = 0
+  join_select_spaces(app)
+  if !buffer.equal(doc.bytes[..doc.length], "a b c\nd\n") || doc.anchor != 1 || doc.cursor != 2 || doc.secondary.count != 1 || doc.secondary.ranges[0].anchor != 3 || doc.secondary.ranges[0].cursor != 4 {
+    #panic("Alt-J selects the joined spaces")
+  }
+  doc.secondary.count = 0
+  // Jump list: G records, Ctrl-o returns, Ctrl-i goes forward; edits shift entries.
+  _ = buffer.load(doc, "one\ntwo\nthree\n")
+  app.jumps = JumpList{}
+  app.prompt_state.panel = Panel.None
+  buffer.move_to(doc, 4, false)
+  edit_key(app, KeyG, ModShift)
+  if buffer.head(doc) != doc.length || app.jumps.count != 1 {
+    #panic("G records a jump")
+  }
+  buffer.move_to(doc, 0, false)
+  _ = buffer.replace(doc, "zero\n")
+  key_dispatch(app, typography, KeyO, ModCtrl)
+  if buffer.head(doc) != 9 {
+    #panic("Ctrl-o returns to the shifted jump")
+  }
+  key_dispatch(app, typography, KeyI, ModCtrl)
+  if buffer.head(doc) != 5 {
+    #panic("Ctrl-i goes forward")
+  }
+  key_dispatch(app, typography, KeyS, ModCtrl)
+  if app.jumps.count != 2 || app.jumps.at != 2 {
+    #panic("Ctrl-s saves the position")
   }
   // Alt-x keeps only whole lines.
   _ = buffer.load(doc, "aa\nbb\ncc\n")

@@ -519,6 +519,10 @@ fn vim_motion(app: *App, typography: *Typography, character: u32, key: u32, coun
   doc := vim_doc(app)
   head := vim_head(app)
   row := buffer.row_at(doc, head)
+  // gg and G are jumps: Ctrl-o returns to where they started.
+  if !operating && doc == app.documents.current && ((prefix_g && character == 'g') || (!prefix_g && character == 'G')) {
+    jump_push(app)
+  }
   if prefix_g {
     if character == 'g' {
       target_row: usize = 0
@@ -1084,69 +1088,25 @@ fn vim_toggle_case(app: *App, count: usize) {
   app.vim.changed = true
   vim_place(app, high)
 }
-// Ctrl-a / Ctrl-x: add to the number at or after the cursor on its line.
+// Ctrl-a / Ctrl-x: add to the number at or after the cursor on its line,
+// leaving the cursor on its last digit.
 fn vim_increment(app: *App, amount: usize, decrease: bool) {
   doc := vim_doc(app)
-  head := buffer.head(doc)
-  ending := vim_text_end(doc, head)
-  at := head
-  // Inside a number, start from its first digit.
-  for at > buffer.line_start(doc, head) && doc.bytes[at] >= '0' && doc.bytes[at] <= '9' && doc.bytes[at - 1] >= '0' && doc.bytes[at - 1] <= '9' {
-    at -= 1
-  }
-  for at < ending && (doc.bytes[at] < '0' || doc.bytes[at] > '9') {
-    at += 1
-  }
-  if at >= ending {
+  if doc != app.documents.current {
     return
   }
-  low := at
-  negative := low > 0 && doc.bytes[low - 1] == '-'
-  value: usize = 0
-  high := low
-  for high < ending && doc.bytes[high] >= '0' && doc.bytes[high] <= '9' && value < 100000000000000 {
-    value = value * 10 + #cast(usize, (doc.bytes[high] - '0'))
-    high += 1
+  head := buffer.head(doc)
+  doc.secondary.count = 0
+  doc.anchor = head
+  doc.cursor = buffer.next(doc, head)
+  revision := doc.revision
+  increment_selections(app, amount, decrease)
+  if doc.revision != revision {
+    app.vim.changed = true
+    vim_place(app, buffer.previous(doc, doc.cursor))
+  } else {
+    vim_place(app, head)
   }
-  if negative {
-    low -= 1
-  }
-  // Signed arithmetic on magnitude and sign.
-  down := decrease != negative
-  if down && amount > value {
-    value = amount - value
-    negative = !negative
-  }
-  else if down {
-    value -= amount
-  }
-  else {
-    value += amount
-  }
-  if value == 0 {
-    negative = false
-  }
-  digits: [24]u8 = []
-  length: usize = 0
-  remaining := value
-  for {
-    digits[23 - length] = #cast(u8, (remaining % 10)) + '0'
-    length += 1
-    remaining /= 10
-    if remaining == 0 {
-      break
-    }
-  }
-  if negative {
-    digits[23 - length] = '-'
-    length += 1
-  }
-  buffer.checkpoint(doc)
-  vim_set_range(doc, low, high)
-  _ = buffer.replace(doc, digits[24 - length..])
-  buffer.checkpoint(doc)
-  app.vim.changed = true
-  vim_place(app, low + length - 1)
 }
 // o / O: open a line with the current indentation and start inserting.
 fn vim_open_line(app: *App, above: bool, count: usize) {
@@ -2048,7 +2008,7 @@ fn vim_normal_key(app: *App, typography: *Typography, character: u32, key: u32, 
       return
     }
     vim_set_range(doc, span.low, span.high)
-    search_selection(app)
+    search_selection(app, true)
     search_repeat(app, character == '#', false)
     vim_place(app, buffer.start(doc))
     return
@@ -2228,7 +2188,7 @@ fn vim_visual_key(app: *App, typography: *Typography, character: u32, key: u32) 
     return
   }
   if character == '*' || character == '#' {
-    search_selection(app)
+    search_selection(app, false)
     search_repeat(app, character == '#', false)
     target := buffer.start(doc)
     app.vim.head = target

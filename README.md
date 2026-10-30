@@ -64,7 +64,7 @@ associations separately in your desktop settings.
 
 ## Dyn SDK migration
 
-Current source uses **Dyn 0.1.0-preview.29**, pinned with verified platform
+Current source uses **Dyn 0.1.0-preview.30**, pinned with verified platform
 checksums in `mise.toml`. Its installed SDK includes the required `std/ui/box`,
 native window bridge sources, and runtime objects; a sibling checkout is optional.
 
@@ -744,7 +744,7 @@ character, so `x` never highlights the first character of the following line. Wo
 | Go-to menu | `g` (Escape cancels) |
 | Close current buffer | `Space c` or `:bd` |
 | New empty buffer | `:enew` |
-| Open / save | `Space f` / `:write` then Enter; `Ctrl O` / `Ctrl S` |
+| Open / save | `Space f` / `:write` then Enter |
 | Save and close buffer | `:x` / `:wq` |
 | Save all / save all and exit | `:wa` / `:xa` |
 | Directory buffer | `Space e`; `Ctrl E` |
@@ -873,8 +873,8 @@ keys and clickable guide entries follow the same Vim dispatch.
 | Buffers, files | `gt gT`, `ZZ` (`:x`), `ZQ` (`:qa`), `:w :q :wq :x :wa :qa`, `:e path` |
 | Ex | `:42`, `:[range]s/pattern/replacement/[gi]` with ranges `%`, `N,M`, `.`, `'<,'>`; `&` is the match, `\r` a line break |
 
-Not yet: marks (`m`, `` ` ``, `'`), the jump list (Ctrl-o / Ctrl-i keep DNA's
-meaning), Replace mode (`R`), `gq`, `=`, sentence and tag objects, `.` after a
+Ctrl-o / Ctrl-i walk the jump list (recorded by `gg`, `G`, searches and LSP
+goto). Not yet: marks (`m`, `` ` ``, `'`), Replace mode (`R`), `gq`, `=`, sentence and tag objects, `.` after a
 visual-mode change, `gJ` (joins with spaces like `J`), and capture groups in `:s` (patterns are PCRE, so write `a|b`,
 not `a\|b`). Ctrl-x closes the buffer only in the Helix keymap.
 

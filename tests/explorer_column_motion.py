@@ -13,15 +13,15 @@ struct Config {popup_animation_ms:f32=40.0,popup_transitions:bool=true}
 struct Animation {now:f32,active,surfaces_ready,resized,geometry_active:bool,geometry_elapsed:f32=8.0}
 struct View {animation:Animation,reduced_motion:bool}
 struct Pointer {dragging:bool}
-struct Trace {pending:u32}
 struct Ui {frame:u64}
 struct Explorer {columns_geometry:motion.Rectangle,columns_frame:u64}
-struct App {config:Config,view:View,pointer:Pointer,render_trace:Trace,ui:Ui,explorer:Explorer}
+struct App {config:Config,view:View,pointer:Pointer,render_pending:u32,ui:Ui,explorer:Explorer}
 const RenderKey:u32=2
 const RenderText:u32=4
 const RenderMouse:u32=8
 const RenderIme:u32=32
 const RenderWindow:u32=16
+fn answering_input(app:*const App)bool{return (app.render_pending&(RenderKey|RenderText|RenderMouse|RenderIme|RenderWindow))!=0}
 terminal:bool
 fn surface_motion_enabled(app:*const App)bool{return !terminal && !app.view.reduced_motion && app.config.popup_transitions && app.config.popup_animation_ms>0.0 && !app.pointer.dragging}
 ''' + s[start:end] + '''
@@ -32,7 +32,7 @@ fn main() {
  app.ui.frame=10
  if explorer_columns_progress(&app,1)!=1.0 {#panic("initial explorer layout")}
  app.ui.frame+=1
- app.render_trace.pending=RenderKey
+ app.render_pending=RenderKey
  first:=explorer_columns_progress(&app,2)
  if first<=1.0 || first>=2.0 || !app.view.animation.active {#panic("new right pane must grow beside anchored columns")}
  if explorer_columns_progress(&app,2)!=first {#panic("same frame advanced twice")}
@@ -42,20 +42,20 @@ fn main() {
  gap:=8.0*explorer_column_fraction(first,1)
  if old_width+gap+new_width<999.9 || old_width+gap+new_width>1000.1 {#panic("columns lost shared boundary")}
  app.ui.frame+=1
- app.render_trace.pending=0
+ app.render_pending=0
  next:=explorer_columns_progress(&app,2)
  if next<=first || next>=2.0 {#panic("column continuation restarted")}
  app.ui.frame+=1
- app.render_trace.pending=RenderText
+ app.render_pending=RenderText
  if explorer_columns_progress(&app,2)!=2.0 {#panic("typing must finish movement immediately")}
  app.ui.frame+=1
- app.render_trace.pending=RenderKey
+ app.render_pending=RenderKey
  back:=explorer_columns_progress(&app,1)
  if back<=1.0 || back>=2.0 {#panic("rightmost pane must retract")}
  app.ui.frame+=1
  forward:=explorer_columns_progress(&app,3)
  if forward<=back || forward>=3.0 {#panic("rapid reversal failed")}
- app.render_trace.pending=0
+ app.render_pending=0
  for frame in 16..100 {
   app.ui.frame=#cast(u64,frame)
   app.view.animation.active=false

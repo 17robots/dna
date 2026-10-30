@@ -8,7 +8,7 @@ fn workflow_smoke(app: *App, typography: *Typography) {
   app.directory_state.length = copy_text(app.directory_state.path[..], configured.value)
   path: [4096]u8 = []
   initial := joined(app, "input.txt", path[..])
-  key_input(app, typography, 111, 64)
+  action(app, typography, 0)
   text_input(app, initial)
   key_input(app, typography, 13, 0)
   if app.prompt_state.panel != Panel.None || !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "first\nsecond\n") {
@@ -101,18 +101,18 @@ fn workflow_smoke(app: *App, typography: *Typography) {
   }
   app.prompt_state.panel = Panel.None
   // Layout/zoom must produce real multiline font geometry.
-  if !ttf.set(typography.document, &app.documents.current.bytes[0], app.documents.current.length) {
+  if !ttf.set(typography.primary_document, &app.documents.current.bytes[0], app.documents.current.length) {
     #panic("smoke text")
   }
   width: i32 = 0
   height: i32 = 0
-  if !ttf.size(typography.document, &width, &height) || #cast(f32, height) < typography.line * 2.0 {
+  if !ttf.size(typography.primary_document, &width, &height) || #cast(f32, height) < typography.line * 2.0 {
     #panic("multiline geometry")
   }
   typography.points = 30.0
   resize_font(typography)
   larger: i32 = 0
-  if !ttf.size(typography.document, &width, &larger) || larger <= height {
+  if !ttf.size(typography.primary_document, &width, &larger) || larger <= height {
     #panic("font zoom")
   }
   typography.points = 20.0
@@ -124,31 +124,31 @@ fn whitespace_smoke(app: *App, typography: *Typography) {
   app.view.insert = true
   buffer.move_to(doc, 1, false)
   text_input(app, " ")
-  if !ttf.set(typography.document, &doc.bytes[0], doc.length) {
+  if !ttf.set(typography.primary_document, &doc.bytes[0], doc.length) {
     #panic("space text update")
   }
   first := ttf.Substring{}
-  if !ttf.substring(typography.document, #cast(i32, doc.cursor), &first) {
+  if !ttf.substring(typography.primary_document, #cast(i32, doc.cursor), &first) {
     #panic("space cursor")
   }
   text_input(app, " ")
-  if !ttf.set(typography.document, &doc.bytes[0], doc.length) {
+  if !ttf.set(typography.primary_document, &doc.bytes[0], doc.length) {
     #panic("second space update")
   }
   second := ttf.Substring{}
-  if !ttf.substring(typography.document, #cast(i32, doc.cursor), &second) || second.x <= first.x {
+  if !ttf.substring(typography.primary_document, #cast(i32, doc.cursor), &second) || second.x <= first.x {
     #panic("trailing space must advance cursor")
   }
   text_input(app, "\n    ")
-  if !ttf.set(typography.document, &doc.bytes[0], doc.length) {
+  if !ttf.set(typography.primary_document, &doc.bytes[0], doc.length) {
     #panic("indent text update")
   }
   indent := ttf.Substring{}
   space := ttf.Substring{}
-  if !ttf.substring(typography.document, #cast(i32, doc.cursor), &indent) || indent.x <= 0 || indent.y <= second.y {
+  if !ttf.substring(typography.primary_document, #cast(i32, doc.cursor), &indent) || indent.x <= 0 || indent.y <= second.y {
     #panic("indentation must advance cursor")
   }
-  if !ttf.substring(typography.document, #cast(i32, doc.cursor) - 1, &space) || space.width <= 0 {
+  if !ttf.substring(typography.primary_document, #cast(i32, doc.cursor) - 1, &space) || space.width <= 0 {
     #panic("selected trailing space must have width")
   }
   if !buffer.equal(doc.bytes[..doc.length], "a  \n    ") {
@@ -724,11 +724,11 @@ fn viewport_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Typo
   doc.cursor = doc.length
   app.view.extend = true
   draw(renderer, window, app, typography)
-  if typography.document_start == 0 || typography.document_end != doc.length {
+  if typography.pane.start == 0 || typography.pane.end != doc.length {
     #panic("EOF viewport bounds")
   }
   caret := ttf.Substring{}
-  if !layout_substring(typography.layout, doc, doc.cursor, &caret) || caret.x <= 0 {
+  if !layout_substring(&typography.pane.layout, doc, doc.cursor, &caret) || caret.x <= 0 {
     #panic("viewport UTF8 cursor")
   }
   // Shrinking and growing the window keeps the caret's line in view.
@@ -750,7 +750,7 @@ fn viewport_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Typo
     outputs[step] = output_height
     draw(renderer, window, app, typography)
     caret_top := #cast(f32, (line_at(doc, doc.cursor) - 1)) * typography.line
-    if typography.document_end != doc.length || caret_top < app.view.scroll_y || caret_top + typography.line > app.view.scroll_y + #cast(f32, output_height) {
+    if typography.pane.end != doc.length || caret_top < app.view.scroll_y || caret_top + typography.line > app.view.scroll_y + #cast(f32, output_height) {
       #panic("resized window must keep the caret line visible")
     }
   }
@@ -762,7 +762,7 @@ fn viewport_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Typo
   typography.points = 30.5
   resize_font(typography)
   draw(renderer, window, app, typography)
-  if typography.document_start > doc.cursor || typography.document_end != doc.length {
+  if typography.pane.start > doc.cursor || typography.pane.end != doc.length {
     #panic("zoom viewport bounds")
   }
   typography.points = previous_points
@@ -770,7 +770,7 @@ fn viewport_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Typo
   buffer.move_to(doc, 0, false)
   app.view.extend = false
   draw(renderer, window, app, typography)
-  if typography.document_start != 0 || typography.document_end >= doc.length || app.view.scroll_y != 0.0 {
+  if typography.pane.start != 0 || typography.pane.end >= doc.length || app.view.scroll_y != 0.0 {
     #panic("return to first viewport")
   }
   // A newline at EOF and then an empty document must both keep a valid cursor.

@@ -19,22 +19,43 @@ fn character_input(app: *App, text: []const u8) {
     if app.prompt_state.panel == Panel.Directory {
       extending = app.explorer.extend
     }
-    _ = buffer.find_character(doc, character, pending == 2 || pending == 4, pending == 3 || pending == 4, app.input_state.pending_count, extending)
-    primary := buffer.Selection{cursor: doc.cursor, anchor: doc.anchor}
-    index: usize = 0
-    for index < doc.secondary.count {
-      selection := doc.secondary.ranges[index]
-      doc.cursor = selection.cursor
-      doc.anchor = selection.anchor
-      _ = buffer.find_character(doc, character, pending == 2 || pending == 4, pending == 3 || pending == 4, app.input_state.pending_count, extending)
-      doc.secondary.ranges[index] = buffer.Selection{cursor: doc.cursor, anchor: doc.anchor}
-      index += 1
+    find_all(doc, character, pending, app.input_state.pending_count, extending)
+    if #len(character) <= 4 {
+      app.input_state.last_find = pending
+      app.input_state.last_find_count = app.input_state.pending_count
+      app.input_state.last_find_length = #cast(u8, #len(character))
+      for i in 0..#len(character) {
+        app.input_state.last_find_text[i] = character[i]
+      }
     }
-    doc.cursor = primary.cursor
-    doc.anchor = primary.anchor
   }
 }
+// Runs one f/t/F/T motion (pending 1-4) on every selection.
+fn find_all(doc: *buffer.Document, character: []const u8, pending: u8, count: usize, extending: bool) {
+  selections := buffer.collect(doc)
+  doc.secondary.count = 0
+  for index in 0..selections.count {
+    doc.cursor = selections.items[index].cursor
+    doc.anchor = selections.items[index].anchor
+    _ = buffer.find_character(doc, character, pending == 2 || pending == 4, pending == 3 || pending == 4, count, extending)
+    selections.items[index] = buffer.Selection{cursor: doc.cursor, anchor: doc.anchor}
+  }
+  buffer.store(doc, &selections)
+}
+// Alt-.: repeat the last f/t/F/T motion.
+fn repeat_find(app: *App, doc: *buffer.Document, extending: bool) {
+  if app.input_state.last_find == 0 {
+    return
+  }
+  length := #cast(usize, app.input_state.last_find_length)
+  find_all(doc, app.input_state.last_find_text[..length], app.input_state.last_find, app.input_state.last_find_count, extending)
+}
 fn paste_selection(app: *App, before: bool, replace: bool) {
+  if app.register_state.selected > 26 {
+    special_register_paste(app, before, replace)
+    app.register_state.selected = 0
+    return
+  }
   if app.register_state.selected > 0 {
     retained := selected_clipboard(app)
     if !retained.owned {
@@ -148,4 +169,79 @@ fn page_motion(app: *App, typography: *Typography, down: bool, half: bool) {
   for step in 0..rows * count {
     buffer.vertical(app.documents.current, down, app.view.extend)
   }
+}
+// Pastes a read-only register: / last search, % file name, # selection
+// numbers (one per selection), . each selection's own text.
+fn special_register_paste(app: *App, before: bool, replace: bool) {
+  doc := app.documents.current
+  code := app.register_state.selected
+  if code == RegisterBlackHole {
+    notice(app, "Register _ is always empty.")
+    return
+  }
+  if code == RegisterSearch {
+    paste_text(app, app.search_history.text[..app.search_history.length], before, replace)
+    return
+  }
+  if code == RegisterFile {
+    paste_text(app, files.name(&app.documents.slots[app.documents.active].file), before, replace)
+    return
+  }
+  count := doc.secondary.count + 1
+  allocated := arena_owner.create(buffer.Capacity + 1)
+  defer arena_owner.release(allocated)
+  storage := mem.push_bytes_uninit(allocated, buffer.Capacity + 1)
+  // Fragments follow selection order in the document, as yanks do.
+  selections := buffer.collect_ordered(doc)
+  fragments: [32][]const u8 = []
+  used: usize = 0
+  for index in 0..count {
+    start := used
+    if code == RegisterIndices {
+      number: [24]u8 = []
+      value := index + 1
+      length: usize = 0
+      for {
+        number[23 - length] = #cast(u8, (value % 10)) + '0'
+        length += 1
+        value /= 10
+        if value == 0 {
+          break
+        }
+      }
+      add_text(storage, &used, number[24 - length..24])
+    }
+    else {
+      low := selections.items[index].anchor
+      high := selections.items[index].cursor
+      if used + high - low > buffer.Capacity {
+        notice(app, "Register text exceeds document capacity.")
+        return
+      }
+      add_text(storage, &used, doc.bytes[low..high])
+    }
+    fragments[index] = storage[start..used]
+  }
+  paste_fragments(app, fragments[..count], before, replace)
+}
+fn paste_fragments(app: *App, fragments: [][]const u8, before: bool, replace: bool) {
+  if #len(fragments) == 1 {
+    paste_text(app, fragments[0], before, replace)
+    return
+  }
+  doc := app.documents.current
+  buffer.checkpoint(doc)
+  saved := buffer.Selection{cursor: doc.cursor, anchor: doc.anchor}
+  saved_secondary := doc.secondary
+  if !replace {
+    buffer.insert_positions(doc, !before)
+  }
+  if !buffer.replace_fragments(doc, fragments) {
+    doc.cursor = saved.cursor
+    doc.anchor = saved.anchor
+    doc.secondary = saved_secondary
+    notice(app, "Paste exceeds capacity or is not valid text.")
+    return
+  }
+  buffer.checkpoint(doc)
 }
