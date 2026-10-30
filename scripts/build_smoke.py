@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
-"""Compile production sources with the test-only startup adapter, under the build cap."""
+"""Build the native editor with test-only startup adapters."""
 import os
 from pathlib import Path
-import shutil
 import subprocess
+import sys
+
 ROOT = Path(__file__).resolve().parents[1]
-stage = ROOT / 'build/editor-smoke'
-stage.mkdir(parents=True, exist_ok=True)
-# Remove obsolete staged sources; never delete user source or build outputs.
-for item in stage.iterdir():
-    if item.is_dir(): shutil.rmtree(item)
-    else: item.unlink()
-shutil.copytree(ROOT/'src', stage, dirs_exist_ok=True)
-shutil.copytree(ROOT/'tests/editor', stage, dirs_exist_ok=True)
-# This harness explicitly links shared SDL_ttf. Do not mix it with mise's
-# default static SDL archive, which would create two independent SDL states.
-environment = dict(os.environ, DYN_LIBRARY_PATH=str(ROOT/'build/deps/install/lib'))
+backend = os.environ.get('DNA_NATIVE_BACKEND', 'auto')
+if backend not in ('auto', 'x11', 'wayland'):
+    raise SystemExit('DNA_NATIVE_BACKEND must be auto, x11 or wayland')
 for mode in os.environ.get('DNA_SMOKE_MODES', 'debug release').split():
-    subprocess.run(['python3', str(ROOT/'scripts/compile.py'), os.environ.get('DYN','dyn'),
-                    'build', str(stage), '--'+mode, '--output', str(ROOT/f'build/dna-smoke-{mode}'),
-                    '--link', str(ROOT/'build/deps/install/lib/libSDL3_ttf.so')], env=environment, check=True)
+    if mode not in ('debug', 'release'):
+        raise SystemExit('DNA_SMOKE_MODES must contain debug and/or release')
+    subprocess.run([sys.executable, str(ROOT / 'scripts/build_native.py'),
+                    '--backend', backend, '--smoke', '--mode', mode,
+                    '--output', str(ROOT / f'build/dna-smoke-{mode}')], check=True)

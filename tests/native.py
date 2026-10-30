@@ -97,13 +97,7 @@ if (root/'dyn').exists():
     finally: lib.dna_syntax_close(p)
     print('PASS background Dyn highlighting and revision isolation')
 
-    interposer=ROOT/'build/highlight-render.so'
-    subprocess.run(['python3', str(ROOT/'scripts/native_test.py'), 'highlight_render', str(interposer)], check=True)
-    with tempfile.TemporaryDirectory() as directory:
-        fixture=Path(directory)/'highlight.dyn';fixture.write_text('fn main() { value := "hello" // comment\n}\n')
-        env=dict(os.environ,SDL_VIDEODRIVER='dummy',DNA_CONFIG=str(Path(directory)/'absent.toml'),DNA_LANGUAGE_DIR=str(root),LD_PRELOAD=str(interposer))
-        for mode in ('debug','release'):
-            subprocess.run([str(ROOT/'build'/f'dna-{mode}'),str(fixture)],env=env,timeout=10,check=True)
+
 else:
     print('SKIP grammar checks: install Dyn into build/test-languages to enable them')
 

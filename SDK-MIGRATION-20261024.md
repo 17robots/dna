@@ -1,6 +1,49 @@
 # Development SDK migration, 2026-10-24
 
-The working DNA source now uses the published Dyn preview.27 SDK pinned in
+## Preview.28 installed SDK, 2026-10-29
+
+DNA now pins the published preview.28 assets and platform checksums in mise and
+CI. Native builds resolve packaged runtime objects under `lib/dyn` and the
+window bridge builder under `share/dyn`; source SDK layouts remain supported.
+Arena test fixtures now account for pointer handles and header storage, including
+TUI released-owner checks and the shared native logging helper.
+
+The original focused validation logs are under `build/preview28-*.log`.
+Release-candidate qualification supersedes that initial check: formatting is
+normalized, GUI tests own their private compositor harness, and staged
+profile/test outputs preserve the production editor. The Linux archive includes
+both Wayland and X11 executables. Extracted dependency checks remove checkout
+fallback paths; mount isolation hides the source tree and SDK when available.
+Current release gates and scoped review findings are recorded under
+`build/release-*.log` and `build/release-readiness.json`. No Windows/macOS runtime
+qualification is claimed.
+
+## Development UI migration, 2026-10-27
+
+Current source now selects the published Dyn preview.28 SDK in `mise.toml`.
+The installed package includes the UI modules and native window bridge; the
+build helpers resolve its `share/dyn` sources and `lib/dyn` runtime objects.
+Preview.27 remains installed for rollback to the published DNA preview.7 source.
+No new DNA application release is published by this update.
+
+DNA now builds persistent `std/ui/box` identities and delegates lookup,
+recycling, frame text, clipping, hit-testing and geometry to the shared layer.
+Indexed application metadata, configurable animation, custom drawing and the
+SDL/SDL_ttf backend remain. This does not remove the native window or text
+backend. See [the migration and friction log](UI-MIGRATION-20261027.md) for the
+precise scope, checks and remaining work.
+
+The preview.28 candidate preserves preview.27's pointer-handle, chained-arena
+ownership model. DNA now uses explicit arena creation, clears released handles,
+and uses the shared SDK's fallible constructors. `src/owned_arena` preserves
+DNA's fixed payload budgets by accounting for the arena header in a bounded
+backing allocation. `src/cstring` preserves bounded, nonallocating path conversion
+and untouched failure storage. Standalone examples and the installer also use
+pointer handles. Import aliases are consistent across modules; `std_fs` identifies
+the SDK filesystem separately from DNA's `fs` module.
+
+
+The published DNA preview.7 source used the Dyn preview.27 SDK pinned in
 `mise.toml`. Global and project mise settings select the same verified package;
 the preview helper uses its compiler and language server. Preview.25 remains
 installed for rollback. This migration is included in the published Linux
@@ -15,7 +58,9 @@ qualification is recorded under `build/preview27-installed`; it clears
 One uninterrupted `just smoke` run passed with the published, mise-installed
 `dyn 0.1.0-preview.27` and `DYN_SDK` unset. Native adapters, the installer, and
 editor binaries were rebuilt against the packaged runtime. This supersedes the
-historical development-SDK qualification below for the current working source.
+historical development-SDK qualification below for the published preview.7
+source. The later unpublished UI migration requires the development SDK as
+recorded at the top of this document.
 
 Coverage includes core debug/release suites, host/filesystem adapters, native
 ABI and thread ownership, GUI and TUI workflows, language-server interactions,

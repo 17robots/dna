@@ -1,7 +1,7 @@
 use "std/process"
-use "std/mem" mem
-use "std/fs" fs
-use "std/io" io
+use "std/mem"
+use "std/fs" std_fs
+use "std/io"
 use "std/c"
 
 #link("c")
@@ -203,8 +203,14 @@ fn run(command: []const u8) {
   if #len(command) >= #len(storage) {
     #panic("language tool command capacity")
   }
-  encoded := c.string_into(storage[..], command)
-  if !encoded.ok || system(encoded.value) != 0 {
+  for byte in command {
+    if byte == 0 {
+      #panic("language tool command contains NUL")
+    }
+  }
+  _ = mem.move(storage[..], command)
+  storage[#len(command)] = 0
+  if system(&storage[0]) != 0 {
     #panic("language tool command failed; see output above")
   }
 }
@@ -396,15 +402,15 @@ fn install(arena: *mem.Arena, root: []const u8, item: *const Language) {
   }
   run(command[..used])
   output_storage: [4096]u8 = []
-  if !fs.write_all(append_path(output_storage[..], package, "extensions"), extension_storage[..extension_length]).ok || !fs.write_all(append_path(output_storage[..], package, "indent"), item.indent).ok {
+  if !std_fs.write_all(append_path(output_storage[..], package, "extensions"), extension_storage[..extension_length]).ok || !std_fs.write_all(append_path(output_storage[..], package, "indent"), item.indent).ok {
     #panic("cannot write package metadata")
   }
-  if names_length > 0 && !fs.write_all(append_path(output_storage[..], package, "filenames"), names_storage[..names_length]).ok {
+  if names_length > 0 && !std_fs.write_all(append_path(output_storage[..], package, "filenames"), names_storage[..names_length]).ok {
     #panic("cannot write package metadata")
   }
   named_storage: [4096]u8 = []
   named := append_path(named_storage[..], temp, item.name)
-  if !fs.rename(package, named).ok {
+  if !std_fs.rename(package, named).ok {
     #panic("cannot stage language package")
   }
   first: usize = 0
@@ -428,14 +434,14 @@ fn install(arena: *mem.Arena, root: []const u8, item: *const Language) {
   add(version_storage[..], &version_length, item.name)
   add(version_storage[..], &version_length, "-")
   add(version_storage[..], &version_length, temp[#len(temp) - 6..])
-  if !fs.rename(named, version_storage[..version_length]).ok {
+  if !std_fs.rename(named, version_storage[..version_length]).ok {
     #panic("cannot publish language version")
   }
   link_storage: [4096]u8 = []
   link := append_path(link_storage[..], temp, "active")
   destination_storage: [4096]u8 = []
   destination := append_path(destination_storage[..], root, item.name)
-  if !fs.symbolic_link(version_storage[..version_length], link).ok || !fs.rename(link, destination).ok {
+  if !std_fs.symbolic_link(version_storage[..version_length], link).ok || !std_fs.rename(link, destination).ok {
     #panic("cannot activate language version")
   }
   _ = io.println(io.stdout(), "Installed {}. Use :language-reload in DNA.", item.name)
@@ -454,7 +460,7 @@ fn main() {
     #panic("registry path unavailable")
   }
   registry := Registry{}
-  read := fs.read_all(arena, path[..c.string_length(&path[0], 4096)], 65536)
+  read := std_fs.read_all(arena, path[..c.string_length(&path[0], 4096)], 65536)
   if !read.ok {
     #panic("cannot read bundled registry")
   }
@@ -472,7 +478,7 @@ fn main() {
     add(config_path[..], &config_length, "/.config")
   }
   add(config_path[..], &config_length, "/dna/languages.toml")
-  custom := fs.read_all(arena, config_path[..config_length], 65536)
+  custom := std_fs.read_all(arena, config_path[..config_length], 65536)
   if custom.ok {
     load_registry(&registry, custom.value)
   }
@@ -538,9 +544,9 @@ fn main() {
       package_storage: [4096]u8 = []
       file_storage: [4096]u8 = []
       package := append_path(package_storage[..], root_storage[..root_length], item.name)
-      parser := fs.metadata(append_path(file_storage[..], package, "parser.so"))
-      query := fs.metadata(append_path(file_storage[..], package, "highlights.scm"))
-      metadata := fs.metadata(append_path(file_storage[..], package, "extensions"))
+      parser := std_fs.metadata(append_path(file_storage[..], package, "parser.so"))
+      query := std_fs.metadata(append_path(file_storage[..], package, "highlights.scm"))
+      metadata := std_fs.metadata(append_path(file_storage[..], package, "extensions"))
       installed[index] = parser.ok && query.ok && metadata.ok && (parser.mode & 61440) == 32768 && (query.mode & 61440) == 32768 && (metadata.mode & 61440) == 32768 && parser.size > 0 && query.size > 0 && metadata.size > 0
       index += 1
     }

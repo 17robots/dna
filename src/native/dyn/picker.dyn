@@ -1,11 +1,11 @@
-// Traversal belongs to one worker. Published rows are immutable until the next
-// generation completes
-// Callers reject stale roots by generation.
+// Traversal belongs to one worker. Each generation publishes growing immutable
+// prefixes so a cold picker need not wait for the entire tree. Callers reject
+// stale roots by generation; the worker only appends until the final snapshot.
 struct PickerPath { length: usize, bytes: [512]u8 }
 struct NativePicker {
   thread, lock, wake: rawptr,
-  stop: native_atomic.AtomicU32,
-  generation: native_atomic.AtomicU64,
+  stop: sync.AtomicU32,
+  generation: sync.AtomicU64,
   root: [4096]u8,
   published: u64,
   count, visited: usize,
@@ -20,7 +20,30 @@ struct PickerScan {
   flags: u32,
 }
 fn picker_cancelled(scan: *PickerScan) bool {
-  return native_atomic.load_u32(&scan.owner.stop) != 0 || native_atomic.load_u64(&scan.owner.generation) != scan.generation
+  return sync.load_u32(&scan.owner.stop) != 0 || sync.load_u64(&scan.owner.generation) != scan.generation
+}
+fn picker_publish(scan: *PickerScan, complete: bool) {
+  worker := scan.owner
+  rec_lock(worker.lock)
+  if !picker_cancelled(scan) {
+    first: usize = 0
+    if worker.published == scan.generation {
+      first = worker.count
+    }
+    for index in first..scan.count {
+      worker.rows[index].length = worker.working[index].length
+      _ = copy(&worker.rows[index].bytes[0], &worker.working[index].bytes[0], worker.working[index].length + 1)
+    }
+    worker.count = scan.count
+    worker.visited = scan.visited
+    worker.flags = scan.flags
+    if !complete {
+      worker.flags |= 8
+    }
+    worker.published = scan.generation
+  }
+  rec_unlock(worker.lock)
+  rec_notify()
 }
 fn picker_walk(scan: *PickerScan, path: *const u8, relative: *const u8, depth: usize) {
   if picker_cancelled(scan) {
@@ -96,6 +119,9 @@ fn picker_walk(scan: *PickerScan, path: *const u8, relative: *const u8, depth: u
       row.length = prefix_length + name_length
       _ = copy(&row.bytes[0], &rel[0], row.length + 1)
       scan.count += 1
+      if scan.count == 64 || scan.count % 128 == 0 {
+        picker_publish(scan, false)
+      }
     }
   }
   if !picker_cancelled(scan) {
@@ -107,14 +133,14 @@ fn picker_worker(pointer: rawptr) i32 {
   completed: u64 = 0
   for {
     rec_lock(worker.lock)
-    for native_atomic.load_u32(&worker.stop) == 0 && completed == native_atomic.load_u64(&worker.generation) {
+    for sync.load_u32(&worker.stop) == 0 && completed == sync.load_u64(&worker.generation) {
       rec_wait(worker.wake, worker.lock)
     }
-    if native_atomic.load_u32(&worker.stop) != 0 {
+    if sync.load_u32(&worker.stop) != 0 {
       rec_unlock(worker.lock)
       break
     }
-    completed = native_atomic.load_u64(&worker.generation)
+    completed = sync.load_u64(&worker.generation)
     root := worker.root
     dna_directory_watch_clear(worker.watch)
     _ = dna_directory_watch_poll(worker.watch)
@@ -124,19 +150,7 @@ fn picker_worker(pointer: rawptr) i32 {
     if root[0] != 0 {
       picker_walk(&scan, &root[0], &empty[0], 0)
     }
-    rec_lock(worker.lock)
-    if !picker_cancelled(&scan) {
-      for index in 0..scan.count {
-        worker.rows[index].length = worker.working[index].length
-        _ = copy(&worker.rows[index].bytes[0], &worker.working[index].bytes[0], worker.working[index].length + 1)
-      }
-      worker.count = scan.count
-      worker.visited = scan.visited
-      worker.flags = scan.flags
-      worker.published = completed
-    }
-    rec_unlock(worker.lock)
-    rec_notify()
+    picker_publish(&scan, true)
   }
   return 0
 }
@@ -172,19 +186,19 @@ pub fn dna_picker_submit(worker: *NativePicker, root: *const u8) u64 {
   }
   rec_lock(worker.lock)
   search_copy_text(worker.root[..], root)
-  request_generation := native_atomic.fetch_add_u64(&worker.generation, 1) + 1
+  request_generation := sync.fetch_add_u64(&worker.generation, 1) + 1
   rec_signal(worker.wake)
   rec_unlock(worker.lock)
   return request_generation
 }
-// -1 stale, 0 pending, 1 complete. flags: limited=1,error=2,watch fallback=4.
+// -1 stale, 0 pending, 1 complete, 2 partial. flags: limited=1,error=2,watch fallback=4.
 pub fn dna_picker_poll(worker: *NativePicker, request_generation: u64, count: *usize, visited: *usize, flags: *u32) i32 {
   if worker == nil {
     return -1
   }
   rec_lock(worker.lock)
   defer rec_unlock(worker.lock)
-  if native_atomic.load_u64(&worker.generation) != request_generation {
+  if sync.load_u64(&worker.generation) != request_generation {
     return -1
   }
   if worker.published != request_generation {
@@ -192,7 +206,10 @@ pub fn dna_picker_poll(worker: *NativePicker, request_generation: u64, count: *u
   }
   count.* = worker.count
   visited.* = worker.visited
-  flags.* = worker.flags
+  flags.* = worker.flags & 7
+  if (worker.flags & 8) != 0 {
+    return 2
+  }
   return 1
 }
 pub fn dna_picker_row(worker: *NativePicker, request_generation: u64, index: usize, output: *u8, capacity: usize) usize {
@@ -201,7 +218,7 @@ pub fn dna_picker_row(worker: *NativePicker, request_generation: u64, index: usi
   }
   rec_lock(worker.lock)
   defer rec_unlock(worker.lock)
-  if native_atomic.load_u64(&worker.generation) != request_generation || worker.published != request_generation || index >= worker.count || worker.rows[index].length >= capacity {
+  if sync.load_u64(&worker.generation) != request_generation || worker.published != request_generation || index >= worker.count || worker.rows[index].length >= capacity {
     return 0
   }
   row := &worker.rows[index]
@@ -221,7 +238,7 @@ pub fn dna_picker_close(worker: *NativePicker) {
     return
   }
   rec_lock(worker.lock)
-  native_atomic.store_u32(&worker.stop, 1)
+  sync.store_u32(&worker.stop, 1)
   rec_signal(worker.wake)
   rec_unlock(worker.lock)
   rec_join(worker.thread, nil)

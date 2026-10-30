@@ -19,7 +19,7 @@
 ; function
 (fn name: (identifier) @function)
 (extern_fn name: (identifier) @function)
-[ "#alignof" "#assert" "#bitcast" "#cast" "#len" "#load" "#offsetof" "#panic" "#reverse" "#sizeof" "#syscall" "#typeof" ] @function.builtin
+[ "#alignof" "#assert" "#bitcast" "#cast" "#len" "#load" "#offsetof" "#panic" "#reverse" "#sizeof" "#syscall" "#typeof" "#wrap" ] @function.builtin
 (call (primary (identifier) @function))
 (call (primary (field_access (identifier) @function)))
 
@@ -75,7 +75,7 @@
 
 ; variable
 (declaration (variable (identifier) @variable))
-(statement (variable (identifier) @variable))
+(block (variable (identifier) @variable))
 "_" @variable.builtin
 (field_access (identifier) @variable.other.member)
 (struct_literal_member (identifier) @variable.other.member)

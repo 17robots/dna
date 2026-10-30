@@ -1,86 +1,96 @@
-use "../platform" platform
+use "../platform" sdl
+use "std/unicode/utf8"
+use "std/unicode/text" unicode_text
 
-// In the terminal frontend, text objects are platform.tui text objects and
+// In the terminal frontend, text objects are sdl.tui text objects and
 // fonts are a placeholder handle; cells are the only glyphs.
 font_handle: u8 = 0
-// Direct SDL_ttf bindings. Text objects and their glyph atlas stay on the UI
-// thread and are destroyed before their font, engine, and SDL renderer.
+// Native text bindings. Text objects and their glyph atlas stay on the UI
+// thread and are destroyed before their font, engine, and native renderer.
 pub fn open(path: *const u8, points: f32) rawptr {
-  if platform.tui_active() {
+  if sdl.tui_active() {
     return #cast(rawptr, &font_handle)
   }
   return ttf_open(path, points)
 }
 pub fn close(font: rawptr) {
-  if platform.tui_active() {
+  if sdl.tui_active() {
     return
   }
   ttf_close(font)
 }
 pub fn font_size(font: rawptr, points: f32) bool {
-  if platform.tui_active() {
+  if sdl.tui_active() {
     return true
   }
   return ttf_font_size(font, points)
 }
 pub fn line_skip(font: rawptr, pixels: i32) {
-  if platform.tui_active() {
+  if sdl.tui_active() {
     return
   }
   ttf_line_skip(font, pixels)
 }
+// Minimum row height that contains the font's baseline and descenders,
+// unaffected by a previously configured line skip.
+pub fn font_height(font: rawptr) i32 {
+  if sdl.tui_active() {
+    return #cast(i32, sdl.CellHeight)
+  }
+  return ttf_font_height(font)
+}
 pub fn measure(font: rawptr, text: *const u8, length: usize, width: *i32, height: *i32) bool {
-  if platform.tui_active() {
-    platform.tui_measure_string(text, length, width, height)
+  if sdl.tui_active() {
+    sdl.tui_measure_string(text, length, width, height)
     return true
   }
   return ttf_measure(font, text, length, width, height)
 }
 pub fn engine(renderer: rawptr) rawptr {
-  if platform.tui_active() {
+  if sdl.tui_active() {
     return #cast(rawptr, &font_handle)
   }
   return ttf_engine(renderer)
 }
 pub fn destroy_engine(engine: rawptr) {
-  if platform.tui_active() {
+  if sdl.tui_active() {
     return
   }
   ttf_destroy_engine(engine)
 }
 pub fn create(engine: rawptr, font: rawptr, text: *const u8, length: usize) rawptr {
-  if platform.tui_active() {
-    handle := platform.tui_text_create()
+  if sdl.tui_active() {
+    handle := sdl.tui_text_create()
     if handle != nil && length > 0 {
-      _ = platform.tui_text_set(handle, text, length)
+      _ = sdl.tui_text_set(handle, text, length)
     }
     return handle
   }
   return ttf_create(engine, font, text, length)
 }
 pub fn destroy(text: rawptr) {
-  if platform.tui_active() {
-    platform.tui_text_destroy(text)
+  if sdl.tui_active() {
+    sdl.tui_text_destroy(text)
     return
   }
   ttf_destroy(text)
 }
 pub fn set(text: rawptr, bytes: *const u8, length: usize) bool {
-  if platform.tui_active() {
-    return platform.tui_text_set(text, bytes, length)
+  if sdl.tui_active() {
+    return sdl.tui_text_set(text, bytes, length)
   }
   return ttf_set(text, bytes, length)
 }
 pub fn wrap(text: rawptr, pixels: i32) bool {
-  if platform.tui_active() {
-    platform.tui_text_wrap(text, pixels)
+  if sdl.tui_active() {
+    sdl.tui_text_wrap(text, pixels)
     return true
   }
   return ttf_wrap(text, pixels)
 }
 pub fn color(text: rawptr, red: u8, green: u8, blue: u8, alpha: u8) bool {
-  if platform.tui_active() {
-    platform.tui_text_color(text, red, green, blue)
+  if sdl.tui_active() {
+    sdl.tui_text_color(text, red, green, blue)
     return true
   }
   return ttf_color(text, red, green, blue, alpha)
@@ -88,22 +98,30 @@ pub fn color(text: rawptr, red: u8, green: u8, blue: u8, alpha: u8) bool {
 // Italic for this text object. The terminal frontend draws it with SGR 3;
 // windows draw with a single font face and keep it upright.
 pub fn italic(text: rawptr, italic: bool) {
-  if platform.tui_active() {
-    platform.tui_text_italic(text, italic)
+  if sdl.tui_active() {
+    sdl.tui_text_italic(text, italic)
   }
 }
 pub fn draw(text: rawptr, x: f32, y: f32) bool {
-  if platform.tui_active() {
-    platform.tui_text_draw(text, x, y)
+  if sdl.tui_active() {
+    sdl.tui_text_draw(text, x, y)
     return true
   }
   // Glyphs drawn at fractional pixels lose a row to sampling at fractional
   // display scales (1.25, 1.5); every text lands on whole pixels.
   return ttf_draw(text, snap(x), snap(y))
 }
+// GUI syntax colors borrow the existing full-line shaping. Callbacks must not
+// mutate or destroy text; their offset identifies a complete glyph cluster.
+pub fn draw_colored(text:rawptr, x, y:f32, color:fn(rawptr, usize)u32, data:rawptr) bool {
+  if sdl.tui_active() {
+    return false
+  }
+  return ttf_draw_colored(text, snap(x), snap(y), color, data)
+}
 pub fn size(text: rawptr, width: *i32, height: *i32) bool {
-  if platform.tui_active() {
-    platform.tui_text_size(text, width, height)
+  if sdl.tui_active() {
+    sdl.tui_text_size(text, width, height)
     return true
   }
   return ttf_size(text, width, height)
@@ -120,39 +138,39 @@ pub struct Substring {
   height: i32,
 }
 pub fn substring(text: rawptr, offset: i32, output: *Substring) bool {
-  if platform.tui_active() {
-    output.* = Substring{height: #cast(i32, platform.CellHeight)}
-    return platform.tui_text_substring(text, offset, &output.x, &output.y, &output.width, &output.offset, &output.length, &output.line)
+  if sdl.tui_active() {
+    output.* = Substring{height: #cast(i32, sdl.CellHeight)}
+    return sdl.tui_text_substring(text, offset, &output.x, &output.y, &output.width, &output.offset, &output.length, &output.line)
   }
   return ttf_substring(text, offset, output)
 }
 pub fn whitespace_visible(text: rawptr, visible: bool) bool {
-  if platform.tui_active() {
+  if sdl.tui_active() {
     return true
   }
   return ttf_whitespace_visible(text, visible)
 }
 pub fn at_point(text: rawptr, x: i32, y: i32, output: *Substring) bool {
-  if platform.tui_active() {
-    found := platform.tui_text_at_point(text, x, y)
-    return platform.tui_text_substring(text, found, &output.x, &output.y, &output.width, &output.offset, &output.length, &output.line)
+  if sdl.tui_active() {
+    found := sdl.tui_text_at_point(text, x, y)
+    return sdl.tui_text_substring(text, found, &output.x, &output.y, &output.width, &output.offset, &output.length, &output.line)
   }
   return ttf_at_point(text, x, y, output)
 }
 pub fn set_font(text: rawptr, font: rawptr) bool {
-  if platform.tui_active() {
+  if sdl.tui_active() {
     return true
   }
   return ttf_set_font(text, font)
 }
 pub fn add_fallback(font: rawptr, fallback: rawptr) bool {
-  if platform.tui_active() {
+  if sdl.tui_active() {
     return true
   }
   return ttf_add_fallback(font, fallback)
 }
 pub fn remove_fallback(font: rawptr, fallback: rawptr) {
-  if platform.tui_active() {
+  if sdl.tui_active() {
     return
   }
   ttf_remove_fallback(font, fallback)
@@ -162,4 +180,59 @@ fn snap(value: f32) f32 {
     return -#cast(f32, (#cast(i64, (0.5 - value))))
   }
   return #cast(f32, (#cast(i64, (value + 0.5))))
+}
+
+// Visual cluster rectangles for a logical UTF-8 byte range. Geometry borrows
+// callback storage only for that call. Do not mutate/destroy text or change
+// frontends in callback.
+// Regions can merge clusters; their geometry is for painting, not navigation.
+// Empty ranges succeed without calls; callback false stops and returns false.
+pub fn selection(text:rawptr, start, end:usize, callback:fn(rawptr, *const Substring)bool, data:rawptr) bool {
+  if text==nil || callback==nil || start>end || end>2147483647 {
+    return false
+  }
+  if !sdl.tui_active() {
+    return ttf_selection(text, start, end, callback, data)
+  }
+  source:=sdl.tui_text_bytes(text)
+  if !utf8.valid(source) || !selection_boundary(source, start) || !selection_boundary(source, end) {
+    return false
+  }
+  if start==end {
+    return true
+  }
+  // Terminal cells follow logical order. Expand to extended graphemes before
+  // visiting so selected marks retain the base cell's visible geometry.
+  low:=start
+  high:=end
+  iterator:=unicode_text.graphemes(source)
+  for iterator.offset<#len(source) {
+    at:=iterator.offset
+    cluster:=unicode_text.next_grapheme(&iterator)
+    if !cluster.ok {
+      return false
+    }
+    if at<end && iterator.offset>start {
+      if at<low {
+        low=at
+      }
+      if iterator.offset>high {
+        high=iterator.offset
+      }
+    }
+  }
+  visit:=SelectionTui{start:low, end:high, callback:callback, data:data}
+  return sdl.tui_text_visit(text, selection_tui_cell, #cast(rawptr, &visit))
+}
+struct SelectionTui {start:usize, end:usize, callback:fn(rawptr, *const Substring)bool, data:rawptr}
+fn selection_boundary(text:[]const u8, offset:usize) bool {
+  return offset<=#len(text) && (offset==#len(text) || (text[offset]&0xc0)!=0x80)
+}
+fn selection_tui_cell(data:rawptr, offset, length:usize, line, x, y, width, height:i32) bool {
+  visit:=#cast(*SelectionTui, data)
+  if offset>=visit.end || offset+length<=visit.start || width<=0 {
+    return true
+  }
+  region:=Substring{flags:4, offset:#cast(i32, offset), length:#cast(i32, length), line:line, x:x, y:y, width:width, height:height}
+  return visit.callback(visit.data, &region)
 }

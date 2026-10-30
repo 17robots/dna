@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Repeated native lifecycles must release descriptors, threads and owned files."""
-import ctypes as c, os, tempfile, time
+import ctypes as c, os, subprocess, sys, tempfile, time
 from pathlib import Path
 root=Path(__file__).resolve().parents[1]
+# This executable is a fixture, not a checked-in or preinstalled dependency.
+plugin_path=root/'examples/plugins/uppercase/uppercase'
+subprocess.run([sys.executable,str(root/'scripts/compile.py'),os.environ.get('DYN','dyn'),
+                'build',str(plugin_path.parent),'--debug','--output',str(plugin_path)],check=True)
 lib=c.CDLL(str(root/'build/deps/install/lib/libdna_native.so'))
 for name,args in [('terminal_open',[c.c_char_p]*3),('syntax_open_named',[c.c_char_p]*2),('plugin_open',[c.c_char_p]*2),('search_open',[]),('recovery_open',[c.c_char_p]),('disk_open',[]),('rpc_open',[c.c_char_p]*2)]:
     fn=getattr(lib,'dna_'+name);fn.argtypes=args;fn.restype=c.c_void_p
@@ -63,7 +67,7 @@ with tempfile.TemporaryDirectory() as d:
         assert colors[latest.index('é'.encode())]==2 and colors[latest.index(b'42')]==6, colors
         stale=c.create_string_buffer(len(latest))
         assert not lib.dna_syntax_colors(syntax,stale,len(latest),1), 'stale syntax published'
-        plugin=lib.dna_plugin_open(os.fsencode(root/'examples/plugins/uppercase/uppercase'),directory);assert plugin
+        plugin=lib.dna_plugin_open(os.fsencode(plugin_path),directory);assert plugin
         search=lib.dna_search_open();assert search;lib.dna_search_submit(search,directory,b'needle')
         recovery=lib.dna_recovery_open(os.fsencode(Path(d)/'recovery'));assert recovery;assert lib.dna_recovery_submit(recovery,b'cycle',5)
         time.sleep(.005);lib.dna_terminal_poll(term)

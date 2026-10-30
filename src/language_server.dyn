@@ -1,9 +1,9 @@
 use "./lsp"
-use "std/io" lsp_stream
+use "std/io"
 
 // Preflight the complete encoding and source ranges before touching caller
 // bytes. The second streaming pass writes directly, without an arena/mapping.
-use "std/unicode/utf8" lsp_utf8
+use "std/unicode/utf8"
 
 struct LspJsonOutput { bytes: []u8, used: usize, writing: bool }
 fn lsp_json_overlap(out: []u8, source: []const u8) bool {
@@ -29,7 +29,7 @@ fn lsp_json_sources(out: []u8, value: *const json.Value, depth: usize) bool {
   if lsp_json_overlap(out, (#cast(*const u8, value))[..#sizeof(json.Value)]) || lsp_json_overlap(out, value.text) || lsp_json_overlap(out, value.key) {
     return false
   }
-  if !lsp_utf8.valid(value.key) {
+  if !utf8.valid(value.key) {
     return false
   }
   child := value.first
@@ -41,31 +41,31 @@ fn lsp_json_sources(out: []u8, value: *const json.Value, depth: usize) bool {
   }
   return true
 }
-fn lsp_json_write(data: rawptr, source: []const u8) lsp_stream.Result {
+fn lsp_json_write(data: rawptr, source: []const u8) io.Result {
   output := #cast(*LspJsonOutput, data)
   if #len(source) > #len(output.bytes) - output.used || (!output.writing && lsp_json_overlap(output.bytes, source)) {
-    return lsp_stream.Result{ error: -28, status: lsp_stream.Status.Error }
+    return io.Result{ error: -28, status: io.Status.Error }
   }
   if output.writing {
     _ = mem.move(output.bytes[output.used..], source)
   }
   output.used += #len(source)
-  return lsp_stream.Result{ transferred: #len(source), status: lsp_stream.Status.Complete }
+  return io.Result{ transferred: #len(source), status: io.Status.Complete }
 }
 fn lsp_json_encode(out: []u8, value: *const json.Value) []u8 {
   if !lsp_json_sources(out, value, 0) {
     return out[..0]
   }
   output := LspJsonOutput{ bytes: out }
-  writer := lsp_stream.Writer{ data: #cast(rawptr, &output), write: lsp_json_write }
+  writer := io.Writer{ data: #cast(rawptr, &output), write: lsp_json_write }
   measured := json.write(writer, value)
-  if measured.status == lsp_stream.Status.Error {
+  if measured.status == io.Status.Error {
     return out[..0]
   }
   output.used = 0
   output.writing = true
   encoded := json.write(writer, value)
-  if encoded.status == lsp_stream.Status.Error {
+  if encoded.status == io.Status.Error {
     return out[..0]
   }
   return out[..output.used]
@@ -83,6 +83,7 @@ extern fn rpc_log "dna_rpc_log"(rpc: rawptr, bytes: *u8, capacity: usize) usize
 extern fn rpc_close "dna_rpc_close"(rpc: rawptr)
 
 struct LspDocument {
+  shadow:LspShadow,
   end: lsp.Position,
   saved_epoch: u64,
   identity: u64,
@@ -105,7 +106,12 @@ struct LanguageServer {
   managed: bool,
   completion_triggers: [128]u32,
   completion_trigger_count: usize,
-  documents: [16]LspDocument,
+  documents: []LspDocument,
+  documents_arena:*mem.Arena,
+  allocation_retry_due:u64,
+  dirty_first, dirty_last, attached_first, attached_last: *Slot,
+  attach_scan: bool,
+  next_document_version: usize,
   process: rawptr,
   command: [4096]u8,
   root: [4096]u8,
@@ -190,7 +196,6 @@ struct LspState {
   // Default servers tried this session, by index in default_server.
   default_started: u64,
   servers: [8]LanguageServer,
-  shadows: [128]LspShadow,
   results: LspResults,
 }
 struct Diagnostic {
@@ -207,9 +212,78 @@ struct Diagnostics { items: [128]Diagnostic, count: usize, revision: u64 }
 fn lsp_note(app: *App, text: []const u8) {
   app.lsp.log_length = copy_text(app.lsp.log[..], text)
 }
+// Stable slots own intrusive links: document callbacks can enqueue without
+// allocation or service execution, including while a slot is being replaced.
+fn lsp_queue_slot(app:*App, index:usize, slot:*Slot) {
+  bit:=#cast(u32, 1)<<#cast(u32, index)
+  if (slot.lsp_dirty_mask&bit)!=0 {
+    return
+  }
+  slot.lsp_dirty_mask|=bit
+  slot.lsp_dirty_next[index]=nil
+  server:=&app.lsp.servers[index]
+  if server.dirty_last==nil {
+    server.dirty_first=slot
+  }
+  else {
+    server.dirty_last.lsp_dirty_next[index]=slot
+  }
+  server.dirty_last=slot
+}
+fn lsp_document_dirty(app:*App, slot_index:usize) {
+  if slot_index>=#len(app.documents.slots) {
+    return
+  }
+  for index in 0..8 {
+    if app.lsp.servers[index].process!=nil {
+      lsp_queue_slot(app, index, app.documents.slots[slot_index])
+    }
+  }
+}
+fn lsp_attach_slot(app:*App, index:usize, slot:*Slot) {
+  bit:=#cast(u32, 1)<<#cast(u32, index)
+  if (slot.lsp_attached_mask&bit)!=0 {
+    return
+  }
+  server:=&app.lsp.servers[index]
+  slot.lsp_attached_mask|=bit
+  slot.lsp_attached_next[index]=nil
+  slot.lsp_attached_previous[index]=server.attached_last
+  if server.attached_last==nil {
+    server.attached_first=slot
+  }
+  else {
+    server.attached_last.lsp_attached_next[index]=slot
+  }
+  server.attached_last=slot
+}
+fn lsp_detach_slot(app:*App, index:usize, slot:*Slot) {
+  bit:=#cast(u32, 1)<<#cast(u32, index)
+  if (slot.lsp_attached_mask&bit)==0 {
+    return
+  }
+  server:=&app.lsp.servers[index]
+  previous:=slot.lsp_attached_previous[index]
+  next:=slot.lsp_attached_next[index]
+  if previous==nil {
+    server.attached_first=next
+  }
+  else {
+    previous.lsp_attached_next[index]=next
+  }
+  if next==nil {
+    server.attached_last=previous
+  }
+  else {
+    next.lsp_attached_previous[index]=previous
+  }
+  slot.lsp_attached_mask&=~bit
+  slot.lsp_attached_next[index]=nil
+  slot.lsp_attached_previous[index]=nil
+}
 fn lsp_results_release(app: *App) {
   if app.lsp.results.owned {
-    mem.arena_release(app.lsp.results.arena)
+    arena_owner.release(app.lsp.results.arena)
     app.lsp.results.arena = nil
     if app.lsp.results.tracked_capacity != 0 {
       allocation_record(app, "lsp_results", app.lsp.results.tracked_capacity, app.lsp.results.tracked_born, true)
@@ -220,27 +294,155 @@ fn lsp_results_release(app: *App) {
 fn lsp_edits_release(app: *App) {
   lsp_edit_reply(app, false)
   if app.lsp.edits.owned {
-    mem.arena_release(app.lsp.edits.arena)
+    arena_owner.release(app.lsp.edits.arena)
     app.lsp.edits.arena = nil
   }
   mem.clear(&app.lsp.edits)
 }
+// Grow before borrowing individual records. Shadow owners move with their
+// records; releasing the old metadata never releases those copied owners.
+// Failed storage growth is retried without polling or losing a wakeup when
+// the new slot has no tracking record yet. Existing dirty records share this
+// backoff, so their expired debounce deadline cannot cause a zero-ms spin.
+fn lsp_allocation_retry(server:*LanguageServer, now:u64) {
+  server.allocation_retry_due=#cast(u64, -1)
+  if now<=#cast(u64, -1)-250 {
+    server.allocation_retry_due=now+250
+  }
+}
+fn lsp_allocation_wait(server:*const LanguageServer, now:u64)i32 {
+  if server.allocation_retry_due==0 {
+    return -1
+  }
+  if now>=server.allocation_retry_due {
+    return 0
+  }
+  remaining:=server.allocation_retry_due-now
+  if remaining>250 {
+    return 250
+  }
+  return #cast(i32, remaining)
+}
+fn lsp_documents_ensure(server:*LanguageServer, count:usize)bool {
+  if count<=#len(server.documents) {
+    return true
+  }
+  if count>(#cast(usize, -1)-#alignof(LspDocument))/#sizeof(LspDocument) {
+    return false
+  }
+  arena:=arena_owner.try_create(count*#sizeof(LspDocument)+#alignof(LspDocument))
+  if arena==nil {
+    return false
+  }
+  allocated:=mem.arena_try_push(arena, count*#sizeof(LspDocument), #alignof(LspDocument))
+  if !allocated.ok {
+    arena_owner.release(arena)
+    return false
+  }
+  records:=(#cast(*LspDocument, allocated.memory))[..count]
+  for i in 0..#len(server.documents) {
+    records[i]=server.documents[i]
+  }
+  previous:=server.documents_arena
+  server.documents=records
+  server.documents_arena=arena
+  arena_owner.release(previous)
+  return true
+}
+// Capacity follows the sent text, not the maximum editor document. Failure
+// leaves the complete previous sent snapshot available for a later retry.
+fn lsp_shadow_ensure(shadow:*LspShadow, length:usize)bool {
+  if length==#cast(usize, -1) || shadow.length==#cast(usize, -1) {
+    return false
+  }
+  needed:=length+1
+  if needed<shadow.length+1 {
+    needed=shadow.length+1
+  }
+  if shadow.owned && #len(shadow.bytes)>=needed {
+    return true
+  }
+  capacity:usize=4096
+  for capacity<needed {
+    if capacity>#cast(usize, -1)/2 {
+      capacity=needed
+      break
+    }
+    capacity*=2
+  }
+  arena:=arena_owner.try_create(capacity)
+  if arena==nil {
+    return false
+  }
+  host.small_pages(arena.data)
+  allocated:=mem.arena_try_push_uninit(arena, capacity, 1)
+  if !allocated.ok {
+    arena_owner.release(arena)
+    return false
+  }
+  bytes:=(#cast(*u8, allocated.memory))[..capacity]
+  if shadow.length>0 {
+    _=buffer.copy_bytes(&bytes[0], &shadow.bytes[0], shadow.length)
+  }
+  previous:=shadow.arena
+  previous_owned:=shadow.owned
+  shadow.arena=arena
+  shadow.bytes=bytes
+  shadow.owned=true
+  if previous_owned {
+    arena_owner.release(previous)
+  }
+  return true
+}
 fn lsp_shadow_release(app: *App, index: usize, slot: usize) {
-  shadow := &app.lsp.shadows[index * 16 + slot]
+  server:=&app.lsp.servers[index]
+  if slot>=#len(server.documents) {
+    return
+  }
+  shadow := &server.documents[slot].shadow
   if shadow.owned {
-    mem.arena_release(shadow.arena)
+    arena_owner.release(shadow.arena)
     shadow.arena = nil
   }
   shadow.* = LspShadow{}
 }
 fn lsp_shadows_release(app: *App, index: usize) {
-  for slot in 0..16 {
+  for slot in 0..#len(app.lsp.servers[index].documents) {
     lsp_shadow_release(app, index, slot)
   }
 }
+fn lsp_worksets_clear(app:*App, index:usize) {
+  server:=&app.lsp.servers[index]
+  bit:=#cast(u32, 1)<<#cast(u32, index)
+  slot:=server.dirty_first
+  for slot!=nil {
+    next:=slot.lsp_dirty_next[index]
+    slot.lsp_dirty_mask&=~bit
+    slot.lsp_dirty_next[index]=nil
+    slot=next
+  }
+  slot=server.attached_first
+  for slot!=nil {
+    next:=slot.lsp_attached_next[index]
+    slot.lsp_attached_mask&=~bit
+    slot.lsp_attached_next[index]=nil
+    slot.lsp_attached_previous[index]=nil
+    slot=next
+  }
+  server.dirty_first=nil
+  server.dirty_last=nil
+  server.attached_first=nil
+  server.attached_last=nil
+  server.attach_scan=false
+}
 fn lsp_stop(app: *App, index: usize) {
+  lsp_worksets_clear(app, index)
   lsp_shadows_release(app, index)
   server := &app.lsp.servers[index]
+  arena_owner.release(server.documents_arena)
+  server.documents_arena=nil
+  server.allocation_retry_due=0
+  server.documents=server.documents[..0]
   if server.process != nil {
     rpc_close(server.process)
   }
@@ -303,6 +505,7 @@ fn lsp_start(app: *App, language: []const u8, command: []const u8) {
   _ = copy_text(server.command[..], command)
   server.root_length = copy_text(server.root[..], app.workspace.project[..app.workspace.project_length])
   server.process = rpc_open(&server.command[0], &server.root[0])
+  server.attach_scan=true
   if server.process == nil {
     notice(app, "Could not start language server.")
     return
@@ -321,7 +524,9 @@ fn lsp_start(app: *App, language: []const u8, command: []const u8) {
   app.prompt_state.panel = Panel.None
 }
 fn lsp_for(app: *App) usize {
-  language := filetype_name(&app.documents.slots[app.documents.active])
+  active_slot:=app.documents.slots[app.documents.active]
+  configured_filetype_slot(app, active_slot)
+  language := filetype_name(active_slot)
   for index in 0..8 {
     server := &app.lsp.servers[index]
     if server.process != nil && buffer.equal(server.language[..server.length], language) {
@@ -343,186 +548,261 @@ fn lsp_document_position(doc: *const buffer.Document, offset: usize) lsp.Positio
   result.line += row
   return result
 }
-fn lsp_sync(app: *App, index: usize, force: bool) {
-  server := &app.lsp.servers[index]
+// One queued slot is the unit of synchronization. Never retain its metadata
+// pointer across a send that can stop the server and release the arena.
+fn lsp_sync_slot(app:*App, index:usize, slot_index:usize, force:bool) bool {
+  server:=&app.lsp.servers[index]
+  if slot_index>=#len(app.documents.slots) || slot_index>=#len(server.documents) {
+    return true
+  }
+  slot := app.documents.slots[slot_index]
+  configured_filetype_slot(app, slot)
+  tracked := &server.documents[slot_index]
+  matches: bool = false
+  // Large files are not sent to language servers (closed if they grow).
+  if slot.document != nil && slot.terminal.handle == nil && slot.file.length > 0 && slot.document.length < buffer.LargeFile {
+    matches = buffer.equal(filetype_name(slot), server.language[..server.length])
+  }
+  if tracked.identity != 0 && (!matches || tracked.identity != slot.identity || !buffer.equal(tracked.path[..tracked.length], files.name(&slot.file))) {
+    close_message: [32768]u8 = []
+    close_used: usize = 0
+    lsp_header(close_message[..], &close_used, "textDocument/didClose", 0)
+    add_text(close_message[..], &close_used, "{\"textDocument\":{\"uri\":")
+    lsp_document_uri(close_message[..], &close_used, tracked.path[..tracked.length])
+    add_text(close_message[..], &close_used, "}}}")
+    if !lsp_send(app, index, close_message[..close_used]) {
+      return false
+    }
+    lsp_shadow_release(app, index, slot_index)
+    tracked.* = LspDocument{}
+    lsp_detach_slot(app, index, slot)
+  }
+  if !matches {
+    return true
+  }
+  if tracked.identity!=0 {
+    lsp_attach_slot(app, index, slot)
+  }
+  doc := slot.document
+  if tracked.identity == slot.identity && tracked.saved_epoch != doc.saved_epoch && !buffer.dirty_cached(doc) {
+    lsp_saved(app, index, slot_index)
+    // Sending didSave can stop the server and free tracking metadata.
+    if !server.ready || server.process==nil {
+      return false
+    }
+  }
+  if tracked.identity == slot.identity && tracked.revision == doc.revision {
+    return true
+  }
+  if tracked.observed != doc.revision {
+    tracked.observed = doc.revision
+    tracked.changed = sdl.ticks()
+  }
+  if !force && tracked.identity != 0 && sdl.ticks() - tracked.changed < #cast(u64, app.config.lsp_change_delay_ms) {
+    return false
+  }
+  opening := tracked.identity == 0
+  shadow := &tracked.shadow
+  if server.sync==2 && !lsp_shadow_ensure(shadow, doc.length) {
+    lsp_allocation_retry(server, sdl.ticks())
+    lsp_note(app, "Could not grow incremental language-server snapshot.")
+    return false
+  }
+  sent: []const u8 = doc.bytes[..doc.length]
+  prefix: usize = 0
+  old_high := shadow.length
+  high := doc.length
+  incremental := !opening && server.sync == 2 && shadow.ready
+  if incremental {
+    before := shadow.bytes[..shadow.length]
+    changed := buffer.changes_since(doc, tracked.revision)
+    if changed.found && changed.old_length == shadow.length {
+      prefix = changed.low
+      old_high = changed.old_high
+      high = changed.high
+    } else {
+      // Reloads and journal overflow require a full diff against the sent copy.
+      for prefix < #len(before) && prefix < doc.length && before[prefix] == doc.bytes[prefix] {
+        prefix += 1
+      }
+      for prefix > 0 && prefix < #len(before) && (before[prefix] & 192) == 128 {
+        prefix -= 1
+      }
+      suffix: usize = 0
+      for suffix < #len(before) - prefix && suffix < doc.length - prefix && before[#len(before) - 1 - suffix] == doc.bytes[doc.length - 1 - suffix] {
+        suffix += 1
+      }
+      for suffix > 0 && (before[#len(before) - suffix] & 192) == 128 {
+        suffix -= 1
+      }
+      old_high = shadow.length - suffix
+      high = doc.length - suffix
+    }
+    sent = doc.bytes[prefix..high]
+  }
+  // Versions are unique within this connection, including when a URI moves
+  // to another slot. LSP's signed integer range must never wrap or repeat.
+  if server.next_document_version>=2147483647 {
+    lsp_note(app, "Language-server document versions exhausted. Use :lsp-restart.")
+    lsp_stop(app, index)
+    return false
+  }
+  work := &app.operations.lsp_send
+  capacity := #len(sent) * 6 + 65536
+  if !work_acquire(app, work, capacity * 2 + 64, "lsp_send") {
+    lsp_allocation_retry(server, sdl.ticks())
+    return false
+  }
+  message := mem.push_bytes_uninit(work.arena, capacity)
+  escaped := mem.push_bytes_uninit(work.arena, capacity)
+  used: usize = 0
+  if opening {
+    lsp_header(message, &used, "textDocument/didOpen", 0)
+  } else {
+    lsp_header(message, &used, "textDocument/didChange", 0)
+  }
+  server.next_document_version+=1
+  tracked.version=server.next_document_version
+  add_text(message, &used, "{\"textDocument\":{\"uri\":")
+  lsp_document_uri(message, &used, files.name(&slot.file))
+  add_text(message, &used, ",\"version\":")
+  add_number(message, &used, tracked.version)
+  if opening {
+    add_text(message, &used, ",\"languageId\":")
+    add_text(message, &used, lsp_json_string(escaped, protocol_language(server.language[..server.length])))
+    add_text(message, &used, ",\"text\":")
+  }
+  if !opening {
+    add_text(message, &used, "},\"contentChanges\":[{")
+    if incremental {
+      start := lsp_document_position(doc, prefix)
+      previous := shadow.bytes[prefix..old_high]
+      end := lsp.position(previous, #len(previous))
+      if end.line == 0 {
+        end.character += start.character
+      }
+      end.line += start.line
+      add_text(message, &used, "\"range\":{\"start\":")
+      lsp_position(message, &used, start)
+      add_text(message, &used, ",\"end\":")
+      lsp_position(message, &used, end)
+      add_text(message, &used, "},")
+    }
+    else if server.sync == 2 {
+      old_end := tracked.end
+      add_text(message, &used, "\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":")
+      lsp_position(message, &used, old_end)
+      add_text(message, &used, "},")
+    }
+    add_text(message, &used, "\"text\":")
+  }
+  quoted := lsp_json_string(escaped, sent)
+  if #len(quoted) == 0 {
+    work_finish(app, work, "lsp_send")
+    lsp_note(app, "Cannot encode document for language server.")
+    lsp_allocation_retry(server, sdl.ticks())
+    return false
+  }
+  add_text(message, &used, quoted)
+  if opening {
+    add_text(message, &used, "}}}")
+  } else {
+    add_text(message, &used, "}]}")
+    add_text(message, &used, "}")
+  }
+  delivered := lsp_send(app, index, message[..used])
+  work_finish(app, work, "lsp_send")
+  if !delivered {
+    return false
+  }
+  if opening {
+    tracked.saved_epoch = doc.saved_epoch
+  }
+  if server.sync == 2 {
+    shadow.ready = shadow.owned
+    if shadow.owned {
+      if incremental {
+        tail := shadow.length - old_high
+        if tail > 0 && high != old_high {
+          _ = buffer.move_bytes(&shadow.bytes[high], &shadow.bytes[old_high], tail)
+        }
+        if high > prefix {
+          _ = buffer.copy_bytes(&shadow.bytes[prefix], &doc.bytes[prefix], high - prefix)
+        }
+      } else if doc.length > 0 {
+        _ = buffer.copy_bytes(&shadow.bytes[0], &doc.bytes[0], doc.length)
+      }
+      shadow.length = doc.length
+    }
+  }
+  tracked.identity = slot.identity
+  tracked.revision = doc.revision
+  tracked.end = lsp_document_position(doc, doc.length)
+  tracked.length = copy_text(tracked.path[..], files.name(&slot.file))
+  lsp_attach_slot(app, index, slot)
+  if tracked.saved_epoch!=doc.saved_epoch && !buffer.dirty_cached(doc) {
+    lsp_saved(app, index, slot_index)
+    if !server.ready || server.process==nil {
+      return false
+    }
+  }
+  return true
+}
+fn lsp_sync(app:*App, index:usize, force:bool) {
+  server:=&app.lsp.servers[index]
   if !server.ready {
     return
   }
-  slot_index: usize = 0
-  for slot_index < 16 {
-    slot := &app.documents.slots[slot_index]
-    tracked := &server.documents[slot_index]
-    matches: bool = false
-    // Large files are not sent to language servers (closed if they grow).
-    if slot.document != nil && slot.terminal.handle == nil && slot.file.length > 0 && slot.document.length < buffer.LargeFile {
-      matches = buffer.equal(filetype_name(slot), server.language[..server.length])
+  if lsp_allocation_wait(server, sdl.ticks())>0 {
+    return
+  }
+  server.allocation_retry_due=0
+  // A server attaches the existing workspace once. Later edits/lifecycle
+  // changes arrive through stable-slot worksets rather than polling buffers.
+  if server.attach_scan {
+    for slot_index in 0..#len(app.documents.slots) {
+      lsp_queue_slot(app, index, app.documents.slots[slot_index])
     }
-    if tracked.identity != 0 && (!matches || tracked.identity != slot.identity || !buffer.equal(tracked.path[..tracked.length], files.name(&slot.file))) {
-      close_message: [32768]u8 = []
-      close_used: usize = 0
-      lsp_header(close_message[..], &close_used, "textDocument/didClose", 0)
-      add_text(close_message[..], &close_used, "{\"textDocument\":{\"uri\":")
-      lsp_document_uri(close_message[..], &close_used, tracked.path[..tracked.length])
-      add_text(close_message[..], &close_used, "}}}")
-      if !lsp_send(app, index, close_message[..close_used]) {
-        return
-      }
-      tracked.* = LspDocument{}
-      lsp_shadow_release(app, index, slot_index)
-    }
-    if !matches {
-      slot_index += 1
-      continue
-    }
-    doc := slot.document
-    if tracked.identity == slot.identity && tracked.saved_epoch != doc.saved_epoch && !buffer.dirty_cached(doc) {
-      lsp_saved(app, index, slot_index)
-    }
-    if tracked.identity == slot.identity && tracked.revision == doc.revision {
-      slot_index += 1
-      continue
-    }
-    if tracked.observed != doc.revision {
-      tracked.observed = doc.revision
-      tracked.changed = sdl.ticks()
-    }
-    if !force && tracked.identity != 0 && sdl.ticks() - tracked.changed < #cast(u64, app.config.lsp_change_delay_ms) {
-      slot_index += 1
-      continue
-    }
-    opening := tracked.identity == 0
-    shadow := &app.lsp.shadows[index * 16 + slot_index]
-    sent: []const u8 = doc.bytes[..doc.length]
-    prefix: usize = 0
-    old_high := shadow.length
-    high := doc.length
-    incremental := !opening && server.sync == 2 && shadow.ready
-    if incremental {
-      before := shadow.bytes[..shadow.length]
-      changed := buffer.changes_since(doc, tracked.revision)
-      if changed.found && changed.old_length == shadow.length {
-        prefix = changed.low
-        old_high = changed.old_high
-        high = changed.high
-      } else {
-        // Reloads and journal overflow require a full diff against the sent copy.
-        for prefix < #len(before) && prefix < doc.length && before[prefix] == doc.bytes[prefix] {
-          prefix += 1
-        }
-        for prefix > 0 && prefix < #len(before) && (before[prefix] & 192) == 128 {
-          prefix -= 1
-        }
-        suffix: usize = 0
-        for suffix < #len(before) - prefix && suffix < doc.length - prefix && before[#len(before) - 1 - suffix] == doc.bytes[doc.length - 1 - suffix] {
-          suffix += 1
-        }
-        for suffix > 0 && (before[#len(before) - suffix] & 192) == 128 {
-          suffix -= 1
-        }
-        old_high = shadow.length - suffix
-        high = doc.length - suffix
-      }
-      sent = doc.bytes[prefix..high]
-    }
-    work := &app.operations.lsp_send
-    capacity := #len(sent) * 6 + 65536
-    if !work_acquire(app, work, capacity * 2 + 64, "lsp_send") {
+    server.attach_scan=false
+  }
+  if force && app.documents.active<#len(app.documents.slots) {
+    lsp_queue_slot(app, index, app.documents.slots[app.documents.active])
+  }
+  if server.dirty_first==nil {
+    return
+  }
+  if !lsp_documents_ensure(server, #len(app.documents.slots)) {
+    lsp_allocation_retry(server, sdl.ticks())
+    lsp_note(app, "Could not grow language-server document tracking.")
+    return
+  }
+  previous:*Slot=nil
+  slot:=server.dirty_first
+  for slot!=nil {
+    next:=slot.lsp_dirty_next[index]
+    completed:=lsp_sync_slot(app, index, slot.index, force && slot.index==app.documents.active)
+    if !server.ready || server.process==nil {
       return
     }
-    message := mem.push_bytes_uninit(work.arena, capacity)
-    escaped := mem.push_bytes_uninit(work.arena, capacity)
-    used: usize = 0
-    if opening {
-      lsp_header(message, &used, "textDocument/didOpen", 0)
+    if completed {
+      if previous==nil {
+        server.dirty_first=next
+      }
+      else {
+        previous.lsp_dirty_next[index]=next
+      }
+      if next==nil {
+        server.dirty_last=previous
+      }
+      slot.lsp_dirty_mask&=~(#cast(u32, 1)<<#cast(u32, index))
+      slot.lsp_dirty_next[index]=nil
     } else {
-      lsp_header(message, &used, "textDocument/didChange", 0)
+      previous=slot
     }
-    tracked.version += 1
-    add_text(message, &used, "{\"textDocument\":{\"uri\":")
-    lsp_document_uri(message, &used, files.name(&slot.file))
-    add_text(message, &used, ",\"version\":")
-    add_number(message, &used, tracked.version)
-    if opening {
-      add_text(message, &used, ",\"languageId\":")
-      add_text(message, &used, lsp_json_string(escaped, protocol_language(server.language[..server.length])))
-      add_text(message, &used, ",\"text\":")
-    }
-    if !opening {
-      add_text(message, &used, "},\"contentChanges\":[{")
-      if incremental {
-        start := lsp_document_position(doc, prefix)
-        previous := shadow.bytes[prefix..old_high]
-        end := lsp.position(previous, #len(previous))
-        if end.line == 0 {
-          end.character += start.character
-        }
-        end.line += start.line
-        add_text(message, &used, "\"range\":{\"start\":")
-        lsp_position(message, &used, start)
-        add_text(message, &used, ",\"end\":")
-        lsp_position(message, &used, end)
-        add_text(message, &used, "},")
-      }
-      else if server.sync == 2 {
-        old_end := tracked.end
-        add_text(message, &used, "\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":")
-        lsp_position(message, &used, old_end)
-        add_text(message, &used, "},")
-      }
-      add_text(message, &used, "\"text\":")
-    }
-    quoted := lsp_json_string(escaped, sent)
-    if #len(quoted) == 0 {
-      work_finish(app, work, "lsp_send")
-      lsp_note(app, "Cannot encode document for language server.")
+    if server.allocation_retry_due!=0 {
       return
     }
-    add_text(message, &used, quoted)
-    if opening {
-      add_text(message, &used, "}}}")
-    } else {
-      add_text(message, &used, "}]}")
-      add_text(message, &used, "}")
-    }
-    delivered := lsp_send(app, index, message[..used])
-    work_finish(app, work, "lsp_send")
-    if !delivered {
-      return
-    }
-    if opening {
-      tracked.saved_epoch = doc.saved_epoch
-    }
-    if server.sync == 2 {
-      if !shadow.owned {
-        created := mem.arena_create((buffer.Capacity + 1) + mem.ArenaBufferOverhead)
-        // This sparse reservation normally touches only a small document prefix.
-        host.small_pages(created.data)
-        shadow.arena = created
-        created = nil
-        shadow.owned = true
-        shadow.bytes = mem.push_bytes_uninit(shadow.arena, buffer.Capacity + 1)
-      }
-      shadow.ready = shadow.owned
-      if shadow.owned {
-        if incremental {
-          tail := shadow.length - old_high
-          if tail > 0 && high != old_high {
-            _ = buffer.move_bytes(&shadow.bytes[high], &shadow.bytes[old_high], tail)
-          }
-          if high > prefix {
-            _ = buffer.copy_bytes(&shadow.bytes[prefix], &doc.bytes[prefix], high - prefix)
-          }
-        } else if doc.length > 0 {
-          _ = buffer.copy_bytes(&shadow.bytes[0], &doc.bytes[0], doc.length)
-        }
-        shadow.length = doc.length
-      }
-    }
-    tracked.identity = slot.identity
-    tracked.revision = doc.revision
-    tracked.end = lsp_document_position(doc, doc.length)
-    tracked.length = copy_text(tracked.path[..], files.name(&slot.file))
-    slot_index += 1
+    slot=next
   }
 }
 fn lsp_position(out: []u8, used: *usize, position: lsp.Position) {
@@ -555,7 +835,11 @@ fn lsp_request(app: *App, kind: usize, argument: []const u8) {
     return
   }
   lsp_sync(app, index, true)
-  if server.process == nil {
+  if server.process == nil || server.allocation_retry_due!=0 {
+    return
+  }
+  active:=app.documents.active
+  if active>=#len(server.documents) || server.documents[active].identity!=app.documents.slots[active].identity || server.documents[active].revision!=app.documents.current.revision {
     return
   }
   lsp_cancel_request(app)
@@ -662,10 +946,14 @@ fn lsp_request(app: *App, kind: usize, argument: []const u8) {
 fn lsp_diagnostics(app: *App, index: usize, params: *const json.Value) {
   storage: [4096]u8 = []
   path := lsp.path(json_text(params, "uri"), storage[..])
-  for slot_index in 0..16 {
-    slot := &app.documents.slots[slot_index]
+  count:=#len(app.documents.slots)
+  if count>#len(app.lsp.servers[index].documents) {
+    count=#len(app.lsp.servers[index].documents)
+  }
+  for slot_index in 0..count {
+    slot := app.documents.slots[slot_index]
     tracked := &app.lsp.servers[index].documents[slot_index]
-    if slot.document != nil && #len(path) > 0 && buffer.equal(files.name(&slot.file), path) && tracked.revision == slot.document.revision {
+    if slot.document != nil && tracked.identity!=0 && tracked.identity==slot.identity && #len(path) > 0 && buffer.equal(files.name(&slot.file), path) && tracked.revision == slot.document.revision && buffer.equal(filetype_name(slot), app.lsp.servers[index].language[..app.lsp.servers[index].length]) {
       version := lsp.number(json.object_get(params, "version"))
       if version.ok && version.value != tracked.version {
         return
@@ -873,7 +1161,7 @@ fn lsp_handle(app: *App, index: usize, source: []const u8, arena: *mem.Arena) bo
     lsp_note(app, "Language command completed.")
     return false
   }
-  slot := &app.documents.slots[app.lsp.slot]
+  slot := app.documents.slots[app.lsp.slot]
   continued := completion_request_compatible(app) && completion_response_matches(app, result)
   stale: []const u8 = ""
   if slot.document == nil || slot.identity != app.lsp.identity {
@@ -1135,8 +1423,8 @@ fn lsp_config(app: *App) {
   }
   length := copy_text(path[..], app.configuration.path[..parent])
   add_text(path[..], &length, "lsp.json")
-  allocated := mem.arena_create((262144) + mem.ArenaBufferOverhead)
-  defer mem.arena_release(allocated)
+  allocated := arena_owner.create((262144))
+  defer arena_owner.release(allocated)
   read := fs.read_all(allocated, path[..length], 32768)
   if !read.ok && configured_count > 0 {
     return
@@ -1190,7 +1478,7 @@ fn lsp_command(app: *App, verb: []const u8, argument: []const u8) bool {
   }
   if buffer.equal(verb, "lsp-restart") {
     index: usize = 0
-    current_language := filetype_name(&app.documents.slots[app.documents.active])
+    current_language := filetype_name(app.documents.slots[app.documents.active])
     for index < 8 && !buffer.equal(app.lsp.servers[index].language[..app.lsp.servers[index].length], current_language) {
       index += 1
     }
@@ -1303,7 +1591,10 @@ fn diagnostics_popup(app: *App, output: []u8) usize {
 
 fn lsp_saved(app: *App, index: usize, slot_index: usize) {
   server := &app.lsp.servers[index]
-  slot := &app.documents.slots[slot_index]
+  if slot_index>=#len(app.documents.slots) || slot_index>=#len(server.documents) {
+    return
+  }
+  slot := app.documents.slots[slot_index]
   tracked := &server.documents[slot_index]
   if !server.save {
     tracked.saved_epoch = slot.document.saved_epoch
@@ -1314,8 +1605,8 @@ fn lsp_saved(app: *App, index: usize, slot_index: usize) {
     return
   }
   capacity := slot.document.length * 6 + 65536
-  allocated := mem.arena_create((capacity * 2 + 64) + mem.ArenaBufferOverhead)
-  defer mem.arena_release(allocated)
+  allocated := arena_owner.create((capacity * 2 + 64))
+  defer arena_owner.release(allocated)
   message := mem.push_bytes_uninit(allocated, capacity)
   escaped := mem.push_bytes_uninit(allocated, capacity)
   used: usize = 0
@@ -1333,25 +1624,40 @@ fn lsp_saved(app: *App, index: usize, slot_index: usize) {
   }
 }
 
-fn lsp_wait_ms(app: *App, fallback: i32) i32 {
-  delay := fallback
-  now := sdl.ticks()
+fn lsp_wait_ms(app:*App, fallback:i32)i32 {
+  delay:=fallback
+  now:=sdl.ticks()
   for index in 0..8 {
-    server := &app.lsp.servers[index]
-    if server.ready {
-      for slot_index in 0..16 {
-        tracked := &server.documents[slot_index]
-        slot := &app.documents.slots[slot_index]
-        if tracked.identity != 0 && slot.document != nil && tracked.identity == slot.identity && tracked.revision != slot.document.revision {
-          remaining: u64 = 0
-          if tracked.changed + #cast(u64, app.config.lsp_change_delay_ms) > now {
-            remaining = tracked.changed + #cast(u64, app.config.lsp_change_delay_ms) - now
-          }
-          if remaining < #cast(u64, delay) {
-            delay = #cast(i32, remaining)
+    server:=&app.lsp.servers[index]
+    if !server.ready {
+      continue
+    }
+    retry:=lsp_allocation_wait(server, now)
+    if retry>=0 {
+      if delay<0 || retry<delay {
+        delay=retry
+      }
+      continue
+    }
+    if server.attach_scan {
+      return 0
+    }
+    slot:=server.dirty_first
+    for slot!=nil {
+      remaining:u64=0
+      if slot.index<#len(server.documents) && slot.document!=nil {
+        tracked:=&server.documents[slot.index]
+        if tracked.identity!=0 && tracked.identity==slot.identity && tracked.revision!=slot.document.revision && tracked.observed==slot.document.revision {
+          due:=tracked.changed+#cast(u64, app.config.lsp_change_delay_ms)
+          if due>now {
+            remaining=due-now
           }
         }
       }
+      if delay<0 || remaining<#cast(u64, delay) {
+        delay=#cast(i32, remaining)
+      }
+      slot=slot.lsp_dirty_next[index]
     }
   }
   return delay
@@ -1361,7 +1667,7 @@ fn lsp_auto_start(app: *App) {
   if app.prompt_state.panel != Panel.None {
     return
   }
-  name := filetype_name(&app.documents.slots[app.documents.active])
+  name := filetype_name(app.documents.slots[app.documents.active])
   index: usize = 0
   // Dyn ships its server in the compiler. Reserve bit 16 after the 16 user
   // language slots so a missing executable only produces one startup failure.

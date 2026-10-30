@@ -49,6 +49,10 @@ fn editor_wait_ms(app: *App, notifications: bool) i32 {
   if !notifications && app.picker_state.watching && delay > 250 {
     delay = 250
   }
+  // Failed watcher allocation needs a retry even when no worker can notify us.
+  if app.disk.retry && delay > 250 {
+    delay = 250
+  }
   if terminals_waiting_for_exit(app) && delay > 16 {
     delay = 16
   }
@@ -72,92 +76,112 @@ fn lsp_running(app: *const App) bool {
   return false
 }
 
-// Service polling, timing and invalidation share one ordered scheduling seam.
+// One ordered service phase, so input can interrupt between independent work.
+// A phase may finish its own transaction; the slice budget is checked afterward.
+fn background_step(app: *App, typography: *Typography, phase: *usize) {
+  started := operation_begin(app)
+  if phase.* == 0 {
+    if app.pointer.hover_due != 0 && sdl.ticks() >= app.pointer.hover_due {
+      app.pointer.hover_due = 0
+      render_request(app, RenderHover)
+    }
+    if config_watch(app, typography) {
+      render_request(app, RenderConfig)
+    }
+    _ = terminal_escape_tick(app)
+    operation_end(app, "config", started)
+  } else if phase.* == 1 {
+    recovery_tick(app)
+    operation_end(app, "recovery", started)
+  } else if phase.* == 2 {
+    if syntax_tick(app) {
+      render_request(app, RenderSyntax)
+    }
+    operation_end(app, "syntax", started)
+  } else if phase.* == 3 {
+    if plugin_tick(app) {
+      render_request(app, RenderPlugin)
+    }
+    operation_end(app, "plugins", started)
+  } else if phase.* == 4 {
+    configured_filetypes(app)
+    lsp_auto_start(app)
+    completion_tick(app)
+    operation_end(app, "language_setup", started)
+  } else if phase.* == 5 {
+    changed := disk_tick(app)
+    if tree_tick(app) {
+      changed = true
+    }
+    if changed {
+      render_request(app, RenderDisk)
+    }
+    operation_end(app, "disk", started)
+  } else if phase.* == 6 {
+    if lsp_tick(app) {
+      render_request(app, RenderLsp)
+    }
+    completion_tick(app)
+    operation_end(app, "lsp", started)
+  } else if phase.* == 7 {
+    changed := format_tick(app)
+    if language_manager_tick(app) {
+      changed = true
+    }
+    save_sequence_tick(app)
+    if changed {
+      render_request(app, RenderFormat)
+    }
+    operation_end(app, "format", started)
+  } else if phase.* == 8 {
+    changed := project_search_tick(app)
+    if picker_index_tick(app) {
+      changed = true
+    }
+    if changed {
+      render_request(app, RenderSearch)
+    }
+    operation_end(app, "search", started)
+  } else if phase.* == 9 {
+    if macro_tick(app, typography) {
+      render_request(app, RenderMacro)
+    }
+    operation_end(app, "macros", started)
+  } else {
+    if terminal_tick(app) {
+      render_request(app, RenderTerminal)
+    }
+    operation_end(app, "terminal", started)
+  }
+  phase.* = (phase.* + 1) % 11
+}
+// Complete-pass seam for explicit callers/tests. The event loop uses slices.
 fn background_tick(app: *App, typography: *Typography) {
-  hover_changed: bool = false
-  if app.pointer.hover_due != 0 && sdl.ticks() >= app.pointer.hover_due {
-    app.pointer.hover_due = 0
-    hover_changed = true
+  phase: usize = 0
+  for true {
+    background_step(app, typography, &phase)
+    if phase == 0 {
+      return
+    }
   }
-  operation_started := operation_begin(app)
-  config_changed := config_watch(app, typography)
-  operation_end(app, "config", operation_started)
-  _ = terminal_escape_tick(app)
-  operation_started = operation_begin(app)
-  recovery_tick(app)
-  operation_end(app, "recovery", operation_started)
-  operation_started = operation_begin(app)
-  syntax_changed := syntax_tick(app)
-  operation_end(app, "syntax", operation_started)
-  operation_started = operation_begin(app)
-  plugin_changed := plugin_tick(app)
-  operation_end(app, "plugins", operation_started)
-  operation_started = operation_begin(app)
-  configured_filetypes(app)
-  lsp_auto_start(app)
-  // Queue due completion with its document update before transport flushing.
-  completion_tick(app)
-  operation_end(app, "language_setup", operation_started)
-  operation_started = operation_begin(app)
-  disk_changed := disk_tick(app)
-  if tree_tick(app) {
-    disk_changed = true
+}
+// Preserve one polled event for the caller; never drain or reorder input.
+// At least one phase progresses after each input paint, including under floods.
+fn background_input_slice(app: *App, typography: *Typography, phase: *usize, event: *sdl.Event) bool {
+  deadline := sdl.ticks() + 2
+  for true {
+    background_step(app, typography, phase)
+    if !app.running {
+      return false
+    }
+    if render_trace_poll(app, event) {
+      return true
+    }
+    if phase.* == 0 || sdl.ticks() >= deadline {
+      return false
+    }
   }
-  operation_end(app, "disk", operation_started)
-  operation_started = operation_begin(app)
-  language_changed := lsp_tick(app)
-  // Consume replies before scheduling completion for the current document.
-  completion_tick(app)
-  operation_end(app, "lsp", operation_started)
-  operation_started = operation_begin(app)
-  format_changed := format_tick(app)
-  if language_manager_tick(app) {
-    format_changed = true
-  }
-  save_sequence_tick(app)
-  operation_end(app, "format", operation_started)
-  operation_started = operation_begin(app)
-  search_changed := project_search_tick(app)
-  if picker_index_tick(app) {
-    search_changed = true
-  }
-  operation_end(app, "search", operation_started)
-  operation_started = operation_begin(app)
-  macro_changed := macro_tick(app, typography)
-  operation_end(app, "macros", operation_started)
-  operation_started = operation_begin(app)
-  terminal_changed := terminal_tick(app)
-  operation_end(app, "terminal", operation_started)
-  if macro_changed {
-    render_request(app, RenderMacro)
-  }
-  if terminal_changed {
-    render_request(app, RenderTerminal)
-  }
-  if syntax_changed {
-    render_request(app, RenderSyntax)
-  }
-  if search_changed {
-    render_request(app, RenderSearch)
-  }
-  if plugin_changed {
-    render_request(app, RenderPlugin)
-  }
-  if language_changed {
-    render_request(app, RenderLsp)
-  }
-  if disk_changed {
-    render_request(app, RenderDisk)
-  }
-  if format_changed {
-    render_request(app, RenderFormat)
-  }
-  if config_changed {
-    render_request(app, RenderConfig)
-  }
-  if hover_changed {
-    render_request(app, RenderHover)
-  }
+  return false
 }
 // Wait between animated frames. With vsync, presenting paces frames to the
 // display, so only the configured floor applies; without it, follow the
@@ -167,10 +191,17 @@ fn animation_interval(app: *const App) u64 {
   if !app.view.vsync && app.view.refresh_ms > interval {
     interval = app.view.refresh_ms
   }
-  return #cast(u64, interval)
+  // A fractional refresh interval must not wake before its deadline.
+  rounded := #cast(u64, interval)
+  if #cast(f32, rounded) < interval {
+    rounded += 1
+  }
+  return rounded
 }
 fn display_refresh(app: *App, window: rawptr) {
-  app.view.refresh_ms = 0.0
+  // Native backends may not expose a monitor mode. Keep timer-only animation
+  // bounded in that case; synchronized presentation still follows the display.
+  app.view.refresh_ms = 1000.0 / 60.0
   mode := sdl.display_mode(sdl.window_display(window))
   if mode != nil && mode.refresh > 1.0 {
     app.view.refresh_ms = 1000.0 / mode.refresh

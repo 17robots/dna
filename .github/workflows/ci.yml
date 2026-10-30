@@ -15,17 +15,33 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Install build dependencies
-        run: pacman -Syu --noconfirm --needed base-devel git curl python cmake ninja clang llvm lld just sdl3 libvterm tree-sitter fontconfig pcre2 libutf8proc ttf-dejavu libxi libxrandr libxss libxtst wayland-protocols libdecor libxkbcommon mesa alsa-lib
+        run: pacman -Syu --noconfirm --needed base-devel bubblewrap git curl python cmake ninja clang llvm lld just libvterm tree-sitter fontconfig pcre2 libutf8proc ttf-dejavu libxi libxrandr libxss libxtst wayland-protocols harfbuzz fribidi freetype2 weston niri libxkbcommon mesa alsa-lib
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Install pinned Dyn compiler
         shell: bash
         run: |
           set -euo pipefail
-          curl --fail --location --retry 3 https://github.com/17robots/dyn/releases/download/v0.1.0-preview.27/dyn-0.1.0-preview.27-linux-x86_64-glibc2.39.tar.gz -o /tmp/dyn.tar.gz
-          echo '81496e7143b3e21765e53dbdc46b403a1cb7c5991d0e7728e40b1fd2dd49d2f6  /tmp/dyn.tar.gz' | sha256sum --check
+          curl --fail --location --retry 3 https://github.com/17robots/dyn/releases/download/v0.1.0-preview.28/dyn-0.1.0-preview.28-linux-x86_64-glibc2.39.tar.gz -o /tmp/dyn.tar.gz
+          echo '8a0fed323e43ea0984f7b672c460c5917c0125e67e58b106d83229969050f2cd  /tmp/dyn.tar.gz' | sha256sum --check
           mkdir -p /opt/dyn
           tar -xzf /tmp/dyn.tar.gz --strip-components=1 -C /opt/dyn
           echo /opt/dyn/bin >> "$GITHUB_PATH"
+      - name: Start isolated native Wayland display
+        shell: bash
+        run: |
+          set -euo pipefail
+          export XDG_RUNTIME_DIR="$(mktemp -d)"
+          chmod 700 "$XDG_RUNTIME_DIR"
+          export WAYLAND_DISPLAY=dna-ci
+          weston --backend=headless --renderer=pixman --socket="$WAYLAND_DISPLAY" --idle-time=0 --log=/tmp/dna-weston.log &
+          for attempt in {1..100}; do
+            if [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then break; fi
+            sleep 0.1
+          done
+          test -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" || { cat /tmp/dna-weston.log; exit 1; }
+          echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> "$GITHUB_ENV"
+          echo "WAYLAND_DISPLAY=$WAYLAND_DISPLAY" >> "$GITHUB_ENV"
+          echo "DNA_SMOKE_TIMEOUT_SECONDS=90" >> "$GITHUB_ENV"
       - name: Formatting
         run: just fmt-check
       - name: Test editor and native boundaries

@@ -5,9 +5,9 @@ struct RegisterState {
   pending: bool,
 }
 
-// One continuous band per selected logical row, aligned to line spacing rather
-// than glyph ink bounds. Newlines inside larger selections extend to the viewport
-// edge; a lone selected newline occupies one cell, like the normal-mode cursor.
+// Paint visual selected regions at line height. Adjacent cells coalesce, while
+// mixed-direction gaps stay unpainted. Selected newlines use virtual space past
+// the visual line end, so extending a band never covers unselected glyphs.
 fn draw_selection(renderer: rawptr, doc: *const buffer.Document, text: *const LineLayout, viewport: TextViewport, typography: *Typography, x: f32, y: f32, scroll_x: f32, scroll_y: f32, right: f32) {
   draw_selection_range(renderer, doc, text, viewport, typography, x, y, scroll_x, scroll_y, right, buffer.start(doc), buffer.end(doc))
   for index in 0..doc.secondary.count {
@@ -22,63 +22,145 @@ fn draw_selection(renderer: rawptr, doc: *const buffer.Document, text: *const Li
     draw_selection_range(renderer, doc, text, viewport, typography, x, y, scroll_x, scroll_y, right, low, high)
   }
 }
-fn draw_selection_range(renderer: rawptr, doc: *const buffer.Document, text: *const LineLayout, viewport: TextViewport, typography: *Typography, x, y, scroll_x, scroll_y, right: f32, low: usize, high: usize) {
-  if low == high {
-    return
+struct SelectionBands {
+  emit: fn(rawptr, *const sdl.Rect) bool,
+  data: rawptr,
+  x, y, height: f32,
+  extent: f32,
+  extent_y: i32,
+  has_extent: bool,
+
+  pending: sdl.Rect,
+  has_pending: bool,
+}
+fn selection_flush(bands:*SelectionBands) bool {
+  if !bands.has_pending {
+    return true
   }
-  at := viewport.start
-  row: usize = 0
-  for at < viewport.end && at < high {
-    ending := buffer.line_end(doc, at)
-    after := ending
-    if after < doc.length {
-      after += 1
+  bands.has_pending=false
+  return bands.emit(bands.data, &bands.pending)
+}
+fn selection_band_add(bands:*SelectionBands, rectangle:sdl.Rect) bool {
+  if rectangle.width<=0.0 {
+    return true
+  }
+  if bands.has_pending && rectangle.y==bands.pending.y && rectangle.height==bands.pending.height && rectangle.x<=bands.pending.x+bands.pending.width+0.01 && bands.pending.x<=rectangle.x+rectangle.width+0.01 {
+    left:=bands.pending.x
+    right:=bands.pending.x+bands.pending.width
+    if rectangle.x<left {
+      left=rectangle.x
     }
-    if low < after && high > at {
-      beginning := at
-      if low > beginning {
-        beginning = low
+    if rectangle.x+rectangle.width>right {
+      right=rectangle.x+rectangle.width
+    }
+    bands.pending.x=left
+    bands.pending.width=right-left
+    return true
+  }
+  if !selection_flush(bands) {
+    return false
+  }
+  bands.pending=rectangle
+  bands.has_pending=true
+  return true
+}
+fn selection_cell(data:rawptr, region:*const ttf.Substring) bool {
+  bands:=#cast(*SelectionBands, data)
+  edge:=#cast(f32, region.x)+#cast(f32, region.width)
+  if !bands.has_extent || region.y>bands.extent_y {
+    bands.extent=edge
+    bands.extent_y=region.y
+    bands.has_extent=true
+  } else if region.y==bands.extent_y && edge>bands.extent {
+    bands.extent=edge
+  }
+  return selection_band_add(bands, sdl.Rect{x:bands.x+#cast(f32, region.x), y:bands.y+#cast(f32, region.y), width:#cast(f32, region.width), height:bands.height})
+}
+struct SelectionExtent {y:i32, value:f32}
+fn selection_extent(data:rawptr, region:*const ttf.Substring) bool {
+  extent:=#cast(*SelectionExtent, data)
+  edge:=#cast(f32, region.x)+#cast(f32, region.width)
+  if region.y==extent.y && edge>extent.value {
+    extent.value=edge
+  }
+  return true
+}
+
+fn selection_paint(data:rawptr, rectangle:*const sdl.Rect) bool {
+  return paint(data, theme().selection) && sdl.fill(data, rectangle)
+}
+fn draw_selection_range(renderer:rawptr, doc:*const buffer.Document, text:*const LineLayout, viewport:TextViewport, typography:*Typography, x, y, scroll_x, scroll_y, right:f32, low, high:usize) {
+  if !selection_regions(doc, text, viewport, typography, x, y, scroll_x, scroll_y, right, low, high, selection_paint, renderer) {
+    #panic("selection regions")
+  }
+}
+// Callback rectangles borrow this traversal and must be copied if retained.
+fn selection_regions(doc:*const buffer.Document, text:*const LineLayout, viewport:TextViewport, typography:*Typography, x, y, scroll_x, scroll_y, right:f32, low, high:usize, emit:fn(rawptr, *const sdl.Rect)bool, data:rawptr) bool {
+  if low>high || high>doc.length || emit==nil {
+    return false
+  }
+  if low==high {
+    return true
+  }
+  at:=viewport.start
+  row:usize=0
+  for at<viewport.end && at<high {
+    ending:=buffer.line_end(doc, at)
+    after:=ending
+    if after<doc.length {
+      after+=1
+    }
+    if low<after && high>at {
+      beginning:=at
+      if low>beginning {
+        beginning=low
       }
-      finish := ending
-      if high < finish {
-        finish = high
+      finish:=ending
+      if high<finish {
+        finish=high
       }
-      first := ttf.Substring{}
-      last := ttf.Substring{}
-      if !layout_substring(text, doc, beginning, &first) {
-        break
+      logical_row:=buffer.row_at(doc, at)
+      if logical_row<text.first_row || logical_row>=text.first_row+text.count {
+        return false
       }
-      left := x - scroll_x
-      if beginning > at {
-        left += #cast(f32, first.x)
+      handle:=text.lines[text.rows[logical_row-text.first_row]].text
+      bands:=SelectionBands{emit:emit, data:data, x:x-scroll_x, y:y+viewport.y+#cast(f32, row)*typography.line-scroll_y, height:typography.line}
+      if !ttf.selection(handle, beginning-at, finish-at, selection_cell, #cast(rawptr, &bands)) {
+        return false
       }
-      edge := right
-      if high <= ending {
-        if !layout_substring(text, doc, finish, &last) {
-          break
+      if high>ending && after>ending {
+        tail:=ttf.Substring{}
+        if !ttf.substring(handle, #cast(i32, ending-at), &tail) {
+          return false
         }
-        edge = x + #cast(f32,
-          last.x) - scroll_x
+        extent:=SelectionExtent{y:tail.y}
+        if beginning==at && finish==ending {
+          if bands.has_extent && bands.extent_y==tail.y {
+            extent.value=bands.extent
+          }
+        } else if !ttf.selection(handle, 0, ending-at, selection_extent, #cast(rawptr, &extent)) {
+          return false
+        }
+        left:=x+extent.value-scroll_x
+        edge:=right
+        if high==low+1 && doc.bytes[low]==10 {
+          edge=left+typography.cell
+        }
+        if !selection_band_add(&bands, sdl.Rect{x:left, y:bands.y+#cast(f32, tail.y), width:edge-left, height:typography.line}) {
+          return false
+        }
       }
-      if high == low + 1 && doc.bytes[low] == 10 {
-        edge = left + typography.cell
-      }
-      if edge < left {
-        swap := edge
-        edge = left
-        left = swap
-      }
-      band := sdl.Rect{x: left, y: y + viewport.y + #cast(f32, row) * typography.line - scroll_y, width: edge - left, height: typography.line}
-      if band.width > 0.0 && (!paint(renderer, theme().selection) || !sdl.fill(renderer, &band)) {
-        #panic("selection band")
+      if !selection_flush(&bands) {
+        return false
       }
     }
-    if after <= at {
+    if after<=at {
       break
     }
-    at = after
-    row += 1
+    at=after
+    row+=1
   }
+  return true
 }
 
 fn draw_extra_cursors(renderer: rawptr, doc: *const buffer.Document, text: *const LineLayout, viewport: TextViewport, typography: *Typography, origin, top, scroll_x, scroll_y: f32, insert: bool) {
@@ -95,8 +177,8 @@ fn draw_extra_cursors(renderer: rawptr, doc: *const buffer.Document, text: *cons
         if insert {
           width = 2.0 * typography.scale
         }
-        left := #cast(f32, substring.x)
-        if buffer.line_start(doc, position) == position {
+        left := text_caret_x(&substring, insert)
+        if buffer.line_start(doc, position) == position && (substring.flags&255)!=5 {
           left = 0.0
         }
         rect := sdl.Rect{x: origin + left - scroll_x, y: top + #cast(f32, (line_at(doc, position) - 1)) * typography.line - scroll_y, width: width, height: typography.points * typography.scale + 5.0 * typography.scale}

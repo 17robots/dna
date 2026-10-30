@@ -1,0 +1,115 @@
+struct CompletionWindowProbe {time:fn(u64), resize:fn(i32, i32), pixels:fn()[]const u8}
+fn completion_window_frame(app:*App, typography:*Typography, renderer, window:rawptr, probe:CompletionWindowProbe, now:u64) sdl.Rect {
+  probe.time(now)
+  app.render_trace.pending=RenderKey
+  draw(renderer, window, app, typography)
+  index:=ui_make_lookup(&app.ui, ui_hash(0, "completion"))
+  if index==0 {
+    #panic("completion fixture missing window")
+  }
+  return app.ui.boxes[index].rect
+}
+fn completion_window_smoke(app:*App, typography:*Typography, renderer, window:rawptr, probe:CompletionWindowProbe) {
+  app.view.reduced_motion=true
+  app.config.popup_transitions=false
+  app.config.smooth_scroll=false
+  app.config.smooth_cursor=false
+  app.view.insert=true
+  probe.resize(960, 640)
+  doc:=app.documents.current
+  _=buffer.load(doc, "al")
+  buffer.move_to(doc, doc.length, false)
+  allocation:=arena_owner.create(65536)
+  parsed:=json.parse(allocation, "[{\"label\":\"alpha\",\"kind\":3,\"detail\":\"fn(i32)\"},{\"label\":\"alpha\",\"kind\":6,\"detail\":\"i32\"}]")
+  if !parsed.ok {
+    #panic("completion fixture JSON")
+  }
+  lsp_results_release(app)
+  state:=&app.lsp.results
+  state.arena=allocation
+  state.owned=true
+  state.kind=1
+  state.active=true
+  state.insert=true
+  state.slot=app.documents.active
+  state.identity=app.documents.slots[app.documents.active].identity
+  state.revision=doc.revision
+  state.position=doc.cursor
+  state.prefix_start=0
+  state.items[0]=parsed.root.first
+  state.items[1]=parsed.root.first.next
+  state.count=2
+  app.prompt_state.panel=Panel.LspResults
+  app.prompt_state.selected=0
+  rect:=completion_window_frame(app, typography, renderer, window, probe, 1000)
+  padding:=app.config.popup_padding*typography.scale
+  if distance(rect.height, typography.line*2.0+padding*2.0)>0.1 {
+    #panic("short completion list must open compactly")
+  }
+  list_key:=ui_child_key("completion", "list")
+  first:=ui_make_lookup(&app.ui, ui_hash_number(list_key, 0))
+  second:=ui_make_lookup(&app.ui, ui_hash_number(list_key, 1))
+  if first==0 || second==0 || first==second {
+    #panic("duplicate completion labels must have separate rows")
+  }
+  hit:=app.ui.boxes[second].rect
+  clicked:=ui_hit(&app.ui, hit.x+hit.width*0.5, hit.y+hit.height*0.5)
+  if clicked!=second || app.ui.boxes[clicked].value!=1 {
+    #panic("duplicate row clicks must select the correct suggestion")
+  }
+  if !buffer.equal(completion_kind(state.items[0]), "fn") || !buffer.equal(completion_kind(state.items[1]), "var") {
+    #panic("completion kind badges")
+  }
+  state.count=1
+  narrow:=completion_window_frame(app, typography, renderer, window, probe, 1010)
+  if narrow.width!=rect.width || narrow.height!=rect.height {
+    #panic("filtering must retain the popup session size")
+  }
+  _=buffer.load(doc, "alp")
+  buffer.move_to(doc, doc.length, false)
+  state.position=doc.cursor
+  state.revision=doc.revision
+  typed:=completion_window_frame(app, typography, renderer, window, probe, 1020)
+  if distance(typed.x, rect.x)>0.1 {
+    #panic("typing must keep completion anchored to the word prefix")
+  }
+  app.prompt_state.panel=Panel.None
+  probe.time(1100)
+  draw(renderer, window, app, typography)
+  lines:[256]u8=[]
+  used:usize=0
+  for row in 0..25 {
+    add_text(lines[..], &used, "x\n")
+  }
+  add_text(lines[..], &used, "al")
+  _=buffer.load(doc, lines[..used])
+  buffer.move_to(doc, doc.length, false)
+  state.position=doc.cursor
+  state.revision=doc.revision
+  state.prefix_start=doc.cursor-2
+  state.count=20
+  for row in 0..20 {
+    state.items[row]=parsed.root.first
+  }
+  app.prompt_state.panel=Panel.LspResults
+  app.prompt_state.selected=19
+  probe.resize(500, 260)
+  compact:=completion_window_frame(app, typography, renderer, window, probe, 1200)
+  pane:=app.view.panes[app.view.focused].rect
+  if compact.x<#cast(f32, pane.x) || compact.x+compact.width>#cast(f32, pane.x+pane.width) || compact.y<#cast(f32, pane.y) || compact.y+compact.height>#cast(f32, pane.y+pane.height) {
+    #panic("completion must fit small panes")
+  }
+  selected:=ui_make_lookup(&app.ui, ui_hash_number(list_key, 19))
+  if selected==0 {
+    #panic("selected completion must be virtualized into view")
+  }
+  selected_rect:=app.ui.boxes[selected].rect
+  if selected_rect.y<compact.y+padding-0.1 || selected_rect.y+selected_rect.height>compact.y+compact.height-padding+0.1 {
+    #panic("selected completion must be fully visible")
+  }
+  key_input(app, typography, KeyEscape, 0)
+  if app.view.insert || completion_visible(app) {
+    #panic("completion Escape must still enter normal mode immediately")
+  }
+  app.running=false
+}

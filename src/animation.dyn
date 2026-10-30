@@ -21,11 +21,24 @@ struct Animation {
   height: i32,
   panel: Panel,
   texture: rawptr,
+  tree_geometry: motion.Rectangle,
+  surfaces_ready, resized: bool,
+  geometry_elapsed: f32,
+  geometry_active, geometry_retargeted: bool,
+  surface_geometry: [8]motion.Rectangle,
+  surface_seen: [8]u64,
+  explorer_closing: bool,
 }
 
 fn animation_begin(app: *App, typography: *Typography, width: i32, height: i32) {
   state := &app.view.animation
   ticks := sdl.ticks()
+  state.geometry_elapsed = 8.0
+  if state.geometry_active && ticks >= state.frame {
+    state.geometry_elapsed = #cast(f32, ticks - state.frame)
+  }
+  state.geometry_active = false
+  state.geometry_retargeted = false
   if state.epoch == 0 {
     state.epoch = ticks
   }
@@ -33,6 +46,7 @@ fn animation_begin(app: *App, typography: *Typography, width: i32, height: i32) 
   state.now = #cast(f32, (ticks - state.epoch))
   state.frame = ticks
   state.active = false
+  state.resized = state.width != width || state.height != height
   state.reset = app.view.reduced_motion || state.document != app.documents.current || state.view_revision != app.view.revision || state.line != typography.line || state.width != width || state.height != height
   if state.width != width || state.height != height {
     if state.texture != nil {
@@ -45,6 +59,125 @@ fn animation_begin(app: *App, typography: *Typography, width: i32, height: i32) 
   state.line = typography.line
   state.width = width
   state.height = height
+}
+fn surface_motion_enabled(app: *const App) bool {
+  return !sdl.tui_active() && !app.view.reduced_motion && app.config.popup_transitions && app.config.popup_animation_ms > 0.0 && !app.pointer.dragging
+}
+fn rectangle_edges(rect: sdl.PixelRect) [4]f32 {
+  return [#cast(f32, rect.x), #cast(f32, rect.y), #cast(f32, rect.x + rect.width), #cast(f32, rect.y + rect.height)]
+}
+fn animated_rectangle(app: *App, state: *motion.Rectangle, target: sdl.PixelRect) sdl.PixelRect {
+  edges := rectangle_edges(target)
+  changed := !state.ready
+  for axis in 0..4 {
+    if edges[axis] != state.target[axis] {
+      changed = true
+    }
+  }
+  answering := (app.render_trace.pending & (RenderKey | RenderText | RenderMouse | RenderIme | RenderWindow)) != 0
+  immediate := !surface_motion_enabled(app) || !app.view.animation.surfaces_ready || app.view.animation.resized || (state.active && !changed && !app.view.animation.geometry_retargeted && answering)
+  rate: f32 = 70.0
+  if app.config.popup_animation_ms > 0.0 {
+    rate = 2800.0 / app.config.popup_animation_ms
+  }
+  motion.rectangle_step(state, edges, app.view.animation.now, app.view.animation.geometry_elapsed, rate, immediate)
+  if state.active {
+    app.view.animation.active = true
+    app.view.animation.geometry_active = true
+  }
+  left := #cast(i32, state.current[0] + 0.5)
+  top := #cast(i32, state.current[1] + 0.5)
+  right := #cast(i32, state.current[2] + 0.5)
+  bottom := #cast(i32, state.current[3] + 0.5)
+  return sdl.PixelRect{x: left, y: top, width: right - left, height: bottom - top}
+}
+// The explorer expands from its left edge; other floating surfaces settle
+// from a slight centered squish. Docks grow from
+// their outer edge with the editor's moving boundary. Current rectangles own
+// both UI layout and placement handles throughout the motion.
+fn animated_surface(app: *App, surface: usize, target: sdl.Rect, scale: f32) sdl.Rect {
+  if surface >= 8 {
+    return target
+  }
+  animation := &app.view.animation
+  state := &animation.surface_geometry[surface]
+  seen := animation.surface_seen[surface]
+  opening := !state.ready || (seen != app.ui.frame && seen + 1 != app.ui.frame)
+  enabled := surface_motion_enabled(app) && animation.surfaces_ready && !animation.resized
+  place := place_of(app, surface)
+  docked := place.mode == settings.PlaceDock
+  edges: [4]f32 = [target.x, target.y, target.x + target.width, target.y + target.height]
+  if docked {
+    // editor_area converts these same strip boundaries to PixelRect targets.
+    for axis in 0..4 {
+      edges[axis] = #cast(f32, #cast(i32, edges[axis]))
+    }
+  }
+  if opening {
+    initial := edges
+    if enabled {
+      if docked {
+        if place.side == 0 {
+          initial[2] = initial[0]
+        }
+        else if place.side == 1 {
+          initial[0] = initial[2]
+        }
+        else if place.side == 2 {
+          initial[3] = initial[1]
+        }
+        else {
+          initial[1] = initial[3]
+        }
+      } else if surface == SurfaceExplorer {
+        initial[2] = initial[0]
+      } else {
+        inset_x := target.width * 0.025
+        inset_y := target.height * 0.05
+        if inset_x > 12.0 * scale {
+          inset_x = 12.0 * scale
+        }
+        if inset_y > 16.0 * scale {
+          inset_y = 16.0 * scale
+        }
+        initial[0] += inset_x
+        initial[2] -= inset_x
+        initial[1] += inset_y
+        initial[3] -= inset_y
+      }
+    }
+    motion.rectangle_seed(state, initial, animation.now)
+  }
+  animation.surface_seen[surface] = app.ui.frame
+  answering := (app.render_trace.pending & (RenderKey | RenderText | RenderMouse | RenderIme | RenderWindow)) != 0
+  immediate := !enabled || (!opening && seen != app.ui.frame && answering)
+  rate: f32 = 70.0
+  if app.config.popup_animation_ms > 0.0 {
+    rate = 2800.0 / app.config.popup_animation_ms
+  }
+  elapsed := animation.geometry_elapsed
+  if !opening && seen == app.ui.frame {
+    elapsed = 0.0
+  }
+  motion.rectangle_step(state, edges, animation.now, elapsed, rate, immediate)
+  if state.active {
+    animation.active = true
+    animation.geometry_active = true
+  }
+  left := state.current[0]
+  top := state.current[1]
+  right := state.current[2]
+  bottom := state.current[3]
+  if docked {
+    left = #cast(f32, #cast(i32, left + 0.5))
+    top = #cast(f32, #cast(i32, top + 0.5))
+    right = #cast(f32, #cast(i32, right + 0.5))
+    bottom = #cast(f32, #cast(i32, bottom + 0.5))
+  }
+  result := sdl.Rect{x: left, y: top, width: right - left, height: bottom - top}
+  placed_rects[surface] = result
+  placed_frames[surface] = app.ui.frame
+  return result
 }
 fn animated_value(app: *App, tween: *motion.Tween, target: f32, duration: f32, reset: bool) f32 {
   value := motion.move(tween, target, app.view.animation.now, duration, reset || app.view.reduced_motion || duration <= 0.0)
@@ -74,6 +207,10 @@ fn cursor_step_snaps(x: *const motion.Tween, y: *const motion.Tween, target_x: f
   if !x.ready || !y.ready {
     return true
   }
+  // No new cursor step: let an existing jump decoration finish naturally.
+  if target_x == x.target && target_y == y.target {
+    return false
+  }
   rows := distance(target_y, y.target)
   if rows > line * 1.5 {
     return false
@@ -92,8 +229,8 @@ fn corner_y(index: usize, height: f32) f32 {
   }
   return 0.0
 }
-// Draws the stretched cursor while a jump is in flight and returns true;
-// returns false when the caller should draw the plain rectangle.
+// Draws the optional stretched decoration while a jump is in flight. The
+// caller always draws the primary caret at its logical destination too.
 fn draw_cursor_trail(renderer: rawptr, app: *App, trail: *CursorTrail, target: sdl.Rect, snap: bool, color: Rgb) bool {
   size := app.config.cursor_trail_size
   duration := app.config.cursor_animation_ms
@@ -158,6 +295,17 @@ fn draw_cursor_trail(renderer: rawptr, app: *App, trail: *CursorTrail, target: s
   }
   return true
 }
+// Editing must remain visible in the rendered viewport, even while its scroll
+// target is approaching smoothly. Preserve the other axis and its momentum.
+fn editing_scroll_visible(view: *AnimatedView, caret_x, caret_y, cell, line, width, height, target_x, target_y: f32) {
+  if caret_x < view.x.value || caret_x + cell > view.x.value + width {
+    motion.snap(&view.x, target_x)
+  }
+  if caret_y < view.y.value || caret_y + line > view.y.value + height {
+    motion.snap(&view.y, target_y)
+  }
+}
+
 fn animated_scroll(app: *App, view: *AnimatedView, x: f32, y: f32, height: f32, reset: bool) {
   reset = reset || !app.config.smooth_scroll
   // Long jumps land near their destination, avoiding a tour through the file.
@@ -170,23 +318,46 @@ fn animated_scroll(app: *App, view: *AnimatedView, x: f32, y: f32, height: f32, 
     motion.snap(&view.cursor_y, 0.0)
     view.cursor_y.ready = false
   }
-  // One or two lines of scroll (the cursor pushing an edge) snap; pages glide.
+  // New one- or two-line steps (the cursor pushing an edge) snap; pages glide.
+  // An unchanged target must continue its transition on subsequent frames.
   line := app.view.animation.line
-  near_y := view.y.ready && distance(y, view.y.target) <= line * 2.0
-  near_x := view.x.ready && distance(x, view.x.target) <= line * 2.0
+  near_y := view.y.ready && y != view.y.target && distance(y, view.y.target) <= line * 2.0
+  near_x := view.x.ready && x != view.x.target && distance(x, view.x.target) <= line * 2.0
   _ = animated_follow(app, &view.x, x, app.config.scroll_animation_ms, reset || near_x)
   _ = animated_follow(app, &view.y, y, app.config.scroll_animation_ms, reset || near_y)
 }
 fn measure_position(doc: *const buffer.Document, typography: *Typography, position: usize) ttf.Substring {
   beginning := buffer.line_start(doc, position)
   ending := buffer.line_end(doc, position)
-  // SDL_ttf interprets length 0 as strlen; use a real empty string for blank lines.
+  geometry:=&typography.caret_geometry
+  owner:*PaneText=nil
+  if typography.current_pane<15 && typography.pane_text[typography.current_pane].caret==typography.caret_text {
+    owner=&typography.pane_text[typography.current_pane]
+    geometry=&owner.caret_geometry
+  }
+  if geometry.ready && geometry.text==typography.caret_text && typography.caret_document==doc && typography.caret_revision!=doc.revision && typography.caret_start==beginning && typography.caret_end==ending && (owner==nil || (owner.caret_document==doc && owner.caret_revision==typography.caret_revision && owner.caret_start==beginning && owner.caret_end==ending)) {
+    changed_line:=buffer.changes_since(doc, typography.caret_revision)
+    if changed_line.found && changed_line.low>ending {
+      typography.caret_revision=doc.revision
+      if owner!=nil {
+        owner.caret_revision=doc.revision
+      }
+    }
+  }
+  changed:=!geometry.ready || geometry.text!=typography.caret_text || typography.caret_document!=doc || typography.caret_revision!=doc.revision || typography.caret_start!=beginning || typography.caret_end!=ending
+  if owner!=nil && (owner.caret_document!=doc || owner.caret_revision!=doc.revision || owner.caret_start!=beginning || owner.caret_end!=ending) {
+    changed=true
+  }
+  if !changed && geometry.position==position {
+    return geometry.value
+  }
+  // the native text backend interprets length 0 as strlen; use a real empty string for blank lines.
   empty: [1]u8 = [0]
   bytes := &doc.bytes[beginning]
   if beginning == ending {
     bytes = &empty[0]
   }
-  if typography.caret_document != doc || typography.caret_revision != doc.revision || typography.caret_start != beginning || typography.caret_end != ending {
+  if changed {
     if !ttf.set(typography.caret_text, bytes, ending - beginning) {
       #panic("caret line update")
     }
@@ -196,8 +367,18 @@ fn measure_position(doc: *const buffer.Document, typography: *Typography, positi
     typography.caret_end = ending
   }
   caret := ttf.Substring{}
+  typography.caret_queries+=1
   if !ttf.substring(typography.caret_text, #cast(i32, (position - beginning)), &caret) {
     #panic("caret geometry")
+  }
+  geometry.*=CaretGeometry{value:caret, text:typography.caret_text, position:position, ready:true}
+  if owner!=nil {
+    // The explorer can temporarily measure through the focused caret object.
+    // Record its actual source so restoring a pane cannot assume stale text.
+    owner.caret_document=typography.caret_document
+    owner.caret_revision=typography.caret_revision
+    owner.caret_start=typography.caret_start
+    owner.caret_end=typography.caret_end
   }
   return caret
 }
@@ -218,9 +399,42 @@ fn popup_begin(renderer: rawptr, app: *App) {
 fn popup_shown(app: *const App) bool {
   return app.prompt_state.panel != Panel.None && !(app.prompt_state.panel == Panel.Tree && tree_docked(app))
 }
+// Retain only the last painted layer while the explorer retracts. Its input
+// panel is already closed; subsequent input can finish this decoration.
+fn explorer_exit(app: *App, showing: bool) sdl.PixelRect {
+  animation := &app.view.animation
+  state := &animation.surface_geometry[SurfaceExplorer]
+  starting := !showing && animation.panel == Panel.Directory && !animation.explorer_closing
+  enabled := surface_motion_enabled(app) && !animation.resized
+  if showing || !enabled {
+    animation.explorer_closing = false
+  }
+  if starting && enabled && state.ready {
+    animation.explorer_closing = true
+  }
+  if !animation.explorer_closing {
+    return sdl.PixelRect{}
+  }
+  edges := state.target
+  edges[2] = edges[0]
+  answering := (app.render_trace.pending & (RenderKey | RenderText | RenderMouse | RenderIme | RenderWindow)) != 0
+  rate: f32 = 70.0
+  if app.config.popup_animation_ms > 0.0 {
+    rate = 2800.0 / app.config.popup_animation_ms
+  }
+  motion.rectangle_step(state, edges, animation.now, animation.geometry_elapsed, rate, !starting && answering)
+  animation.explorer_closing = state.active
+  if state.active {
+    animation.active = true
+    animation.geometry_active = true
+  }
+  return sdl.PixelRect{x:#cast(i32, state.current[0]), y:#cast(i32, state.current[1]), width:#cast(i32, state.current[2]-state.current[0]+0.5), height:#cast(i32, state.current[3]-state.current[1]+0.5)}
+}
+
 fn popup_present(renderer: rawptr, app: *App) {
   state := &app.view.animation
   showing := popup_shown(app)
+  closing := explorer_exit(app, showing)
   if !state.popup.ready {
     motion.snap(&state.popup, 0.0)
   }
@@ -237,7 +451,11 @@ fn popup_present(renderer: rawptr, app: *App) {
     if !sdl.target(renderer, nil) {
       #panic("popup target reset")
     }
-    if opacity > 0.0 {
+    if closing.width > 0 && closing.height > 0 {
+      if !sdl.clip(renderer, &closing) || !sdl.texture_alpha(state.texture, 255) || !sdl.render_texture(renderer, state.texture, nil, nil) || !sdl.clip(renderer, nil) {
+        #panic("explorer exit composite")
+      }
+    } else if opacity > 0.0 {
       if !sdl.texture_alpha(state.texture, #cast(u8, (opacity * 255.0))) || !sdl.render_texture(renderer, state.texture, nil, nil) {
         #panic("popup composite")
       }
@@ -250,4 +468,13 @@ fn release_popup(app: *App) {
   if app.view.animation.texture != nil {
     sdl.destroy_texture(app.view.animation.texture)
   }
+}
+
+// Insert carets follow the logical leading edge; block cursors cover glyphs.
+fn text_caret_x(hit:*const ttf.Substring, insert:bool) f32 {
+  x:=#cast(f32, hit.x)
+  if insert && (hit.flags&255)==5 {
+    x+=#cast(f32, hit.width)
+  }
+  return x
 }

@@ -1,37 +1,43 @@
-// Linux/glibc synchronization. Use pthread threads: std/thread's raw clone
-// does not establish the TLS required by libc and the linked C libraries.
-// Opaque layouts are checked by the native ABI test before linking.
+// Portable SDK synchronization with pthread-backed threads on this Linux host.
+// Threads retain libc TLS for the linked C libraries; mutexes, conditions and
+// one-time initialization no longer expose pthread object layouts.
 #link("pthread")
-struct NativeMutex { storage: [5]u64 }
-struct NativeCondition { storage: [6]u64 }
-struct NativeTimespec { seconds: i64, nanoseconds: i64 }
-struct NativeThread { handle: usize, entry: fn(rawptr) i32, state: rawptr, result: i32, finished: native_atomic.AtomicU32, retired_next: *NativeThread }
-extern fn sync_mutex_init "pthread_mutex_init"(lock: rawptr, attributes: rawptr) i32
-extern fn sync_mutex_destroy "pthread_mutex_destroy"(lock: rawptr) i32
-extern fn sync_mutex_lock "pthread_mutex_lock"(lock: rawptr) i32
-extern fn sync_mutex_unlock "pthread_mutex_unlock"(lock: rawptr) i32
-extern fn sync_condition_init "pthread_cond_init"(condition: rawptr, attributes: rawptr) i32
-extern fn sync_condition_destroy "pthread_cond_destroy"(condition: rawptr) i32
-extern fn sync_condition_wait "pthread_cond_wait"(condition: rawptr, lock: rawptr) i32
-extern fn sync_condition_signal "pthread_cond_signal"(condition: rawptr) i32
+type NativeMutex = sync.Mutex
+type NativeCondition = sync.Condition
+struct NativeThread { handle: usize, entry: fn(rawptr) i32, state: rawptr, result: i32, finished: sync.AtomicU32, retired_next: *NativeThread }
+fn sync_mutex_init(lock: rawptr, attributes: rawptr) i32 {
+  #cast(*NativeMutex, lock).* = sync.mutex()
+  return 0
+}
+fn sync_mutex_destroy(lock: rawptr) i32 {
+  return 0
+}
+fn sync_mutex_lock(lock: rawptr) i32 {
+  sync.lock(#cast(*NativeMutex, lock))
+  return 0
+}
+fn sync_mutex_unlock(lock: rawptr) i32 {
+  sync.unlock(#cast(*NativeMutex, lock))
+  return 0
+}
+fn sync_condition_init(condition: rawptr, attributes: rawptr) i32 {
+  #cast(*NativeCondition, condition).* = sync.condition()
+  return 0
+}
+fn sync_condition_destroy(condition: rawptr) i32 {
+  return 0
+}
+fn sync_condition_wait(condition: rawptr, lock: rawptr) i32 {
+  sync.condition_wait(#cast(*NativeCondition, condition), #cast(*NativeMutex, lock))
+  return 0
+}
+fn sync_condition_signal(condition: rawptr) i32 {
+  sync.condition_signal(#cast(*NativeCondition, condition))
+  return 0
+}
 extern fn sync_thread_create "pthread_create"(thread: *usize, attributes: rawptr, entry: fn(rawptr) rawptr, state: rawptr) i32
 extern fn sync_thread_join "pthread_join"(thread: usize, result: rawptr) i32
 extern fn sync_thread_self "pthread_self"() usize
-extern fn sync_clock "clock_gettime"(clock: i32, result: *NativeTimespec) i32
-sync_clock_lock: NativeMutex = NativeMutex{}
-sync_clock_start: u64 = 0
-pub fn dna_ticks() u64 {
-  _ = sync_mutex_lock(#cast(rawptr, &sync_clock_lock))
-  now: NativeTimespec = NativeTimespec{}
-  _ = sync_clock(1, &now)
-  milliseconds := #cast(u64, now.seconds) * 1000 + #cast(u64, now.nanoseconds) / 1000000
-  if sync_clock_start == 0 {
-    sync_clock_start = milliseconds
-  }
-  start := sync_clock_start
-  _ = sync_mutex_unlock(#cast(rawptr, &sync_clock_lock))
-  return milliseconds - start
-}
 pub fn dna_mutex_create() rawptr {
   lock := #cast(rawptr, rec_malloc(#sizeof(NativeMutex)))
   if lock != nil && sync_mutex_init(lock, nil) != 0 {
@@ -75,7 +81,7 @@ pub fn dna_condition_signal(condition: rawptr) {
 fn sync_run(pointer: rawptr) rawptr {
   thread := #cast(*NativeThread, pointer)
   thread.result = thread.entry(thread.state)
-  native_atomic.store_u32(&thread.finished, 1)
+  sync.store_u32(&thread.finished, 1)
   return nil
 }
 // Only successfully joined records may be freed. On a persistent join
@@ -122,9 +128,8 @@ pub fn dna_thread_join(pointer: rawptr, status: *i32) {
   }
   joined := sync_thread_join(thread.handle, nil) == 0
   if !joined {
-    for native_atomic.load_u32(&thread.finished) == 0 {
-      delay := NativeTimespec{nanoseconds: 1000000}
-      _ = #syscall(35, &delay, 0)
+    for sync.load_u32(&thread.finished) == 0 {
+      _ = time.sleep(time.Millisecond)
     }
     joined = sync_thread_join(thread.handle, nil) == 0
   }
@@ -146,8 +151,7 @@ pub fn dna_thread_join(pointer: rawptr, status: *i32) {
 // Dyn's current executable entry point does not run archive .init_array
 // constructors. Keep adapter globals zero-initialized and establish nonzero
 // defaults on first use, for both shared and static consumers of the same ABI.
-extern fn native_call_once "pthread_once"(once: *i32, initialize: fn()) i32
-native_initialized: i32 = 0
+native_initialized: sync.Once = sync.Once{}
 fn native_defaults() {
   notify_queue = -1
   notify_stop_fd = -1
@@ -157,5 +161,8 @@ fn native_defaults() {
   terminal_callbacks = TermCallbacks{property: terminal_property, pushline: terminal_pushline}
 }
 fn native_initialize() {
-  _ = native_call_once(&native_initialized, native_defaults)
+  if sync.once_begin(&native_initialized) {
+    native_defaults()
+    sync.once_complete(&native_initialized)
+  }
 }

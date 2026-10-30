@@ -1,0 +1,156 @@
+// Only the standalone native driver supplies deterministic time and readback.
+struct SurfaceEntranceProbe { time:fn(u64), pixels:fn()[]const u8, resize:fn(i32, i32) }
+fn surface_entrance_draw(app:*App, typography:*Typography, renderer, window:rawptr, probe:SurfaceEntranceProbe, now:u64, cause:u32) {
+  probe.time(now)
+  app.render_trace.pending=cause
+  draw(renderer, window, app, typography)
+}
+fn surface_entrance_smoke(app:*App, typography:*Typography, renderer, window:rawptr, probe:SurfaceEntranceProbe) {
+  app.prompt_state.panel=Panel.None
+  app.config.popup_animation_ms=40.0
+  app.config.popup_transitions=true
+  app.config.smooth_cursor=false
+  app.config.smooth_scroll=false
+  app.view.reduced_motion=false
+  app.config.explorer_icons=false
+  probe.resize(960, 640)
+  text:[200]u8=[]
+  for i in 0..200 {
+    text[i]='W'
+  }
+  _=buffer.load(app.documents.current, text[..])
+  buffer.move_to(app.documents.current, 200, false)
+  surface_entrance_draw(app, typography, renderer, window, probe, 1000, 0)
+  if app.view.panes[0].geometry.active || app.view.panes[0].rect.width!=960 {
+    #panic("startup geometry must be immediate")
+  }
+  pane_split(app, true)
+  right:=app.view.focused
+  pane_direction(app, KeyH)
+  if app.view.focused==right {
+    #panic("split keyboard navigation before first paint follows wrong geometry")
+  }
+  pane_direction(app, KeyL)
+  surface_entrance_draw(app, typography, renderer, window, probe, 1000, RenderKey)
+  first:=app.view.panes[0].first
+  second:=app.view.panes[0].second
+  a:=app.view.panes[first].rect
+  b:=app.view.panes[second].rect
+  if b.width<=0 || b.width>=480 || !app.view.panes[second].geometry.active {
+    #panic("split must grow spatially from shared edge")
+  }
+  if a.x+a.width!=b.x || b.x+b.width!=960 {
+    #panic("first split frame has gap or overlap")
+  }
+  camera_x:=app.view.scroll_x
+  surface_entrance_draw(app, typography, renderer, window, probe, 1016, RenderAnimation)
+  next:=app.view.panes[second].rect
+  if next.width<=b.width || next.width>=480 {
+    #panic("split geometry must advance without restart")
+  }
+  if app.view.panes[first].rect.x+app.view.panes[first].rect.width!=next.x {
+    #panic("moving split boundary diverged")
+  }
+  if app.view.scroll_x!=camera_x {
+    #panic("intermediate narrow pane permanently changed camera")
+  }
+  surface_entrance_draw(app, typography, renderer, window, probe, 1400, RenderAnimation)
+  if app.view.panes[first].geometry.active || app.view.panes[second].geometry.active || app.view.panes[second].rect.width!=480 {
+    #panic("split geometry must settle exactly")
+  }
+  pixels:=probe.pixels()
+  owner:=arena_owner.create(#len(pixels)+128)
+  defer arena_owner.release(owner)
+  saved:=mem.push_bytes_uninit(owner, #len(pixels))
+  _=mem.copy(saved, pixels)
+  app.view.reduced_motion=true
+  surface_entrance_draw(app, typography, renderer, window, probe, 1400, 0)
+  if !buffer.equal(saved, probe.pixels()) {
+    #panic("settled geometry differs from immediate rendering")
+  }
+  app.view.reduced_motion=false
+  pane_close(app)
+  surface_entrance_draw(app, typography, renderer, window, probe, 1500, RenderKey)
+  if app.view.panes[0].rect.width<=480 || app.view.panes[0].rect.width>=960 {
+    #panic("closing split must expand survivor smoothly")
+  }
+  surface_entrance_draw(app, typography, renderer, window, probe, 1800, RenderAnimation)
+  pane_split(app, false)
+  surface_entrance_draw(app, typography, renderer, window, probe, 1900, RenderKey)
+  if !app.view.panes[app.view.focused].geometry.active {
+    #panic("stacked split must move")
+  }
+  app.view.insert=true
+  text_input(app, "x")
+  surface_entrance_draw(app, typography, renderer, window, probe, 1901, RenderText)
+  for index in 0..15 {
+    pane:=&app.view.panes[index]
+    if pane.used && (pane.geometry.active || pane.rect.height!=pane.target_rect.height) {
+      #panic("genuine input must finish existing pane geometry")
+    }
+  }
+  for mode in 0..4 {
+    pane_only(app)
+    app.view.reduced_motion=mode==0
+    app.config.popup_transitions=mode!=1
+    app.config.popup_animation_ms=40.0
+    if mode==2 {
+      app.config.popup_animation_ms=0.0
+    }
+    app.pointer.dragging=mode==3
+    pane_split(app, true)
+    surface_entrance_draw(app, typography, renderer, window, probe, 2100+#cast(u64, mode)*400, RenderKey)
+    if app.view.panes[app.view.focused].geometry.active {
+      #panic("motion opt-out still animates geometry")
+    }
+  }
+  app.pointer.dragging=false
+  app.view.reduced_motion=false
+  app.config.popup_transitions=true
+  app.config.popup_animation_ms=40.0
+  pane_only(app)
+  surface_entrance_draw(app, typography, renderer, window, probe, 4000, RenderText)
+  // Every dock side shares its moving boundary with the editor area.
+  app.config.explorer_style=1
+  for side in 0..4 {
+    app.tree=TreeState{}
+    app.prompt_state.panel=Panel.None
+    surface_entrance_draw(app, typography, renderer, window, probe, 4100+#cast(u64, side)*1000, RenderText)
+    app.config.places[SurfaceExplorer]=settings.Placement{mode:settings.PlaceDock, side:#cast(u8, side), size:0.25}
+    app.tree.open=true
+    app.tree.loaded=true
+    app.tree.root_length=copy_text(app.tree.root[..], "/geometry-fixture")
+    app.tree.names_used=copy_text(app.tree.names[..], "example.dyn")
+    app.tree.nodes[0]=TreeNode{offset:0, length:11}
+    app.tree.count=1
+    app.prompt_state.panel=Panel.Tree
+    surface_entrance_draw(app, typography, renderer, window, probe, 4200+#cast(u64, side)*1000, RenderKey)
+    if !app.view.animation.tree_geometry.active {
+      #panic("docked explorer must expand spatially")
+    }
+    rect:=app.tree.rect
+    editor:=app.view.panes[0].rect
+    if side==0 && #cast(i32, rect.x+rect.width)!=editor.x {
+      #panic("left dock shared boundary")
+    }
+    if side==1 && editor.x+editor.width!=#cast(i32, rect.x) {
+      #panic("right dock shared boundary")
+    }
+    if side==2 && #cast(i32, rect.y+rect.height)!=editor.y {
+      #panic("top dock shared boundary")
+    }
+    if side==3 && editor.y+editor.height!=#cast(i32, rect.y) {
+      #panic("bottom dock shared boundary")
+    }
+    surface_entrance_draw(app, typography, renderer, window, probe, 4500+#cast(u64, side)*1000, RenderAnimation)
+    if app.view.animation.tree_geometry.active {
+      #panic("docked geometry must settle")
+    }
+  }
+  probe.resize(1000, 700)
+  surface_entrance_draw(app, typography, renderer, window, probe, 9000, RenderWindow)
+  if app.view.panes[0].geometry.active {
+    #panic("window resize must snap geometry")
+  }
+  app.running=false
+}

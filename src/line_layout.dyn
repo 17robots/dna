@@ -5,6 +5,7 @@ const LineSlots: usize = 256
 
 struct LineText { text: rawptr, hash: u64, length: usize, used: bool }
 struct LineLayout {
+  builds:u64,
   lines: [256]LineText,
   // Pool slot drawn on each visible row.
   rows: [256]usize,
@@ -38,9 +39,19 @@ fn line_bytes(doc: *const buffer.Document, row: usize) []const u8 {
 }
 // Bring the visible rows up to date. Returns the number of lines shaped.
 fn line_layout_update(typography: *Typography, layout: *LineLayout, doc: *const buffer.Document, identity: u64, viewport: TextViewport) usize {
-  if layout.document == doc && layout.identity == identity && layout.revision == doc.revision && layout.start == viewport.start && layout.end == viewport.end && layout.line == typography.line {
-    return 0
+  if layout.document == doc && layout.identity == identity && layout.start == viewport.start && layout.end == viewport.end && layout.line == typography.line {
+    if layout.revision == doc.revision {
+      return 0
+    }
+    changed:=buffer.changes_since(doc, layout.revision)
+    // The journal's common prefix proves every edit was strictly after these
+    // complete visible lines. Boundary edits and missing history rebuild.
+    if changed.found && changed.low>layout.end {
+      layout.revision=doc.revision
+      return 0
+    }
   }
+  layout.builds+=1
   first := buffer.row_at(doc, viewport.start)
   count: usize = 0
   for count < LineSlots && first + count < doc.line_count && (count == 0 || buffer.row_start(doc, first + count) < viewport.end) {
@@ -84,7 +95,7 @@ fn line_layout_update(typography: *Typography, layout: *LineLayout, doc: *const 
       }
     }
     bytes := line_bytes(doc, first + index)
-    // SDL_ttf reads length 0 as a C string; give empty lines a real one.
+    // the native text backend reads length 0 as a C string; give empty lines a real one.
     empty: [1]u8 = [0]
     source: *const u8 = &empty[0]
     if #len(bytes) > 0 {
@@ -116,7 +127,7 @@ fn line_layout_draw(layout: *LineLayout, color: Rgb, x: f32, y: f32) {
   }
 }
 // Geometry of a document position, relative to the first visible row, like
-// TTF_GetTextSubString on the old whole-viewport text object.
+// the old whole-viewport substring query.
 fn layout_substring(layout: *const LineLayout, doc: *const buffer.Document, position: usize, output: *ttf.Substring) bool {
   row := buffer.row_at(doc, position)
   if row < layout.first_row || row >= layout.first_row + layout.count {

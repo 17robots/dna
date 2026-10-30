@@ -35,9 +35,58 @@ pub struct SavedPane {
 pub struct State {
   project: []const u8,
   buffers: [16]SavedBuffer,
+  additional: []SavedBuffer,
+  storage: *mem.Arena,
   panes: [15]SavedPane,
   active: usize,
   focused: usize,
+}
+// Preserve the inline legacy representation while growing snapshots as needed.
+pub fn buffer_count(state: *const State) usize {
+  return 16 + #len(state.additional)
+}
+pub fn buffer_at(state: *const State, index: usize) *const SavedBuffer {
+  if index < 16 {
+    return &state.buffers[index]
+  }
+  return &state.additional[index - 16]
+}
+pub fn buffer_mut(state: *State, index: usize) *SavedBuffer {
+  if index < 16 {
+    return &state.buffers[index]
+  }
+  return &state.additional[index - 16]
+}
+pub fn prepare(state: *State, count: usize) bool {
+  if count <= buffer_count(state) {
+    return true
+  }
+  if count - 16 > (#cast(usize, -1) - mem.ArenaHeader) / #sizeof(SavedBuffer) {
+    return false
+  }
+  created := mem.arena_try_create((count - 16) * #sizeof(SavedBuffer) + mem.ArenaHeader)
+  if !created.ok {
+    return false
+  }
+  storage := created.arena
+  allocated := mem.arena_try_push(storage, (count - 16) * #sizeof(SavedBuffer), #alignof(SavedBuffer))
+  if !allocated.ok {
+    mem.arena_release(storage)
+    return false
+  }
+  additional := (#cast(*SavedBuffer, allocated.memory))[..count - 16]
+  for index in 0..#len(state.additional) {
+    additional[index] = state.additional[index]
+  }
+  mem.arena_release(state.storage)
+  state.storage = storage
+  state.additional = additional
+  return true
+}
+pub fn release(state: *State) {
+  mem.arena_release(state.storage)
+  state.storage = nil
+  state.additional = state.additional[..0]
 }
 struct Reader { bytes: []const u8, at: usize, ok: bool = true }
 struct Writer { bytes: []u8, at: usize, ok: bool = true }
@@ -101,12 +150,20 @@ fn get_text(input: *Reader, limit: usize) []const u8 {
 }
 pub fn encode(state: *const State, output: []u8) usize {
   writer := Writer{bytes: output}
-  text(&writer, "DNA session 2")
+  if #len(state.additional) > 0 {
+    text(&writer, "DNA session 3")
+  }
+  else {
+    text(&writer, "DNA session 2")
+  }
   text(&writer, state.project)
   number(&writer, state.active)
   number(&writer, state.focused)
-  for index in 0..16 {
-    item := &state.buffers[index]
+  if #len(state.additional) > 0 {
+    number(&writer, buffer_count(state))
+  }
+  for index in 0..buffer_count(state) {
+    item := buffer_at(state, index)
     if item.used && item.reload {
       // Flag 2: the path and position only.
       number(&writer, 2)
@@ -180,10 +237,10 @@ fn tree(state: *const State, index: usize, parent: usize, seen: *u32) bool {
   if pane.branch {
     return tree(state, pane.first, index, seen) && tree(state, pane.second, index, seen)
   }
-  if pane.slot >= 16 || !state.buffers[pane.slot].used {
+  if pane.slot >= buffer_count(state) || !buffer_at(state, pane.slot).used {
     return false
   }
-  item := &state.buffers[pane.slot]
+  item := buffer_at(state, pane.slot)
   // Reloaded text is unknown here; positions are clamped after the reload.
   if item.reload {
     return pane.scroll_x <= 100000000 && pane.scroll_y <= 100000000
@@ -196,19 +253,34 @@ fn tree(state: *const State, index: usize, parent: usize, seen: *u32) bool {
   }
   return pane.cursor <= #len(item.text) && pane.anchor <= #len(item.text) && pane.scroll_x <= 100000000 && pane.scroll_y <= 100000000
 }
+// Replaces owned metadata; source text remains borrowed until the next decode.
 pub fn decode(source: []const u8, state: *State) bool {
+  release(state)
   mem.clear(state)
+  success := false
+  defer {
+    if !success {
+      release(state)
+    }
+  }
   reader := Reader{bytes: source}
   version := get_text(&reader, 32)
-  newer := buffer.equal(version, "DNA session 2")
+  dynamic := buffer.equal(version, "DNA session 3")
+  newer := dynamic || buffer.equal(version, "DNA session 2")
   if !newer && !buffer.equal(version, "DNA session 1") {
     return false
   }
   state.project = get_text(&reader, 4095)
   state.active = get_number(&reader)
   state.focused = get_number(&reader)
-  for index in 0..16 {
-    item := &state.buffers[index]
+  if dynamic {
+    count := get_number(&reader)
+    if !reader.ok || count <= 16 || count > (#len(source) - reader.at) / 8 || !prepare(state, count) {
+      return false
+    }
+  }
+  for index in 0..buffer_count(state) {
+    item := buffer_mut(state, index)
     used := get_number(&reader)
     if used > 2 || (used == 2 && !newer) {
       return false
@@ -253,7 +325,7 @@ pub fn decode(source: []const u8, state: *State) bool {
         }
       }
       for previous in 0..index {
-        if #len(item.path) > 0 && state.buffers[previous].used && buffer.equal(state.buffers[previous].path, item.path) {
+        if #len(item.path) > 0 && buffer_at(state, previous).used && buffer.equal(buffer_at(state, previous).path, item.path) {
           return false
         }
       }
@@ -288,7 +360,7 @@ pub fn decode(source: []const u8, state: *State) bool {
       }
     }
   }
-  if !reader.ok || reader.at != #len(source) || state.active >= 16 || state.focused >= 15 || !state.buffers[state.active].used || !state.panes[state.focused].used || state.panes[state.focused].branch || state.panes[state.focused].slot != state.active {
+  if !reader.ok || reader.at != #len(source) || state.active >= buffer_count(state) || state.focused >= 15 || !buffer_at(state, state.active).used || !state.panes[state.focused].used || state.panes[state.focused].branch || state.panes[state.focused].slot != state.active {
     return false
   }
   seen: u32 = 0
@@ -300,13 +372,17 @@ pub fn decode(source: []const u8, state: *State) bool {
       return false
     }
   }
-  return #len(state.project) > 0 && state.project[0] == '/'
+  success = #len(state.project) > 0 && state.project[0] == '/'
+  return success
 }
 
 pub fn encoded_size(state: *const State) usize {
-  size: usize = 8 + 13 + 8 + #len(state.project) + 16 + 16 * 8 + 15 * 8
-  for index in 0..16 {
-    item := &state.buffers[index]
+  size: usize = 8 + 13 + 8 + #len(state.project) + 16 + buffer_count(state) * 8 + 15 * 8
+  if #len(state.additional) > 0 {
+    size += 8
+  }
+  for index in 0..buffer_count(state) {
+    item := buffer_at(state, index)
     if item.used && item.reload {
       size += 32 + #len(item.path) + #len(item.filetype)
     }

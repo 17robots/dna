@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-"""Verify deterministic packaging and run only extracted files in a clean image."""
+"""Verify deterministic packaging, extracted dependencies and isolated startup."""
 import hashlib
 import json
 import os
+import shutil
+import sys
 from pathlib import Path
 import subprocess
 import tarfile
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'scripts'))
+from dyn_path import real_dyn
 archive = ROOT / 'build/packages/dna-preview-linux-x86_64.tar.gz'
 subprocess.run(['python3', str(ROOT / 'scripts/package.py')], check=True)
 first = hashlib.sha256(archive.read_bytes()).hexdigest()
@@ -25,27 +29,43 @@ with tempfile.TemporaryDirectory(prefix='dna-clean-package-') as temporary:
         digest, filename = entry.split('  ', 1)
         assert hashlib.sha256((package / filename).read_bytes()).hexdigest() == digest
     # Load the extracted Dyn/C adapter without repository library search paths.
-    host_env = dict(PATH=os.defpath, HOME=str(directory), SDL_VIDEODRIVER='dummy',
+    host_env = dict(os.environ, PATH=os.defpath, HOME=str(directory),
                     DYN_EDITOR_SMOKE='1', DNA_RECOVERY='0',
                     DNA_CONFIG=str(directory/'config.toml'),
                     DNA_LANGUAGE_DIR=str(directory/'languages'))
+    for variable in ('LD_LIBRARY_PATH', 'DYN_LIBRARY_PATH', 'LD_PRELOAD', 'DNA_WORKFLOW_TEST', 'DYN_SDK'):
+        host_env.pop(variable, None)
+    library_env = dict(host_env, LD_LIBRARY_PATH=str(package / 'lib'))
+    for binary in [*(package / 'bin').iterdir(), *(package / 'lib').iterdir()]:
+        paths = subprocess.check_output(['ldd', str(binary)], env=library_env, text=True)
+        assert 'not found' not in paths, paths
+        assert str(ROOT) not in paths, paths
+        dynamic = subprocess.check_output(['readelf', '-d', str(binary)], text=True)
+        assert str(ROOT) not in dynamic, dynamic
     subprocess.run([str(package/'dna')], cwd=directory, env=host_env, check=True, timeout=30)
-    print('PASS relocated package startup/presentation/shutdown on current host')
-    image = os.environ.get('DNA_PACKAGE_IMAGE')
-    if image:
-        # Pin the locally selected image for this invocation; no image pull or network.
-        identity = subprocess.check_output(['podman', 'image', 'inspect', '--format', '{{.Id}}', image], text=True).strip()
-        font = subprocess.check_output(['fc-match', '-f', '%{file}', 'monospace'], text=True).strip()
-        subprocess.run([
-            'podman', 'run', '--rm', '--pull=never', '--network=none', '--read-only', '--tmpfs', '/tmp',
-            '-v', f'{package}:/preview:ro', '-v', f'{font}:/font.ttf:ro',
-            '-e', 'HOME=/tmp', '-e', 'SDL_VIDEODRIVER=dummy', '-e', 'DNA_FONT=/font.ttf',
-            '-e', 'DYN_EDITOR_SMOKE=1', '-e', 'DNA_RECOVERY=0', '-e', 'DNA_CONFIG=/tmp/config.toml',
-            '-e', 'DNA_LANGUAGE_DIR=/tmp/languages', identity, '/preview/dna',
-        ], check=True, timeout=30)
-        report = {'image': identity, 'archive_sha256': first, 'mode': 'headless extracted-package smoke; no SDK/repository mount or network'}
-        (ROOT / 'build/packages/container-check.json').write_text(json.dumps(report, indent=2)+'\n')
-        print('PASS isolated package startup:', identity)
+    for backend, display in (('wayland', 'WAYLAND_DISPLAY'), ('x11', 'DISPLAY')):
+        if host_env.get(display):
+            subprocess.run([str(package / 'bin' / ('dna-' + backend))], cwd=directory,
+                           env=library_env, check=True, timeout=30)
+            print('PASS extracted ' + backend + ' startup/presentation/shutdown')
+    subprocess.run(['python3', str(ROOT/'tests/version.py'), '--binary', str(package/'dna'),
+                    '--binary', str(package/'bin/dna-wayland'), '--binary', str(package/'bin/dna-x11')],
+                   env=host_env, check=True, timeout=30)
+    print('PASS relocated launcher and dependencies without checkout library paths')
+    isolation = shutil.which('bwrap')
+    if isolation:
+        probe = subprocess.run([isolation, '--ro-bind', '/', '/', '--', '/usr/bin/true'],
+                               capture_output=True, text=True)
+        if probe.returncode:
+            print('UNAVAILABLE mount isolation: ' + probe.stderr.strip())
+            isolation = None
+    if isolation:
+        sandbox = ['bwrap', '--ro-bind', '/', '/', '--bind', str(directory), str(directory),
+                   '--tmpfs', str(ROOT), '--tmpfs', str(real_dyn().parent.parent), '--']
+        subprocess.run([*sandbox, str(package / 'dna')], cwd=directory,
+                       env=host_env, check=True, timeout=30)
+        print('PASS extracted package with checkout and Dyn SDK hidden by mount namespace')
     else:
-        print('Container check not requested; set DNA_PACKAGE_IMAGE to a local compatible image.')
-print('PASS repeated archive SHA-256 and extracted checksums:', first)
+        print('UNAVAILABLE mount isolation; extracted startup and dependency checks still required')
+    print('PASS package contains no SDL dependency')
+    assert not any('SDL' in p.name for p in (package/'lib').iterdir())

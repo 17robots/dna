@@ -1,0 +1,99 @@
+struct StatusFileMotionProbe {time:fn(u64)}
+fn status_file_motion_box(app:*App) usize {
+  key:=ui_hash(ui_hash_number(ui_hash(0, "status"), app.view.focused), "file")
+  index:=ui_make_lookup(&app.ui, key)
+  if index==0 {
+    #panic("status file motion fixture missing filename box")
+  }
+  return index
+}
+fn status_file_motion_draw(app:*App, typography:*Typography, renderer, window:rawptr, probe:StatusFileMotionProbe, now:u64, cause:u32) f32 {
+  probe.time(now)
+  app.render_trace.pending=cause
+  draw(renderer, window, app, typography)
+  return app.ui.boxes[status_file_motion_box(app)].rect.width
+}
+fn status_file_motion_smoke(app:*App, typography:*Typography, renderer, window:rawptr, probe:StatusFileMotionProbe) {
+  app.view.reduced_motion=false
+  app.config.popup_animation_ms=40.0
+  app.config.popup_transitions=true
+  app.config.smooth_cursor=false
+  app.config.smooth_scroll=false
+  app.prompt_state.panel=Panel.None
+  app.view.status_line=true
+  initial:=status_file_motion_draw(app, typography, renderer, window, probe, 1000, 0)
+  expected:=ui_text_width(&app.ui, "Untitled")+app.ui.cell*2.0
+  if initial!=expected {
+    #panic("startup filename must be fully visible")
+  }
+  if !new_buffer(app) {
+    #panic("filename motion new buffer")
+  }
+  first:=status_file_motion_draw(app, typography, renderer, window, probe, 1010, RenderKey)
+  if first>=expected || first<app.ui.cell {
+    #panic("new buffer filename must grow spatially")
+  }
+  index:=status_file_motion_box(app)
+  if (app.ui.boxes[index].flags&UiClip)==0 {
+    #panic("growing filename must clip its text")
+  }
+  hit:=app.ui.boxes[index].rect
+  if ui_hit(&app.ui, hit.x+hit.width*0.5, hit.y+hit.height*0.5)!=index {
+    #panic("filename hit target must track its current width")
+  }
+  if ui_hit(&app.ui, hit.x+hit.width+1.0, hit.y+hit.height*0.5)==index {
+    #panic("hidden filename extent must not capture input")
+  }
+  if !app.view.animation.active {
+    #panic("filename growth must schedule animation frames")
+  }
+  middle:=status_file_motion_draw(app, typography, renderer, window, probe, 1026, RenderAnimation)
+  if middle<=first || middle>=expected {
+    #panic("filename growth must advance without restart")
+  }
+  settled:=status_file_motion_draw(app, typography, renderer, window, probe, 1210, RenderAnimation)
+  if settled!=expected {
+    #panic("filename growth must settle exactly")
+  }
+  if !new_buffer(app) {
+    #panic("filename motion input buffer")
+  }
+  _=status_file_motion_draw(app, typography, renderer, window, probe, 1300, RenderKey)
+  app.view.insert=true
+  text_input(app, "x")
+  if status_file_motion_draw(app, typography, renderer, window, probe, 1301, RenderText)!=expected {
+    #panic("typing must finish filename motion immediately")
+  }
+  if app.documents.current.length!=1 {
+    #panic("filename motion delayed editing")
+  }
+  for mode in 0..3 {
+    app.view.reduced_motion=mode==0
+    app.config.popup_transitions=mode!=1
+    app.config.popup_animation_ms=40.0
+    if mode==2 {
+      app.config.popup_animation_ms=0.0
+    }
+    if !new_buffer(app) {
+      #panic("filename disabled buffer")
+    }
+    if status_file_motion_draw(app, typography, renderer, window, probe, 1400+#cast(u64, mode)*100, RenderKey)!=expected {
+      #panic("disabled filename motion must snap")
+    }
+  }
+  app.view.reduced_motion=false
+  app.config.popup_transitions=true
+  app.config.popup_animation_ms=40.0
+  pane_split(app, true)
+  if status_file_motion_draw(app, typography, renderer, window, probe, 1800, RenderKey)>=expected {
+    #panic("new split filename must have its own reveal")
+  }
+  if status_file_motion_draw(app, typography, renderer, window, probe, 2000, RenderAnimation)!=expected {
+    #panic("split filename must settle")
+  }
+  pane_focus(app, app.view.panes[0].first)
+  if status_file_motion_draw(app, typography, renderer, window, probe, 2001, RenderKey)!=expected {
+    #panic("focus must not restart an unchanged pane filename")
+  }
+  app.running=false
+}

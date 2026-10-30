@@ -70,7 +70,7 @@ fn vim_visual(app: *const App) bool {
 // ---------------------------------------------------------------------------
 // Characters
 
-// The typed character: layout-aware from SDL when the event carried one,
+// The typed character: layout-aware from the native backend when the event carried one,
 // otherwise the US layout's symbol for the keycode and Shift.
 fn vim_character(app: *const App, key: u32, modifiers: u16) u32 {
   if (modifiers & ModCtrl) != 0 {
@@ -730,13 +730,13 @@ fn vim_store(app: *App, text: []const u8, linewise: bool) {
   if app.vim.register == VimBlackHole || #len(text) == 0 {
     return
   }
-  allocated := mem.arena_create((#len(text) + 1) + mem.ArenaBufferOverhead)
+  allocated := arena_owner.create((#len(text) + 1))
   storage := mem.push_bytes_uninit(allocated, #len(text) + 1)
   _ = buffer.copy_bytes(&storage[0], &text[0], #len(text))
   storage[#len(text)] = 0
   slot := vim_register_slot(app)
   if slot.owned {
-    mem.arena_release(slot.arena)
+    arena_owner.release(slot.arena)
     slot.arena = nil
   }
   slot.arena = allocated
@@ -935,8 +935,8 @@ fn vim_put(app: *App, after: bool, count: usize) {
   if fetched.linewise && body[#len(body) - 1] != 10 {
     size += count
   }
-  reserved := mem.arena_create((size + 2) + mem.ArenaBufferOverhead)
-  defer mem.arena_release(reserved)
+  reserved := arena_owner.create((size + 2))
+  defer arena_owner.release(reserved)
   storage := mem.push_bytes_uninit(reserved, size + 2)
   used: usize = 0
   for copy in 0..count {
@@ -1004,8 +1004,8 @@ fn vim_replace_characters(app: *App, character: u32, count: usize) {
     encoded[0] = 10
     length = 1
   }
-  reserved := mem.arena_create((length * count + 1) + mem.ArenaBufferOverhead)
-  defer mem.arena_release(reserved)
+  reserved := arena_owner.create((length * count + 1))
+  defer arena_owner.release(reserved)
   payload := mem.push_bytes_uninit(reserved, length * count + 1)
   used: usize = 0
   repeats := count
@@ -1207,8 +1207,8 @@ fn vim_insert_finish(app: *App) {
   if app.vim.insert_lines {
     piece = typed + 1
   }
-  reserved := mem.arena_create((piece * (count - 1) + 1) + mem.ArenaBufferOverhead)
-  defer mem.arena_release(reserved)
+  reserved := arena_owner.create((piece * (count - 1) + 1))
+  defer arena_owner.release(reserved)
   payload := mem.push_bytes_uninit(reserved, piece * (count - 1) + 1)
   used: usize = 0
   for copy in 1..count {
@@ -1363,6 +1363,27 @@ fn vim_after_search(app: *App) {
 
 // ---------------------------------------------------------------------------
 // Dispatch
+
+// Guides observe pending Vim state; they never become Helix prompt panels.
+fn vim_menu_prefix(app: *const App) u32 {
+  if !app.config.vim_keys || app.view.insert || app.prompt_state.panel != Panel.None {
+    return 0
+  }
+  pending := app.vim.pending
+  if pending == 'g' || pending == 'z' || pending == 'Z' || pending == 'i' || pending == 'a' {
+    return pending
+  }
+  return 0
+}
+fn vim_menu_context(app: *const App) u32 {
+  if app.vim.operator != 0 {
+    return 2
+  }
+  if app.vim.mode != VimMode.Normal {
+    return 1
+  }
+  return 0
+}
 
 // Returns true when the Vim profile handled the key. Keys it leaves alone
 // (Space leader, :, Ctrl shortcuts DNA owns) fall through to DNA.
@@ -1600,10 +1621,24 @@ fn vim_pending(app: *App, typography: *Typography, character: u32, key: u32) {
     else if character == 'b' || character == '-' {
       view_key(app, typography, KeyB)
     }
-    app.prompt_state.panel = Panel.None
+    if app.explorer.vim_borrowed {
+      app.prompt_state.panel=Panel.Directory
+    }
+    else {
+      app.prompt_state.panel=Panel.None
+    }
     return
   }
   if pending == 'Z' {
+    if app.explorer.vim_borrowed {
+      if character=='Z' {
+        explorer_preview(app)
+      }
+      else if character=='Q' {
+        app.prompt_state.panel=Panel.None
+      }
+      return
+    }
     if character == 'Z' {
       action(app, typography, command_named("x"))
     }
@@ -1623,6 +1658,12 @@ fn vim_pending(app: *App, typography: *Typography, character: u32, key: u32) {
 }
 // g prefix outside of motions: operators, gv, gJ, LSP gotos, buffers.
 fn vim_g_key(app: *App, typography: *Typography, character: u32, key: u32) {
+  // Draft rows have no owning file slot or language server. Editing g motions
+  // still run, but file/buffer/LSP actions must not escape the borrowed draft.
+  if app.explorer.vim_borrowed && (character=='d' || character=='D' || character=='y' || character=='r' || character=='i' || character=='t' || character=='T') {
+    app.vim.count=0
+    return
+  }
   if character == '~' || character == 'u' || character == 'U' {
     if app.vim.operator == character && app.vim.operator_g {
       // g~~ / guu / gUU: the whole line.
@@ -1992,7 +2033,12 @@ fn vim_normal_key(app: *App, typography: *Typography, character: u32, key: u32, 
   if character == '/' || character == '?' {
     app.vim.count = 0
     app.input_state.search_backwards = character == '?'
-    action(app, typography, 3)
+    if app.explorer.vim_borrowed {
+      search_open(app, Panel.Search, true)
+    }
+    else {
+      action(app, typography, 3)
+    }
     return
   }
   if character == '*' || character == '#' {
@@ -2009,6 +2055,9 @@ fn vim_normal_key(app: *App, typography: *Typography, character: u32, key: u32, 
   }
   if character == 'K' {
     app.vim.count = 0
+    if app.explorer.vim_borrowed {
+      return
+    }
     action(app, typography, command_named("hover"))
     return
   }
@@ -2188,7 +2237,12 @@ fn vim_visual_key(app: *App, typography: *Typography, character: u32, key: u32) 
   }
   if character == '/' || character == '?' {
     app.input_state.search_backwards = character == '?'
-    action(app, typography, 3)
+    if app.explorer.vim_borrowed {
+      search_open(app, Panel.Search, true)
+    }
+    else {
+      action(app, typography, 3)
+    }
     return
   }
   typed := app.vim.count > 0
@@ -2206,8 +2260,8 @@ fn vim_visual_put(app: *App, swap: bool) {
     vim_escape(app)
     return
   }
-  reserved := mem.arena_create((#len(fetched.text) + 1) + mem.ArenaBufferOverhead)
-  defer mem.arena_release(reserved)
+  reserved := arena_owner.create((#len(fetched.text) + 1))
+  defer arena_owner.release(reserved)
   payload := mem.push_bytes_uninit(reserved, #len(fetched.text) + 1)
   _ = buffer.copy_bytes(&payload[0], &fetched.text[0], #len(fetched.text))
   replacement := payload[..#len(fetched.text)]

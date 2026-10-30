@@ -1,8 +1,14 @@
 struct Documents {
-  slots: [16]Slot,
+  // The directory can move; individually allocated Slot records never move.
+  // Borrowed file/slot pointers stay valid while additional buffers are opened.
+  slots: []*Slot,
+  index_storage: []*Slot,
+  buffer_results: []usize,
+  storage: *mem.Arena,
   active: usize,
   count: usize,
   next_identity: u64,
+  generation: u64,
   current: *buffer.Document,
   file: *files.State,
   saving: SaveSequence,
@@ -13,6 +19,7 @@ struct Documents {
 }
 // Documents own their storage; switching views never copies text or undo history.
 struct TerminalState {
+  owner: *App, previous, next: *Slot,
   handle: rawptr,
   input: bool,
   review: bool,
@@ -28,15 +35,25 @@ struct TerminalState {
   escape_target: rawptr,
 }
 struct Slot {
+  lsp_dirty_mask, lsp_attached_mask: u32,
+  lsp_dirty_next, lsp_attached_next, lsp_attached_previous: [8]*Slot,
   inferred_filetype: bool,
   disk_changed: bool,
+  watch: DiskWatch,
   diagnostics: Diagnostics,
   terminal: TerminalState,
   identity: u64,
+  owner: *App,
+  observed_saved_epoch: u64,
+  index: usize,
   arena_born: u64,
   filetype: [65]u8,
   filetype_length: usize,
+  filetype_dirty: bool,
+  filetype_next: *Slot,
   syntax: rawptr,
+  syntax_owner: *App,
+  syntax_next, syntax_previous: *Slot,
   syntax_checked: bool,
   syntax_revision: u64,
   syntax_used: u64,
@@ -51,17 +68,121 @@ struct Slot {
   file_config: FileConfig,
 }
 
-fn new_buffer(app: *App) bool {
-  index: usize = 0
-  for index < 16 && app.documents.slots[index].document != nil {
-    index += 1
+// Buffer mutations only publish deferred work. Stable Slot records outlive
+// borrowed callback contexts; detachment precedes every document owner release.
+fn document_changed(context: rawptr) {
+  slot := #cast(*Slot, context)
+  app := slot.owner
+  if app == nil || slot.document == nil {
+    return
   }
-  if index == 16 {
-    notice(app, "Buffer limit reached (16). Close a buffer first.")
+  app.documents.generation += 1
+  lsp_document_dirty(app, slot.index)
+  if slot.observed_saved_epoch != slot.document.saved_epoch {
+    slot.observed_saved_epoch = slot.document.saved_epoch
+    disk_dirty_slot(app, slot.index)
+  }
+}
+fn document_observe(app: *App, slot: *Slot) {
+  slot.owner = app
+  slot.observed_saved_epoch = slot.document.saved_epoch
+  buffer.observe(slot.document, #cast(rawptr, slot), document_changed)
+}
+fn document_lifecycle_changed(app: *App, index: usize) {
+  filetype_dirty_slot(app, index)
+  app.documents.generation += 1
+  lsp_document_dirty(app, index)
+  disk_dirty_slot(app, index)
+}
+
+fn documents_append_slot(app: *App) *Slot {
+  documents := &app.documents
+  if documents.storage == nil {
+    documents.storage = mem.arena_try_create(65536).arena
+    if documents.storage == nil {
+      return nil
+    }
+  }
+  maximum := #cast(usize, -1)
+  if #len(documents.slots) == maximum {
+    return nil
+  }
+  needed := #len(documents.slots) + 1
+  if needed > #len(documents.index_storage) {
+    if #len(documents.index_storage) > maximum / 2 {
+      return nil
+    }
+    capacity := #len(documents.index_storage) * 2
+    if capacity < 8 {
+      capacity = 8
+    }
+    if capacity < needed || capacity > maximum / (#sizeof(*Slot) + #sizeof(usize)) {
+      return nil
+    }
+    // One allocation publishes pointer and picker directories atomically.
+    pointers := mem.arena_try_push(documents.storage, capacity * (#sizeof(*Slot) + #sizeof(usize)), #alignof(*Slot))
+    if !pointers.ok {
+      return nil
+    }
+    next := (#cast(**Slot, pointers.memory))[..capacity]
+    indices := (#cast(*usize, #cast(usize, pointers.memory) + capacity * #sizeof(*Slot)))[..capacity]
+    for index in 0..#len(documents.slots) {
+      next[index] = documents.slots[index]
+      indices[index] = documents.buffer_results[index]
+    }
+    documents.index_storage = next
+    documents.buffer_results = indices
+    documents.slots = next[..#len(documents.slots)]
+  }
+  // A cancelled restore can retain unpublished empty records for reuse.
+  slot := documents.index_storage[#len(documents.slots)]
+  if slot == nil {
+    allocated := mem.arena_try_push(documents.storage, #sizeof(Slot), #alignof(Slot))
+    if !allocated.ok {
+      return nil
+    }
+    slot = #cast(*Slot, allocated.memory)
+    documents.index_storage[#len(documents.slots)] = slot
+  }
+  slot.index = needed - 1
+  documents.slots = documents.index_storage[..needed]
+  return slot
+}
+fn buffer_match(app: *const App, index: usize) usize {
+  return app.documents.buffer_results[index]
+}
+fn new_buffer(app: *App) bool {
+  if app.documents.next_identity == #cast(u64, -1) {
+    notice(app, "Buffer identity space exhausted.")
     return false
   }
-  allocated := mem.arena_create((#sizeof(buffer.Document) + buffer.Capacity + 129) + mem.ArenaBufferOverhead)
-  slot := &app.documents.slots[index]
+  index: usize = 0
+  for index < #len(app.documents.slots) && app.documents.slots[index].document != nil {
+    index += 1
+  }
+  allocated := arena_owner.try_create(#sizeof(buffer.Document) + buffer.Capacity + 129)
+  if allocated == nil {
+    notice(app, "Could not allocate a new buffer. Existing buffers are unchanged.")
+    return false
+  }
+  document := buffer.try_allocate(allocated)
+  colors := mem.arena_try_push_uninit(allocated, buffer.Capacity + 1, 1)
+  if document == nil || !colors.ok {
+    arena_owner.release(allocated)
+    notice(app, "Could not initialize a new buffer. Existing buffers are unchanged.")
+    return false
+  }
+  slot: *Slot = nil
+  if index == #len(app.documents.slots) {
+    slot = documents_append_slot(app)
+  } else {
+    slot = app.documents.slots[index]
+  }
+  if slot == nil {
+    arena_owner.release(allocated)
+    notice(app, "Could not grow buffer storage. Existing buffers are unchanged.")
+    return false
+  }
   slot.arena = allocated
   allocated = nil
   app.documents.next_identity += 1
@@ -74,16 +195,17 @@ fn new_buffer(app: *App) bool {
   slot.terminal = TerminalState{}
   mem.clear(&slot.diagnostics)
   slot.disk_changed = false
-  slot.document = buffer.allocate(slot.arena)
-  slot.colors = mem.push_bytes_uninit(slot.arena, buffer.Capacity + 1)
+  slot.document = document
+  slot.colors = colors.memory[..buffer.Capacity + 1]
   _ = buffer.load(slot.document, "")
+  document_observe(app, slot)
   app.documents.count += 1
   activate(app, index)
   return true
 }
 fn documents_release(app: *App) {
-  for index in 0..16 {
-    slot := &app.documents.slots[index]
+  for index in 0..#len(app.documents.slots) {
+    slot := app.documents.slots[index]
     if slot.document != nil {
       if !buffer.dirty_cached(slot.document) {
         files.discard_recovery(&slot.file)
@@ -91,6 +213,13 @@ fn documents_release(app: *App) {
       document_release(app, slot)
     }
   }
+  app.documents.current = nil
+  app.documents.file = nil
+  app.documents.slots = app.documents.slots[..0]
+  app.documents.index_storage = app.documents.index_storage[..0]
+  app.documents.buffer_results = app.documents.buffer_results[..0]
+  mem.arena_release(app.documents.storage)
+  app.documents.storage = nil
 }
 
 // One owner handles document arena accounting and invalidates borrowed pointers.
@@ -98,10 +227,25 @@ fn document_release(app: *App, slot: *Slot) {
   if slot.document == nil {
     return
   }
-  mem.arena_release(slot.arena)
+  buffer.clear_observer(slot.document)
+  slot.owner = nil
+  arena_owner.release(slot.arena)
   slot.arena = nil
   allocation_record(app, "document", #sizeof(buffer.Document) + buffer.Capacity + 129, slot.arena_born, true)
   slot.document = nil
   slot.colors = slot.colors[..0]
   slot.arena_born = 0
+}
+
+// Missing documents for a bounded edit batch are acquired before edits. On a
+// failed acquisition, discard only that batch's new documents and restore focus.
+fn documents_rollback_new(app: *App, indices: []const usize, original: usize) {
+  // Restore the original view before discarding temporary owners: rollback
+  // must not close the split whose temporary buffer failed to open.
+  activate(app, original)
+  remaining := #len(indices)
+  for remaining > 0 {
+    remaining -= 1
+    close_slot(app, indices[remaining])
+  }
 }

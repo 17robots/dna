@@ -18,7 +18,7 @@ source = (ROOT / 'src/language_server.dyn').read_text()
 helpers = source[source.index('// Preflight the complete encoding'):source.index('extern fn rpc_open')]
 fixture = '''use "std/encoding/json"
 use "std/mem"
-use "std/io" lsp_stream
+use "std/io"
 ''' + helpers + '''
 fn same(a: []const u8, b: []const u8) bool {
   if #len(a) != #len(b) { return false }
@@ -88,11 +88,11 @@ fixture += '''  output: [16]u8
   unchanged(output[..])
   state := LspJsonOutput{ bytes: output[..2], writing: true }
   rejected := lsp_json_write(#cast(rawptr, &state), "long")
-  if rejected.status != lsp_stream.Status.Error || rejected.transferred != 0 || state.used != 0 { #panic("callback partial failure") }
+  if rejected.status != io.Status.Error || rejected.transferred != 0 || state.used != 0 { #panic("callback partial failure") }
   unchanged(output[..])
   state.writing = false
   rejected = lsp_json_write(#cast(rawptr, &state), "long")
-  if rejected.status != lsp_stream.Status.Error || state.used != 0 { #panic("count callback failure") }
+  if rejected.status != io.Status.Error || state.used != 0 { #panic("count callback failure") }
   unchanged(output[..])
   node_storage: [16]u64 = []
   node := #cast(*json.Value, &node_storage[0])

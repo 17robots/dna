@@ -1,0 +1,84 @@
+struct SelectionGeometryProbe {rectangles:[32]sdl.Rect, count:usize, pixels:[512]u8}
+fn selection_geometry_rect(data:rawptr, rectangle:*const sdl.Rect) bool {
+  probe:=#cast(*SelectionGeometryProbe, data)
+  if probe.count>=32 || rectangle.x<0.0 || rectangle.x+rectangle.width>512.0 {
+    return false
+  }
+  probe.rectangles[probe.count]=rectangle.*
+  probe.count+=1
+  for x in #cast(usize, rectangle.x)..#cast(usize, rectangle.x+rectangle.width) {
+    probe.pixels[x]=1
+  }
+  return true
+}
+fn selection_geometry_cell(data:rawptr, region:*const ttf.Substring) bool {
+  rectangle:=sdl.Rect{x:#cast(f32, region.x), y:#cast(f32, region.y), width:#cast(f32, region.width), height:#cast(f32, region.height)}
+  return selection_geometry_rect(data, &rectangle)
+}
+fn selection_geometry_smoke(typography:*Typography) {
+  owned:=arena_owner.create(#sizeof(App)+#sizeof(LineLayout)+256)
+  scratch:=arena_owner.create(2097152)
+  defer arena_owner.release(owned)
+  defer arena_owner.release(scratch)
+  app:=mem.push(App, owned)
+  app.scratch=scratch
+  app.config=settings.Settings{}
+  defer release_editor_state(app)
+  if !new_buffer(app) {
+    #panic("selection geometry buffer")
+  }
+  doc:=app.documents.current
+  _=buffer.load(doc, "abc אבג def")
+  layout:=mem.push(LineLayout, owned)
+  defer line_layout_release(layout)
+  viewport:=TextViewport{end:doc.length}
+  _=line_layout_update(typography, layout, doc, 1, viewport)
+  expected:=SelectionGeometryProbe{}
+  actual:=SelectionGeometryProbe{}
+  handle:=layout.lines[layout.rows[0]].text
+  if !ttf.selection(handle, 2, 6, selection_geometry_cell, #cast(rawptr, &expected)) || !selection_regions(doc, layout, viewport, typography, 0.0, 0.0, 0.0, 0.0, 300.0, 2, 6, selection_geometry_rect, #cast(rawptr, &actual)) {
+    #panic("mixed selection geometry")
+  }
+  for x in 0..512 {
+    if expected.pixels[x]!=actual.pixels[x] {
+      #panic("selection must not paint across visual gaps")
+    }
+  }
+  backend_storage:[16]u8=[]
+  backend:=host.environment("DNA_SMOKE_BACKEND", backend_storage[..])
+  if backend.ok && backend.found && buffer.equal(backend.value, "native") && !sdl.tui_active() && actual.count!=2 {
+    #panic("native mixed selection needs two separate bands")
+  }
+  _=buffer.load(doc, "abc אבג123def")
+  viewport.end=doc.length
+  _=line_layout_update(typography, layout, doc, 1, viewport)
+  actual=SelectionGeometryProbe{}
+  if !selection_regions(doc, layout, viewport, typography, 0.0, 0.0, 0.0, 0.0, 300.0, 10, 16, selection_geometry_rect, #cast(rawptr, &actual)) {
+    #panic("equal-parity selection geometry")
+  }
+  if backend.ok && backend.found && buffer.equal(backend.value, "native") && !sdl.tui_active() && actual.count!=2 {
+    #panic("adjacent LTR source ranges can have an unselected bidi gap")
+  }
+  _=buffer.load(doc, "a\xe2\x80\xa8b")
+  viewport.end=doc.length
+  _=line_layout_update(typography, layout, doc, 1, viewport)
+  actual=SelectionGeometryProbe{}
+  if !selection_regions(doc, layout, viewport, typography, 0.0, 0.0, 0.0, 0.0, 300.0, 0, doc.length, selection_geometry_rect, #cast(rawptr, &actual)) {
+    #panic("selection follows visual line offsets")
+  }
+  if backend.ok && backend.found && buffer.equal(backend.value, "native") && !sdl.tui_active() && (actual.count!=2 || actual.rectangles[0].y==actual.rectangles[1].y) {
+    #panic("Unicode line separator selections retain distinct visual rows")
+  }
+  _=buffer.load(doc, "abcd\n\nlast")
+  viewport.end=doc.length
+  _=line_layout_update(typography, layout, doc, 1, viewport)
+  actual=SelectionGeometryProbe{}
+  if !selection_regions(doc, layout, viewport, typography, 0.0, 0.0, 0.0, 0.0, 300.0, 0, doc.length, selection_geometry_rect, #cast(rawptr, &actual)) || actual.count!=3 || actual.rectangles[0].width!=300.0 || actual.rectangles[1].width!=300.0 {
+    #panic("LTR rows coalesce including blank newline bands")
+  }
+  ending:=buffer.line_end(doc, 0)
+  actual=SelectionGeometryProbe{}
+  if !selection_regions(doc, layout, viewport, typography, 0.0, 0.0, 0.0, 0.0, 300.0, ending, ending+1, selection_geometry_rect, #cast(rawptr, &actual)) || actual.count!=1 || actual.rectangles[0].width!=typography.cell {
+    #panic("selected newline occupies one virtual cell")
+  }
+}

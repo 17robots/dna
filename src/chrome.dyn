@@ -1,3 +1,5 @@
+use "std/math"
+
 struct WindowTitleState {
   text: [8192]u8,
   length: usize,
@@ -96,16 +98,80 @@ const StatusBase: usize = 1000000
 // One status segment; clickable segments run a command for their pane.
 fn status_segment(app: *App, ui: *UiState, pane: usize, name: []const u8, text: []const u8, command: usize, flags: u32) {
   segment_flags := flags | UiText
+  // Focus remains readable even when the caret is hidden by a panel or blink.
+  // Use existing theme inks, keeping segment dimensions and hit targets stable.
+  if pane != app.view.focused {
+    segment_flags = segment_flags | UiMuted
+  } else if buffer.equal(name, "mode") {
+    segment_flags = segment_flags | UiBackground
+  }
   if command != 0 {
     segment_flags = segment_flags | UiClickable | UiHover
   }
   segment := ui_make(ui, ui_key(ui, name), segment_flags)
+  if (segment_flags & UiBackground) != 0 {
+    ui.boxes[segment].fill = theme().selection
+  }
   ui_text_set(ui, segment, text)
   ui.boxes[segment].value = StatusBase + pane * 1000 + command
   ui.boxes[segment].padding[0] = ui.cell
   ui_size(ui, segment, UiAxisX, UiSizeKind.Text, 0.0, 1.0)
   ui_size(ui, segment, UiAxisY, UiSizeKind.Percent, 1.0, 1.0)
   ui_animate(app, ui, segment, false)
+}
+// A new file label grows like a small tab. The source text stays opaque and
+// the actual width is used by both layout and hit testing.
+fn status_file_width(app: *App, ui: *UiState, pane: usize, target: f32) f32 {
+  state := &ui.status_files[pane]
+  identity := app.documents.slots[app.documents.active].identity
+  now := app.view.animation.now
+  changed := !state.ready || state.identity != identity || state.frame + 1 < ui.frame
+  enabled := !sdl.tui_active() && !app.view.reduced_motion && app.config.popup_transitions && app.config.popup_animation_ms > 0.0 && !app.pointer.dragging
+  if changed {
+    state.width = target
+    if enabled && ui.frame > 1 {
+      state.width = ui.cell * 2.0
+    }
+    state.sampled = now
+    state.identity = identity
+    state.ready = true
+  }
+  state.frame = ui.frame
+  answering := (app.render_trace.pending & (RenderKey | RenderText | RenderMouse | RenderIme)) != 0
+  immediate := !enabled || (!changed && answering) || (app.render_trace.pending & RenderWindow) != 0
+  if immediate {
+    state.width = target
+  } else {
+    elapsed := (now - state.sampled) / 1000.0
+    if elapsed < 0.0 {
+      elapsed = 0.0
+    }
+    if elapsed > 0.25 {
+      elapsed = 0.25
+    }
+    rate := 70.0 * 40.0 / app.config.popup_animation_ms
+    weight := 1.0 - #cast(f32, math.exp2_64(-#cast(f64, rate * elapsed)))
+    state.width += (target - state.width) * weight
+  }
+  state.sampled = now
+  remaining := target - state.width
+  if remaining < 0.0 {
+    remaining = -remaining
+  }
+  state.active = remaining >= 0.5
+  if !state.active {
+    state.width = target
+  }
+  if state.active {
+    app.view.animation.active = true
+  }
+  return state.width
+}
+fn status_file_segment(app: *App, ui: *UiState, pane: usize, text: []const u8) {
+  status_segment(app, ui, pane, "file", text, 21, UiClip)
+  segment := ui.boxes[ui_parent(ui)].last
+  width := status_file_width(app, ui, pane, ui_text_width(ui, text) + ui.cell * 2.0)
+  ui_size(ui, segment, UiAxisX, UiSizeKind.Pixels, width / ui.scale, 1.0)
 }
 // Status line built from segments. Clicking the file or buffer count opens
 // the buffer picker, the filetype sets the language, !N lists diagnostics,
@@ -154,13 +220,13 @@ fn draw_status(renderer: rawptr, app: *App, typography: *Typography, width: i32,
     leaf -= 1
   }
   if #len(path) == 0 {
-    status_segment(app, ui, pane, "file", "Untitled", 21, 0)
+    status_file_segment(app, ui, pane, "Untitled")
   } else {
-    status_segment(app, ui, pane, "file", path[leaf..], 21, 0)
+    status_file_segment(app, ui, pane, path[leaf..])
   }
   kind: [96]u8 = []
   kind_length := copy_text(kind[..], "[")
-  add_text(kind[..], &kind_length, filetype_name(&app.documents.slots[app.documents.active]))
+  add_text(kind[..], &kind_length, filetype_name(app.documents.slots[app.documents.active]))
   add_text(kind[..], &kind_length, "]")
   status_segment(app, ui, pane, "filetype", kind[..kind_length], 54, 0)
   if app.documents.slots[app.documents.active].disk_changed {

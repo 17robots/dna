@@ -1,0 +1,206 @@
+// Exercise command dispatch and document/view ownership together.
+fn buffer_close_command(app:*App, typography:*Typography, command:[]const u8) {
+  panel(app, Panel.Commands)
+  app.prompt_state.length=copy_text(app.prompt_state.text[..], command)
+  command_submit(app, typography)
+}
+fn buffer_close_views(app:*const App) usize {
+  count:usize=0
+  for index in 0..15 {
+    if app.view.panes[index].used && !app.view.panes[index].branch {
+      count+=1
+    }
+  }
+  return count
+}
+fn buffer_close_smoke(app:*App, typography:*Typography, scenario:usize, path:[]const u8) {
+  app.config.close_last_buffer=0
+  app.config.language_count=0
+  file_config_invalidate(app)
+  app.view.reduced_motion=true
+  app.prompt_state.panel=Panel.None
+  if scenario>=13 {
+    app.config.close_last_buffer=1
+    slot:=app.documents.active
+    identity:=app.documents.slots[slot].identity
+    doc:=app.documents.current
+    _=buffer.load(doc, "shared file\n")
+    if scenario==16 || scenario==19 {
+      if #len(files.open(app.documents.file, doc, path, app.scratch))>0 {
+        #panic("shared save fixture open")
+      }
+    }
+    pane_split(app, true)
+    if scenario==15 || scenario==16 || scenario==19 || scenario==20 {
+      if scenario==20 && !files.set_name(app.documents.file, path) {
+        #panic("shared save failure path")
+      }
+      buffer.checkpoint(doc)
+      _=buffer.replace(doc, "saved ")
+      buffer.checkpoint(doc)
+      file_config_invalidate(app)
+    }
+    if scenario==14 || scenario==16 || scenario==18 || scenario==19 || scenario==20 {
+      buffer_close_command(app, typography, "x")
+    } else {
+      buffer_close_command(app, typography, "q")
+    }
+    if scenario==20 {
+      if !app.running || buffer_close_views(app)!=2 || app.documents.current!=doc || !buffer.dirty_cached(doc) {
+        #panic("failed shared save must preserve both views")
+      }
+    } else {
+      if !app.running || app.documents.count!=1 || app.documents.current!=doc || app.documents.slots[slot].identity!=identity || buffer_close_views(app)!=1 || app.view.panes[0].branch || app.prompt_state.panel!=Panel.None {
+        #panic("closing shared split must preserve file and application")
+      }
+      if scenario==15 && !buffer.dirty_cached(doc) {
+        #panic("shared view quit discarded dirty text")
+      }
+      if (scenario==16 || scenario==19) && buffer.dirty_cached(doc) {
+        #panic("shared view x did not save before closing")
+      }
+      expected:[]const u8="shared file\n"
+      if scenario==15 || scenario==16 || scenario==19 {
+        expected="saved shared file\n"
+      }
+      if !buffer.equal(doc.bytes[..doc.length], expected) {
+        #panic("closing shared split changed file contents")
+      }
+    }
+    app.running=false
+    return
+  }
+  if scenario==5 || scenario==7 || scenario==8 || scenario==12 {
+    if scenario==8 {
+      app.config.close_last_buffer=2
+    }
+    _=buffer.load(app.documents.current, "first file\n")
+    if scenario==7 {
+      if #len(files.open(app.documents.file, app.documents.current, path, app.scratch))>0 {
+        #panic("TUI save fixture open")
+      }
+      buffer.checkpoint(app.documents.current)
+      _=buffer.replace(app.documents.current, "saved ")
+      buffer.checkpoint(app.documents.current)
+      buffer_close_command(app, typography, "x")
+    } else if scenario==12 {
+      buffer_close_command(app, typography, "x")
+    } else {
+      buffer_close_command(app, typography, "q")
+    }
+    if scenario==8 {
+      if !app.running {
+        #panic("explicit keep last buffer setting ignored")
+      }
+      app.running=false
+    } else if app.running {
+      #panic("last TUI buffer must close terminal editor")
+    }
+    return
+  }
+  if scenario==0 || scenario==11 {
+    if scenario==11 {
+      buffer_close_command(app, typography, "x")
+    } else {
+      buffer_close_command(app, typography, "q")
+    }
+    if !app.running || app.documents.count!=1 || app.documents.current.length!=0 || app.prompt_state.panel!=Panel.None {
+      #panic("last GUI buffer must leave an empty open editor")
+    }
+    app.running=false
+    return
+  }
+  first:=app.documents.active
+  _=buffer.load(app.documents.current, "first file\n")
+  if !new_buffer(app) {
+    #panic("close fixture second buffer")
+  }
+  second:=app.documents.active
+  _=buffer.load(app.documents.current, "second file\n")
+  if !new_buffer(app) {
+    #panic("close fixture hidden buffer")
+  }
+  hidden:=app.documents.active
+  _=buffer.load(app.documents.current, "hidden file\n")
+  activate(app, second)
+  pane_init(app)
+  pane_split(app, true)
+  activate(app, first)
+  if scenario==9 || scenario==10 {
+    if scenario==9 {
+      open_file(app, path)
+    } else {
+      created:[2]usize=[]
+      for index in 0..2 {
+        if !new_buffer(app) {
+          #panic("rollback fixture allocation")
+        }
+        created[index]=app.documents.active
+      }
+      documents_rollback_new(app, created[..], first)
+    }
+    if app.documents.active!=first || app.documents.count!=3 || buffer_close_views(app)!=2 || app.documents.slots[first].document==nil {
+      #panic("failed open or edit acquisition must preserve the original split")
+    }
+    app.running=false
+    return
+  }
+  if scenario==2 {
+    buffer.checkpoint(app.documents.current)
+    _=buffer.replace(app.documents.current, "dirty ")
+    buffer.checkpoint(app.documents.current)
+    buffer_close_command(app, typography, "q")
+    if app.prompt_state.panel!=Panel.Quit || buffer_close_views(app)!=2 {
+      #panic("dirty close must confirm before removing split")
+    }
+    cancel_buffer_close(app)
+    if app.documents.slots[first].document==nil || buffer_close_views(app)!=2 {
+      #panic("cancel dirty close must preserve buffer and split")
+    }
+    buffer_close_command(app, typography, "q")
+    // Discard follows the same close operation after confirmation.
+    key_input(app, typography, KeyD, 0)
+  } else if scenario==3 {
+    if #len(files.open(app.documents.file, app.documents.current, path, app.scratch))>0 {
+      #panic("close fixture save path")
+    }
+    buffer.checkpoint(app.documents.current)
+    _=buffer.replace(app.documents.current, "saved ")
+    buffer.checkpoint(app.documents.current)
+    file_config_invalidate(app)
+    buffer_close_command(app, typography, "x")
+  } else if scenario==6 {
+    if !files.set_name(app.documents.file, path) {
+      #panic("save failure fixture path")
+    }
+    buffer.checkpoint(app.documents.current)
+    _=buffer.replace(app.documents.current, "unsaved ")
+    buffer.checkpoint(app.documents.current)
+    buffer_close_command(app, typography, "x")
+    if !app.running || app.documents.count!=3 || app.documents.slots[first].document==nil || buffer_close_views(app)!=2 || !buffer.dirty_cached(app.documents.current) {
+      #panic("save failure must preserve buffer and split")
+    }
+    app.running=false
+    return
+  } else if scenario==4 {
+    // The first close leaves the shared file in its other view.
+    pane_split(app, false)
+    buffer_close_command(app, typography, "q")
+    if app.documents.slots[first].document==nil || buffer_close_views(app)!=2 {
+      #panic("shared close must remove only one view")
+    }
+    buffer_close_command(app, typography, "q")
+  } else {
+    buffer_close_command(app, typography, "q")
+  }
+  if !app.running || app.documents.count!=2 || app.documents.slots[first].document!=nil {
+    #panic("close command must delete only the target buffer")
+  }
+  if buffer_close_views(app)!=1 || app.view.panes[0].branch || app.documents.active!=second {
+    #panic("closing a buffer must remove its split instead of refilling it")
+  }
+  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "second file\n") || app.documents.slots[hidden].document==nil {
+    #panic("closing a split must preserve visible and hidden files")
+  }
+  app.running=false
+}

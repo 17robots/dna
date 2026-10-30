@@ -90,9 +90,10 @@ struct Tui {
   clipboard: rawptr,
 }
 state: Tui = Tui{}
-grid: [131072]Cell = []
-shown: [131072]Cell = []
-output: [1048576]u8 = []
+screen_storage: *mem.Arena
+grid: []Cell
+shown: []Cell
+output: []u8
 output_used: usize = 0
 
 pub fn tui_active() bool {
@@ -102,6 +103,17 @@ pub fn tui_active() bool {
 pub fn tui_start() bool {
   if tty_enter() == 0 {
     return false
+  }
+  if #len(grid) == 0 {
+    // Keep bounded screen capacity separate from unrelated static data: the
+    // loader can touch a huge BSS page before we can apply a residency hint.
+    // Fresh owning mappings supply zero cells without touching unused rows.
+    count := MaxColumns * MaxRows
+    screen_storage = mem.arena_create(2 * count * #sizeof(Cell) + 1048576 + mem.ArenaBufferOverhead)
+    host.small_pages(screen_storage.data)
+    grid = (#cast(*Cell, mem.arena_push_uninit(screen_storage, count * #sizeof(Cell), #alignof(Cell))))[..count]
+    shown = (#cast(*Cell, mem.arena_push_uninit(screen_storage, count * #sizeof(Cell), #alignof(Cell))))[..count]
+    output = mem.push_bytes_uninit(screen_storage, 1048576)
   }
   state.active = true
   state.color = 0
@@ -169,6 +181,12 @@ pub fn tui_stop() {
     tty_leave()
     state.active = false
   }
+  mem.arena_release(screen_storage)
+  screen_storage = nil
+  grid = grid[..0]
+  shown = shown[..0]
+  output = output[..0]
+  output_used = 0
 }
 fn tui_measure() {
   columns: i32 = 80
@@ -286,10 +304,12 @@ fn to_row(y: f32) i32 {
   return #cast(i32, ((y + CellHeight * 0.5) / CellHeight))
 }
 fn floor_cell(value: f32, size: f32) i32 {
-  if value < 0.0 {
-    return -1
+  scaled := value / size
+  truncated := #cast(i32, scaled)
+  if scaled < #cast(f32, truncated) {
+    return truncated - 1
   }
-  return #cast(i32, (value / size))
+  return truncated
 }
 pub fn tui_fill(rectangle: *const Rect) {
   x := rectangle.x + #cast(f32, state.origin_x)
@@ -632,7 +652,7 @@ pub fn tui_text_size(handle: rawptr, width: *i32, height: *i32) {
   width.* = widest * #cast(i32, CellWidth)
   height.* = rows * #cast(i32, CellHeight)
 }
-// Geometry of the codepoint at a byte offset, like TTF_GetTextSubString.
+// Geometry of the codepoint at a byte offset, with the native substring interface.
 pub fn tui_text_substring(handle: rawptr, offset: i32, x: *i32, y: *i32, width: *i32, start: *i32, length: *i32, line: *i32) bool {
   text := #cast(*TuiText, handle)
   step := LayoutStep{}
@@ -1026,7 +1046,7 @@ pub fn tui_clipboard_set(text: *const u8, length: usize) {
   tty_write(&output[0], output_used)
   output_used = 0
 }
-// A heap copy, released through the platform free like SDL's.
+// A heap copy, released through the platform free function.
 pub fn tui_clipboard_get() *const u8 {
   length: usize = 0
   if state.clipboard != nil {
@@ -1059,7 +1079,7 @@ pub fn tui_last_character() u32 {
 }
 
 // ---------------------------------------------------------------------------
-// Input: terminal bytes to SDL-shaped events.
+// Input: terminal bytes to internal events.
 
 const ModShift: u16 = 3
 const ModAlt: u16 = 768
@@ -1129,7 +1149,7 @@ fn kitty_modifiers(value: u32) u16 {
   }
   return modifiers
 }
-// SDL keycodes for special keys (scancode | 1 << 30).
+// Internal keycodes for special keys (scancode | 1 << 30).
 fn special_key(final: u8, number: u32) u32 {
   if final == 'A' {
     return 1073741906
@@ -1616,9 +1636,9 @@ fn take(event: *Event) bool {
   }
   return true
 }
-// Wait up to milliseconds (-1 forever) for an event, like SDL_WaitEventTimeout.
+// Wait up to milliseconds (-1 forever) for an event, with a bounded native wait.
 pub fn tui_wait(event: *Event, milliseconds: i32) bool {
-  // Thread wake-ups and pushed events still arrive through SDL's queue.
+  // Thread wake-ups and pushed events arrive through the native queue.
   if sdl_poll(event) {
     return true
   }
@@ -1659,14 +1679,14 @@ pub fn tui_wait(event: *Event, milliseconds: i32) bool {
     }
   }
   count := read_input(wait)
-  // Woken by a worker thread: an SDL build may have its event queued; a
-  // build without SDL gets a plain user event so the loop runs its ticks.
+  // Woken by a worker thread: consume a queued native event or synthesize
+  // a user event so either frontend runs its pending service work.
   if count == -2 {
     if sdl_poll(event) {
       return true
     }
     wake := Event{}
-    wake.words[0] = 32768
+    wake.words[0] = #cast(u64, WorkerWakeEvent)
     event.* = wake
     return true
   }
@@ -1688,7 +1708,7 @@ pub fn tui_poll(event: *Event) bool {
 pub fn tui_push(event: *const Event) {
   queue(event.*)
 }
-// Keyboard modifiers as SDL_GetModState reports them. Terminals only say
+// Internal keyboard modifier masks. Terminals only say
 // what was held with a mouse report, so that is what this answers.
 pub fn tui_modifiers() u16 {
   return state.mouse_modifiers
@@ -1701,5 +1721,41 @@ pub fn tui_suspend() bool {
   }
   tui_measure()
   state.full_redraw = true
+  return true
+}
+
+// Borrowed until the next text mutation or destruction.
+pub fn tui_text_bytes(handle:rawptr) []const u8 {
+  if handle==nil {
+    return ""
+  }
+  text:=#cast(*TuiText, handle)
+  if !text.alive {
+    return ""
+  }
+  return text_bytes(text)
+}
+// Linear cell walk for selection and other read-only geometry consumers.
+pub fn tui_text_visit(handle:rawptr, callback:fn(rawptr, usize, usize, i32, i32, i32, i32, i32)bool, data:rawptr) bool {
+  if handle==nil || callback==nil {
+    return false
+  }
+  text:=#cast(*TuiText, handle)
+  if !text.alive {
+    return false
+  }
+  step:=LayoutStep{}
+  for layout_next(text, &step) {
+    width:=step.width
+    if step.character==9 {
+      width=(step.column/4+1)*4-step.column
+    }
+    if step.character==10 || step.character==13 {
+      width=0
+    }
+    if !callback(data, step.offset, step.bytes, step.row, step.column*#cast(i32, CellWidth), step.row*#cast(i32, CellHeight), width*#cast(i32, CellWidth), #cast(i32, CellHeight)) {
+      return false
+    }
+  }
   return true
 }

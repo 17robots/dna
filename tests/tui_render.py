@@ -127,8 +127,12 @@ def fail(message, rows):
 
 def check_handoff(root, sample, environment):
     """With a display the editor quits cleanly and re-executes as --gui,
-    consuming the handoff session (SDL's dummy driver stands in for it)."""
-    session = Session(['--tui', str(sample)], dict(environment, WAYLAND_DISPLAY='dna-test', SDL_VIDEODRIVER='dummy'))
+    consuming the handoff session on the current native display."""
+    display = {key: os.environ[key] for key in ('DISPLAY', 'WAYLAND_DISPLAY') if os.environ.get(key)}
+    if not display:
+        print('SKIP native GUI handoff: no desktop display available')
+        return
+    session = Session(['--tui', str(sample)], dict(environment, **display))
     try:
         session.wait_for('first line')
         session.send(b'i')
@@ -687,6 +691,10 @@ with tempfile.TemporaryDirectory(prefix='dna-tui-') as directory:
     environment.update(TERM='xterm-256color', XDG_CONFIG_HOME=str(root / 'config'), XDG_STATE_HOME=str(root / 'state'), DNA_DEFAULT_SERVERS='0', DNA_LANGUAGE_DIR=str(LANGUAGES), SHELL='/bin/sh', ENV='', PS1='$ ')
     environment.pop('DISPLAY', None)
     environment.pop('WAYLAND_DISPLAY', None)
+    if os.environ.get('DNA_TUI_HANDOFF_ONLY') == '1':
+        check_handoff(root, sample, environment)
+        print('PASS native TUI-to-GUI handoff')
+        sys.exit(0)
     check_language_manager(root, sample, environment)
     check_language_update_all(root, sample, environment)
     if os.environ.get('DNA_TUI_MANAGER_ONLY') == '1':

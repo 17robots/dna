@@ -993,7 +993,7 @@ fn bindings_smoke(app: *App, typography: *Typography) {
   if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "keep my unsaved work") {
     #panic("cancel quit keeps edits")
   }
-  // Quitting one of two views must not discard their shared dirty document.
+  // Closing one shared view leaves its dirty owner and other view alive.
   shared := app.documents.current
   shared_slot := app.documents.active
   shared_total := app.documents.count
@@ -1003,8 +1003,8 @@ fn bindings_smoke(app: *App, typography: *Typography) {
   key_input(app, typography, 58, 0)
   text_input(app, "q")
   key_input(app, typography, 13, 0)
-  if app.prompt_state.panel != Panel.None || app.view.focused != 0 || app.view.panes[0].branch {
-    #panic("q closes active split only")
+  if app.prompt_state.panel != Panel.None || app.view.panes[0].branch || !app.running {
+    #panic("q closes only shared view without exiting or prompting")
   }
   if app.documents.current != shared || app.documents.active != shared_slot || app.documents.count != shared_total || shared.cursor != 3 || !buffer.dirty(shared) {
     #panic("q preserves other view and shared edits")
@@ -1325,18 +1325,20 @@ fn empty_quit_smoke(app: *App, typography: *Typography) {
   if app.documents.count != 1 || app.documents.file.length != 0 || app.documents.current.length != 0 {
     return
   }
+  expected_running := !close_last_quits(app)
   pane_split(app, true)
   key_input(app, typography, 58, 0)
   text_input(app, "q")
   key_input(app, typography, 13, 0)
   if !app.running || app.view.focused != 0 || app.view.panes[0].branch {
-    #panic("empty split quit keeps final view")
+    #panic("closing shared split must keep final view and application alive")
   }
+  app.running = true
   key_input(app, typography, 58, 0)
   text_input(app, "q")
   key_input(app, typography, 13, 0)
-  if app.running {
-    #panic("empty final view quit exits editor")
+  if app.running != expected_running {
+    #panic("last buffer close follows frontend close policy")
   }
   app.running = true
 }
@@ -1666,7 +1668,8 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
       if at + 1 < echo_length && echo_screen[at] == '^' && echo_screen[at + 1] == '[' {
         leaked = true
       }
-      if echo_screen[at] == 'Q' && at > 0 && echo_screen[at - 1] == 10 && at + 1 < echo_length && (echo_screen[at + 1] == ' ' || echo_screen[at + 1] == 10) {
+      // A short terminal can scroll the echoed line onto its first row.
+      if echo_screen[at] == 'Q' && (at == 0 || echo_screen[at - 1] == 10) && at + 1 < echo_length && (echo_screen[at + 1] == ' ' || echo_screen[at + 1] == 10) {
         echoed = true
       }
     }
@@ -1823,7 +1826,7 @@ fn editor_commands_smoke(app: *App, typography: *Typography) {
     #panic("hnew did not create independent horizontal buffer")
   }
   smoke_command(app, typography, "filetype python")
-  if !buffer.equal(filetype_name(&app.documents.slots[app.documents.active]), "python") || app.documents.slots[vertical_slot].filetype_length != 0 || app.documents.file.length != 0 {
+  if !buffer.equal(filetype_name(app.documents.slots[app.documents.active]), "python") || app.documents.slots[vertical_slot].filetype_length != 0 || app.documents.file.length != 0 {
     #panic("buffer-local filetype")
   }
   smoke_command(app, typography, "ft")
@@ -1831,11 +1834,11 @@ fn editor_commands_smoke(app: *App, typography: *Typography) {
     #panic("filetype query")
   }
   smoke_command(app, typography, "filetype ../invalid")
-  if !buffer.equal(filetype_name(&app.documents.slots[app.documents.active]), "python") {
+  if !buffer.equal(filetype_name(app.documents.slots[app.documents.active]), "python") {
     #panic("invalid filetype mutated buffer")
   }
   smoke_command(app, typography, "set-language text")
-  if !buffer.equal(filetype_name(&app.documents.slots[app.documents.active]), "text") || app.documents.slots[app.documents.active].syntax != nil {
+  if !buffer.equal(filetype_name(app.documents.slots[app.documents.active]), "text") || app.documents.slots[app.documents.active].syntax != nil {
     #panic("text filetype did not disable syntax")
   }
   smoke_command(app, typography, "filetype auto")
@@ -1850,7 +1853,7 @@ fn editor_commands_smoke(app: *App, typography: *Typography) {
     app.workspace.language_root_length = copy_text(app.workspace.language_root[..], installed.value)
     _ = buffer.load(app.documents.current, "{\"n\":42}")
     smoke_command(app, typography, "filetype json")
-    if app.documents.slots[app.documents.active].syntax == nil || !buffer.equal(filetype_name(&app.documents.slots[app.documents.active]), "json") {
+    if app.documents.slots[app.documents.active].syntax == nil || !buffer.equal(filetype_name(app.documents.slots[app.documents.active]), "json") {
       #panic("unnamed buffer explicit grammar")
     }
     syntax_deadline := sdl.ticks() + 3000
@@ -1870,11 +1873,11 @@ fn editor_commands_smoke(app: *App, typography: *Typography) {
     add_text(save_storage[..], &save_length, "/filetype-test.py")
     save_file(app, save_storage[..save_length])
     _ = syntax_tick(app)
-    if app.documents.slots[app.documents.active].syntax == nil || !buffer.equal(filetype_name(&app.documents.slots[app.documents.active]), "json") {
+    if app.documents.slots[app.documents.active].syntax == nil || !buffer.equal(filetype_name(app.documents.slots[app.documents.active]), "json") {
       #panic("save discarded explicit filetype")
     }
     smoke_command(app, typography, "filetype auto")
-    if app.documents.slots[app.documents.active].syntax == nil || !buffer.equal(filetype_name(&app.documents.slots[app.documents.active]), "python") {
+    if app.documents.slots[app.documents.active].syntax == nil || !buffer.equal(filetype_name(app.documents.slots[app.documents.active]), "python") {
       #panic("auto did not restore extension detection")
     }
     smoke_command(app, typography, "filetype text")
@@ -2002,7 +2005,7 @@ fn picker_close_smoke(app: *App, typography: *Typography) {
   panel(app, Panel.Buffers)
   text_input(app, "picker-selected")
   buffer_matches(app)
-  if app.prompt_state.match_count != 1 || app.prompt_state.matches[0] != target {
+  if app.prompt_state.match_count != 1 || buffer_match(app, 0) != target {
     #panic("filtered picker fixture")
   }
   key_input(app, typography, 120, 64)
@@ -2015,7 +2018,7 @@ fn picker_close_smoke(app: *App, typography: *Typography) {
     #panic("close confirmation names wrong buffer")
   }
   key_input(app, typography, 99, 0)
-  if app.prompt_state.panel != Panel.Buffers || app.documents.current != original_doc || app.documents.active != original || app.documents.slots[target].document != target_doc || target_doc.revision != target_revision || !buffer.dirty(target_doc) || !buffer.equal(app.prompt_state.text[..app.prompt_state.length], "picker-selected") || app.prompt_state.matches[app.prompt_state.selected] != target {
+  if app.prompt_state.panel != Panel.Buffers || app.documents.current != original_doc || app.documents.active != original || app.documents.slots[target].document != target_doc || target_doc.revision != target_revision || !buffer.dirty(target_doc) || !buffer.equal(app.prompt_state.text[..app.prompt_state.length], "picker-selected") || buffer_match(app, app.prompt_state.selected) != target {
     #panic("picker cancellation lost buffer, selection, filter or focus")
   }
   key_input(app, typography, 120, 64)
@@ -2042,7 +2045,7 @@ fn picker_close_smoke(app: *App, typography: *Typography) {
   panel(app, Panel.Buffers)
   buffer_matches(app)
   row: usize = 0
-  for row < app.prompt_state.match_count && app.prompt_state.matches[row] != clean {
+  for row < app.prompt_state.match_count && buffer_match(app, row) != clean {
     row += 1
   }
   app.prompt_state.selected = row
@@ -2061,7 +2064,7 @@ fn picker_close_smoke(app: *App, typography: *Typography) {
   panel(app, Panel.Buffers)
   buffer_matches(app)
   row = 0
-  for row < app.prompt_state.match_count && app.prompt_state.matches[row] != saving {
+  for row < app.prompt_state.match_count && buffer_match(app, row) != saving {
     row += 1
   }
   app.prompt_state.selected = row
@@ -2071,7 +2074,7 @@ fn picker_close_smoke(app: *App, typography: *Typography) {
     #panic("picker save target")
   }
   key_input(app, typography, 27, 0)
-  if app.prompt_state.panel != Panel.Buffers || app.documents.active != original || app.prompt_state.matches[app.prompt_state.selected] != saving || !buffer.dirty(app.documents.slots[saving].document) {
+  if app.prompt_state.panel != Panel.Buffers || app.documents.active != original || buffer_match(app, app.prompt_state.selected) != saving || !buffer.dirty(app.documents.slots[saving].document) {
     #panic("picker Save As cancellation")
   }
   fixture_storage: [4096]u8 = []
@@ -2110,7 +2113,7 @@ fn picker_close_smoke(app: *App, typography: *Typography) {
     text_input(app, "Terminal")
     buffer_matches(app)
     row = 0
-    for row < app.prompt_state.match_count && app.prompt_state.matches[row] != terminal_slot {
+    for row < app.prompt_state.match_count && buffer_match(app, row) != terminal_slot {
       row += 1
     }
     app.prompt_state.selected = row
@@ -2400,7 +2403,7 @@ fn project_tools_smoke(renderer: rawptr, window: rawptr, app: *App, typography: 
   }
   pane_only(app)
   // Splits share the width evenly: thirds, then quarters, also when nested.
-  app.view.panes[0].rect = sdl.PixelRect{x: 0, y: 0, width: 1200, height: 600}
+  pane_layout(app, 0, sdl.PixelRect{x: 0, y: 0, width: 1200, height: 600})
   pane_split(app, true)
   pane_split(app, true)
   if !pane_widths_even(app, 3) {
@@ -2449,10 +2452,10 @@ fn persistence_smoke() {
   if !fixture.ok || !fixture.found {
     return
   }
-  owner := mem.arena_create((#sizeof(App) + 128) + mem.ArenaBufferOverhead)
-  temporary := mem.arena_create((2097152) + mem.ArenaBufferOverhead)
-  defer mem.arena_release(owner)
-  defer mem.arena_release(temporary)
+  owner := arena_owner.create((#sizeof(App) + 128))
+  temporary := arena_owner.create((2097152))
+  defer arena_owner.release(owner)
+  defer arena_owner.release(temporary)
   test_app := #cast(*App, mem.arena_push(owner, #sizeof(App), #alignof(App)))
   test_app.scratch = temporary
   test_app.config = settings.Settings{}
@@ -2514,10 +2517,10 @@ fn plugin_host_smoke(typography: *Typography) {
   if !fixture.ok || !fixture.found {
     return
   }
-  owner := mem.arena_create((#sizeof(App) + 128) + mem.ArenaBufferOverhead)
-  temporary := mem.arena_create((2097152) + mem.ArenaBufferOverhead)
-  defer mem.arena_release(owner)
-  defer mem.arena_release(temporary)
+  owner := arena_owner.create((#sizeof(App) + 128))
+  temporary := arena_owner.create((2097152))
+  defer arena_owner.release(owner)
+  defer arena_owner.release(temporary)
   test_app := #cast(*App, mem.arena_push(owner, #sizeof(App), #alignof(App)))
   test_app.scratch = temporary
   test_app.config = settings.Settings{}
@@ -2827,7 +2830,7 @@ fn batch_bindings_smoke(app: *App, typography: *Typography) {
   activate(app, original)
 }
 
-// Distinct pane widths across the top row are equal within rounding.
+// Logical target widths across the top row are equal before animated paint.
 fn pane_widths_even(app: *App, columns: usize) bool {
   total: i32 = 0
   count: usize = 0
@@ -2835,14 +2838,14 @@ fn pane_widths_even(app: *App, columns: usize) bool {
   largest: i32 = 0
   for index in 0..15 {
     pane := &app.view.panes[index]
-    if pane.used && !pane.branch && pane.rect.y == 0 {
-      total += pane.rect.width
+    if pane.used && !pane.branch && pane.target_rect.y == 0 {
+      total += pane.target_rect.width
       count += 1
-      if pane.rect.width < smallest {
-        smallest = pane.rect.width
+      if pane.target_rect.width < smallest {
+        smallest = pane.target_rect.width
       }
-      if pane.rect.width > largest {
-        largest = pane.rect.width
+      if pane.target_rect.width > largest {
+        largest = pane.target_rect.width
       }
     }
   }

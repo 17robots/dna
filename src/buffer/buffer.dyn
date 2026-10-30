@@ -25,8 +25,14 @@ pub struct Snapshot {
 }
 
 // Allocate Document in an arena, not on the call stack. All retained bytes are
-// owned here; no slices from file I/O, SDL, or frame scratch survive a call.
+// owned here; no slices from file I/O, native rendering, or frame scratch survive a call.
 pub struct Document {
+  // Optional owner notification. It only marks deferred work; callbacks must not
+  // edit the document, execute services, or retain temporary mutation storage.
+  change_context: rawptr,
+  on_change: fn(rawptr),
+  notification_depth: usize,
+  notification_pending: bool,
   batching, goal_valid: bool,
   dirty_cached, dirty_text: bool,
   dirty_revision, dirty_epoch, dirty_scans: u64,
@@ -53,6 +59,39 @@ pub struct Document {
   line_storage: [1073741824]u8, checkpoint_storage: [268435456]u8,
 }
 
+// The document borrows the context until cleared or its owner releases it.
+// Rebinding replaces the prior observer without calling either callback.
+pub fn observe(document: *Document, context: rawptr, changed: fn(rawptr)) {
+  document.change_context = context
+  document.on_change = changed
+}
+pub fn clear_observer(document: *Document) {
+  document.on_change = nil
+  document.change_context = nil
+}
+// Compound edits rebuild marks/selections after nested text replacements. Only
+// their outer completion publishes the notification; the revision journal stays
+// unchanged and still records each internal edit for incremental consumers.
+fn begin_change(document: *Document) {
+  document.notification_depth += 1
+}
+fn end_change(document: *Document) {
+  document.notification_depth -= 1
+  if document.notification_depth == 0 && document.notification_pending {
+    notify_changed(document)
+  }
+}
+fn notify_changed(document: *Document) {
+  document.notification_pending = true
+  if document.notification_depth != 0 {
+    return
+  }
+  document.notification_pending = false
+  if document.on_change != nil {
+    document.on_change(document.change_context)
+  }
+}
+
 // The Dyn runtime links its own byte-at-a-time memcpy/memmove into every
 // executable. Bulk document copies call glibc's checked entry points, which
 // reach its vectorized implementations. The bound is length + 1 because LLVM
@@ -71,18 +110,29 @@ extern fn find_byte "memchr"(source: *const u8, byte: i32, length: usize) rawptr
 // Own the full bounded address range without eagerly touching unused text/undo
 // pages. Works with reused/poisoned arenas too: metadata is explicitly zeroed,
 // and load/checkpoint initialize every byte before it becomes readable.
-pub fn allocate(arena: *mem.Arena) *Document {
+pub fn try_allocate(arena: *mem.Arena) *Document {
   // Sparse bounded storage must not fault 2 MiB huge pages for tiny prefixes.
   // Owned arenas are page-aligned mappings; borrowed arenas remain untouched.
   if arena.owns_memory {
     _ = #syscall(28, &arena.data[0], #len(arena.data), 15)
   }
-  document := #cast(*Document, mem.arena_push_uninit(arena, #sizeof(Document), #alignof(Document)))
+  allocated := mem.arena_try_push_uninit(arena, #sizeof(Document), #alignof(Document))
+  if !allocated.ok {
+    return nil
+  }
+  document := #cast(*Document, allocated.memory)
   memory := #cast(*u8, document)
   metadata := #cast(usize, &document.bytes[0]) - #cast(usize, memory)
   mem.zero(memory[..metadata])
   _ = load(document, "")
   return document
+}
+pub fn allocate(arena: *mem.Arena) *Document {
+  result := try_allocate(arena)
+  if result == nil {
+    #panic("cannot allocate document")
+  }
+  return result
 }
 pub fn equal(a: []const u8, b: []const u8) bool {
   if #len(a) != #len(b) {
@@ -140,7 +190,7 @@ fn snapshot(document: *Document, index: usize) {
   document.checkpoint_view = document.bytes[..]
   release_clean_baselines(document)
 }
-pub fn mark_saved(document: *Document) {
+fn set_saved(document: *Document) {
   document.saved_epoch += 1
   document.saved_rows = document.rows
   document.saved_length = document.length
@@ -153,6 +203,10 @@ pub fn mark_saved(document: *Document) {
     document.checkpoint_view = document.bytes[..]
   }
   release_clean_baselines(document)
+}
+pub fn mark_saved(document: *Document) {
+  set_saved(document)
+  notify_changed(document)
 }
 extern fn snapshot_page_size "getpagesize"() i32
 fn release_storage_tail(storage: *u8, used: *usize, keep: usize) {
@@ -235,13 +289,14 @@ pub fn load(document: *Document, text: []const u8) bool {
     document.history_storage_used = 1
   }
   index_lines(document)
-  mark_saved(document)
+  set_saved(document)
   snapshot(document, 0)
   // Reload deliberately resets undo history. Consume aliased input first,
   // then reclaim only pages beyond the newly live text/index/history prefixes.
   release_storage_tail(&document.bytes[0], &document.text_storage_used, document.length + 1)
   release_storage_tail(&document.line_storage[0], &document.line_storage_used, line_index_bytes(document))
   release_storage_tail(&document.history_storage[0], &document.history_storage_used, 1)
+  notify_changed(document)
   return true
 }
 fn same_rows(a: *const RowAnchors, b: *const RowAnchors) bool {
@@ -270,8 +325,9 @@ pub fn track_rows(document: *Document, count: usize) {
     offset = line_end(document, offset) + 1
   }
 
-  mark_saved(document)
+  set_saved(document)
   snapshot(document, document.history_at)
+  notify_changed(document)
 }
 // 257 means an ambiguous join of two existing rows. Callers must not apply it.
 pub fn row_id(document: *const Document, offset: usize) usize {
@@ -419,6 +475,7 @@ pub fn replace(document: *Document, text: []const u8) bool {
     }
     identity += 1
   }
+  notify_changed(document)
   return true
 }
 // Shrinking block sizes for the checkpoint diff's prefix and suffix scans.
@@ -570,6 +627,7 @@ fn restore(document: *Document, delta: *const Snapshot, forward: bool) {
       document.marks[restored_mark] = position_offset(document, retained_positions[restored_mark])
     }
   }
+  notify_changed(document)
 }
 pub fn undo(document: *Document) {
   checkpoint(document)

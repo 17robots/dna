@@ -1,3 +1,4 @@
+use "std/ui/box" box_ui
 
 // Immediate-mode UI core, after the RAD Debugger's design. Panels rebuild a
 // box tree every drawn frame; boxes are keyed by a hash of their name and
@@ -22,6 +23,9 @@ const UiFocus: u32 = 2048
 
 const UiAxisX: usize = 0
 const UiAxisY: usize = 1
+// The custom native renderer clips to its real viewport; panel layout uses a
+// screen-coordinate canvas so independent roots do not constrain each other.
+const UiCanvasExtent: f32 = 1000000000.0
 const UiCapacity: usize = 512
 
 enum UiSizeKind { Pixels, Text, Percent, Children }
@@ -29,10 +33,10 @@ enum UiSizeKind { Pixels, Text, Percent, Children }
 struct UiSize { kind: UiSizeKind, value, strictness: f32 }
 
 struct UiBox {
+  // Shared cached identity and geometry; other fields are native/app metadata.
+  shared: *box_ui.Box,
   key: u64,
   touched: u64,
-  // Build order within the frame; later boxes draw on top and win hits.
-  order: u64,
   // Tree links for the frame being built; pool indexes, 0 means none.
   parent, first, last, next: usize,
   flags: u32,
@@ -40,7 +44,6 @@ struct UiBox {
   size: [2]UiSize,
   padding: [2]f32,
   floating: [2]f32,
-  text_start, text_length: usize,
   fill: Rgb,
   // Caller data, such as the command a row runs.
   value: usize,
@@ -55,12 +58,21 @@ struct UiBox {
   // Scrollable content height: children's total, or set by custom drawing.
   content: f32,
 }
+struct StatusFileMotion {
+  identity, frame: u64,
+  width, sampled: f32,
+  ready, active: bool,
+}
 struct UiState {
+  // The shared cache owns keyed boxes, frame text and geometry. Indexed
+  // records retain application colors, values and custom animation only.
+  cache_arena: *mem.Arena,
+  shared: *box_ui.State,
+  frame_arena: *mem.Arena,
+  free_slots: [512]usize,
+  free_count: usize,
   boxes: [512]UiBox,
-  text: [32768]u8,
-  text_used: usize,
   frame: u64,
-  made: u64,
   // Set while draw() builds one frame shared by every panel on screen.
   in_draw: bool,
   root: usize,
@@ -78,15 +90,12 @@ struct UiState {
   redraw: bool,
   wheel: f32,
   // Panel state that outlives one frame.
-  palette_open: motion.Tween,
   palette_selected: usize,
+  palette_rows: usize,
   palette_query: u64,
-  menu_open: motion.Tween,
   hover_open: motion.Tween,
   dialog_open: motion.Tween,
   sheet_open: motion.Tween,
-  explorer_open: motion.Tween,
-  explorer_seen: u64,
   // Explorer list geometry from the last drawn frame, for mouse rows.
   explorer_top, explorer_scroll: f32,
   explorer_body: sdl.Rect,
@@ -103,20 +112,34 @@ struct UiState {
   hover_text: u64,
   completion_selected: usize,
   completion_count: usize,
-  picker_open: motion.Tween,
+  completion_rows: usize,
+  completion_width: f32,
+  completion_frame, completion_identity, completion_hash: u64,
+  completion_above: bool,
   picker_selected: usize,
   picker_count: usize,
+  status_files: [15]StatusFileMotion,
 }
 
 fn ui_hash(seed: u64, text: []const u8) u64 {
-  hash: u64 = (seed % 4294967296) ^ 5381
-  for byte in text {
-    hash = ((hash * 33) ^ #cast(u64, byte)) % 1099511627776
-  }
-  return hash + 1
+  return box_ui.key_bytes(seed, text)
 }
 fn ui_hash_number(seed: u64, number: usize) u64 {
-  return ((seed % 1099511627776) * 31 + #cast(u64, number) * 2654435761 % 1099511627776) % 1099511627776 + 1
+  return box_ui.key_number(seed, #cast(u64, number))
+}
+// Shared boxes and frame text are owned independently of application records.
+fn ui_release(ui: *UiState) {
+  ui.shared = nil
+  mem.arena_release(ui.frame_arena)
+  ui.frame_arena = nil
+  mem.arena_release(ui.cache_arena)
+  ui.cache_arena = nil
+  mem.clear(&ui.boxes)
+  ui.root = 0
+  ui.depth = 0
+  ui.frame = 0
+  ui.free_count = 0
+  ui.mouse_seen = false
 }
 // Panels call this; inside draw() the frame is already begun, so every panel
 // on screen shares one frame and hit-testing sees all of them. Standalone
@@ -129,13 +152,38 @@ fn ui_panel_begin(ui: *UiState, typography: *const Typography) {
 }
 fn ui_begin(ui: *UiState, typography: *const Typography) {
   ui.frame += 1
-  ui.made = 0
-  ui.text_used = 0
   ui.depth = 0
   ui.root = 0
   ui.scale = typography.scale
   ui.cell = typography.cell
   ui.line = typography.line
+  if ui.cache_arena == nil {
+    ui.cache_arena = mem.arena_create(0)
+  }
+  if ui.frame_arena == nil {
+    ui.frame_arena = mem.arena_create(0)
+  }
+  if ui.shared == nil {
+    ui.shared = box_ui.create(ui.cache_arena, ui_shared_measure, ui, ui.line)
+  }
+  mem.arena_reset(ui.frame_arena)
+  box_ui.begin(ui.shared, ui.frame_arena, box_ui.Input{}, UiCanvasExtent, UiCanvasExtent, 0.0)
+  // DNA clips each panel independently and renders into the actual viewport.
+  ui.shared.root.flags = 0
+  ui.shared.root.visible = [0.0, 0.0, UiCanvasExtent, UiCanvasExtent]
+  ui.shared.scale = ui.scale
+  ui.shared.line_height = ui.line
+  ui.free_count = 0
+  // Application metadata uses bounded integer handles. Identity lookup,
+  // duplicate derivation and persistent box recycling belong to std/ui/box.
+  for offset in 1..UiCapacity {
+    index := UiCapacity - offset
+    candidate := &ui.boxes[index]
+    if candidate.key == 0 || candidate.touched + 1 < ui.frame {
+      ui.free_slots[ui.free_count] = index
+      ui.free_count += 1
+    }
+  }
 }
 fn ui_parent(ui: *const UiState) usize {
   if ui.depth == 0 {
@@ -143,38 +191,30 @@ fn ui_parent(ui: *const UiState) usize {
   }
   return ui.stack[ui.depth - 1]
 }
-// Returns the pool index for key, creating it on first use. Boxes not built
-// in the previous frame are free for reuse.
+// Builds the shared persistent box and attaches DNA's renderer/widget record.
 fn ui_make(ui: *UiState, key: u64, flags: u32) usize {
-  found: usize = 0
-  free: usize = 0
-  index: usize = 1
-  for index < UiCapacity && found == 0 {
-    candidate := &ui.boxes[index]
-    if candidate.key == key && candidate.touched + 1 >= ui.frame {
-      found = index
-    }
-    else if free == 0 && (candidate.key == 0 || candidate.touched + 1 < ui.frame) {
-      free = index
-    }
-    index += 1
+  parent_index := ui_parent(ui)
+  if parent_index != 0 {
+    box_ui.push_parent(ui.shared, ui.boxes[parent_index].shared)
   }
+  shared := box_ui.build_key(ui.shared, 0, key, "")
+  if parent_index != 0 {
+    box_ui.pop_parent(ui.shared)
+  }
+  found := shared.user_data
   if found == 0 {
-    if free == 0 {
+    if ui.free_count == 0 {
       #panic("UI box capacity")
     }
-    found = free
+    ui.free_count -= 1
+    found = ui.free_slots[ui.free_count]
     ui.boxes[found] = UiBox{}
-    ui.boxes[found].key = key
+    shared.user_data = found
   }
   made := &ui.boxes[found]
-  if made.touched == ui.frame {
-    // Equal names in one frame (e.g. overloaded completions) get a derived key.
-    return ui_make(ui, ui_hash_number(key, 7919), flags)
-  }
+  made.shared = shared
+  made.key = shared.key
   made.touched = ui.frame
-  ui.made += 1
-  made.order = ui.made
   made.flags = flags
   made.first = 0
   made.last = 0
@@ -184,7 +224,6 @@ fn ui_make(ui: *UiState, key: u64, flags: u32) usize {
   made.size[1] = UiSize{kind: UiSizeKind.Children, value: 0.0, strictness: 1.0}
   made.padding[0] = 0.0
   made.padding[1] = 0.0
-  made.text_length = 0
   made.value = 0
   made.content = 0.0
   made.parent = ui_parent(ui)
@@ -206,12 +245,14 @@ fn ui_make(ui: *UiState, key: u64, flags: u32) usize {
 }
 // Pool index of a box built in the last frame, or 0.
 fn ui_make_lookup(ui: *const UiState, key: u64) usize {
-  for index in 1..UiCapacity {
-    if ui.boxes[index].key == key && ui.boxes[index].touched == ui.frame {
-      return index
-    }
+  if ui.shared == nil {
+    return 0
   }
-  return 0
+  found := box_ui.find(ui.shared, key)
+  if found == nil {
+    return 0
+  }
+  return found.user_data
 }
 // Key of a named child of a named root, for finding boxes after layout.
 fn ui_child_key(root: []const u8, child: []const u8) u64 {
@@ -241,19 +282,12 @@ fn ui_size(ui: *UiState, index: usize, axis: usize, kind: UiSizeKind, value: f32
   ui.boxes[index].size[axis] = UiSize{kind: kind, value: value, strictness: strictness}
 }
 fn ui_text_set(ui: *UiState, index: usize, text: []const u8) {
-  made := &ui.boxes[index]
-  made.text_start = ui.text_used
-  made.text_length = 0
-  if ui.text_used + #len(text) >= #len(ui.text) {
-    return
-  }
-  _ = mem.copy(ui.text[ui.text_used..ui.text_used + #len(text)], text)
-  ui.text_used += #len(text)
-  made.text_length = #len(text)
+  copied := mem.push_bytes_uninit(ui.frame_arena, #len(text))
+  _ = mem.copy(copied, text)
+  ui.boxes[index].shared.text = copied
 }
 fn ui_text_of(ui: *const UiState, index: usize) []const u8 {
-  made := &ui.boxes[index]
-  return ui.text[made.text_start..made.text_start + made.text_length]
+  return ui.boxes[index].shared.text
 }
 // A text box sized to its content.
 fn ui_label(ui: *UiState, name: []const u8, text: []const u8, flags: u32) usize {
@@ -266,33 +300,28 @@ fn ui_label(ui: *UiState, name: []const u8, text: []const u8, flags: u32) usize 
 fn ui_contains(rect: sdl.Rect, x: f32, y: f32) bool {
   return rect.width > 0.0 && x >= rect.x && y >= rect.y && x < rect.x + rect.width && y < rect.y + rect.height
 }
-// Hover uses last frame's rectangle, clipped by every clipping ancestor.
+// Shared boxes retain last frame's clipped geometry during the next build.
 fn ui_visible_at(ui: *const UiState, index: usize, x: f32, y: f32) bool {
-  if !ui_contains(ui.boxes[index].rect, x, y) {
+  shared := ui.boxes[index].shared
+  if shared == nil {
     return false
   }
-  ancestor := ui.boxes[index].parent
-  for ancestor != 0 {
-    if (ui.boxes[ancestor].flags & UiClip) != 0 && !ui_contains(ui.boxes[ancestor].rect, x, y) {
-      return false
-    }
-    ancestor = ui.boxes[ancestor].parent
-  }
-  return true
+  area := shared.visible
+  return x >= area[0] && y >= area[1] && x < area[2] && y < area[3]
 }
 fn ui_hovered(ui: *const UiState, index: usize) bool {
   return ui.mouse_seen && ui_visible_at(ui, index, ui.mouse_x, ui.mouse_y)
 }
-// Topmost clickable box built last frame under the point; 0 when none.
+// The shared tree owns clipping and build-order hit precedence across panels.
 fn ui_hit(ui: *const UiState, x: f32, y: f32) usize {
-  hit: usize = 0
-  for index in 1..UiCapacity {
-    candidate := &ui.boxes[index]
-    if candidate.key != 0 && candidate.touched == ui.frame && (candidate.flags & UiClickable) != 0 && ui_visible_at(ui, index, x, y) && (hit == 0 || candidate.order > ui.boxes[hit].order) {
-      hit = index
-    }
+  if ui.shared == nil {
+    return 0
   }
-  return hit
+  key := box_ui.hit(ui.shared, x, y)
+  if key == 0 {
+    return 0
+  }
+  return ui_make_lookup(ui, key)
 }
 // Pointer motion; asks for a redraw only when the hovered box changes.
 fn ui_pointer(ui: *UiState, x: f32, y: f32) {
@@ -320,7 +349,8 @@ fn ui_animate(app: *App, ui: *UiState, index: usize, selected: bool) {
   }
   duration := app.config.popup_animation_ms
   _ = animated_value(app, &made.hot, hot_target, duration, false)
-  _ = animated_value(app, &made.selected, selected_target, duration, false)
+  // Selection is input feedback. Hover remains a decorative transition.
+  motion.snap(&made.selected, selected_target)
 }
 
 fn ui_text_width(ui: *const UiState, text: []const u8) f32 {
@@ -332,165 +362,122 @@ fn ui_text_width(ui: *const UiState, text: []const u8) f32 {
   }
   return #cast(f32, count) * ui.cell
 }
-fn ui_standalone(ui: *UiState, index: usize, axis: usize) {
-  made := &ui.boxes[index]
-  if made.size[axis].kind == UiSizeKind.Pixels {
-    made.extent[axis] = made.size[axis].value * ui.scale
-  }
-  else if made.size[axis].kind == UiSizeKind.Text {
-    if axis == UiAxisX {
-      made.extent[axis] = ui_text_width(ui, ui_text_of(ui, index)) + made.padding[axis] * 2.0
-    }
-    else {
-      made.extent[axis] = ui.line + made.padding[axis] * 2.0
-    }
-  }
-  child := made.first
-  for child != 0 {
-    ui_standalone(ui, child, axis)
-    child = ui.boxes[child].next
-  }
+fn ui_shared_measure(data: rawptr, text: []const u8) f32 {
+  return ui_text_width(#cast(*const UiState, data), text)
 }
-fn ui_upward(ui: *UiState, index: usize, axis: usize) {
-  made := &ui.boxes[index]
-  if made.size[axis].kind == UiSizeKind.Percent && made.parent != 0 {
-    owner := &ui.boxes[made.parent]
-    made.extent[axis] = (owner.extent[axis] - owner.padding[axis] * 2.0) * made.size[axis].value
+
+fn ui_shared_size(size: UiSize) box_ui.Size {
+  if size.kind == UiSizeKind.Pixels {
+    return box_ui.pixels(size.value, size.strictness)
   }
-  child := made.first
-  for child != 0 {
-    ui_upward(ui, child, axis)
-    child = ui.boxes[child].next
+  if size.kind == UiSizeKind.Text {
+    return box_ui.text_size(0.0, size.strictness)
   }
+  if size.kind == UiSizeKind.Percent {
+    return box_ui.percent(size.value, size.strictness)
+  }
+  return box_ui.children(size.strictness)
 }
-fn ui_downward(ui: *UiState, index: usize, axis: usize) {
-  made := &ui.boxes[index]
-  child := made.first
-  for child != 0 {
-    ui_downward(ui, child, axis)
-    child = ui.boxes[child].next
-  }
-  if made.size[axis].kind == UiSizeKind.Children {
-    total: f32 = 0.0
-    item := made.first
-    for item != 0 {
-      if axis == made.axis {
-        total += ui.boxes[item].extent[axis]
-      }
-      else if ui.boxes[item].extent[axis] > total {
-        total = ui.boxes[item].extent[axis]
-      }
-      item = ui.boxes[item].next
+
+fn ui_layout_member(ui: *const UiState, index: usize) bool {
+  current := index
+  for current != 0 {
+    if current == ui.root {
+      return true
     }
-    made.extent[axis] = total + made.padding[axis] * 2.0
+    current = ui.boxes[current].parent
   }
+  return false
 }
-// Shrink children that overflow their parent, taking only the slack each
-// child's strictness allows. Scrolling parents keep full child sizes.
-fn ui_solve(ui: *UiState, index: usize, axis: usize) {
-  made := &ui.boxes[index]
-  available := made.extent[axis] - made.padding[axis] * 2.0
-  if (made.flags & UiScroll) == 0 || axis != UiAxisY {
-    if axis == made.axis {
-      total: f32 = 0.0
-      slack: f32 = 0.0
-      item := made.first
-      for item != 0 {
-        total += ui.boxes[item].extent[axis]
-        slack += ui.boxes[item].extent[axis] * (1.0 - ui.boxes[item].size[axis].strictness)
-        item = ui.boxes[item].next
-      }
-      overflow := total - available
-      // Fully flexible children (strictness 0) give up space first, in order,
-      // so a filler takes exactly what is left; the rest shrink proportionally.
-      flexible := made.first
-      for flexible != 0 && overflow > 0.0 {
-        yielding := &ui.boxes[flexible]
-        if yielding.size[axis].strictness == 0.0 {
-          taken := yielding.extent[axis]
-          if taken > overflow {
-            taken = overflow
-          }
-          yielding.extent[axis] -= taken
-          overflow -= taken
-          slack -= taken
-        }
-        flexible = yielding.next
-      }
-      if overflow > 0.0 && slack > 0.0 {
-        fraction := overflow / slack
-        if fraction > 1.0 {
-          fraction = 1.0
-        }
-        shrink := made.first
-        for shrink != 0 {
-          sized := &ui.boxes[shrink]
-          sized.extent[axis] -= sized.extent[axis] * (1.0 - sized.size[axis].strictness) * fraction
-          shrink = sized.next
-        }
-      }
-    }
-    else {
-      clamp := made.first
-      for clamp != 0 {
-        bounded := &ui.boxes[clamp]
-        if bounded.extent[axis] > available {
-          bounded.extent[axis] = available
-        }
-        clamp = bounded.next
-      }
-    }
-  }
-  child := made.first
-  for child != 0 {
-    ui_solve(ui, child, axis)
-    child = ui.boxes[child].next
-  }
-}
-fn ui_place(ui: *UiState, index: usize, axis: usize) {
-  made := &ui.boxes[index]
-  if made.parent == 0 || (made.flags & UiFloating) != 0 {
-    made.position[axis] = made.floating[axis]
-  }
-  cursor := made.position[axis] + made.padding[axis]
-  if axis == UiAxisY && (made.flags & UiScroll) != 0 {
-    cursor -= made.scroll.value
-  }
-  child := made.first
-  for child != 0 {
-    placed := &ui.boxes[child]
-    if (placed.flags & UiFloating) == 0 {
-      if axis == made.axis {
-        placed.position[axis] = cursor
-        cursor += placed.extent[axis]
-      }
-      else {
-        placed.position[axis] = made.position[axis] + made.padding[axis]
-        if axis == UiAxisY && (made.flags & UiScroll) != 0 {
-          placed.position[axis] -= made.scroll.value
-        }
-      }
-    }
-    ui_place(ui, child, axis)
-    child = placed.next
-  }
-  if axis == UiAxisY {
-    made.rect = sdl.Rect{x: made.position[0], y: made.position[1], width: made.extent[0], height: made.extent[1]}
-    if made.first != 0 && (made.flags & UiScroll) != 0 {
-      made.content = cursor + made.scroll.value - made.position[1] - made.padding[1]
-    }
-  }
-}
+
+// Compatibility boundary for the indexed DNA widgets and custom native renderer.
+// Geometry is solved by std/ui/box; these records retain application-specific
+// colors, values, tweening and lookup identities until widget migration ends.
 fn ui_layout(ui: *UiState) {
   if ui.root == 0 {
     return
   }
-  for axis in 0..2 {
-    ui_standalone(ui, ui.root, axis)
-    ui_upward(ui, ui.root, axis)
-    ui_downward(ui, ui.root, axis)
-    ui_solve(ui, ui.root, axis)
-    ui_place(ui, ui.root, axis)
+  for index in 1..UiCapacity {
+    source := &ui.boxes[index]
+    if source.touched != ui.frame || !ui_layout_member(ui, index) {
+      continue
+    }
+    target := source.shared
+    target.key = source.key
+    target.axis = #cast(u8, source.axis)
+    target.width = ui_shared_size(source.size[0])
+    target.height = ui_shared_size(source.size[1])
+    target.text = ui_text_of(ui, index)
+    target.padding = source.padding
+    target.floating = source.floating
+    target.flags = box_ui.GreedyShrink
+    if source.flags & UiClickable != 0 {
+      target.flags |= box_ui.Clickable
+    }
+    if source.flags & UiFloating != 0 {
+      target.flags |= box_ui.AbsoluteX | box_ui.AbsoluteY
+    }
+    if source.flags & UiClip != 0 {
+      target.flags |= box_ui.Clip
+    }
+    if source.flags & UiScroll != 0 {
+      target.flags |= box_ui.ScrollY
+      target.view[1] = source.scroll.value
+      target.view_target[1] = source.scroll_target
+    }
+    if source.parent != 0 {
+      target.parent = ui.boxes[source.parent].shared
+      // DNA fills the cross axis to its parent's available width regardless
+      // of semantic-size strictness. Keep this policy at the adapter boundary.
+      if ui.boxes[source.parent].axis != UiAxisX {
+        target.width.strictness = 0.0
+      }
+      if ui.boxes[source.parent].axis != UiAxisY {
+        target.height.strictness = 0.0
+      }
+    }
+    if source.first != 0 {
+      target.first = ui.boxes[source.first].shared
+    }
+    if source.last != 0 {
+      target.last = ui.boxes[source.last].shared
+    }
+    if source.next != 0 {
+      target.next = ui.boxes[source.next].shared
+    }
+  }
+  root := ui.boxes[ui.root].shared
+  // std's frame root is at the origin; DNA's root represents an independently
+  // placed panel. A synthetic screen root gives it normal absolute positioning.
+  screen := box_ui.Box{}
+  screen.width = box_ui.pixels(UiCanvasExtent, 1.0)
+  screen.height = box_ui.pixels(UiCanvasExtent, 1.0)
+  screen.first = root
+  screen.last = root
+  previous_parent := root.parent
+  following := root.next
+  root.next = nil
+  root.parent = &screen
+  root.flags |= box_ui.AbsoluteX | box_ui.AbsoluteY
+  state := box_ui.State{ root: &screen, depth: 1, scale: ui.scale,
+    line_height: ui.line, measure: ui_shared_measure, measure_data: ui,
+    reduced_motion: true }
+  box_ui.layout(&state)
+  root.parent = previous_parent
+  root.next = following
+  for index in 1..UiCapacity {
+    source := &ui.boxes[index]
+    if source.touched != ui.frame || !ui_layout_member(ui, index) {
+      continue
+    }
+    target := source.shared
+    source.extent = target.size
+    source.position[0] = target.rect[0]
+    source.position[1] = target.rect[1]
+    source.rect = sdl.Rect{ x: target.rect[0], y: target.rect[1], width: target.size[0], height: target.size[1] }
+    if source.first != 0 && source.flags & UiScroll != 0 {
+      source.content = target.content[1] - target.padding[1] * 2.0
+    }
   }
 }
 
@@ -568,7 +555,7 @@ fn ui_draw_box(renderer: rawptr, ui: *UiState, typography: *Typography, index: u
       #panic("UI clip")
     }
   }
-  if (made.flags & UiText) != 0 && made.text_length > 0 {
+  if (made.flags & UiText) != 0 && #len(made.shared.text) > 0 {
     text := ui_text_of(ui, index)
     x := rect.x + made.padding[0]
     // Right-aligned text that does not fit keeps its start visible instead.
@@ -642,7 +629,7 @@ fn ui_list_scroll(app: *App, ui: *UiState, list: usize, count: usize, selected: 
   if scrolled.scroll_target < 0.0 {
     scrolled.scroll_target = 0.0
   }
-  _ = animated_follow(app, &scrolled.scroll, scrolled.scroll_target, app.config.scroll_animation_ms * 2.0, reset || !app.config.smooth_scroll)
+  _ = animated_follow(app, &scrolled.scroll, scrolled.scroll_target, app.config.scroll_animation_ms, reset || !app.config.smooth_scroll)
 }
 struct UiWindow { first, last: usize }
 // Rows that can show this frame, covering the whole glide. Lists build only
@@ -692,7 +679,7 @@ fn ui_sheet_begin(app: *App, ui: *UiState, typography: *const Typography, name: 
   if app.view.animation.panel != app.prompt_state.panel {
     motion.snap(&ui.sheet_open, 0.0)
   }
-  slide := animated_value(app, &ui.sheet_open, 0.0, app.config.popup_animation_ms * 2.0, false)
+  slide := animated_value(app, &ui.sheet_open, 0.0, app.config.popup_animation_ms, false)
   frame := ui_make(ui, ui_hash(0, name), UiFloating | UiBackground | UiBorder | UiClip)
   ui.boxes[frame].floating[0] = rect.x
   ui.boxes[frame].floating[1] = rect.y + slide

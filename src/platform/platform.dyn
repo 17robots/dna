@@ -1,10 +1,17 @@
-// SDL3 ABI declarations. Drawing, event and window calls go through wrappers
+use "std/mem"
+// Report lost native input without applying a guessed partial transaction.
+pub const InputOverflowEvent: u32 = 32770
+// Worker completion schedules another service pass before the editor idles.
+pub const WorkerWakeEvent: u32 = 32768
+#assert(InputOverflowEvent != PasteEvent)
+#assert(WorkerWakeEvent != InputOverflowEvent && WorkerWakeEvent != PasteEvent)
+// Internal event and rendering interface. Calls go through wrappers
 // that route to the terminal backend (tui.dyn) while it is active.
 extern fn string_length "strlen"(text: *const u8) usize
 // Dummy non-nil handle for windows, renderers and textures in the terminal.
 tui_handle: u8 = 0
-// SDL3 ABI declarations. Field order and padding must match SDL headers.
-// Do not regroup fields by type: SDL writes these events directly into memory.
+// Internal event records shared by the native GUI and terminal frontends.
+// Preserve this layout while migrating callers and test event producers.
 pub struct Event { words: [16]u64 }
 pub struct KeyEvent {
   kind: u32,
@@ -22,7 +29,7 @@ pub struct KeyEvent {
 pub struct TextEvent { kind, reserved: u32, timestamp: u64, window: u32, text: *const u8 }
 pub struct Rect { x, y, width, height: f32 }
 pub struct PixelRect { x, y, width, height: i32 }
-// SDL_Vertex: position, float color, texture coordinate.
+// Vertex: position, float color, texture coordinate.
 pub struct Vertex { x, y, red, green, blue, alpha, u, v: f32 }
 pub struct MouseButton {
   kind: u32,
@@ -184,6 +191,13 @@ pub fn fill(renderer: rawptr, rectangle: *const Rect) bool {
   }
   return sdl_fill(renderer, rectangle)
 }
+// Temporary presentation opacity; logical layout and input geometry stay live.
+pub fn draw_opacity(renderer: rawptr, alpha: u8) bool {
+  if tui_active() {
+    return true
+  }
+  return sdl_draw_opacity(renderer, alpha)
+}
 pub fn geometry(renderer: rawptr, texture: rawptr, vertices: *const Vertex, count: i32, indices: *const i32, index_count: i32) bool {
   if tui_active() {
     return true
@@ -276,7 +290,7 @@ pub fn poll(event: *Event) bool {
   }
   return sdl_poll(event)
 }
-// Milliseconds since startup; native, so terminal-only builds need no SDL.
+// Milliseconds since startup; native, so terminal-only builds need no GUI libraries.
 pub extern fn ticks "dna_ticks"() u64
 pub fn create_texture(renderer: rawptr, format: u32, access: i32, width: i32, height: i32) rawptr {
   if tui_active() {

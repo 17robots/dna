@@ -1,0 +1,71 @@
+// Compare syntax's actual framebuffer to an independently tinted full-line
+// draw. Contextual shaping, bidi, tabs and combining clusters must stay intact.
+fn native_syntax_single_pass_smoke(app:*App, typography:*Typography, renderer:rawptr, window:rawptr, probe:NativeTypingFrameProbe) {
+  slot:=app.documents.slots[app.documents.active]
+  old_syntax:=slot.syntax
+  old_colors:=slot.colors
+  old_revision:=slot.syntax_revision
+  defer slot.syntax=old_syntax
+  defer slot.colors=old_colors
+  defer slot.syntax_revision=old_revision
+  old_text:=theme_override(4)
+  defer theme_set_override(4, old_text)
+  saved:[6]u32=[]
+  for i in 0..6 {
+    saved[i]=theme_override(#cast(u32, i+8))
+  }
+  defer {
+    for i in 0..6 {
+      theme_set_override(#cast(u32, i+8), saved[i])
+    }
+  }
+  app.prompt_state.panel=Panel.None
+  app.view.reduced_motion=true
+  app.view.line_numbers=false
+  app.view.status_line=false
+  app.view.highlight_line=false
+  app.view.insert=true
+  app.config.vim_keys=false
+  probe.resize(960, 640)
+  doc:=app.documents.current
+  owner:=arena_owner.create(960*640*4+4096)
+  defer arena_owner.release(owner)
+  slot.colors=mem.push_bytes_uninit(owner, 256)
+  before:=mem.push_bytes_uninit(owner, 960*640*4)
+  slot.syntax=#cast(rawptr, 1)
+  ink:=rgb_value(theme().syntax_keyword)
+  for sample in ["fn mainthing() { print(\"hello\") }\n\n", "office ffi e\xCC\x81 café\n\n", "abc \xD7\x90\xD7\x91\xD7\x92 123 \xD8\xB3\xD9\x84\xD8\xA7\xD9\x85\n\n", "fn\tname()\t{ return 42 }\n\n"] {
+    for mixed in 0..2 {
+      _=buffer.load(doc, sample)
+      buffer.move_to(doc, doc.length, false)
+      slot.syntax_revision=doc.revision
+      for i in 0..6 {
+        theme_set_override(#cast(u32, i+8), ink)
+      }
+      theme_set_override(4, old_text)
+      if mixed!=0 {
+        theme_set_override(4, ink)
+      }
+      for at in 0..#len(slot.colors) {
+        slot.colors[at]=3
+        if mixed!=0 {
+          slot.colors[at]=#cast(u8, at%7)
+        }
+      }
+      app.config.syntax_enabled=true
+      draw(renderer, window, app, typography)
+      _=mem.copy(before, probe.pixels())
+      app.config.syntax_enabled=false
+      theme_set_override(4, ink)
+      draw(renderer, window, app, typography)
+      reference:=probe.pixels()
+      region:=#cast(usize, (app.config.document_padding*typography.scale+typography.line))*960*4
+      for at in 0..region {
+        if before[at]!=reference[at] {
+          #panic("syntax antialias is painted over a second normal-text raster or reshapes clusters")
+        }
+      }
+    }
+  }
+  app.running=false
+}

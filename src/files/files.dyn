@@ -1,3 +1,5 @@
+use "../cstring" cstring
+use "../owned_arena" arena_owner
 use "../filesystem" fs
 use "std/mem"
 use "std/c"
@@ -6,7 +8,7 @@ use "../buffer"
 
 // Borrow caller storage; invalid input/capacity failure leaves it unchanged.
 fn bounded_string(storage: []u8, source: []const u8) c.StringResult {
-  return c.string_into(storage, source)
+  return cstring.bounded(storage, source)
 }
 
 #link("c")
@@ -106,11 +108,11 @@ pub fn metadata(path: []const u8) fs.Metadata {
 pub struct FileText { arena: *mem.Arena, data: []const u8, ok: bool, too_large: bool }
 
 pub fn read_text(path: []const u8) FileText {
-  reserved := mem.arena_create(buffer.Capacity + 1 + mem.ArenaBufferOverhead)
+  reserved := arena_owner.create(buffer.Capacity + 1)
   result := FileText{arena: reserved}
   opened := fs.open(path)
   if !opened.ok {
-    mem.arena_release(result.arena)
+    arena_owner.release(result.arena)
     result.arena = nil
     return FileText{}
   }
@@ -140,7 +142,7 @@ pub fn read_text(path: []const u8) FileText {
   closed := fs.close(&opened.value)
   if failed || result.too_large || total > buffer.Capacity || !closed.ok {
     too_large := result.too_large || total > buffer.Capacity
-    mem.arena_release(result.arena)
+    arena_owner.release(result.arena)
     result.arena = nil
     return FileText{too_large: too_large}
   }
@@ -177,7 +179,7 @@ pub fn read_prefix(arena: *mem.Arena, path: []const u8, maximum: usize) []const 
   return storage[..total]
 }
 pub fn release_text(text: *FileText) {
-  mem.arena_release(text.arena)
+  arena_owner.release(text.arena)
   text.arena = nil
   text.data = text.data[..0]
   text.ok = false

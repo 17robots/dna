@@ -18,9 +18,6 @@ for directory in ('src', 'tests'):
     assert not remaining, f'DNA-owned C sources remain: {remaining}'
 # Dyn type, C type, C field:Dyn field mappings.
 LAYOUTS = [
- ('NativeMutex', 'pthread_mutex_t', ''),
- ('NativeCondition', 'pthread_cond_t', ''),
- ('NativeTimespec', 'struct timespec', 'tv_sec:seconds tv_nsec:nanoseconds'),
  ('InstallStat', 'struct stat', 'st_dev:device st_ino:inode st_nlink:links st_mode:mode st_uid:uid st_gid:gid st_rdev:rdevice st_size:size st_blksize:block_size st_blocks:blocks st_atim.tv_sec:access_seconds st_atim.tv_nsec:access_nanos st_mtim.tv_sec:modify_seconds st_mtim.tv_nsec:modify_nanos st_ctim.tv_sec:change_seconds st_ctim.tv_nsec:change_nanos'),
  ('InstallEntry', 'struct dirent', 'd_ino:inode d_off:offset d_reclen:length d_type:kind d_name:name'),
  ('PollDescriptor', 'struct pollfd', 'fd events revents:returned'),
@@ -58,8 +55,6 @@ HEADERS = '''#define _GNU_SOURCE
 #include <tree_sitter/api.h>
 #include <vterm.h>
 #include <pcre2.h>
-#include <SDL3/SDL.h>
-#include <SDL3_ttf/SDL_ttf.h>
 '''
 # Opaque libc records and constants used by bindings, including original checks.
 ASSERTS = [
@@ -73,16 +68,6 @@ ASSERTS = [
  'sizeof(struct sigaction)==152 && offsetof(struct sigaction,sa_mask)==8 && offsetof(struct sigaction,sa_flags)==136 && offsetof(struct sigaction,sa_restorer)==144',
  '(PCRE2_UTF | PCRE2_UCP | PCRE2_NEVER_BACKSLASH_C)==0x001a0000',
  'sizeof(PCRE2_SIZE)==sizeof(size_t)',
- 'sizeof(TTF_SubString)==36 && offsetof(TTF_SubString,rect)==20',
- 'sizeof(SDL_Event)==128 && _Alignof(SDL_Event)==8',
- 'sizeof(SDL_KeyboardEvent)==40 && offsetof(SDL_KeyboardEvent,key)==28',
- 'sizeof(SDL_TextEditingEvent)==40 && offsetof(SDL_TextEditingEvent,start)==32',
- 'sizeof(SDL_TextInputEvent)==32 && offsetof(SDL_TextInputEvent,text)==24',
- 'sizeof(SDL_MouseButtonEvent)==40 && offsetof(SDL_MouseButtonEvent,x)==28',
- 'sizeof(SDL_MouseMotionEvent)==48 && offsetof(SDL_MouseMotionEvent,x)==28',
- 'SDL_EVENT_TEXT_EDITING==770 && SDL_EVENT_KEY_DOWN==768 && SDL_EVENT_TEXT_INPUT==771 && SDL_EVENT_WINDOW_CLOSE_REQUESTED==528',
- 'SDLK_F1==1073741882 && SDL_PIXELFORMAT_RGBA8888==0x16462004u && SDL_TEXTUREACCESS_TARGET==2 && SDL_BLENDMODE_BLEND==1',
- 'SDL_EVENT_MOUSE_MOTION==1024 && SDL_EVENT_MOUSE_BUTTON_DOWN==1025 && SDL_EVENT_MOUSE_BUTTON_UP==1026',
 ]
 code = [HEADERS] + [f'_Static_assert({check}, "native ABI {i}");' for i, check in enumerate(ASSERTS)]
 code += ['int main(void) {']
@@ -102,7 +87,7 @@ code += ['VTermScreenCell cell = {0}; unsigned bits; cell.attrs.bold=1; memcpy(&
          'memset(&cell.attrs,0,4); cell.attrs.italic=1; memcpy(&bits,&cell.attrs,4); if(bits!=8)return 1;',
          'memset(&cell.attrs,0,4); cell.attrs.reverse=1; memcpy(&bits,&cell.attrs,4); if(bits!=32)return 1;',
          'return 0; }']
-flags = shlex.split(subprocess.check_output(['pkg-config','--cflags','sdl3','tree-sitter','vterm'],text=True))
+flags = shlex.split(subprocess.check_output(['pkg-config','--cflags','tree-sitter','vterm'],text=True))
 subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror',
                 '-I'+str(ROOT/'build/deps/install/include'), *flags, '-x','c','-','-o',str(STAGE/'headers')],
                input='\n'.join(code), text=True, check=True)

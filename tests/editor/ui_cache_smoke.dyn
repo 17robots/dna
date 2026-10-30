@@ -1,0 +1,164 @@
+// Application contracts for DNA's shared keyed-box cache. Hash values and
+// record slot choices stay opaque; identity, retained tweens and input do not.
+fn ui_cache_panel(ui: *UiState, name: []const u8, x: f32) usize {
+  panel := ui_make(ui, ui_hash(0, name), UiFloating)
+  ui.boxes[panel].floating = [x, 0.0]
+  ui_size(ui, panel, UiAxisX, UiSizeKind.Pixels, 100.0, 1.0)
+  ui_size(ui, panel, UiAxisY, UiSizeKind.Pixels, 100.0, 1.0)
+  ui_push(ui, panel)
+  return panel
+}
+
+fn ui_cache_smoke() {
+  owned := arena_owner.create(#sizeof(UiState) + 128)
+  defer arena_owner.release(owned)
+  ui := mem.push(UiState, owned)
+  defer ui_release(ui)
+  typography := Typography{}
+  typography.scale = 1.0
+  typography.cell = 8.0
+  typography.line = 16.0
+
+  ui_begin(ui, &typography)
+  panel := ui_cache_panel(ui, "retained", 0.0)
+  first := ui_label(ui, "same-row", "first", UiClickable | UiHover)
+  second := ui_label(ui, "same-row", "second", UiClickable | UiHover)
+  first_key := ui.boxes[first].key
+  second_key := ui.boxes[second].key
+  if first == second || first_key == second_key {
+    #panic("shared cache duplicate labels remain independent")
+  }
+  motion.snap(&ui.boxes[first].hot, 0.25)
+  motion.snap(&ui.boxes[second].hot, 0.75)
+  motion.snap(&ui.boxes[first].selected, 0.5)
+  ui.boxes[first].value = 91
+  ui_pop(ui)
+  ui_layout(ui)
+  ui_pointer(ui, 2.0, 5.0)
+  if ui_hit(ui, 2.0, 5.0) != first || !ui.redraw {
+    #panic("shared cache initial hover redraw")
+  }
+  ui.redraw = false
+  ui_pointer(ui, 3.0, 5.0)
+  if ui.redraw {
+    #panic("shared cache motion inside row stays idle")
+  }
+
+  ui_begin(ui, &typography)
+  rebuilt := ui_cache_panel(ui, "retained", 0.0)
+  first_again := ui_label(ui, "same-row", "changed", UiClickable | UiHover)
+  second_again := ui_label(ui, "same-row", "second", UiClickable | UiHover)
+  if rebuilt != panel || first_again != first || second_again != second ||
+    ui.boxes[first_again].key != first_key || ui.boxes[second_again].key != second_key {
+    #panic("shared cache stable identity and duplicate build order")
+  }
+  if ui.boxes[first_again].hot.value != 0.25 || ui.boxes[first_again].selected.value != 0.5 || ui.boxes[second_again].hot.value != 0.75 {
+    #panic("shared cache retains independent application tweens")
+  }
+  if ui.boxes[first_again].value != 0 || ui_text_of(ui, first_again)[0] != 'c' {
+    #panic("shared cache rebuilds caller data and label")
+  }
+  ui_pop(ui)
+  ui_layout(ui)
+  if ui_make_lookup(ui, first_key) != first_again || ui_hit(ui, 2.0, 5.0) != first_again {
+    #panic("shared cache lookup and input survive rebuild")
+  }
+  // A later panel cannot erase an earlier panel's text, geometry or hits.
+  _ = ui_cache_panel(ui, "later", 200.0)
+  text: [4]u8 = ['l', 'a', 't', 'e']
+  later := ui_label(ui, "row", text[..], UiClickable)
+  text[0] = 'X'
+  ui_pop(ui)
+  ui_layout(ui)
+  if ui_hit(ui, 2.0, 5.0) != first_again || ui_hit(ui, 202.0, 5.0) != later ||
+    ui_text_of(ui, first_again)[0] != 'c' || ui_text_of(ui, later)[0] != 'l' {
+    #panic("shared cache multiple panels retain geometry and owned text")
+  }
+
+  // Solving an earlier root again must not walk its global next-panel link.
+  // The later panel's retained rect and input must agree after that solve.
+  later_rect := ui.boxes[later].rect
+  ui.root = panel
+  ui_layout(ui)
+  if ui.boxes[later].rect.x != later_rect.x || ui.boxes[later].rect.y != later_rect.y ||
+    ui.boxes[later].rect.width != later_rect.width || ui_hit(ui, 202.0, 5.0) != later {
+    #panic("shared cache earlier panel relayout preserves later panel")
+  }
+  // Frame text is arena-owned rather than a fixed 32 KiB label slab.
+  _ = ui_cache_panel(ui, "long-text", 400.0)
+  large: [40000]u8 = []
+  for at in 0..#len(large) {
+    large[at] = #cast(u8, 65 + at % 26)
+  }
+  long_label := ui_label(ui, "long-label", large[..], UiClickable)
+  large[0] = '!'
+  large[39999] = '!'
+  ui_pop(ui)
+  ui_layout(ui)
+  long_text := ui_text_of(ui, long_label)
+  if #len(long_text) != 40000 || long_text[0] != 'A' || long_text[39999] != #cast(u8, 65 + 39999 % 26) ||
+    ui_text_of(ui, first_again)[0] != 'c' || ui_hit(ui, 202.0, 5.0) != later {
+    #panic("shared cache large owned text survives caller mutation and layout")
+  }
+  ui.root = panel
+  ui_layout(ui)
+  if #len(ui_text_of(ui, long_label)) != 40000 || ui_hit(ui, 402.0, 5.0) != long_label {
+    #panic("shared cache large text survives other panel relayout")
+  }
+
+  // A key absent for two whole builds returns as a fresh application record.
+  ui_begin(ui, &typography)
+  stale_key := ui_hash(0, "stale")
+  stale := ui_make(ui, stale_key, UiFloating | UiClickable)
+  motion.snap(&ui.boxes[stale].hot, 0.9)
+  motion.snap(&ui.boxes[stale].selected, 0.8)
+  motion.snap(&ui.boxes[stale].scroll, 7.0)
+  ui.boxes[stale].value = 177
+  for step in 0..2 {
+    ui_begin(ui, &typography)
+    if ui_make_lookup(ui, stale_key) != 0 {
+      #panic("shared cache hides keys not built this frame")
+    }
+    _ = ui_make(ui, ui_hash_number(ui_hash(0, "missing"), step), UiFloating)
+  }
+  ui_begin(ui, &typography)
+  fresh := ui_make(ui, stale_key, UiFloating | UiClickable)
+  if ui.boxes[fresh].hot.ready || ui.boxes[fresh].selected.ready || ui.boxes[fresh].scroll.ready || ui.boxes[fresh].value != 0 {
+    #panic("shared cache recycled records clear old caller state")
+  }
+
+  // A changing-key workload must recycle storage rather than allocate one
+  // persistent box for every label ever seen. Warm-up covers both live frames.
+  warm: usize = 0
+  for frame in 0..96 {
+    ui_begin(ui, &typography)
+    _ = ui_cache_panel(ui, "churn", 0.0)
+    for row in 0..32 {
+      entry := ui_make(ui, ui_hash_number(ui_hash(0, "changing"), frame * 32 + row), 0)
+      ui_size(ui, entry, UiAxisY, UiSizeKind.Pixels, 1.0, 1.0)
+    }
+    ui_pop(ui)
+    ui_layout(ui)
+    if frame == 15 {
+      warm = mem.arena_used(ui.cache_arena)
+    }
+  }
+  if mem.arena_used(ui.cache_arena) > warm + #sizeof(box_ui.Box) * 4 {
+    #panic("shared cache changing keys keep bounded persistent storage")
+  }
+  ui_release(ui)
+  if ui.shared != nil || ui.cache_arena != nil || ui.frame_arena != nil {
+    #panic("shared cache release clears owner and frame storage")
+  }
+  ui_begin(ui, &typography)
+  _ = ui_cache_panel(ui, "retained", 0.0)
+  after_release := ui_label(ui, "same-row", "rebuilt", UiClickable | UiHover)
+  ui_pop(ui)
+  ui_layout(ui)
+  if ui.shared == nil || ui.boxes[after_release].hot.ready || ui.boxes[after_release].selected.ready ||
+    ui_text_of(ui, after_release)[0] != 'r' || ui_hit(ui, 2.0, 5.0) != after_release {
+    #panic("shared cache release then rebuild starts fresh and accepts input")
+  }
+  ui_release(ui)
+  ui_release(ui)
+}

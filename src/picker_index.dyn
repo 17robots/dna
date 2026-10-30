@@ -16,6 +16,7 @@ fn picker_index_submit(app: *App) {
   }
   state.generation = picker_native_submit(state.worker, &state.index.root[0])
   state.pending = true
+  state.received_count = 0
   state.watching = true
   state.refresh_due = 0
 }
@@ -31,11 +32,23 @@ fn picker_index_receive(app: *App) bool {
   if status == 0 {
     return false
   }
-  state.pending = false
+  if status != 2 {
+    state.pending = false
+  }
   if status < 0 {
     return false
   }
   index := state.index
+  if status == 2 {
+    // A complete cached list stays stable during a warm refresh. Cold lists
+    // instead accept growing immutable prefixes while traversal continues.
+    if state.received_count == 0 && index.count > 0 {
+      return false
+    }
+    if state.received_count == count {
+      return false
+    }
+  }
   index.count = 0
   index.visited = visited
   index.limited = (flags & 1) != 0
@@ -50,6 +63,7 @@ fn picker_index_receive(app: *App) bool {
       index.count += 1
     }
   }
+  state.received_count = count
   if state.watch_fallback && state.refresh_due == 0 {
     state.refresh_due = sdl.ticks() + 2000
   }

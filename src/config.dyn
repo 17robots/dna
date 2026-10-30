@@ -262,8 +262,9 @@ fn config_reload(app: *App, typography: *Typography, startup: bool) {
   parsed.font_family = app.configuration.font_family[..family_length]
   app.lsp.auto_started = 0
   app.lsp.default_started = 0
-  for configured_slot in 0..16 {
-    reset_slot := &app.documents.slots[configured_slot]
+  for configured_slot in 0..#len(app.documents.slots) {
+    reset_slot := app.documents.slots[configured_slot]
+    filetype_dirty_slot(app, configured_slot)
     if reset_slot.inferred_filetype {
       reset_slot.filetype_length = 0
       reset_slot.inferred_filetype = false
@@ -377,9 +378,59 @@ fn font_select(app: *App, typography: *Typography, path: []const u8) {
   resize_font(typography)
   app.view.revision += 1
 }
+// Logical navigation actions share configured bindings across documents and
+// the tree; command-valued bindings still use the normal palette dispatcher.
+fn configured_navigation(command:[]const u8)u32 {
+  if buffer.equal(command, "move-up") {
+    return KeyUp
+  }
+  if buffer.equal(command, "move-down") {
+    return KeyDown
+  }
+  if buffer.equal(command, "move-left") {
+    return KeyLeft
+  }
+  if buffer.equal(command, "move-right") {
+    return KeyRight
+  }
+  if buffer.equal(command, "page-up") {
+    return KeyPageUp
+  }
+  if buffer.equal(command, "page-down") {
+    return KeyPageDown
+  }
+  return 0
+}
+fn configured_binding(app:*const App, key:u32, modifiers:u16, scope:u8)*const settings.Binding {
+  normalized:u16=0
+  if (modifiers&ModShift)!=0 {
+    normalized|=3
+  }
+  if (modifiers&ModCtrl)!=0 {
+    normalized|=192
+  }
+  if (modifiers&ModAlt)!=0 {
+    normalized|=768
+  }
+  for index in 0..app.config.binding_count {
+    binding:=&app.config.bindings[index]
+    if binding.scope==scope && binding.key==key && binding.modifiers==normalized {
+      return binding
+    }
+  }
+  return nil
+}
 fn configured_key(app: *App, typography: *Typography, key: u32, modifiers: u16) bool {
+  explorer_borrow:=explorer_vim_begin(app)
+  defer explorer_vim_finish(app, typography, &explorer_borrow)
   scope: u8 = 0
-  if app.prompt_state.panel == Panel.None && !app.view.insert && !app.view.extend && app.documents.slots[app.documents.active].terminal.handle == nil {
+  if app.prompt_state.panel==Panel.Tree && !app.tree.searching && !app.tree.goto_pending {
+    scope=1
+  }
+  else if app.prompt_state.panel==Panel.Directory && !app.explorer.insert && !app.explorer.extend && (!app.config.vim_keys || vim_idle(app)) {
+    scope=1
+  }
+  else if app.prompt_state.panel == Panel.None && !app.view.insert && !app.view.extend && app.documents.slots[app.documents.active].terminal.handle == nil && (!app.config.vim_keys || vim_idle(app)) {
     scope = 1
   }
   else if app.prompt_state.panel == Panel.Leader && !app.input_state.leader_explorer {
@@ -388,29 +439,46 @@ fn configured_key(app: *App, typography: *Typography, key: u32, modifiers: u16) 
   if scope == 0 {
     return false
   }
-  index: usize = 0
-  for index < app.config.binding_count {
-    binding := &app.config.bindings[index]
-    normalized: u16 = 0
-    if (modifiers & ModShift) != 0 {
-      normalized = normalized | 3
-    }
-    if (modifiers & ModCtrl) != 0 {
-      normalized = normalized | 192
-    }
-    if (modifiers & ModAlt) != 0 {
-      normalized = normalized | 768
-    }
-    if binding.scope == scope && binding.key == key && binding.modifiers == normalized {
-      app.prompt_state.panel = Panel.Commands
-      app.prompt_state.length = copy_text(app.prompt_state.text[..], binding.command)
-      app.prompt_state.selected = 0
-      command_execute(app, typography)
-      return true
-    }
-    index += 1
+  binding:=configured_binding(app, key, modifiers, scope)
+  if binding==nil {
+    return false
   }
-  return false
+  navigation:=configured_navigation(binding.command)
+  if navigation!=0 {
+    character:=app.input_state.character
+    app.input_state.character=0
+    defer {
+      app.input_state.character=character
+    }
+    if app.prompt_state.panel==Panel.Tree {
+      tree_key(app, typography, navigation, 0)
+    }
+    else if app.prompt_state.panel==Panel.Directory {
+      explorer_key(app, typography, navigation, 0)
+    }
+    else {
+      if app.prompt_state.panel==Panel.Leader {
+        app.prompt_state.panel=Panel.None
+      }
+      if !app.config.vim_keys || !vim_key(app, typography, navigation, 0) {
+        edit_key(app, navigation, 0)
+      }
+    }
+    return true
+  }
+  if app.prompt_state.panel==Panel.Directory {
+    app.explorer.commands=true
+  }
+  app.prompt_state.panel=Panel.Commands
+  app.prompt_state.length=copy_text(app.prompt_state.text[..], binding.command)
+  app.prompt_state.selected=0
+  if app.explorer.vim_borrowed {
+    app.explorer.dispatch_pending=2
+  }
+  else {
+    command_execute(app, typography)
+  }
+  return true
 }
 fn cleanup_config_fonts(typography: *Typography) {
   release_pane_text(typography)

@@ -5,6 +5,7 @@ struct PickerState {
   index: *PickerIndex,
   arena: *mem.Arena,
   rows: usize,
+  received_count: usize,
   epoch: u64,
   preview: PickerPreview,
   closing: bool,
@@ -93,7 +94,73 @@ fn key_hint(goto: bool, index: usize) KeyHint {
   info := command_info(leader_command(index))
   return KeyHint{key: info.key, label: info.hint}
 }
+fn vim_menu_active(app: *const App) bool {
+  return vim_menu_prefix(app) != 0
+}
+fn vim_key_hint(app: *const App, index: usize) KeyHint {
+  prefix := vim_menu_prefix(app)
+  if prefix == 'g' {
+    hints: [19]KeyHint = [
+      KeyHint{key:"g", label:"first/count line"}, KeyHint{key:"e", label:"previous word end"},
+      KeyHint{key:"E", label:"previous WORD end"}, KeyHint{key:"_", label:"last nonblank"},
+      KeyHint{key:"j", label:"next line"}, KeyHint{key:"k", label:"previous line"},
+      KeyHint{key:"0", label:"line start"}, KeyHint{key:"~", label:"toggle case operator"},
+      KeyHint{key:"u", label:"lowercase operator"}, KeyHint{key:"U", label:"uppercase operator"},
+      KeyHint{key:"v", label:"restore selection"}, KeyHint{key:"J", label:"join lines"},
+      KeyHint{key:"d", label:"definition"}, KeyHint{key:"r", label:"references"},
+      KeyHint{key:"y", label:"type definition"}, KeyHint{key:"i", label:"implementation"},
+      KeyHint{key:"t", label:"next buffer"}, KeyHint{key:"T", label:"previous buffer"},
+      KeyHint{key:"D", label:"definition"},
+    ]
+    if index < key_menu_count(app) {
+      return hints[index]
+    }
+  }
+  if prefix == 'z' {
+    hints: [3]KeyHint = [KeyHint{key:"z", label:"center cursor"}, KeyHint{key:"t", label:"cursor at top"}, KeyHint{key:"b", label:"cursor at bottom"}]
+    if index < 3 {
+      return hints[index]
+    }
+  }
+  if prefix == 'Z' {
+    hints: [2]KeyHint = [KeyHint{key:"Z", label:"save and close"}, KeyHint{key:"Q", label:"exit editor"}]
+    if index < 2 {
+      return hints[index]
+    }
+  }
+  if prefix == 'i' || prefix == 'a' {
+    hints: [10]KeyHint = [
+      KeyHint{key:"w", label:"word"}, KeyHint{key:"W", label:"WORD"}, KeyHint{key:"p", label:"paragraph"},
+      KeyHint{key:"\"", label:"double quotes"}, KeyHint{key:"'", label:"single quotes"}, KeyHint{key:"`", label:"backticks"},
+      KeyHint{key:"(", label:"parentheses"}, KeyHint{key:"[", label:"brackets"}, KeyHint{key:"{", label:"braces"}, KeyHint{key:"<", label:"angle brackets"},
+    ]
+    if index < 10 {
+      return hints[index]
+    }
+  }
+  return KeyHint{}
+}
 fn key_menu_count(app: *const App) usize {
+  prefix := vim_menu_prefix(app)
+  if prefix == 'g' {
+    context := vim_menu_context(app)
+    if context == 2 {
+      return 7
+    }
+    if context == 1 {
+      return 10
+    }
+    return 19
+  }
+  if prefix == 'z' {
+    return 3
+  }
+  if prefix == 'Z' {
+    return 2
+  }
+  if prefix == 'i' || prefix == 'a' {
+    return 10
+  }
   if app.prompt_state.panel == Panel.Leader {
     return 12
   }
@@ -121,6 +188,9 @@ fn key_menu_count(app: *const App) usize {
   return 11
 }
 fn key_menu_hint(app: *const App, index: usize) KeyHint {
+  if vim_menu_active(app) {
+    return vim_key_hint(app, index)
+  }
   hint := key_hint(app.prompt_state.panel == Panel.Goto, index)
   if app.prompt_state.panel == Panel.Windows {
     hint = window_hint(index)
@@ -164,17 +234,13 @@ fn draw_key_menu(renderer: rawptr, app: *App, typography: *Typography, width: i3
   if box_height > available {
     box_height = available
   }
-  // Menus rise into place as they fade in.
-  if !key_menu_is(app.view.animation.panel) {
-    motion.snap(&ui.menu_open, 10.0 * scale)
-  }
-  rise := animated_value(app, &ui.menu_open, 0.0, app.config.popup_animation_ms * 2.0, false)
-  placed := place_rect(app, SurfaceMenu, width, height, status, scale, sdl.Rect{x: #cast(f32, width) - box_width - margin, y: #cast(f32, height) - status - box_height - margin, width: box_width, height: box_height})
+  target := place_rect(app, SurfaceMenu, width, height, status, scale, sdl.Rect{x: #cast(f32, width) - box_width - margin, y: #cast(f32, height) - status - box_height - margin, width: box_width, height: box_height})
+  placed := animated_surface(app, SurfaceMenu, target, scale)
   box_width = placed.width
   box_height = placed.height
   menu := ui_make(ui, ui_hash(0, "key menu"), UiFloating | UiBackground | UiBorder | UiClip)
   ui.boxes[menu].floating[0] = placed.x
-  ui.boxes[menu].floating[1] = placed.y + rise
+  ui.boxes[menu].floating[1] = placed.y
   ui.boxes[menu].fill = theme().surface
   ui.boxes[menu].padding[0] = padding
   ui.boxes[menu].padding[1] = padding
@@ -182,6 +248,22 @@ fn draw_key_menu(renderer: rawptr, app: *App, typography: *Typography, width: i3
   ui_size(ui, menu, UiAxisY, UiSizeKind.Pixels, box_height / scale, 1.0)
   ui_push(ui, menu)
   title: []const u8 = "space"
+  prefix := vim_menu_prefix(app)
+  if prefix == 'g' {
+    title = "Vim g"
+  }
+  if prefix == 'z' {
+    title = "Vim z"
+  }
+  if prefix == 'Z' {
+    title = "Vim Z"
+  }
+  if prefix == 'i' {
+    title = "Vim inside object"
+  }
+  if prefix == 'a' {
+    title = "Vim around object"
+  }
   if app.prompt_state.panel == Panel.Goto {
     title = "goto (g)"
   }
@@ -232,6 +314,9 @@ fn draw_key_menu(renderer: rawptr, app: *App, typography: *Typography, width: i3
     ui_pop(ui)
   }
   footer: []const u8 = "esc  cancel"
+  if vim_menu_active(app) {
+    footer = "esc cancels; counts/operators stay active"
+  }
   if app.prompt_state.panel == Panel.Match && (app.match_state.stage == 1 || app.match_state.stage == 2) {
     footer = "esc cancel; syntax objects need queries"
   }
@@ -266,6 +351,13 @@ fn key_menu_mouse(app: *App, typography: *Typography, x: f32, y: f32, pressed: b
   }
   hint := key_menu_hint(app, ui.boxes[hit].value)
   if #len(hint.key) == 0 {
+    return
+  }
+  if vim_menu_active(app) {
+    character := app.input_state.character
+    app.input_state.character = #cast(u32, hint.key[0])
+    key_input(app, typography, #cast(u32, hint.key[0]), 0)
+    app.input_state.character = character
     return
   }
   if app.prompt_state.panel == Panel.Match && app.match_state.stage != 0 {
@@ -339,8 +431,8 @@ fn picker_preview_colors(app: *App, path: []const u8, doc: *buffer.Document, sho
     return shown[..0]
   }
   if doc != nil {
-    for index in 0..16 {
-      slot := &app.documents.slots[index]
+    for index in 0..#len(app.documents.slots) {
+      slot := app.documents.slots[index]
       if slot.document == doc && slot.syntax != nil && slot.syntax_revision == doc.revision && #len(shown) <= doc.length {
         return slot.colors[..#len(shown)]
       }
@@ -390,6 +482,14 @@ fn picker_slim_geometry(app: *const App, typography: *const Typography, width: i
     natural = picker_dropdown_rect(width, content, scale)
   }
   rect := place_rect(app, SurfacePicker, width, height, status, scale, natural)
+  // Explicit placement and window bounds can shorten the natural popup.
+  // Scroll against rows that actually fit inside the final frame.
+  placed_room := (rect.height - padding * 2.0) / line - 2.0
+  if placed_room < 1.0 {
+    rows = 1
+  } else if #cast(usize, placed_room) < rows {
+    rows = #cast(usize, placed_room)
+  }
   return PickerGeometry{rect: rect, padding: padding, body_y: rect.y + padding + line * 2.0, rows: rows, preview: false, footer: false, list_width: rect.width - padding * 2.0}
 }
 fn picker_geometry(app: *const App, typography: *const Typography, width: i32, height: i32, status: f32, count: usize) PickerGeometry {
@@ -419,6 +519,38 @@ fn picker_state_counts(app: *App) PickerCounts {
   return PickerCounts{count: app.completion.count, selected: app.completion.selected}
 }
 struct PickerCounts { count, selected: usize }
+// Keep at least one complete row while the frame settles, and size scrolling
+// from the frame actually drawn rather than its eventual destination.
+fn picker_visual_geometry(typography: *const Typography, target: PickerGeometry, rect: sdl.Rect) PickerGeometry {
+  result := target
+  overhead: f32 = 2.0
+  if target.footer {
+    overhead = 3.0
+  }
+  minimum := target.padding * 2.0 + typography.line * (overhead + 1.0)
+  if minimum > target.rect.height {
+    minimum = target.rect.height
+  }
+  if rect.height < minimum {
+    rect.height = minimum
+    rect.y = target.rect.y + (target.rect.height - minimum) * 0.5
+  }
+  result.rect = rect
+  result.body_y = rect.y + target.padding + typography.line * 2.0
+  room := (rect.height - target.padding * 2.0) / typography.line - overhead
+  result.rows = 1
+  if room >= 1.0 {
+    result.rows = #cast(usize, room)
+  }
+  if result.rows > target.rows {
+    result.rows = target.rows
+  }
+  result.list_width = rect.width - target.padding * 2.0
+  if target.preview {
+    result.list_width = (rect.width - target.padding * 3.0) * 0.45
+  }
+  return result
+}
 // File, buffer and resource pickers: a list that scrolls smoothly beside an
 // optional syntax-highlighted preview.
 fn draw_picker(renderer: rawptr, app: *App, typography: *Typography, width: i32, height: i32, status: f32) {
@@ -426,24 +558,24 @@ fn draw_picker(renderer: rawptr, app: *App, typography: *Typography, width: i32,
   count := counts.count
   selected := counts.selected
   geometry := picker_geometry(app, typography, width, height, status, count)
+  animated_rect := animated_surface(app, SurfacePicker, geometry.rect, typography.scale)
+  geometry = picker_visual_geometry(typography, geometry, animated_rect)
   rect := geometry.rect
+  placed_rects[SurfacePicker] = rect
   padding := geometry.padding
   rows := geometry.rows
   preview := geometry.preview
   scale := typography.scale
   line := typography.line
+  viewport_changed := app.picker_state.rows != rows
   app.picker_state.rows = rows
   buffers := app.prompt_state.panel == Panel.Buffers
   ui := &app.ui
   ui_panel_begin(ui, typography)
   opening := app.view.animation.panel != Panel.Open && app.view.animation.panel != Panel.Buffers
-  if opening {
-    motion.snap(&ui.picker_open, 0.0)
-  }
-  slide := animated_value(app, &ui.picker_open, 0.0, app.config.popup_animation_ms * 2.0, false)
   frame := ui_make(ui, ui_hash(0, "picker"), UiFloating | UiBackground | UiBorder | UiClip)
   ui.boxes[frame].floating[0] = rect.x
-  ui.boxes[frame].floating[1] = rect.y + slide
+  ui.boxes[frame].floating[1] = rect.y
   ui.boxes[frame].fill = theme().surface
   ui.boxes[frame].padding[0] = padding
   ui.boxes[frame].padding[1] = padding
@@ -502,7 +634,12 @@ fn draw_picker(renderer: rawptr, app: *App, typography: *Typography, width: i32,
   list := ui_make(ui, ui_key(ui, "list"), UiClip | UiScroll)
   ui_size(ui, list, UiAxisX, UiSizeKind.Pixels, geometry.list_width / scale, 1.0)
   ui_size(ui, list, UiAxisY, UiSizeKind.Percent, 1.0, 1.0)
-  ui_list_scroll(app, ui, list, count, selected, line * #cast(f32, rows), opening, opening || selected != ui.picker_selected || count != ui.picker_count)
+  ui_list_scroll(app, ui, list, count, selected, line * #cast(f32, rows), opening, opening || viewport_changed || selected != ui.picker_selected || count != ui.picker_count)
+  // A resized viewport must not leave the unchanged selection clipped while
+  // its former scroll offset catches up. Normal navigation still glides.
+  if viewport_changed {
+    motion.snap(&ui.boxes[list].scroll, ui.boxes[list].scroll_target)
+  }
   window := ui_list_window(ui, list, count, line * #cast(f32, rows))
   ui_push(ui, list)
   preview_box: usize = 0
@@ -512,10 +649,10 @@ fn draw_picker(renderer: rawptr, app: *App, typography: *Typography, width: i32,
     length: usize = 0
     key: u64 = 0
     if buffers {
-      slot := &app.documents.slots[app.prompt_state.matches[row]]
+      slot := app.documents.slots[buffer_match(app, row)]
       name := files.name(&slot.file)
       key = ui_hash_number(ui.boxes[list].key, #cast(usize, (slot.identity % 1099511627776)))
-      if app.prompt_state.matches[row] == app.documents.active {
+      if buffer_match(app, row) == app.documents.active {
         add_text(label[..], &length, "* ")
       }
       if buffer.dirty_cached(slot.document) {
@@ -567,7 +704,11 @@ fn draw_picker(renderer: rawptr, app: *App, typography: *Typography, width: i32,
   }
   ui_spacer(ui, "below", #cast(f32, (count - window.last)) * line)
   if count == 0 {
-    empty := ui_label(ui, "empty", "No matches", UiMuted)
+    empty_text: []const u8 = "No matches"
+    if !buffers && app.resource_state.kind == 0 && !app.resource_state.fonts && app.picker_state.pending {
+      empty_text = "Loading files..."
+    }
+    empty := ui_label(ui, "empty", empty_text, UiMuted)
     ui.boxes[empty].padding[0] = typography.cell
   }
   ui_pop(ui)
@@ -638,7 +779,7 @@ fn draw_picker(renderer: rawptr, app: *App, typography: *Typography, width: i32,
     doc: *buffer.Document = nil
     if selected < count {
       if buffers {
-        chosen := &app.documents.slots[app.prompt_state.matches[selected]]
+        chosen := app.documents.slots[buffer_match(app, selected)]
         doc = chosen.document
         path_length = copy_text(path[..], files.name(&chosen.file))
       }
@@ -666,7 +807,7 @@ fn draw_picker(renderer: rawptr, app: *App, typography: *Typography, width: i32,
 fn picker_release(app: *App) {
   picker_index_close(app)
   if app.picker_state.index != nil {
-    mem.arena_release(app.picker_state.arena)
+    arena_owner.release(app.picker_state.arena)
     app.picker_state.arena = nil
     app.picker_state.index = nil
   }

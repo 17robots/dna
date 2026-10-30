@@ -1,0 +1,90 @@
+// Presentation-free framebuffer callbacks are supplied only by the standalone
+// native frame driver. The editor's actual input, layout and draw paths run.
+struct NativeTypingFrameProbe {
+  pixels: fn() []const u8,
+  resize: fn(i32, i32),
+}
+fn native_typing_frame_equal(app: *App, typography: *Typography, renderer: rawptr, window: rawptr, probe: NativeTypingFrameProbe, reason: []const u8) {
+  draw(renderer, window, app, typography)
+  pixels := probe.pixels()
+  owner := arena_owner.create(#len(pixels) + 64)
+  defer arena_owner.release(owner)
+  saved := mem.push_bytes_uninit(owner, #len(pixels))
+  _ = mem.copy(saved, pixels)
+  // A follow-up draw without another input must not repair the first frame.
+  draw(renderer, window, app, typography)
+  if !buffer.equal(saved, probe.pixels()) {
+    #panic(reason)
+  }
+  // Rebuild both document geometry and UI labels, preserving logical state.
+  for pane in 0..15 {
+    release_pane_cache(typography, pane)
+  }
+  typography.caret_document = nil
+  ui_cache_clear(typography)
+  draw(renderer, window, app, typography)
+  if !buffer.equal(saved, probe.pixels()) {
+    #panic(reason)
+  }
+}
+fn native_typing_frame_smoke(app: *App, typography: *Typography, renderer: rawptr, window: rawptr, probe: NativeTypingFrameProbe) {
+  app.prompt_state.panel = Panel.None
+  app.view.reduced_motion = true
+  app.view.insert = true
+  app.config.vim_keys = false
+  for size in 0..3 {
+    width: i32 = 640
+    height: i32 = 400
+    if size == 1 {
+      width = 960
+      height = 640
+    }
+    if size == 2 {
+      width = 1920
+      height = 1080
+    }
+    probe.resize(width, height)
+    content: [16000]u8 = []
+    length: usize = 0
+    for row in 0..100 {
+      add_text(content[..], &length, "fn repeated() { value := 1234 }\n")
+    }
+    _ = buffer.load(app.documents.current, content[..length])
+    buffer.move_to(app.documents.current, 3, false)
+    app.view.scroll_x = 0.0
+    app.view.scroll_y = 0.0
+    native_typing_frame_equal(app, typography, renderer, window, probe, "initial cached/fresh frame mismatch")
+    for character in ["h", "e", "l", "l", "o", " ", "é", "\xE4\xB8\xAD", "\xD7\x90", "x\xCC\x81"] {
+      text_input(app, character)
+      native_typing_frame_equal(app, typography, renderer, window, probe, "typing cached/fresh frame mismatch")
+    }
+    for step in 0..8 {
+      key_input(app, typography, KeyBackspace, 0)
+      native_typing_frame_equal(app, typography, renderer, window, probe, "backspace cached/fresh frame mismatch")
+    }
+    key_input(app, typography, KeyReturn, 0)
+    native_typing_frame_equal(app, typography, renderer, window, probe, "newline cached/fresh frame mismatch")
+    wide: [400]u8 = []
+    for at in 0..400 {
+      wide[at] = 'W'
+    }
+    text_input(app, wide[..])
+    native_typing_frame_equal(app, typography, renderer, window, probe, "long line cached/fresh frame mismatch")
+    for step in 0..6 {
+      key_input(app, typography, KeyBackspace, 0)
+      native_typing_frame_equal(app, typography, renderer, window, probe, "long line backspace cached/fresh frame mismatch")
+    }
+    lines: [160]u8 = []
+    for row in 0..80 {
+      lines[row * 2] = 10
+      lines[row * 2 + 1] = 'x'
+    }
+    text_input(app, lines[..])
+    native_typing_frame_equal(app, typography, renderer, window, probe, "vertical scroll cached/fresh frame mismatch")
+    for step in 0..4 {
+      key_input(app, typography, KeyBackspace, 0)
+      native_typing_frame_equal(app, typography, renderer, window, probe, "scrolled backspace cached/fresh frame mismatch")
+    }
+  }
+  app.running = false
+}

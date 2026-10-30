@@ -1,0 +1,247 @@
+// Production document owners and stable slot identities across directory growth.
+fn buffer_growth_smoke() {
+  fixture_storage: [4096]u8 = []
+  fixture := host.environment("DNA_WORKFLOW_TEST", fixture_storage[..])
+  if !fixture.ok || !fixture.found {
+    return
+  }
+  directory_storage: [4096]u8 = []
+  directory_length := copy_text(directory_storage[..], fixture.value)
+  add_text(directory_storage[..], &directory_length, "/.dna-growth-")
+  add_number(directory_storage[..], &directory_length, #cast(usize, host.process_id()))
+  directory := directory_storage[..directory_length]
+  if config_directories(&directory_storage[0]) == 0 {
+    #panic("growth fixture directory")
+  }
+  defer buffer_growth_cleanup(directory)
+  owner := arena_owner.create(#sizeof(App) + 128)
+  scratch := arena_owner.create(2097152)
+  defer arena_owner.release(owner)
+  defer arena_owner.release(scratch)
+  app := #cast(*App, mem.arena_push(owner, #sizeof(App), #alignof(App)))
+  app.scratch = scratch
+  settings.defaults(&app.config)
+  app.config.recovery_enabled = false
+  app.disk.retry = true
+  if editor_wait_ms(app, true) > 250 {
+    #panic("failed disk registration must retry without notifications")
+  }
+  app.disk.retry = false
+  app.workspace.project_length = copy_text(app.workspace.project[..], directory)
+  defer release_editor_state(app)
+  defer operations_release(app)
+  defer disk_release(app)
+  tiny_memory: [mem.ArenaHeader + 64]u8 = []
+  tiny := mem.arena_from_buffer(tiny_memory[..])
+  if buffer.try_allocate(tiny) != nil || mem.arena_used(tiny) != 0 {
+    #panic("fallible document allocation rollback")
+  }
+  if !new_buffer(app) {
+    #panic("initial growing buffer")
+  }
+  first := app.documents.slots[0]
+  first_file := app.documents.file
+  first_identity := first.identity
+  for index in 0..80 {
+    if index != 0 && !new_buffer(app) {
+      #panic("growing past sixteen buffers")
+    }
+    text: [96]u8 = []
+    text_length := copy_text(text[..], "buffer ")
+    add_number(text[..], &text_length, index)
+    _ = buffer.load(app.documents.current, text[..text_length])
+    path: [4096]u8 = []
+    path_length := copy_text(path[..], directory)
+    add_text(path[..], &path_length, "/growth-")
+    add_number(path[..], &path_length, index)
+    add_text(path[..], &path_length, ".txt")
+    save_file(app, path[..path_length])
+    if buffer.dirty_cached(app.documents.current) || !buffer.equal(files.name(app.documents.file), path[..path_length]) {
+      #panic("save growing buffer")
+    }
+    if app.documents.slots[0] != first || &first.file != first_file || first.identity != first_identity {
+      #panic("growing invalidated stable pointer")
+    }
+  }
+  if app.documents.count != 80 || #len(app.documents.slots) != 80 {
+    #panic("growing buffer count")
+  }
+  for index in 0..80 {
+    activate(app, index)
+    text: [96]u8 = []
+    length := copy_text(text[..], "buffer ")
+    add_number(text[..], &length, index)
+    if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], text[..length]) {
+      #panic("switch growing buffer")
+    }
+    read := files.read_text(files.name(app.documents.file))
+    same := read.ok && buffer.equal(read.data, text[..length])
+    files.release_text(&read)
+    if !same {
+      #panic("growing buffer disk contents")
+    }
+    for previous in 0..index {
+      if app.documents.slots[previous].identity == app.documents.slots[index].identity {
+        #panic("duplicate buffer identity")
+      }
+    }
+  }
+  _ = disk_tick(app)
+  if app.disk.worker == nil || app.disk.retry {
+    #panic("register eighty disk watches")
+  }
+  for index in 0..80 {
+    if app.documents.slots[index].watch.identity != app.documents.slots[index].identity {
+      #panic("skipped growing disk watch")
+    }
+  }
+  for index in 0..80 {
+    observed := app.documents.slots[index]
+    if observed.owner != app || observed.document.change_context != #cast(rawptr, observed) || observed.document.on_change == nil {
+      #panic("stable buffer observer binding")
+    }
+  }
+  recovery_probe_remember(app)
+  if recovery_needed(app) {
+    #panic("idle aggregate recovery")
+  }
+  before_generation := app.documents.generation
+  doc := app.documents.current
+  buffer.move_to(doc, doc.length, false)
+  _ = buffer.replace(doc, "!")
+  buffer.checkpoint(doc)
+  if app.documents.generation == before_generation || !recovery_needed(app) {
+    #panic("edit aggregate recovery")
+  }
+  recovery_probe_remember(app)
+  before_generation = app.documents.generation
+  buffer.undo(doc)
+  if app.documents.generation == before_generation || !recovery_needed(app) {
+    #panic("undo aggregate recovery")
+  }
+  recovery_probe_remember(app)
+  before_generation = app.documents.generation
+  buffer.redo(doc)
+  if app.documents.generation == before_generation || !recovery_needed(app) {
+    #panic("redo aggregate recovery")
+  }
+  buffer.undo(doc)
+  recovery_probe_remember(app)
+  before_generation = app.documents.generation
+  buffer.mark_saved(doc)
+  if app.documents.generation == before_generation || !recovery_needed(app) {
+    #panic("save aggregate recovery")
+  }
+  recovery_probe_remember(app)
+  before_generation = app.documents.generation
+  _ = buffer.load(doc, "buffer 79")
+  if app.documents.generation == before_generation || !recovery_needed(app) {
+    #panic("load aggregate recovery")
+  }
+  next_buffer(app, false)
+  if app.documents.active != 0 {
+    #panic("dynamic forward wrap")
+  }
+  next_buffer(app, true)
+  if app.documents.active != 79 {
+    #panic("dynamic backward wrap")
+  }
+  app.prompt_state.length = 0
+  buffer_matches(app)
+  if app.prompt_state.match_count != 80 || buffer_match(app, 79) != 79 {
+    #panic("dynamic buffer picker")
+  }
+  snapshot := workspace.State{}
+  defer workspace.release(&snapshot)
+  if !session_capture(app, &snapshot, false) || workspace.buffer_count(&snapshot) != 80 || !workspace.buffer_at(&snapshot, 79).used {
+    #panic("capture growing session")
+  }
+  // Both Slot and directory growth failures preserve every existing owner.
+  for failure_kind in 0..2 {
+    retained := app.documents.storage
+    slot_directory := app.documents.index_storage
+    if failure_kind == 1 {
+      app.documents.index_storage = slot_directory[..#len(app.documents.slots)]
+    }
+    app.documents.storage = mem.arena_create_bounded(mem.ArenaHeader, mem.ArenaHeader)
+    active := app.documents.active
+    identity := app.documents.slots[active].identity
+    current := app.documents.current
+    current_file := app.documents.file
+    unexpected := new_buffer(app)
+    mem.arena_release(app.documents.storage)
+    app.documents.storage = retained
+    app.documents.index_storage = slot_directory
+    if unexpected || app.documents.count != 80 || #len(app.documents.slots) != 80 || app.documents.active != active || app.documents.current != current || app.documents.file != current_file || app.documents.slots[active].identity != identity {
+      #panic("failed buffer allocation changed workspace")
+    }
+  }
+  session_path_storage: [4096]u8 = []
+  session_path_length := copy_text(session_path_storage[..], directory)
+  add_text(session_path_storage[..], &session_path_length, "/growth.session")
+  previous_directory: [4096]u8 = []
+  previous_directory_length := host.current_directory(previous_directory[..])
+  if !session_save(app, session_path_storage[..session_path_length]) || !session_restore(app, session_path_storage[..session_path_length]) {
+    #panic("save and restore eighty buffers")
+  }
+  if previous_directory_length > 0 {
+    _ = host.change_directory(previous_directory[..previous_directory_length])
+  }
+  if app.documents.count != 80 || app.documents.slots[0] != first || first.identity == first_identity || app.documents.slots[79].document == nil {
+    #panic("restore stable slots with fresh identities")
+  }
+  for index in 0..80 {
+    observed := app.documents.slots[index]
+    if observed.owner != app || observed.document.change_context != #cast(rawptr, observed) {
+      #panic("restored observer binding")
+    }
+  }
+  recovery_probe_remember(app)
+  old_identity := app.documents.slots[10].identity
+  pointer := app.documents.slots[10]
+  close_slot(app, 10)
+  if pointer.owner != nil || !recovery_needed(app) {
+    #panic("close detaches observer and marks recovery")
+  }
+  detached_generation := app.documents.generation
+  document_changed(#cast(rawptr, pointer))
+  if app.documents.generation != detached_generation {
+    #panic("detached stale context")
+  }
+  if app.documents.count != 79 || !new_buffer(app) || app.documents.active != 10 || app.documents.slots[10] != pointer || pointer.identity == old_identity {
+    #panic("stable reuse with fresh async identity")
+  }
+  for app.documents.count > 1 {
+    close_slot(app, app.documents.active)
+  }
+  if app.documents.count != 1 || app.documents.current == nil {
+    #panic("close growing buffers")
+  }
+}
+
+fn buffer_growth_cleanup(directory: []const u8) {
+  for index in 0..80 {
+    path: [4096]u8 = []
+    length := copy_text(path[..], directory)
+    add_text(path[..], &length, "/growth-")
+    add_number(path[..], &length, index)
+    add_text(path[..], &length, ".txt")
+    if !fs.remove(path[..length]).ok {
+      #panic("remove growth fixture file")
+    }
+  }
+  session: [4096]u8 = []
+  length := copy_text(session[..], directory)
+  add_text(session[..], &length, "/growth.session")
+  if !fs.remove(session[..length]).ok || !fs.remove_directory(directory).ok {
+    #panic("remove growth fixture directory")
+  }
+}
+
+fn recovery_probe_remember(app: *App) {
+  app.recovery.ready = true
+  app.recovery.generation = app.documents.generation
+  app.recovery.active = app.documents.active
+  app.recovery.view = app.view.revision
+  app.recovery.project_length = copy_text(app.recovery.project[..], app.workspace.project[..app.workspace.project_length])
+}

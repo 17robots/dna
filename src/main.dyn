@@ -1,3 +1,4 @@
+use "./cstring" cstring
 use "host"
 
 extern fn notifications_start "dna_notify_start"() i32
@@ -7,15 +8,18 @@ extern fn handoff_run "dna_handoff_run"()
 // The editor returns after all its cleanup; a pending :frontend handoff then
 // replaces this process with the other frontend.
 fn main() {
+  if cli_version() {
+    return
+  }
   editor_main()
   handoff_run()
 }
 fn editor_main() {
-  owned := mem.arena_create((#sizeof(App) + 128) + mem.ArenaBufferOverhead)
-  scratch := mem.arena_create((2097152) + mem.ArenaBufferOverhead)
+  owned := arena_owner.create((#sizeof(App) + 128))
+  scratch := arena_owner.create((2097152))
 
-  defer mem.arena_release(scratch)
-  defer mem.arena_release(owned)
+  defer arena_owner.release(scratch)
+  defer arena_owner.release(owned)
 
   // Fresh mappings are already zero. Pushing uninitialized memory and opting
   // out of huge pages keeps untouched state (path buffers, caches, pools) off
@@ -92,13 +96,13 @@ fn editor_main() {
     #panic("--tui needs a terminal on stdin and stdout")
   }
   defer sdl.tui_stop()
-  // The terminal frontend still uses SDL's event queue for worker wake-ups.
+  // Native notifications wake either frontend through its event queue.
   sdl_flags: u32 = 32
   if terminal {
     sdl_flags = 16384
   }
   if !sdl.init(sdl_flags) {
-    #panic("SDL init failed")
+    #panic("native platform init failed")
   }
   defer sdl.quit()
 
@@ -107,7 +111,7 @@ fn editor_main() {
   defer notifications_stop()
 
   title: [64]u8 = []
-  encoded_title := c.string_into(title[..], "DNA")
+  encoded_title := cstring.bounded(title[..], "DNA")
   if !encoded_title.ok {
     #panic("title capacity")
   }
@@ -150,14 +154,14 @@ fn editor_main() {
     font_path[#len(configured.value)] = 0
   }
   else {
-    default_font := c.string_into(font_path[..], "/usr/share/fonts/TTF/ZedMonoNerdFontMono-Regular.ttf")
+    default_font := cstring.bounded(font_path[..], "/usr/share/fonts/TTF/ZedMonoNerdFontMono-Regular.ttf")
     if !default_font.ok {
       #panic("font path capacity")
     }
   }
   font := ttf.open(&font_path[0], 16.0)
   if font == nil && !configured.found {
-    fallback := c.string_into(font_path[..], "/usr/share/fonts/noto/NotoSansMono-Regular.ttf")
+    fallback := cstring.bounded(font_path[..], "/usr/share/fonts/noto/NotoSansMono-Regular.ttf")
     if fallback.ok {
       font = ttf.open(fallback.value, 16.0)
     }
@@ -223,16 +227,7 @@ fn editor_main() {
   }
   defer cleanup_config_fonts(&typography)
   defer ui_cache_release(&typography)
-  defer release_terminals(app)
-  defer syntax_release(app)
-  defer lsp_release(app)
-  defer disk_release(app)
-  defer tree_release(app)
-  defer recovery_release(app)
-  defer plugin_release(app)
-  defer format_release(app)
-  defer language_manager_release(app)
-  defer project_search_release(app)
+  defer release_background_services(app)
   resize_font(&typography)
   config_reload(app, &typography, true)
   // Loading settings normally dismisses panels; retain a failed launch notice.
@@ -265,13 +260,28 @@ fn editor_main() {
   draw(renderer, window, app, &typography)
   event := sdl.Event{}
   receiving: bool = false
-  // In a window, SDL text input stays on: switching it on and off as panels
+  event_ready: bool = false
+  background_phase: usize = 0
+  background_pending: bool = true
+  background_again: bool = false
+  // In a window, native text input stays on: switching it on and off as panels
   // change (the g menu, counts, leaving terminal input) restarts the input
   // method, and on Wayland the next key can be lost. Instead, the text event
-  // SDL sends for a key that acted as a command (i, g, :) is dropped.
+  // the backend sends for a key that acted as a command (i, g, :) is dropped.
   command_character: u32 = 0
   for app.running {
-    background_tick(app, &typography)
+    // Ready input owns the next paint; maintenance runs only after that paint
+    // or while waiting for input, and can yield between service phases.
+    if !event_ready {
+      event_ready = render_trace_poll(app, &event)
+    }
+    if !event_ready && background_pending {
+      event_ready = background_input_slice(app, &typography, &background_phase, &event)
+      background_pending = background_phase != 0 || background_again
+      if background_phase == 0 {
+        background_again = false
+      }
+    }
     if !app.running {
       break
     }
@@ -297,6 +307,9 @@ fn editor_main() {
     }
 
     wait_ms := editor_wait_ms(app, notifications)
+    if background_pending {
+      wait_ms = 0
+    }
 
     if app.render_trace.enabled && wait_ms >= 100 {
       render_trace_flush(&app.render_trace)
@@ -304,11 +317,11 @@ fn editor_main() {
 
     wait_started := operation_begin(app)
 
-    event_ready := false
-
-    if app.render_trace.pending != 0 {
+    if event_ready {
+      operation_wake(app, "ready_poll", 0, true, wait_started)
+    } else if app.render_trace.pending != 0 {
       // Combine a worker update with already queued input, without delaying paint.
-      event_ready = sdl.poll(&event)
+      event_ready = render_trace_poll(app, &event)
       operation_wake(app, "pending_poll", 0, event_ready, wait_started)
       if !event_ready {
         draw(renderer, window, app, &typography)
@@ -316,8 +329,12 @@ fn editor_main() {
       }
     } else {
       event_ready = sdl.wait_timeout(&event, wait_ms)
+      if event_ready {
+        render_trace_event(app, &event)
+      }
       operation_wake(app, "wait", wait_ms, event_ready, wait_started)
       if !event_ready {
+        background_pending = true
         if app.view.animation.active {
           render_request(app, RenderAnimation)
           draw(renderer, window, app, &typography)
@@ -325,6 +342,7 @@ fn editor_main() {
         continue
       }
     }
+    event_ready = false
     input_started := operation_begin(app)
     // Preserve event order, but draw once per bounded batch instead of once
     // for both key-down and its following text event. Bound prevents starvation.
@@ -340,7 +358,11 @@ fn editor_main() {
       if kind >= 1024 && kind <= 1026 && app.render_trace.pending != 0 {
         draw(renderer, window, app, &typography)
       }
-      if kind == 256 || kind == 528 {
+      if kind == sdl.WorkerWakeEvent {
+        // Completion may arrive after its service phase in the current pass.
+        // Finish this pass, then revisit every phase before waiting for input.
+        background_again = true
+      } else if kind == 256 || kind == 528 {
         action(app, &typography, 16)
       } else if kind == 768 {
         key := #cast(*const sdl.KeyEvent, &event)
@@ -383,6 +405,13 @@ fn editor_main() {
           redraw = true
           render_request(app, RenderMouse)
         }
+      } else if kind == sdl.InputOverflowEvent {
+        app.composition.length = 0
+        app.pointer.dragging = false
+        command_character = 0
+        notice(app, "Input was dropped because the input queue filled. Retry the last action.")
+        redraw = true
+        render_request(app, RenderWindow)
       } else if kind == sdl.PasteEvent {
         // A whole bracketed paste from the terminal frontend.
         paste_input(app, sdl.tui_paste())
@@ -405,6 +434,8 @@ fn editor_main() {
           } else {
             notice(app, "Text input exceeds capacity.")
           }
+          redraw = true
+          render_request(app, RenderText)
         }
       }
       if kind >= 512 && kind <= 540 {
@@ -419,10 +450,6 @@ fn editor_main() {
       if kind == 770 {
         redraw = true
         render_request(app, RenderIme)
-      }
-      if kind == 771 {
-        redraw = true
-        render_request(app, RenderText)
       }
       if kind == 256 || (kind >= 512 && kind <= 540) {
         redraw = true
@@ -445,14 +472,22 @@ fn editor_main() {
       }
       processed += 1
 
-      if !app.running || processed >= 64 || !sdl.poll(&event) {
+      if !app.running || processed >= 64 || !render_trace_poll(app, &event) {
         break
       }
     }
     operation_end(app, "input", input_started)
+    app.render_trace.event_seen = 0
 
     if (redraw || app.render_trace.pending != 0) && app.running {
       draw(renderer, window, app, &typography)
+    }
+    if app.running {
+      event_ready = background_input_slice(app, &typography, &background_phase, &event)
+      background_pending = background_phase != 0 || background_again
+      if background_phase == 0 {
+        background_again = false
+      }
     }
   }
 

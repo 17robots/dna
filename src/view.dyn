@@ -14,7 +14,6 @@ fn present_pacing(app: *App, renderer: rawptr) {
   }
 }
 fn draw(renderer: rawptr, window: rawptr, app: *App, typography: *Typography) {
-  present_pacing(app, renderer)
   render_trace_begin(app, typography)
 
   if !paint(renderer, theme().background) || !sdl.clear(renderer) {
@@ -40,6 +39,9 @@ fn draw(renderer: rawptr, window: rawptr, app: *App, typography: *Typography) {
   }
   draw_panes(renderer, app, typography, width, height)
   draw_split_handles(renderer, app, typography, width, height)
+  if !tree_docked(app) {
+    app.view.animation.tree_geometry.ready = false
+  }
   // A docked tree is part of the layout, drawn whether or not it has focus.
   if tree_docked(app) {
     draw_tree(renderer, app, typography, width, height)
@@ -64,7 +66,7 @@ fn draw(renderer: rawptr, window: rawptr, app: *App, typography: *Typography) {
     draw_terminal(renderer, app, typography, width, height, true, true)
   } else if app.prompt_state.panel == Panel.Directory {
     draw_explorer(renderer, app, typography, width, height)
-  } else if key_menu_is(app.prompt_state.panel) {
+  } else if key_menu_is(app.prompt_state.panel) || vim_menu_active(app) {
     // Menus opened from the explorer overlay it instead of hiding it.
     if (app.prompt_state.panel == Panel.Goto && app.input_state.goto_explorer) || (app.prompt_state.panel == Panel.Leader && app.input_state.leader_explorer) {
       draw_explorer(renderer, app, typography, width, height)
@@ -125,11 +127,14 @@ fn draw(renderer: rawptr, window: rawptr, app: *App, typography: *Typography) {
     app.render_trace.present_started = render_clock()
   }
   app.ui.in_draw = false
+  // Drawing computes whether motion is still active on this frame.
+  present_pacing(app, renderer)
   if !sdl.present(renderer) {
     #panic("present failed")
   }
 
   render_trace_end(app, typography)
+  app.view.animation.surfaces_ready = true
 }
 
 fn draw_document(renderer: rawptr, app: *App, typography: *Typography, width: i32, height: i32, focused: bool) {
@@ -159,38 +164,54 @@ fn draw_document(renderer: rawptr, app: *App, typography: *Typography, width: i3
     visible_height = typography.line
   }
 
+  camera_width := visible_width
+  camera_height := visible_height
+  if app.view.pane_ready {
+    pane := &app.view.panes[typography.current_pane]
+    if pane.geometry.active {
+      camera_width = #cast(f32, pane.target_rect.width) - origin - margin
+      camera_height = #cast(f32, pane.target_rect.height) - margin * 2.0 - status_height
+      if camera_width < typography.cell {
+        camera_width = typography.cell
+      }
+      if camera_height < typography.line {
+        camera_height = typography.line
+      }
+    }
+  }
+
   head := doc.cursor
   if !app.view.insert {
     head = buffer.head(doc)
   }
   caret_y := #cast(f32, (line_at(doc, head) - 1)) * typography.line
   scroll_margin := app.config.scroll_margin * typography.line
-  if scroll_margin > (visible_height - typography.line) * 0.5 {
-    scroll_margin = (visible_height - typography.line) * 0.5
+  if scroll_margin > (camera_height - typography.line) * 0.5 {
+    scroll_margin = (camera_height - typography.line) * 0.5
   }
 
   if caret_y - scroll_margin < app.view.scroll_y {
     app.view.scroll_y = caret_y - scroll_margin
   }
-  if caret_y + typography.line + scroll_margin > app.view.scroll_y + visible_height {
-    app.view.scroll_y = caret_y + typography.line + scroll_margin - visible_height
+  if caret_y + typography.line + scroll_margin > app.view.scroll_y + camera_height {
+    app.view.scroll_y = caret_y + typography.line + scroll_margin - camera_height
   }
   if app.view.scroll_y < 0.0 {
     app.view.scroll_y = 0.0
   }
 
   caret := measure_position(doc, typography, head)
-  caret_x := #cast(f32, caret.x)
+  caret_x := text_caret_x(&caret, app.view.insert)
   horizontal_margin := app.config.horizontal_scroll_margin * typography.cell
-  if horizontal_margin > visible_width * 0.4 {
-    horizontal_margin = visible_width * 0.4
+  if horizontal_margin > camera_width * 0.4 {
+    horizontal_margin = camera_width * 0.4
   }
 
   if caret_x - horizontal_margin < app.view.scroll_x {
     app.view.scroll_x = caret_x - horizontal_margin
   }
-  if caret_x + typography.cell + horizontal_margin > app.view.scroll_x + visible_width {
-    app.view.scroll_x = caret_x + typography.cell + horizontal_margin - visible_width
+  if caret_x + typography.cell + horizontal_margin > app.view.scroll_x + camera_width {
+    app.view.scroll_x = caret_x + typography.cell + horizontal_margin - camera_width
   }
   if app.view.scroll_x < 0.0 {
     app.view.scroll_x = 0.0
@@ -198,9 +219,12 @@ fn draw_document(renderer: rawptr, app: *App, typography: *Typography, width: i3
 
   visual := &app.view.animation.file
   animated_scroll(app, visual, app.view.scroll_x, app.view.scroll_y, visible_height, app.view.animation.reset)
+  if focused && app.view.insert {
+    editing_scroll_visible(visual, caret_x, caret_y, typography.cell, typography.line, visible_width, visible_height, app.view.scroll_x, app.view.scroll_y)
+  }
   scroll_x := visual.x.value
   scroll_y := visual.y.value
-  viewport := visible_viewport(doc, typography.line, visible_height, scroll_y)
+  viewport := visible_viewport(doc, typography.line, visible_height, visual.y.value)
 
   shaped := line_layout_update(typography, typography.layout, doc, app.documents.slots[app.documents.active].identity, viewport)
   if shaped > 0 {
@@ -240,20 +264,28 @@ fn draw_document(renderer: rawptr, app: *App, typography: *Typography, width: i3
   cursor_target_x := origin + caret_x - scroll_x
   cursor_target_y := margin + caret_y - scroll_y
   cursor_snap := app.view.animation.reset || !app.config.smooth_cursor || cursor_step_snaps(&visual.cursor_x, &visual.cursor_y, cursor_target_x, cursor_target_y, typography.cell, typography.line)
-  cursor_x := animated_follow(app, &visual.cursor_x, cursor_target_x, app.config.cursor_animation_ms, cursor_snap)
-  cursor_y := animated_follow(app, &visual.cursor_y, cursor_target_y, app.config.cursor_animation_ms, cursor_snap)
-  cursor := sdl.Rect{x: cursor_x, y: cursor_y, width: cursor_width, height: typography.points * typography.scale + 5.0 * typography.scale}
+  // The editing caret is always at its logical destination. Only the trailing
+  // decoration follows time; retain the last logical point for jump policy.
+  _ = animated_follow(app, &visual.cursor_x, cursor_target_x, app.config.cursor_animation_ms, true)
+  _ = animated_follow(app, &visual.cursor_y, cursor_target_y, app.config.cursor_animation_ms, true)
+  cursor := sdl.Rect{x: cursor_target_x, y: cursor_target_y, width: cursor_width, height: typography.points * typography.scale + 5.0 * typography.scale}
 
   cursor_target := sdl.Rect{x: cursor_target_x, y: cursor_target_y, width: cursor.width, height: cursor.height}
-  if focused && !draw_cursor_trail(renderer, app, &visual.trail, cursor_target, cursor_snap, theme().cursor) && (!paint(renderer, theme().cursor) || !sdl.fill(renderer, &cursor)) {
-    #panic("cursor draw failed")
+  if focused {
+    _ = draw_cursor_trail(renderer, app, &visual.trail, cursor_target, cursor_snap, theme().cursor)
+    if !paint(renderer, theme().cursor) || !sdl.fill(renderer, &cursor) {
+      #panic("cursor draw failed")
+    }
   }
   if focused {
     draw_extra_cursors(renderer, doc, typography.layout, viewport, typography, origin, margin, scroll_x, scroll_y, app.view.insert)
   }
-  line_layout_draw(typography.layout, theme().text, origin - scroll_x, margin + viewport.y - scroll_y)
-
-  draw_syntax(renderer, app, typography, viewport, origin - scroll_x, margin + viewport.y - scroll_y, clipping_document)
+  if sdl.tui_active() {
+    line_layout_draw(typography.layout, theme().text, origin - scroll_x, margin + viewport.y - scroll_y)
+    _ = draw_syntax(renderer, app, typography, viewport, origin - scroll_x, margin + viewport.y - scroll_y, clipping_document)
+  } else if !draw_syntax(renderer, app, typography, viewport, origin - scroll_x, margin + viewport.y - scroll_y, clipping_document) {
+    line_layout_draw(typography.layout, theme().text, origin - scroll_x, margin + viewport.y - scroll_y)
+  }
   _ = draw_diagnostics(renderer, app, typography, viewport, origin - scroll_x, margin - scroll_y)
 
   if !sdl.clip(renderer, nil) {
@@ -280,6 +312,18 @@ fn draw_panes(renderer: rawptr, app: *App, typography: *Typography, width: i32, 
   }
 
   pane_layout(app, 0, editor_area(app, width, height, typography.scale))
+  for index in 0..15 {
+    pane := &app.view.panes[index]
+    if pane.used {
+      edges := rectangle_edges(pane.target_rect)
+      for axis in 0..4 {
+        if edges[axis] != pane.geometry.target[axis] {
+          app.view.animation.geometry_retargeted = true
+        }
+      }
+    }
+  }
+  pane_animate_layout(app, 0)
   saved_visual := app.view.animation.file
   saved_reset := app.view.animation.reset
   // Draw inactive views first and restore the focused editing context last.
@@ -289,6 +333,9 @@ fn draw_panes(renderer: rawptr, app: *App, typography: *Typography, width: i32, 
       focused := index == app.view.focused
       if pane.used && !pane.branch && ((pass == 0 && !focused) || (pass == 1 && focused)) {
         pane_load(app, index)
+        if pane.rect.width <= 0 || pane.rect.height <= 0 {
+          continue
+        }
         app.view.animation.reset = saved_reset || !focused
 
         if focused {
@@ -385,6 +432,7 @@ fn draw_panes(renderer: rawptr, app: *App, typography: *Typography, width: i32, 
       }
     }
   }
+  pane_load(app, app.view.focused)
   app.view.animation.reset = saved_reset
   if !sdl.viewport(renderer, nil) {
     #panic("pane viewport reset")

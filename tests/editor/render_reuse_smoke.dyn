@@ -1,0 +1,89 @@
+// Exercise the actual draw path, not only direct geometry-query micro probes.
+fn render_reuse_passes(typography:*const Typography)u64 {
+  total:u64=0
+  for i in 0..15 {
+    total+=typography.pane_text[i].layout.builds
+  }
+  return total
+}
+fn render_reuse_smoke(app:*App, typography:*Typography, renderer:rawptr, window:rawptr) {
+  pane_only(app)
+  app.prompt_state.panel=Panel.None
+  app.view.reduced_motion=true
+  doc:=app.documents.current
+  source:[18000]u8=[]
+  used:usize=0
+  for row in 0..600 {
+    for byte in "office AV אבג é\r\n" {
+      source[used]=byte
+      used+=1
+    }
+  }
+  if !buffer.load(doc, source[..used]) {
+    #panic("render reuse document")
+  }
+  pane_split(app, true)
+  pane_split(app, false)
+  pane_focus(app, 1)
+  pane_split(app, false)
+  rows:[4]usize=[0, 50, 100, 450]
+  leaves:[4]usize=[3, 4, 5, 6]
+  for i in 0..4 {
+    leaf:=leaves[i]
+    if !app.view.panes[leaf].used || app.view.panes[leaf].branch {
+      #panic("render reuse four-pane fixture")
+    }
+    app.view.panes[leaf].scroll_y=#cast(f32, rows[i])*typography.line
+    position:=buffer.row_start(doc, rows[i])
+    doc.marks[leaf*2]=position
+    doc.marks[leaf*2+1]=position
+  }
+  pane_load(app, 6)
+  app.view.insert=true
+  app.view.extend=false
+  draw(renderer, window, app, typography)
+  draw(renderer, window, app, typography)
+  queries:=typography.caret_queries
+  builds:=render_reuse_passes(typography)
+  for frame in 0..8 {
+    draw(renderer, window, app, typography)
+  }
+  if typography.caret_queries!=queries || render_reuse_passes(typography)!=builds {
+    #panic("unchanged pane redraw repeated caret/layout work")
+  }
+  text_input(app, "x")
+  draw(renderer, window, app, typography)
+  if typography.caret_queries-queries!=1 || render_reuse_passes(typography)-builds!=1 {
+    #panic("one-pane edit rebuilt unchanged earlier panes")
+  }
+  queries=typography.caret_queries
+  builds=render_reuse_passes(typography)
+  draw(renderer, window, app, typography)
+  if typography.caret_queries!=queries || render_reuse_passes(typography)!=builds {
+    #panic("post-edit unchanged pane reuse")
+  }
+  // Journal overflow must rebuild rather than guess which old lines changed.
+  for change in 0..130 {
+    if !buffer.replace(doc, "a") {
+      #panic("render reuse journal fixture")
+    }
+  }
+  draw(renderer, window, app, typography)
+  if typography.caret_queries-queries!=4 || render_reuse_passes(typography)-builds!=4 {
+    #panic("missing journal did not invalidate pane caches")
+  }
+  queries=typography.caret_queries
+  points:=typography.points
+  typography.points=points+1.0
+  resize_font(typography)
+  draw(renderer, window, app, typography)
+  if typography.caret_queries-queries!=4 {
+    #panic("font change retained stale caret metrics")
+  }
+  typography.points=points
+  resize_font(typography)
+  pane_only(app)
+  app.view.insert=false
+  app.view.extend=false
+  _=buffer.load(doc, "")
+}

@@ -3,7 +3,7 @@ fn activate(app: *App, index: usize) {
   terminal_mode(app).goto_pending = false
   pane_store(app)
   if app.documents.current != nil {
-    previous := &app.documents.slots[app.documents.active]
+    previous := app.documents.slots[app.documents.active]
     buffer.checkpoint(app.documents.current)
     previous.scroll_x = app.view.scroll_x
     previous.scroll_y = app.view.scroll_y
@@ -15,7 +15,8 @@ fn activate(app: *App, index: usize) {
     app.documents.previous = app.documents.active
   }
   app.documents.active = index
-  current := &app.documents.slots[index]
+  document_lifecycle_changed(app, index)
+  current := app.documents.slots[index]
   app.documents.current = current.document
   app.documents.file = &current.file
   app.view.scroll_x = current.scroll_x
@@ -26,10 +27,11 @@ fn activate(app: *App, index: usize) {
   pane_store(app)
 }
 fn next_buffer(app: *App, backwards: bool) {
-  for step in 1..=16 {
-    index := (app.documents.active + step) % 16
+  length := #len(app.documents.slots)
+  for step in 1..=length {
+    index := (app.documents.active + step) % length
     if backwards {
-      index = (app.documents.active + 16 - step) % 16
+      index = (app.documents.active + length - step) % length
     }
     if app.documents.slots[index].document != nil {
       activate(app, index)
@@ -37,7 +39,27 @@ fn next_buffer(app: *App, backwards: bool) {
     }
   }
 }
+// A buffer can own several views. Closing the active view must not destroy
+// the shared owner or invoke the last-buffer exit policy while another view
+// still displays it. The buffer picker explicitly closes owners instead.
+fn close_shared_view(app: *App) bool {
+  if !app.view.pane_ready || app.picker_state.closing {
+    return false
+  }
+  pane_store(app)
+  for index in 0..15 {
+    pane := &app.view.panes[index]
+    if index != app.view.focused && pane.used && !pane.branch && pane.slot == app.documents.active {
+      pane_close(app)
+      return true
+    }
+  }
+  return false
+}
 fn request_buffer_close(app: *App) {
+  if close_shared_view(app) {
+    return
+  }
   if app.documents.slots[app.documents.active].terminal.handle != nil && terminal_alive(app.documents.slots[app.documents.active].terminal.handle) != 0 {
     app.terminal_state.closing_all = false
     app.prompt_state.panel = Panel.TerminalClose
@@ -51,17 +73,12 @@ fn request_buffer_close(app: *App) {
   }
 }
 fn quit_view(app: *App) {
-  if app.view.pane_ready && app.view.focused != 0 {
-    pane_close(app)
-    return
-  }
-  if app.documents.count == 1 && app.documents.file.length == 0 && app.documents.current.length == 0 && !buffer.dirty_cached(app.documents.current) {
-    request_quit(app)
-    return
-  }
   request_buffer_close(app)
 }
 fn close_clean(app: *App) {
+  if close_shared_view(app) {
+    return
+  }
   last := app.documents.count == 1
   close_slot(app, app.documents.active)
   app.prompt_state.panel = Panel.None
@@ -79,16 +96,24 @@ fn close_last_quits(app: *const App) bool {
   return app.config.close_last_buffer == 1
 }
 fn close_slot(app: *App, closed: usize) {
+  document_lifecycle_changed(app, closed)
+  if app.documents.count == 1 && app.documents.next_identity == #cast(u64, -1) {
+    notice(app, "Buffer identity space exhausted. Buffer preserved.")
+    return
+  }
   if app.documents.slots[closed].terminal.handle != nil {
     terminal_mode(app).escape_pending = false
-    pane_remove_terminal(app, closed)
   }
-  slot_syntax_release(&app.documents.slots[closed])
+  // Remove views while their documents are still alive. The surviving pane
+  // keeps its own buffer rather than being refilled with an unrelated file.
+  pane_remove_slot(app, closed)
+  slot_syntax_release(app.documents.slots[closed])
   if app.documents.slots[closed].terminal.handle != nil {
+    terminal_untrack(app.documents.slots[closed])
     terminal_close(app.documents.slots[closed].terminal.handle)
     app.documents.slots[closed].terminal.handle = nil
   }
-  slot := &app.documents.slots[closed]
+  slot := app.documents.slots[closed]
   slot.terminal.keep_output = false
   slot.filetype_length = 0
   slot.inferred_filetype = false
@@ -103,8 +128,13 @@ fn close_slot(app: *App, closed: usize) {
     app.view.scroll_y = 0.0
     app.view.insert = false
     app.view.extend = false
+    slot.scroll_x = 0.0
+    slot.scroll_y = 0.0
+    slot.insert = false
+    slot.extend = false
     app.prompt_state.panel = Panel.None
     app.view.revision += 1
+    pane_store(app)
     return
   }
   document_release(app, slot)
@@ -143,7 +173,7 @@ fn request_quit(app: *App) {
     app.prompt_state.panel = Panel.DirectoryDiscard
     return
   }
-  for index in 0..16 {
+  for index in 0..#len(app.documents.slots) {
     if app.documents.slots[index].document != nil && buffer.dirty_cached(app.documents.slots[index].document) {
       activate(app, index)
       app.documents.closing_one = false
@@ -160,8 +190,8 @@ fn request_quit(app: *App) {
 }
 fn buffer_matches(app: *App) {
   app.prompt_state.match_count = 0
-  for index in 0..16 {
-    slot := &app.documents.slots[index]
+  for index in 0..#len(app.documents.slots) {
+    slot := app.documents.slots[index]
     if slot.document != nil {
       name := files.name(&slot.file)
       if #len(name) == 0 {
@@ -171,7 +201,7 @@ fn buffer_matches(app: *App) {
         name = "Terminal"
       }
       if picker_match(name, app.prompt_state.text[..app.prompt_state.length]) {
-        app.prompt_state.matches[app.prompt_state.match_count] = index
+        app.documents.buffer_results[app.prompt_state.match_count] = index
         app.prompt_state.match_count += 1
       }
     }
@@ -186,13 +216,13 @@ fn picker_close_selected(app: *App) {
   if app.prompt_state.match_count == 0 || app.prompt_state.selected >= app.prompt_state.match_count {
     return
   }
-  target := app.prompt_state.matches[app.prompt_state.selected]
+  target := app.documents.buffer_results[app.prompt_state.selected]
   app.picker_state.closing = true
   app.picker_state.close_target = target
   app.picker_state.close_return = app.documents.active
   app.picker_state.close_row = app.prompt_state.selected
   app.picker_state.close_query_length = copy_text(app.picker_state.close_query[..], app.prompt_state.text[..app.prompt_state.length])
-  slot := &app.documents.slots[target]
+  slot := app.documents.slots[target]
   if slot.terminal.handle != nil && terminal_alive(slot.terminal.handle) != 0 {
     app.terminal_state.closing_all = false
     app.prompt_state.panel = Panel.TerminalClose
@@ -227,7 +257,7 @@ fn finish_picker_close(app: *App) {
     }
     index: usize = 0
     for index < app.prompt_state.match_count {
-      if app.prompt_state.matches[index] == app.picker_state.close_target {
+      if app.documents.buffer_results[index] == app.picker_state.close_target {
         app.prompt_state.selected = index
         break
       }

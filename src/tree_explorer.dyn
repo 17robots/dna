@@ -16,6 +16,9 @@ struct TreeState {
   names_used: usize,
   count: usize,
   selected: usize,
+  search: [256]u8, search_length: usize, searching: bool, search_failed: bool,
+  key_count:usize, goto_pending:bool,
+  search_saved: [256]u8, search_saved_length: usize, search_origin: usize,
   // Rows that fit, from the last draw; paging moves by this.
   rows: usize,
   open: bool,
@@ -333,6 +336,7 @@ fn tree_set_root(app: *App, path: []const u8) {
 // Space e with the tree style: focus the tree, or hand focus back.
 fn tree_toggle(app: *App) {
   tree := &app.tree
+  tree_search_cancel(tree)
   if app.prompt_state.panel == Panel.Tree {
     tree_unfocus(app)
     return
@@ -350,12 +354,14 @@ fn tree_toggle(app: *App) {
 }
 // Escape: a docked tree stays in view; a floating one closes.
 fn tree_unfocus(app: *App) {
+  tree_search_cancel(&app.tree)
   if !tree_docked(app) {
     app.tree.open = false
   }
   app.prompt_state.panel = Panel.None
 }
 fn tree_close(app: *App) {
+  tree_search_cancel(&app.tree)
   app.tree.open = false
   if app.prompt_state.panel == Panel.Tree {
     app.prompt_state.panel = Panel.None
@@ -397,10 +403,175 @@ fn tree_parent_index(tree: *const TreeState, index: usize) usize {
   }
   return TreeCapacity
 }
+// Search only expanded/visible rows. Keep folders, ordering and file actions
+// intact; matches move selection rather than rebuilding a filtered tree.
+fn tree_search_find(tree: *TreeState, backwards: bool, include_current: bool) bool {
+  if tree.count == 0 || tree.search_length == 0 {
+    return false
+  }
+  index:=tree.selected
+  if index>=tree.count {
+    index=0
+  }
+  for step in 0..tree.count {
+    if step!=0 || !include_current {
+      if backwards {
+        if index==0 {
+          index=tree.count
+        }
+        index-=1
+      } else {
+        index+=1
+        if index==tree.count {
+          index=0
+        }
+      }
+    }
+    relative:[4096]u8=[]
+    if contains(tree_relative(tree, index, relative[..]), tree.search[..tree.search_length]) {
+      tree.selected=index
+      tree.search_failed=false
+      return true
+    }
+  }
+  tree.search_failed=true
+  return false
+}
+fn tree_search_cancel(tree:*TreeState) {
+  if !tree.searching {
+    return
+  }
+  tree.searching=false
+  tree.search_length=copy_text(tree.search[..], tree.search_saved[..tree.search_saved_length])
+  tree.selected=tree.search_origin
+  if tree.count==0 {
+    tree.selected=0
+  }
+  else if tree.selected>=tree.count {
+    tree.selected=tree.count-1
+  }
+  tree.search_failed=false
+}
+fn tree_search_open(tree:*TreeState) {
+  tree.search_saved_length=copy_text(tree.search_saved[..], tree.search[..tree.search_length])
+  tree.search_origin=tree.selected
+  tree.search_length=0
+  tree.searching=true
+  tree.search_failed=false
+}
+fn tree_search_refresh(tree:*TreeState) {
+  tree.selected=tree.search_origin
+  if tree.count==0 {
+    tree.selected=0
+  }
+  else if tree.selected>=tree.count {
+    tree.selected=tree.count-1
+  }
+  tree.search_failed=false
+  if tree.search_length>0 {
+    _=tree_search_find(tree, false, true)
+  }
+}
+fn tree_search_text(app:*App, text:[]const u8) {
+  tree:=&app.tree
+  if !tree.searching || !buffer.valid(text) || #len(text)>=256-tree.search_length {
+    return
+  }
+  add_text(tree.search[..], &tree.search_length, text)
+  tree_search_refresh(tree)
+}
+fn tree_search_key(app:*App, key:u32, modifiers:u16) bool {
+  tree:=&app.tree
+  if !tree.searching {
+    return false
+  }
+  if key==KeyEscape {
+    tree_search_cancel(tree)
+  }
+  else if key==KeyReturn {
+    tree.searching=false
+  }
+  // Keep the query active while browsing its matches, just like a picker.
+  // Plain j/k/n/p remain query text; only the control aliases navigate.
+  else if (modifiers&ModAlt)==0 && (key==KeyDown || ((modifiers&ModCtrl)!=0 && (key==KeyN || key==KeyJ))) {
+    _=tree_search_find(tree, false, false)
+  }
+  else if (modifiers&ModAlt)==0 && (key==KeyUp || ((modifiers&ModCtrl)!=0 && (key==KeyP || key==KeyK))) {
+    _=tree_search_find(tree, true, false)
+  }
+  else if key==KeyBackspace {
+    if tree.search_length>0 {
+      tree.search_length-=1
+      for tree.search_length>0 && (tree.search[tree.search_length]&192)==128 {
+        tree.search_length-=1
+      }
+      tree_search_refresh(tree)
+    }
+  }
+  return true
+}
 fn tree_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
   tree := &app.tree
+  if tree_search_key(app, key, modifiers) {
+    return
+  }
+  if key==KeyEscape && (tree.goto_pending || tree.key_count>0) {
+    tree.goto_pending=false
+    tree.key_count=0
+    return
+  }
   shift := (modifiers & ModShift) != 0
   control := (modifiers & ModCtrl) != 0
+  if app.config.vim_keys && !control && (modifiers&ModAlt)==0 {
+    if !shift && ((key>='1' && key<='9') || (key=='0' && tree.key_count>0)) {
+      if tree.key_count<100000 {
+        tree.key_count=tree.key_count*10+#cast(usize, key-'0')
+      }
+      return
+    }
+    if key==KeyG && !shift {
+      if !tree.goto_pending {
+        tree.goto_pending=true
+        return
+      }
+      tree.selected=0
+      if tree.key_count>0 {
+        tree.selected=tree.key_count-1
+      }
+      if tree.count>0 && tree.selected>=tree.count {
+        tree.selected=tree.count-1
+      }
+      tree.goto_pending=false
+      tree.key_count=0
+      return
+    }
+    if key==KeyG && shift {
+      tree.selected=0
+      if tree.count>0 {
+        tree.selected=tree.count-1
+      }
+      if tree.key_count>0 && tree.key_count<=tree.count {
+        tree.selected=tree.key_count-1
+      }
+      tree.goto_pending=false
+      tree.key_count=0
+      return
+    }
+  }
+  repeat:=tree.key_count
+  if repeat==0 {
+    repeat=1
+  }
+  tree.key_count=0
+  tree.goto_pending=false
+  if !control && (modifiers & ModAlt)==0 && key==KeySlash {
+    tree_search_open(tree)
+    return
+  }
+  if !control && (modifiers & ModAlt)==0 && key==KeyN && tree.search_length>0 {
+    _=tree_search_find(tree, shift, false)
+    return
+  }
   page := tree.rows
   if page < 2 {
     page = 2
@@ -429,11 +600,13 @@ fn tree_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
     tree_close(app)
   }
   else if key == KeyJ || key == KeyDown {
-    tree.selected += 1
+    tree.selected += repeat
   }
   else if key == KeyK || key == KeyUp {
-    if tree.selected > 0 {
-      tree.selected -= 1
+    if tree.selected >= repeat {
+      tree.selected -= repeat
+    } else {
+      tree.selected=0
     }
   }
   else if key == KeyPageDown {
@@ -594,6 +767,34 @@ fn draw_tree(renderer: rawptr, app: *App, typography: *Typography, width: i32, h
   focused := app.prompt_state.panel == Panel.Tree
   natural := sdl.Rect{x: #cast(f32, width) * 0.04, y: #cast(f32, height) * 0.1, width: #cast(f32, width) * 0.32, height: #cast(f32, height) * 0.8}
   rect := place_rect(app, SurfaceExplorer, width, height, 0.0, scale, natural)
+  if tree_docked(app) {
+    geometry := &app.view.animation.tree_geometry
+    target := sdl.PixelRect{x:#cast(i32, rect.x), y:#cast(i32, rect.y), width:#cast(i32, rect.width), height:#cast(i32, rect.height)}
+    if !geometry.ready && app.view.animation.surfaces_ready {
+      collapsed := rectangle_edges(target)
+      place := place_of(app, SurfaceExplorer)
+      if place.side == 0 {
+        collapsed[2] = collapsed[0]
+      }
+      else if place.side == 1 {
+        collapsed[0] = collapsed[2]
+      }
+      else if place.side == 2 {
+        collapsed[3] = collapsed[1]
+      }
+      else {
+        collapsed[1] = collapsed[3]
+      }
+      motion.rectangle_seed(geometry, collapsed, app.view.animation.now)
+    }
+    shown := animated_rectangle(app, geometry, target)
+    rect = sdl.Rect{x:#cast(f32, shown.x), y:#cast(f32, shown.y), width:#cast(f32, shown.width), height:#cast(f32, shown.height)}
+  }
+  else {
+    rect = animated_surface(app, SurfaceExplorer, rect, scale)
+  }
+  placed_rects[SurfaceExplorer] = rect
+  placed_frames[SurfaceExplorer] = app.ui.frame
   tree.rect = rect
   rows: usize = 1
   room := (rect.height - padding * 2.0 - line * 1.5) / line
@@ -619,6 +820,16 @@ fn draw_tree(renderer: rawptr, app: *App, typography: *Typography, width: i32, h
   title_length := copy_text(title[..], root[leaf..])
   if tree.limited {
     add_text(title[..], &title_length, "  [limited]")
+  }
+  if tree.searching || tree.search_length>0 {
+    add_text(title[..], &title_length, "  /")
+    add_text(title[..], &title_length, tree.search[..tree.search_length])
+    if tree.searching {
+      add_text(title[..], &title_length, "  [Enter: keep, Esc: cancel]")
+    }
+    if tree.search_failed {
+      add_text(title[..], &title_length, "  [no match]")
+    }
   }
   heading_flags: u32 = UiMuted
   if focused {

@@ -1,4 +1,4 @@
-// Vim profile through key_input/text_input, as SDL delivers them: keys
+// Vim profile through key_input/text_input, as the native backend delivers them: keys
 // always, text only while inserting (text input is off in normal mode).
 fn vim_type(app: *App, typography: *Typography, keys: []const u8) {
   for byte in keys {
@@ -95,12 +95,32 @@ fn vim_smoke(app: *App, typography: *Typography) {
   // Completed and canceled operators must not count a later text object.
   for command in ["2yy", "2yw", "2ygg", "2yi(", "2yiz", "2yi[", "2y\x1b", "2yi\x1b", "2yfZ"] {
     vim_start(app, "((x))\nsecond\n")
+    // Operator-count coverage must not depend on a compositor clipboard seat.
+    // Native clipboard acquisition is qualified separately with real input.
+    app.vim.register = 1
     vim_type(app, typography, command)
     vim_place(app, 2)
     vim_type(app, typography, "vi(")
     doc := app.documents.current
     if app.vim.mode != VimMode.Visual || buffer.start(doc) != 2 || buffer.end(doc) != 3 {
-      #panic("completed or canceled operator count leaked into vi(")
+      line: [256]u8 = []
+      used := copy_text(line[..], "completed/canceled operator before vi(: ")
+      add_text(line[..], &used, command)
+      add_text(line[..], &used, " | mode ")
+      add_number(line[..], &used, #cast(usize, app.vim.mode))
+      add_text(line[..], &used, " panel ")
+      add_number(line[..], &used, #cast(usize, app.prompt_state.panel))
+      add_text(line[..], &used, " selection ")
+      add_number(line[..], &used, buffer.start(doc))
+      add_text(line[..], &used, ":")
+      add_number(line[..], &used, buffer.end(doc))
+      add_text(line[..], &used, " operator/count/pending ")
+      add_number(line[..], &used, #cast(usize, app.vim.operator))
+      add_text(line[..], &used, "/")
+      add_number(line[..], &used, app.vim.operator_count)
+      add_text(line[..], &used, "/")
+      add_number(line[..], &used, #cast(usize, app.vim.pending))
+      #panic(line[..used])
     }
   }
   // Counts survive operator prefixes and multiply with motion counts.

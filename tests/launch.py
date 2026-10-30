@@ -12,6 +12,8 @@ with tempfile.TemporaryDirectory(prefix="dna-launch-") as temporary:
     project.mkdir()
     (project / "example.dyn").write_text("fn main() {}\n")
     (root / "--gui").write_text("literal flag filename\n")
+    (root / "--version").write_text("literal version flag filename\n")
+    (root / "version").write_text("literal version filename\n")
     (root / "alias").symlink_to(project, target_is_directory=True)
     config = root / "config.toml"
     config.write_text("reduced_motion = true\n")
@@ -20,6 +22,8 @@ with tempfile.TemporaryDirectory(prefix="dna-launch-") as temporary:
         (["project with spaces/example.dyn", "--gui"], "file", project / "example.dyn"),
         (["--gui", "project with spaces/new.dyn"], "error", project / "new.dyn"),
         (["--", "--gui"], "file", root / "--gui"),
+        (["--", "--version"], "file", root / "--version"),
+        (["--", "version"], "file", root / "version"),
         ([str(project)], "directory", project),
         (["project with spaces/", "--gui"], "directory", project),
         (["--gui", "alias"], "directory", project),
@@ -33,7 +37,6 @@ with tempfile.TemporaryDirectory(prefix="dna-launch-") as temporary:
                            DNA_LAUNCH_EXPECT=str(expected), DNA_LAUNCH_KIND=kind,
                            DNA_CONFIG=str(config), DNA_RECOVERY="0",
                            XDG_CONFIG_HOME=str(root / "config"), XDG_STATE_HOME=str(root / "state"))
-                env.setdefault("SDL_VIDEODRIVER", "dummy")
                 subprocess.run([str(ROOT / f"build/dna-smoke-{mode}"), *arguments],
                                cwd=root, env=env, check=True, timeout=15)
         print(f"PASS launch arguments ({mode}, {len(cases) * 2} cases)", flush=True)

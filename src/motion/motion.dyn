@@ -2,6 +2,47 @@
 // do not sleep and input/document state never depends on animation progress.
 pub struct Tween { value, from, target, started: f32, ready, active: bool, velocity, sampled: f32 }
 
+// Persistent panel edges. Exponential settling matches RAD's frame-rate
+// independent current += (target-current)*(1-2^(-rate*dt)) response.
+pub struct Rectangle { current, target: [4]f32, sampled: f32, ready, active: bool }
+pub fn rectangle_seed(rect: *Rectangle, edges: [4]f32, now: f32) {
+  rect.current = edges
+  rect.target = edges
+  rect.sampled = now
+  rect.ready = true
+  rect.active = false
+}
+pub fn rectangle_step(rect: *Rectangle, target: [4]f32, now, elapsed_ms, rate: f32, immediate: bool) {
+  if !rect.ready || immediate || rate <= 0.0 {
+    rectangle_seed(rect, target, now)
+    return
+  }
+  elapsed := elapsed_ms / 1000.0
+  if elapsed < 0.0 {
+    elapsed = 0.0
+  }
+  if elapsed > 0.25 {
+    elapsed = 0.25
+  }
+  rect.sampled = now
+  rect.target = target
+  amount := 1.0 - exponential(-0.69314718056 * rate * elapsed)
+  rect.active = false
+  for axis in 0..4 {
+    rect.current[axis] += (target[axis] - rect.current[axis]) * amount
+    error := target[axis] - rect.current[axis]
+    if error < 0.0 {
+      error = -error
+    }
+    if error >= 0.5 {
+      rect.active = true
+    }
+  }
+  if !rect.active {
+    rect.current = target
+  }
+}
+
 pub fn snap(tween: *Tween, value: f32) {
   tween.velocity = 0.0
   tween.value = value
@@ -41,8 +82,9 @@ pub fn move(tween: *Tween, target: f32, now: f32, duration: f32, immediate: bool
 }
 
 // Critically damped spring toward target, for scrolling and cursor motion.
-// Retargeting keeps the current velocity, so held keys glide instead of
-// restarting a curve. Reaches 99% of a jump within duration milliseconds and
+// Retargeting keeps velocity that approaches the new target without passing
+// it. Reversals shed opposing momentum rather than moving away from input.
+// Reaches 99% of a jump within duration milliseconds and
 // is exact for any frame timing (closed-form step, not integration).
 pub fn follow(tween: *Tween, target: f32, now: f32, duration: f32, immediate: bool) f32 {
   if !tween.ready || immediate || duration <= 0.0 {
@@ -50,6 +92,25 @@ pub fn follow(tween: *Tween, target: f32, now: f32, duration: f32, immediate: bo
     tween.velocity = 0.0
     tween.sampled = now
     return target
+  }
+  if target != tween.target {
+    delta := target - tween.value
+    limit := 6.6 / (duration / 1000.0) * delta
+    if delta >= 0.0 {
+      if tween.velocity < 0.0 {
+        tween.velocity = 0.0
+      }
+      if tween.velocity > limit {
+        tween.velocity = limit
+      }
+    } else {
+      if tween.velocity > 0.0 {
+        tween.velocity = 0.0
+      }
+      if tween.velocity < limit {
+        tween.velocity = limit
+      }
+    }
   }
   tween.target = target
   // A spring at rest starts from one short frame ago: motion begins on this

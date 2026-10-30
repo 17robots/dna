@@ -22,7 +22,7 @@ def result(worker, generation):
     while True:
         status = lib.dna_picker_poll(worker, generation, c.byref(count), c.byref(visited), c.byref(flags))
         assert status >= 0, 'unexpected stale generation'
-        if status: break
+        if status == 1: break
         assert time.monotonic() < deadline, 'picker stalled'
         time.sleep(.001)
     rows = set()

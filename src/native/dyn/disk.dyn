@@ -5,10 +5,12 @@ struct DiskWatched {
   path: [4096]u8, identity: u64, generation: u64, baseline: u64,
   baseline_length: usize, stamp: InstallStat, stamped: bool, pending: bool,
   status: i32, bytes: *u8, length: usize,
+  ready_next: usize, queued: bool,
 }
 struct DiskWorker {
   thread: rawptr, lock: rawptr, wake: rawptr, stop: bool,
-  changes: i32, control: [2]i32, watches: [16]i32, files: [16]DiskWatched,
+  changes: i32, control: [2]i32, watches: []i32, files: []DiskWatched,
+  ready_first, ready_last: usize,
 }
 struct DiskPathWatch { fd: i32 }
 struct DiskDirectoryWatch { fd: i32, count: usize, watches: [256]i32 }
@@ -17,7 +19,48 @@ extern fn disk_stat "stat"(path: *const u8, output: *InstallStat) i32
 extern fn disk_inotify "inotify_init1"(flags: i32) i32
 extern fn disk_add "inotify_add_watch"(fd: i32, path: *const u8, mask: u32) i32
 extern fn disk_remove "inotify_rm_watch"(fd: i32, wd: i32) i32
-extern fn disk_timedwait "pthread_cond_timedwait"(wake: rawptr, lock: rawptr, until: *NativeTimespec) i32
+
+// Queue links are one-based stable slot indices; vector growth preserves them.
+fn disk_ready_push(d: *DiskWorker, index: usize) {
+  target := &d.files[index]
+  if target.queued {
+    return
+  }
+  target.queued = true
+  target.ready_next = 0
+  if d.ready_last == 0 {
+    d.ready_first = index + 1
+  }
+  else {
+    d.files[d.ready_last - 1].ready_next = index + 1
+  }
+  d.ready_last = index + 1
+}
+struct DiskReady { index: usize, identity: u64 }
+pub fn dna_disk_next_ready(d: *DiskWorker, output: *DiskReady) i32 {
+  if d == nil || output == nil {
+    return 0
+  }
+  rec_lock(d.lock)
+  for d.ready_first != 0 {
+    index := d.ready_first - 1
+    target := &d.files[index]
+    d.ready_first = target.ready_next
+    if d.ready_first == 0 {
+      d.ready_last = 0
+    }
+    target.ready_next = 0
+    target.queued = false
+    if target.pending && target.identity != 0 {
+      output.index = index
+      output.identity = target.identity
+      rec_unlock(d.lock)
+      return 1
+    }
+  }
+  rec_unlock(d.lock)
+  return 0
+}
 
 fn disk_hash(bytes: *const u8, length: usize) u64 {
   value: u64 = 1469598103934665603
@@ -59,11 +102,19 @@ fn disk_wake(d: *DiskWorker) {
 }
 fn disk_directories(d: *DiskWorker) bool {
   complete := d.changes >= 0 && d.control[0] >= 0
-  previous := d.watches
-  for i in 0..16 {
+  count := #len(d.files)
+  if count == 0 {
+    return complete
+  }
+  previous := #cast(*i32, search_alloc(count * #sizeof(i32), 3))
+  if previous == nil {
+    return false
+  }
+  _ = copy(#cast(*u8, previous), #cast(*u8, &d.watches[0]), count * #sizeof(i32))
+  for i in 0..count {
     d.watches[i] = -1
   }
-  for i in 0..16 {
+  for i in 0..count {
     if d.files[i].identity == 0 {
       continue
     }
@@ -78,36 +129,31 @@ fn disk_directories(d: *DiskWorker) bool {
       complete = false
     }
   }
-  for i in 0..16 {
+  for i in 0..count {
     used := false
-    for j in 0..16 {
-      if d.watches[j] == previous[i] {
+    for j in 0..count {
+      if d.watches[j] == previous[..count][i] {
         used = true
       }
     }
     for j in 0..i {
-      if previous[j] == previous[i] {
+      if previous[..count][j] == previous[..count][i] {
         used = true
       }
     }
-    if previous[i] >= 0 && !used {
-      _ = disk_remove(d.changes, previous[i])
+    if previous[..count][i] >= 0 && !used {
+      _ = disk_remove(d.changes, previous[..count][i])
     }
   }
+  search_free(#cast(rawptr, previous))
   return complete
 }
 fn disk_wait(d: *DiskWorker, complete: bool) {
   if d.control[0] < 0 {
     rec_lock(d.lock)
     if !d.stop {
-      until := NativeTimespec{}
-      _ = sync_clock(0, &until)
-      until.nanoseconds += 250000000
-      if until.nanoseconds >= 1000000000 {
-        until.seconds += 1
-        until.nanoseconds -= 1000000000
-      }
-      _ = disk_timedwait(d.wake, d.lock, &until)
+      // The predicate remains protected by the same mutex on every return.
+      _ = sync.condition_wait_timeout(#cast(*NativeCondition, d.wake), #cast(*NativeMutex, d.lock), 250000000)
     }
     rec_unlock(d.lock)
     return
@@ -134,8 +180,9 @@ fn disk_worker(context: rawptr) i32 {
   for {
     rec_lock(d.lock)
     complete := disk_directories(d)
+    slot_count := #len(d.files)
     rec_unlock(d.lock)
-    for i in 0..16 {
+    for i in 0..slot_count {
       rec_lock(d.lock)
       if d.stop {
         rec_unlock(d.lock)
@@ -206,6 +253,7 @@ fn disk_worker(context: rawptr) i32 {
         target.bytes = nil
         target.length = 0
         target.pending = true
+        disk_ready_push(d, i)
         if changed {
           target.bytes = bytes
           bytes = nil
@@ -231,6 +279,12 @@ fn disk_worker(context: rawptr) i32 {
   return 0
 }
 fn disk_release(d: *DiskWorker) {
+  if #len(d.files) > 0 {
+    search_free(#cast(rawptr, &d.files[0]))
+  }
+  if #len(d.watches) > 0 {
+    search_free(#cast(rawptr, &d.watches[0]))
+  }
   if d.wake != nil {
     rec_condition_free(d.wake)
   }
@@ -258,9 +312,6 @@ pub fn dna_disk_open() *DiskWorker {
     d.control[0] = -1
     d.control[1] = -1
   }
-  for i in 0..16 {
-    d.watches[i] = -1
-  }
   d.lock = rec_mutex()
   d.wake = rec_condition()
   if d.lock == nil || d.wake == nil {
@@ -274,29 +325,100 @@ pub fn dna_disk_open() *DiskWorker {
   }
   return d
 }
-pub fn dna_disk_watch(d: *DiskWorker, index: u32, identity: u64, path: *const u8, saved: *const u8, length: usize) {
-  if d == nil || index >= 16 || path == nil || string_length(path) >= 4096 {
-    return
+// Call only under d.lock. The worker retains values, never element pointers,
+// across unlock; replace both containers together or preserve the old owners.
+fn disk_reserve(d: *DiskWorker, index: usize) bool {
+  if index < #len(d.files) {
+    return true
   }
-  baseline := disk_hash(saved, length)
+  maximum := #cast(usize, -1) / #sizeof(DiskWatched)
+  if index >= maximum {
+    return false
+  }
+  capacity := #len(d.files)
+  if capacity == 0 {
+    capacity = 8
+  }
+  for capacity <= index {
+    if capacity > maximum / 2 {
+      capacity = index + 1
+      break
+    }
+    capacity *= 2
+  }
+  files := #cast(*DiskWatched, search_calloc(capacity, #sizeof(DiskWatched), 3))
+  if files == nil {
+    return false
+  }
+  watches := #cast(*i32, search_alloc(capacity * #sizeof(i32), 3))
+  if watches == nil {
+    search_free(#cast(rawptr, files))
+    return false
+  }
+  for i in 0..capacity {
+    watches[..capacity][i] = -1
+  }
+  if #len(d.files) > 0 {
+    _ = copy(#cast(*u8, files), #cast(*u8, &d.files[0]), #len(d.files) * #sizeof(DiskWatched))
+    _ = copy(#cast(*u8, watches), #cast(*u8, &d.watches[0]), #len(d.watches) * #sizeof(i32))
+    search_free(#cast(rawptr, &d.files[0]))
+    search_free(#cast(rawptr, &d.watches[0]))
+  }
+  d.files = files[..capacity]
+  d.watches = watches[..capacity]
+  return true
+}
+pub fn dna_disk_watch_checked(d: *DiskWorker, index: usize, identity: u64, path: *const u8, saved: *const u8, length: usize) i32 {
+  if d == nil {
+    return 0
+  }
+  if identity != 0 && (path == nil || string_length(path) >= 4096 || (saved == nil && length != 0)) {
+    return 0
+  }
+  baseline: u64 = 0
+  if identity != 0 {
+    baseline = disk_hash(saved, length)
+  }
   rec_lock(d.lock)
+  if !d.stop && identity == 0 && index >= #len(d.files) {
+    rec_unlock(d.lock)
+    return 1
+  }
+  if d.stop || !disk_reserve(d, index) {
+    rec_unlock(d.lock)
+    return 0
+  }
   w := &d.files[index]
   search_free(#cast(rawptr, w.bytes))
   next_generation := w.generation + 1
+  ready_next := w.ready_next
+  queued := w.queued
   w.* = DiskWatched{}
+  w.ready_next = ready_next
+  w.queued = queued
   w.generation = next_generation
   w.identity = identity
-  _ = copy(&w.path[0], path, string_length(path) + 1)
+  if identity != 0 {
+    _ = copy(&w.path[0], path, string_length(path) + 1)
+  }
   w.baseline = baseline
   w.baseline_length = length
   disk_wake(d)
   rec_unlock(d.lock)
+  return 1
 }
-pub fn dna_disk_pending(d: *DiskWorker, index: u32, identity: u64) isize {
-  if d == nil || index >= 16 {
+pub fn dna_disk_watch(d: *DiskWorker, index: u32, identity: u64, path: *const u8, saved: *const u8, length: usize) {
+  _ = dna_disk_watch_checked(d, #cast(usize, index), identity, path, saved, length)
+}
+pub fn dna_disk_pending_at(d: *DiskWorker, index: usize, identity: u64) isize {
+  if d == nil {
     return 0
   }
   rec_lock(d.lock)
+  if index >= #len(d.files) {
+    rec_unlock(d.lock)
+    return 0
+  }
   w := &d.files[index]
   result: isize = 0
   if w.identity == identity && w.pending {
@@ -308,11 +430,18 @@ pub fn dna_disk_pending(d: *DiskWorker, index: u32, identity: u64) isize {
   rec_unlock(d.lock)
   return result
 }
-pub fn dna_disk_take(d: *DiskWorker, index: u32, identity: u64, output: *u8, capacity: usize) i32 {
-  if d == nil || index >= 16 {
+pub fn dna_disk_pending(d: *DiskWorker, index: u32, identity: u64) isize {
+  return dna_disk_pending_at(d, #cast(usize, index), identity)
+}
+pub fn dna_disk_take_at(d: *DiskWorker, index: usize, identity: u64, output: *u8, capacity: usize) i32 {
+  if d == nil {
     return 0
   }
   rec_lock(d.lock)
+  if index >= #len(d.files) {
+    rec_unlock(d.lock)
+    return 0
+  }
   w := &d.files[index]
   result: i32 = 0
   if w.identity == identity && w.pending {
@@ -337,6 +466,9 @@ pub fn dna_disk_take(d: *DiskWorker, index: u32, identity: u64, output: *u8, cap
   rec_unlock(d.lock)
   return result
 }
+pub fn dna_disk_take(d: *DiskWorker, index: u32, identity: u64, output: *u8, capacity: usize) i32 {
+  return dna_disk_take_at(d, #cast(usize, index), identity, output, capacity)
+}
 pub fn dna_disk_close(d: *DiskWorker) {
   if d == nil {
     return
@@ -346,7 +478,7 @@ pub fn dna_disk_close(d: *DiskWorker) {
   disk_wake(d)
   rec_unlock(d.lock)
   rec_join(d.thread, nil)
-  for i in 0..16 {
+  for i in 0..#len(d.files) {
     search_free(#cast(rawptr, d.files[i].bytes))
   }
   disk_release(d)

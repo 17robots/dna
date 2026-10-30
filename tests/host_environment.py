@@ -7,6 +7,7 @@ rejection precedes wrapper invocation; it does not run the native Windows runtim
 DYN may select a compiler; the default is the adjacent migration SDK build.
 """
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -18,6 +19,8 @@ with tempfile.TemporaryDirectory(prefix='dna-host-environment-') as directory:
     stage = Path(directory)
     host = stage / 'host'
     host.mkdir()
+    for module in ("owned_arena", "cstring"):
+        shutil.copytree(ROOT / "src" / module, stage / module)
     (host / 'host.dyn').write_text((ROOT / 'src/host/host.dyn').read_text())
     adapter = (ROOT / 'src/host/windows.dyn').read_text()
     adapter = adapter.replace('#target(kernel: windows)\n', '').replace('#link("kernel32")\n', '')
@@ -130,4 +133,12 @@ fn main() {''']
         binary = stage / ('check-' + mode)
         subprocess.run([DYN, 'build', str(stage), '--' + mode, '--link', str(stage / 'probe.o'), '--output', str(binary)], check=True, timeout=120)
         subprocess.run([str(binary)], check=True, timeout=5)
+# Keep target-selected imports honest as well as the mocked Windows behavior.
+with tempfile.TemporaryDirectory(prefix='dna-host-targets-') as directory:
+    stage = Path(directory)
+    for module in ('host', 'owned_arena', 'cstring'):
+        shutil.copytree(ROOT / 'src' / module, stage / module)
+    (stage / 'main.dyn').write_text('use "./host" host\nfn main() { storage: [32]u8 = []\n _ = host.environment("PATH", storage[..]) }\n')
+    for target in ('x86_64-macos', 'aarch64-macos', 'x86_64-windows', 'aarch64-windows'):
+        subprocess.run([DYN, 'check', str(stage), '--target', target], check=True, timeout=120)
 print('PASS Windows environment preflight, UTF-16 boundaries, diagnostics and bounded borrowed output (mock wrapper; no native Windows runtime)')
