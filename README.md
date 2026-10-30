@@ -64,7 +64,7 @@ associations separately in your desktop settings.
 
 ## Dyn SDK migration
 
-Current source uses **Dyn 0.1.0-preview.29**, pinned with verified platform
+Current source uses **Dyn 0.1.0-preview.30**, pinned with verified platform
 checksums in `mise.toml`. Its installed SDK includes the required `std/ui/box`,
 native window bridge sources, and runtime objects; a sibling checkout is optional.
 

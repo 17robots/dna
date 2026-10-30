@@ -1,24 +1,33 @@
-# DNA 0.1.0-preview.9
+# DNA 0.1.0-preview.10
 
 Experimental Linux x86-64 preview built with the published Dyn
-0.1.0-preview.29 compiler, SDK and runtime.
+0.1.0-preview.30 compiler, SDK and runtime.
 
 ## Changes
 
-- Draw the native GUI through a GPU presenter with one glyph atlas and
-  framebuffer-backed popups. Set `DNA_RENDERER=software` for the software
-  presenter.
-- Lower idle memory. Panes allocate storage only when used, fonts under
-  `/usr/share/fonts` and `/usr/lib/fonts` are mapped read-only instead of
-  copied, and Dyn preview.29 sizes file reads exactly and keeps small arenas
-  off transparent huge pages. On the reference machine, idle private memory
-  fell from 43.8 MiB to 30.0 MiB with an 8 MB Nerd Font.
-- Install desktop entries for the GUI and TUI with `dna-install-desktop`.
-- Pin verified Dyn preview.29 packages in mise and CI.
+- Sharper text. Glyph coverage was blended linearly, which thinned
+  antialiased edges and washed out light text on dark themes. Coverage is now
+  gamma-corrected once per cached glyph; shapes and spacing are unchanged.
+- Helix keymap additions: `Alt-.` repeats the last `f`/`t` motion; `Ctrl-a`,
+  `:increment` and `:decrement` change numbers in every selection; `|`, `Alt-|`,
+  `!` and `Alt-!` pipe selections through the shell (`:pipe`, `:pipe-to`,
+  `:insert-output`, `:append-output`); `*` searches whole words and `Alt-*`
+  the exact text; `Alt-J` joins lines and selects the spaces; `Alt-a` and
+  `Alt-I` select all syntax siblings or children; registers `_`, `+`, `*`,
+  `"` and read-only `/`, `%`, `#`, `.`.
+- Jump list: `Ctrl-o` goes back, `Ctrl-i` or `Tab` forward, `Ctrl-s` saves the
+  position. `gg`, `ge`, `G`, searches, language-server goto and the
+  diagnostics list record jumps, and saved positions follow edits.
+- **Breaking:** `Ctrl-O` (open) and `Ctrl-S` (save) are removed. Use `Space f`
+  or `:open`, and `:w`.
+- Vim `*` matches whole words.
+- Dyn preview.30 underlines unknown types without the preceding `: `.
+- Internal cleanup: shared selection helpers, direct per-pane text caches and
+  frame requests separated from tracing.
 
 ## Compatibility
 
-Unchanged from preview.8. The application target remains Linux x86-64 and
+Unchanged from preview.9. The application target remains Linux x86-64 and
 needs compatible host glibc, a monospace font, and desktop libraries/graphics
 drivers for GUI operation. Fonts outside the system font directories are still
 copied into memory, so later changes to those files cannot fault the editor.
