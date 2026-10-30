@@ -13,12 +13,12 @@ font, and desktop display libraries for GUI mode. It does not run on Ubuntu
 Preview.8 changes are recorded in [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
 ```sh
-mise use -g 'github:17robots/dna[prerelease=true,strip_components=1,bin_path=.]@0.1.0-preview.8'
+mise use -g 'github:17robots/dna[prerelease=true,strip_components=1,bin_path=.]@0.1.0-preview.9'
 dna path/to/file.dyn
 dna path/to/project
 ```
 
-Use `mise exec github:17robots/dna@0.1.0-preview.8 -- dna path/to/project`
+Use `mise exec github:17robots/dna@0.1.0-preview.9 -- dna path/to/project`
 if mise is not activated in your shell. The explicit `bin_path=.` selects the
 archive's launcher, which loads its bundled libraries. The Dyn SDK is needed to
 build DNA, but is not required to run this package. Language servers are
@@ -27,11 +27,10 @@ installed separately.
 This uses [mise's GitHub backend](https://mise.jdx.dev/dev-tools/backends/github.html);
 no separate mise plugin or registry entry is required.
 
-### Desktop launchers (next package)
+### Desktop launchers
 
-Packages built from this source include `dna-install-desktop` and standard
-entries under `share/applications`. This is newer than the published preview.8
-archive. Run the helper after extracting a package that includes it:
+Packages from preview.9 on include `dna-install-desktop` and standard entries
+under `share/applications`. Run the helper after extracting the package:
 
 ```sh
 ./dna-install-desktop
@@ -53,7 +52,7 @@ section of your global mise config to refresh the entries after each install:
 postinstall = '"$MISE_TOOL_INSTALL_PATH/dna-install-desktop"'
 ```
 
-To register an existing installation from this checkout, including preview.8:
+To register an older installation, such as preview.8, from this checkout:
 
 ```sh
 ./packaging/linux/dna-install-desktop --launcher "$(mise which dna)"
