@@ -109,6 +109,23 @@ fn scene(renderer:rawptr,phase:i32) {
   check(sdl_color(renderer,#cast(u8,i%255),93,211,255) && sdl_fill(renderer,&rect),"batch rollover")
  }
 }
+fn popup_scene(renderer:rawptr) {
+ mask:[35]u8=[0,31,63,127,191,223,255,255,223,191,127,63,31,0,0,128,255,128,0,128,255,255,0,255,0,255,0,255,1,2,3,4,5,6,7]
+ // Popups use a full-window framebuffer texture. Non-power-of-two desktop
+ // dimensions must preserve every glyph texel during one-to-one composition.
+ popup:=sdl_create_texture(renderer,0,2,2548,1407)
+ check(popup!=nil && sdl_target(renderer,popup),"desktop popup target")
+ check(sdl_clip(renderer,nil) && sdl_color(renderer,33,37,43,255) && sdl_clear(renderer),"desktop popup clear")
+ for row in 0..234 {
+  for col in 0..318 {
+   check(native_text_cached_bitmap(renderer,1,&mask[0],7,5,#cast(f32,col*8),#cast(f32,row*6),220,225,235,255),"desktop popup glyph")
+  }
+ }
+ check(sdl_target(renderer,nil),"desktop popup restore")
+ popup_rect:=Rect{width:2548.0,height:1407.0}
+ check(sdl_render_texture(renderer,popup,nil,&popup_rect),"desktop popup composite")
+ sdl_destroy_texture(popup)
+}
 fn snapshot(destination:[]u8) {
  width:=native_gui.surface.width
  height:=native_gui.surface.height
@@ -130,7 +147,7 @@ fn snapshot(destination:[]u8) {
 }
 fn main() {
  title:="DNA GPU parity\x00"
- window:=sdl_create_window(&title[0],320,180,0)
+ window:=sdl_create_window(&title[0],2548,1407,0)
  check(window!=nil,"window")
  defer sdl_destroy_window(window)
  native_probe_software=true
@@ -140,9 +157,12 @@ fn main() {
  defer mem.arena_release(owner)
  size:=#cast(usize,native_gui.surface.width*native_gui.surface.height)*4
  reference:=mem.push_bytes_uninit(owner,size)
+ popup_reference:=mem.push_bytes_uninit(owner,size)
  actual:=mem.push_bytes_uninit(owner,size)
  scene(renderer,0)
  snapshot(reference)
+ popup_scene(renderer)
+ snapshot(popup_reference)
  sdl_destroy_renderer(renderer)
  native_probe_software=false
  renderer=sdl_create_renderer(window,nil)
@@ -180,6 +200,13 @@ fn main() {
   }
  }
  check(differences==0,"direct GPU pixels differ from software reference")
+ popup_scene(renderer)
+ snapshot(actual)
+ for i in 0..size {
+  a:=#cast(i32,popup_reference[i])
+  b:=#cast(i32,actual[i])
+  check(a-b<=1 && b-a<=1,"desktop popup glyph texels differ from software reference")
+ }
  // Atlas identity remains safe when CPU addresses are reused after font close.
  mask:[1]u8=[255]
  first_draw:=draws
