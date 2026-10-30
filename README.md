@@ -13,12 +13,12 @@ font, and desktop display libraries for GUI mode. It does not run on Ubuntu
 Preview.8 changes are recorded in [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
 ```sh
-mise use -g 'github:17robots/dna[prerelease=true,strip_components=1,bin_path=.]@0.1.0-preview.9'
+mise use -g 'github:17robots/dna[prerelease=true,strip_components=1,bin_path=.]@0.1.0-preview.10'
 dna path/to/file.dyn
 dna path/to/project
 ```
 
-Use `mise exec github:17robots/dna@0.1.0-preview.9 -- dna path/to/project`
+Use `mise exec github:17robots/dna@0.1.0-preview.10 -- dna path/to/project`
 if mise is not activated in your shell. The explicit `bin_path=.` selects the
 archive's launcher, which loads its bundled libraries. The Dyn SDK is needed to
 build DNA, but is not required to run this package. Language servers are
