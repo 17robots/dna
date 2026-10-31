@@ -10,15 +10,15 @@ No web runtime. [DESIGN.md](DESIGN.md) records the broader product direction.
 The Linux x86-64 preview requires **glibc 2.43 or newer**, a system monospace
 font, and desktop display libraries for GUI mode. It does not run on Ubuntu
 24.04's glibc 2.39. See [PRERELEASE.md](PRERELEASE.md) before installing.
-Preview.8 changes are recorded in [RELEASE_NOTES.md](RELEASE_NOTES.md).
+Preview.11 changes are recorded in [RELEASE_NOTES.md](RELEASE_NOTES.md).
 
 ```sh
-mise use -g 'github:17robots/dna[prerelease=true,strip_components=1,bin_path=.]@0.1.0-preview.10'
+mise use -g 'github:17robots/dna[prerelease=true,strip_components=1,bin_path=.]@0.1.0-preview.11'
 dna path/to/file.dyn
 dna path/to/project
 ```
 
-Use `mise exec github:17robots/dna@0.1.0-preview.10 -- dna path/to/project`
+Use `mise exec github:17robots/dna@0.1.0-preview.11 -- dna path/to/project`
 if mise is not activated in your shell. The explicit `bin_path=.` selects the
 archive's launcher, which loads its bundled libraries. The Dyn SDK is needed to
 build DNA, but is not required to run this package. Language servers are

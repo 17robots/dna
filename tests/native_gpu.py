@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from native_gpu_probe import install as install_gpu_probe
 ROOT=Path(__file__).resolve().parents[1]
 BACKEND=os.environ.get('DNA_NATIVE_BACKEND','wayland')
 DYN=os.environ['DYN']
@@ -147,9 +148,13 @@ fn snapshot(destination:[]u8) {
 }
 fn main() {
  title:="DNA GPU parity\x00"
- window:=sdl_create_window(&title[0],2548,1407,0)
+ window:=sdl_create_window(&title[0],320,180,0)
  check(window!=nil,"window")
  defer sdl_destroy_window(window)
+ // The compositor may constrain the actual drawable; rendering below uses
+ // an exact-size test framebuffer rather than reading beyond that drawable.
+ native_gui.window.width=2548
+ native_gui.window.height=1407
  native_probe_software=true
  renderer:=sdl_create_renderer(window,nil)
  check(renderer!=nil && !native_gui.direct,"software reference")
@@ -205,7 +210,11 @@ fn main() {
  for i in 0..size {
   a:=#cast(i32,popup_reference[i])
   b:=#cast(i32,actual[i])
-  check(a-b<=1 && b-a<=1,"desktop popup glyph texels differ from software reference")
+  if a-b>1 || b-a>1 {
+   message:="popup pixel %d %d: %d != %d\n\x00"
+   _=report(2,&message[0],#cast(i32,i/4%#cast(usize,native_gui.surface.width)),#cast(i32,i/4/#cast(usize,native_gui.surface.width)),a,b)
+   #panic("desktop popup glyph texels differ from software reference")
+  }
  }
  // Atlas identity remains safe when CPU addresses are reused after font close.
  mask:[1]u8=[255]
@@ -308,6 +317,7 @@ with tempfile.TemporaryDirectory(prefix='dna-native-gpu-') as directory:
         declarations.append(types[match.start():end])
     (stage/'types.dyn').write_text('use "std/mem"\n#link("dna_native")\npub const WorkerWakeEvent:u32=32768\npub const InputOverflowEvent:u32=32770\n'+'\n'.join(declarations))
     gui=(ROOT/'src/platform/gui.dyn').read_text().replace('native_gui.direct=!native_software_requested()','native_gui.direct=!native_probe_software')
+    gui=install_gpu_probe(gui)
     gui+='\nnative_probe_software:bool\n'
     (stage/'sdl.dyn').write_text(gui)
     shutil.copytree(ROOT/'src/platform/native_present',stage/'native_present')
