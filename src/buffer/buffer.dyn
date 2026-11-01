@@ -835,12 +835,35 @@ pub fn row_start(document: *const Document, row: usize) usize {
   return rope_after_newline(document.root, row)
 }
 
+// Count UTF-8 leading bytes directly in each leaf. Word-sized batches avoid
+// per-byte document access and debug call tracing on giant status columns.
 pub fn codepoints(document: *const Document, low: usize, high: usize) usize {
   count: usize = 0
-  for at in low..high {
-    if (byte_at(document, at) & 192) != 128 {
-      count += 1
+  at := low
+  for at < high {
+    text := chunk_at(document, at)
+    length := #len(text)
+    if length > high - at {
+      length = high - at
     }
+    index: usize = 0
+    for index < length {
+      if length - index >= 8 && (#cast(usize, &text[index]) & 7) == 0 {
+        word := (#cast(*const u64, &text[index])).*
+        // A continuation byte has its top bit set and next bit clear.
+        bits := ((word & ~((word & 0x4040404040404040) << 1)) & 0x8080808080808080) >> 7
+        pairs := (bits & 0x00ff00ff00ff00ff) + ((bits >> 8) & 0x00ff00ff00ff00ff)
+        halves := (pairs & 0x0000ffff0000ffff) + ((pairs >> 16) & 0x0000ffff0000ffff)
+        count += 8 - #cast(usize, (halves + (halves >> 32)) & 255)
+        index += 8
+      } else {
+        if (text[index] & 192) != 128 {
+          count += 1
+        }
+        index += 1
+      }
+    }
+    at += length
   }
   return count
 }

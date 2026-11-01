@@ -17,6 +17,7 @@ fn uniform(text: []const u8, byte: u8, scratch: []u8) bool {
   return buffer.equal(text, scratch[..#len(text)])
 }
 fn main() {
+  codepoint_checks()
   lazy_checks()
   arena := arena_owner.create(#sizeof(buffer.Document))
   defer arena_owner.release(arena)
@@ -1708,4 +1709,42 @@ fn storage_byte(at: usize) u8 {
     return 10
   }
   return #cast(u8, 97 + at % 26)
+}
+
+// Exercise aligned words, unaligned ranges, UTF-8 split at a leaf edge, and
+// edited trees against a byte-by-byte reference count.
+fn codepoint_checks() {
+  arena := mem.arena_create(#sizeof(buffer.Document) + 65536)
+  defer mem.arena_release(arena)
+  doc := buffer.allocate(arena)
+  defer buffer.release(doc)
+  text := mem.arena_push_uninit(arena, 32768, 1)[..32768]
+  fill(text, 97)
+  prefix := "é界🙂"
+  for index in 0..#len(prefix) {
+    text[16381 + index] = prefix[index]
+  }
+  if !buffer.load(doc, text) {
+    #panic("codepoint fixture must be valid UTF-8")
+  }
+  for edited in 0..2 {
+    if edited == 1 {
+      buffer.move_to(doc, 100, false)
+      _ = buffer.replace(doc, prefix)
+    }
+    for low in 0..16 {
+      for tail in 0..16 {
+        high := doc.length - tail
+        expected: usize = 0
+        for at in low..high {
+          if (buffer.byte_at(doc, at) & 192) != 128 {
+            expected += 1
+          }
+        }
+        if buffer.codepoints(doc, low, high) != expected || buffer.codepoints(doc, low, low) != 0 {
+          #panic("codepoint count must match leading bytes across leaves")
+        }
+      }
+    }
+  }
 }
