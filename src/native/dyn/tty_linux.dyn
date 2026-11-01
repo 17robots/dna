@@ -34,3 +34,73 @@ fn tty_executable_path() *const u8 {
   return &executable[0]
 }
 extern fn tty_ioctl "ioctl"(fd: i32, request: u64, output: rawptr) i32
+
+extern fn tty_getattr "tcgetattr"(fd: i32, value: *TtyTermios) i32
+extern fn tty_setattr "tcsetattr"(fd: i32, action: i32, value: *const TtyTermios) i32
+extern fn tty_isatty "isatty"(fd: i32) i32
+extern fn tty_signal "signal"(number: i32, handler: fn(i32)) rawptr
+extern fn tty_sigaction "sigaction"(number: i32, action: *const TtySignalAction, old: rawptr) i32
+extern fn tty_raise "raise"(number: i32) i32
+extern fn tty_setenv "setenv"(key: *const u8, value: *const u8, overwrite: i32) i32
+extern fn tty_execv "execv"(path: *const u8, arguments: **const u8) i32
+
+tty_saved: TtyTermios = TtyTermios{}
+fn tty_enter_host() bool {
+  if tty_isatty(tty_input) == 0 || tty_isatty(tty_output) == 0 || tty_getattr(tty_input, &tty_saved) != 0 {
+    return false
+  }
+  raw := tty_saved
+  tty_make_raw(&raw)
+  if tty_setattr(tty_input, 2, &raw) != 0 {
+    return false
+  }
+  return true
+}
+fn tty_leave_host() {
+  _ = tty_setattr(tty_input, 2, &tty_saved)
+}
+fn tty_register_handlers() {
+  _ = tty_atexit(tty_exit_handler)
+  fatal := tty_fatal_signals()
+  for number in fatal {
+    _ = tty_signal(number, tty_fatal)
+  }
+  // SIGBUS first tries to repair a truncated file mapping.
+  map_guard_install()
+  action := TtySignalAction{handler: tty_resize}
+  _ = tty_sigaction(28, &action, nil)
+}
+fn tty_fatal_host(number: i32) {
+  _ = tty_signal(number, nil)
+  _ = tty_raise(number)
+}
+fn tty_size_host(columns, rows: *i32) i32 {
+  size := TtySize{}
+  fd := tty_output
+  if fd < 0 {
+    fd = 1
+  }
+  if tty_ioctl(fd, TtyGetSize, #cast(rawptr, &size)) != 0 || size.columns == 0 || size.rows == 0 {
+    return 0
+  }
+  columns.* = #cast(i32, size.columns)
+  rows.* = #cast(i32, size.rows)
+  return 1
+}
+fn tty_read_host(buffer: *u8, capacity, timeout: i32) i32 {
+  return tty_read_posix(buffer, capacity, timeout)
+}
+fn tty_handoff_host(executable: *const u8, arguments: **const u8, session: *const u8) bool {
+  variable: []const u8 = "DNA_HANDOFF\0"
+  _ = tty_setenv(&variable[0], session, 1)
+  _ = tty_execv(executable, arguments)
+  return false
+}
+fn tty_suspend_host() i32 {
+  if sync.load_u32(&tty_active) == 0 {
+    return 0
+  }
+  dna_tty_leave()
+  _ = tty_raise(TtySuspendSignal)
+  return dna_tty_enter()
+}

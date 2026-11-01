@@ -1,0 +1,447 @@
+#target(kernel: windows)
+
+// Shared policy reads normalized metadata, never CRT stat or native records.
+struct InstallStat {
+  device, inode, links: u64,
+  mode, uid, gid, padding: u32,
+  rdevice: u64,
+  size, block_size, blocks: i64,
+  access_seconds, access_nanos, modify_seconds, modify_nanos: i64,
+  change_seconds, change_nanos: i64,
+  reserved: [3]i64,
+}
+struct InstallEntry { inode: u64, offset: i64, length: u16, kind: u8, name: [1024]u8 }
+struct InstallWinUnicode { length, maximum: u16, text: *const u16 }
+struct InstallWinAttributes { length: u32, root: rawptr, name: *InstallWinUnicode, flags: u32, security, quality: rawptr }
+struct InstallWinStatus { status: isize, information: usize }
+struct InstallWinRename { replace: u32, root: rawptr, length: u32, name: [1024]u16 }
+struct InstallWinDirectoryRecord {
+  next, index: u32,
+  created, accessed, modified, changed, size, allocation: i64,
+  attributes, name_length, extra: u32,
+  short_length, reserved: u8,
+  short_name: [12]u16,
+  short_padding: u16,
+  inode: u64,
+  name: [1]u16,
+}
+struct InstallWinDirectory {
+  fd: i32, offset: usize, loaded, finished: bool,
+  buffer: [8192]u64,
+  entry: InstallEntry,
+}
+struct InstallWinAPI {
+  open: fn(*rawptr, u32, *InstallWinAttributes, *InstallWinStatus, *i64, u32, u32, u32, u32, rawptr, u32) i32,
+  status_error: fn(i32) u32,
+  information: fn(rawptr, u32, rawptr, u32) i32,
+  set: fn(rawptr, u32, rawptr, u32) i32,
+  duplicate: fn(rawptr, rawptr, rawptr, *rawptr, u32, i32, u32) i32,
+  process: fn() rawptr,
+  remove_directory: fn(*const u16) i32,
+}
+install_win_api: InstallWinAPI
+install_win_once: win_io_sync.Once
+fn install_win_prepare() {
+  win_io_prepare()
+  if win_io_sync.once_begin(&install_win_once) {
+    kernel := win_io_loader.open("kernel32.dll", 0)
+    native := win_io_loader.open("ntdll.dll", 0)
+    if !kernel.ok || !native.ok {
+      #panic("missing Windows directory IO library")
+    }
+    install_win_api.open = #cast(fn(*rawptr, u32, *InstallWinAttributes, *InstallWinStatus, *i64, u32, u32, u32, u32, rawptr, u32) i32, win_io_symbol(native.value, "NtCreateFile"))
+    install_win_api.status_error = #cast(fn(i32) u32, win_io_symbol(native.value, "RtlNtStatusToDosError"))
+    install_win_api.information = #cast(fn(rawptr, u32, rawptr, u32) i32, win_io_symbol(kernel.value, "GetFileInformationByHandleEx"))
+    install_win_api.set = #cast(fn(rawptr, u32, rawptr, u32) i32, win_io_symbol(kernel.value, "SetFileInformationByHandle"))
+    install_win_api.duplicate = #cast(fn(rawptr, rawptr, rawptr, *rawptr, u32, i32, u32) i32, win_io_symbol(kernel.value, "DuplicateHandle"))
+    install_win_api.process = #cast(fn() rawptr, win_io_symbol(kernel.value, "GetCurrentProcess"))
+    install_win_api.remove_directory = #cast(fn(*const u16) i32, win_io_symbol(kernel.value, "RemoveDirectoryW"))
+    win_io_sync.once_complete(&install_win_once)
+  }
+}
+fn install_win_name(path: *const u8) bool {
+  if path == nil || path.* == 0 {
+    rec_errno().* = 22
+    return false
+  }
+  length := string_length(path)
+  if length > 1023 || (length == 1 && path.* == 46) || (length == 2 && path.* == 46 && path[..2][1] == 46) {
+    rec_errno().* = 22
+    return false
+  }
+  for byte in path[..length] {
+    if byte < 32 || byte == 47 || byte == 92 || byte == 58 || byte == 42 || byte == 63 {
+      rec_errno().* = 22
+      return false
+    }
+  }
+  if path[..length][length - 1] == 46 || path[..length][length - 1] == 32 {
+    rec_errno().* = 22
+    return false
+  }
+  return true
+}
+fn install_win_metadata(handle: rawptr, output: *InstallStat) i32 {
+  info := WinIOInformation{}
+  if win_io_api.info(handle, &info) == 0 {
+    return win_io_fail(win_io_api.error())
+  }
+  mode: u32 = 0o100666
+  if (info.attributes & 16) != 0 {
+    mode = 0o040777
+  }
+  if (info.attributes & 1) != 0 {
+    mode &= ~#cast(u32, 0o222)
+  }
+  if (info.attributes & 1024) != 0 {
+    mode = 0o120777
+  }
+  accessed := (#cast(u64, info.times[3]) << 32) | #cast(u64, info.times[2])
+  modified := (#cast(u64, info.times[5]) << 32) | #cast(u64, info.times[4])
+  size := (#cast(u64, info.size_high) << 32) | #cast(u64, info.size_low)
+  if size > 9223372036854775807 {
+    rec_errno().* = 75
+    return -1
+  }
+  // Match filesystem.windows.file_stamp exactly. Its change token is the
+  // volume identity, not the native FILE_BASIC_INFO change timestamp.
+  output.* = InstallStat{
+    device: #cast(u64, info.volume),
+    inode: (#cast(u64, info.index_high) << 32) | #cast(u64, info.index_low),
+    links: #cast(u64, info.links), mode: mode, size: #cast(i64, size), block_size: 4096,
+    access_seconds: #cast(i64, accessed / 10000000), access_nanos: #cast(i64, (accessed % 10000000) * 100),
+    modify_seconds: #cast(i64, modified / 10000000), modify_nanos: #cast(i64, (modified % 10000000) * 100),
+    change_seconds: #cast(i64, info.volume),
+  }
+  return 0
+}
+fn install_fstat(fd: i32, info: *InstallStat) i32 {
+  install_win_prepare()
+  return install_win_metadata(win_io_handle(fd), info)
+}
+fn install_win_path_stat(path: *const u8, info: *InstallStat, nofollow: bool) i32 {
+  install_win_prepare()
+  wide: [32768]u16 = []
+  if !win_io_path(path, wide[..]) {
+    return -1
+  }
+  flags: u32 = 33554432
+  if nofollow {
+    flags |= 2097152
+  }
+  handle := win_io_api.create(&wide[0], 0, 7, nil, 3, flags, nil)
+  if #cast(isize, handle) == -1 {
+    return win_io_fail(win_io_api.error())
+  }
+  result := install_win_metadata(handle, info)
+  saved := rec_errno().*
+  _ = win_io_api.close(handle)
+  rec_errno().* = saved
+  return result
+}
+fn install_lstat(path: *const u8, info: *InstallStat) i32 {
+  return install_win_path_stat(path, info, true)
+}
+fn disk_stat(path: *const u8, info: *InstallStat) i32 {
+  return install_win_path_stat(path, info, false)
+}
+// A single relative component is opened against the retained directory object.
+// No path reconstruction occurs after acquiring or renaming the parent handle.
+// Metadata may open a reparse object itself; transport never follows it.
+fn install_win_relative(fd: i32, path: *const u8, access: u32, options: u32, no_reparse: bool) rawptr {
+  install_win_prepare()
+  if !install_win_name(path) {
+    return nil
+  }
+  parent := win_io_handle(fd)
+  parent_info := WinIOInformation{}
+  if win_io_api.info(parent, &parent_info) == 0 {
+    _ = win_io_fail(win_io_api.error())
+    return nil
+  }
+  if (parent_info.attributes & 16) == 0 || (parent_info.attributes & 1024) != 0 {
+    _ = win_io_fail(50)
+    return nil
+  }
+  wide: [1024]u16 = []
+  if !win_io_path(path, wide[..]) {
+    return nil
+  }
+  units: usize = 0
+  for wide[units] != 0 {
+    units += 1
+  }
+  name := InstallWinUnicode{length: #cast(u16, units * 2), maximum: #cast(u16, (units + 1) * 2), text: &wide[0]}
+  attributes := InstallWinAttributes{length: #cast(u32, #sizeof(InstallWinAttributes)), root: parent, name: &name, flags: 64}
+  // All opens have a single component and OPEN_REPARSE_POINT. DONT_REPARSE
+  // adds refusal during name parsing for data transport; metadata inspects the
+  // reparse object's attributes without following its target.
+  if no_reparse {
+    attributes.flags |= 4096
+  }
+  status := InstallWinStatus{}
+  handle: rawptr = nil
+  result := install_win_api.open(&handle, access | 1048576, &attributes, &status, nil, 0, 7, 1, options | 2113568, nil, 0)
+  if result < 0 {
+    if result == -1073740533 {
+      _ = win_io_fail(50)
+    } else {
+      _ = win_io_fail(install_win_api.status_error(result))
+    }
+    return nil
+  }
+  info := WinIOInformation{}
+  if win_io_api.info(handle, &info) == 0 {
+    code := win_io_api.error()
+    _ = win_io_api.close(handle)
+    _ = win_io_fail(code)
+    return nil
+  }
+  if no_reparse && (info.attributes & 1024) != 0 {
+    _ = win_io_api.close(handle)
+    _ = win_io_fail(50)
+    return nil
+  }
+  return handle
+}
+fn install_openat(fd: i32, path: *const u8, flags: i32, mode: u32) i32 {
+  install_win_prepare()
+  if fd == -100 {
+    return rec_open(path, flags, mode)
+  }
+  // Shared callers use this path for reads only. Private creates are performed
+  // by rec_open, which establishes their protected DACL at creation time.
+  if (flags & (64 | 128 | 512 | 1024)) != 0 || (flags & 3) != 0 {
+    return win_io_fail(50)
+  }
+  options: u32 = 64
+  if (flags & 65536) != 0 {
+    options = 1
+  }
+  handle := install_win_relative(fd, path, 2147483776, options, true)
+  if handle == nil {
+    return -1
+  }
+  return win_io_adopt(handle, 0)
+}
+fn install_fstatat(fd: i32, path: *const u8, info: *InstallStat, flags: i32) i32 {
+  install_win_prepare()
+  if (flags & ~#cast(i32, 256)) != 0 {
+    return win_io_fail(50)
+  }
+  if fd == -100 {
+    return install_win_path_stat(path, info, (flags & 256) != 0)
+  }
+  // Even callers requesting follow metadata cannot escape a held parent via
+  // a junction. Returning link metadata lets their regular/directory checks
+  // reject it while picker enumeration remains complete.
+  handle := install_win_relative(fd, path, 128, 0, false)
+  if handle == nil {
+    return -1
+  }
+  result := install_win_metadata(handle, info)
+  saved := rec_errno().*
+  _ = win_io_api.close(handle)
+  rec_errno().* = saved
+  return result
+}
+fn install_dup(fd: i32) i32 {
+  install_win_prepare()
+  duplicate: rawptr = nil
+  process := install_win_api.process()
+  if install_win_api.duplicate(process, win_io_handle(fd), process, &duplicate, 0, 0, 2) == 0 {
+    return win_io_fail(win_io_api.error())
+  }
+  return win_io_adopt(duplicate, 0)
+}
+fn install_fdopendir(fd: i32) rawptr {
+  install_win_prepare()
+  info := WinIOInformation{}
+  if win_io_api.info(win_io_handle(fd), &info) == 0 {
+    _ = win_io_fail(win_io_api.error())
+    return nil
+  }
+  if (info.attributes & 16) == 0 || (info.attributes & 1024) != 0 {
+    _ = win_io_fail(267)
+    return nil
+  }
+  directory := #cast(*InstallWinDirectory, rec_alloc(1, #sizeof(InstallWinDirectory)))
+  if directory == nil {
+    rec_errno().* = 12
+    return nil
+  }
+  directory.fd = fd
+  return #cast(rawptr, directory)
+}
+fn install_readdir(opaque: rawptr) *InstallEntry {
+  install_win_prepare()
+  directory := #cast(*InstallWinDirectory, opaque)
+  if directory.finished {
+    rec_errno().* = 0
+    return nil
+  }
+  buffer := #cast(*u8, &directory.buffer[0])
+  if !directory.loaded {
+    kind: u32 = 11
+    if directory.offset != 0 {
+      kind = 10
+    }
+    if install_win_api.information(win_io_handle(directory.fd), kind, #cast(rawptr, buffer), 65536) == 0 {
+      code := win_io_api.error()
+      directory.finished = true
+      if code == 18 {
+        rec_errno().* = 0
+      } else {
+        _ = win_io_fail(code)
+      }
+      return nil
+    }
+    directory.offset = 0
+    directory.loaded = true
+  }
+  offset := directory.offset
+  if offset > 65432 {
+    directory.finished = true
+    _ = win_io_fail(13)
+    return nil
+  }
+  record := #cast(*InstallWinDirectoryRecord, &buffer[..65536][offset])
+  if (record.name_length & 1) != 0 || record.name_length > #cast(u32, 65536 - offset - 104) || record.next > #cast(u32, 65536 - offset) || (record.next != 0 && ((record.next & 7) != 0 || record.next < 104)) {
+    directory.finished = true
+    _ = win_io_fail(13)
+    return nil
+  }
+  amount := win_io_host.utf8(65001, 128, &record.name[0], #cast(i32, record.name_length / 2), &directory.entry.name[0], 1023, nil, nil)
+  if amount <= 0 {
+    directory.finished = true
+    _ = win_io_fail(win_io_api.error())
+    return nil
+  }
+  directory.entry.name[#cast(usize, amount)] = 0
+  directory.entry.inode = record.inode
+  directory.entry.length = #cast(u16, amount + 1)
+  directory.entry.kind = 8
+  if (record.attributes & 1024) != 0 {
+    directory.entry.kind = 10
+  } else if (record.attributes & 16) != 0 {
+    directory.entry.kind = 4
+  }
+  if record.next == 0 {
+    // offset remains nonzero as the continuation marker for the next batch.
+    directory.offset = 65536
+    directory.loaded = false
+  } else {
+    directory.offset += #cast(usize, record.next)
+  }
+  return &directory.entry
+}
+fn install_closedir(opaque: rawptr) i32 {
+  directory := #cast(*InstallWinDirectory, opaque)
+  result := rec_close(directory.fd)
+  rec_free(opaque)
+  return result
+}
+fn search_dirfd(opaque: rawptr) i32 {
+  return #cast(*InstallWinDirectory, opaque).fd
+}
+fn install_rmdir(path: *const u8) i32 {
+  install_win_prepare()
+  wide: [32768]u16 = []
+  if !win_io_path(path, wide[..]) {
+    return -1
+  }
+  if install_win_api.remove_directory(&wide[0]) == 0 {
+    return win_io_fail(win_io_api.error())
+  }
+  return 0
+}
+fn install_mkdtemp(path: *u8) *u8 {
+  install_win_prepare()
+  if path == nil {
+    _ = win_io_fail(87)
+    return nil
+  }
+  length := string_length(path)
+  if length < 6 {
+    _ = win_io_fail(87)
+    return nil
+  }
+  for at in length - 6..length {
+    if path[..length][at] != 88 {
+      _ = win_io_fail(87)
+      return nil
+    }
+  }
+  alphabet := "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_-"
+  for attempt in 0..128 {
+    random: [6]u8 = []
+    if win_io_api.random(&random[0], 6) == 0 {
+      _ = win_io_fail(5)
+      return nil
+    }
+    for at in 0..6 {
+      path[..length][length - 6 + at] = alphabet[#cast(usize, random[at] & 63)]
+    }
+    if rec_mkdir(path, 448) == 0 {
+      return path
+    }
+    if rec_errno().* != 17 {
+      return nil
+    }
+  }
+  rec_errno().* = 17
+  return nil
+}
+fn install_rename(source_fd: i32, source: *const u8, target_fd: i32, target: *const u8, flags: u32) i32 {
+  install_win_prepare()
+  // Windows has no atomic directory exchange. Never emulate it with a sequence
+  // that could publish a missing or partial active version after a crash.
+  if flags != 1 {
+    return win_io_fail(50)
+  }
+  if source_fd == -100 || target_fd == -100 {
+    if source_fd != -100 || target_fd != -100 {
+      return win_io_fail(50)
+    }
+    from: [32768]u16 = []
+    to: [32768]u16 = []
+    if !win_io_path(source, from[..]) || !win_io_path(target, to[..]) {
+      return -1
+    }
+    if win_io_api.move(&from[0], &to[0], 8) == 0 {
+      return win_io_fail(win_io_api.error())
+    }
+    return 0
+  }
+  if !install_win_name(target) {
+    return -1
+  }
+  // DELETE access belongs to the source handle; target resolution remains
+  // relative to the independently retained destination directory handle.
+  handle := install_win_relative(source_fd, source, 65664, 0, true)
+  if handle == nil {
+    return -1
+  }
+  defer _ = win_io_api.close(handle)
+  root := win_io_handle(target_fd)
+  info := WinIOInformation{}
+  if win_io_api.info(root, &info) == 0 {
+    return win_io_fail(win_io_api.error())
+  }
+  if (info.attributes & 16) == 0 || (info.attributes & 1024) != 0 {
+    return win_io_fail(50)
+  }
+  rename := InstallWinRename{root: root}
+  if !win_io_path(target, rename.name[..]) {
+    return -1
+  }
+  units: usize = 0
+  for rename.name[units] != 0 {
+    units += 1
+  }
+  rename.length = #cast(u32, units * 2)
+  if install_win_api.set(handle, 3, #cast(rawptr, &rename), #cast(u32, #sizeof(InstallWinRename))) == 0 {
+    return win_io_fail(win_io_api.error())
+  }
+  return 0
+}

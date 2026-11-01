@@ -75,8 +75,8 @@ def main():
         native = ROOT / 'src/native/dyn'
         for name in ('notify_windows.dyn', 'notify_gui.dyn', 'sync_desktop.dyn', 'sync_windows.dyn'):
             shutil.copyfile(native / name, stage / name)
-        (stage / 'sync.dyn').write_text((native / 'sync.dyn').read_text().split("// Dyn's current executable entry point", 1)[0])
-        (stage / 'main.dyn').write_text(FIXTURE)
+        (stage / 'sync.dyn').write_text((native / 'sync.dyn').read_text(encoding="utf-8").split("// Dyn's current executable entry point", 1)[0], encoding="utf-8")
+        (stage / 'main.dyn').write_text(FIXTURE, encoding="utf-8")
         for target in ('x86_64-windows', 'aarch64-windows'):
             for mode in ('debug', 'release'):
                 output = stage / (target + '-' + mode)

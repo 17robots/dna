@@ -118,7 +118,7 @@ with tempfile.TemporaryDirectory(prefix='dna-rec-io-') as temporary:
     shutil.copyfile(ROOT / 'src/native/dyn/rec_io_windows.dyn', bridge / 'rec_io_windows.dyn')
     # The fixture lives in the production adapter's module, so private policy
     # functions are exercised without inventing a public testing ABI.
-    (bridge / 'main.dyn').write_text(SOURCE)
+    (bridge / 'main.dyn').write_text(SOURCE, encoding="utf-8")
     environment = sdk_environment(compiler)
     for target in ('x86_64-windows', 'aarch64-windows'):
         for mode in ('debug', 'release'):

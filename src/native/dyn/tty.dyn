@@ -1,17 +1,8 @@
 // Linux/glibc terminal ownership. Signal handlers use only lock-free atomics
 // and async-signal-safe libc operations; layouts match the native ABI probe.
 struct TtySize { rows, columns, width, height: u16 }
-extern fn tty_getattr "tcgetattr"(fd: i32, value: *TtyTermios) i32
-extern fn tty_setattr "tcsetattr"(fd: i32, action: i32, value: *const TtyTermios) i32
-extern fn tty_isatty "isatty"(fd: i32) i32
 extern fn tty_atexit "atexit"(handler: fn()) i32
-extern fn tty_signal "signal"(number: i32, handler: fn(i32)) rawptr
-extern fn tty_sigaction "sigaction"(number: i32, action: *const TtySignalAction, old: rawptr) i32
-extern fn tty_raise "raise"(number: i32) i32
-extern fn tty_setenv "setenv"(key: *const u8, value: *const u8, overwrite: i32) i32
-extern fn tty_execv "execv"(path: *const u8, arguments: **const u8) i32
 
-tty_saved: TtyTermios = TtyTermios{}
 tty_active: sync.AtomicU32 = sync.AtomicU32{}
 tty_resize_pending: sync.AtomicU32 = sync.AtomicU32{}
 tty_input: i32 = 0
@@ -41,15 +32,14 @@ pub fn dna_tty_leave() {
   }
   sequence: []const u8 = "\x1b[<u\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[0 q\x1b[0m\x1b[?25h\x1b[?1049l"
   tty_write_all(&sequence[0], #len(sequence))
-  _ = tty_setattr(tty_input, 2, &tty_saved)
+  tty_leave_host()
 }
 fn tty_exit_handler() {
   dna_tty_leave()
 }
 fn tty_fatal(number: i32) {
   dna_tty_leave()
-  _ = tty_signal(number, nil)
-  _ = tty_raise(number)
+  tty_fatal_host(number)
 }
 fn tty_resize(number: i32) {
   _ = number
@@ -62,12 +52,7 @@ pub fn dna_tty_enter() i32 {
   }
   tty_input = 0
   tty_output = 1
-  if tty_isatty(tty_input) == 0 || tty_isatty(tty_output) == 0 || tty_getattr(tty_input, &tty_saved) != 0 {
-    return 0
-  }
-  raw := tty_saved
-  tty_make_raw(&raw)
-  if tty_setattr(tty_input, 2, &raw) != 0 {
+  if !tty_enter_host() {
     return 0
   }
   sync.store_u32(&tty_active, 1)
@@ -76,15 +61,7 @@ pub fn dna_tty_enter() i32 {
   }
   if !tty_registered {
     tty_registered = true
-    _ = tty_atexit(tty_exit_handler)
-    fatal := tty_fatal_signals()
-    for number in fatal {
-      _ = tty_signal(number, tty_fatal)
-    }
-    // SIGBUS first tries to repair a truncated file mapping.
-    map_guard_install()
-    action := TtySignalAction{handler: tty_resize}
-    _ = tty_sigaction(28, &action, nil)
+    tty_register_handlers()
   }
   sequence: []const u8 = "\x1b[?1049h\x1b[?25l\x1b[?2004h\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[>1u"
   tty_write_all(&sequence[0], #len(sequence))
@@ -92,18 +69,9 @@ pub fn dna_tty_enter() i32 {
 }
 pub fn dna_tty_size(columns: *i32, rows: *i32) i32 {
   native_initialize()
-  size := TtySize{}
-  fd := tty_output
-  if fd < 0 {
-    fd = 1
-  }
-  if tty_ioctl(fd, TtyGetSize, #cast(rawptr, &size)) != 0 || size.columns == 0 || size.rows == 0 {
-    return 0
-  }
-  columns.* = #cast(i32, size.columns)
-  rows.* = #cast(i32, size.rows)
-  return 1
+  return tty_size_host(columns, rows)
 }
+
 pub fn dna_tty_resized() i32 {
   if sync.exchange_u32(&tty_resize_pending, 0) != 0 {
     return 1
@@ -111,6 +79,9 @@ pub fn dna_tty_resized() i32 {
   return 0
 }
 pub fn dna_tty_read(buffer: *u8, capacity: i32, timeout: i32) i32 {
+  return tty_read_host(buffer, capacity, timeout)
+}
+fn tty_read_posix(buffer: *u8, capacity: i32, timeout: i32) i32 {
   native_initialize()
   targets: [2]PollDescriptor = [PollDescriptor{fd: tty_input, events: 1}, PollDescriptor{fd: tty_wake_descriptor, events: 1}]
   count: usize = 1
@@ -173,11 +144,9 @@ pub fn dna_handoff_run() {
   arguments[count] = &tty_handoff_flag[0]
   count += 1
   arguments[count] = nil
-  variable: []const u8 = "DNA_HANDOFF\0"
   executable := tty_executable_path()
-  _ = tty_setenv(&variable[0], &tty_handoff_session[0], 1)
-  if executable != nil {
-    _ = tty_execv(executable, &arguments[0])
+  if executable != nil && tty_handoff_host(executable, &arguments[0], &tty_handoff_session[0]) {
+    return
   }
   failed: []const u8 = "dna: frontend switch failed; :session-restore the file named by DNA_HANDOFF\n"
   _ = rec_write(2, &failed[0], #len(failed))
@@ -206,10 +175,5 @@ pub fn dna_tui_free(pointer: rawptr) {
   rec_free(pointer)
 }
 pub fn dna_tty_suspend() i32 {
-  if sync.load_u32(&tty_active) == 0 {
-    return 0
-  }
-  dna_tty_leave()
-  _ = tty_raise(TtySuspendSignal)
-  return dna_tty_enter()
+  return tty_suspend_host()
 }

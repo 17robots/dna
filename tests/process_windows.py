@@ -226,7 +226,7 @@ def main():
             shutil.copytree(ROOT / 'src' / module, stage / module)
         for source in ('process_windows.dyn', 'rec_io_windows.dyn'):
             shutil.copyfile(ROOT / 'src/native/dyn' / source, stage / source)
-        (stage / 'main.dyn').write_text(FIXTURE)
+        (stage / 'main.dyn').write_text(FIXTURE, encoding="utf-8")
         if os.name == 'nt':
             kits = Path(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')) / 'Windows Kits/10/Lib'
             libraries = work / 'lib'

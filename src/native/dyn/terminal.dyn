@@ -16,8 +16,8 @@ struct TermReviewRow { start, count, offset: u32 }
 struct TermHistoryRow { cells: *TermCell, count: i32 }
 struct Terminal {
   theme_generation, selection_color, cursor_color: u32,
-  vt, screen: rawptr,
-  pid, fd, exit_fd, rows, cols, exited, status, read_closed: i32,
+  vt, screen, platform: rawptr,
+  pid, fd, input_fd, exit_fd, rows, cols, exited, status, read_closed: i32,
   pending: [65536]u8, pending_len: usize,
   history: [2000]TermHistoryRow, history_count, history_head, scroll: i32,
   glyphs: *rawptr, font, engine: rawptr, points: f32,
@@ -135,6 +135,7 @@ pub fn dna_terminal_open(cwd: *const u8, shell: *const u8, command: *const u8) *
     return nil
   }
   t.fd = -1
+  t.input_fd = -1
   t.exit_fd = -1
   t.theme_generation = 4294967295
   t.selection_color = 3490128
@@ -157,61 +158,13 @@ pub fn dna_terminal_open(cwd: *const u8, shell: *const u8, command: *const u8) *
   bg := terminal_color(1579032)
   term_default(term_state(t.vt), &fg, &bg)
   term_reset(t.screen, 1)
-  size := TtySize{ rows: 24, columns: 80 }
-  env_name: []const u8 = "environ\0"
-  env_pointer := #cast(***const u8, proc_symbol(nil, &env_name[0]))
-  if env_pointer == nil {
+  if !terminal_start(t, cwd, shell, command) {
     terminal_dispose(t)
     return nil
   }
-  environment := env_pointer.*
-  count: usize = 0
-  for environment[..count + 1][count] != nil {
-    count += 1
-  }
-  filtered := #cast(**const u8, dna_memory_calloc(count + 2, #sizeof(rawptr), 2))
-  if filtered == nil {
-    terminal_dispose(t)
-    return nil
-  }
-  kept: usize = 0
-  for index in 0..count {
-    entry := environment[..count][#cast(usize, (index))]
-    if !terminal_prefix(entry, "TERM=") && !terminal_prefix(entry, "COLUMNS=") && !terminal_prefix(entry, "LINES=") {
-      filtered[..count + 2][kept] = entry
-      kept += 1
-    }
-  }
-  term_env: []const u8 = "TERM=xterm-256color\0"
-  interactive: []const u8 = "-i\0"
-  execute: []const u8 = "-c\0"
-  filtered[..count + 2][kept] = &term_env[0]
-  interactive_args: [3]*const u8 = [shell, &interactive[0], nil]
-  command_args: [4]*const u8 = [shell, &execute[0], command, nil]
-  t.pid = term_forkpty(&t.fd, nil, nil, &size)
-  if t.pid < 0 {
-    dna_memory_free(#cast(rawptr, filtered))
-    terminal_dispose(t)
-    return nil
-  }
-  if t.pid == 0 {
-    if term_chdir(cwd) != 0 {
-      term_exit(126)
-    }
-    args := &interactive_args[0]
-    if command != nil && command.* != 0 {
-      args = &command_args[0]
-    }
-    _ = term_execve(shell, args, filtered)
-    term_exit(127)
-  }
-  dna_memory_free(#cast(rawptr, filtered))
-  // PTY hangup may precede waitpid readiness. Watch child exit independently.
-  t.exit_fd = terminal_exit_descriptor(t.pid)
-  _ = proc_nonblocking(t.fd)
-  _ = proc_fcntl(t.fd, 2, 1)
   return t
 }
+
 fn terminal_flush(t: *Terminal) {
   bytes: [4096]u8 = []
   for {
@@ -225,8 +178,8 @@ fn terminal_flush(t: *Terminal) {
     }
   }
   for t.pending_len > 0 {
-    sent := rec_write(t.fd, &t.pending[0], t.pending_len)
-    if sent < 0 && rec_errno().* == 4 {
+    sent := proc_write(t.input_fd, &t.pending[0], t.pending_len)
+    if sent == -4 {
       continue
     }
     if sent <= 0 {
@@ -256,7 +209,7 @@ pub fn dna_terminal_poll(t: *Terminal) i32 {
   }
   term_damage(t.screen)
   terminal_flush(t)
-  if t.exited == 0 && proc_wait(t.pid, &t.status, 1) == t.pid {
+  if t.exited == 0 && terminal_exit_native(t) {
     t.exited = 1
     changed = 1
   }
@@ -274,7 +227,16 @@ pub fn dna_terminal_poll(t: *Terminal) i32 {
     if t.pending_len != 0 {
       writing = 1
     }
-    dna_watch(t.fd, writing)
+    if t.input_fd == t.fd {
+      dna_watch(t.fd, writing)
+    } else {
+      dna_watch(t.fd, 0)
+      if writing != 0 {
+        dna_watch(t.input_fd, 1)
+      } else {
+        dna_unwatch(t.input_fd)
+      }
+    }
   } else {
     dna_unwatch(t.fd)
   }
@@ -287,12 +249,12 @@ pub fn dna_terminal_alive(t: *Terminal) i32 {
   return 0
 }
 pub fn dna_terminal_needs_poll(t: *Terminal) i32 {
-  // Older kernels or descriptor exhaustion still need a bounded exit check.
-  if t.exited == 0 && t.read_closed != 0 && t.exit_fd < 0 {
+  if terminal_needs_exit_poll(t) {
     return 1
   }
   return 0
 }
+
 pub fn dna_terminal_text(t: *Terminal, text: *const u8, length: usize) {
   t.scroll = 0
   index: usize = 0
@@ -505,7 +467,7 @@ pub fn dna_terminal_resize(t: *Terminal, width: f32, height: f32, cw: f32, lh: f
     t.rows = rows
     term_size(t.vt, rows, cols)
     size := TtySize{rows: #cast(u16, rows), columns: #cast(u16, cols)}
-    terminal_resize_native(t.fd, &size)
+    terminal_resize_host(t, &size)
     return 1
   }
   return 0
@@ -585,19 +547,7 @@ pub fn dna_terminal_close(t: *Terminal) {
   if t == nil {
     return
   }
-  dna_unwatch(t.fd)
-  _ = rec_close(t.fd)
-  if t.exit_fd >= 0 {
-    dna_unwatch(t.exit_fd)
-    _ = rec_close(t.exit_fd)
-  }
-  if t.exited == 0 {
-    _ = proc_kill(-t.pid, 1)
-    _ = proc_kill(t.pid, 1)
-    _ = proc_kill(-t.pid, 9)
-    _ = proc_kill(t.pid, 9)
-    _ = proc_wait(t.pid, nil, 0)
-  }
+  terminal_stop(t)
   terminal_gui_close(t)
   terminal_dispose(t)
 }
@@ -980,4 +930,85 @@ pub fn dna_terminal_review_point(t: *Terminal, x: f32, y: f32) usize {
     col = #cast(i32, line.count) - 1
   }
   return #cast(usize, t.review[..506100][line.start + #cast(u32, col)].offset)
+}
+
+// POSIX launch policy receives platform routines explicitly; Windows supplies
+// a ConPTY owner without importing fork, signals, or termios layouts.
+struct PosixTerminalHooks {
+  fork: fn(*i32, rawptr, rawptr, *const TtySize) i32,
+  chdir: fn(*const u8) i32,
+  exit: fn(i32),
+  exec: fn(*const u8, **const u8, **const u8) i32,
+  exit_descriptor: fn(i32) i32,
+  close_on_exec: fn(i32),
+}
+fn terminal_posix_start(t: *Terminal, cwd, shell, command: *const u8, hooks: PosixTerminalHooks) bool {
+  size := TtySize{ rows: 24, columns: 80 }
+  env_name: []const u8 = "environ\0"
+  env_pointer := #cast(***const u8, proc_symbol(nil, &env_name[0]))
+  if env_pointer == nil {
+    return false
+  }
+  environment := env_pointer.*
+  count: usize = 0
+  for environment[..count + 1][count] != nil {
+    count += 1
+  }
+  filtered := #cast(**const u8, dna_memory_calloc(count + 2, #sizeof(rawptr), 2))
+  if filtered == nil {
+    return false
+  }
+  kept: usize = 0
+  for index in 0..count {
+    entry := environment[..count][#cast(usize, (index))]
+    if !terminal_prefix(entry, "TERM=") && !terminal_prefix(entry, "COLUMNS=") && !terminal_prefix(entry, "LINES=") {
+      filtered[..count + 2][kept] = entry
+      kept += 1
+    }
+  }
+  term_env: []const u8 = "TERM=xterm-256color\0"
+  interactive: []const u8 = "-i\0"
+  execute: []const u8 = "-c\0"
+  filtered[..count + 2][kept] = &term_env[0]
+  interactive_args: [3]*const u8 = [shell, &interactive[0], nil]
+  command_args: [4]*const u8 = [shell, &execute[0], command, nil]
+  t.pid = hooks.fork(&t.fd, nil, nil, &size)
+  if t.pid < 0 {
+    dna_memory_free(#cast(rawptr, filtered))
+    return false
+  }
+  if t.pid == 0 {
+    if hooks.chdir(cwd) != 0 {
+      hooks.exit(126)
+    }
+    args := &interactive_args[0]
+    if command != nil && command.* != 0 {
+      args = &command_args[0]
+    }
+    _ = hooks.exec(shell, args, filtered)
+    hooks.exit(127)
+  }
+  dna_memory_free(#cast(rawptr, filtered))
+  // PTY hangup may precede waitpid readiness. Watch child exit independently.
+  t.exit_fd = hooks.exit_descriptor(t.pid)
+  _ = proc_nonblocking(t.fd)
+  hooks.close_on_exec(t.fd)
+  t.input_fd = t.fd
+  return true
+}
+
+fn terminal_posix_stop(t: *Terminal, kill: fn(i32, i32) i32, wait: fn(i32, *i32, i32) i32) {
+  dna_unwatch(t.fd)
+  _ = rec_close(t.fd)
+  if t.exit_fd >= 0 {
+    dna_unwatch(t.exit_fd)
+    _ = rec_close(t.exit_fd)
+  }
+  if t.exited == 0 {
+    _ = kill(-t.pid, 1)
+    _ = kill(t.pid, 1)
+    _ = kill(-t.pid, 9)
+    _ = kill(t.pid, 9)
+    _ = wait(t.pid, nil, 0)
+  }
 }
