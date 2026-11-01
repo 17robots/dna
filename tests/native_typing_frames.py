@@ -7,6 +7,9 @@ import subprocess
 import sys
 import tempfile
 from native_gpu_probe import install as gpu_probe
+# This correctness oracle redraws hundreds of full frames at up to 1920x1080.
+# Hosted LLVMpipe runs consume CPU throughout and need a larger bounded budget
+# than startup smoke; latency/performance gates are separate tests.
 ROOT=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='dna-typing-frames-',dir=ROOT/'build') as temporary:
     work=Path(temporary);stage=work/'src';shutil.copytree(ROOT/'src',stage)
@@ -41,9 +44,9 @@ fn finish_probe(app:*App){}
         binary=work/'editor'
         subprocess.run([sys.executable,str(ROOT/'scripts/build_native.py'),'--source',str(stage),'--mode',mode,'--output',str(binary)],check=True,stdout=subprocess.DEVNULL)
         if '--negative-control' in sys.argv:
-            result=subprocess.run([str(binary)],env=env,capture_output=True,text=True,timeout=90)
+            result=subprocess.run([str(binary)],env=env,capture_output=True,text=True,timeout=240)
             assert result.returncode!=0 and 'initial cached/fresh frame mismatch' in result.stderr, result.stdout+result.stderr
             print(f'PASS native typing negative control ({mode}): injected whole-frame blanking is detected',flush=True)
             continue
-        subprocess.run([str(binary)],env=env,check=True,timeout=90)
+        subprocess.run([str(binary)],env=env,check=True,timeout=240)
         print(f'PASS native typing framebuffer ({mode}): ASCII/Unicode, backspace/newline, long line and vertical scroll; cached frame equals unchanged and forced-fresh draw at640/960/1920',flush=True)
