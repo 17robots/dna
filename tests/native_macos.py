@@ -60,6 +60,16 @@ with tempfile.TemporaryDirectory(prefix='dna-native-macos-') as temporary:
     # real process pipes, cancellation, filesystem replacement and vnode events.
     for test in ('jobs.py', 'disk.py'):
         run([sys.executable, ROOT/'tests'/test], env=environment)
+    sys.path.insert(0,str(ROOT/'scripts'))
+    from dyn_path import real_dyn
+    from native_macos import linker_environment
+    compile_environment, links = linker_environment(real_dyn())
+    run([sys.executable, ROOT/'scripts/compile.py', real_dyn(), 'build',
+         ROOT/'examples/plugins/uppercase', '--release', '--output',
+         ROOT/'examples/plugins/uppercase/uppercase', *links], env=compile_environment)
+    service_environment = dict(environment, DNA_NATIVE_LIBRARY=str(ROOT/'build/deps/install/lib/libdna_native.dylib'))
+    for test in ('plugins.py', 'recovery.py'):
+        run([sys.executable, ROOT/'tests'/test], env=service_environment)
     lib = c.CDLL(str(ROOT/'build/deps/install/lib/libdna_native.dylib'))
     callback_type = c.CFUNCTYPE(None, c.c_void_p)
     notified = threading.Event()
