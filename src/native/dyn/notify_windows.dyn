@@ -1,0 +1,173 @@
+#target(kernel: windows)
+#link("kernel32")
+
+// Registrations own only descriptor numbers, never service pointers. Holding
+// notify_registry during probing and unwatch prevents close/reuse races.
+struct WindowsWatch { next: *WindowsWatch, fd, writing: i32, armed: bool }
+notify_watches: *WindowsWatch = nil
+notify_registry: NativeMutex = NativeMutex{}
+notify_delivery: NativeMutex = NativeMutex{}
+notify_enabled: bool = false
+notify_running: bool = false
+notify_thread: rawptr = nil
+notify_stop_event: rawptr = nil
+use "std/dynlib" notify_loader
+struct WindowsNotifyAPI {
+  create: fn(rawptr, i32, i32, *const u16) rawptr,
+  set: fn(rawptr) i32,
+  wait: fn(rawptr, u32) u32,
+  close: fn(rawptr) i32,
+}
+notify_api: WindowsNotifyAPI
+notify_api_once: sync.Once
+fn notify_symbol(library: rawptr, name: []const u8) rawptr {
+  result := notify_loader.symbol(library, name)
+  if !result.ok || result.value == nil {
+    #panic("missing Windows notification API")
+  }
+  return result.value
+}
+fn notify_prepare() {
+  if sync.once_begin(&notify_api_once) {
+    library := notify_loader.open("kernel32.dll", 0)
+    if !library.ok {
+      #panic("missing Windows kernel API")
+    }
+    notify_api.create = #cast(fn(rawptr, i32, i32, *const u16) rawptr, notify_symbol(library.value, "CreateEventW"))
+    notify_api.set = #cast(fn(rawptr) i32, notify_symbol(library.value, "SetEvent"))
+    notify_api.wait = #cast(fn(rawptr, u32) u32, notify_symbol(library.value, "WaitForSingleObject"))
+    notify_api.close = #cast(fn(rawptr) i32, notify_symbol(library.value, "CloseHandle"))
+    sync.once_complete(&notify_api_once)
+  }
+}
+
+pub fn dna_notify() {
+  _ = sync_mutex_lock(#cast(rawptr, &notify_delivery))
+  if notify_enabled {
+    notify_gui()
+    dna_tty_wake()
+  }
+  _ = sync_mutex_unlock(#cast(rawptr, &notify_delivery))
+}
+fn notify_worker(context: rawptr) i32 {
+  _ = context
+  for notify_api.wait(notify_stop_event, 10) == 258 {
+    delivered := false
+    _ = sync_mutex_lock(#cast(rawptr, &notify_registry))
+    watch := notify_watches
+    for watch != nil {
+      if watch.armed {
+        events: i16 = 1
+        if watch.writing != 0 {
+          events = 4
+        }
+        descriptor := PollDescriptor{fd: watch.fd, events: events}
+        if proc_poll(&descriptor, 1, 0) > 0 && descriptor.returned != 0 {
+          watch.armed = false
+          delivered = true
+        }
+      }
+      watch = watch.next
+    }
+    _ = sync_mutex_unlock(#cast(rawptr, &notify_registry))
+    if delivered {
+      dna_notify()
+    }
+  }
+  return 0
+}
+pub fn dna_notify_start() i32 {
+  native_initialize()
+  notify_prepare()
+  _ = sync_mutex_lock(#cast(rawptr, &notify_registry))
+  defer _ = sync_mutex_unlock(#cast(rawptr, &notify_registry))
+  if notify_running {
+    return 0
+  }
+  notify_stop_event = notify_api.create(nil, 1, 0, nil)
+  if notify_stop_event == nil {
+    return 0
+  }
+  notify_thread = dna_thread_create(notify_worker, nil)
+  if notify_thread == nil {
+    _ = notify_api.close(notify_stop_event)
+    notify_stop_event = nil
+    return 0
+  }
+  notify_running = true
+  _ = sync_mutex_lock(#cast(rawptr, &notify_delivery))
+  notify_enabled = true
+  _ = sync_mutex_unlock(#cast(rawptr, &notify_delivery))
+  return 1
+}
+pub fn dna_notify_stop() {
+  _ = sync_mutex_lock(#cast(rawptr, &notify_delivery))
+  notify_enabled = false
+  _ = sync_mutex_unlock(#cast(rawptr, &notify_delivery))
+  _ = sync_mutex_lock(#cast(rawptr, &notify_registry))
+  if !notify_running {
+    _ = sync_mutex_unlock(#cast(rawptr, &notify_registry))
+    return
+  }
+  _ = notify_api.set(notify_stop_event)
+  worker := notify_thread
+  _ = sync_mutex_unlock(#cast(rawptr, &notify_registry))
+  dna_thread_join(worker, nil)
+  _ = sync_mutex_lock(#cast(rawptr, &notify_registry))
+  defer _ = sync_mutex_unlock(#cast(rawptr, &notify_registry))
+  _ = notify_api.close(notify_stop_event)
+  notify_stop_event = nil
+  notify_thread = nil
+  notify_running = false
+  watch := notify_watches
+  notify_watches = nil
+  for watch != nil {
+    next := watch.next
+    rec_free(#cast(rawptr, watch))
+    watch = next
+  }
+}
+pub fn dna_watch(fd: i32, writing: i32) {
+  native_initialize()
+  if fd < 0 {
+    return
+  }
+  _ = sync_mutex_lock(#cast(rawptr, &notify_registry))
+  defer _ = sync_mutex_unlock(#cast(rawptr, &notify_registry))
+  if !notify_running {
+    return
+  }
+  watch := notify_watches
+  for watch != nil {
+    if watch.fd == fd {
+      watch.writing = writing
+      watch.armed = true
+      return
+    }
+    watch = watch.next
+  }
+  watch = #cast(*WindowsWatch, rec_malloc(#sizeof(WindowsWatch)))
+  if watch != nil {
+    watch.* = WindowsWatch{next: notify_watches, fd: fd, writing: writing, armed: true}
+    notify_watches = watch
+  }
+}
+pub fn dna_unwatch(fd: i32) {
+  if fd < 0 {
+    return
+  }
+  _ = sync_mutex_lock(#cast(rawptr, &notify_registry))
+  defer _ = sync_mutex_unlock(#cast(rawptr, &notify_registry))
+  link := &notify_watches
+  for link.* != nil {
+    watch := link.*
+    if watch.fd == fd {
+      link.* = watch.next
+      rec_free(#cast(rawptr, watch))
+      return
+    }
+    link = &watch.next
+  }
+}
+
+fn notify_defaults() {}

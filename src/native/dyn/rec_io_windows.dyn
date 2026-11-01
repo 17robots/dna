@@ -1,0 +1,337 @@
+#target(kernel: windows)
+#link("kernel32")
+#link("advapi32")
+#link("ucrt")
+use "./filesystem" win_io_files
+use "./host" win_io_host
+use "std/dynlib" win_io_loader
+
+// Shared service policy uses Linux flags and errno values. Windows handles
+// enter the CRT descriptor table once, without inheritance or text conversion.
+// A successful adoption transfers ownership to _close; failure closes here.
+extern fn win_io_crt_adopt "_open_osfhandle"(handle: isize, flags: i32) i32
+extern fn win_io_crt_handle "_get_osfhandle"(fd: i32) isize
+extern fn win_io_crt_close "_close"(fd: i32) i32
+extern fn win_io_crt_errno "_errno"() *i32
+extern fn win_io_crt_environment "getenv"(name: *const u8) *u8
+use "std/sync" win_io_sync
+struct WinIOInformation { attributes: u32, times: [6]u32, volume, size_high, size_low, links, index_high, index_low: u32 }
+struct WinIOAPI {
+  create: fn(*const u16, u32, u32, rawptr, u32, u32, rawptr) rawptr,
+  close: fn(rawptr) i32,
+  error: fn() u32,
+  write: fn(rawptr, *const u8, u32, *u32, rawptr) i32,
+  flush: fn(rawptr) i32,
+  move: fn(*const u16, *const u16, u32) i32,
+  delete: fn(*const u16) i32,
+  reopen: fn(rawptr, u32, u32, u32) rawptr,
+  type: fn(rawptr) u32,
+  info: fn(rawptr, *WinIOInformation) i32,
+  random: fn(*u8, u32) u8,
+  load: fn(*const u16) rawptr,
+}
+win_io_api: WinIOAPI
+win_io_once: win_io_sync.Once
+fn win_io_symbol(library: rawptr, name: []const u8) rawptr {
+  result := win_io_loader.symbol(library, name)
+  if !result.ok || result.value == nil {
+    #panic("missing Windows IO routine")
+  }
+  return result.value
+}
+fn win_io_prepare() {
+  if win_io_sync.once_begin(&win_io_once) {
+    // Known ASCII system library names use the SDK loader. User-supplied DLL
+    // paths below use LoadLibraryW instead of the SDK's narrow loader wrapper.
+    kernel := win_io_loader.open("kernel32.dll", 0)
+    security := win_io_loader.open("advapi32.dll", 0)
+    if !kernel.ok || !security.ok {
+      #panic("missing Windows IO system library")
+    }
+    win_io_api.create = #cast(fn(*const u16, u32, u32, rawptr, u32, u32, rawptr) rawptr, win_io_symbol(kernel.value, "CreateFileW"))
+    win_io_api.close = #cast(fn(rawptr) i32, win_io_symbol(kernel.value, "CloseHandle"))
+    win_io_api.error = #cast(fn() u32, win_io_symbol(kernel.value, "GetLastError"))
+    win_io_api.write = #cast(fn(rawptr, *const u8, u32, *u32, rawptr) i32, win_io_symbol(kernel.value, "WriteFile"))
+    win_io_api.flush = #cast(fn(rawptr) i32, win_io_symbol(kernel.value, "FlushFileBuffers"))
+    win_io_api.move = #cast(fn(*const u16, *const u16, u32) i32, win_io_symbol(kernel.value, "MoveFileExW"))
+    win_io_api.delete = #cast(fn(*const u16) i32, win_io_symbol(kernel.value, "DeleteFileW"))
+    win_io_api.reopen = #cast(fn(rawptr, u32, u32, u32) rawptr, win_io_symbol(kernel.value, "ReOpenFile"))
+    win_io_api.type = #cast(fn(rawptr) u32, win_io_symbol(kernel.value, "GetFileType"))
+    win_io_api.info = #cast(fn(rawptr, *WinIOInformation) i32, win_io_symbol(kernel.value, "GetFileInformationByHandle"))
+    win_io_api.random = #cast(fn(*u8, u32) u8, win_io_symbol(security.value, "SystemFunction036"))
+    win_io_api.load = #cast(fn(*const u16) rawptr, win_io_symbol(kernel.value, "LoadLibraryW"))
+    win_io_sync.once_complete(&win_io_once)
+  }
+}
+
+fn rec_errno() *i32 {
+  return win_io_crt_errno()
+}
+fn rec_retry() bool {
+  return rec_errno().* == 11
+}
+fn win_io_fail(code: u32) i32 {
+  error: i32 = 5
+  if code == 2 || code == 3 || code == 15 {
+    error = 2
+  } else if code == 5 || code == 32 || code == 33 {
+    error = 13
+  } else if code == 6 {
+    error = 9
+  } else if code == 8 || code == 14 {
+    error = 12
+  } else if code == 80 || code == 183 {
+    error = 17
+  } else if code == 87 || code == 123 {
+    error = 22
+  } else if code == 109 || code == 232 {
+    error = 32
+  } else if code == 112 {
+    error = 28
+  } else if code == 206 {
+    error = 36
+  } else if code == 267 {
+    error = 20
+  } else if code == 50 || code == 1 {
+    error = 95
+  }
+  rec_errno().* = error
+  return -1
+}
+fn win_io_text(path: *const u8) []const u8 {
+  return path[..string_length(path)]
+}
+fn win_io_path(path: *const u8, output: []u16) bool {
+  if path == nil || path.* == 0 {
+    _ = win_io_fail(87)
+    return false
+  }
+  length := string_length(path)
+  if length > 2147483647 {
+    _ = win_io_fail(206)
+    return false
+  }
+  used := win_io_host.utf16(65001, 8, path, #cast(i32, length), &output[0], #cast(i32, #len(output)) - 1)
+  if used <= 0 {
+    _ = win_io_fail(win_io_api.error())
+    return false
+  }
+  output[#cast(usize, used)] = 0
+  return true
+}
+fn win_io_handle(fd: i32) rawptr {
+  return #cast(rawptr, win_io_crt_handle(fd))
+}
+fn win_io_adopt(handle: rawptr, flags: i32) i32 {
+  win_io_prepare()
+  fd := win_io_crt_adopt(#cast(isize, handle), flags | 32768 | 128)
+  if fd < 0 {
+    saved := rec_errno().*
+    _ = win_io_api.close(handle)
+    rec_errno().* = saved
+  }
+  return fd
+}
+fn rec_open(path: *const u8, flags: i32, mode: u32) i32 {
+  win_io_prepare()
+  // Append is unused by this policy; do not silently implement it as overwrite.
+  if (flags & 1024) != 0 || (flags & 3) == 3 {
+    return win_io_fail(50)
+  }
+  wide: [32768]u16 = []
+  if !win_io_path(path, wide[..]) {
+    return -1
+  }
+  handle: rawptr = nil
+  if (flags & 192) == 192 {
+    if (flags & 65536) != 0 || (flags & 3) == 0 {
+      return win_io_fail(50)
+    }
+    // Mode bits do not describe Windows ACLs. Restrict every private output at
+    // creation, including executable plugin payloads, before exposing a handle.
+    created := win_io_files.create_private_exclusive(win_io_text(path))
+    if !created.ok {
+      return win_io_fail(#cast(u32, 0 - created.error))
+    }
+    handle = #cast(rawptr, created.value.descriptor)
+    if (flags & 3) == 2 {
+      replacement := win_io_api.reopen(handle, 3221225472, 7, 0)
+      if #cast(isize, replacement) == -1 {
+        code := win_io_api.error()
+        _ = win_io_api.close(handle)
+        _ = win_io_api.delete(&wide[0])
+        return win_io_fail(code)
+      }
+      _ = win_io_api.close(handle)
+      handle = replacement
+    }
+  } else {
+    _ = mode
+    access: u32 = 2147483648
+    if (flags & 3) == 1 {
+      access = 1073741824
+    } else if (flags & 3) == 2 {
+      access = 3221225472
+    }
+    creation: u32 = 3
+    if (flags & 64) != 0 {
+      creation = 4
+      if (flags & 512) != 0 {
+        creation = 2
+      }
+    } else if (flags & 512) != 0 {
+      creation = 5
+    }
+    attributes: u32 = 128
+    if (flags & 65536) != 0 {
+      attributes |= 33554432
+    }
+    if (flags & 131072) != 0 {
+      attributes |= 2097152
+    }
+    handle = win_io_api.create(&wide[0], access, 7, nil, creation, attributes, nil)
+    if #cast(isize, handle) == -1 {
+      return win_io_fail(win_io_api.error())
+    }
+  }
+  info := WinIOInformation{}
+  failure: u32 = 0
+  if win_io_api.type(handle) != 1 {
+    failure = 50
+  } else if win_io_api.info(handle, &info) == 0 {
+    failure = win_io_api.error()
+  } else if (flags & 131072) != 0 && (info.attributes & 1024) != 0 {
+    failure = 50
+  } else if (flags & 65536) != 0 && (info.attributes & 16) == 0 {
+    failure = 267
+  } else if (flags & 65536) == 0 && (info.attributes & 16) != 0 {
+    failure = 50
+  }
+  if failure != 0 {
+    _ = win_io_api.close(handle)
+    return win_io_fail(failure)
+  }
+  return win_io_adopt(handle, flags & 3)
+}
+fn rec_close(fd: i32) i32 {
+  return win_io_crt_close(fd)
+}
+fn rec_write(fd: i32, bytes: *const u8, length: usize) isize {
+  win_io_prepare()
+  amount := length
+  if amount > 2147483647 {
+    amount = 2147483647
+  }
+  written: u32 = 0
+  if win_io_api.write(win_io_handle(fd), bytes, #cast(u32, amount), &written, nil) == 0 {
+    return #cast(isize, win_io_fail(win_io_api.error()))
+  }
+  return #cast(isize, written)
+}
+fn rec_sync(fd: i32) i32 {
+  win_io_prepare()
+  handle := win_io_handle(fd)
+  info := WinIOInformation{}
+  if win_io_api.info(handle, &info) == 0 {
+    return win_io_fail(win_io_api.error())
+  }
+  // Win32 has no POSIX parent-directory fsync contract. Keep this limitation
+  // explicit so recovery cannot report durability that was never established.
+  if (info.attributes & 16) != 0 {
+    return win_io_fail(50)
+  }
+  if win_io_api.flush(handle) == 0 {
+    return win_io_fail(win_io_api.error())
+  }
+  return 0
+}
+fn rec_rename(from: *const u8, to: *const u8) i32 {
+  win_io_prepare()
+  source: [32768]u16 = []
+  target: [32768]u16 = []
+  if !win_io_path(from, source[..]) || !win_io_path(to, target[..]) {
+    return -1
+  }
+  // Same-volume atomic file replacement; never permit COPY_ALLOWED fallback.
+  if win_io_api.move(&source[0], &target[0], 9) == 0 {
+    return win_io_fail(win_io_api.error())
+  }
+  return 0
+}
+fn rec_unlink(path: *const u8) i32 {
+  win_io_prepare()
+  wide: [32768]u16 = []
+  if !win_io_path(path, wide[..]) {
+    return -1
+  }
+  if win_io_api.delete(&wide[0]) == 0 {
+    return win_io_fail(win_io_api.error())
+  }
+  return 0
+}
+fn rec_mkdir(path: *const u8, mode: u32) i32 {
+  win_io_prepare()
+  if path == nil || path.* == 0 {
+    return win_io_fail(87)
+  }
+  result := win_io_files.make_directory(win_io_text(path), #cast(usize, mode))
+  if !result.ok {
+    return win_io_fail(#cast(u32, 0 - result.error))
+  }
+  return 0
+}
+fn rec_temp(path: *u8) i32 {
+  win_io_prepare()
+  if path == nil {
+    return win_io_fail(87)
+  }
+  length := string_length(path)
+  if length < 6 {
+    return win_io_fail(87)
+  }
+  for at in length - 6..length {
+    if path[..length][at] != 88 {
+      return win_io_fail(87)
+    }
+  }
+  alphabet := "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_-"
+  for attempt in 0..128 {
+    random: [6]u8 = []
+    if win_io_api.random(&random[0], 6) == 0 {
+      return win_io_fail(5)
+    }
+    for index in 0..6 {
+      path[..length][length - 6 + index] = alphabet[#cast(usize, random[index] & 63)]
+    }
+    fd := rec_open(path, 524482, 384)
+    if fd >= 0 || rec_errno().* != 17 {
+      return fd
+    }
+  }
+  rec_errno().* = 17
+  return -1
+}
+// This optional diagnostic switch uses the CRT's narrow environment snapshot.
+// Its ASCII names/values are portable; use host.environment for Unicode data.
+fn memory_environment(name: *const u8) *u8 {
+  return win_io_crt_environment(name)
+}
+fn syntax_dlopen(path: *const u8, flags: i32) rawptr {
+  win_io_prepare()
+  _ = flags
+  wide: [32768]u16 = []
+  if !win_io_path(path, wide[..]) {
+    return nil
+  }
+  library := win_io_api.load(&wide[0])
+  if library == nil {
+    _ = win_io_fail(win_io_api.error())
+  }
+  return library
+}
+fn syntax_dlclose(library: rawptr) i32 {
+  if win_io_loader.close(&library).ok {
+    return 0
+  }
+  return -1
+}
