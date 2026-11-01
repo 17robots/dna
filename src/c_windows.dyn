@@ -9,6 +9,7 @@ struct WindowsFrontendAPI {
   thread_times, process_times: fn(rawptr, *u64, *u64, *u64, *u64) i32,
   current_thread, current_process: fn() rawptr,
   screen: fn(i32) i32,
+  system_directory: fn(*u16, u32) u32,
 }
 frontend_windows_api: WindowsFrontendAPI
 frontend_windows_once: frontend_sync.Once
@@ -32,6 +33,7 @@ fn frontend_prepare() {
     frontend_windows_api.current_thread = #cast(fn() rawptr, frontend_symbol(kernel.value, "GetCurrentThread"))
     frontend_windows_api.current_process = #cast(fn() rawptr, frontend_symbol(kernel.value, "GetCurrentProcess"))
     frontend_windows_api.screen = #cast(fn(i32) i32, frontend_symbol(user.value, "GetSystemMetrics"))
+    frontend_windows_api.system_directory = #cast(fn(*u16, u32) u32, frontend_symbol(kernel.value, "GetSystemDirectoryW"))
     frontend_sync.once_complete(&frontend_windows_once)
   }
 }
@@ -107,4 +109,233 @@ fn thread_clock(kind: i32, time: *ThreadTime) i32 {
   time.seconds = #cast(i64, ticks / 10000000)
   time.nanoseconds = #cast(i64, (ticks % 10000000) * 100)
   return 0
+}
+
+
+use "std/mem" frontend_mem
+use "std/encoding/base64" frontend_base64
+struct WindowsLanguageCommand {
+  script: [16384]u16,
+  scratch: [32768]u16,
+  arguments: [16384]u16,
+  system: [32768]u8,
+}
+fn frontend_system_directory(space: *WindowsLanguageCommand) usize {
+  frontend_prepare()
+  units := frontend_windows_api.system_directory(&space.scratch[0], 32768)
+  if units < 3 || units >= 32768 || space.scratch[1] != 58 || (space.scratch[2] != 92 && space.scratch[2] != 47) {
+    return 0
+  }
+  used := host.utf8(65001, 128, &space.scratch[0], #cast(i32, units), &space.system[0], 32767, nil, nil)
+  if used <= 0 {
+    return 0
+  }
+  length := #cast(usize, used)
+  for at in 0..length {
+    if space.system[at] == 92 {
+      space.system[at] = 47
+    }
+  }
+  for length > 3 && space.system[length - 1] == 47 {
+    length -= 1
+  }
+  space.system[length] = 0
+  return length
+}
+fn platform_job_directory(output: []u8) usize {
+  arena := frontend_mem.arena_try_create(196608)
+  if !arena.ok {
+    return 0
+  }
+  defer frontend_mem.arena_release(arena.arena)
+  allocation := frontend_mem.arena_try_push_uninit(arena.arena, #sizeof(WindowsLanguageCommand), #alignof(WindowsLanguageCommand))
+  if !allocation.ok {
+    return 0
+  }
+  space := #cast(*WindowsLanguageCommand, allocation.memory)
+  size := frontend_system_directory(space)
+  if size == 0 || size >= #len(output) {
+    return 0
+  }
+  for at in 0..size {
+    output[at] = space.system[at]
+  }
+  output[size] = 0
+  return size
+}
+fn frontend_language_text(space: *WindowsLanguageCommand, used: *usize, text: []const u8) bool {
+  if #len(text) > #len(space.script) - used.* {
+    return false
+  }
+  for byte in text {
+    space.script[used.*] = #cast(u16, byte)
+    used.* += 1
+  }
+  return true
+}
+fn frontend_language_units(space: *WindowsLanguageCommand, used: *usize, text: []const u16) bool {
+  if #len(space.script) - used.* < 2 {
+    return false
+  }
+  space.script[used.*] = 39
+  used.* += 1
+  for unit in text {
+    // PowerShell treats smart apostrophes as quote delimiters too. Double
+    // every single-quote delimiter while retaining its original code point.
+    quoted := unit == 39 || (unit >= 8216 && unit <= 8219)
+    required: usize = 1
+    if quoted {
+      required = 2
+    }
+    if required >= #len(space.script) - used.* {
+      return false
+    }
+    space.script[used.*] = unit
+    used.* += 1
+    if quoted {
+      space.script[used.*] = unit
+      used.* += 1
+    }
+  }
+  space.script[used.*] = 39
+  used.* += 1
+  return true
+}
+fn frontend_language_convert(space: *WindowsLanguageCommand, text: []const u8) isize {
+  if #len(text) > 32767 {
+    return -1
+  }
+  for byte in text {
+    if byte == 0 {
+      return -1
+    }
+  }
+  if #len(text) == 0 {
+    return 0
+  }
+  units := host.utf16(65001, 8, &text[0], #cast(i32, #len(text)), &space.scratch[0], 32768)
+  if units <= 0 {
+    return -1
+  }
+  return #cast(isize, units)
+}
+fn frontend_language_literal(space: *WindowsLanguageCommand, used: *usize, text: []const u8) bool {
+  units := frontend_language_convert(space, text)
+  if units < 0 {
+    return false
+  }
+  return frontend_language_units(space, used, space.scratch[..#cast(usize, units)])
+}
+// ProcessStartInfo.Arguments uses the Windows CRT command-line contract.
+// Double backslashes before quotes and the closing delimiter; quote every arg.
+fn frontend_language_argument(space: *WindowsLanguageCommand, used: *usize, text: []const u8) bool {
+  units := frontend_language_convert(space, text)
+  if units < 0 || #len(space.arguments) - used.* < 3 {
+    return false
+  }
+  if used.* != 0 {
+    space.arguments[used.*] = 32
+    used.* += 1
+  }
+  space.arguments[used.*] = 34
+  used.* += 1
+  slashes: usize = 0
+  for unit in space.scratch[..#cast(usize, units)] {
+    if unit == 92 {
+      slashes += 1
+      continue
+    }
+    count := slashes
+    if unit == 34 {
+      count = slashes * 2 + 1
+    }
+    if count + 1 >= #len(space.arguments) - used.* {
+      return false
+    }
+    for index in 0..count {
+      space.arguments[used.*] = 92
+      used.* += 1
+    }
+    space.arguments[used.*] = unit
+    used.* += 1
+    slashes = 0
+  }
+  if slashes * 2 + 1 > #len(space.arguments) - used.* {
+    return false
+  }
+  for index in 0..slashes * 2 {
+    space.arguments[used.*] = 92
+    used.* += 1
+  }
+  space.arguments[used.*] = 34
+  used.* += 1
+  return true
+}
+fn platform_language_command(output: []u8, used: *usize, root, helper, verb, name: []const u8) bool {
+  if used.* >= #len(output) || #len(root) == 0 || #len(helper) == 0 || #len(verb) == 0 {
+    return false
+  }
+  arena := frontend_mem.arena_try_create(196608)
+  if !arena.ok {
+    return false
+  }
+  defer frontend_mem.arena_release(arena.arena)
+  allocation := frontend_mem.arena_try_push_uninit(arena.arena, #sizeof(WindowsLanguageCommand), #alignof(WindowsLanguageCommand))
+  if !allocation.ok {
+    return false
+  }
+  space := #cast(*WindowsLanguageCommand, allocation.memory)
+  directory := frontend_system_directory(space)
+  if directory == 0 {
+    return false
+  }
+  // Only this trusted, canonical OS path remains outside EncodedCommand.
+  // Refuse expansion characters instead of accepting a different launcher path.
+  for byte in space.system[..directory] {
+    if byte < 32 || byte >= 128 || byte == 34 || byte == 37 || byte == 33 {
+      return false
+    }
+  }
+  arguments: usize = 0
+  if !frontend_language_argument(space, &arguments, verb) || (#len(name) > 0 && !frontend_language_argument(space, &arguments, name)) {
+    return false
+  }
+  script: usize = 0
+  if !frontend_language_text(space, &script, "$ErrorActionPreference='Stop'; $start=[System.Diagnostics.ProcessStartInfo]::new(); $start.UseShellExecute=$false; $start.CreateNoWindow=[Console]::IsOutputRedirected; $start.FileName=") || !frontend_language_literal(space, &script, helper) || !frontend_language_text(space, &script, "; $start.Arguments=") || !frontend_language_units(space, &script, space.arguments[..arguments]) || !frontend_language_text(space, &script, "; $start.EnvironmentVariables['DNA_LANGUAGE_DIR']=") || !frontend_language_literal(space, &script, root) {
+    return false
+  }
+  // No redirects and no PowerShell native-command pipeline: the helper inherits
+  // the original byte handles, preserving interactive LSP framing and stderr.
+  if !frontend_language_text(space, &script, "; $process=[System.Diagnostics.Process]::new(); $process.StartInfo=$start; if(-not $process.Start()){exit 1}; $process.WaitForExit(); $code=$process.ExitCode; $process.Dispose(); exit $code") {
+    return false
+  }
+  suffix := "/WindowsPowerShell/v1.0/powershell.exe\" -NoLogo -NoProfile -NonInteractive -EncodedCommand "
+  encoded_size := ((script * 2 + 2) / 3) * 4
+  required := 1 + directory + #len(suffix) + encoded_size
+  // cmd.exe's own limit is lower than CreateProcessW's 32768-unit buffer.
+  // Leave output and its existing prefix untouched unless the whole command fits.
+  if required > 8190 || used.* > 8190 - required || required >= #len(output) - used.* || used.* + required >= 32768 {
+    return false
+  }
+  bytes := (#cast(*const u8, &space.script[0]))[..script * 2]
+  // Windows x64 and arm64 both store UTF-16 units little-endian.
+  encoded := frontend_base64.encode(arena.arena, bytes)
+  at := used.*
+  output[at] = 34
+  at += 1
+  for byte in space.system[..directory] {
+    output[at] = byte
+    at += 1
+  }
+  for byte in suffix {
+    output[at] = byte
+    at += 1
+  }
+  for byte in encoded {
+    output[at] = byte
+    at += 1
+  }
+  output[at] = 0
+  used.* = at
+  return true
 }

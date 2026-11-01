@@ -15,24 +15,93 @@ struct WinPtyAPI {
   close: fn(rawptr),
   event: fn(rawptr, i32, i32, rawptr) rawptr,
   signal: fn(rawptr) i32,
+  module: fn(u32, rawptr, *rawptr) i32,
+  module_path: fn(rawptr, *u16, u32) u32,
+  load: fn(*const u16, rawptr, u32) rawptr,
+  attributes: fn(*const u16) u32,
+  library: rawptr,
+  ready: bool,
 }
 win_pty_api: WinPtyAPI
 win_pty_once: win_proc_sync.Once
-fn win_pty_prepare() {
+fn win_pty_symbol(library: rawptr, name: []const u8) rawptr {
+  result := win_proc_loader.symbol(library, name)
+  if result.ok {
+    return result.value
+  }
+  return nil
+}
+fn win_pty_bundle_file(path: []u16, directory: usize, name: []const u8) bool {
+  if directory + #len(name) >= #len(path) {
+    return false
+  }
+  for index in 0..#len(name) {
+    path[directory + index] = #cast(u16, name[index])
+  }
+  path[directory + #len(name)] = 0
+  attributes := win_pty_api.attributes(&path[0])
+  return attributes != 4294967295 && (attributes & 1040) == 0
+}
+fn win_pty_configure() bool {
+  kernel := win_proc_loader.open("kernel32.dll", 0)
+  if !kernel.ok {
+    return false
+  }
+  win_pty_api.module = #cast(fn(u32, rawptr, *rawptr) i32, win_pty_symbol(kernel.value, "GetModuleHandleExW"))
+  win_pty_api.module_path = #cast(fn(rawptr, *u16, u32) u32, win_pty_symbol(kernel.value, "GetModuleFileNameW"))
+  win_pty_api.load = #cast(fn(*const u16, rawptr, u32) rawptr, win_pty_symbol(kernel.value, "LoadLibraryExW"))
+  win_pty_api.attributes = #cast(fn(*const u16) u32, win_pty_symbol(kernel.value, "GetFileAttributesW"))
+  win_pty_api.event = #cast(fn(rawptr, i32, i32, rawptr) rawptr, win_pty_symbol(kernel.value, "CreateEventW"))
+  win_pty_api.signal = #cast(fn(rawptr) i32, win_pty_symbol(kernel.value, "SetEvent"))
+  if win_pty_api.module == nil || win_pty_api.module_path == nil || win_pty_api.load == nil || win_pty_api.attributes == nil || win_pty_api.event == nil || win_pty_api.signal == nil {
+    return false
+  }
+  module: rawptr = nil
+  // FROM_ADDRESS | UNCHANGED_REFCOUNT. Resolve from this adapter's containing
+  // DLL/executable, never the working directory or the ambient PATH.
+  if win_pty_api.module(6, #cast(rawptr, terminal_start), &module) == 0 {
+    return false
+  }
+  path: [32768]u16 = []
+  length := win_pty_api.module_path(module, &path[0], 32768)
+  if length == 0 || length >= 32768 {
+    return false
+  }
+  directory := #cast(usize, length)
+  for directory > 0 && path[directory - 1] != 92 && path[directory - 1] != 47 {
+    directory -= 1
+  }
+  if directory == 0 {
+    return false
+  }
+  // The official DLL otherwise falls back to the inbox host when its bundled
+  // console host is missing. Require both verified deployment members.
+  if !win_pty_bundle_file(path[..], directory, "OpenConsole.exe") || !win_pty_bundle_file(path[..], directory, "conpty.dll") {
+    return false
+  }
+  // DLL_LOAD_DIR | DEFAULT_DIRS excludes current-directory and PATH lookup.
+  library := win_pty_api.load(&path[0], nil, 4352)
+  if library == nil {
+    return false
+  }
+  // All pseudoconsole operations come from this same pinned implementation.
+  win_pty_api.create = #cast(fn(u32, rawptr, rawptr, u32, *rawptr) i32, win_pty_symbol(library, "ConptyCreatePseudoConsole"))
+  win_pty_api.resize = #cast(fn(rawptr, u32) i32, win_pty_symbol(library, "ConptyResizePseudoConsole"))
+  win_pty_api.close = #cast(fn(rawptr), win_pty_symbol(library, "ConptyClosePseudoConsole"))
+  if win_pty_api.create == nil || win_pty_api.resize == nil || win_pty_api.close == nil {
+    _ = win_proc_loader.close(&library)
+    return false
+  }
+  win_pty_api.library = library
+  return true
+}
+fn win_pty_prepare() bool {
   win_proc_prepare()
   if win_proc_sync.once_begin(&win_pty_once) {
-    kernel := win_proc_loader.open("kernel32.dll", 0)
-    if !kernel.ok {
-      #panic("missing ConPTY library")
-    }
-    // COORD is a four-byte value (two signed 16-bit fields) on both targets.
-    win_pty_api.create = #cast(fn(u32, rawptr, rawptr, u32, *rawptr) i32, win_io_symbol(kernel.value, "CreatePseudoConsole"))
-    win_pty_api.resize = #cast(fn(rawptr, u32) i32, win_io_symbol(kernel.value, "ResizePseudoConsole"))
-    win_pty_api.close = #cast(fn(rawptr), win_io_symbol(kernel.value, "ClosePseudoConsole"))
-    win_pty_api.event = #cast(fn(rawptr, i32, i32, rawptr) rawptr, win_io_symbol(kernel.value, "CreateEventW"))
-    win_pty_api.signal = #cast(fn(rawptr) i32, win_io_symbol(kernel.value, "SetEvent"))
+    win_pty_api.ready = win_pty_configure()
     win_proc_sync.once_complete(&win_pty_once)
   }
+  return win_pty_api.ready
 }
 fn win_pty_worker(context: rawptr) i32 {
   owner := #cast(*WinPtyOwner, context)
@@ -245,7 +314,9 @@ fn win_pty_command(space: *WinProcSpace, shell, command: *const u8) bool {
   return true
 }
 fn terminal_start(t: *Terminal, cwd, shell, command: *const u8) bool {
-  win_pty_prepare()
+  if !win_pty_prepare() {
+    return false
+  }
   if cwd == nil || !win_proc_absolute(cwd) {
     return false
   }

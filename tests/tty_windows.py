@@ -16,6 +16,7 @@ SOURCE = r'''#link("ucrt")
 use "std/sync" sync
 use "std/thread"
 use "std/mem"
+use "std/io"
 extern fn string_length "strlen"(text:*const u8) usize
 extern fn rec_alloc "calloc"(count:usize,size:usize) rawptr
 extern fn rec_free "free"(value:rawptr)
@@ -46,6 +47,38 @@ fn expect_bytes(actual:[]const u8,expected:[]const u8) {
   if #len(actual)!=#len(expected) { #panic("console input length") }
   for at in 0..#len(actual) { if actual[at]!=expected[at] { #panic("console input bytes") } }
 }
+fixture_input:rawptr
+fixture_peek:fn(rawptr,*WinTtyRecord,u32,*u32)i32
+fn fixture_read_exact(expected:[]const u8, chunk_limit:i32) {
+  bytes:[64]u8=[]
+  records:[16]WinTtyRecord=[]
+  record_count:u32=0
+  _=fixture_peek(fixture_input,&records[0],16,&record_count)
+  used:usize=0
+  started:=win_tty_api.ticks()
+  last:i32=0
+  for used<#len(expected) {
+    elapsed:=win_tty_api.ticks()-started
+    if elapsed>=100 { break }
+    remaining:=100-elapsed
+    want:=#len(expected)-used
+    if want>#cast(usize,chunk_limit) { want=#cast(usize,chunk_limit) }
+    last=tty_read_host(&bytes[used],#cast(i32,want),#cast(i32,remaining))
+    if last>0 { used+=#cast(usize,last)
+    } else if last!=-2 && last!=0 { break }
+  }
+  valid:=used==#len(expected)
+  for at in 0..used { if bytes[at]!=expected[at] { valid=false } }
+  if !valid {
+    _=io.println(io.stderr(),"console exact read: expected {} bytes, received {}, last {}, pending length {}, offset {}, repeat {}",#len(expected),used,last,win_tty_length,win_tty_offset,win_tty_repeat)
+    for at in 0..used { _=io.println(io.stderr(),"console byte {} = {}",at,bytes[at]) }
+    for at in 0..#cast(usize,record_count) {
+      key:=#cast(*WinTtyKey,&records[at].data[0])
+      _=io.println(io.stderr(),"queued record kind {}: down {}, repeat {}, key {}, scan {}, character {}, control {}",records[at].kind,key.down,key.repeat,key.key,key.scan,key.character,key.control)
+    }
+    #panic("console exact input bytes")
+  }
+}
 fn main() {
   win_tty_prepare()
   // A child mode validates real argument parsing, quoting and per-child env.
@@ -73,6 +106,7 @@ fn main() {
   release:=#cast(fn()i32,win_io_symbol(kernel.value,"FreeConsole"))
   standard:=#cast(fn(u32,rawptr)i32,win_io_symbol(kernel.value,"SetStdHandle"))
   write_input:=#cast(fn(rawptr,*const WinTtyRecord,u32,*u32)i32,win_io_symbol(kernel.value,"WriteConsoleInputW"))
+  fixture_peek=#cast(fn(rawptr,*WinTtyRecord,u32,*u32)i32,win_io_symbol(kernel.value,"PeekConsoleInputW"))
   flush_input:=#cast(fn(rawptr)i32,win_io_symbol(kernel.value,"FlushConsoleInputBuffer"))
   handles:=#cast(fn(rawptr,*u32)i32,win_io_symbol(kernel.value,"GetProcessHandleCount"))
   sleep:=#cast(fn(u32),win_io_symbol(kernel.value,"Sleep"))
@@ -92,6 +126,7 @@ fn main() {
   if !win_io_path(&output_name[0],wide[..]) { #panic("console output path") }
   output:=win_io_api.create(&wide[0],3221225472,3,nil,3,0,nil)
   if #cast(isize,input)==-1 || #cast(isize,output)==-1 || standard(4294967286,input)==0 || standard(4294967285,output)==0 { #panic("isolated standard handles") }
+  fixture_input=input
   before_input:u32=0
   before_output:u32=0
   if win_tty_api.mode(input,&before_input)==0 || win_tty_api.mode(output,&before_output)==0 { #panic("saved console modes") }
@@ -111,8 +146,13 @@ fn main() {
   if write_input(input,&record,1,&written)==0 || tty_read_host(&bytes[0],64,100)!=2 { #panic("Unicode input") }
   expect_bytes(bytes[..2],"é")
   key.*=WinTtyKey{down:1,repeat:2,key:38,control:8}
-  if write_input(input,&record,1,&written)==0 || tty_read_host(&bytes[0],64,100)!=12 { #panic("repeated modified arrow") }
-  expect_bytes(bytes[..12],"\x1b[1;5A\x1b[1;5A")
+  if write_input(input,&record,1,&written)==0 || written!=1 { #panic("repeated modified arrow injection") }
+  fixture_read_exact("\x1b[1;5A\x1b[1;5A",64)
+  // A terminal byte stream may split a repeated key across reads. Retain every
+  // byte and repetition when the caller can accept only one byte at a time.
+  key.repeat=3
+  if write_input(input,&record,1,&written)==0 || written!=1 { #panic("partial repeat injection") }
+  fixture_read_exact("\x1b[1;5A\x1b[1;5A\x1b[1;5A",1)
   key.*=WinTtyKey{down:1,repeat:1,character:55357}
   _=write_input(input,&record,1,&written)
   key.character=56898

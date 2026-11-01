@@ -122,7 +122,7 @@ def main():
         dependencies()
         subprocess.run([sys.executable, ROOT/'scripts/compile.py', real_dyn(), 'build', stage,
                         '--'+mode, '--output', output], env=windows_environment(real_dyn()), check=True)
-        snapshot_runtime((deps/'install/lib/dna_native.dll',), output.parent)
+        snapshot_runtime((deps/'install/lib/dna_native.dll',), output.parent, tools=True)
     elif sys.platform == 'darwin':
         from dyn_path import real_dyn
         from native_macos import linker_environment

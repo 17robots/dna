@@ -5,8 +5,6 @@ use "std/io"
 use "std/c"
 
 #link("dna_native")
-extern fn system "system"(command: *const u8) i32
-extern fn temporary "mkdtemp"(path: *u8) *u8
 extern fn registry_path "dna_language_registry"(output: *u8, capacity: usize) i32
 extern fn syntax_open "dna_syntax_open"(root: *const u8, filename: *const u8) rawptr
 extern fn syntax_close "dna_syntax_close"(syntax: rawptr)
@@ -214,12 +212,9 @@ fn run(command: []const u8) {
   }
 }
 fn cleanup(path: []const u8) {
-  command: [8192]u8 = []
-  used: usize = 0
-  add(command[..], &used, "rm -rf -- ")
-  quote(command[..], &used, path)
-  _ = system(&command[0])
+  _ = installer_remove_tree(path)
 }
+
 fn append_path(output: []u8, parent: []const u8, leaf: []const u8) []u8 {
   used: usize = 0
   add(output, &used, parent)
@@ -506,7 +501,7 @@ fn main() {
   if root_length == 0 {
     #panic("language data directory is empty")
   }
-  if root_storage[0] != '/' {
+  if !installer_absolute(root_storage[..root_length]) {
     relative_root: [4096]u8 = []
     relative_length: usize = 0
     add(relative_root[..], &relative_length, root_storage[..root_length])
@@ -541,13 +536,7 @@ fn main() {
     index: usize = 0
     for index < registry.count {
       item := &registry.entries[index]
-      package_storage: [4096]u8 = []
-      file_storage: [4096]u8 = []
-      package := append_path(package_storage[..], root_storage[..root_length], item.name)
-      parser := std_fs.metadata(append_path(file_storage[..], package, "parser.so"))
-      query := std_fs.metadata(append_path(file_storage[..], package, "highlights.scm"))
-      metadata := std_fs.metadata(append_path(file_storage[..], package, "extensions"))
-      installed[index] = parser.ok && query.ok && metadata.ok && (parser.mode & 61440) == 32768 && (query.mode & 61440) == 32768 && (metadata.mode & 61440) == 32768 && parser.size > 0 && query.size > 0 && metadata.size > 0
+      installed[index] = grammar_installed(root_storage[..root_length], item.name)
       index += 1
     }
     _ = io.println(io.stdout(), "Installed languages:")

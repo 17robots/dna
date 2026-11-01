@@ -69,8 +69,8 @@ def native_tests(binary, work):
         if capacity > 0 and not result:
             assert guarded.raw[16] == 0, 'failed path must return empty string'
     assert lib.test_path(None, 0) == 0 and lib.test_path(None, 32) == 0
-    assert lib.test_helper(buffer, len(buffer)) == len(b'bin/dna-language.exe')
-    assert buffer.value == b'bin/dna-language.exe'
+    assert lib.test_helper(buffer, len(buffer)) == len(b'dna-language.exe')
+    assert buffer.value == b'dna-language.exe'
     readable = work / 'readable café 日本語.txt'
     readable.write_bytes(b'language payload')
     empty = work / 'empty.txt'

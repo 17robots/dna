@@ -3,14 +3,16 @@ use "std/dynlib" installer_loader
 use "std/sync" installer_sync
 struct InstallerPathResult { value:[]u8, error:isize, ok:bool }
 struct InstallerRemoval { directory:rawptr, parent:i32, name:*const u8 }
-struct InstallerDarwinEntry { inode,seek:u64, record_length,name_length:u16, kind:u8, name:[1024]u8 }
+struct InstallerDarwinEntry { inode, seek:u64, record_length, name_length:u16, kind:u8, name:[1024]u8 }
 installer_errno_once:installer_sync.Once
 installer_errno_get:fn() *i32
 fn installer_mac_prepare() {
   if installer_sync.once_begin(&installer_errno_once) {
-    result:=installer_loader.symbol(#cast(rawptr,#cast(isize,-2)),"__error")
-    if !result.ok { #panic("missing libSystem errno accessor") }
-    installer_errno_get=#cast(fn() *i32,result.value)
+    result:=installer_loader.symbol(#cast(rawptr, #cast(isize, -2)), "__error")
+    if !result.ok {
+      #panic("missing libSystem errno accessor")
+    }
+    installer_errno_get=#cast(fn() *i32, result.value)
     installer_sync.once_complete(&installer_errno_once)
   }
 }
@@ -21,28 +23,38 @@ extern fn installer_unlinkat "unlinkat"(fd:i32, name:*const u8, flags:i32) i32
 extern fn installer_dirfd "dirfd"(directory:rawptr) i32
 extern fn installer_closedir "closedir"(directory:rawptr) i32
 fn installer_close_fd(fd:i32) {
-  file:=std_fs.adopt_handle(#cast(isize,fd))
+  file:=std_fs.adopt_handle(#cast(isize, fd))
   _=std_fs.close(&file)
 }
-fn installer_symbolic_link(target,path:[]const u8) std_fs.Result {
+fn installer_symbolic_link(target, path:[]const u8) std_fs.Result {
   installer_mac_prepare()
   arena:=mem.arena_create(16384)
   defer mem.arena_release(arena)
-  old:=c.string_from_bytes(arena,target)
-  name:=c.string_from_bytes(arena,path)
-  if !old.ok || !name.ok { return std_fs.Result{error:-22} }
-  if installer_symlink(old.value,name.value)!=0 { return std_fs.Result{error:0-#cast(isize,installer_errno_get().*)} }
+  old:=c.string_from_bytes(arena, target)
+  name:=c.string_from_bytes(arena, path)
+  if !old.ok || !name.ok {
+    return std_fs.Result{error:-22}
+  }
+  if installer_symlink(old.value, name.value)!=0 {
+    return std_fs.Result{error:0-#cast(isize, installer_errno_get().*)}
+  }
   return std_fs.Result{ok:true}
 }
-fn installer_read_link(arena:*mem.Arena,path:[]const u8) InstallerPathResult {
+fn installer_read_link(arena:*mem.Arena, path:[]const u8) InstallerPathResult {
   installer_mac_prepare()
-  name:=c.string_from_bytes(arena,path)
-  if !name.ok { return InstallerPathResult{error:-22} }
-  output:=mem.push_array(u8,arena,4096)
-  count:=installer_readlink(name.value,&output[0],#len(output))
-  if count<0 { return InstallerPathResult{error:0-#cast(isize,installer_errno_get().*)} }
-  if count>=4096 { return InstallerPathResult{error:-28} }
-  return InstallerPathResult{value:output[..#cast(usize,count)],ok:true}
+  name:=c.string_from_bytes(arena, path)
+  if !name.ok {
+    return InstallerPathResult{error:-22}
+  }
+  output:=mem.push_array(u8, arena, 4096)
+  count:=installer_readlink(name.value, &output[0], #len(output))
+  if count<0 {
+    return InstallerPathResult{error:0-#cast(isize, installer_errno_get().*)}
+  }
+  if count>=4096 {
+    return InstallerPathResult{error:-28}
+  }
+  return InstallerPathResult{value:output[..#cast(usize, count)], ok:true}
 }
 // Every descent is relative to an owned directory and refuses symlinks.
 // Parent directory buffers keep each child's name alive until it is removed.
@@ -50,32 +62,44 @@ fn installer_remove_tree(path:[]const u8) std_fs.Result {
   installer_mac_prepare()
   arena:=mem.arena_create(32768)
   defer mem.arena_release(arena)
-  frames:=mem.push_array(InstallerRemoval,arena,128)
-  root:=c.string_from_bytes(arena,path)
-  if !root.ok { return std_fs.Result{error:-22} }
+  frames:=mem.push_array(InstallerRemoval, arena, 128)
+  root:=c.string_from_bytes(arena, path)
+  if !root.ok {
+    return std_fs.Result{error:-22}
+  }
   parent:i32=-2
   name:=root.value
   depth:usize=0
   defer {
     for index in 0..depth {
-      if frames[index].directory!=nil { _=installer_closedir(frames[index].directory) }
+      if frames[index].directory!=nil {
+        _=installer_closedir(frames[index].directory)
+      }
     }
   }
   for true {
     // O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC, with Darwin's variadic ABI.
-    descriptor:=installer_openat(parent,name,17826048,0)
+    descriptor:=installer_openat(parent, name, 17826048, 0)
     if descriptor<0 {
       error:=installer_errno_get().*
-      if error!=20 && error!=62 { return std_fs.Result{error:0-#cast(isize,error)} }
-      if installer_unlinkat(parent,name,0)!=0 { return std_fs.Result{error:0-#cast(isize,installer_errno_get().*)} }
+      if error!=20 && error!=62 {
+        return std_fs.Result{error:0-#cast(isize, error)}
+      }
+      if installer_unlinkat(parent, name, 0)!=0 {
+        return std_fs.Result{error:0-#cast(isize, installer_errno_get().*)}
+      }
     } else {
-      if depth==128 { installer_close_fd(descriptor)
-        return std_fs.Result{error:-28} }
-      directory:=installer_fdopendir(descriptor)
-      if directory==nil { error:=installer_errno_get().*
+      if depth==128 {
         installer_close_fd(descriptor)
-        return std_fs.Result{error:0-#cast(isize,error)} }
-      frames[depth]=InstallerRemoval{directory:directory,parent:parent,name:name}
+        return std_fs.Result{error:-28}
+      }
+      directory:=installer_fdopendir(descriptor)
+      if directory==nil {
+        error:=installer_errno_get().*
+        installer_close_fd(descriptor)
+        return std_fs.Result{error:0-#cast(isize, error)}
+      }
+      frames[depth]=InstallerRemoval{directory:directory, parent:parent, name:name}
       depth+=1
     }
     descend:=false
@@ -85,20 +109,28 @@ fn installer_remove_tree(path:[]const u8) std_fs.Result {
       entry:=installer_readdir(frame.directory)
       if entry==nil {
         error:=installer_errno_get().*
-        if error!=0 { return std_fs.Result{error:0-#cast(isize,error)} }
+        if error!=0 {
+          return std_fs.Result{error:0-#cast(isize, error)}
+        }
         _=installer_closedir(frame.directory)
         frame.directory=nil
         depth-=1
-        if installer_unlinkat(frame.parent,frame.name,128)!=0 { return std_fs.Result{error:0-#cast(isize,installer_errno_get().*)} }
+        if installer_unlinkat(frame.parent, frame.name, 128)!=0 {
+          return std_fs.Result{error:0-#cast(isize, installer_errno_get().*)}
+        }
         continue
       }
-      if (entry.name[0]==46 && entry.name[1]==0) || (entry.name[0]==46 && entry.name[1]==46 && entry.name[2]==0) { continue }
+      if (entry.name[0]==46 && entry.name[1]==0) || (entry.name[0]==46 && entry.name[1]==46 && entry.name[2]==0) {
+        continue
+      }
       parent=installer_dirfd(frame.directory)
       name=&entry.name[0]
       descend=true
       break
     }
-    if !descend { return std_fs.Result{ok:true} }
+    if !descend {
+      return std_fs.Result{ok:true}
+    }
   }
   return std_fs.Result{ok:true}
 }

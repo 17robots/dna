@@ -1,0 +1,462 @@
+#target(kernel: windows)
+
+// Language pointers are signed regular files. Publishing them uses the
+// installer's existing single file rename; immutable versions remain private.
+const LanguageWinMagic: []const u8 = "DNA language version 1\n"
+fn language_win_failure(error: i32) isize {
+  if error <= 0 {
+    error = 5
+  }
+  rec_errno().* = error
+  return 0 - #cast(isize, error)
+}
+fn language_win_output(output: *u8, capacity: usize, text: []const u8) isize {
+  if output == nil || #len(text) >= capacity {
+    return language_win_failure(36)
+  }
+  if #len(text) > 0 {
+    _ = copy(output, &text[0], #len(text))
+  }
+  output[..capacity][#len(text)] = 0
+  return #cast(isize, #len(text))
+}
+// Walk from the absolute drive/share root using retained directory handles.
+// No ancestor or leaf reparse point can redirect a later relative operation.
+fn language_win_parent(path: *const u8, leaf: []u8) i32 {
+  install_win_prepare()
+  if path == nil {
+    _ = language_win_failure(22)
+    return -1
+  }
+  length := string_length(path)
+  if length >= 4096 {
+    _ = language_win_failure(36)
+    return -1
+  }
+  root := rec_path_root(path, length)
+  if root == 0 {
+    _ = language_win_failure(22)
+    return -1
+  }
+  text := path[..length]
+  for length > root && rec_path_separator(text[length - 1]) {
+    length -= 1
+  }
+  if length <= root {
+    _ = language_win_failure(22)
+    return -1
+  }
+  root_path: [4096]u8 = []
+  _ = copy(&root_path[0], path, root)
+  current := rec_open(&root_path[0], 720896, 0)
+  if current < 0 {
+    return -1
+  }
+  at := root
+  for at < length {
+    for at < length && rec_path_separator(text[at]) {
+      at += 1
+    }
+    first := at
+    for at < length && !rec_path_separator(text[at]) {
+      at += 1
+    }
+    amount := at - first
+    if amount == 0 || amount >= #len(leaf) {
+      _ = rec_close(current)
+      _ = language_win_failure(36)
+      return -1
+    }
+    _ = copy(&leaf[0], &text[first], amount)
+    leaf[amount] = 0
+    if !install_win_name(&leaf[0]) {
+      _ = rec_close(current)
+      return -1
+    }
+    if at == length {
+      return current
+    }
+    next := install_openat(current, &leaf[0], 720896, 0)
+    saved := rec_errno().*
+    _ = rec_close(current)
+    rec_errno().* = saved
+    if next < 0 {
+      return -1
+    }
+    current = next
+  }
+  _ = rec_close(current)
+  _ = language_win_failure(22)
+  return -1
+}
+fn language_win_alphanumeric(byte: u8) bool {
+  return (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+}
+fn language_win_version(leaf: *const u8, active: *const u8) bool {
+  length := string_length(leaf)
+  if length < 9 || length > 1023 {
+    return false
+  }
+  text := leaf[..length]
+  if text[0] != 46 || text[length - 7] != 45 {
+    return false
+  }
+  for at in length - 6..length {
+    if !language_win_alphanumeric(text[at]) {
+      return false
+    }
+  }
+  stem: [1024]u8 = []
+  _ = copy(&stem[0], &text[1], length - 8)
+  if !install_win_name(&stem[0]) {
+    return false
+  }
+  if active != nil {
+    amount := string_length(active)
+    if amount != length - 8 {
+      return false
+    }
+    for at in 0..amount {
+      left := stem[at]
+      right := active[..amount][at]
+      if left >= 97 && left <= 122 {
+        left -= 32
+      }
+      if right >= 97 && right <= 122 {
+        right -= 32
+      }
+      if left != right {
+        return false
+      }
+    }
+  }
+  return true
+}
+fn language_win_write(fd: i32, bytes: []const u8) bool {
+  at: usize = 0
+  for at < #len(bytes) {
+    written := rec_write(fd, &bytes[at], #len(bytes) - at)
+    if written < 0 && rec_errno().* == 4 {
+      continue
+    }
+    if written <= 0 {
+      return false
+    }
+    at += #cast(usize, written)
+  }
+  return true
+}
+fn language_win_disposition(fd: i32) bool {
+  remove: u8 = 1
+  status := InstallWinStatus{}
+  result := install_win_api.rename(win_io_handle(fd), &status, #cast(rawptr, &remove), 1, 13)
+  if result < 0 {
+    _ = win_io_fail(install_win_api.status_error(result))
+    return false
+  }
+  return true
+}
+pub fn dna_language_pointer(target, path: *const u8) i32 {
+  install_win_prepare()
+  if target == nil || path == nil || !rec_absolute(target) || !rec_absolute(path) {
+    return 0
+  }
+  length := string_length(target)
+  if length == 0 || length > 4095 {
+    return 0
+  }
+  for byte in target[..length] {
+    if byte == 10 || byte == 13 {
+      return 0
+    }
+  }
+  version: [1024]u8 = []
+  parent := language_win_parent(target, version[..])
+  if parent < 0 {
+    return 0
+  }
+  if !language_win_version(&version[0], nil) {
+    _ = rec_close(parent)
+    return 0
+  }
+  version_fd := install_openat(parent, &version[0], 720896, 0)
+  _ = rec_close(parent)
+  if version_fd < 0 {
+    return 0
+  }
+  _ = rec_close(version_fd)
+  leaf: [1024]u8 = []
+  parent = language_win_parent(path, leaf[..])
+  if parent < 0 {
+    return 0
+  }
+  defer _ = rec_close(parent)
+  fd := install_win_create_private(parent, &leaf[0], false, false)
+  if fd < 0 {
+    return 0
+  }
+  success := language_win_write(fd, LanguageWinMagic) && language_win_write(fd, target[..length])
+  newline: [1]u8 = [10]
+  success = success && language_win_write(fd, newline[..]) && rec_sync(fd) == 0
+  if !success {
+    _ = language_win_disposition(fd)
+  }
+  closed := rec_close(fd)
+  if success && closed == 0 {
+    return 1
+  }
+  return 0
+}
+fn language_win_read_at(parent: i32, leaf: *const u8, output: *u8, capacity: usize) isize {
+  fd := install_openat(parent, leaf, 655360, 0)
+  if fd < 0 {
+    return language_win_failure(rec_errno().*)
+  }
+  defer _ = rec_close(fd)
+  info := InstallStat{}
+  if install_fstat(fd, &info) != 0 {
+    return language_win_failure(rec_errno().*)
+  }
+  if (info.mode & 61440) != 32768 || info.size <= #cast(i64, #len(LanguageWinMagic)) || info.size > #cast(i64, #len(LanguageWinMagic) + 4096) {
+    return language_win_failure(22)
+  }
+  bytes: [4192]u8 = []
+  used: usize = 0
+  for used < #len(bytes) {
+    amount := proc_read_raw(fd, &bytes[used], #len(bytes) - used)
+    if amount < 0 && rec_errno().* == 4 {
+      continue
+    }
+    if amount < 0 {
+      return language_win_failure(rec_errno().*)
+    }
+    if amount == 0 {
+      break
+    }
+    used += #cast(usize, amount)
+  }
+  if used == #len(bytes) || used != #cast(usize, info.size) || bytes[used - 1] != 10 {
+    return language_win_failure(22)
+  }
+  for at in 0..#len(LanguageWinMagic) {
+    if bytes[at] != LanguageWinMagic[at] {
+      return language_win_failure(22)
+    }
+  }
+  length := used - #len(LanguageWinMagic) - 1
+  if length == 0 || length > 4095 {
+    return language_win_failure(22)
+  }
+  target: [4096]u8 = []
+  for at in 0..length {
+    byte := bytes[#len(LanguageWinMagic) + at]
+    if byte == 0 || byte == 10 || byte == 13 {
+      return language_win_failure(22)
+    }
+    target[at] = byte
+  }
+  if !rec_absolute(&target[0]) {
+    return language_win_failure(22)
+  }
+  version: [1024]u8 = []
+  target_parent := language_win_parent(&target[0], version[..])
+  if target_parent < 0 {
+    return language_win_failure(rec_errno().*)
+  }
+  defer _ = rec_close(target_parent)
+  here := InstallStat{}
+  there := InstallStat{}
+  if install_fstat(parent, &here) != 0 || install_fstat(target_parent, &there) != 0 {
+    return language_win_failure(rec_errno().*)
+  }
+  if here.inode == 0 || here.device != there.device || here.inode != there.inode || !language_win_version(&version[0], leaf) {
+    return language_win_failure(22)
+  }
+  version_fd := install_openat(parent, &version[0], 720896, 0)
+  if version_fd < 0 {
+    return language_win_failure(rec_errno().*)
+  }
+  _ = rec_close(version_fd)
+  return language_win_output(output, capacity, target[..length])
+}
+pub fn dna_language_read_link(path: *const u8, output: *u8, capacity: usize) isize {
+  install_win_prepare()
+  leaf: [1024]u8 = []
+  parent := language_win_parent(path, leaf[..])
+  if parent < 0 {
+    return language_win_failure(rec_errno().*)
+  }
+  defer _ = rec_close(parent)
+  return language_win_read_at(parent, &leaf[0], output, capacity)
+}
+pub fn dna_language_resolve_directory(path: *const u8, output: *u8, capacity: usize) isize {
+  install_win_prepare()
+  if path == nil || !rec_absolute(path) {
+    return language_win_failure(22)
+  }
+  length := string_length(path)
+  if length >= 4096 {
+    return language_win_failure(36)
+  }
+  root := rec_path_root(path, length)
+  trimmed := length
+  for trimmed > root && rec_path_separator(path[..length][trimmed - 1]) {
+    trimmed -= 1
+  }
+  if trimmed <= root {
+    fd := rec_open(path, 720896, 0)
+    if fd < 0 {
+      return language_win_failure(rec_errno().*)
+    }
+    _ = rec_close(fd)
+    return language_win_output(output, capacity, path[..length])
+  }
+  leaf: [1024]u8 = []
+  parent := language_win_parent(path, leaf[..])
+  if parent < 0 {
+    return language_win_failure(rec_errno().*)
+  }
+  defer _ = rec_close(parent)
+  info := InstallStat{}
+  if install_fstatat(parent, &leaf[0], &info, 256) != 0 {
+    return language_win_failure(rec_errno().*)
+  }
+  if (info.mode & 61440) == 16384 {
+    fd := install_openat(parent, &leaf[0], 720896, 0)
+    if fd < 0 {
+      return language_win_failure(rec_errno().*)
+    }
+    _ = rec_close(fd)
+    return language_win_output(output, capacity, path[..length])
+  }
+  if (info.mode & 61440) != 32768 {
+    return language_win_failure(95)
+  }
+  return language_win_read_at(parent, &leaf[0], output, capacity)
+}
+fn syntax_language_directory(path: *const u8, output: *u8, capacity: usize) isize {
+  return dna_language_resolve_directory(path, output, capacity)
+}
+fn language_win_random(output: *u8) bool {
+  alphabet: []const u8 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+  used: usize = 0
+  for used < 6 {
+    bytes: [16]u8 = []
+    if win_io_api.random(&bytes[0], 16) == 0 {
+      return false
+    }
+    for byte in bytes {
+      if byte < 248 && used < 6 {
+        output[..6][used] = alphabet[#cast(usize, byte % 62)]
+        used += 1
+      }
+    }
+  }
+  return true
+}
+pub fn dna_install_temporary(path: *u8) *u8 {
+  install_win_prepare()
+  if path == nil || !rec_absolute(path) {
+    return nil
+  }
+  length := string_length(path)
+  if length < 6 {
+    return nil
+  }
+  for at in length - 6..length {
+    if path[..length][at] != 88 {
+      return nil
+    }
+  }
+  leaf: [1024]u8 = []
+  parent := language_win_parent(path, leaf[..])
+  if parent < 0 {
+    return nil
+  }
+  defer _ = rec_close(parent)
+  amount := string_length(&leaf[0])
+  if amount < 6 {
+    return nil
+  }
+  for attempt in 0..128 {
+    random: [6]u8 = []
+    if !language_win_random(&random[0]) {
+      return nil
+    }
+    _ = copy(&path[..length][length - 6], &random[0], 6)
+    _ = copy(&leaf[amount - 6], &random[0], 6)
+    fd := install_win_create_private(parent, &leaf[0], true, false)
+    if fd >= 0 {
+      _ = rec_close(fd)
+      return path
+    }
+    if rec_errno().* != 17 {
+      return nil
+    }
+  }
+  return nil
+}
+// Each frame owns one retained object. A directory's stream consumes that
+// descriptor and closes it on every exit; a reparse object is deleted itself.
+fn language_win_remove_at(parent: i32, leaf: *const u8, depth: usize) bool {
+  handle := install_win_relative(parent, leaf, 2147549312, 0, false)
+  if handle == nil {
+    return false
+  }
+  fd := win_io_adopt(handle, 0)
+  if fd < 0 {
+    return false
+  }
+  info := WinIOInformation{}
+  if win_io_api.info(handle, &info) == 0 {
+    _ = rec_close(fd)
+    return false
+  }
+  if (info.attributes & 16) == 0 || (info.attributes & 1024) != 0 {
+    ok := language_win_disposition(fd)
+    if rec_close(fd) != 0 {
+      return false
+    }
+    return ok
+  }
+  if depth >= 128 {
+    _ = rec_close(fd)
+    return false
+  }
+  directory := install_fdopendir(fd)
+  if directory == nil {
+    _ = rec_close(fd)
+    return false
+  }
+  defer _ = install_closedir(directory)
+  for {
+    entry := install_readdir(directory)
+    if entry == nil {
+      if rec_errno().* != 0 {
+        return false
+      }
+      break
+    }
+    name := &entry.name[0]
+    if install_equal(name, ".") || install_equal(name, "..") {
+      continue
+    }
+    if !language_win_remove_at(search_dirfd(directory), name, depth + 1) {
+      return false
+    }
+  }
+  return language_win_disposition(search_dirfd(directory))
+}
+pub fn dna_install_remove_tree(path: *const u8) i32 {
+  install_win_prepare()
+  leaf: [1024]u8 = []
+  parent := language_win_parent(path, leaf[..])
+  if parent < 0 {
+    return 0
+  }
+  defer _ = rec_close(parent)
+  if language_win_remove_at(parent, &leaf[0], 0) {
+    return 1
+  }
+  return 0
+}

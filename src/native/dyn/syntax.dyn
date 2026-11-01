@@ -460,14 +460,15 @@ fn syntax_put(output: []u8, used: *usize, text: []const u8) bool {
   used.* += #len(text)
   return true
 }
-fn syntax_path(output: []u8, root: *const u8, name: *const u8, leaf: []const u8) bool {
+fn syntax_path(output: []u8, directory: *const u8, leaf: []const u8) bool {
   used: usize = 0
-  if !syntax_put(output, &used, root[..string_length(root)]) || !syntax_put(output, &used, "/") || !syntax_put(output, &used, name[..string_length(name)]) || !syntax_put(output, &used, "/") || !syntax_put(output, &used, leaf) {
+  if !syntax_put(output, &used, directory[..string_length(directory)]) || !syntax_put(output, &used, "/") || !syntax_put(output, &used, leaf) {
     return false
   }
   output[used] = 0
   return true
 }
+
 fn syntax_list_matches(bytes: []const u8, name: []const u8) bool {
   start: usize = 0
   for i in 0..=#len(bytes) {
@@ -505,7 +506,7 @@ fn syntax_open(root: *const u8, filename: *const u8, selected: *const u8) *Synta
   file := filename[..string_length(filename)]
   base: usize = 0
   for i in 0..#len(file) {
-    if file[i] == 47 {
+    if rec_path_separator(file[i]) {
       base = i + 1
     }
   }
@@ -536,19 +537,24 @@ fn syntax_open(root: *const u8, filename: *const u8, selected: *const u8) *Synta
     path: [4096]u8 = []
     extensions: [1024]u8 = []
     name := &entry.name[0]
+    package: [4096]u8 = []
+    version_directory: [4096]u8 = []
+    if !install_path(package[..], install_text(root), "/", install_text(name), "") || dna_language_resolve_directory(&package[0], &version_directory[0], #len(version_directory)) < 0 {
+      continue
+    }
     if selected != nil {
       if search_compare(name, selected) != 0 {
         continue
       }
     } else {
       matches := false
-      if syntax_path(path[..], root, name, "filenames") {
+      if syntax_path(path[..], &version_directory[0], "filenames") {
         length := syntax_readfile(&path[0], &extensions[0], 1024)
         if length >= 0 {
           matches = syntax_list_matches(extensions[..#cast(usize, length)], file[base..])
         }
       }
-      if !matches && extension <= #len(file) && syntax_path(path[..], root, name, "extensions") {
+      if !matches && extension <= #len(file) && syntax_path(path[..], &version_directory[0], "extensions") {
         length := syntax_readfile(&path[0], &extensions[0], 1024)
         if length >= 0 {
           matches = syntax_list_matches(extensions[..#cast(usize, length)], file[extension..])
@@ -558,7 +564,7 @@ fn syntax_open(root: *const u8, filename: *const u8, selected: *const u8) *Synta
         continue
       }
     }
-    if !syntax_path(path[..], root, name, "parser.so") {
+    if !syntax_path(path[..], &version_directory[0], "parser.so") {
       continue
     }
     library := syntax_dlopen(&path[0], 2)
@@ -589,7 +595,7 @@ fn syntax_open(root: *const u8, filename: *const u8, selected: *const u8) *Synta
     worker.parser = syntax_parser_new()
     query := #cast(*u8, dna_memory_alloc(262144, 0))
     length: i32 = -1
-    if query != nil && syntax_path(path[..], root, name, "highlights.scm") {
+    if query != nil && syntax_path(path[..], &version_directory[0], "highlights.scm") {
       length = syntax_readfile(&path[0], query, 262144)
     }
     offset: u32 = 0
@@ -598,7 +604,7 @@ fn syntax_open(root: *const u8, filename: *const u8, selected: *const u8) *Synta
       worker.query = syntax_query_new(language(), query, #cast(u32, length), &offset, &error)
     }
     object_length: i32 = -1
-    if query != nil && syntax_path(path[..], root, name, "textobjects.scm") {
+    if query != nil && syntax_path(path[..], &version_directory[0], "textobjects.scm") {
       object_length = syntax_readfile(&path[0], query, 262144)
     }
     if object_length > 0 {
@@ -625,7 +631,7 @@ fn syntax_open(root: *const u8, filename: *const u8, selected: *const u8) *Synta
     }
     indentation: [16]u8 = []
     worker.indent = 4
-    if syntax_path(path[..], root, name, "indent") && syntax_readfile(&path[0], &indentation[0], 16) > 0 {
+    if syntax_path(path[..], &version_directory[0], "indent") && syntax_readfile(&path[0], &indentation[0], 16) > 0 {
       width := syntax_atoi(&indentation[0])
       if width >= 1 && width <= 16 {
         worker.indent = #cast(u32, width)
@@ -810,7 +816,7 @@ fn syntax_installed_path(relative: []const u8, output: *u8, capacity: usize) i32
   // dladdr names the native library in shared builds and the editor itself
   // in static builds. Resolve package and development layouts from that file,
   // never from the current project directory.
-  for prefix in ["/../", "/deps/install/", "/build/deps/install/"] {
+  for prefix in ["/", "/../", "/../bin/", "/deps/install/", "/build/deps/install/"] {
     used: usize = 0
     if !syntax_put(output[..capacity], &used, path[..slash]) || !syntax_put(output[..capacity], &used, prefix) || !syntax_put(output[..capacity], &used, relative) {
       return 0

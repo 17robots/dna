@@ -38,6 +38,31 @@ pub fn test_stage(root,name,manifest,executable,leaf:*const u8)i32 {
   if plugin_win_build_version(container,manifest,executable,name,leaf,version[..]) { return 1 }
   return 0
 }
+test_last_errno:i32
+pub fn test_errno()i32 { return test_last_errno }
+pub fn test_install(manifest,executable,root,name,leaf:*const u8)i32 {
+  result:=dna_plugin_install(manifest,executable,root,name,leaf)
+  test_last_errno=rec_errno().*
+  return result
+}
+pub fn test_private_primitive(root,name:*const u8,directory,executable:i32)i32 {
+  plugin_win_prepare()
+  parent:=rec_open(root,720896,0)
+  if parent<0 { test_last_errno=rec_errno().*
+    return -1 }
+  defer _=rec_close(parent)
+  fd:=install_win_create_private(parent,name,directory!=0,executable!=0)
+  if fd<0 { test_last_errno=rec_errno().*
+    return -2 }
+  defer _=rec_close(fd)
+  test_last_errno=0
+  if directory==0 {
+    value:[]const u8="primitive data"
+    if !plugin_win_write(fd,value) { test_last_errno=rec_errno().*
+      return -3 }
+  }
+  return 1
+}
 fn main() {}
 '''
 
@@ -49,6 +74,9 @@ def configure(binary):
     library.dna_plugin_rollback.argtypes = [c.c_char_p] * 2
     library.dna_plugin_resolve.argtypes = [c.c_char_p, c.c_void_p, c.c_size_t]
     library.test_stage.argtypes = [c.c_char_p] * 5
+    library.test_install.argtypes = [c.c_char_p] * 5
+    library.test_errno.argtypes = []
+    library.test_private_primitive.argtypes = [c.c_char_p, c.c_char_p, c.c_int, c.c_int]
     return library
 
 
@@ -90,10 +118,27 @@ def native_tests(binary, work):
 
     def install(index=0, plugin=name, leaf='run.exe'):
         manifest, executable = sources[index]
-        return lib.dna_plugin_install(encoded(manifest), encoded(executable), encoded(root), encoded(plugin), encoded(leaf))
+        return lib.test_install(encoded(manifest), encoded(executable), encoded(root), encoded(plugin), encoded(leaf))
 
     assert resolve(lib, sources[0][0]) == sources[0][0], 'external manifest passthrough'
-    assert install() == 1
+    installed = install()
+    if installed != 1:
+        first_errno = lib.test_errno()
+        tree = []
+        for path in sorted(root.rglob('*')) if root.exists() else []:
+            if path.is_symlink():
+                tree.append((str(path.relative_to(root)), 'reparse'))
+            elif path.is_file():
+                tree.append((str(path.relative_to(root)), path.stat().st_size,
+                             path.read_bytes()[:64] if path.suffix != '.exe' else b'PE'))
+            else:
+                tree.append((str(path.relative_to(root)), 'directory'))
+        parent = container if container.is_dir() else root if root.is_dir() else work
+        probes = []
+        for label, directory, executable in (('directory', 1, 0), ('data', 0, 0), ('executable', 0, 1)):
+            result = lib.test_private_primitive(encoded(parent), ('private-probe-' + label).encode(), directory, executable)
+            probes.append((label, result, lib.test_errno()))
+        raise AssertionError(('first plugin install', installed, first_errno, tree, 'relative private primitives', probes))
     first = active(lib, container)
     assert first[:2] == ('1', str(sources[0][0]))
     assert (container / '.dna-managed').read_bytes() == b'DNA plugin versions 1\n'

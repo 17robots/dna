@@ -282,10 +282,16 @@ def main():
             binary = ROOT / ('build/windows-' + mode + '/dna.exe')
             native.build(SimpleNamespace(backend='native', mode=mode, release=mode == 'release',
                 source=ROOT / 'src', smoke=False, output=binary, no_cache=False))
-            run([binary, '--version'], env=isolated)
-            run([binary, '--gui'], cwd=cwd, env=isolated)
+            # Prove the complete captured runtime works after relocation, with
+            # checkout provider/helper directories removed from DLL lookup.
+            relocated = work / ('relocated native editor café 日本語-' + mode)
+            import shutil
+            shutil.copytree(binary.parent, relocated)
+            standalone = dict(isolated, PATH=str(Path(os.environ['SystemRoot'])/'System32')+os.pathsep+os.environ['SystemRoot'])
+            run([relocated/binary.name, '--version'], env=standalone)
+            run([relocated/binary.name, '--gui'], cwd=cwd, env=standalone)
             manifest = json.loads((binary.parent / 'dna-runtime.json').read_text(encoding='utf-8'))
-            assert {'dna_native.dll', 'dyn_window.dll', 'libharfbuzz-0.dll', 'libfribidi-0.dll', 'libfreetype-6.dll'} <= {entry['name'].lower() for entry in manifest}
+            assert {'dna_native.dll', 'dyn_window.dll', 'conpty.dll', 'openconsole.exe', 'dna-language.exe', 'libharfbuzz-0.dll', 'libfribidi-0.dll', 'libfreetype-6.dll'} <= {entry['name'].lower() for entry in manifest}
             print('PASS full native Win32 editor startup, GL presentation and cleanup (' + mode + ')', flush=True)
     print('PASS full Windows service/editor qualification; language installer remains explicitly unqualified.', flush=True)
 

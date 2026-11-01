@@ -41,6 +41,7 @@ def environment(compiler):
     result = sdk_environment(compiler)
     result['PATH'] = os.pathsep.join((str(DEPS / 'install/bin'), str(DEPS / 'install/lib'),
         str(prefix() / 'bin'), result.get('PATH', '')))
+    result['DNA_WINDOWS_PREFIX'] = str(prefix())
     result['CC'] = shlex.quote(tool('gcc').as_posix())
     result['PKG_CONFIG'] = str(tool('pkg-config'))
     result['DYN_LIBRARY_PATH'] = os.pathsep.join((str(DEPS / 'install/lib'), str(prefix() / 'lib')))
@@ -92,11 +93,19 @@ def dll_imports(path):
     return re.findall(r'^\s*DLL Name:\s*(\S+)\s*$', listing, re.MULTILINE)
 
 
-def snapshot_runtime(roots, destination):
+def snapshot_runtime(roots, destination, tools=False):
     """Copy the real PE import closure plus explicitly loaded text providers."""
     destination.mkdir(parents=True, exist_ok=True)
+    from conpty import install as install_conpty
+    companions = install_conpty(destination)
     providers = ('libharfbuzz-0.dll', 'libfribidi-0.dll', 'libfreetype-6.dll')
-    pending = [Path(path) for path in roots]
+    pending = [Path(path) for path in roots] + [path for path in companions if path.suffix.lower() in ('.dll', '.exe')]
+    if tools:
+        helper = DEPS / 'install/bin/dna-language.exe'
+        if not helper.is_file():
+            raise SystemExit('Missing native language helper: ' + str(helper))
+        pending.append(helper)
+        shutil.copytree(DEPS / 'install/share/dna', destination / 'share/dna', dirs_exist_ok=True)
     for name in providers:
         path = prefix() / 'bin' / name
         if not path.is_file():
@@ -106,7 +115,7 @@ def snapshot_runtime(roots, destination):
     if (prefix() / 'bin/opengl32.dll').is_file():
         pending += list((prefix() / 'bin').glob('*gallium*.dll'))
         pending += list((prefix() / 'bin').glob('*glapi*.dll'))
-    available = {path.name.lower(): path for directory in (DEPS / 'install/lib', prefix() / 'bin')
+    available = {path.name.lower(): path for directory in (destination, DEPS / 'install/lib', prefix() / 'bin')
                  for path in directory.glob('*.dll')}
     system = Path(os.environ.get('SystemRoot', 'C:/Windows')) / 'System32'
     visited = {}
@@ -173,8 +182,15 @@ def dependencies():
         data.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(ROOT / 'languages/registry.toml', data / 'languages.toml')
         shutil.copytree(ROOT / 'languages/queries', data / 'queries', dirs_exist_ok=True)
+        installer = ROOT / 'build/native-windows/installer'
+        if installer.exists():
+            shutil.rmtree(installer)
+        shutil.copytree(ROOT / 'installer', installer)
+        for module in ('filesystem', 'host', 'cstring', 'owned_arena'):
+            shutil.copytree(ROOT / 'src' / module, installer / module)
+        run([sys.executable, ROOT / 'scripts/compile.py', compiler, 'build', installer,
+            '--release', '--output', binary / 'dna-language.exe'], env=env)
         print('Built native Windows support/window DLLs and captured runtime dependencies.', flush=True)
-        print('QUALIFICATION GAP: language installer execution remains pending.', flush=True)
         return compiler
 
 
@@ -193,5 +209,5 @@ def build(args):
     binary.parent.mkdir(parents=True, exist_ok=True)
     run([sys.executable, ROOT / 'scripts/compile.py', compiler, 'build', stage, '--' + mode,
         *(['--no-cache'] if args.no_cache else []), '--output', binary], env=environment(compiler))
-    snapshot_runtime((binary, DEPS / 'install/lib/dna_native.dll', DEPS / 'install/lib/dyn_window.dll'), binary.parent)
+    snapshot_runtime((binary, DEPS / 'install/lib/dna_native.dll', DEPS / 'install/lib/dyn_window.dll'), binary.parent, tools=True)
     print('Built ' + str(binary) + '; native Win32 GUI with adjacent runtime DLLs, no SDL.', flush=True)

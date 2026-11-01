@@ -19,6 +19,12 @@ extern fn string_length "strlen"(text:*const u8)usize
 extern fn copy "memcpy"(output:*u8,input:*const u8,length:usize)rawptr
 fn dna_notify() {}
 fn native_initialize() {}
+// This export belongs only to the fixture; the production ABI stays opaque.
+pub fn test_failure(state:*RecoveryWorker,output:*RecoveryFailure) {
+  rec_lock(state.lock)
+  output.*=state.failure
+  rec_unlock(state.lock)
+}
 pub fn test_snapshot(path:*const u8,bytes:*const u8,length:usize)i32 {
   if rec_snapshot(path,bytes,length) { return 1 }
   return 0
@@ -46,6 +52,23 @@ fn main() {}
 '''
 
 
+class RecoveryFailure(c.Structure):
+    _fields_ = [('stage', c.c_int32), ('error', c.c_int32), ('length', c.c_size_t)]
+
+
+STAGES = {1: 'path initialization', 2: 'temporary open', 3: 'write',
+          4: 'file sync', 5: 'file close', 6: 'atomic rename',
+          7: 'parent open', 8: 'parent sync'}
+
+
+def failure_detail(library, state):
+    failure = RecoveryFailure()
+    library.test_failure(state, c.byref(failure))
+    return {'stage': STAGES.get(failure.stage, str(failure.stage)),
+            'errno': failure.error, 'snapshot_length': failure.length,
+            'error_flag': library.dna_recovery_error(state)}
+
+
 def configure(binary):
     library = c.CDLL(str(binary))
     library.dna_recovery_open.argtypes = [c.c_char_p]
@@ -57,6 +80,7 @@ def configure(binary):
     library.dna_recovery_close.argtypes = [c.c_void_p]
     library.test_snapshot.argtypes = [c.c_char_p, c.c_void_p, c.c_size_t]
     library.test_parent_limit.argtypes = [c.c_char_p]
+    library.test_failure.argtypes = [c.c_void_p, c.POINTER(RecoveryFailure)]
     assert library.test_roots() == 1, 'drive/UNC roots and relative path rejection'
     return library
 
@@ -145,8 +169,8 @@ def native_tests(binary, work):
             for index in range(50):
                 text = (str(index) + '\n').encode() * 25000
                 assert lib.dna_recovery_submit(state, text, len(text))
-            saved = wait_snapshot(root, text, lambda: lib.dna_recovery_error(state))
-            assert not lib.dna_recovery_error(state)
+            saved = wait_snapshot(root, text, lambda: failure_detail(lib, state))
+            assert not lib.dna_recovery_error(state), failure_detail(lib, state)
             private_acl(root)
             private_acl(saved)
             assert not list(root.glob('*.tmp'))
@@ -174,8 +198,8 @@ def native_tests(binary, work):
         assert state
         payload = ('snapshot-' + str(index)).encode()
         assert lib.dna_recovery_submit(state, payload, len(payload))
-        wait_snapshot(root, payload)
-        assert not lib.dna_recovery_error(state)
+        wait_snapshot(root, payload, lambda: failure_detail(lib, state))
+        assert not lib.dna_recovery_error(state), failure_detail(lib, state)
         lib.dna_recovery_close(state)
         assert list(root.iterdir()) == []
     assert kernel.GetProcessHandleCount(kernel.GetCurrentProcess(), c.byref(count))
@@ -247,8 +271,8 @@ if __name__ == '__main__':
         assert state
         payload = b'crash snapshot\x00exact'
         assert library.dna_recovery_submit(state, payload, len(payload))
-        wait_snapshot(root, payload)
-        assert not library.dna_recovery_error(state)
+        wait_snapshot(root, payload, lambda: failure_detail(library, state))
+        assert not library.dna_recovery_error(state), failure_detail(library, state)
         os._exit(0)
     else:
         main()
