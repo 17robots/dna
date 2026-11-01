@@ -1,2 +1,135 @@
 #target(kernel: windows)
 #link("ucrt")
+#link("kernel32")
+use "std/sync" file_windows_sync
+use "std/dynlib" file_windows_loader
+use "std/c" file_windows_c
+
+struct FileWindowsAttributes { attributes, tag: u32 }
+struct FileWindowsPathAPI {
+  open: fn(*const u16, u32, u32, rawptr, u32, u32, rawptr) rawptr,
+  information: fn(rawptr, u32, rawptr, u32) i32,
+  final_path: fn(rawptr, *u16, u32, u32) u32,
+  close: fn(rawptr) i32,
+  wide: fn(u32, u32, *const u8, i32, *u16, i32) i32,
+  utf8: fn(u32, u32, *const u16, i32, *u8, i32, rawptr, rawptr) i32,
+}
+file_windows_path_api: FileWindowsPathAPI
+file_windows_path_once: file_windows_sync.Once
+fn file_windows_path_symbol(library: rawptr, name: []const u8) rawptr {
+  found := file_windows_loader.symbol(library, name)
+  if !found.ok || found.value == nil {
+    #panic("missing Windows file path routine")
+  }
+  return found.value
+}
+fn file_windows_path_prepare() {
+  if file_windows_sync.once_begin(&file_windows_path_once) {
+    kernel := file_windows_loader.open("kernel32.dll", 0)
+    if !kernel.ok {
+      #panic("missing Windows file path library")
+    }
+    file_windows_path_api.open = #cast(fn(*const u16, u32, u32, rawptr, u32, u32, rawptr) rawptr, file_windows_path_symbol(kernel.value, "CreateFileW"))
+    file_windows_path_api.information = #cast(fn(rawptr, u32, rawptr, u32) i32, file_windows_path_symbol(kernel.value, "GetFileInformationByHandleEx"))
+    file_windows_path_api.final_path = #cast(fn(rawptr, *u16, u32, u32) u32, file_windows_path_symbol(kernel.value, "GetFinalPathNameByHandleW"))
+    file_windows_path_api.close = #cast(fn(rawptr) i32, file_windows_path_symbol(kernel.value, "CloseHandle"))
+    file_windows_path_api.wide = #cast(fn(u32, u32, *const u8, i32, *u16, i32) i32, file_windows_path_symbol(kernel.value, "MultiByteToWideChar"))
+    file_windows_path_api.utf8 = #cast(fn(u32, u32, *const u16, i32, *u8, i32, rawptr, rawptr) i32, file_windows_path_symbol(kernel.value, "WideCharToMultiByte"))
+    file_windows_sync.once_complete(&file_windows_path_once)
+  }
+}
+// std/path operates on the normalized separators. The returned slice borrows
+// storage and is NUL-terminated; failed capacity/input checks return empty.
+fn file_normalize_path(path: []const u8, storage: []u8) []const u8 {
+  if #len(storage) == 0 {
+    return ""
+  }
+  if #len(path) >= #len(storage) {
+    storage[0] = 0
+    return storage[..0]
+  }
+  for byte in path {
+    if byte == 0 {
+      storage[0] = 0
+      return storage[..0]
+    }
+  }
+  for index in 0..#len(path) {
+    byte := path[index]
+    if byte == 92 {
+      byte = 47
+    }
+    storage[index] = byte
+  }
+  storage[#len(path)] = 0
+  return storage[..#len(path)]
+}
+// POSIX-shaped parent-directory seam. Callers provide a 4096-byte output,
+// and keep the final file component separate so nofollow still sees it.
+fn realpath(path: *const u8, output: *u8) *u8 {
+  if output == nil {
+    return nil
+  }
+  if path == nil {
+    output.* = 0
+    return nil
+  }
+  length := file_windows_c.string_length(path, 4096)
+  if length == 0 || length >= 4096 {
+    output.* = 0
+    return nil
+  }
+  file_windows_path_prepare()
+  wide: [32768]u16 = []
+  used := file_windows_path_api.wide(65001, 8, path, #cast(i32, length), &wide[0], 32767)
+  if used <= 0 {
+    output.* = 0
+    return nil
+  }
+  output.* = 0
+  wide[#cast(usize, used)] = 0
+  // Follow only this parent directory, sharing rename/delete with other owners.
+  directory := file_windows_path_api.open(&wide[0], 128, 7, nil, 3, 33554432, nil)
+  if directory == nil || #cast(isize, directory) == -1 {
+    return nil
+  }
+  defer _ = file_windows_path_api.close(directory)
+  info := FileWindowsAttributes{}
+  if file_windows_path_api.information(directory, 9, #cast(rawptr, &info), #cast(u32, #sizeof(FileWindowsAttributes))) == 0 || (info.attributes & 16) == 0 {
+    return nil
+  }
+  count := file_windows_path_api.final_path(directory, &wide[0], 32768, 0)
+  if count == 0 || count >= 32768 {
+    return nil
+  }
+  first: usize = 0
+  if count >= 4 && wide[0] == 92 && wide[1] == 92 && wide[2] == 63 && wide[3] == 92 {
+    if count >= 8 && wide[4] == 85 && wide[5] == 78 && wide[6] == 67 && wide[7] == 92 {
+      // Convert \\?\UNC\server\share into \\server\share in place.
+      wide[6] = 92
+      first = 6
+    } else if count >= 7 && wide[5] == 58 && wide[6] == 92 {
+      first = 4
+    } else {
+      return nil
+    }
+  }
+  units := #cast(i32, count) - #cast(i32, first)
+  needed := file_windows_path_api.utf8(65001, 128, &wide[first], units, nil, 0, nil, nil)
+  if needed <= 0 || needed >= 4096 {
+    return nil
+  }
+  written := file_windows_path_api.utf8(65001, 128, &wide[first], units, output, 4095, nil, nil)
+  if written != needed {
+    output.* = 0
+    return nil
+  }
+  bytes := output[..4096]
+  for index in 0..#cast(usize, written) {
+    if bytes[index] == 92 {
+      bytes[index] = 47
+    }
+  }
+  bytes[#cast(usize, written)] = 0
+  return output
+}

@@ -118,6 +118,10 @@ def main():
         from native_macos import dependencies
         dependencies()
         return
+    if sys.platform == 'win32':
+        from native_windows import dependencies
+        dependencies()
+        return
     if not sys.platform.startswith('linux'):
         raise SystemExit('Native dependency builds support Linux and macOS; Windows services remain unfinished.')
     required = ('vterm', 'tree-sitter >= 0.25', 'libpcre2-8', 'libutf8proc')

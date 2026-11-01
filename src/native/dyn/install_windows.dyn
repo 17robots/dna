@@ -450,3 +450,94 @@ fn install_rename(source_fd: i32, source: *const u8, target_fd: i32, target: *co
   }
   return 0
 }
+
+struct InstallWinPrivateAPI {
+  descriptor: fn(*const u16, u32, *rawptr, *u32)i32,
+  free: fn(rawptr)rawptr,
+  volume: fn(rawptr, rawptr, u32, rawptr, rawptr, *u32, rawptr, u32)i32,
+}
+install_win_private_api: InstallWinPrivateAPI
+install_win_private_once: win_io_sync.Once
+fn install_win_private_prepare() {
+  install_win_prepare()
+  if win_io_sync.once_begin(&install_win_private_once) {
+    security:=win_io_loader.open("advapi32.dll", 0)
+    kernel:=win_io_loader.open("kernel32.dll", 0)
+    if !security.ok || !kernel.ok {
+      #panic("missing Windows plugin security library")
+    }
+    install_win_private_api.descriptor=#cast(fn(*const u16, u32, *rawptr, *u32)i32, win_io_symbol(security.value, "ConvertStringSecurityDescriptorToSecurityDescriptorW"))
+    install_win_private_api.free=#cast(fn(rawptr)rawptr, win_io_symbol(kernel.value, "LocalFree"))
+    install_win_private_api.volume=#cast(fn(rawptr, rawptr, u32, rawptr, rawptr, *u32, rawptr, u32)i32, win_io_symbol(kernel.value, "GetVolumeInformationByHandleW"))
+    win_io_sync.once_complete(&install_win_private_once)
+  }
+}
+
+fn install_win_create_private(parent:i32, name:*const u8, directory, executable:bool)i32 {
+  install_win_private_prepare()
+  if !install_win_name(name) {
+    return -1
+  }
+  root:=win_io_handle(parent)
+  info:=WinIOInformation{}
+  if win_io_api.info(root, &info)==0 {
+    return win_io_fail(win_io_api.error())
+  }
+  if (info.attributes&16)==0 || (info.attributes&1024)!=0 {
+    return win_io_fail(50)
+  }
+  flags:u32=0
+  if install_win_private_api.volume(root, nil, 0, nil, nil, &flags, nil, 0)==0 {
+    return win_io_fail(win_io_api.error())
+  }
+  if (flags&8)==0 {
+    return win_io_fail(50)
+  }
+  policy:[]const u8="D:P(A;;FRFWSDWDWO;;;OW)"
+  if directory {
+    policy="D:P(A;OICI;FA;;;OW)"
+  } else if executable {
+    policy="D:P(A;;FRFWFXSDWDWO;;;OW)"
+  }
+  security_text:[64]u16=[]
+  for at in 0..#len(policy) {
+    security_text[at]=#cast(u16, policy[at])
+  }
+  security:rawptr=nil
+  security_size:u32=0
+  if install_win_private_api.descriptor(&security_text[0], 1, &security, &security_size)==0 {
+    return win_io_fail(win_io_api.error())
+  }
+  defer _=install_win_private_api.free(security)
+  wide:[1024]u16=[]
+  if !win_io_path(name, wide[..]) {
+    return -1
+  }
+  units:usize=0
+  for wide[units]!=0 {
+    units+=1
+  }
+  native_name:=InstallWinUnicode{length:#cast(u16, units*2), maximum:#cast(u16, (units+1)*2), text:&wide[0]}
+  attributes:=InstallWinAttributes{length:#cast(u32, #sizeof(InstallWinAttributes)), root:root, name:&native_name, flags:4160, security:security}
+  access:u32=1074856064 // GENERIC_WRITE | DELETE | SYNCHRONIZE | READ_ATTRIBUTES
+  options:u32=2113634 // nofollow, backup intent, synchronous, write-through, non-directory
+  if directory {
+    access=3222339712
+    options=2113569
+  }
+  file_attributes:u32=128
+  if directory {
+    file_attributes=16
+  }
+  status:=InstallWinStatus{}
+  handle:rawptr=nil
+  result:=install_win_api.open(&handle, access, &attributes, &status, nil, file_attributes, 7, 2, options, nil, 0)
+  if result<0 {
+    return win_io_fail(install_win_api.status_error(result))
+  }
+  mode:i32=1
+  if directory {
+    mode=0
+  }
+  return win_io_adopt(handle, mode)
+}

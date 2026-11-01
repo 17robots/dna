@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the Linux or macOS native GUI without SDL."""
+"""Build the Linux, macOS or Windows native GUI without SDL."""
 import argparse
 import ctypes
 import os
@@ -25,6 +25,10 @@ def build():
     if sys.platform=='darwin':
         from native_macos import build as build_macos
         build_macos(args)
+        return
+    if sys.platform=='win32':
+        from native_windows import build as build_windows
+        build_windows(args)
         return
     if args.backend=='native':
         raise SystemExit('The native backend selects Cocoa on macOS; Linux uses x11 or wayland.')

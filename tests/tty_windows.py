@@ -78,10 +78,12 @@ fn main() {
   sleep:=#cast(fn(u32),win_io_symbol(kernel.value,"Sleep"))
   original_input:=win_tty_api.standard(4294967286)
   original_output:=win_tty_api.standard(4294967285)
+  original_error:=win_tty_api.standard(4294967284)
   // CI usually starts without a console. If attached, detach only this fixture
   // process before creating its isolated console; the parent remains untouched.
   _=release()
   if allocate()==0 { #panic("isolated console allocation") }
+  _=standard(4294967284,original_error)
   input_name:[]const u8="CONIN$\0"
   output_name:[]const u8="CONOUT$\0"
   wide:[32]u16=[]

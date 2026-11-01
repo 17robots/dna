@@ -12,10 +12,12 @@ extern fn fs_dacl "GetSecurityDescriptorDacl"(descriptor: rawptr, present: *i32,
 extern fn fs_set_security "SetSecurityInfo"(handle: rawptr, object_type: u32, information: u32, owner: rawptr, group: rawptr, dacl: rawptr, sacl: rawptr) u32
 extern fn fs_reopen "ReOpenFile"(handle: rawptr, access: u32, share: u32, flags: u32) rawptr
 extern fn fs_volume "GetVolumeInformationByHandleW"(handle: rawptr, name: rawptr, name_length: u32, serial: rawptr, component_length: rawptr, flags: *u32, filesystem: rawptr, filesystem_length: u32) i32
-fn windows_private_descriptor(directory: bool, output: *rawptr) Result {
+fn windows_private_descriptor_for(directory: bool, executable: bool, output: *rawptr) Result {
   text: []const u8 = "D:P(A;;FRFWSDWDWO;;;OW)"
   if directory {
     text = "D:P(A;OICI;FA;;;OW)"
+  } else if executable {
+    text = "D:P(A;;FRFWFXSDWDWO;;;OW)"
   }
   wide: [64]u16 = []
   converted := windows_path(text, wide[..])
@@ -27,6 +29,9 @@ fn windows_private_descriptor(directory: bool, output: *rawptr) Result {
     return windows_failure(fs_error())
   }
   return Result{ok: true}
+}
+fn windows_private_descriptor(directory: bool, output: *rawptr) Result {
+  return windows_private_descriptor_for(directory, false, output)
 }
 fn windows_acl_volume(handle: rawptr) Result {
   flags: u32 = 0
@@ -411,14 +416,14 @@ pub fn read_link(path: []const u8, destination: []u8) PathResult {
 }
 // Restrict at creation, before any other process can acquire a permissive
 // handle. A later chmod alone cannot revoke access from already-open handles.
-pub fn create_private_exclusive(path: []const u8) FileResult {
+fn windows_create_private(path: []const u8, executable: bool) FileResult {
   wide: [32768]u16 = []
   converted := windows_path(path, wide[..])
   if !converted.ok {
     return FileResult{error: converted.error, kind: converted.kind}
   }
   descriptor: rawptr = nil
-  prepared := windows_private_descriptor(false, &descriptor)
+  prepared := windows_private_descriptor_for(false, executable, &descriptor)
   if !prepared.ok {
     return FileResult{error: prepared.error, kind: prepared.kind}
   }
@@ -436,6 +441,14 @@ pub fn create_private_exclusive(path: []const u8) FileResult {
     return FileResult{error: supported.error, kind: supported.kind}
   }
   return FileResult{value: std_fs.adopt_handle(#cast(isize, handle)), ok: true}
+}
+pub fn create_private_exclusive(path: []const u8) FileResult {
+  return windows_create_private(path, false)
+}
+// Private executable payloads need FILE_EXECUTE as well as the data rights.
+// Establish the protected owner-only DACL in CreateFileW, never after writing.
+pub fn create_private_executable_exclusive(path: []const u8) FileResult {
+  return windows_create_private(path, true)
 }
 pub fn set_permissions(file: *File, mode: usize) Result {
   if !std_fs.is_open(file) {

@@ -1,0 +1,644 @@
+#target(kernel: windows)
+use "std/encoding/json" plugin_win_json
+use "std/mem" plugin_win_mem
+
+// Versions are complete before a single regular-file rename publishes their
+// names. The current/previous pair changes together; rollback swaps the pair.
+// No directory exchange or sequence with a missing active version is used.
+const PluginWinSignature: []const u8 = "DNA plugin versions 1\n"
+const PluginWinVersionSignature: []const u8 = "DNA plugin version 1\n"
+struct PluginWinPointer { active: [10]u8, previous: [10]u8, missing: bool }
+plugin_win_mutex: NativeMutex
+fn plugin_win_prepare() {
+  install_win_prepare()
+}
+fn plugin_win_equal(text:[]const u8, expected:[]const u8)bool {
+  if #len(text)!=#len(expected) {
+    return false
+  }
+  for at in 0..#len(text) {
+    if text[at]!=expected[at] {
+      return false
+    }
+  }
+  return true
+}
+fn plugin_win_case(text:[]const u8, expected:[]const u8)bool {
+  if #len(text)!=#len(expected) {
+    return false
+  }
+  for at in 0..#len(text) {
+    left:=text[at]
+    right:=expected[at]
+    if left>=97 && left<=122 {
+      left-=32
+    }
+    if right>=97 && right<=122 {
+      right-=32
+    }
+    if left!=right {
+      return false
+    }
+  }
+  return true
+}
+fn plugin_win_name(path:*const u8)bool {
+  if !install_win_name(path) {
+    return false
+  }
+  text:=install_text(path)
+  base:=#len(text)
+  for at in 0..#len(text) {
+    if text[at]==46 {
+      base=at
+      break
+    }
+  }
+  stem:=text[..base]
+  for reserved in ["CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$"] {
+    if plugin_win_case(stem, reserved) {
+      return false
+    }
+  }
+  if base>=4 && (plugin_win_case(stem[..3], "COM") || plugin_win_case(stem[..3], "LPT")) {
+    if base==4 && stem[3]>=49 && stem[3]<=57 {
+      return false
+    }
+    if base==5 && stem[3]==194 && (stem[4]==185 || stem[4]==178 || stem[4]==179) {
+      return false
+    }
+  }
+  for byte in text {
+    if byte==34 || byte==60 || byte==62 || byte==124 {
+      return false
+    }
+  }
+  return true
+}
+fn plugin_win_leaf(path:*const u8)bool {
+  if !plugin_win_name(path) {
+    return false
+  }
+  text:=install_text(path)
+  for reserved in ["plugin.json", ".dna-managed", ".dna-source", ".dna-current"] {
+    if plugin_win_case(text, reserved) {
+      return false
+    }
+  }
+  return true
+}
+fn plugin_win_version(path:*const u8)bool {
+  if string_length(path)!=9 {
+    return false
+  }
+  text:=path[..9]
+  if text[0]!=46 || text[1]!=118 || text[2]!=45 {
+    return false
+  }
+  for at in 3..9 {
+    byte:=text[at]
+    if !((byte>=48 && byte<=57) || (byte>=65 && byte<=90) || (byte>=97 && byte<=122) || byte==95 || byte==45) {
+      return false
+    }
+  }
+  return true
+}
+fn plugin_win_random(output:[]u8, prefix:[]const u8)bool {
+  if #len(prefix)+7>#len(output) {
+    return false
+  }
+  _=copy(&output[0], &prefix[0], #len(prefix))
+  random:[6]u8=[]
+  if win_io_api.random(&random[0], 6)==0 {
+    return false
+  }
+  alphabet:[]const u8="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_-"
+  for at in 0..6 {
+    output[#len(prefix)+at]=alphabet[#cast(usize, random[at]&63)]
+  }
+  output[#len(prefix)+6]=0
+  return true
+}
+// Creation is relative to the retained parent and attaches its private DACL
+// in NtCreateFile. No pathname is reconstructed or permission fixed up later.
+
+fn plugin_win_write(fd:i32, bytes:[]const u8)bool {
+  at:usize=0
+  for at<#len(bytes) {
+    written:=rec_write(fd, &bytes[at], #len(bytes)-at)
+    if written<0 && rec_errno().*==4 {
+      continue
+    }
+    if written<=0 {
+      return false
+    }
+    at+=#cast(usize, written)
+  }
+  return rec_sync(fd)==0
+}
+fn plugin_win_write_file(parent:i32, name:*const u8, bytes:[]const u8)bool {
+  fd:=install_win_create_private(parent, name, false, false)
+  if fd<0 {
+    return false
+  }
+  ok:=plugin_win_write(fd, bytes)
+  if rec_close(fd)!=0 {
+    return false
+  }
+  return ok
+}
+fn plugin_win_read(parent:i32, name:*const u8, output:[]u8)isize {
+  fd:=install_openat(parent, name, 655360, 0)
+  if fd<0 {
+    return -1
+  }
+  defer _=rec_close(fd)
+  info:=InstallStat{}
+  if install_fstat(fd, &info)!=0 {
+    return -1
+  }
+  if (info.mode&61440)!=32768 || info.size<0 || #cast(u64, info.size)>#cast(u64, #len(output)) {
+    rec_errno().*=22
+    return -1
+  }
+  used:usize=0
+  for used<#len(output) {
+    count:=proc_read_raw(fd, &output[used], #len(output)-used)
+    if count<0 && rec_errno().*==4 {
+      continue
+    }
+    if count<0 {
+      return -1
+    }
+    if count==0 {
+      return #cast(isize, used)
+    }
+    used+=#cast(usize, count)
+  }
+  extra:u8=0
+  if proc_read_raw(fd, &extra, 1)!=0 {
+    rec_errno().*=22
+    return -1
+  }
+  return #cast(isize, used)
+}
+fn plugin_win_marker(parent:i32, version:bool)bool {
+  name:[]const u8=".dna-managed\0"
+  bytes:[32]u8=[]
+  length:=plugin_win_read(parent, &name[0], bytes[..])
+  if length<0 {
+    return false
+  }
+  rec_errno().*=0
+  expected:=PluginWinSignature
+  if version {
+    expected=PluginWinVersionSignature
+  }
+  return plugin_win_equal(bytes[..#cast(usize, length)], expected)
+}
+fn plugin_win_manifest(parent:i32, name, leaf:*const u8, output:[]u8)bool {
+  filename:[]const u8="plugin.json\0"
+  bytes:[16384]u8=[]
+  length:=plugin_win_read(parent, &filename[0], bytes[..])
+  if length<=0 {
+    return false
+  }
+  arena:=plugin_win_mem.arena_create(262144)
+  defer plugin_win_mem.arena_release(arena)
+  parsed:=plugin_win_json.parse(arena, bytes[..#cast(usize, length)])
+  if !parsed.ok || !plugin_win_json.is_object(parsed.root) {
+    return false
+  }
+  executable:=plugin_win_json.object_get(parsed.root, "executable")
+  plugin_name:=plugin_win_json.object_get(parsed.root, "name")
+  if !plugin_win_json.is_string(executable) || !plugin_win_json.is_string(plugin_name) || #len(executable.text)==0 || #len(executable.text)>=#len(output) {
+    return false
+  }
+  for byte in executable.text {
+    if byte==0 {
+      return false
+    }
+  }
+  if #len(plugin_name.text)==0 || #len(plugin_name.text)>127 {
+    return false
+  }
+  plugin:[128]u8=[]
+  for at in 0..#len(plugin_name.text) {
+    if plugin_name.text[at]==0 {
+      return false
+    }
+    plugin[at]=plugin_name.text[at]
+  }
+  if !plugin_win_name(&plugin[0]) {
+    return false
+  }
+  _=copy(&output[0], &executable.text[0], #len(executable.text))
+  output[#len(executable.text)]=0
+  if !plugin_win_leaf(&output[0]) {
+    return false
+  }
+  if leaf!=nil && !plugin_win_equal(executable.text, install_text(leaf)) {
+    return false
+  }
+  if name!=nil && !plugin_win_equal(plugin_name.text, install_text(name)) {
+    return false
+  }
+  return true
+}
+fn plugin_win_valid_version(parent:i32, name:*const u8)bool {
+  if !plugin_win_version(name) {
+    return false
+  }
+  fd:=install_openat(parent, name, 720896, 0)
+  if fd<0 {
+    return false
+  }
+  defer _=rec_close(fd)
+  if !plugin_win_marker(fd, true) {
+    return false
+  }
+  executable:[1024]u8=[]
+  if !plugin_win_manifest(fd, nil, nil, executable[..]) {
+    return false
+  }
+  info:=InstallStat{}
+  if install_fstatat(fd, &executable[0], &info, 256)!=0 || (info.mode&61440)!=32768 || info.size<=0 || info.size>16777216 {
+    return false
+  }
+  provenance:[]const u8=".dna-source\0"
+  bytes:[4096]u8=[]
+  length:=plugin_win_read(fd, &provenance[0], bytes[..])
+  return length>0 && length<4096
+}
+fn plugin_win_pointer(parent:i32, pointer:*PluginWinPointer, allow_missing:bool)bool {
+  filename:[]const u8=".dna-current\0"
+  bytes:[64]u8=[]
+  length:=plugin_win_read(parent, &filename[0], bytes[..])
+  if length<0 {
+    if allow_missing && rec_errno().*==2 {
+      pointer.missing=true
+      return true
+    }
+    return false
+  }
+  if length!=11 && length!=20 {
+    return false
+  }
+  if bytes[9]!=10 || bytes[#cast(usize, length)-1]!=10 {
+    return false
+  }
+  _=copy(&pointer.active[0], &bytes[0], 9)
+  if length==20 {
+    _=copy(&pointer.previous[0], &bytes[10], 9)
+  }
+  if !plugin_win_valid_version(parent, &pointer.active[0]) {
+    return false
+  }
+  if length==20 && (!plugin_win_valid_version(parent, &pointer.previous[0]) || plugin_win_equal(pointer.active[..9], pointer.previous[..9])) {
+    return false
+  }
+  return true
+}
+fn plugin_win_rename_fd(fd, parent:i32, name:*const u8, replace:bool)bool {
+  rename:=InstallWinRename{root:win_io_handle(parent)}
+  if replace {
+    rename.replace=1
+  }
+  if !win_io_path(name, rename.name[..]) {
+    return false
+  }
+  units:usize=0
+  for rename.name[units]!=0 {
+    units+=1
+  }
+  rename.length=#cast(u32, units*2)
+  status:=InstallWinStatus{}
+  bytes:=#cast(usize, &rename.name[0])-#cast(usize, &rename)+#cast(usize, rename.length)
+  result:=install_win_api.rename(win_io_handle(fd), &status, #cast(rawptr, &rename), #cast(u32, bytes), 10)
+  if result<0 {
+    _=win_io_fail(install_win_api.status_error(result))
+    return false
+  }
+  return true
+}
+fn plugin_win_discard(fd:i32) {
+  saved:=rec_errno().*
+  remove:u8=1
+  status:=InstallWinStatus{}
+  _=install_win_api.rename(win_io_handle(fd), &status, #cast(rawptr, &remove), 1, 13)
+  rec_errno().*=saved
+}
+fn plugin_win_publish(parent:i32, pointer:*const PluginWinPointer)bool {
+  temporary:[16]u8=[]
+  fd:i32=-1
+  for attempt in 0..128 {
+    if !plugin_win_random(temporary[..], ".p-") {
+      return false
+    }
+    fd=install_win_create_private(parent, &temporary[0], false, false)
+    if fd>=0 {
+      break
+    }
+    if rec_errno().*!=17 {
+      return false
+    }
+  }
+  if fd<0 {
+    return false
+  }
+  defer _=rec_close(fd)
+  bytes:[20]u8=[]
+  _=copy(&bytes[0], &pointer.active[0], 9)
+  bytes[9]=10
+  length:usize=11
+  if pointer.previous[0]!=0 {
+    _=copy(&bytes[10], &pointer.previous[0], 9)
+    length=20
+  }
+  bytes[length-1]=10
+  if !plugin_win_write(fd, bytes[..length]) {
+    plugin_win_discard(fd)
+    return false
+  }
+  current:[]const u8=".dna-current\0"
+  // The file is flushed before one atomic rename. This establishes complete
+  // versions across process crashes, without claiming directory/power-loss sync.
+  if plugin_win_rename_fd(fd, parent, &current[0], true) {
+    return true
+  }
+  plugin_win_discard(fd)
+  return false
+}
+fn plugin_win_copy(parent:i32, leaf, source:*const u8, executable:bool, maximum:usize)bool {
+  input:=rec_open(source, 657408, 0)
+  if input<0 {
+    return false
+  }
+  defer _=rec_close(input)
+  info:=InstallStat{}
+  if install_fstat(input, &info)!=0 || (info.mode&61440)!=32768 || info.size<=0 || #cast(u64, info.size)>#cast(u64, maximum) {
+    return false
+  }
+  output:=install_win_create_private(parent, leaf, false, executable)
+  if output<0 {
+    return false
+  }
+  defer _=rec_close(output)
+  bytes:[16384]u8=[]
+  total:usize=0
+  for {
+    count:=proc_read_raw(input, &bytes[0], #len(bytes))
+    if count<0 && rec_errno().*==4 {
+      continue
+    }
+    if count<0 {
+      return false
+    }
+    if count==0 {
+      break
+    }
+    total+=#cast(usize, count)
+    if total>maximum {
+      return false
+    }
+    at:usize=0
+    for at<#cast(usize, count) {
+      written:=rec_write(output, &bytes[at], #cast(usize, count)-at)
+      if written<=0 {
+        return false
+      }
+      at+=#cast(usize, written)
+    }
+  }
+  return rec_sync(output)==0 && total==#cast(usize, info.size)
+}
+fn plugin_win_build_version(parent:i32, manifest, executable, name, leaf:*const u8, version:[]u8)bool {
+  fd:i32=-1
+  for attempt in 0..128 {
+    if !plugin_win_random(version, ".v-") {
+      return false
+    }
+    fd=install_win_create_private(parent, &version[0], true, false)
+    if fd>=0 {
+      break
+    }
+    if rec_errno().*!=17 {
+      return false
+    }
+  }
+  if fd<0 {
+    return false
+  }
+  defer _=rec_close(fd)
+  config:[]const u8="plugin.json\0"
+  provenance:[]const u8=".dna-source\0"
+  marker:[]const u8=".dna-managed\0"
+  if !plugin_win_copy(fd, &config[0], manifest, false, 16384) || !plugin_win_copy(fd, leaf, executable, true, 16777216) || !plugin_win_write_file(fd, &provenance[0], install_text(manifest)) {
+    return false
+  }
+  parsed_leaf:[1024]u8=[]
+  if !plugin_win_manifest(fd, name, leaf, parsed_leaf[..]) {
+    return false
+  }
+  // The marker is the last stage write; only a fully built version validates.
+  return plugin_win_write_file(fd, &marker[0], PluginWinVersionSignature)
+}
+fn plugin_win_container(root:i32, name:*const u8, create:bool)i32 {
+  if create {
+    fd:=install_win_create_private(root, name, true, false)
+    if fd>=0 {
+      marker:[]const u8=".dna-managed\0"
+      if !plugin_win_write_file(fd, &marker[0], PluginWinSignature) {
+        _=rec_close(fd)
+        return -1
+      }
+      return fd
+    }
+    if rec_errno().*!=17 {
+      return -1
+    }
+  }
+  handle:=install_win_relative(root, name, 2147549312, 1, true)
+  if handle==nil {
+    return -1
+  }
+  fd:=win_io_adopt(handle, 0)
+  if fd<0 {
+    return -1
+  }
+  if !plugin_win_marker(fd, false) {
+    _=rec_close(fd)
+    return -1
+  }
+  return fd
+}
+pub fn dna_plugin_install(manifest, executable, root, name, leaf:*const u8)i32 {
+  plugin_win_prepare()
+  _=sync_mutex_lock(#cast(rawptr, &plugin_win_mutex))
+  defer _=sync_mutex_unlock(#cast(rawptr, &plugin_win_mutex))
+  if manifest==nil || executable==nil || root==nil || !rec_absolute(root) || !plugin_win_name(name) || string_length(name)>127 || !plugin_win_leaf(leaf) || string_length(manifest)==0 || string_length(manifest)>4095 {
+    return 0
+  }
+  if dna_make_directories(root)==0 {
+    return 0
+  }
+  parent:=rec_open(root, 720896, 0)
+  if parent<0 {
+    return 0
+  }
+  defer _=rec_close(parent)
+  container:=plugin_win_container(parent, name, true)
+  if container<0 {
+    return 0
+  }
+  defer _=rec_close(container)
+  previous:=PluginWinPointer{}
+  if !plugin_win_pointer(container, &previous, true) {
+    return 0
+  }
+  current:=PluginWinPointer{}
+  if !plugin_win_build_version(container, manifest, executable, name, leaf, current.active[..]) {
+    return 0
+  }
+  if !previous.missing {
+    _=copy(&current.previous[0], &previous.active[0], 10)
+  }
+  if plugin_win_publish(container, &current) {
+    return 1
+  }
+  return 0
+}
+pub fn dna_plugin_rollback(root, name:*const u8)i32 {
+  plugin_win_prepare()
+  _=sync_mutex_lock(#cast(rawptr, &plugin_win_mutex))
+  defer _=sync_mutex_unlock(#cast(rawptr, &plugin_win_mutex))
+  if root==nil || !rec_absolute(root) || !plugin_win_name(name) {
+    return 0
+  }
+  parent:=rec_open(root, 720896, 0)
+  if parent<0 {
+    return 0
+  }
+  defer _=rec_close(parent)
+  container:=plugin_win_container(parent, name, false)
+  if container<0 {
+    return 0
+  }
+  defer _=rec_close(container)
+  before:=PluginWinPointer{}
+  if !plugin_win_pointer(container, &before, false) || before.previous[0]==0 {
+    return 0
+  }
+  after:=PluginWinPointer{}
+  _=copy(&after.active[0], &before.previous[0], 10)
+  _=copy(&after.previous[0], &before.active[0], 10)
+  if plugin_win_publish(container, &after) {
+    return 1
+  }
+  return 0
+}
+pub fn dna_plugin_remove(root, name:*const u8)i32 {
+  plugin_win_prepare()
+  _=sync_mutex_lock(#cast(rawptr, &plugin_win_mutex))
+  defer _=sync_mutex_unlock(#cast(rawptr, &plugin_win_mutex))
+  if root==nil || !rec_absolute(root) || !plugin_win_name(name) || string_length(name)>127 {
+    return 0
+  }
+  parent:=rec_open(root, 720896, 0)
+  if parent<0 {
+    return 0
+  }
+  defer _=rec_close(parent)
+  container:=plugin_win_container(parent, name, false)
+  if container<0 {
+    return 0
+  }
+  defer _=rec_close(container)
+  prefix:[160]u8=[]
+  if !install_path(prefix[..], ".removed-", install_text(name), "-", "") {
+    return 0
+  }
+  archive:[192]u8=[]
+  for attempt in 0..128 {
+    if !plugin_win_random(archive[..], install_text(&prefix[0])) {
+      return 0
+    }
+    if plugin_win_rename_fd(container, parent, &archive[0], false) {
+      return 1
+    }
+    if rec_errno().*!=17 {
+      return 0
+    }
+  }
+  return 0
+}
+fn plugin_win_output(output:*u8, capacity:usize, text:[]const u8)i32 {
+  if output==nil || #len(text)>=capacity {
+    return 0
+  }
+  if #len(text)>0 {
+    _=copy(output, &text[0], #len(text))
+  }
+  output[..capacity][#len(text)]=0
+  return 1
+}
+pub fn dna_plugin_resolve(path:*const u8, output:*u8, capacity:usize)i32 {
+  plugin_win_prepare()
+  _=sync_mutex_lock(#cast(rawptr, &plugin_win_mutex))
+  defer _=sync_mutex_unlock(#cast(rawptr, &plugin_win_mutex))
+  if path==nil || path.*==0 {
+    return 0
+  }
+  text:=install_text(path)
+  if #len(text)>=4096 {
+    return 0
+  }
+  slash:usize=0
+  for at in 0..#len(text) {
+    if rec_path_separator(text[at]) {
+      slash=at+1
+    }
+  }
+  leaf:=text[slash..]
+  if !plugin_win_case(leaf, "plugin.json") && !plugin_win_case(leaf, ".dna-source") {
+    return plugin_win_output(output, capacity, text)
+  }
+  if slash==0 {
+    return plugin_win_output(output, capacity, text)
+  }
+  container_path:[4096]u8=[]
+  parent_length:=slash-1
+  root:=rec_path_root(path, #len(text))
+  if slash<=root {
+    parent_length=slash
+  }
+  _=copy(&container_path[0], path, parent_length)
+  container:=rec_open(&container_path[0], 720896, 0)
+  if container<0 {
+    if rec_errno().*==2 {
+      return plugin_win_output(output, capacity, text)
+    }
+    return 0
+  }
+  defer _=rec_close(container)
+  if !plugin_win_marker(container, false) {
+    if rec_errno().*==95 || rec_errno().*==13 {
+      return 0
+    }
+    return plugin_win_output(output, capacity, text)
+  }
+  pointer:=PluginWinPointer{}
+  if !plugin_win_pointer(container, &pointer, false) {
+    return 0
+  }
+  resolved:[4096]u8=[]
+  if !install_path(resolved[..], container_path[..parent_length], "/", install_text(&pointer.active[0]), "/") {
+    return 0
+  }
+  used:=string_length(&resolved[0])
+  if used+#len(leaf)>=4096 {
+    return 0
+  }
+  _=copy(&resolved[used], &leaf[0], #len(leaf))
+  return plugin_win_output(output, capacity, resolved[..used+#len(leaf)])
+}

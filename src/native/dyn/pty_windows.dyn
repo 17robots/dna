@@ -354,7 +354,13 @@ fn terminal_exit_native(t: *Terminal) bool {
   if win_proc_api.exit(owner.child.process, &code) != 0 && code <= 2147483647 {
     t.status = #cast(i32, code)
   }
-  return true
+  // ConPTY can deliver its final frame after the leader signals. Close on the
+  // worker while the UI keeps draining, and publish exit only after EOF.
+  if win_proc_sync.exchange_u32(&owner.stop, 1) == 0 {
+    _ = win_proc_api.terminate_job(owner.child.job, 1)
+    _ = win_pty_api.signal(owner.event)
+  }
+  return win_proc_sync.load_u32(&owner.done) != 0 && t.read_closed != 0
 }
 fn terminal_needs_exit_poll(t: *Terminal) bool {
   return t.platform != nil && t.exited == 0

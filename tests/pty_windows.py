@@ -26,7 +26,7 @@ extern fn rec_free "free"(memory:rawptr)
 extern fn string_length "strlen"(text:*const u8) usize
 extern fn copy "memcpy"(output:*u8, input:*const u8, size:usize) rawptr
 struct TtySize { rows, columns, width, height:u16 }
-struct Terminal { pid,fd,input_fd,exit_fd,status,exited:i32, platform:rawptr }
+struct Terminal { pid,fd,input_fd,exit_fd,status,exited,read_closed:i32, platform:rawptr }
 fn dna_watch(fd:i32,writing:i32) { _=fd
   _=writing }
 fn dna_unwatch(fd:i32) { _=fd }
@@ -41,7 +41,10 @@ pub fn test_open(cwd,shell,command:*const u8) rawptr {
   return #cast(rawptr,terminal)
 }
 pub fn test_read(pointer:rawptr,bytes:*u8,size:usize) isize {
-  return proc_read((#cast(*Terminal,pointer)).fd,bytes,size)
+  terminal:=#cast(*Terminal,pointer)
+  received:=proc_read(terminal.fd,bytes,size)
+  if received==0 { terminal.read_closed=1 }
+  return received
 }
 pub fn test_write(pointer:rawptr,bytes:*const u8,size:usize) isize {
   return proc_write((#cast(*Terminal,pointer)).input_fd,bytes,size)
@@ -69,6 +72,36 @@ pub fn test_close(pointer:rawptr) {
 }
 fn main() {}
 '''
+
+
+def process_handles():
+    class Handle(c.Structure):
+        _fields_ = [("object", c.c_void_p), ("pid", c.c_size_t), ("handle", c.c_size_t),
+                    ("access", c.c_uint32), ("creator", c.c_uint16), ("type", c.c_uint16),
+                    ("attributes", c.c_uint32), ("reserved", c.c_uint32)]
+    native = c.WinDLL('ntdll')
+    native.NtQuerySystemInformation.argtypes = [c.c_uint32, c.c_void_p, c.c_uint32, c.POINTER(c.c_uint32)]
+    size = 1024 * 1024
+    while size <= 128 * 1024 * 1024:
+        buffer = c.create_string_buffer(size)
+        needed = c.c_uint32()
+        result = native.NtQuerySystemInformation(64, buffer, size, c.byref(needed))
+        if result == 0:
+            count = c.c_size_t.from_buffer(buffer).value
+            rows = (Handle * count).from_buffer(buffer, 2 * c.sizeof(c.c_size_t))
+            return {row.handle: row.type for row in rows if row.pid == os.getpid()}
+        size = max(size * 2, needed.value)
+    raise AssertionError('handle diagnostic query failed')
+
+def handle_type(handle):
+    native = c.WinDLL('ntdll')
+    native.NtQueryObject.argtypes = [c.c_void_p, c.c_uint32, c.c_void_p, c.c_uint32, c.c_void_p]
+    buffer = c.create_string_buffer(4096)
+    if native.NtQueryObject(handle, 2, buffer, len(buffer), None) == 0:
+        length = c.c_uint16.from_buffer(buffer).value
+        pointer = c.c_void_p.from_buffer(buffer, 8).value
+        return c.wstring_at(pointer, length // 2)
+    return 'unknown'
 
 
 def native_tests(binary, work, mode):
@@ -205,11 +238,14 @@ for line in sys.stdin:
     count = c.c_uint32()
     assert kernel.GetProcessHandleCount(kernel.GetCurrentProcess(), c.byref(count))
     before = count.value
+    handles_before = process_handles()
     for _ in range(8):
         terminal = open_terminal(b'echo lifecycle')
         lib.test_close(terminal)
     assert kernel.GetProcessHandleCount(kernel.GetCurrentProcess(), c.byref(count))
-    assert count.value <= before + 2, ('ConPTY lifecycle handle leak', before, count.value)
+    handles_after = process_handles()
+    added = [(handle, handle_type(handle), kind) for handle, kind in handles_after.items() if handle not in handles_before]
+    assert count.value <= before + 2, ('ConPTY lifecycle handle leak', before, count.value, added)
     assert not lib.test_open(b'Z:\\dna-missing\\directory', None, b'echo invalid')
     print('PASS ConPTY: native output, Unicode cwd, default/custom shell, resize, exit, full-output teardown, descendant cancellation and handle cleanup (' + mode + ')', flush=True)
 

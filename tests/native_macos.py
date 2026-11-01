@@ -29,6 +29,7 @@ ABI = r'''
 #include <termios.h>
 #include <signal.h>
 #include <spawn.h>
+#include <time.h>
 #include <dirent.h>
 #include <fcntl.h>
 _Static_assert(sizeof(struct stat)==144 && offsetof(struct stat,st_ino)==8 && offsetof(struct stat,st_size)==96, "stat ABI");
@@ -40,6 +41,7 @@ _Static_assert(sizeof(posix_spawnattr_t)==8 && sizeof(posix_spawn_file_actions_t
 _Static_assert(sizeof(struct kevent)==32 && offsetof(struct kevent,filter)==8 && offsetof(struct kevent,data)==16 && offsetof(struct kevent,udata)==24, "kevent ABI");
 _Static_assert(TIOCGWINSZ==1074295912 && TIOCSWINSZ==2148037735 && SIGTSTP==18 && SIGBUS==10, "tty constants");
 _Static_assert(O_EVTONLY==32768 && O_CLOEXEC==16777216 && EV_DISPATCH==128 && EV_CLEAR==32, "watch constants");
+_Static_assert(CLOCK_THREAD_CPUTIME_ID==16 && CLOCK_PROCESS_CPUTIME_ID==12, "CPU clock identifiers");
 int main(void) { return 0; }
 '''
 with tempfile.TemporaryDirectory(prefix='dna-native-macos-') as temporary:

@@ -1,0 +1,79 @@
+#target(kernel: windows)
+use "std/dynlib" execute_loader
+use "std/sync" execute_sync
+
+struct ExecuteMapping { read, write, execute, all: u32 }
+struct ExecuteWindowsAPI {
+  security: fn(rawptr, u32, u32, rawptr, rawptr, rawptr, rawptr, *rawptr) u32,
+  process: fn() rawptr,
+  token: fn(rawptr, u32, *rawptr) i32,
+  duplicate: fn(rawptr, i32, *rawptr) i32,
+  check: fn(rawptr, rawptr, u32, *ExecuteMapping, rawptr, *u32, *u32, *i32) i32,
+  ready: bool,
+}
+execute_windows_api: ExecuteWindowsAPI
+execute_windows_once: execute_sync.Once
+fn execute_windows_symbol(library: rawptr, name: []const u8) rawptr {
+  result := execute_loader.symbol(library, name)
+  if result.ok {
+    return result.value
+  }
+  return nil
+}
+fn execute_windows_prepare() bool {
+  if execute_sync.once_begin(&execute_windows_once) {
+    security := execute_loader.open("advapi32.dll", 0)
+    kernel := execute_loader.open("kernel32.dll", 0)
+    if security.ok && kernel.ok {
+      execute_windows_api.security = #cast(fn(rawptr, u32, u32, rawptr, rawptr, rawptr, rawptr, *rawptr) u32, execute_windows_symbol(security.value, "GetSecurityInfo"))
+      execute_windows_api.process = #cast(fn() rawptr, execute_windows_symbol(kernel.value, "GetCurrentProcess"))
+      execute_windows_api.token = #cast(fn(rawptr, u32, *rawptr) i32, execute_windows_symbol(security.value, "OpenProcessToken"))
+      execute_windows_api.duplicate = #cast(fn(rawptr, i32, *rawptr) i32, execute_windows_symbol(security.value, "DuplicateToken"))
+      execute_windows_api.check = #cast(fn(rawptr, rawptr, u32, *ExecuteMapping, rawptr, *u32, *u32, *i32) i32, execute_windows_symbol(security.value, "AccessCheck"))
+      execute_windows_api.ready = execute_windows_api.security != nil && execute_windows_api.process != nil && execute_windows_api.token != nil && execute_windows_api.duplicate != nil && execute_windows_api.check != nil
+    }
+    execute_sync.once_complete(&execute_windows_once)
+  }
+  return execute_windows_api.ready
+}
+// Windows mode bits cannot express DACL execute rights. Check only callers
+// that need execution, against the descriptor of the retained nofollow file.
+// Metadata and directory scans keep their existing inexpensive contract.
+pub fn executable(path: []const u8) bool {
+  if !execute_windows_prepare() {
+    return false
+  }
+  opened := open_nofollow(path)
+  if !opened.ok {
+    return false
+  }
+  defer _ = close(&opened.value)
+  descriptor: rawptr = nil
+  // AccessCheck requires owner and group SIDs, not only the DACL.
+  if execute_windows_api.security(#cast(rawptr, opened.value.descriptor), 1, 7, nil, nil, nil, nil, &descriptor) != 0 || descriptor == nil {
+    if descriptor != nil {
+      _ = fs_local_free(descriptor)
+    }
+    return false
+  }
+  defer _ = fs_local_free(descriptor)
+  primary: rawptr = nil
+  // TOKEN_QUERY | TOKEN_DUPLICATE; AccessCheck needs an impersonation token.
+  if execute_windows_api.token(execute_windows_api.process(), 10, &primary) == 0 {
+    return false
+  }
+  defer _ = fs_close(primary)
+  impersonation: rawptr = nil
+  if execute_windows_api.duplicate(primary, 2, &impersonation) == 0 {
+    return false
+  }
+  defer _ = fs_close(impersonation)
+  mapping := ExecuteMapping{read: 0x120089, write: 0x120116, execute: 0x1200a0, all: 0x1f01ff}
+  privileges: [128]u64 = []
+  privilege_size: u32 = #cast(u32, #sizeof(privileges))
+  granted: u32 = 0
+  allowed: i32 = 0
+  // FILE_EXECUTE is already a specific access right; no generic bits remain.
+  // An insufficient privilege buffer or any other API error fails closed.
+  return execute_windows_api.check(descriptor, impersonation, 32, &mapping, #cast(rawptr, &privileges[0]), &privilege_size, &granted, &allowed) != 0 && allowed != 0 && (granted & 32) != 0
+}

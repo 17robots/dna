@@ -1,2 +1,110 @@
 #target(kernel: windows)
 #link("ucrt")
+
+use "std/dynlib" frontend_loader
+use "std/sync" frontend_sync
+extern fn frontend_isatty "_isatty"(descriptor: i32) i32
+struct WindowsFrontendAPI {
+  set_environment: fn(*const u16, *const u16) i32,
+  thread_times, process_times: fn(rawptr, *u64, *u64, *u64, *u64) i32,
+  current_thread, current_process: fn() rawptr,
+  screen: fn(i32) i32,
+}
+frontend_windows_api: WindowsFrontendAPI
+frontend_windows_once: frontend_sync.Once
+fn frontend_symbol(library: rawptr, name: []const u8) rawptr {
+  result := frontend_loader.symbol(library, name)
+  if !result.ok || result.value == nil {
+    #panic("missing Windows frontend routine")
+  }
+  return result.value
+}
+fn frontend_prepare() {
+  if frontend_sync.once_begin(&frontend_windows_once) {
+    kernel := frontend_loader.open("kernel32.dll", 0)
+    user := frontend_loader.open("user32.dll", 0)
+    if !kernel.ok || !user.ok {
+      #panic("missing Windows frontend library")
+    }
+    frontend_windows_api.set_environment = #cast(fn(*const u16, *const u16) i32, frontend_symbol(kernel.value, "SetEnvironmentVariableW"))
+    frontend_windows_api.thread_times = #cast(fn(rawptr, *u64, *u64, *u64, *u64) i32, frontend_symbol(kernel.value, "GetThreadTimes"))
+    frontend_windows_api.process_times = #cast(fn(rawptr, *u64, *u64, *u64, *u64) i32, frontend_symbol(kernel.value, "GetProcessTimes"))
+    frontend_windows_api.current_thread = #cast(fn() rawptr, frontend_symbol(kernel.value, "GetCurrentThread"))
+    frontend_windows_api.current_process = #cast(fn() rawptr, frontend_symbol(kernel.value, "GetCurrentProcess"))
+    frontend_windows_api.screen = #cast(fn(i32) i32, frontend_symbol(user.value, "GetSystemMetrics"))
+    frontend_sync.once_complete(&frontend_windows_once)
+  }
+}
+fn frontend_display_available() bool {
+  frontend_prepare()
+  return frontend_windows_api.screen(0) > 0 && frontend_windows_api.screen(1) > 0
+}
+fn frontend_wide(text: *const u8, output: []u16) bool {
+  length := c.string_length(text, 65536)
+  if length >= 65536 {
+    return false
+  }
+  if length == 0 {
+    output[0] = 0
+    return true
+  }
+  used := host.utf16(65001, 8, text, #cast(i32, length), &output[0], #cast(i32, #len(output)) - 1)
+  if used <= 0 {
+    return false
+  }
+  output[#cast(usize, used)] = 0
+  return true
+}
+fn handoff_setenv(name, value: *const u8, overwrite: i32) i32 {
+  frontend_prepare()
+  if name == nil || value == nil {
+    return -1
+  }
+  if overwrite == 0 {
+    storage: [4096]u8 = []
+    present := host.environment(name[..c.string_length(name, 65536)], storage[..])
+    if present.found {
+      return 0
+    }
+  }
+  key: [32768]u16 = []
+  text: [32768]u16 = []
+  if !frontend_wide(name, key[..]) || !frontend_wide(value, text[..]) {
+    return -1
+  }
+  if frontend_windows_api.set_environment(&key[0], &text[0]) == 0 {
+    return -1
+  }
+  return 0
+}
+fn handoff_unsetenv(name: *const u8) i32 {
+  frontend_prepare()
+  key: [32768]u16 = []
+  if name == nil || !frontend_wide(name, key[..]) {
+    return -1
+  }
+  if frontend_windows_api.set_environment(&key[0], nil) == 0 {
+    return -1
+  }
+  return 0
+}
+fn thread_clock(kind: i32, time: *ThreadTime) i32 {
+  frontend_prepare()
+  created: u64 = 0
+  ended: u64 = 0
+  kernel: u64 = 0
+  user: u64 = 0
+  status: i32 = 0
+  if kind == 3 {
+    status = frontend_windows_api.thread_times(frontend_windows_api.current_thread(), &created, &ended, &kernel, &user)
+  } else if kind == 2 {
+    status = frontend_windows_api.process_times(frontend_windows_api.current_process(), &created, &ended, &kernel, &user)
+  }
+  if status == 0 {
+    return -1
+  }
+  ticks := kernel + user
+  time.seconds = #cast(i64, ticks / 10000000)
+  time.nanoseconds = #cast(i64, (ticks % 10000000) * 100)
+  return 0
+}

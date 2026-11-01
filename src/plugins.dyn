@@ -35,6 +35,7 @@ extern fn plugin_read "dna_plugin_read"(plugin: rawptr, output: *u8, capacity: u
 extern fn plugin_stderr "dna_plugin_log"(plugin: rawptr, bytes: *u8, capacity: usize) usize
 extern fn plugin_close "dna_plugin_close"(plugin: rawptr)
 extern fn plugin_install_native "dna_plugin_install"(manifest: *const u8, executable: *const u8, root: *const u8, name: *const u8, leaf: *const u8) i32
+extern fn plugin_resolve_native "dna_plugin_resolve"(path: *const u8, output: *u8, capacity: usize) i32
 extern fn plugin_remove_native "dna_plugin_remove"(root: *const u8, name: *const u8) i32
 extern fn plugin_rollback_native "dna_plugin_rollback"(root: *const u8, name: *const u8) i32
 
@@ -98,6 +99,11 @@ fn plugin_prepare(app: *App, manifest: []const u8) {
     notice(app, "Plugin manifest path is invalid.")
     return
   }
+  if plugin_resolve_native(&storage[0], &expanded[0], #len(expanded)) == 0 {
+    notice(app, "Installed plugin version is invalid.")
+    return
+  }
+  path = expanded[..c.string_length(&expanded[0], #len(expanded))]
   mark := mem.arena_mark(app.scratch)
   defer mem.arena_rewind(app.scratch, mark)
   manifest_info := files.metadata(path)
@@ -177,7 +183,7 @@ fn plugin_prepare(app: *App, manifest: []const u8) {
   used := copy_text(pending.executable[..], path[..parent])
   add_text(pending.executable[..], &used, executable)
   info := files.metadata(pending.executable[..used])
-  if !info.ok || (info.mode & 61440) != 32768 || (info.mode & 73) == 0 {
+  if !info.ok || (info.mode & 61440) != 32768 || !fs.executable(pending.executable[..used]) {
     notice(app, "Plugin executable must be a regular executable file beside its manifest.")
     return
   }
@@ -538,7 +544,8 @@ fn plugin_list(app: *App) {
         add_text(installed[..], &installed_length, "/")
         add_text(installed[..], &installed_length, candidate.key)
         add_text(installed[..], &installed_length, "/plugin.json")
-        if !files.metadata(installed[..installed_length]).ok {
+        active_manifest: [4096]u8 = []
+        if plugin_resolve_native(&installed[0], &active_manifest[0], #len(active_manifest)) == 0 || !files.metadata(active_manifest[..c.string_length(&active_manifest[0], #len(active_manifest))]).ok {
           add_text(text[..], &used, "  ")
           add_text(text[..], &used, candidate.key)
           add_text(text[..], &used, "\n")
@@ -573,12 +580,16 @@ fn plugin_install(app: *App, source: []const u8) bool {
     notice(app, "Invalid plugin source.")
     return false
   }
+  if plugin_resolve_native(&manifest[0], &expanded[0], #len(expanded)) == 0 {
+    notice(app, "Installed plugin source version is invalid.")
+    return false
+  }
   executable_length := c.string_length(&pending.executable[0], 4096)
   leaf_start := executable_length
   for leaf_start > 0 && pending.executable[leaf_start - 1] != '/' {
     leaf_start -= 1
   }
-  if plugin_install_native(&manifest[0], &pending.executable[0], &root[0], &pending.name[0], &pending.executable[leaf_start]) == 0 {
+  if plugin_install_native(&expanded[0], &pending.executable[0], &root[0], &pending.name[0], &pending.executable[leaf_start]) == 0 {
     notice(app, "Plugin install failed. Only manifest and executable (up to 16 MiB) are copied; unmanaged destinations are preserved.")
     return false
   }
@@ -628,9 +639,14 @@ fn plugin_update(app: *App, name: []const u8) {
   add_text(path[..], &length, "plugins/")
   add_text(path[..], &length, name)
   add_text(path[..], &length, "/.dna-source")
+  resolved_source: [4096]u8 = []
+  if plugin_resolve_native(&path[0], &resolved_source[0], #len(resolved_source)) == 0 {
+    notice(app, "Installed plugin source version is invalid.")
+    return
+  }
   mark := mem.arena_mark(app.scratch)
   defer mem.arena_rewind(app.scratch, mark)
-  read := fs.read_all(app.scratch, path[..length], 4095)
+  read := fs.read_all(app.scratch, resolved_source[..c.string_length(&resolved_source[0], #len(resolved_source))], 4095)
   if !read.ok || #len(read.value) == 0 {
     notice(app, "This installation has no recorded source. Use :plugin-install /path/plugin.json first.")
     return

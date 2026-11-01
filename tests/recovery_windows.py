@@ -113,7 +113,7 @@ def shared_read(path):
         kernel.CloseHandle(handle)
 
 
-def wait_snapshot(root, expected):
+def wait_snapshot(root, expected, error=None):
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
         paths = [path for path in root.glob('session-*') if path.suffix != '.tmp']
@@ -125,7 +125,8 @@ def wait_snapshot(root, expected):
                 # Atomic replacement may race this observation; retry the name.
                 pass
         time.sleep(.005)
-    raise AssertionError('recovery snapshot deadline: ' + str(root))
+    entries = [(str(path), path.stat().st_size) for path in root.glob('*')]
+    raise AssertionError(('recovery snapshot deadline', str(root), entries, error() if error else None))
 
 
 def native_tests(binary, work):
@@ -144,7 +145,7 @@ def native_tests(binary, work):
             for index in range(50):
                 text = (str(index) + '\n').encode() * 25000
                 assert lib.dna_recovery_submit(state, text, len(text))
-            saved = wait_snapshot(root, text)
+            saved = wait_snapshot(root, text, lambda: lib.dna_recovery_error(state))
             assert not lib.dna_recovery_error(state)
             private_acl(root)
             private_acl(saved)

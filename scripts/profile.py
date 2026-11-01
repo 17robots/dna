@@ -111,11 +111,18 @@ def main():
         f'const ProfileExplorers: []const u8 = "{" ".join(chosen["explorers"])}"\n'
         f'const ProfilePickers: []const u8 = "{" ".join(chosen["pickers"])}"\n')
     deps = ROOT / 'build/deps'
-    output = ROOT / 'build' / f'dna-{name}'
+    output = ROOT / 'build' / (f'dna-{name}.exe' if sys.platform == 'win32' else f'dna-{name}')
     if 'gui' in chosen['frontends']:
         subprocess.run([sys.executable, str(ROOT / 'scripts/build_native.py'),
                         '--source', str(stage), '--mode', mode,
                         '--output', str(output)], check=True)
+    elif sys.platform == 'win32':
+        from dyn_path import real_dyn
+        from native_windows import dependencies, environment as windows_environment, snapshot_runtime
+        dependencies()
+        subprocess.run([sys.executable, ROOT/'scripts/compile.py', real_dyn(), 'build', stage,
+                        '--'+mode, '--output', output], env=windows_environment(real_dyn()), check=True)
+        snapshot_runtime((deps/'install/lib/dna_native.dll',), output.parent)
     elif sys.platform == 'darwin':
         from dyn_path import real_dyn
         from native_macos import linker_environment
