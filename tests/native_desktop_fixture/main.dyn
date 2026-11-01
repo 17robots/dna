@@ -3,6 +3,7 @@ use "vendor/window/events"
 use "std/ui/software"
 use "std/mem"
 use "std/errors"
+use "std/io"
 use "./presenter" presenter
 
 fn check(ok:bool, message:[]const u8) {
@@ -15,7 +16,10 @@ fn render(renderer:*presenter.Presenter, surface:software.Surface) {
   pixel:[4]u8=[]
   renderer.api.pixel_store_i(3333, 1)
   renderer.api.read_pixels(0, surface.height-1, 1, 1, 6408, 5121, #cast(rawptr, &pixel[0]))
-  check(pixel[0]==17 && pixel[1]==83 && pixel[2]==201 && pixel[3]==255, "desktop GL pixel readback")
+  if pixel[0]!=17 || pixel[1]!=83 || pixel[2]!=201 || pixel[3]!=255 {
+    _=io.println(io.stderr(), "desktop readback {} {} {} {} at {}x{}; GL error {}", pixel[0], pixel[1], pixel[2], pixel[3], surface.width, surface.height, renderer.api.get_error())
+    #panic("desktop GL pixel readback")
+  }
   renderer.api.read_pixels(surface.width-1, 0, 1, 1, 6408, 5121, #cast(rawptr, &pixel[0]))
   check(pixel[0]==201 && pixel[1]==31 && pixel[2]==19 && pixel[3]==255, "desktop upload orientation")
 }
@@ -41,6 +45,9 @@ fn main() {
   // Vsync control is optional on a valid desktop context.
   pacing:=window.set_swap_interval(&host, 0)
   check(pacing.ok || pacing.kind==errors.Kind.Unsupported, "desktop pacing control")
+  // EGL may acquire the resized default back buffer only at swap. Realize
+  // that buffer before asserting pixels at the new drawable's outer edges.
+  check(window.swap(&host).ok, "desktop resized back buffer")
   event:=events.Event{}
   for window.next_event(&host, &event) {}
   check(window.wake(&host).ok, "desktop wake")
