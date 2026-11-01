@@ -81,13 +81,21 @@ fn mapping_and_ranges() {
     if mapped[..#len(bytes)][0] != bytes[0] || mapped[..#len(bytes)][200000] != bytes[200000] {
       #panic("mapping contents")
     }
-    // Darwin zeroes inaccessible backing pages; Windows refuses truncation
-    // while views exist. Both must keep the process safe.
+    // Darwin protects inaccessible backing pages, while already resident
+    // private pages may retain old bytes. Windows refuses truncation while
+    // views exist. Reads must remain safe and source metadata authoritative.
     truncated := fs.create("mapped.bin")
     if truncated.ok {
       require(fs.close(&truncated.value), "truncate close")
-      if mapped[..#len(bytes)][200000] != 0 {
-        #panic("truncated mapping not resilient")
+      changed := fs.file_metadata(&source.value)
+      if !changed.ok || changed.size != 0 {
+        #panic("source truncation not observed")
+      }
+      for position in [100000, 200000] {
+        observed := mapped[..#len(bytes)][position]
+        if observed != 0 && observed != bytes[position] {
+          #panic("unexpected truncated mapping contents")
+        }
       }
     } else if mapped[..#len(bytes)][200000] != bytes[200000] {
       #panic("mapping after refused truncation")
