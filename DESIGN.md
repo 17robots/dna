@@ -256,7 +256,7 @@ queried around the last drawn view (`syntax_window_tick` in `src/syntax.dyn`).
 Tree queries for objects and syntax selections remain disabled for these
 documents. Cursor, selection and explorer identities remain per-state metadata.
 
-Single-line drawing is bounded at 1 MiB of text per displayed row. On a longer
+Single-line drawing is bounded at 64 KiB of text per displayed row. On a longer
 line, a window follows the primary cursor in half-window steps. Drawing, caret
 geometry, selections, syntax ink and mouse hit tests share its origin. Text
 outside the current window becomes visible when the cursor moves there.
