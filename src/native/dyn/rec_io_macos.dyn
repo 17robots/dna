@@ -1,0 +1,114 @@
+#target(kernel: darwin)
+#link("System")
+use "std/dynlib" native_loader
+
+struct DarwinIO {
+  error: fn() *i32,
+  close: fn(i32) i32,
+  write: fn(i32, *const u8, usize) isize,
+  environment: fn(*const u8) *u8,
+}
+darwin_io: DarwinIO
+darwin_io_once: sync.Once
+fn darwin_io_symbol(name: []const u8) rawptr {
+  result := native_loader.symbol(#cast(rawptr, #cast(isize, -2)), name)
+  if !result.ok || result.value == nil {
+    #panic("missing libSystem IO routine")
+  }
+  return result.value
+}
+fn darwin_io_prepare() {
+  if sync.once_begin(&darwin_io_once) {
+    darwin_io.error = #cast(fn() *i32, darwin_io_symbol("__error"))
+    darwin_io.close = #cast(fn(i32) i32, darwin_io_symbol("close"))
+    darwin_io.write = #cast(fn(i32, *const u8, usize) isize, darwin_io_symbol("write"))
+    darwin_io.environment = #cast(fn(*const u8) *u8, darwin_io_symbol("getenv"))
+    sync.once_complete(&darwin_io_once)
+  }
+}
+fn rec_errno() *i32 {
+  darwin_io_prepare()
+  return darwin_io.error()
+}
+fn rec_retry() bool {
+  return rec_errno().* == 35
+}
+// Shared service policy uses Linux flag values internally. Only this boundary
+// translates them; Darwin's variadic open ABI must remain variadic on arm64.
+fn darwin_io_flags(flags: i32) i32 {
+  native := flags & 3
+  if (flags & 64) != 0 {
+    native |= 512
+  }
+  if (flags & 128) != 0 {
+    native |= 2048
+  }
+  if (flags & 512) != 0 {
+    native |= 1024
+  }
+  if (flags & 2048) != 0 {
+    native |= 4
+  }
+  if (flags & 65536) != 0 {
+    native |= 1048576
+  }
+  if (flags & 131072) != 0 {
+    native |= 256
+  }
+  if (flags & 524288) != 0 {
+    native |= 16777216
+  }
+  return native
+}
+extern fn darwin_io_open "open"(path: *const u8, flags: i32, ...) i32
+extern fn darwin_io_sync "fsync"(fd: i32) i32
+extern fn darwin_io_rename "rename"(from: *const u8, to: *const u8) i32
+extern fn darwin_io_unlink "unlink"(path: *const u8) i32
+extern fn darwin_io_mkdir "mkdir"(path: *const u8, mode: u16) i32
+extern fn darwin_io_temp "mkstemp"(path: *u8) i32
+fn rec_open(path:*const u8, flags:i32, mode:u32) i32 {
+  darwin_io_prepare()
+  return darwin_io_open(path, darwin_io_flags(flags), mode)
+}
+fn rec_close(fd:i32) i32 {
+  darwin_io_prepare()
+  return darwin_io.close(fd)
+}
+fn rec_write(fd:i32, bytes:*const u8, length:usize) isize {
+  darwin_io_prepare()
+  return darwin_io.write(fd, bytes, length)
+}
+fn rec_sync(fd:i32) i32 {
+  darwin_io_prepare()
+  return darwin_io_sync(fd)
+}
+fn rec_rename(from:*const u8, to:*const u8) i32 {
+  darwin_io_prepare()
+  return darwin_io_rename(from, to)
+}
+fn rec_unlink(path:*const u8) i32 {
+  darwin_io_prepare()
+  return darwin_io_unlink(path)
+}
+fn rec_mkdir(path:*const u8, mode:u32) i32 {
+  darwin_io_prepare()
+  return darwin_io_mkdir(path, #cast(u16, mode))
+}
+fn rec_temp(path:*u8) i32 {
+  darwin_io_prepare()
+  return darwin_io_temp(path)
+}
+fn memory_environment(name:*const u8) *u8 {
+  darwin_io_prepare()
+  return darwin_io.environment(name)
+}
+
+fn syntax_dlopen(path:*const u8, flags:i32) rawptr {
+  return native_loader.open(path[..string_length(path)], flags).value
+}
+fn syntax_dlclose(library:rawptr) i32 {
+  if native_loader.close(&library).ok {
+    return 0
+  }
+  return -1
+}

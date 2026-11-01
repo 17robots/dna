@@ -99,6 +99,8 @@ def main():
                 if source in STUBS:
                     shutil.copyfile(ROOT / STUBS[source], stage / source)
     if 'gui' not in chosen['frontends']:
+        for source in [*(stage / 'platform').glob('window_*.dyn'), *(stage / 'platform').glob('memory_*.dyn')]:
+            source.unlink()
         for folder in ('platform/native_present', 'platform/backend'):
             shutil.rmtree(stage / folder, ignore_errors=True)
     (stage / 'build_profile.dyn').write_text(
@@ -114,6 +116,12 @@ def main():
         subprocess.run([sys.executable, str(ROOT / 'scripts/build_native.py'),
                         '--source', str(stage), '--mode', mode,
                         '--output', str(output)], check=True)
+    elif sys.platform == 'darwin':
+        from dyn_path import real_dyn
+        from native_macos import linker_environment
+        environment, links = linker_environment(real_dyn())
+        subprocess.run([sys.executable, ROOT/'scripts/compile.py', real_dyn(), 'build', stage,
+                        '--'+mode, '--output', output, *links], env=environment, check=True)
     else:
         environment = dict(os.environ, DYN_LIBRARY_PATH=str(deps / 'tui-static'))
         subprocess.run([sys.executable, str(ROOT / 'scripts/compile.py'), os.environ.get('DYN', 'dyn'),

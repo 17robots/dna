@@ -12,6 +12,8 @@ struct RpcTransport {
   pending: usize,
   header: usize,
   body: usize,
+  building: bool,
+  build_capacity: usize,
   log_length: usize,
 }
 
@@ -30,8 +32,44 @@ pub fn dna_rpc_open(command: *const u8, directory: *const u8) *RpcTransport {
   proc_watch(state.child.error, 0)
   return state
 }
-pub fn dna_rpc_send(state: *RpcTransport, bytes: *const u8, length: usize) i32 {
-  if state == nil || state.failed || bytes == nil || length == 0 || length > 8388608 {
+// Outgoing document messages can be larger than incoming server responses.
+// Begin/commit lets the UI encode tree chunks straight into the owned queue.
+// The returned view expires on commit, abort, send, or close; calls are confined
+// to the main thread, with no event-loop re-entry while a message is building.
+const RpcOutgoingLimit: usize = 1073741824
+pub fn dna_rpc_send_begin(state: *RpcTransport, capacity: usize) *u8 {
+  if state == nil || state.failed || state.building || capacity == 0 || capacity > RpcOutgoingLimit {
+    return nil
+  }
+  remaining := state.pending - state.sent
+  if remaining > RpcOutgoingLimit + 8192 - capacity - 64 {
+    return nil
+  }
+  if remaining > 0 && state.sent > 0 {
+    _ = proc_move(state.queue, &state.queue[..state.pending][state.sent], remaining)
+  }
+  state.pending = remaining
+  state.sent = 0
+  queue := proc_realloc(state.queue, remaining + capacity + 64)
+  if queue == nil {
+    return nil
+  }
+  state.queue = queue
+  state.building = true
+  state.build_capacity = capacity
+  return &queue[..remaining + capacity + 64][remaining + 64]
+}
+pub fn dna_rpc_send_abort(state: *RpcTransport) {
+  if state != nil {
+    state.building = false
+  }
+}
+pub fn dna_rpc_send_commit(state: *RpcTransport, length: usize) i32 {
+  if state == nil || !state.building {
+    return 0
+  }
+  state.building = false
+  if state.failed || length == 0 || length > state.build_capacity {
     return 0
   }
   prefix: []const u8 = "Content-Length: "
@@ -54,26 +92,24 @@ pub fn dna_rpc_send(state: *RpcTransport, bytes: *const u8, length: usize) i32 {
   }
   _ = copy(&header[used], &suffix[0], 4)
   used += 4
-  remaining := state.pending - state.sent
-  if remaining + length + used > 8396800 {
-    return 0
-  }
-  if remaining > 0 && state.sent > 0 {
-    _ = proc_move(state.queue, &state.queue[..state.pending][state.sent], remaining)
-  }
-  state.pending = remaining
-  state.sent = 0
-  queue := proc_realloc(state.queue, remaining + length + used)
-  if queue == nil {
-    return 0
-  }
-  state.queue = queue
-  capacity := remaining + length + used
-  _ = copy(&queue[..capacity][remaining], &header[0], used)
-  _ = copy(&queue[..capacity][remaining + used], bytes, length)
-  state.pending = capacity
+  remaining := state.pending
+  capacity := remaining + state.build_capacity + 64
+  _ = proc_move(&state.queue[..capacity][remaining + used], &state.queue[..capacity][remaining + 64], length)
+  _ = copy(&state.queue[..capacity][remaining], &header[0], used)
+  state.pending = remaining + used + length
   proc_watch(state.child.input, 1)
   return 1
+}
+pub fn dna_rpc_send(state: *RpcTransport, bytes: *const u8, length: usize) i32 {
+  if bytes == nil {
+    return 0
+  }
+  target := dna_rpc_send_begin(state, length)
+  if target == nil {
+    return 0
+  }
+  _ = copy(target, bytes, length)
+  return dna_rpc_send_commit(state, length)
 }
 fn rpc_parse(state: *RpcTransport) bool {
   if state.body > 0 {

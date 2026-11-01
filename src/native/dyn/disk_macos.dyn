@@ -1,0 +1,290 @@
+#target(kernel: darwin)
+// Each queue owns vnode registrations and a pump thread. Its nonblocking pipe
+// carries small rescan records into the existing event-first disk/picker policy.
+// A full pipe already has an unread rescan, so coalescing never loses coverage.
+struct DarwinVnode { next:*DarwinVnode, fd:i32, device, inode:u64, parent:i32, generation:u64, path:[4096]u8 }
+struct DarwinDiskQueue {
+  next:*DarwinDiskQueue, queue:i32, events, stop:[2]i32, thread:rawptr,
+  nodes:*DarwinVnode, failed:sync.AtomicU32, generation:u64,
+}
+darwin_disk_queues:*DarwinDiskQueue
+darwin_disk_lock:NativeMutex
+fn disk_darwin_find(fd:i32) *DarwinDiskQueue {
+  value:=darwin_disk_queues
+  for value!=nil {
+    if value.events[0]==fd {
+      return value
+    }
+    value=value.next
+  }
+  return nil
+}
+fn disk_darwin_pump(context:rawptr) i32 {
+  owner:=#cast(*DarwinDiskQueue, context)
+  events:[32]NotifyKEvent=[]
+  for true {
+    count:=notify_kevent(owner.queue, nil, 0, &events[0], 32, nil)
+    if count<0 {
+      if rec_errno().*==4 {
+        continue
+      }
+      sync.store_u32(&owner.failed, 1)
+      // The owner must rescan even if the event transport fails.
+      failed:=DiskEvent{descriptor:-1, mask:8192}
+      _=rec_write(owner.events[1], #cast(*const u8, &failed), #sizeof(DiskEvent))
+      return 0
+    }
+    for index in 0..count {
+      event:=&events[#cast(usize, index)]
+      if event.filter == -1 && event.identity==#cast(usize, owner.stop[0]) {
+        return 0
+      }
+      event_mask:u32=256
+      if (event.notes&97)!=0 || (event.flags&16384)!=0 {
+        event_mask=3072
+      }
+      record:=DiskEvent{descriptor:#cast(i32, event.identity), mask:event_mask}
+      _=rec_write(owner.events[1], #cast(*const u8, &record), #sizeof(DiskEvent))
+    }
+  }
+  return 0
+}
+fn disk_inotify(flags:i32) i32 {
+  _=flags
+  owner:=#cast(*DarwinDiskQueue, rec_alloc(1, #sizeof(DarwinDiskQueue)))
+  if owner==nil {
+    return -1
+  }
+  owner.queue=notify_kqueue()
+  owner.events=[-1, -1]
+  owner.stop=[-1, -1]
+  if owner.queue<0 || proc_pipe(&owner.events[0], 526336)!=0 || proc_pipe(&owner.stop[0], 526336)!=0 {
+    if owner.queue>=0 {
+      _=rec_close(owner.queue)
+    }
+    proc_close_fds(owner.events[..])
+    proc_close_fds(owner.stop[..])
+    rec_free(#cast(rawptr, owner))
+    return -1
+  }
+  _=proc_fcntl(owner.queue, 2, 1)
+  stop:=NotifyKEvent{identity:#cast(usize, owner.stop[0]), filter:-1, flags:1}
+  if notify_kevent(owner.queue, &stop, 1, nil, 0, nil)==0 {
+    owner.thread=dna_thread_create(disk_darwin_pump, #cast(rawptr, owner))
+  }
+  if owner.thread==nil {
+    _=rec_close(owner.queue)
+    proc_close_fds(owner.events[..])
+    proc_close_fds(owner.stop[..])
+    rec_free(#cast(rawptr, owner))
+    return -1
+  }
+  rec_lock(#cast(rawptr, &darwin_disk_lock))
+  owner.next=darwin_disk_queues
+  darwin_disk_queues=owner
+  rec_unlock(#cast(rawptr, &darwin_disk_lock))
+  return owner.events[0]
+}
+fn disk_add(queue:i32, path:*const u8, requested_mask:u32) i32 {
+  _=requested_mask
+  rec_lock(#cast(rawptr, &darwin_disk_lock))
+  defer rec_unlock(#cast(rawptr, &darwin_disk_lock))
+  owner:=disk_darwin_find(queue)
+  if owner==nil || sync.load_u32(&owner.failed)!=0 {
+    return -1
+  }
+  // O_EVTONLY | O_CLOEXEC. Parent identity and nofollow checks of the actual
+  // document remain in the shared snapshot transaction.
+  fd:=darwin_io_open(path, 16809984, 0)
+  if fd<0 {
+    return -1
+  }
+  info:=InstallStat{}
+  if install_fstat(fd, &info)!=0 {
+    _=rec_close(fd)
+    return -1
+  }
+  node:=owner.nodes
+  for node!=nil {
+    if node.parent<0 && node.device==info.device && node.inode==info.inode {
+      _=rec_close(fd)
+      return node.fd
+    }
+    node=node.next
+  }
+  node=#cast(*DarwinVnode, rec_alloc(1, #sizeof(DarwinVnode)))
+  if node==nil {
+    _=rec_close(fd)
+    return -1
+  }
+  // EVFILT_VNODE, EV_ADD|EV_CLEAR; DELETE/WRITE/EXTEND/ATTRIB/LINK/RENAME/REVOKE.
+  event:=NotifyKEvent{identity:#cast(usize, fd), filter:-4, flags:33, notes:127}
+  if notify_kevent(owner.queue, &event, 1, nil, 0, nil)!=0 {
+    _=rec_close(fd)
+    rec_free(#cast(rawptr, node))
+    return -1
+  }
+  node.parent=-1
+  node.fd=fd
+  node.device=info.device
+  node.inode=info.inode
+  node.next=owner.nodes
+  owner.nodes=node
+  return fd
+}
+fn disk_remove(queue:i32, descriptor:i32) i32 {
+  rec_lock(#cast(rawptr, &darwin_disk_lock))
+  defer rec_unlock(#cast(rawptr, &darwin_disk_lock))
+  owner:=disk_darwin_find(queue)
+  if owner==nil {
+    return -1
+  }
+  children:=&owner.nodes
+  for children.*!=nil {
+    child:=children.*
+    if child.parent==descriptor {
+      children.*=child.next
+      _=rec_close(child.fd)
+      rec_free(#cast(rawptr, child))
+    } else {
+      children=&child.next
+    }
+  }
+  link:=&owner.nodes
+  for link.*!=nil {
+    node:=link.*
+    if node.fd==descriptor {
+      link.*=node.next
+      event:=NotifyKEvent{identity:#cast(usize, descriptor), filter:-4, flags:2}
+      _=notify_kevent(owner.queue, &event, 1, nil, 0, nil)
+      _=rec_close(descriptor)
+      rec_free(#cast(rawptr, node))
+      return 0
+    }
+    link=&node.next
+  }
+  return -1
+}
+fn disk_changes_close(fd:i32) {
+  rec_lock(#cast(rawptr, &darwin_disk_lock))
+  link:=&darwin_disk_queues
+  for link.*!=nil && link.*.events[0]!=fd {
+    link=&link.*.next
+  }
+  owner:=link.*
+  if owner!=nil {
+    link.*=owner.next
+  }
+  rec_unlock(#cast(rawptr, &darwin_disk_lock))
+  if owner==nil {
+    return
+  }
+  byte:u8=1
+  _=rec_write(owner.stop[1], &byte, 1)
+  dna_thread_join(owner.thread, nil)
+  _=rec_close(owner.queue)
+  node:=owner.nodes
+  for node!=nil {
+    next:=node.next
+    _=rec_close(node.fd)
+    rec_free(#cast(rawptr, node))
+    node=next
+  }
+  proc_close_fds(owner.events[..])
+  proc_close_fds(owner.stop[..])
+  rec_free(#cast(rawptr, owner))
+}
+
+// Directory vnodes report name changes, not writes to existing children. Keep
+// one file vnode per logical watched path, replacing its owner after rename.
+fn disk_target_watch(queue:i32, path:*const u8, parent:i32) bool {
+  if parent<0 {
+    return false
+  }
+  rec_lock(#cast(rawptr, &darwin_disk_lock))
+  defer rec_unlock(#cast(rawptr, &darwin_disk_lock))
+  owner:=disk_darwin_find(queue)
+  if owner==nil || sync.load_u32(&owner.failed)!=0 {
+    return false
+  }
+  link:=&owner.nodes
+  for link.*!=nil {
+    node:=link.*
+    if node.parent==parent && install_equal(&node.path[0], path[..string_length(path)]) {
+      break
+    }
+    link=&node.next
+  }
+  previous:=link.*
+  fd:=darwin_io_open(path, 16810240, 0) // EVTONLY | CLOEXEC | NOFOLLOW
+  if fd<0 {
+    error:=rec_errno().*
+    if previous!=nil {
+      link.*=previous.next
+      _=rec_close(previous.fd)
+      rec_free(#cast(rawptr, previous))
+    }
+    return error==2 || error==20 || error==62
+  }
+  info:=InstallStat{}
+  if install_fstat(fd, &info)!=0 {
+    _=rec_close(fd)
+    return false
+  }
+  if previous!=nil && previous.device==info.device && previous.inode==info.inode {
+    previous.generation=owner.generation
+    _=rec_close(fd)
+    return true
+  }
+  next:=#cast(*DarwinVnode, rec_alloc(1, #sizeof(DarwinVnode)))
+  if next==nil {
+    _=rec_close(fd)
+    return false
+  }
+  event:=NotifyKEvent{identity:#cast(usize, fd), filter:-4, flags:33, notes:127}
+  if notify_kevent(owner.queue, &event, 1, nil, 0, nil)!=0 {
+    _=rec_close(fd)
+    rec_free(#cast(rawptr, next))
+    return false
+  }
+  next.fd=fd
+  next.generation=owner.generation
+  next.parent=parent
+  next.device=info.device
+  next.inode=info.inode
+  _=copy(&next.path[0], path, string_length(path)+1)
+  if previous!=nil {
+    next.next=previous.next
+    _=rec_close(previous.fd)
+    rec_free(#cast(rawptr, previous))
+  }
+  link.*=next
+  return true
+}
+fn disk_targets_begin(queue:i32) {
+  rec_lock(#cast(rawptr, &darwin_disk_lock))
+  defer rec_unlock(#cast(rawptr, &darwin_disk_lock))
+  owner:=disk_darwin_find(queue)
+  if owner!=nil {
+    owner.generation=#wrap(owner.generation+1)
+  }
+}
+fn disk_targets_end(queue:i32) {
+  rec_lock(#cast(rawptr, &darwin_disk_lock))
+  defer rec_unlock(#cast(rawptr, &darwin_disk_lock))
+  owner:=disk_darwin_find(queue)
+  if owner==nil {
+    return
+  }
+  link:=&owner.nodes
+  for link.*!=nil {
+    node:=link.*
+    if node.parent>=0 && node.generation!=owner.generation {
+      link.*=node.next
+      _=rec_close(node.fd)
+      rec_free(#cast(rawptr, node))
+    } else {
+      link=&node.next
+    }
+  }
+}

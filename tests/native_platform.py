@@ -225,10 +225,14 @@ with tempfile.TemporaryDirectory(prefix='dna-native-platform-') as directory:
         declarations.append(types[match.start():end])
     (stage/'types.dyn').write_text('use "std/mem"\n#link("dna_native")\npub const WorkerWakeEvent:u32=32768\npub const InputOverflowEvent:u32=32770\n'+'\n'.join(declarations))
     shutil.copyfile(ROOT/'src/platform/gui.dyn',stage/'sdl.dyn')
+    for module in ('host','owned_arena','cstring'):
+        shutil.copytree(ROOT/'src'/module,stage/module)
+    for selection in [*(ROOT/'src/platform').glob('window_*.dyn'), *(ROOT/'src/platform').glob('memory_*.dyn')]:
+        shutil.copyfile(selection,stage/selection.name)
     shutil.copytree(ROOT/'src/platform/native_present',stage/'native_present')
     (stage/'backend').mkdir()
     shutil.copyfile(ROOT/f'modules/native/platform_{BACKEND}.dyn',stage/'backend/backend.dyn')
-    for source in [stage/'sdl.dyn',*(stage/'native_present').rglob('*.dyn')]:
+    for source in [stage/'sdl.dyn',*stage.glob('window_*.dyn'),*(stage/'native_present').rglob('*.dyn')]:
         text=source.read_text().replace('"vendor/window/wayland"','"vendor/window"')
         if BACKEND=='wayland': text=text.replace('"vendor/window"','"vendor/window/wayland"')
         source.write_text(text)

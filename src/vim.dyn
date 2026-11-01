@@ -256,7 +256,7 @@ fn vim_class(doc: *const buffer.Document, at: usize, big: bool) u8 {
   if at >= doc.length {
     return 0
   }
-  byte := doc.bytes[at]
+  byte := buffer.byte_at(doc, at)
   if byte == ' ' || byte == 9 || byte == 10 || byte == 13 {
     return 0
   }
@@ -278,7 +278,7 @@ fn vim_word_forward(doc: *const buffer.Document, position: usize, big: bool) usi
     }
   }
   for at < doc.length && vim_class(doc, at, big) == 0 {
-    if doc.bytes[at] == 10 && at + 1 < doc.length && doc.bytes[at + 1] == 10 {
+    if buffer.byte_at(doc, at) == 10 && at + 1 < doc.length && buffer.byte_at(doc, at + 1) == 10 {
       return at + 1
     }
     at = buffer.next(doc, at)
@@ -311,7 +311,7 @@ fn vim_word_back(doc: *const buffer.Document, position: usize, big: bool) usize 
   }
   at := buffer.previous(doc, position)
   for at > 0 && vim_class(doc, at, big) == 0 {
-    if doc.bytes[at] == 10 && doc.bytes[at - 1] == 10 {
+    if buffer.byte_at(doc, at) == 10 && buffer.byte_at(doc, at - 1) == 10 {
       return at
     }
     at = buffer.previous(doc, at)
@@ -387,19 +387,19 @@ fn vim_bracket_pair(byte: u8) u8 {
 fn vim_match(doc: *const buffer.Document, position: usize) VimMotion {
   ending := vim_text_end(doc, position)
   at := position
-  for at < ending && vim_bracket_pair(doc.bytes[at]) == 0 {
+  for at < ending && vim_bracket_pair(buffer.byte_at(doc, at)) == 0 {
     at += 1
   }
   if at >= ending {
     return VimMotion{}
   }
-  open := doc.bytes[at]
+  open := buffer.byte_at(doc, at)
   close := vim_bracket_pair(open)
   forward := open == '(' || open == '[' || open == '{'
   depth: usize = 0
   scan := at
   for {
-    byte := doc.bytes[scan]
+    byte := buffer.byte_at(doc, scan)
     if byte == open {
       depth += 1
     }
@@ -456,7 +456,7 @@ fn vim_find(doc: *const buffer.Document, position: usize, kind: u32, text: []con
       }
       at = buffer.previous(doc, at)
     }
-    if at + #len(text) <= doc.length && buffer.equal(doc.bytes[at..at + #len(text)], text) {
+    if at + #len(text) <= doc.length && buffer.equal(buffer.range(doc, at, at + #len(text)), text) {
       found += 1
     }
   }
@@ -548,7 +548,7 @@ fn vim_motion(app: *App, typography: *Typography, character: u32, key: u32, coun
       }
       beginning := buffer.row_start(doc, last_row)
       at := vim_text_end(doc, beginning)
-      for at > beginning && (doc.bytes[at - 1] == ' ' || doc.bytes[at - 1] == 9) {
+      for at > beginning && (buffer.byte_at(doc, at - 1) == ' ' || buffer.byte_at(doc, at - 1) == 9) {
         at -= 1
       }
       if at > beginning {
@@ -837,15 +837,15 @@ fn vim_operate(app: *App, operator: u32, low: usize, end: usize, linewise: bool,
   else if inclusive && range_high < doc.length {
     range_high = buffer.next(doc, range_high)
   }
-  text := doc.bytes[range_low..range_high]
+  text := buffer.range(doc, range_low, range_high)
   if operator == 'y' {
     if linewise && #len(text) > 0 && text[#len(text) - 1] != 10 {
       // The last line without a newline still yanks as a whole line.
       first_line := buffer.line_start(doc, first)
-      vim_store(app, doc.bytes[first_line..range_high], true)
+      vim_store(app, buffer.range(doc, first_line, range_high), true)
     }
     else if linewise {
-      vim_store(app, doc.bytes[buffer.line_start(doc, first)..range_high], true)
+      vim_store(app, buffer.range(doc, buffer.line_start(doc, first), range_high), true)
     }
     else {
       vim_store(app, text, false)
@@ -868,7 +868,7 @@ fn vim_operate(app: *App, operator: u32, low: usize, end: usize, linewise: bool,
   app.vim.changed = true
   if operator == 'd' || operator == 'c' {
     if linewise {
-      vim_store(app, doc.bytes[buffer.line_start(doc, first)..range_high], true)
+      vim_store(app, buffer.range(doc, buffer.line_start(doc, first), range_high), true)
     }
     else {
       vim_store(app, text, false)
@@ -1114,7 +1114,7 @@ fn vim_open_line(app: *App, above: bool, count: usize) {
   head := buffer.head(doc)
   beginning := buffer.line_start(doc, head)
   indent_end := beginning
-  for indent_end < doc.length && (doc.bytes[indent_end] == ' ' || doc.bytes[indent_end] == 9) {
+  for indent_end < doc.length && (buffer.byte_at(doc, indent_end) == ' ' || buffer.byte_at(doc, indent_end) == 9) {
     indent_end += 1
   }
   indent: [256]u8 = []
@@ -1122,7 +1122,7 @@ fn vim_open_line(app: *App, above: bool, count: usize) {
   if indent_length > 255 {
     indent_length = 255
   }
-  _ = buffer.copy_bytes(&indent[1], &doc.bytes[beginning], indent_length)
+  _ = buffer.copy_bytes(&indent[1], buffer.pointer(doc, beginning, beginning + indent_length), indent_length)
   indent[0] = 10
   buffer.checkpoint(doc)
   position: usize = 0
@@ -1177,7 +1177,7 @@ fn vim_insert_finish(app: *App) {
       used += 1
     }
     if typed > 0 {
-      _ = buffer.copy_bytes(&payload[used], &doc.bytes[start], typed)
+      _ = buffer.copy_bytes(&payload[used], buffer.pointer(doc, start, start + typed), typed)
     }
     used += typed
   }
@@ -1745,7 +1745,7 @@ fn vim_apply_motion(app: *App, motion: VimMotion, character: u32, prefix_g: bool
         return
       }
       high = buffer.previous(doc, high)
-      if high > low && doc.bytes[high] == 10 {
+      if high > low && buffer.byte_at(doc, high) == 10 {
         vim_operate(app, operator, low, high, false, false)
         return
       }
@@ -2239,7 +2239,7 @@ fn vim_visual_put(app: *App, swap: bool) {
     vim_line_range(doc, low, high, &range_low, &range_high)
   }
   if swap {
-    vim_store(app, doc.bytes[range_low..range_high], linewise)
+    vim_store(app, buffer.range(doc, range_low, range_high), linewise)
   }
   vim_register_done(app)
   buffer.checkpoint(doc)

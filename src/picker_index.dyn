@@ -49,17 +49,27 @@ fn picker_index_receive(app: *App) bool {
       return false
     }
   }
-  index.count = 0
+  // Rows of one generation are immutable prefixes, so a growing snapshot only
+  // imports what is new instead of copying the whole list again.
+  if state.received_count == 0 || state.received_count > count {
+    state.received_count = 0
+    index.count = 0
+    index.used = 0
+  }
   index.visited = visited
   index.limited = (flags & 1) != 0
   index.error = (flags & 2) != 0
   state.watch_fallback = (flags & 4) != 0
-  for row in 0..count {
-    entry := &index.entries[index.count]
-    length := picker_native_row(state.worker, state.generation, row, &entry.name[0], #len(entry.name))
+  for row in state.received_count..count {
+    if index.count == #len(index.offsets) || #len(index.names) - index.used < 512 {
+      index.limited = true
+      break
+    }
+    length := picker_native_row(state.worker, state.generation, row, &index.names[index.used], #len(index.names) - index.used)
     if length > 0 {
-      entry.length = length
-      entry.directory = false
+      index.names[index.used + length] = 0
+      index.offsets[index.count] = index.used
+      index.used += length + 1
       index.count += 1
     }
   }
@@ -68,6 +78,14 @@ fn picker_index_receive(app: *App) bool {
     state.refresh_due = sdl.ticks() + 2000
   }
   return true
+}
+fn picker_index_name(index: *PickerIndex, row: usize) []const u8 {
+  start := index.offsets[row]
+  length: usize = 0
+  for index.names[start + length] != 0 {
+    length += 1
+  }
+  return index.names[start..start + length]
 }
 fn picker_index_tick(app: *App) bool {
   state := &app.picker_state

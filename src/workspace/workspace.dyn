@@ -16,6 +16,17 @@ pub struct SavedBuffer {
   used: bool,
   // Restore from the file on disk; text and saved are not stored.
   reload: bool,
+  // With reload: unsaved edits as one replacement of file bytes
+  // patch_low..patch_high by patch, valid only while the file still has
+  // stamp (inode, size, modification seconds and nanoseconds).
+  patched: bool,
+  patch_low, patch_high: usize,
+  patch: []const u8,
+  stamp: [4]u64,
+  // With patched: when pieces is nonempty, the text is these pieces instead
+  // of one replacement. Each piece is three little-endian words (1 for
+  // literal bytes from patch, else 0 for bytes of the file; offset; length).
+  pieces: []const u8,
 }
 pub struct SavedPane {
   secondary: buffer.SelectionSet,
@@ -37,6 +48,8 @@ pub struct State {
   buffers: [16]SavedBuffer,
   additional: []SavedBuffer,
   storage: *mem.Arena,
+  // Piece records and literals captured for recovery, owned by the state.
+  patches: *mem.Arena,
   panes: [15]SavedPane,
   active: usize,
   focused: usize,
@@ -86,6 +99,10 @@ pub fn prepare(state: *State, count: usize) bool {
 pub fn release(state: *State) {
   mem.arena_release(state.storage)
   state.storage = nil
+  if state.patches != nil {
+    mem.arena_release(state.patches)
+    state.patches = nil
+  }
   state.additional = state.additional[..0]
 }
 struct Reader { bytes: []const u8, at: usize, ok: bool = true }
@@ -130,6 +147,17 @@ fn get_number(input: *Reader) usize {
   input.at += 8
   return value
 }
+// Length-prefixed binary bytes, without the UTF-8 check get_text applies.
+fn get_bytes(input: *Reader, limit: usize) []const u8 {
+  length := get_number(input)
+  if length > limit || length > #len(input.bytes) - input.at {
+    input.ok = false
+    return ""
+  }
+  result := input.bytes[input.at..input.at + length]
+  input.at += length
+  return result
+}
 fn get_text(input: *Reader, limit: usize) []const u8 {
   length := get_number(input)
   if length > limit || length > #len(input.bytes) - input.at {
@@ -165,12 +193,30 @@ pub fn encode(state: *const State, output: []u8) usize {
   for index in 0..buffer_count(state) {
     item := buffer_at(state, index)
     if item.used && item.reload {
-      // Flag 2: the path and position only.
-      number(&writer, 2)
+      // Flag 2: the path and position only; flag 3 adds the edit patch.
+      if item.patched && #len(item.pieces) > 0 {
+        number(&writer, 4)
+      } else if item.patched {
+        number(&writer, 3)
+      } else {
+        number(&writer, 2)
+      }
       text(&writer, item.path)
       text(&writer, item.filetype)
       number(&writer, item.cursor)
       number(&writer, item.anchor)
+      if item.patched {
+        for value in item.stamp {
+          number(&writer, #cast(usize, value))
+        }
+        if #len(item.pieces) > 0 {
+          text(&writer, item.pieces)
+        } else {
+          number(&writer, item.patch_low)
+          number(&writer, item.patch_high)
+        }
+        text(&writer, item.patch)
+      }
       continue
     }
     number(&writer, flag(item.used))
@@ -282,16 +328,35 @@ pub fn decode(source: []const u8, state: *State) bool {
   for index in 0..buffer_count(state) {
     item := buffer_mut(state, index)
     used := get_number(&reader)
-    if used > 2 || (used == 2 && !newer) {
+    if used > 4 || (used >= 2 && !newer) {
       return false
     }
-    if used == 2 {
+    if used >= 2 {
       item.used = true
       item.reload = true
       item.path = get_text(&reader, 3999)
       item.filetype = get_text(&reader, 64)
       item.cursor = get_number(&reader)
       item.anchor = get_number(&reader)
+      if used >= 3 {
+        item.patched = true
+        for index_stamp in 0..4 {
+          item.stamp[index_stamp] = #cast(u64, get_number(&reader))
+        }
+        if used == 4 {
+          item.pieces = get_bytes(&reader, #len(source))
+          if #len(item.pieces) == 0 || #len(item.pieces) % 24 != 0 {
+            return false
+          }
+        } else {
+          item.patch_low = get_number(&reader)
+          item.patch_high = get_number(&reader)
+        }
+        item.patch = get_text(&reader, buffer.Capacity)
+        if item.patch_low > item.patch_high || !utf8.valid(item.patch) {
+          return false
+        }
+      }
       if #len(item.path) == 0 || item.path[0] != '/' {
         return false
       }
@@ -385,6 +450,14 @@ pub fn encoded_size(state: *const State) usize {
     item := buffer_at(state, index)
     if item.used && item.reload {
       size += 32 + #len(item.path) + #len(item.filetype)
+      if item.patched {
+        // Four stamp words, the range, and the patch with its length.
+        size += 56 + #len(item.patch)
+        if #len(item.pieces) > 0 {
+          // The piece records with their length replace the two range words.
+          size += #len(item.pieces) - 8
+        }
+      }
     }
     else if item.used {
       if item.split_saved {

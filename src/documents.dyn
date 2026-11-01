@@ -14,6 +14,8 @@ struct Documents {
   saving: SaveSequence,
   closing_one: bool,
   quit_after_save: bool,
+  // A large document's save writing on a worker (file_actions.dyn).
+  save_task: *SaveTask,
   // Previously active slot, for ga (goto alternate buffer).
   previous: usize,
 }
@@ -57,6 +59,12 @@ struct Slot {
   syntax_checked: bool,
   syntax_revision: u64,
   syntax_used: u64,
+  // Large documents parse an immutable snapshot with windowed color output:
+  // window_* is the color range requested under window_tag, shown_* the
+  // range slot.colors currently describes, view_* the last drawn range.
+  syntax_window_low, syntax_window_high, syntax_shown_low, syntax_shown_high: usize,
+  syntax_view_low, syntax_view_high: usize,
+  syntax_window_tag, syntax_shown_tag, syntax_window_revision: u64,
   colors: []u8,
   arena: *mem.Arena,
   document: *buffer.Document,
@@ -168,6 +176,9 @@ fn new_buffer(app: *App) bool {
   document := buffer.try_allocate(allocated)
   colors := mem.arena_try_push_uninit(allocated, buffer.Capacity + 1, 1)
   if document == nil || !colors.ok {
+    if document != nil {
+      buffer.release(document)
+    }
     arena_owner.release(allocated)
     notice(app, "Could not initialize a new buffer. Existing buffers are unchanged.")
     return false
@@ -179,6 +190,7 @@ fn new_buffer(app: *App) bool {
     slot = app.documents.slots[index]
   }
   if slot == nil {
+    buffer.release(document)
     arena_owner.release(allocated)
     notice(app, "Could not grow buffer storage. Existing buffers are unchanged.")
     return false
@@ -229,6 +241,7 @@ fn document_release(app: *App, slot: *Slot) {
   }
   buffer.clear_observer(slot.document)
   slot.owner = nil
+  buffer.release(slot.document)
   arena_owner.release(slot.arena)
   slot.arena = nil
   allocation_record(app, "document", #sizeof(buffer.Document) + buffer.Capacity + 129, slot.arena_born, true)
@@ -248,4 +261,27 @@ fn documents_rollback_new(app: *App, indices: []const usize, original: usize) {
     remaining -= 1
     close_slot(app, indices[remaining])
   }
+}
+// Advance files loading in the background. Returns true when one finished.
+fn documents_load_tick(app: *App) bool {
+  changed := false
+  for index in 0..#len(app.documents.slots) {
+    doc := app.documents.slots[index].document
+    if doc != nil && buffer.load_state(doc) == buffer.LoadRunning && buffer.load_tick(doc) {
+      changed = true
+      if buffer.load_state(doc) == buffer.LoadFailed {
+        notice(app, "Later text in this file is not valid UTF-8; only its start is open, and saving is disabled.")
+      }
+    }
+  }
+  return changed
+}
+fn documents_loading(app: *const App) bool {
+  for index in 0..#len(app.documents.slots) {
+    doc := app.documents.slots[index].document
+    if doc != nil && buffer.load_state(doc) == buffer.LoadRunning {
+      return true
+    }
+  }
+  return false
 }

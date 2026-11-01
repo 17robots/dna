@@ -1,4 +1,5 @@
 use "./pattern"
+use "std/time"
 
 struct SearchHistory { text: [4096]u8, length: usize }
 
@@ -12,6 +13,9 @@ struct SearchState {
   error_offset: usize,
   scroll_x: f32,
   scroll_y: f32,
+  // Large documents search on a worker while the prompt stays responsive;
+  // status is 5 until it reports.
+  task: *pattern.SearchTask,
 }
 
 fn search_prompt(kind: Panel) bool {
@@ -29,6 +33,7 @@ fn search_open(app: *App, kind: Panel, explorer: bool) {
     scroll_y = app.explorer.scroll_y
   }
   panel(app, kind)
+  pattern.task_finish(app.search_state.task)
   app.search_state = SearchState{document: doc, primary: buffer.Selection{cursor: doc.cursor, anchor: doc.anchor}, secondary: doc.secondary, explorer: explorer, extend: extending, scroll_x: scroll_x, scroll_y: scroll_y}
 }
 fn search_restore(app: *App) {
@@ -49,26 +54,37 @@ fn search_restore(app: *App) {
   }
 }
 fn search_close(app: *App) {
+  pattern.task_finish(app.search_state.task)
+  app.search_state.task = nil
   app.prompt_state.panel = Panel.None
   if app.search_state.explorer {
     app.prompt_state.panel = Panel.Directory
   }
 }
-fn search_step(doc: *const buffer.Document, compiled: *pattern.Pattern, selection: buffer.Selection, backwards: bool) pattern.Match {
+// Where a search from selection starts: past an empty cursor going forward,
+// at the selection's start going back.
+fn search_base(doc: *const buffer.Document, selection: buffer.Selection, backwards: bool) usize {
   base := selection.cursor
   if !backwards {
     if selection.cursor == selection.anchor && base < doc.length {
       base = buffer.next(doc, base)
     }
-    // Skip a zero-width match at the current cursor when repeating.
-    result := pattern.find(compiled, doc.bytes[..doc.length], base)
-    if result.found || result.error {
-      return result
-    }
-    return pattern.find(compiled, doc.bytes[..doc.length], 0)
+    return base
   }
   if selection.anchor < base {
     base = selection.anchor
+  }
+  return base
+}
+fn search_step(doc: *const buffer.Document, compiled: *pattern.Pattern, selection: buffer.Selection, backwards: bool) pattern.Match {
+  base := search_base(doc, selection, backwards)
+  if !backwards {
+    // Skip a zero-width match at the current cursor when repeating.
+    result := pattern.find_document(compiled, doc, base)
+    if result.found || result.error {
+      return result
+    }
+    return pattern.find_document(compiled, doc, 0)
   }
   // Scan forward to the last match before the cursor. Positions strictly
   // advance, so the scan is linear and needs no attempt cap.
@@ -76,7 +92,7 @@ fn search_step(doc: *const buffer.Document, compiled: *pattern.Pattern, selectio
   wrapped := pattern.Match{}
   at: usize = 0
   for at <= doc.length {
-    candidate := pattern.find(compiled, doc.bytes[..doc.length], at)
+    candidate := pattern.find_document(compiled, doc, at)
     if candidate.error {
       return candidate
     }
@@ -159,7 +175,7 @@ fn select_matches(doc: *buffer.Document, compiled: *pattern.Pattern, split: bool
     range := buffer.ordered(originals.items[current])
     low := range.anchor
     high := range.cursor
-    text := doc.bytes[low..high]
+    text := buffer.range(doc, low, high)
     at: usize = 0
     segment: usize = 0
     attempts: usize = 0
@@ -207,8 +223,36 @@ fn search_preview(app: *App) {
   search_restore(app)
   state := &app.search_state
   state.status = 0
+  pattern.task_finish(state.task)
+  state.task = nil
   if app.prompt_state.length == 0 {
     return
+  }
+  doc := state.document
+  if app.prompt_state.panel != Panel.Search && doc.length >= pattern.BackgroundMinimum {
+    mode: u8 = 1
+    if app.prompt_state.panel == Panel.Split {
+      mode = 2
+    } else if app.prompt_state.panel == Panel.Keep {
+      mode = 3
+    } else if app.prompt_state.panel == Panel.Remove {
+      mode = 4
+    }
+    ranges := buffer.collect(doc)
+    state.task = pattern.task_start_ranges(app.prompt_state.text[..app.prompt_state.length], doc, &ranges, mode)
+    if state.task != nil {
+      state.status = 5
+      return
+    }
+  }
+  if app.prompt_state.panel == Panel.Search && doc.length >= pattern.BackgroundMinimum && doc.secondary.count == 0 {
+    backwards := app.input_state.search_backwards
+    base := search_base(doc, buffer.Selection{anchor: doc.anchor, cursor: doc.cursor}, backwards)
+    state.task = pattern.task_start(app.prompt_state.text[..app.prompt_state.length], doc, base, backwards)
+    if state.task != nil {
+      state.status = 5
+      return
+    }
   }
   compiled := pattern.open(app.prompt_state.text[..app.prompt_state.length])
   defer pattern.close(&compiled)
@@ -227,10 +271,65 @@ fn search_preview(app: *App) {
     state.status = select_matches(state.document, &compiled, app.prompt_state.panel == Panel.Split)
   }
 }
-fn search_submit(app: *App) {
-  // An empty preview dismisses immediately; do not repeat an unsuccessful scan.
-  if app.prompt_state.length > 0 && app.search_state.status != 1 {
+// Apply a finished worker search. Returns true when the view changed.
+fn search_tick(app: *App) bool {
+  state := &app.search_state
+  if state.task == nil || !pattern.task_done(state.task) {
+    return false
+  }
+  result := pattern.task_result(state.task)
+  ranges_status := pattern.task_status(state.task)
+  ranges_output := pattern.task_output(state.task).*
+  stale := pattern.task_revision(state.task) != state.document.revision
+  pattern.task_finish(state.task)
+  state.task = nil
+  if stale {
     search_preview(app)
+    return true
+  }
+  if app.prompt_state.panel != Panel.Search {
+    state.status = ranges_status
+    if ranges_status == 0 {
+      buffer.store(state.document, &ranges_output)
+    }
+    return true
+  }
+  state.status = 1
+  if result.error {
+    state.status = 3
+  }
+  else if result.found {
+    doc := state.document
+    original := buffer.Selection{anchor: doc.anchor, cursor: doc.cursor}
+    selection := search_range(doc, original, result, state.extend, app.input_state.search_backwards)
+    doc.anchor = selection.anchor
+    doc.cursor = selection.cursor
+    state.status = 0
+  }
+  return true
+}
+fn search_pause() {
+  _ = time.sleep(time.Millisecond)
+}
+fn search_waiting(app: *const App) bool {
+  return app.search_state.task != nil
+}
+fn search_submit(app: *App) {
+  // Enter while a worker searches waits for its answer.
+  for app.search_state.task != nil && !pattern.task_done(app.search_state.task) {
+    search_pause()
+  }
+  _ = search_tick(app)
+  // An empty preview dismisses immediately; do not repeat an unsuccessful scan.
+  // A large document's preview already ran on the worker; repeating it
+  // would only start another.
+  background := app.search_state.document != nil && app.search_state.document.length >= pattern.BackgroundMinimum
+  if app.prompt_state.length > 0 && app.search_state.status != 1 && !(background && app.search_state.status == 0) {
+    search_preview(app)
+    for app.search_state.task != nil && !pattern.task_done(app.search_state.task) {
+      search_pause()
+    }
+    _ = search_tick(app)
   }
   if app.prompt_state.length == 0 || app.search_state.status == 1 {
     search_restore(app)
@@ -259,6 +358,9 @@ fn search_repeat(app: *App, backwards: bool, explorer: bool) {
     doc = app.explorer.document
     extending = app.explorer.extend
   }
+  if doc.length >= pattern.BackgroundMinimum && doc.secondary.count == 0 && search_repeat_windowed(app, doc, extending, backwards) {
+    return
+  }
   compiled := pattern.open(app.search_history.text[..app.search_history.length])
   defer pattern.close(&compiled)
   if !compiled.ok {
@@ -268,6 +370,28 @@ fn search_repeat(app: *App, backwards: bool, explorer: bool) {
   if result != 0 {
     notice(app, "No match, or search exceeded its work limit.")
   }
+}
+// Repeat a search in a large document with the worker's windowed search,
+// waiting for it: a backward step there never rescans from the top.
+fn search_repeat_windowed(app: *App, doc: *buffer.Document, extending: bool, backwards: bool) bool {
+  original := buffer.Selection{anchor: doc.anchor, cursor: doc.cursor}
+  task := pattern.task_start(app.search_history.text[..app.search_history.length], doc, search_base(doc, original, backwards), backwards)
+  if task == nil {
+    return false
+  }
+  for !pattern.task_done(task) {
+    search_pause()
+  }
+  result := pattern.task_result(task)
+  pattern.task_finish(task)
+  if result.found {
+    selection := search_range(doc, original, result, extending, backwards)
+    doc.anchor = selection.anchor
+    doc.cursor = selection.cursor
+  } else {
+    notice(app, "No match, or search exceeded its work limit.")
+  }
+  return true
 }
 fn search_label(app: *const App) []const u8 {
   if app.prompt_state.length == 0 {
@@ -285,6 +409,9 @@ fn search_label(app: *const App) []const u8 {
   if app.search_state.status == 4 {
     return "More than 32 selections. Narrow the pattern; selection unchanged."
   }
+  if app.search_state.status == 5 {
+    return "Searching..."
+  }
   return "Enter accepts. Escape restores the original selection."
 }
 
@@ -293,7 +420,7 @@ fn filter_selections(doc: *buffer.Document, compiled: *pattern.Pattern, remove: 
   output := buffer.Selections{}
   for index in 0..originals.count {
     range := buffer.ordered(originals.items[index])
-    found := pattern.find(compiled, doc.bytes[range.anchor..range.cursor], 0)
+    found := pattern.find(compiled, buffer.range(doc, range.anchor, range.cursor), 0)
     if found.error {
       return 3
     }

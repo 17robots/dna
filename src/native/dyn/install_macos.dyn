@@ -1,0 +1,151 @@
+#target(kernel: darwin)
+#link("System")
+struct InstallStat {
+  device, inode, links: u64,
+  mode, uid, gid, padding: u32,
+  rdevice: u64,
+  size, block_size, blocks: i64,
+  access_seconds, access_nanos, modify_seconds, modify_nanos: i64,
+  change_seconds, change_nanos: i64,
+  reserved: [3]i64,
+}
+struct InstallEntry { inode: u64, offset: i64, length: u16, kind: u8, name: [1024]u8 }
+
+struct DarwinStat {
+  device: i32, mode, links: u16, inode: u64,
+  uid, gid: u32, special_device: i32,
+  access_seconds, access_nanoseconds, modified_seconds, modified_nanoseconds: i64,
+  changed_seconds, changed_nanoseconds, birth_seconds, birth_nanoseconds: i64,
+  size, blocks: i64, block_size: i32, flags, generation: u32,
+  spare: i32, spare_quad: [2]i64,
+}
+struct DarwinEntry {
+  inode, seek: u64, record_length, name_length: u16, kind: u8, name: [1024]u8,
+}
+// Policy consumes normalized metadata, never a Darwin struct stat directly.
+fn install_darwin_info(output:*InstallStat, value:*const DarwinStat) {
+  output.* = InstallStat{
+    device: #cast(u64, #cast(u32, value.device)), inode: value.inode,
+    links: #cast(u64, value.links), mode: #cast(u32, value.mode), uid:value.uid, gid:value.gid,
+    rdevice:#cast(u64, #cast(u32, value.special_device)), size:value.size,
+    block_size:#cast(i64, value.block_size), blocks:value.blocks,
+    access_seconds:value.access_seconds, access_nanos:value.access_nanoseconds,
+    modify_seconds:value.modified_seconds, modify_nanos:value.modified_nanoseconds,
+    change_seconds:value.changed_seconds, change_nanos:value.changed_nanoseconds,
+  }
+}
+extern fn install_darwin_openat "openat"(fd:i32, name:*const u8, flags:i32, ...) i32
+extern fn install_mkdtemp "mkdtemp"(path:*u8) *u8
+extern fn install_rmdir "rmdir"(path:*const u8) i32
+extern fn install_darwin_rename "renameatx_np"(source_fd:i32, source:*const u8, target_fd:i32, target:*const u8, flags:u32) i32
+extern fn install_dup "dup"(fd:i32) i32
+extern fn install_darwin_closedir "closedir"(directory:rawptr) i32
+extern fn install_darwin_dirfd "dirfd"(directory:rawptr) i32
+struct DarwinDirectory { native:rawptr, entry:InstallEntry }
+fn install_fstat(fd:i32, output:*InstallStat) i32 {
+  darwin_io_prepare()
+  info:=DarwinStat{}
+  result:=install_darwin_fstat(fd, &info)
+  if result==0 {
+    install_darwin_info(output, &info)
+  }
+  return result
+}
+fn install_lstat(path:*const u8, output:*InstallStat) i32 {
+  darwin_io_prepare()
+  info:=DarwinStat{}
+  result:=install_darwin_lstat(path, &info)
+  if result==0 {
+    install_darwin_info(output, &info)
+  }
+  return result
+}
+fn disk_stat(path:*const u8, output:*InstallStat) i32 {
+  darwin_io_prepare()
+  info:=DarwinStat{}
+  result:=install_darwin_stat(path, &info)
+  if result==0 {
+    install_darwin_info(output, &info)
+  }
+  return result
+}
+fn install_fstatat(fd:i32, path:*const u8, output:*InstallStat, flags:i32) i32 {
+  darwin_io_prepare()
+  native:i32=0
+  if (flags&256)!=0 {
+    native|=32
+  }
+  if fd == -100 {
+    fd = -2
+  }
+  info:=DarwinStat{}
+  result:=install_darwin_fstatat(fd, path, &info, native)
+  if result==0 {
+    install_darwin_info(output, &info)
+  }
+  return result
+}
+fn install_openat(fd:i32, path:*const u8, flags:i32, mode:u32) i32 {
+  darwin_io_prepare()
+  if fd == -100 {
+    fd = -2
+  }
+  return install_darwin_openat(fd, path, darwin_io_flags(flags), mode)
+}
+fn install_rename(source_fd:i32, source:*const u8, target_fd:i32, target:*const u8, flags:u32) i32 {
+  darwin_io_prepare()
+  if source_fd == -100 {
+    source_fd = -2
+  }
+  if target_fd == -100 {
+    target_fd = -2
+  }
+  native:u32=0
+  if (flags&1)!=0 {
+    native|=4
+  }
+  if (flags&2)!=0 {
+    native|=2
+  }
+  return install_darwin_rename(source_fd, source, target_fd, target, native)
+}
+fn install_fdopendir(fd:i32) rawptr {
+  owner:=#cast(*DarwinDirectory, rec_alloc(1, #sizeof(DarwinDirectory)))
+  if owner==nil {
+    return nil
+  }
+  native:=install_darwin_fdopendir(fd)
+  if native==nil {
+    rec_free(#cast(rawptr, owner))
+    return nil
+  }
+  owner.native=native
+  return #cast(rawptr, owner)
+}
+fn install_readdir(directory:rawptr) *InstallEntry {
+  owner:=#cast(*DarwinDirectory, directory)
+  entry:=install_darwin_readdir(owner.native)
+  if entry==nil {
+    return nil
+  }
+  owner.entry.inode=entry.inode
+  owner.entry.offset=#cast(i64, entry.seek)
+  owner.entry.kind=entry.kind
+  owner.entry.length=entry.record_length
+  amount:=#cast(usize, entry.name_length)
+  if amount>1023 {
+    amount=1023
+  }
+  _=copy(&owner.entry.name[0], &entry.name[0], amount)
+  owner.entry.name[amount]=0
+  return &owner.entry
+}
+fn install_closedir(directory:rawptr) i32 {
+  owner:=#cast(*DarwinDirectory, directory)
+  result:=install_darwin_closedir(owner.native)
+  rec_free(directory)
+  return result
+}
+fn search_dirfd(directory:rawptr) i32 {
+  return install_darwin_dirfd(#cast(*DarwinDirectory, directory).native)
+}

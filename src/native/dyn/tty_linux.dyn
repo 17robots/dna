@@ -1,0 +1,36 @@
+#target(kernel: linux)
+struct TtyTermios { input, output, control, local: u32, line: u8, characters: [32]u8, input_speed, output_speed: u32 }
+struct TtySignalAction { handler: fn(i32), mask: [16]u64, flags: i32, restore: fn() }
+const TtyGetSize:u64=21523
+const TtySuspendSignal:i32=20
+fn tty_fatal_signals() [8]i32 {
+  return [15, 1, 3, 11, 7, 6, 8, 4]
+}
+fn tty_make_raw(raw:*TtyTermios) {
+  raw.input &= ~#cast(u32, 1330) // BRKINT | ICRNL | INPCK | ISTRIP | IXON
+  raw.output &= ~#cast(u32, 1)
+  raw.control |= 48
+  raw.local &= ~#cast(u32, 32779) // ECHO | ICANON | IEXTEN | ISIG
+  raw.characters[6] = 0
+  raw.characters[5] = 0
+}
+fn tty_wake_create() i32 {
+  return notify_eventfd(0, 526336)
+}
+fn tty_wake_signal(bytes:*const u8) {
+  _=rec_write(tty_wake_descriptor, bytes, 8)
+}
+fn tty_arguments() isize {
+  command: []const u8 = "/proc/self/cmdline\0"
+  descriptor := rec_open(&command[0], 524288, 0)
+  if descriptor<0 {
+    return -1
+  }
+  defer _=rec_close(descriptor)
+  return proc_read_raw(descriptor, &tty_command_line[0], 65535)
+}
+fn tty_executable_path() *const u8 {
+  executable: []const u8 = "/proc/self/exe\0"
+  return &executable[0]
+}
+extern fn tty_ioctl "ioctl"(fd: i32, request: u64, output: rawptr) i32

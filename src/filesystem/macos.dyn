@@ -1,6 +1,8 @@
 #target(kernel: darwin)
 #link("System")
 use "../cstring" cstring
+use "std/dynlib" dynlib
+use "std/sync" sync
 
 // Darwin arm64 uses the 64-bit inode ABI without the Intel $INODE64 suffix.
 // Layouts: apple-oss-distributions/xnu bsd/sys/{stat,dirent,cdefs}.h.
@@ -17,12 +19,6 @@ struct DarwinEntry {
 }
 pub struct Directory { handle: *u8, storage: []u8 }
 extern fn darwin_open "open"(path: *const u8, flags: i32, ...) i32
-extern fn darwin_errno "__error"() *i32
-extern fn darwin_stat "stat"(path: *const u8, result: *DarwinStat) i32
-extern fn darwin_lstat "lstat"(path: *const u8, result: *DarwinStat) i32
-extern fn darwin_fstat "fstat"(file: i32, result: *DarwinStat) i32
-extern fn darwin_opendir "opendir"(path: *const u8) *u8
-extern fn darwin_readdir "readdir"(directory: *u8) *DarwinEntry
 extern fn darwin_closedir "closedir"(directory: *u8) i32
 extern fn darwin_rename "rename"(source: *const u8, destination: *const u8) i32
 extern fn darwin_rename_exclusive "renamex_np"(source: *const u8, destination: *const u8, flags: u32) i32
@@ -32,7 +28,28 @@ extern fn darwin_rmdir "rmdir"(path: *const u8) i32
 extern fn darwin_readlink "readlink"(path: *const u8, destination: *u8, capacity: usize) isize
 extern fn darwin_fchmod "fchmod"(file: i32, mode: u16) i32
 
+// The pinned SDK thread module also imports __error. Resolving this accessor
+// avoids duplicate foreign declarations when filesystem and buffer coexist.
+// Initialize before a fallible libc call so loader work cannot alter its errno.
+darwin_errno_once: sync.Once = sync.Once{}
+darwin_errno_get: fn() *i32 = nil
+fn darwin_prepare_errno() {
+  if sync.once_begin(&darwin_errno_once) {
+    // Darwin RTLD_DEFAULT searches process-lifetime system libraries.
+    symbol := dynlib.symbol(#cast(rawptr, #cast(isize, -2)), "__error")
+    if !symbol.ok || symbol.value == nil {
+      #panic("libSystem errno accessor unavailable")
+    }
+    darwin_errno_get = #cast(fn() *i32, symbol.value)
+    sync.once_complete(&darwin_errno_once)
+  }
+}
+fn darwin_errno() *i32 {
+  darwin_prepare_errno()
+  return darwin_errno_get()
+}
 fn darwin_path(path: []const u8, storage: []u8) *const u8 {
+  darwin_prepare_errno()
   if #len(path) == 0 {
     return nil
   }
@@ -82,6 +99,7 @@ pub fn metadata_nofollow(path: []const u8) Metadata {
   return darwin_metadata(darwin_lstat(name, &info), &info)
 }
 pub fn file_metadata(file: *const File) Metadata {
+  darwin_prepare_errno()
   if !is_open(file) {
     return Metadata{error: -9, kind: errors.Kind.InvalidState}
   }
@@ -135,6 +153,7 @@ pub fn directory_next(directory: *Directory) DirectoryEntry {
   return DirectoryEntry{}
 }
 pub fn close_directory(directory: *Directory) Result {
+  darwin_prepare_errno()
   if directory.handle == nil {
     return Result{error: -9, kind: errors.Kind.InvalidState}
   }
@@ -202,6 +221,7 @@ pub fn read_link(path: []const u8, destination: []u8) PathResult {
   return PathResult{path: destination[..#cast(usize, length)], ok: true}
 }
 pub fn set_permissions(file: *File, mode: usize) Result {
+  darwin_prepare_errno()
   if !is_open(file) {
     return Result{error: -9, kind: errors.Kind.InvalidState}
   }
@@ -248,4 +268,90 @@ pub fn preserve_permissions(file: *File, source: []const u8) Result {
     return Result{error: info.error, kind: info.kind}
   }
   return set_permissions(file, #cast(usize, (info.mode & 511)))
+}
+// Identity, size and times of an open file, from fstat.
+pub fn file_stamp(file: *const File) Stamp {
+  info := DarwinStat{}
+  if darwin_fstat(#cast(i32, file.descriptor), &info) != 0 {
+    return Stamp{}
+  }
+  return Stamp{inode: info.inode, size: #cast(u64, info.size), modify_seconds: #cast(u64, info.modified_seconds), modify_nanos: #cast(u64, info.modified_nanoseconds), change_seconds: #cast(u64, info.changed_seconds), change_nanos: #cast(u64, info.changed_nanoseconds), ok: true}
+}
+// APFS clones only whole files (clonefile), so there is no range copy;
+// callers write instead.
+pub fn copy_range(source: *const File, offset: u64, destination: *File, length: usize) Result {
+  return Result{kind: errors.Kind.Unsupported}
+}
+
+extern fn darwin_mmap "mmap"(address: rawptr, length: usize, protection: i32, flags: i32, descriptor: i32, offset: i64) *u8
+extern fn darwin_munmap "munmap"(address: *u8, length: usize) i32
+// MAP_PRIVATE | MAP_RESILIENT_MEDIA: inaccessible backing pages (including
+// truncation) become zero pages, never SIGBUS. Origin stamps still reject
+// saving text from a changed file. Older kernels may refuse the flag; fall
+// back to reading rather than retrying with an unguarded mapping.
+pub fn map_file(descriptor: isize, length: u64) *u8 {
+  if length == 0 || descriptor < 0 {
+    return nil
+  }
+  bytes := darwin_mmap(nil, #cast(usize, length), 1, 16386, #cast(i32, descriptor), 0)
+  if #cast(isize, bytes) == -1 {
+    return nil
+  }
+  return bytes
+}
+pub fn unmap_file(bytes: *u8, length: u64) {
+  _ = darwin_munmap(bytes, #cast(usize, length))
+}
+
+// APFS can seed a save with a whole-file copy-on-write clone. The ordinary
+// exclusive-create save remains the fallback on unsupported volumes.
+pub const WholeFileClones: bool = true
+extern fn darwin_clone "fclonefileat"(source: i32, directory: i32, path: *const u8, flags: u32) i32
+extern fn darwin_truncate "ftruncate"(file: i32, length: i64) i32
+pub fn clone_exclusive(source: *const File, path: []const u8) FileResult {
+  if !is_open(source) {
+    return FileResult{kind: errors.Kind.InvalidState}
+  }
+  info := file_metadata(source)
+  // A read-only origin can still be saved through replacement. Do not change
+  // its permissions merely to enable this optimization.
+  if !info.ok || (info.mode & 61440) != 32768 || (info.mode & 128) == 0 {
+    return FileResult{kind: errors.Kind.Unsupported}
+  }
+  storage: [4096]u8 = []
+  name := darwin_path(path, storage[..])
+  if name == nil {
+    return FileResult{kind: errors.Kind.InvalidInput}
+  }
+  // AT_FDCWD, CLONE_NOFOLLOW | CLONE_NOOWNERCOPY. The target must not exist.
+  if darwin_clone(#cast(i32, source.descriptor), -2, name, 3) != 0 {
+    code := darwin_error()
+    return FileResult{error: code, kind: errors.darwin(code)}
+  }
+  // O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK. Refuse a substituted
+  // symlink and never block on a substituted FIFO while opening the clone.
+  descriptor := darwin_open(name, 16777478)
+  if descriptor < 0 {
+    code := darwin_error()
+    _ = darwin_unlink(name)
+    return FileResult{error: code, kind: errors.darwin(code)}
+  }
+  file := adopt_handle(#cast(isize, descriptor))
+  cloned := file_metadata(&file)
+  if !cloned.ok || (cloned.mode & 61440) != 32768 || cloned.size != info.size {
+    _ = close(&file)
+    _ = darwin_unlink(name)
+    return FileResult{kind: errors.Kind.InvalidState}
+  }
+  return FileResult{value: file, ok: true}
+}
+pub fn resize(file: *File, length: usize) Result {
+  darwin_prepare_errno()
+  if !is_open(file) {
+    return Result{kind: errors.Kind.InvalidState}
+  }
+  if length > 9223372036854775807 {
+    return Result{kind: errors.Kind.InvalidInput}
+  }
+  return darwin_result(darwin_truncate(#cast(i32, file.descriptor), #cast(i64, length)))
 }

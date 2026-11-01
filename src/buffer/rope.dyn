@@ -1,0 +1,488 @@
+// Persistent piece tree holding document text.
+//
+// Text lives in immutable blocks. Leaves point at a run inside one block, and
+// internal nodes join two subtrees, AVL-balanced by height. Every node caches
+// its byte length and newline count, so offset and line lookups descend the
+// tree instead of scanning text. Nodes never change after construction; an
+// edit builds new nodes along one path and shares everything else. That makes
+// a saved baseline or an undo entry just another retained root.
+//
+// Ownership: functions taking *RopeNode consume one reference to each argument
+// and return an owned reference. rope_retain adds a reference for a caller that
+// wants to keep its own; rope_release drops one.
+
+extern fn rope_malloc "malloc"(size: usize) rawptr
+extern fn rope_free "free"(value: rawptr)
+
+// Largest leaf. Smaller leaves make line lookups inside a leaf cheaper; larger
+// ones use less tree metadata on very large files.
+const LeafLimit: usize = 16384
+// Leaves at or below this size are merged with typed text instead of gaining a
+// new tiny neighbor, which keeps fragmentation bounded while typing.
+const LeafMerge: usize = 2048
+
+// A block read from a file may keep that file open (origin >= 0) with the
+// stamp it had when read, so saving can copy unchanged ranges in-kernel.
+// A block whose bytes are a file mapping (mapped > 0 bytes) is unmapped
+// through rope_unmap instead of freed.
+struct RopeBlock { refs: usize, bytes: *u8, origin: isize, stamp: [6]u64, mapped: u64 }
+rope_unmap: fn(*u8, u64) = nil
+// Closes a block's origin descriptor. Set by whoever records origins, so this
+// module declares no libc close of its own.
+rope_origin_close: fn(isize) = nil
+struct RopeNode {
+  refs: usize,
+  left, right: *RopeNode,
+  block: *RopeBlock,
+  data: *const u8,
+  // Leaves only: offsets of each newline within the leaf, ascending. Leaves
+  // never exceed LeafLimit bytes, so u16 offsets suffice.
+  newlines: *u16,
+  length, lines, height: usize,
+}
+struct RopePair { left, right: *RopeNode }
+
+fn rope_block_create(text: []const u8) *RopeBlock {
+  block := #cast(*RopeBlock, rope_malloc(#sizeof(RopeBlock)))
+  if block == nil {
+    #panic("cannot allocate text block")
+  }
+  size := #len(text)
+  if size == 0 {
+    size = 1
+  }
+  block.bytes = #cast(*u8, rope_malloc(size))
+  if block.bytes == nil {
+    #panic("cannot allocate text block")
+  }
+  if #len(text) > 0 {
+    _ = copy_bytes(block.bytes, &text[0], #len(text))
+  }
+  block.refs = 0
+  block.origin = -1
+  block.mapped = 0
+  return block
+}
+fn rope_block_release(block: *RopeBlock) {
+  block.refs -= 1
+  if block.refs == 0 {
+    if block.origin >= 0 && rope_origin_close != nil {
+      rope_origin_close(block.origin)
+    }
+    if block.mapped > 0 {
+      rope_unmap(block.bytes, block.mapped)
+    }
+    else {
+      rope_free(#cast(rawptr, block.bytes))
+    }
+    rope_free(#cast(rawptr, block))
+  }
+}
+fn rope_newlines_in(data: *const u8, length: usize) usize {
+  count: usize = 0
+  at: usize = 0
+  for at < length {
+    found := find_byte(&data[..length][at], 10, length - at)
+    if found == nil {
+      break
+    }
+    at = #cast(usize, found) - #cast(usize, data) + 1
+    count += 1
+  }
+  return count
+}
+fn rope_node_alloc() *RopeNode {
+  node := #cast(*RopeNode, rope_malloc(#sizeof(RopeNode)))
+  if node == nil {
+    #panic("cannot allocate text node")
+  }
+  node.refs = 1
+  return node
+}
+fn rope_leaf(block: *RopeBlock, data: *const u8, length: usize) *RopeNode {
+  if length == 0 {
+    return nil
+  }
+  node := rope_node_alloc()
+  node.left = nil
+  node.right = nil
+  block.refs += 1
+  node.block = block
+  node.data = data
+  node.length = length
+  // One memchr pass finds every newline; the table is then copied exactly.
+  found: [16384]u16 = []
+  count: usize = 0
+  at: usize = 0
+  for at < length {
+    hit := find_byte(&data[..length][at], 10, length - at)
+    if hit == nil {
+      break
+    }
+    position := #cast(usize, hit) - #cast(usize, data)
+    found[count] = #cast(u16, position)
+    count += 1
+    at = position + 1
+  }
+  node.lines = count
+  node.newlines = nil
+  if count > 0 {
+    node.newlines = #cast(*u16, rope_malloc(count * #sizeof(u16)))
+    if node.newlines == nil {
+      #panic("cannot allocate text node")
+    }
+    _ = copy_bytes(#cast(*u8, node.newlines), #cast(*const u8, &found[0]), count * #sizeof(u16))
+  }
+  node.height = 1
+  return node
+}
+pub fn rope_retain(node: *RopeNode) *RopeNode {
+  if node != nil {
+    node.refs += 1
+  }
+  return node
+}
+pub fn rope_release(node: *RopeNode) {
+  current := node
+  for current != nil {
+    current.refs -= 1
+    if current.refs != 0 {
+      return
+    }
+    if current.block != nil {
+      rope_block_release(current.block)
+      if current.newlines != nil {
+        rope_free(#cast(rawptr, current.newlines))
+      }
+      rope_free(#cast(rawptr, current))
+      return
+    }
+    // Recurse on one side and loop on the other to bound stack depth.
+    right := current.right
+    rope_release(current.left)
+    rope_free(#cast(rawptr, current))
+    current = right
+  }
+}
+fn rope_height(node: *const RopeNode) usize {
+  if node == nil {
+    return 0
+  }
+  return node.height
+}
+pub fn rope_length(node: *const RopeNode) usize {
+  if node == nil {
+    return 0
+  }
+  return node.length
+}
+pub fn rope_lines(node: *const RopeNode) usize {
+  if node == nil {
+    return 0
+  }
+  return node.lines
+}
+// Internal node over two non-empty owned subtrees.
+fn rope_make(left: *RopeNode, right: *RopeNode) *RopeNode {
+  if left == nil {
+    return right
+  }
+  if right == nil {
+    return left
+  }
+  node := rope_node_alloc()
+  node.left = left
+  node.right = right
+  node.block = nil
+  node.data = nil
+  node.newlines = nil
+  node.length = left.length + right.length
+  node.lines = left.lines + right.lines
+  node.height = left.height + 1
+  if right.height > left.height {
+    node.height = right.height + 1
+  }
+  return node
+}
+// Children of an owned internal node, each owned by the caller afterwards.
+fn rope_take(node: *RopeNode) RopePair {
+  pair := RopePair{left: rope_retain(node.left), right: rope_retain(node.right)}
+  rope_release(node)
+  return pair
+}
+fn rope_rebalance(left: *RopeNode, right: *RopeNode) *RopeNode {
+  if rope_height(left) > rope_height(right) + 1 {
+    parts := rope_take(left)
+    if rope_height(parts.left) >= rope_height(parts.right) {
+      return rope_make(parts.left, rope_make(parts.right, right))
+    }
+    inner := rope_take(parts.right)
+    return rope_make(rope_make(parts.left, inner.left), rope_make(inner.right, right))
+  }
+  if rope_height(right) > rope_height(left) + 1 {
+    parts := rope_take(right)
+    if rope_height(parts.right) >= rope_height(parts.left) {
+      return rope_make(rope_make(left, parts.left), parts.right)
+    }
+    inner := rope_take(parts.left)
+    return rope_make(rope_make(left, inner.left), rope_make(inner.right, parts.right))
+  }
+  return rope_make(left, right)
+}
+pub fn rope_join(left: *RopeNode, right: *RopeNode) *RopeNode {
+  if left == nil {
+    return right
+  }
+  if right == nil {
+    return left
+  }
+  if left.height > right.height + 1 {
+    parts := rope_take(left)
+    return rope_rebalance(parts.left, rope_join(parts.right, right))
+  }
+  if right.height > left.height + 1 {
+    parts := rope_take(right)
+    return rope_rebalance(rope_join(left, parts.left), parts.right)
+  }
+  return rope_make(left, right)
+}
+// Bytes before offset go left, the rest right.
+pub fn rope_split(node: *RopeNode, offset: usize) RopePair {
+  if node == nil {
+    return RopePair{}
+  }
+  if offset == 0 {
+    return RopePair{right: node}
+  }
+  if offset >= node.length {
+    return RopePair{left: node}
+  }
+  if node.block != nil {
+    pair := RopePair{left: rope_leaf(node.block, node.data, offset), right: rope_leaf(node.block, &node.data[..node.length][offset], node.length - offset)}
+    rope_release(node)
+    return pair
+  }
+  parts := rope_take(node)
+  size := rope_length(parts.left)
+  if offset <= size {
+    inner := rope_split(parts.left, offset)
+    return RopePair{left: inner.left, right: rope_join(inner.right, parts.right)}
+  }
+  inner := rope_split(parts.right, offset - size)
+  return RopePair{left: rope_join(parts.left, inner.left), right: inner.right}
+}
+// Balanced tree over leaves of an owned block's first total bytes.
+fn rope_from_block(block: *RopeBlock, total: usize) *RopeNode {
+  if total == 0 {
+    return nil
+  }
+  count := (total + LeafLimit - 1) / LeafLimit
+  return rope_build(block, total, 0, count)
+}
+// Balanced tree over leaves of one new block holding text.
+pub fn rope_from(text: []const u8) *RopeNode {
+  if #len(text) == 0 {
+    return nil
+  }
+  block := rope_block_create(text)
+  block.refs = 1
+  count := (#len(text) + LeafLimit - 1) / LeafLimit
+  result := rope_build(block, #len(text), 0, count)
+  rope_block_release(block)
+  return result
+}
+fn rope_build(block: *RopeBlock, total: usize, first: usize, count: usize) *RopeNode {
+  if count == 1 {
+    low := first * LeafLimit
+    high := low + LeafLimit
+    if high > total {
+      high = total
+    }
+    return rope_leaf(block, &block.bytes[..total][low], high - low)
+  }
+  half := count / 2
+  return rope_make(rope_build(block, total, first, half), rope_build(block, total, first + half, count - half))
+}
+// Leaf containing offset (offset < length): its data and starting offset.
+struct RopeRun { data: *const u8, block: *RopeBlock, low, high: usize }
+pub fn rope_run(node: *const RopeNode, offset: usize) RopeRun {
+  current := node
+  base: usize = 0
+  for current.block == nil {
+    size := current.left.length
+    if offset - base < size {
+      current = current.left
+    } else {
+      base += size
+      current = current.right
+    }
+  }
+  return RopeRun{data: current.data, block: current.block, low: base, high: base + current.length}
+}
+// Bytes low..high that live in private storage rather than a file mapping.
+fn rope_private_bytes(node: *const RopeNode, low: usize, high: usize) usize {
+  total: usize = 0
+  at := low
+  for at < high {
+    run := rope_run(node, at)
+    end := run.high
+    if end > high {
+      end = high
+    }
+    if run.block.mapped == 0 {
+      total += end - at
+    }
+    at = end
+  }
+  return total
+}
+// Copy bytes low..high into output, which holds at least high - low bytes.
+pub fn rope_copy(node: *const RopeNode, low: usize, high: usize, output: *u8) {
+  at := low
+  written: usize = 0
+  for at < high {
+    run := rope_run(node, at)
+    end := run.high
+    if end > high {
+      end = high
+    }
+    _ = copy_bytes(&output[..high - low][written], &run.data[..run.high - run.low][at - run.low], end - at)
+    written += end - at
+    at = end
+  }
+}
+// Newlines in bytes 0..offset.
+pub fn rope_newlines_before(node: *const RopeNode, offset: usize) usize {
+  current := node
+  base: usize = 0
+  count: usize = 0
+  for current != nil {
+    if current.block != nil {
+      if current.lines == 0 {
+        return count
+      }
+      // Newlines in the leaf before offset - base, by binary search.
+      table := current.newlines[..current.lines]
+      wanted := offset - base
+      low: usize = 0
+      high := current.lines
+      for low < high {
+        middle := (low + high) / 2
+        if #cast(usize, table[middle]) < wanted {
+          low = middle + 1
+        } else {
+          high = middle
+        }
+      }
+      return count + low
+    }
+    size := current.left.length
+    if offset - base <= size {
+      current = current.left
+    } else {
+      base += size
+      count += current.left.lines
+      current = current.right
+    }
+  }
+  return count
+}
+// Offset just after the nth newline (n >= 1, n <= newline count).
+pub fn rope_after_newline(node: *const RopeNode, wanted: usize) usize {
+  current := node
+  base: usize = 0
+  remaining := wanted
+  for current.block == nil {
+    if remaining <= current.left.lines {
+      current = current.left
+    } else {
+      remaining -= current.left.lines
+      base += current.left.length
+      current = current.right
+    }
+  }
+  return base + #cast(usize, current.newlines[..current.lines][remaining - 1]) + 1
+}
+// Replace bytes low..high of an owned tree. Small neighboring leaves are
+// rewritten together with the new text so typing does not fragment the tree.
+pub fn rope_replace(root: *RopeNode, low: usize, high: usize, text: []const u8) *RopeNode {
+  length := rope_length(root)
+  first := low
+  last := high
+  if low > 0 {
+    run := rope_run(root, low - 1)
+    if run.block.mapped == 0 && run.high - run.low <= LeafMerge {
+      first = run.low
+    }
+  }
+  if high < length {
+    run := rope_run(root, high)
+    if run.block.mapped == 0 && run.high - run.low <= LeafMerge {
+      last = run.high
+    }
+  }
+  size := (low - first) + #len(text) + (last - high)
+  middle: *RopeNode = nil
+  if size > 0 {
+    if first == low && last == high {
+      middle = rope_from(text)
+    } else {
+      scratch := #cast(*u8, rope_malloc(size))
+      if scratch == nil {
+        #panic("cannot allocate edit")
+      }
+      rope_copy(root, first, low, scratch)
+      if #len(text) > 0 {
+        _ = copy_bytes(&scratch[..size][low - first], &text[0], #len(text))
+      }
+      if last > high {
+        rope_copy(root, high, last, &scratch[..size][low - first + #len(text)])
+      }
+      middle = rope_from(scratch[..size])
+      rope_free(#cast(rawptr, scratch))
+    }
+  }
+  head := rope_split(root, first)
+  tail := rope_split(head.right, last - first)
+  rope_release(tail.left)
+  return rope_join(rope_join(head.left, middle), tail.right)
+}
+// Equal byte ranges a[a_low..] and b[b_low..] of the given size.
+pub fn rope_equal(a: *const RopeNode, a_low: usize, b: *const RopeNode, b_low: usize, size: usize) bool {
+  done: usize = 0
+  for done < size {
+    left := rope_run(a, a_low + done)
+    right := rope_run(b, b_low + done)
+    step := left.high - (a_low + done)
+    if right.high - (b_low + done) < step {
+      step = right.high - (b_low + done)
+    }
+    if size - done < step {
+      step = size - done
+    }
+    first := &left.data[..left.high - left.low][a_low + done - left.low]
+    second := &right.data[..right.high - right.low][b_low + done - right.low]
+    // Shared storage is equal without reading it.
+    if first != second && compare_bytes(first, second, step) != 0 {
+      return false
+    }
+    done += step
+  }
+  return true
+}
+// Equal range of a tree and plain bytes.
+pub fn rope_equal_bytes(a: *const RopeNode, low: usize, text: []const u8) bool {
+  done: usize = 0
+  for done < #len(text) {
+    run := rope_run(a, low + done)
+    step := run.high - (low + done)
+    if #len(text) - done < step {
+      step = #len(text) - done
+    }
+    if compare_bytes(&run.data[..run.high - run.low][low + done - run.low], &text[done], step) != 0 {
+      return false
+    }
+    done += step
+  }
+  return true
+}

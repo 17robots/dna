@@ -1,0 +1,158 @@
+// Full-context parsing from an immutable source. Only colors are windowed;
+// syntax trees retain grammar state from the beginning of the document.
+struct SyntaxStream {
+  context: rawptr,
+  read: fn(rawptr, u32, *u32) *const u8,
+  done: fn(rawptr),
+  length, low, high: u32,
+  revision, document_revision: u64,
+}
+struct SyntaxStreamCache { tree: rawptr, revision: u64, length: u32 }
+struct SyntaxStreamInput {
+  request: *const SyntaxStream,
+  captures: [2][]u8,
+  failed: bool,
+}
+fn syntax_stream_read(context: rawptr, byte: u32, point: SyntaxPoint, length: *u32) *const u8 {
+  _ = point
+  input := #cast(*SyntaxStreamInput, context)
+  return input.request.read(input.request.context, byte, length)
+}
+fn syntax_stream_capture(context: rawptr, start: u32, end: u32, slot: u32) *const u8 {
+  input := #cast(*SyntaxStreamInput, context)
+  length := end - start
+  if !syntax_reserve(&input.captures[slot], #cast(usize, length)) {
+    input.failed = true
+    return nil
+  }
+  output := &input.captures[slot][0]
+  at := start
+  for at < end {
+    size: u32 = 0
+    bytes := input.request.read(input.request.context, at, &size)
+    if bytes == nil || size == 0 {
+      input.failed = true
+      return nil
+    }
+    if size > end - at {
+      size = end - at
+    }
+    _ = copy(&output[..length + 1][at - start], bytes, #cast(usize, size))
+    at += size
+  }
+  output[..length + 1][length] = 0
+  return output
+}
+// The caller holds the mutex. A displaced pending source has no readers.
+fn syntax_stream_drop(worker: *SyntaxWorker) {
+  if worker.stream_pending {
+    worker.stream.done(worker.stream.context)
+    worker.stream_pending = false
+  }
+}
+pub fn dna_syntax_stream(worker: *SyntaxWorker, request: *const SyntaxStream) i32 {
+  if worker == nil || request == nil || request.read == nil || request.done == nil || request.low > request.high || request.high > request.length || request.high - request.low >= 16777216 {
+    return 0
+  }
+  rec_lock(worker.mutex)
+  if worker.revision == request.revision && !worker.retry {
+    rec_unlock(worker.mutex)
+    return 0
+  }
+  syntax_stream_drop(worker)
+  worker.stream = request.*
+  worker.stream_pending = true
+  worker.length = request.high - request.low
+  worker.revision = request.revision
+  worker.pending = true
+  worker.retry = false
+  worker.ready = false
+  sync.store_u32(&worker.cancel, 1)
+  rec_signal(worker.wake)
+  rec_unlock(worker.mutex)
+  return 1
+}
+fn syntax_stream_run(worker: *SyntaxWorker, request: *const SyntaxStream, cache: *SyntaxStreamCache) {
+  input := SyntaxStreamInput{request: request}
+  defer syntax_buffer_free(input.captures[0])
+  defer syntax_buffer_free(input.captures[1])
+  deadline := SyntaxDeadline{worker: worker, end: syntax_millis() + 2}
+  if cache.tree == nil || cache.revision != request.document_revision || cache.length != request.length {
+    syntax_tree_delete(cache.tree)
+    cache.tree = nil
+    syntax_parser_reset(worker.parser)
+    source := SyntaxSource{payload: #cast(rawptr, &input), read: syntax_stream_read}
+    options := SyntaxParseOptions{payload: #cast(rawptr, &deadline), progress: syntax_progress}
+    cache.tree = syntax_parse(worker.parser, nil, source, options)
+    cache.revision = request.document_revision
+    cache.length = request.length
+  }
+  empty: [0]u8 = []
+  stream_colors := empty[..]
+  defer syntax_buffer_free(stream_colors)
+  complete := cache.tree != nil && syntax_reserve(&stream_colors, #cast(usize, request.high - request.low))
+  if complete {
+    _ = syntax_fill(&stream_colors[0], 0, #cast(usize, request.high - request.low))
+    cursor := syntax_cursor_new()
+    if cursor != nil {
+      defer syntax_cursor_delete(cursor)
+      syntax_cursor_limit(cursor, 4294967295)
+      syntax_cursor_range(cursor, request.low, request.high)
+      options := SyntaxQueryOptions{payload: #cast(rawptr, &deadline), progress: syntax_query_progress}
+      syntax_cursor_exec(cursor, worker.query, syntax_root(cache.tree), &options)
+      source := PredicateSource{context: #cast(rawptr, &input), length: request.length, range: syntax_stream_capture}
+      match := TsMatch{}
+      capture: u32 = 0
+      for !syntax_cooperate(&deadline) && syntax_cursor_next(cursor, &match, &capture) {
+        if !predicates_pass_source(worker.query_predicates, &match, &source) {
+          continue
+        }
+        entry := match.captures[..match.capture_count][capture]
+        size: u32 = 0
+        name := syntax_capture_name(worker.query, entry.index, &size)
+        color := syntax_style(name[..size])
+        start := pred_start(entry.node)
+        end := pred_end(entry.node)
+        if start < request.low {
+          start = request.low
+        }
+        if end > request.high {
+          end = request.high
+        }
+        if color != 0 && start < end {
+          _ = syntax_fill(&stream_colors[start - request.low], color, #cast(usize, end - start))
+        }
+      }
+      complete = !input.failed && !syntax_cursor_exceeded(cursor) && sync.load_u32(&worker.cancel) == 0
+    } else {
+      complete = false
+    }
+  }
+  rec_lock(worker.mutex)
+  if worker.revision == request.revision && sync.load_u32(&worker.cancel) == 0 {
+    if complete {
+      spare := worker.colors
+      worker.colors = stream_colors
+      stream_colors = spare
+      syntax_tree_delete(worker.published)
+      worker.published = nil
+      worker.object_count = 0
+      worker.finished = request.revision
+      worker.ready = true
+    } else {
+      worker.retry = true
+    }
+  }
+  rec_unlock(worker.mutex)
+}
+pub fn dna_syntax_stream_needed(worker: *SyntaxWorker, revision: u64) i32 {
+  if syntax_trylock(worker.mutex) != 0 {
+    return 0
+  }
+  needed := worker.revision != revision || worker.retry
+  rec_unlock(worker.mutex)
+  if needed {
+    return 1
+  }
+  return 0
+}

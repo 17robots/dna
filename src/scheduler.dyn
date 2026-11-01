@@ -56,6 +56,11 @@ fn editor_wait_ms(app: *App, notifications: bool) i32 {
   if terminals_waiting_for_exit(app) && delay > 16 {
     delay = 16
   }
+  // Raw-thread workers (search, save, background loading) cannot wake the
+  // loop through native notifications, which need libc thread state; poll.
+  if (search_waiting(app) || documents_loading(app) || app.documents.save_task != nil) && delay > 16 {
+    delay = 16
+  }
   if !notifications && (terminals_running(app) || syntax_waiting(app) || app.project_find.status == 1 || app.picker_state.pending || plugins_running(app) || app.formatting.process != nil || app.language_manager.process != nil || lsp_running(app)) && delay > 16 {
     delay = 16
   }
@@ -97,6 +102,9 @@ fn background_step(app: *App, typography: *Typography, phase: *usize) {
     if syntax_tick(app) {
       render_request(app, RenderSyntax)
     }
+    if search_tick(app) {
+      render_request(app, RenderSyntax)
+    }
     operation_end(app, "syntax", started)
   } else if phase.* == 3 {
     if plugin_tick(app) {
@@ -110,6 +118,9 @@ fn background_step(app: *App, typography: *Typography, phase: *usize) {
     operation_end(app, "language_setup", started)
   } else if phase.* == 5 {
     changed := disk_tick(app)
+    if documents_load_tick(app) {
+      changed = true
+    }
     if tree_tick(app) {
       changed = true
     }
@@ -129,6 +140,9 @@ fn background_step(app: *App, typography: *Typography, phase: *usize) {
       changed = true
     }
     save_sequence_tick(app)
+    if save_tick(app) {
+      changed = true
+    }
     if changed {
       render_request(app, RenderFormat)
     }

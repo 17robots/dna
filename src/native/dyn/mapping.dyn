@@ -1,0 +1,82 @@
+#target(kernel: linux)
+// Read-only file mappings for large documents, guarded against truncation.
+//
+// A mapped file that shrinks underneath the editor would raise SIGBUS on the
+// next read past its new end. The guard handler replaces the mapping from the
+// faulting page onward with zero pages and counts the event, so the editor
+// keeps running and the disk watcher reports the change. Faults outside a
+// registered mapping fall through to the terminal's fatal handler.
+struct MapSignalAction { handler: fn(i32, rawptr, rawptr), mask: [16]u64, flags: i32, restore: fn() }
+struct MapRange { base, length: sync.AtomicU64 }
+const MapSlots: usize = 256
+const MapPage: u64 = 4096
+
+map_ranges: [256]MapRange = []
+map_damaged: sync.AtomicU64 = sync.AtomicU64{}
+
+fn map_bus(number: i32, information: rawptr, context: rawptr) {
+  _ = context
+  // siginfo_t.si_addr sits at offset 16 on Linux x86_64 and aarch64.
+  address := #cast(*u64, #cast(usize, information) + 16).*
+  for index in 0..MapSlots {
+    base := sync.load_u64(&map_ranges[index].base)
+    length := sync.load_u64(&map_ranges[index].length)
+    if length == 0 || address < base || address >= base + length {
+      continue
+    }
+    page := address & ~(MapPage - 1)
+    end := (base + length + MapPage - 1) & ~(MapPage - 1)
+    // MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS, PROT_READ.
+    result := #syscall(9, page, end - page, 1, 50, -1, 0)
+    if result >= 0 {
+      _ = sync.fetch_add_u64(&map_damaged, 1)
+      return
+    }
+    break
+  }
+  tty_fatal(number)
+}
+// Own SIGBUS. Called again after the terminal registers its fatal handlers,
+// so the guard always runs first.
+fn map_guard_install() {
+  // SA_SIGINFO | SA_NODEFER, so a second fault during recovery is reported.
+  action := MapSignalAction{handler: map_bus, flags: 1073741828}
+  _ = tty_sigaction(7, #cast(*const TtySignalAction, &action), nil)
+}
+// Map length bytes of fd read-only. Returns nil when mapping fails or no slot
+// is free; the caller then reads the file instead.
+pub fn dna_map_file(fd: isize, length: u64) *u8 {
+  native_initialize()
+  if length == 0 {
+    return nil
+  }
+  map_guard_install()
+  for index in 0..MapSlots {
+    if sync.load_u64(&map_ranges[index].length) != 0 {
+      continue
+    }
+    // PROT_READ, MAP_PRIVATE.
+    result := #syscall(9, 0, length, 1, 2, fd, 0)
+    if result < 0 {
+      return nil
+    }
+    sync.store_u64(&map_ranges[index].base, #cast(u64, result))
+    sync.store_u64(&map_ranges[index].length, length)
+    return #cast(*u8, result)
+  }
+  return nil
+}
+pub fn dna_unmap_file(bytes: *u8, length: u64) {
+  base := #cast(u64, #cast(usize, bytes))
+  for index in 0..MapSlots {
+    if sync.load_u64(&map_ranges[index].base) == base && sync.load_u64(&map_ranges[index].length) == length {
+      sync.store_u64(&map_ranges[index].length, 0)
+      break
+    }
+  }
+  _ = #syscall(11, base, length)
+}
+// Mappings repaired after truncation since start; the editor compares counts.
+pub fn dna_map_damaged() u64 {
+  return sync.load_u64(&map_damaged)
+}

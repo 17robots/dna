@@ -1,9 +1,56 @@
+use "std/sync"
+
 extern fn syntax_open_named "dna_syntax_open_named"(root: *const u8, name: *const u8) rawptr
 extern fn syntax_name "dna_syntax_name"(syntax: rawptr) *const u8
 extern fn syntax_open "dna_syntax_open"(root: *const u8, filename: *const u8) rawptr
 extern fn syntax_update "dna_syntax_update"(syntax: rawptr, text: *const u8, length: u32, revision: u64)
 struct SyntaxChange { revision: u64, low, old_high, high, old_length, row, column: u32 }
 extern fn syntax_update_changed "dna_syntax_update_changed"(syntax: rawptr, text: *const u8, length: u32, revision: u64, change: *const SyntaxChange)
+extern fn syntax_update_begin "dna_syntax_update_begin"(syntax: rawptr, length: u32, revision: u64) *u8
+extern fn syntax_update_commit "dna_syntax_update_commit"(syntax: rawptr, length: u32, revision: u64, change: *const SyntaxChange)
+struct SyntaxStream {
+  context: rawptr,
+  read: fn(rawptr, u32, *u32) *const u8,
+  done: fn(rawptr),
+  length, low, high: u32,
+  revision, document_revision: u64,
+}
+extern fn syntax_stream "dna_syntax_stream"(syntax: rawptr, request: *const SyntaxStream) i32
+extern fn syntax_stream_needed "dna_syntax_stream_needed"(syntax: rawptr, revision: u64) i32
+// Rope reference counts belong to the UI thread. Workers only mark sources
+// done; collection releases snapshots after their last read has finished.
+struct SyntaxSnapshot {
+  next: *SyntaxSnapshot,
+  arena: *mem.Arena,
+  text: buffer.TextSnapshot,
+  done: sync.AtomicU32,
+}
+syntax_snapshots: *SyntaxSnapshot = nil
+fn syntax_snapshot_read(context: rawptr, byte: u32, length: *u32) *const u8 {
+  source := #cast(*SyntaxSnapshot, context)
+  bytes := buffer.snapshot_chunk(&source.text, #cast(usize, byte))
+  length.* = #cast(u32, #len(bytes))
+  if #len(bytes) == 0 {
+    return nil
+  }
+  return &bytes[0]
+}
+fn syntax_snapshot_done(context: rawptr) {
+  sync.store_u32(&#cast(*SyntaxSnapshot, context).done, 1)
+}
+fn syntax_snapshot_collect() {
+  link := &syntax_snapshots
+  for link.* != nil {
+    source := link.*
+    if sync.load_u32(&source.done) == 0 {
+      link = &source.next
+      continue
+    }
+    link.* = source.next
+    buffer.snapshot_release(&source.text)
+    arena_owner.release(source.arena)
+  }
+}
 extern fn syntax_colors "dna_syntax_colors"(syntax: rawptr, output: *u8, length: u32, revision: u64) i32
 extern fn syntax_close "dna_syntax_close"(syntax: rawptr)
 extern fn syntax_retire "dna_syntax_retire"(syntax: rawptr) i32
@@ -94,6 +141,9 @@ fn slot_syntax_release(slot: *Slot) {
   slot.syntax_checked = false
   slot.syntax_revision = 0
   slot.syntax_used = 0
+  slot.syntax_window_tag = 0
+  slot.syntax_shown_tag = 0
+  slot.syntax_shown_high = 0
 }
 fn syntax_release(app: *App) {
   for index in 0..#len(app.documents.slots) {
@@ -101,6 +151,7 @@ fn syntax_release(app: *App) {
   }
   preview_syntax_release(app)
   syntax_collect(1)
+  syntax_snapshot_collect()
 }
 fn syntax_visible(app: *App) SyntaxVisible {
   visible := SyntaxVisible{}
@@ -169,13 +220,19 @@ fn syntax_slot_tick(app: *App, slot: *Slot) bool {
       slot.syntax = syntax_open_named(&app.workspace.language_root[0], &slot.filetype[0])
     }
     slot.syntax_checked = true
+    slot.syntax_window_tag = 0
+    slot.syntax_shown_tag = 0
+    slot.syntax_shown_high = 0
   }
   syntax_track(app, slot)
-  if slot.syntax == nil || slot.document.length >= buffer.LargeFile {
+  if slot.syntax == nil {
     return false
   }
   slot.syntax_used = sdl.ticks()
   doc := slot.document
+  if doc.length >= buffer.LargeFile {
+    return syntax_window_tick(slot)
+  }
   if slot.syntax_revision == doc.revision {
     return false
   }
@@ -183,9 +240,9 @@ fn syntax_slot_tick(app: *App, slot: *Slot) bool {
   if change.found && change.old_length < buffer.LargeFile {
     row := buffer.row_at(doc, change.low)
     hint := SyntaxChange{revision: slot.syntax_revision, low: #cast(u32, change.low), old_high: #cast(u32, change.old_high), high: #cast(u32, change.high), old_length: #cast(u32, change.old_length), row: #cast(u32, row), column: #cast(u32, (change.low - buffer.row_start(doc, row)))}
-    syntax_update_changed(slot.syntax, &doc.bytes[0], #cast(u32, doc.length), doc.revision, &hint)
+    syntax_copy(slot.syntax, doc, &hint)
   } else {
-    syntax_update(slot.syntax, &doc.bytes[0], #cast(u32, doc.length), doc.revision)
+    syntax_copy(slot.syntax, doc, nil)
   }
   if syntax_colors(slot.syntax, &slot.colors[0], #cast(u32, doc.length), doc.revision) != 0 {
     slot.syntax_revision = doc.revision
@@ -193,8 +250,93 @@ fn syntax_slot_tick(app: *App, slot: *Slot) bool {
   }
   return false
 }
+// Color output extends beyond the drawn view. Parsing reads the whole snapshot.
+const SyntaxMargin: usize = 524288
+// Parser revisions for windows carry this bit, so they never match a document
+// revision: tree queries (objects, selections) stay off in window mode.
+const SyntaxWindowBit: u64 = 9223372036854775808
+fn syntax_window_needed(slot: *const Slot) bool {
+  doc := slot.document
+  if slot.syntax_window_tag != 0 {
+    covered := slot.syntax_view_low >= slot.syntax_window_low && slot.syntax_view_high <= slot.syntax_window_high
+    return !covered || slot.syntax_window_revision != doc.revision
+  }
+  return true
+}
+// Largest retained color window while scrolling. Parsing uses the full snapshot.
+const SyntaxWindowLimit: usize = 8388608
+fn syntax_window_tick(slot: *Slot) bool {
+  doc := slot.document
+  if doc.length > 4294967294 {
+    return false
+  }
+  if syntax_window_needed(slot) || syntax_stream_needed(slot.syntax, slot.syntax_window_tag) != 0 {
+    low: usize = 0
+    high := slot.syntax_view_high + SyntaxMargin
+    if high > doc.length {
+      high = doc.length
+    }
+    // Keep a stable color origin while nearby views fit the output bound.
+    if slot.syntax_window_tag != 0 && slot.syntax_view_low >= slot.syntax_window_low && high >= slot.syntax_window_low && high - slot.syntax_window_low <= SyntaxWindowLimit && slot.syntax_window_low <= doc.length {
+      low = slot.syntax_window_low
+    } else {
+      if slot.syntax_view_low > SyntaxMargin {
+        low = slot.syntax_view_low - SyntaxMargin
+      }
+    }
+    if high < low {
+      high = low
+    }
+    if high - low > SyntaxWindowLimit {
+      high = low + SyntaxWindowLimit
+    }
+    tag := ((slot.syntax_window_tag + 1) & (SyntaxWindowBit - 1)) | SyntaxWindowBit
+    arena := arena_owner.create(#sizeof(SyntaxSnapshot) + 64)
+    source := mem.push(SyntaxSnapshot, arena)
+    source.arena = arena
+    source.text = buffer.snapshot_take(doc)
+    request := SyntaxStream{context: #cast(rawptr, source), read: syntax_snapshot_read, done: syntax_snapshot_done,
+      length: #cast(u32, doc.length), low: #cast(u32, low), high: #cast(u32, high), revision: tag, document_revision: doc.revision}
+    if syntax_stream(slot.syntax, &request) == 0 {
+      buffer.snapshot_release(&source.text)
+      arena_owner.release(arena)
+      return false
+    }
+    source.next = syntax_snapshots
+    syntax_snapshots = source
+    slot.syntax_window_tag = tag
+    slot.syntax_window_low = low
+    slot.syntax_window_high = high
+    slot.syntax_window_revision = doc.revision
+  }
+  // Older colors stay drawn while a moved window parses at the same revision.
+  if slot.syntax_shown_tag == slot.syntax_window_tag {
+    return false
+  }
+  if syntax_colors(slot.syntax, &slot.colors[0], #cast(u32, slot.syntax_window_high - slot.syntax_window_low), slot.syntax_window_tag) != 0 {
+    slot.syntax_shown_low = slot.syntax_window_low
+    slot.syntax_shown_high = slot.syntax_window_high
+    slot.syntax_shown_tag = slot.syntax_window_tag
+    slot.syntax_revision = doc.revision
+    return true
+  }
+  return false
+}
+// Copy the document's chunks straight into the parser's buffer.
+fn syntax_copy(syntax: rawptr, doc: *const buffer.Document, change: *const SyntaxChange) {
+  if doc.length >= buffer.LargeFile {
+    return
+  }
+  target := syntax_update_begin(syntax, #cast(u32, doc.length), doc.revision)
+  if target == nil {
+    return
+  }
+  buffer.copy_range(doc, 0, doc.length, target[..doc.length + 1])
+  syntax_update_commit(syntax, #cast(u32, doc.length), doc.revision, change)
+}
 fn syntax_tick(app: *App) bool {
   syntax_collect(0)
+  syntax_snapshot_collect()
   if !app.config.syntax_enabled {
     return false
   }
@@ -221,7 +363,18 @@ fn syntax_waiting(app: *App) bool {
   visible := syntax_visible(app)
   for item in 0..visible.count {
     slot := app.documents.slots[visible.indices[item]]
-    if slot.document != nil && slot.syntax != nil && slot.syntax_revision != slot.document.revision && slot.document.length < buffer.LargeFile {
+    if slot.document == nil || slot.syntax == nil {
+      continue
+    }
+    if slot.document.length >= buffer.LargeFile {
+      if slot.document.length > 4294967294 {
+        continue
+      }
+      if syntax_window_needed(slot) || slot.syntax_shown_tag != slot.syntax_window_tag {
+        return true
+      }
+    }
+    else if slot.syntax_revision != slot.document.revision {
       return true
     }
   }
@@ -250,6 +403,16 @@ fn syntax_color(style: u8) Rgb {
 // ranges identify unchanged prefix/suffix bytes; edited bytes stay uncolored.
 // Parser revision checks for selections, objects and indentation remain strict.
 fn syntax_display_style(slot:*const Slot, change:buffer.ChangedRange, current:bool, at:usize) u8 {
+  if slot.document.length >= buffer.LargeFile {
+    if !current || at < slot.syntax_shown_low || at >= slot.syntax_shown_high {
+      return 0
+    }
+    return slot.colors[at - slot.syntax_shown_low]
+  }
+  // Documents past the color table (only plain-text large files) stay uncolored.
+  if at >= #len(slot.colors) || change.old_high + at >= #len(slot.colors) + change.high {
+    return 0
+  }
   if current {
     return slot.colors[at]
   }
@@ -282,7 +445,27 @@ fn draw_syntax(renderer: rawptr, app: *App, typography: *Typography, viewport: T
   }
   slot := app.documents.slots[app.documents.active]
   doc := app.documents.current
-  if slot.syntax == nil || slot.syntax_revision == 0 || doc.length >= buffer.LargeFile {
+  if slot.syntax == nil {
+    return false
+  }
+  large := doc.length >= buffer.LargeFile
+  if large {
+    // Remember what is drawn so the next tick parses around it.
+    writable := #cast(*Slot, slot)
+    writable.syntax_view_low = viewport.start
+    writable.syntax_view_high = viewport.end
+    if viewport.end - viewport.start > 2 * SyntaxMargin {
+      position := buffer.head(doc)
+      if position >= viewport.start && position <= viewport.end {
+        low := buffer.line_start(doc, position)
+        high := buffer.line_end(doc, position)
+        low = line_draw_start(doc, low, high)
+        writable.syntax_view_low = low
+        writable.syntax_view_high = line_draw_end(doc, low, high)
+      }
+    }
+  }
+  if slot.syntax_revision == 0 || (large && slot.syntax_revision != doc.revision) {
     return false
   }
   current:=slot.syntax_revision==doc.revision
@@ -301,7 +484,7 @@ fn draw_syntax(renderer: rawptr, app: *App, typography: *Typography, viewport: T
     // whole touched scalar so provisional spans never split a codepoint.
     display_change.low=buffer.boundary(doc, display_change.low)
     end:=display_change.high
-    for end<doc.length && (doc.bytes[end]&192)==128 {
+    for end<doc.length && (buffer.byte_at(doc, end)&192)==128 {
       end+=1
     }
     display_change.old_high+=end-display_change.high
@@ -315,7 +498,7 @@ fn draw_syntax(renderer: rawptr, app: *App, typography: *Typography, viewport: T
     }
     layout:=&current_pane_text(typography).layout
     for index in 0..layout.count {
-      state.offset=buffer.row_start(doc, layout.first_row+index)
+      state.offset=layout.origins[index]
       text:=layout.lines[layout.rows[index]].text
       if !ttf.draw_colored(text, x, y+#cast(f32, index)*layout.line, syntax_display_ink, #cast(rawptr, &state)) {
         #panic("syntax line draw")
@@ -326,15 +509,30 @@ fn draw_syntax(renderer: rawptr, app: *App, typography: *Typography, viewport: T
   at := viewport.start
   span_index: usize = 0
   for at < viewport.end {
+    row := buffer.row_at(doc, at)
+    row_low := buffer.row_start(doc, row)
+    row_high := buffer.line_end(doc, at)
+    origin := line_draw_start(doc, row_low, row_high)
+    shown := line_draw_end(doc, origin, row_high)
+    if at < origin {
+      at = origin
+    }
+    if at >= shown {
+      at = row_high
+      if at < doc.length {
+        at += 1
+      }
+      continue
+    }
     // Tabs/newlines have no colored ink. Split at them so tab stops retain the
     // positions from the original document layout, rather than a span's origin.
-    if doc.bytes[at] == 9 || doc.bytes[at] == 10 {
+    if buffer.byte_at(doc, at) == 9 || buffer.byte_at(doc, at) == 10 {
       at += 1
       continue
     }
     style := syntax_display_style(slot, display_change, current, at)
     end := at + 1
-    for end < viewport.end && syntax_display_style(slot, display_change, current, end) == style && doc.bytes[end] != 9 && doc.bytes[end] != 10 {
+    for end < shown && end < viewport.end && syntax_display_style(slot, display_change, current, end) == style && buffer.byte_at(doc, end) != 9 && buffer.byte_at(doc, end) != 10 {
       end += 1
     }
     if style != 0 {
@@ -403,14 +601,14 @@ fn draw_syntax(renderer: rawptr, app: *App, typography: *Typography, viewport: T
             }
             span_text = cached.text
             if !cached.text_ready {
-              if !ttf.set(span_text, &doc.bytes[at], end - at) || !ttf.substring(span_text, 0, &cached.origin) {
+              if !ttf.set(span_text, buffer.pointer(doc, at, end), end - at) || !ttf.substring(span_text, 0, &cached.origin) {
                 #panic("syntax span update")
               }
               cached.text_ready = true
             }
             span_start = cached.origin
           } else {
-            if !ttf.set(span_text, &doc.bytes[at], end - at) || !ttf.substring(span_text, 0, &span_start) {
+            if !ttf.set(span_text, buffer.pointer(doc, at, end), end - at) || !ttf.substring(span_text, 0, &span_start) {
               #panic("syntax overflow span")
             }
           }

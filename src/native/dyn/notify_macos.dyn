@@ -1,0 +1,119 @@
+#target(kernel: darwin)
+#link("System")
+// EV_DISPATCH mirrors the Linux one-shot registration: the UI rearms after
+// draining a service. Events carry descriptors, never worker-owned pointers.
+struct NotifyKEvent { identity:usize, filter:i16, flags:u16, notes:u32, data:isize, user:rawptr }
+extern fn notify_kqueue "kqueue"() i32
+extern fn notify_kevent "kevent"(queue:i32, changes:*const NotifyKEvent, change_count:i32, events:*NotifyKEvent, capacity:i32, timeout:rawptr) i32
+notify_queue:i32
+notify_stop_fd:i32
+notify_stop_writer:i32
+notify_thread:rawptr
+notify_enabled:bool
+notify_delivery:NativeMutex
+pub fn dna_notify() {
+  _=sync_mutex_lock(#cast(rawptr, &notify_delivery))
+  if notify_enabled {
+    notify_gui()
+    dna_tty_wake()
+  }
+  _=sync_mutex_unlock(#cast(rawptr, &notify_delivery))
+}
+fn notify_worker(context:rawptr) i32 {
+  _=context
+  events:[32]NotifyKEvent=[]
+  for true {
+    count:=notify_kevent(notify_queue, nil, 0, &events[0], 32, nil)
+    if count<0 {
+      if rec_errno().*==4 {
+        continue
+      }
+      return 0
+    }
+    for index in 0..count {
+      if events[#cast(usize, index)].identity==#cast(usize, notify_stop_fd) {
+        return 0
+      }
+    }
+    if count>0 {
+      dna_notify()
+    }
+  }
+  return 0
+}
+pub fn dna_notify_start() i32 {
+  native_initialize()
+  notify_queue=notify_kqueue()
+  if notify_queue<0 {
+    return 0
+  }
+  _=proc_fcntl(notify_queue, 2, 1)
+  pipe:[2]i32=[-1, -1]
+  if proc_pipe(&pipe[0], 526336)!=0 {
+    _=rec_close(notify_queue)
+    notify_queue=-1
+    return 0
+  }
+  notify_stop_fd=pipe[0]
+  notify_stop_writer=pipe[1]
+  event:=NotifyKEvent{identity:#cast(usize, notify_stop_fd), filter:-1, flags:1}
+  if notify_kevent(notify_queue, &event, 1, nil, 0, nil)==0 {
+    _=sync_mutex_lock(#cast(rawptr, &notify_delivery))
+    notify_enabled=true
+    _=sync_mutex_unlock(#cast(rawptr, &notify_delivery))
+    notify_thread=dna_thread_create(notify_worker, nil)
+    if notify_thread!=nil {
+      return 1
+    }
+  }
+  _=sync_mutex_lock(#cast(rawptr, &notify_delivery))
+  notify_enabled=false
+  _=sync_mutex_unlock(#cast(rawptr, &notify_delivery))
+  _=rec_close(notify_stop_fd)
+  _=rec_close(notify_stop_writer)
+  _=rec_close(notify_queue)
+  notify_queue=-1
+  notify_stop_fd=-1
+  return 0
+}
+pub fn dna_notify_stop() {
+  _=sync_mutex_lock(#cast(rawptr, &notify_delivery))
+  running:=notify_enabled
+  notify_enabled=false
+  _=sync_mutex_unlock(#cast(rawptr, &notify_delivery))
+  if !running {
+    return
+  }
+  byte:u8=1
+  _=rec_write(notify_stop_writer, &byte, 1)
+  dna_thread_join(notify_thread, nil)
+  notify_thread=nil
+  _=rec_close(notify_stop_fd)
+  _=rec_close(notify_stop_writer)
+  _=rec_close(notify_queue)
+  notify_queue=-1
+  notify_stop_fd=-1
+}
+pub fn dna_watch(fd:i32, writing:i32) {
+  native_initialize()
+  if notify_queue<0 || fd<0 {
+    return
+  }
+  dna_unwatch(fd)
+  filter:i16=-1
+  if writing!=0 {
+    filter=-2
+  }
+  event:=NotifyKEvent{identity:#cast(usize, fd), filter:filter, flags:133}
+  _=notify_kevent(notify_queue, &event, 1, nil, 0, nil)
+}
+pub fn dna_unwatch(fd:i32) {
+  native_initialize()
+  if notify_queue<0 || fd<0 {
+    return
+  }
+  event:=NotifyKEvent{identity:#cast(usize, fd), filter:-1, flags:2}
+  _=notify_kevent(notify_queue, &event, 1, nil, 0, nil)
+  event.filter=-2
+  _=notify_kevent(notify_queue, &event, 1, nil, 0, nil)
+}

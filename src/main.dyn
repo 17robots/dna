@@ -6,6 +6,7 @@ extern fn notifications_start "dna_notify_start"() i32
 extern fn notifications_stop "dna_notify_stop"()
 extern fn handoff_run "dna_handoff_run"()
 
+
 // The editor returns after all its cleanup; a pending :frontend handoff then
 // replaces this process with the other frontend.
 fn main() {
@@ -16,6 +17,8 @@ fn main() {
   handoff_run()
 }
 fn editor_main() {
+  // Large documents map their file; the native guard survives truncation.
+  files.set_mapper(map_file, unmap_file)
   owned := arena_owner.create((#sizeof(App) + 128))
   scratch := arena_owner.create((2097152))
 
@@ -175,12 +178,14 @@ fn editor_main() {
   }
   defer ttf.destroy_engine(engine)
 
-  document := ttf.create(engine, font, &app.documents.current.bytes[0], app.documents.current.length)
+  // Rows are laid out per line (line_layout.dyn); the pane object starts
+  // empty like every other pane instead of copying the whole document.
+  empty: [1]u8 = [0]
+  document := ttf.create(engine, font, &empty[0], 0)
   if document == nil {
     #panic("document text failed")
   }
   defer ttf.destroy(document)
-  empty: [1]u8 = [0]
   palette := ttf.create(engine, font, &empty[0], 0)
   if palette == nil {
     #panic("palette text failed")
@@ -263,6 +268,7 @@ fn editor_main() {
   // method, and on Wayland the next key can be lost. Instead, the text event
   // the backend sends for a key that acted as a command (i, g, :) is dropped.
   command_character: u32 = 0
+  defer save_wait(app)
   for app.running {
     // Ready input owns the next paint; maintenance runs only after that paint
     // or while waiting for input, and can yield between service phases.

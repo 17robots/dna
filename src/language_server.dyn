@@ -1,5 +1,6 @@
 use "./lsp"
 use "std/io"
+use "std/thread"
 
 // Preflight the complete encoding and source ranges before touching caller
 // bytes. The second streaming pass writes directly, without an arena/mapping.
@@ -70,6 +71,181 @@ fn lsp_json_encode(out: []u8, value: *const json.Value) []u8 {
   }
   return out[..output.used]
 }
+// Bytes escaped as JSON string content: the escaped size, and the escaped
+// bytes written to out unless it is nil. Allocates nothing, so encoder
+// threads can run it.
+fn lsp_escape(out: *u8, bytes: []const u8) usize {
+  hex: []const u8 = "0123456789abcdef"
+  used: usize = 0
+  at: usize = 0
+  count := #len(bytes)
+  for at < count {
+    // Copy runs that need no escape eight bytes at a time: a word passes when
+    // no byte is below 32, a quote or a backslash.
+    plain := at
+    for count - plain >= 8 {
+      // Words are read aligned; single bytes lead up to the boundary.
+      if (#cast(usize, &bytes[plain]) & 7) != 0 {
+        lead := bytes[plain]
+        if lead < 32 || lead == '"' || lead == 92 {
+          break
+        }
+        plain += 1
+        continue
+      }
+      word := #cast(*const u64, &bytes[plain]).*
+      quote := word ^ 0x2222222222222222
+      slash := word ^ 0x5c5c5c5c5c5c5c5c
+      special := (#wrap(word - 0x2020202020202020) & ~word) | (#wrap(quote - 0x0101010101010101) & ~quote) | (#wrap(slash - 0x0101010101010101) & ~slash)
+      if (special & 0x8080808080808080) != 0 {
+        break
+      }
+      plain += 8
+    }
+    if plain > at {
+      if out != nil {
+        _ = buffer.copy_bytes(&out[..used + plain - at][used], &bytes[at], plain - at)
+      }
+      used += plain - at
+      at = plain
+      if at == count {
+        break
+      }
+    }
+    byte := bytes[at]
+    at += 1
+    needed: usize = 1
+    if byte == '"' || byte == 92 || byte == 10 || byte == 13 || byte == 9 {
+      needed = 2
+    } else if byte < 32 {
+      needed = 6
+    }
+    if out != nil {
+      target := out[..used + needed]
+      if needed == 1 {
+        target[used] = byte
+      } else if needed == 6 {
+        target[used] = 92
+        target[used + 1] = 'u'
+        target[used + 2] = '0'
+        target[used + 3] = '0'
+        target[used + 4] = hex[#cast(usize, byte >> 4)]
+        target[used + 5] = hex[#cast(usize, byte & 15)]
+      } else {
+        target[used] = 92
+        target[used + 1] = byte
+        if byte == 10 {
+          target[used + 1] = 'n'
+        } else if byte == 13 {
+          target[used + 1] = 'r'
+        } else if byte == 9 {
+          target[used + 1] = 't'
+        }
+      }
+    }
+    used += needed
+  }
+  return used
+}
+// Documents at least this large are escaped by several threads.
+const LspParallelEscape: usize = 16777216
+const LspEscapeStack: usize = 65536
+struct LspEscapeJob { snapshot: *const buffer.TextSnapshot, low, high: usize, out: *u8, size: usize }
+fn lsp_escape_job(context: rawptr) isize {
+  job := #cast(*LspEscapeJob, context)
+  size: usize = 0
+  at := job.low
+  for at < job.high {
+    chunk := buffer.snapshot_chunk(job.snapshot, at)
+    if #len(chunk) > job.high - at {
+      chunk = chunk[..job.high - at]
+    }
+    if job.out == nil {
+      size += lsp_escape(nil, chunk)
+    } else {
+      size += lsp_escape(&job.out[..size + 1][size], chunk)
+    }
+    at += #len(chunk)
+  }
+  job.size = size
+  return 0
+}
+// Run every job, all but the first on new threads (or here when one cannot
+// start).
+fn lsp_escape_run(jobs: []LspEscapeJob) {
+  arena := mem.arena_create(4096)
+  defer mem.arena_release(arena)
+  threads: [16]*thread.Thread = []
+  started: [16]bool = []
+  for index in 1..#len(jobs) {
+    spawned := thread.spawn_with_size(arena, LspEscapeStack, lsp_escape_job, #cast(rawptr, &jobs[index]))
+    if spawned.ok {
+      threads[index] = spawned.value
+      started[index] = true
+    }
+  }
+  _ = lsp_escape_job(#cast(rawptr, &jobs[0]))
+  for index in 1..#len(jobs) {
+    if started[index] {
+      if !thread.join(threads[index]).ok {
+        #panic("cannot join language-server encoder")
+      }
+    } else {
+      _ = lsp_escape_job(#cast(rawptr, &jobs[index]))
+    }
+  }
+}
+// Document text low..high as a JSON string, escaped chunk by chunk from the
+// document's storage. out needs (high - low) * 6 + 2 bytes. Large ranges are
+// measured, then written, by one thread per CPU over equal slices.
+fn lsp_json_document(out: []u8, doc: *const buffer.Document, low: usize, high: usize) []u8 {
+  if #len(out) < 2 {
+    return out[..0]
+  }
+  out[0] = '"'
+  used: usize = 1
+  workers := buffer.parallel_workers()
+  if high - low >= LspParallelEscape && workers > 1 {
+    snapshot := buffer.snapshot_take(doc)
+    defer buffer.snapshot_release(&snapshot)
+    storage: [16]LspEscapeJob = []
+    jobs := storage[..workers]
+    for index in 0..workers {
+      jobs[index] = LspEscapeJob{snapshot: &snapshot, low: low + (high - low) * index / workers, high: low + (high - low) * (index + 1) / workers}
+    }
+    lsp_escape_run(jobs)
+    total: usize = 0
+    for index in 0..workers {
+      total += jobs[index].size
+    }
+    // Keep room for the final quote and never publish partial JSON.
+    if total >= #len(out) - used {
+      return out[..0]
+    }
+    for index in 0..workers {
+      jobs[index].out = &out[used]
+      used += jobs[index].size
+    }
+    lsp_escape_run(jobs)
+  } else {
+    at := low
+    for at < high {
+      chunk := buffer.chunk_at(doc, at)
+      if #len(chunk) > high - at {
+        chunk = chunk[..high - at]
+      }
+      // Worst case six bytes per byte; measure only when that may not fit.
+      if #len(chunk) * 6 >= #len(out) - used && lsp_escape(nil, chunk) >= #len(out) - used {
+        return out[..0]
+      }
+      used += lsp_escape(&out[used], chunk)
+      at += #len(chunk)
+    }
+  }
+  out[used] = '"'
+  used += 1
+  return out[..used]
+}
 fn lsp_json_string(out: []u8, source: []const u8) []u8 {
   value := json.Value{ kind: json.KindString, text: source }
   return lsp_json_encode(out, &value)
@@ -77,6 +253,9 @@ fn lsp_json_string(out: []u8, source: []const u8) []u8 {
 
 extern fn rpc_open "dna_rpc_open"(command: *const u8, directory: *const u8) rawptr
 extern fn rpc_send "dna_rpc_send"(rpc: rawptr, bytes: *const u8, length: usize) i32
+extern fn rpc_send_begin "dna_rpc_send_begin"(rpc: rawptr, capacity: usize) *u8
+extern fn rpc_send_commit "dna_rpc_send_commit"(rpc: rawptr, length: usize) i32
+extern fn rpc_send_abort "dna_rpc_send_abort"(rpc: rawptr)
 extern fn rpc_size "dna_rpc_size"(rpc: rawptr) isize
 extern fn rpc_take "dna_rpc_take"(rpc: rawptr, bytes: *u8, capacity: usize) isize
 extern fn rpc_log "dna_rpc_log"(rpc: rawptr, bytes: *u8, capacity: usize) usize
@@ -95,12 +274,12 @@ struct LspDocument {
   length: usize,
 }
 // Last text sent to an incremental-sync server, so a change sends only the
-// edited region. Created lazily; freed on close, restart and shutdown.
+// edited region. A retained snapshot of the document's tree: it shares all
+// storage with the document, so it costs no copy. Freed on close, restart
+// and shutdown.
 struct LspShadow {
-  arena: *mem.Arena,
-  bytes: []u8,
-  length: usize,
-  owned, ready: bool,
+  snapshot: buffer.TextSnapshot,
+  ready: bool,
 }
 struct LanguageServer {
   managed: bool,
@@ -349,61 +528,13 @@ fn lsp_documents_ensure(server:*LanguageServer, count:usize)bool {
   arena_owner.release(previous)
   return true
 }
-// Capacity follows the sent text, not the maximum editor document. Failure
-// leaves the complete previous sent snapshot available for a later retry.
-fn lsp_shadow_ensure(shadow:*LspShadow, length:usize)bool {
-  if length==#cast(usize, -1) || shadow.length==#cast(usize, -1) {
-    return false
-  }
-  needed:=length+1
-  if needed<shadow.length+1 {
-    needed=shadow.length+1
-  }
-  if shadow.owned && #len(shadow.bytes)>=needed {
-    return true
-  }
-  capacity:usize=4096
-  for capacity<needed {
-    if capacity>#cast(usize, -1)/2 {
-      capacity=needed
-      break
-    }
-    capacity*=2
-  }
-  arena:=arena_owner.try_create(capacity)
-  if arena==nil {
-    return false
-  }
-  host.small_pages(arena.data)
-  allocated:=mem.arena_try_push_uninit(arena, capacity, 1)
-  if !allocated.ok {
-    arena_owner.release(arena)
-    return false
-  }
-  bytes:=(#cast(*u8, allocated.memory))[..capacity]
-  if shadow.length>0 {
-    _=buffer.copy_bytes(&bytes[0], &shadow.bytes[0], shadow.length)
-  }
-  previous:=shadow.arena
-  previous_owned:=shadow.owned
-  shadow.arena=arena
-  shadow.bytes=bytes
-  shadow.owned=true
-  if previous_owned {
-    arena_owner.release(previous)
-  }
-  return true
-}
 fn lsp_shadow_release(app: *App, index: usize, slot: usize) {
   server:=&app.lsp.servers[index]
   if slot>=#len(server.documents) {
     return
   }
   shadow := &server.documents[slot].shadow
-  if shadow.owned {
-    arena_owner.release(shadow.arena)
-    shadow.arena = nil
-  }
+  buffer.snapshot_release(&shadow.snapshot)
   shadow.* = LspShadow{}
 }
 fn lsp_shadows_release(app: *App, index: usize) {
@@ -542,11 +673,8 @@ fn lsp_document_uri(out: []u8, used: *usize, path: []const u8) {
 }
 // The line index skips unchanged preceding lines; only this line needs UTF-16 counting.
 fn lsp_document_position(doc: *const buffer.Document, offset: usize) lsp.Position {
-  row := buffer.row_at(doc, offset)
-  start := buffer.row_start(doc, row)
-  result := lsp.position(doc.bytes[start..offset], offset - start)
-  result.line += row
-  return result
+  point := buffer.document_point(doc, offset)
+  return lsp.Position{line: point.line, character: point.character}
 }
 // One queued slot is the unit of synchronization. Never retain its metadata
 // pointer across a send that can stop the server and release the arena.
@@ -559,8 +687,11 @@ fn lsp_sync_slot(app:*App, index:usize, slot_index:usize, force:bool) bool {
   configured_filetype_slot(app, slot)
   tracked := &server.documents[slot_index]
   matches: bool = false
-  // Large files are not sent to language servers (closed if they grow).
-  if slot.document != nil && slot.terminal.handle == nil && slot.file.length > 0 && slot.document.length < buffer.LargeFile {
+  // Documents past one message's size are not sent (closed if they grow).
+  // Messages escape text from the tree without a flat copy; their virtual
+  // reservation is six bytes per text byte, capped at 1 GiB and touched only
+  // as written. Large outgoing messages do not relax incoming response bounds.
+  if slot.document != nil && slot.terminal.handle == nil && slot.file.length > 0 && slot.document.length < 1073676288 {
     matches = buffer.equal(filetype_name(slot), server.language[..server.length])
   }
   if tracked.identity != 0 && (!matches || tracked.identity != slot.identity || !buffer.equal(tracked.path[..tracked.length], files.name(&slot.file))) {
@@ -603,42 +734,36 @@ fn lsp_sync_slot(app:*App, index:usize, slot_index:usize, force:bool) bool {
   }
   opening := tracked.identity == 0
   shadow := &tracked.shadow
-  if server.sync==2 && !lsp_shadow_ensure(shadow, doc.length) {
-    lsp_allocation_retry(server, sdl.ticks())
-    lsp_note(app, "Could not grow incremental language-server snapshot.")
-    return false
-  }
-  sent: []const u8 = doc.bytes[..doc.length]
   prefix: usize = 0
-  old_high := shadow.length
+  old_high := shadow.snapshot.length
   high := doc.length
   incremental := !opening && server.sync == 2 && shadow.ready
   if incremental {
-    before := shadow.bytes[..shadow.length]
     changed := buffer.changes_since(doc, tracked.revision)
-    if changed.found && changed.old_length == shadow.length {
+    if changed.found && changed.old_length == shadow.snapshot.length {
       prefix = changed.low
       old_high = changed.old_high
       high = changed.high
     } else {
-      // Reloads and journal overflow require a full diff against the sent copy.
-      for prefix < #len(before) && prefix < doc.length && before[prefix] == doc.bytes[prefix] {
-        prefix += 1
-      }
-      for prefix > 0 && prefix < #len(before) && (before[prefix] & 192) == 128 {
+      // Reloads and journal overflow require a full diff against the sent text.
+      common := buffer.snapshot_common(&shadow.snapshot, doc)
+      prefix = common.prefix
+      for prefix > 0 && prefix < shadow.snapshot.length && (buffer.snapshot_byte_at(&shadow.snapshot, prefix) & 192) == 128 {
         prefix -= 1
       }
-      suffix: usize = 0
-      for suffix < #len(before) - prefix && suffix < doc.length - prefix && before[#len(before) - 1 - suffix] == doc.bytes[doc.length - 1 - suffix] {
-        suffix += 1
-      }
-      for suffix > 0 && (before[#len(before) - suffix] & 192) == 128 {
+      suffix := common.suffix
+      for suffix > 0 && (buffer.snapshot_byte_at(&shadow.snapshot, shadow.snapshot.length - suffix) & 192) == 128 {
         suffix -= 1
       }
-      old_high = shadow.length - suffix
+      old_high = shadow.snapshot.length - suffix
       high = doc.length - suffix
     }
-    sent = doc.bytes[prefix..high]
+  }
+  sent_low: usize = 0
+  sent_high := doc.length
+  if incremental {
+    sent_low = prefix
+    sent_high = high
   }
   // Versions are unique within this connection, including when a URI moves
   // to another slot. LSP's signed integer range must never wrap or repeat.
@@ -648,13 +773,23 @@ fn lsp_sync_slot(app:*App, index:usize, slot_index:usize, force:bool) bool {
     return false
   }
   work := &app.operations.lsp_send
-  capacity := #len(sent) * 6 + 65536
-  if !work_acquire(app, work, capacity * 2 + 64, "lsp_send") {
+  capacity := (sent_high - sent_low) * 6 + 65536
+  // The native queue owns encoded text; only URI/string scratch lives here.
+  if capacity > 1073741824 {
+    capacity = 1073741824
+  }
+  if !work_acquire(app, work, 65536 + 64, "lsp_send") {
     lsp_allocation_retry(server, sdl.ticks())
     return false
   }
-  message := mem.push_bytes_uninit(work.arena, capacity)
-  escaped := mem.push_bytes_uninit(work.arena, capacity)
+  target := rpc_send_begin(server.process, capacity)
+  if target == nil {
+    work_finish(app, work, "lsp_send")
+    lsp_allocation_retry(server, sdl.ticks())
+    return false
+  }
+  message := target[..capacity]
+  escaped := mem.push_bytes_uninit(work.arena, 65536)
   used: usize = 0
   if opening {
     lsp_header(message, &used, "textDocument/didOpen", 0)
@@ -676,12 +811,9 @@ fn lsp_sync_slot(app:*App, index:usize, slot_index:usize, force:bool) bool {
     add_text(message, &used, "},\"contentChanges\":[{")
     if incremental {
       start := lsp_document_position(doc, prefix)
-      previous := shadow.bytes[prefix..old_high]
-      end := lsp.position(previous, #len(previous))
-      if end.line == 0 {
-        end.character += start.character
-      }
-      end.line += start.line
+      // The old end, in the text the server holds.
+      old_end := buffer.snapshot_point(&shadow.snapshot, old_high)
+      end := lsp.Position{line: old_end.line, character: old_end.character}
       add_text(message, &used, "\"range\":{\"start\":")
       lsp_position(message, &used, start)
       add_text(message, &used, ",\"end\":")
@@ -696,21 +828,22 @@ fn lsp_sync_slot(app:*App, index:usize, slot_index:usize, force:bool) bool {
     }
     add_text(message, &used, "\"text\":")
   }
-  quoted := lsp_json_string(escaped, sent)
+  quoted := lsp_json_document(message[used..capacity - 16], doc, sent_low, sent_high)
   if #len(quoted) == 0 {
+    rpc_send_abort(server.process)
     work_finish(app, work, "lsp_send")
     lsp_note(app, "Cannot encode document for language server.")
     lsp_allocation_retry(server, sdl.ticks())
     return false
   }
-  add_text(message, &used, quoted)
+  used += #len(quoted)
   if opening {
     add_text(message, &used, "}}}")
   } else {
     add_text(message, &used, "}]}")
     add_text(message, &used, "}")
   }
-  delivered := lsp_send(app, index, message[..used])
+  delivered := rpc_send_commit(server.process, used) != 0
   work_finish(app, work, "lsp_send")
   if !delivered {
     return false
@@ -719,21 +852,9 @@ fn lsp_sync_slot(app:*App, index:usize, slot_index:usize, force:bool) bool {
     tracked.saved_epoch = doc.saved_epoch
   }
   if server.sync == 2 {
-    shadow.ready = shadow.owned
-    if shadow.owned {
-      if incremental {
-        tail := shadow.length - old_high
-        if tail > 0 && high != old_high {
-          _ = buffer.move_bytes(&shadow.bytes[high], &shadow.bytes[old_high], tail)
-        }
-        if high > prefix {
-          _ = buffer.copy_bytes(&shadow.bytes[prefix], &doc.bytes[prefix], high - prefix)
-        }
-      } else if doc.length > 0 {
-        _ = buffer.copy_bytes(&shadow.bytes[0], &doc.bytes[0], doc.length)
-      }
-      shadow.length = doc.length
-    }
+    buffer.snapshot_release(&shadow.snapshot)
+    shadow.snapshot = buffer.snapshot_take(doc)
+    shadow.ready = true
   }
   tracked.identity = slot.identity
   tracked.revision = doc.revision
@@ -904,14 +1025,14 @@ fn lsp_request(app: *App, kind: usize, argument: []const u8) {
   }
   else if kind == 6 {
     add_text(message[..], &used, "\"range\":{\"start\":")
-    lsp_position(message[..], &used, lsp.position(doc.bytes[..doc.length], buffer.start(doc)))
+    lsp_position(message[..], &used, lsp_document_position(doc, buffer.start(doc)))
     add_text(message[..], &used, ",\"end\":")
-    lsp_position(message[..], &used, lsp.position(doc.bytes[..doc.length], buffer.end(doc)))
+    lsp_position(message[..], &used, lsp_document_position(doc, buffer.end(doc)))
     add_text(message[..], &used, "},\"context\":{\"diagnostics\":[]}")
   }
   else {
     add_text(message[..], &used, "\"position\":")
-    lsp_position(message[..], &used, lsp.position(doc.bytes[..doc.length], position))
+    lsp_position(message[..], &used, lsp_document_position(doc, position))
   }
   if kind == 1 {
     if #len(argument) != 0 {
@@ -1604,11 +1725,20 @@ fn lsp_saved(app: *App, index: usize, slot_index: usize) {
   if tracked.revision != slot.document.revision {
     return
   }
-  capacity := slot.document.length * 6 + 65536
-  allocated := arena_owner.create((capacity * 2 + 64))
-  defer arena_owner.release(allocated)
-  message := mem.push_bytes_uninit(allocated, capacity)
-  escaped := mem.push_bytes_uninit(allocated, capacity)
+  capacity: usize = 65536
+  if server.save_text {
+    capacity = slot.document.length * 6 + 65536
+    if capacity > 1073741824 {
+      capacity = 1073741824
+    }
+  }
+  target := rpc_send_begin(server.process, capacity)
+  if target == nil {
+    lsp_note(app, "Language server queue full or disconnected. Use :lsp-restart.")
+    lsp_stop(app, index)
+    return
+  }
+  message := target[..capacity]
   used: usize = 0
   lsp_header(message, &used, "textDocument/didSave", 0)
   add_text(message, &used, "{\"textDocument\":{\"uri\":")
@@ -1616,11 +1746,20 @@ fn lsp_saved(app: *App, index: usize, slot_index: usize) {
   add_text(message, &used, "}")
   if server.save_text {
     add_text(message, &used, ",\"text\":")
-    add_text(message, &used, lsp_json_string(escaped, slot.document.bytes[..slot.document.length]))
+    quoted := lsp_json_document(message[used..capacity - 4], slot.document, 0, slot.document.length)
+    if #len(quoted) == 0 {
+      rpc_send_abort(server.process)
+      lsp_note(app, "Cannot encode saved document for language server.")
+      return
+    }
+    used += #len(quoted)
   }
   add_text(message, &used, "}}")
-  if lsp_send(app, index, message[..used]) {
+  if rpc_send_commit(server.process, used) != 0 {
     tracked.saved_epoch = slot.document.saved_epoch
+  } else {
+    lsp_note(app, "Language server queue full or disconnected. Use :lsp-restart.")
+    lsp_stop(app, index)
   }
 }
 

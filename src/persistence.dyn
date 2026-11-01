@@ -24,7 +24,7 @@ fn recovery_delay(app: *const App) u64 {
   }
   return base * #cast(u64, steps)
 }
-struct RestoredDocument { arena: *mem.Arena, document: *buffer.Document, colors: []u8 }
+struct RestoredDocument { arena: *mem.Arena, document: *buffer.Document, colors: []u8, stamp: fs.Stamp }
 
 extern fn recovery_open "dna_recovery_open"(directory: *const u8) rawptr
 extern fn recovery_submit "dna_recovery_submit"(recovery: rawptr, bytes: *const u8, length: usize) i32
@@ -42,6 +42,105 @@ fn session_path(app: *App, argument: []const u8, output: []u8) []const u8 {
 // Recovery snapshots record large files (buffer.LargeFile and up) by path, to
 // be reloaded from disk; rewriting them every few seconds would cost hundreds
 // of megabytes of writes. Explicit session saves keep all text.
+// Unsaved edits as one replacement against the saved file. Refuse a capture
+// that cannot retain every edit; never replace recovery with a path-only entry
+// for a dirty document. The worker's whole-record bound is checked separately.
+// Largest single replaced region or total of new bytes a recovery record
+// holds: what a session decodes as one text.
+const RecoveryPatchLimit: usize = buffer.Capacity
+// Edited regions above this are recorded as pieces rather than one patch.
+const RecoveryPiecesMinimum: usize = 1048576
+// Whole recovery record; the native worker enforces the same bound.
+const RecoveryRecordLimit: usize = 1073741824
+fn recovery_pieces(saved: *workspace.SavedBuffer, state: *workspace.State, doc: *const buffer.Document) bool {
+  if state.patches == nil {
+    state.patches = mem.arena_create(RecoveryPatchLimit + 268435456)
+  }
+  list := buffer.saved_pieces(doc, state.patches, RecoveryPatchLimit)
+  if !list.ok {
+    return false
+  }
+  records := mem.arena_try_push_uninit(state.patches, #len(list.pieces) * 24 + 1, 8)
+  if !records.ok {
+    return false
+  }
+  encoded := (#cast(*u8, records.memory))[..#len(list.pieces) * 24]
+  for index in 0..#len(list.pieces) {
+    piece := list.pieces[index]
+    kind: usize = 0
+    if piece.literal {
+      kind = 1
+    }
+    words: [3]usize = [kind, piece.offset, piece.length]
+    for word in 0..3 {
+      for byte in 0..8 {
+        encoded[index * 24 + word * 8 + byte] = #cast(u8, (words[word] >> (byte * 8)) & 255)
+      }
+    }
+  }
+  saved.patched = true
+  saved.pieces = encoded
+  saved.patch = list.literals
+  return true
+}
+fn recovery_patch(saved: *workspace.SavedBuffer, state: *workspace.State, slot: *Slot) bool {
+  doc := slot.document
+  // Edits against a partly loaded file are recorded once it completes.
+  if buffer.load_state(doc) != buffer.LoadComplete {
+    return true
+  }
+  if !buffer.dirty_cached(doc) {
+    return true
+  }
+  stamp := files.saved_stamp(&slot.file)
+  if !stamp.ok {
+    return false
+  }
+  low := doc.saved_prefix
+  if low > doc.saved_length || low > doc.length {
+    return false
+  }
+  suffix := doc.saved_suffix
+  if suffix > doc.saved_length - low || suffix > doc.length - low {
+    return false
+  }
+  high := doc.length - suffix
+  saved.stamp = [stamp.inode, stamp.size, stamp.modify_seconds, stamp.modify_nanos]
+  if high - low > RecoveryPiecesMinimum {
+    // A large edited region: record pieces of the saved file plus only the
+    // new bytes, never more than the region itself.
+    return recovery_pieces(saved, state, doc)
+  }
+  saved.patched = true
+  saved.patch_low = low
+  saved.patch_high = doc.saved_length - suffix
+  saved.patch = buffer.range(doc, low, high)
+  saved.stamp = [stamp.inode, stamp.size, stamp.modify_seconds, stamp.modify_nanos]
+  return true
+}
+fn recovery_apply_pieces(doc: *buffer.Document, saved: *const workspace.SavedBuffer) bool {
+  count := #len(saved.pieces) / 24
+  arena := arena_owner.create(count * #sizeof(buffer.Piece) + 64)
+  defer arena_owner.release(arena)
+  pieces := (#cast(*buffer.Piece, &mem.push_bytes_uninit(arena, count * #sizeof(buffer.Piece) + 16)[0]))[..count]
+  for index in 0..count {
+    words: [3]usize = []
+    for word in 0..3 {
+      for byte in 0..8 {
+        words[word] |= #cast(usize, saved.pieces[index * 24 + word * 8 + byte]) << (byte * 8)
+      }
+    }
+    if words[0] > 1 {
+      return false
+    }
+    pieces[index] = buffer.Piece{literal: words[0] == 1, offset: words[1], length: words[2]}
+  }
+  if !buffer.apply_pieces(doc, pieces, saved.patch) {
+    return false
+  }
+  buffer.checkpoint(doc)
+  return true
+}
 fn session_capture(app: *App, state: *workspace.State, recovery: bool) bool {
   pane_init(app)
   pane_store(app)
@@ -58,15 +157,22 @@ fn session_capture(app: *App, state: *workspace.State, recovery: bool) bool {
     saved := workspace.buffer_mut(state, index)
     if slot.document != nil {
       doc := slot.document
-      saved.* = workspace.SavedBuffer{used: true, path: files.name(&slot.file), text: doc.bytes[..doc.length], saved_parts: buffer.saved_parts(doc), split_saved: true, filetype: slot.filetype[..slot.filetype_length], cursor: doc.cursor, anchor: doc.anchor, secondary: doc.secondary}
+      filetype: []const u8 = slot.filetype[..slot.filetype_length]
       if slot.inferred_filetype {
-        saved.*.filetype = ""
+        filetype = ""
       }
       if slot.terminal.handle != nil {
         saved.* = workspace.SavedBuffer{used: true}
       }
       else if recovery && doc.length >= buffer.LargeFile && slot.file.length > 0 {
-        saved.* = workspace.SavedBuffer{used: true, reload: true, path: files.name(&slot.file), filetype: saved.*.filetype, cursor: doc.cursor, anchor: doc.anchor}
+        saved.* = workspace.SavedBuffer{used: true, reload: true, path: files.name(&slot.file), filetype: filetype, cursor: doc.cursor, anchor: doc.anchor}
+        if !recovery_patch(saved, state, slot) {
+          plugin_log(app, "Cannot capture every large-file edit within the recovery limit. Previous recovery retained; save explicitly.")
+          return false
+        }
+      }
+      else {
+        saved.* = workspace.SavedBuffer{used: true, path: files.name(&slot.file), text: buffer.all(doc), saved_parts: buffer.saved_parts(doc), split_saved: true, filetype: filetype, cursor: doc.cursor, anchor: doc.anchor, secondary: doc.secondary}
       }
     }
   }
@@ -217,12 +323,36 @@ fn session_restore(app: *App, argument: []const u8) bool {
       restored[index].colors = colors.memory[..buffer.Capacity + 1]
       doc := restored[index].document
       if saved.reload {
-        disk := files.read_text(saved.path)
-        loaded := disk.ok && buffer.load(doc, disk.data)
+        // Read (or map) the file straight into storage the document adopts.
+        disk := files.read_document(saved.path)
+        loaded := disk.ok && buffer.load_storage(doc, &disk.storage, #len(disk.data))
+        stamp := disk.stamp
+        restored[index].stamp = stamp
         files.release_text(&disk)
         if !loaded {
           notice(app, "A large file in the session can no longer be read. Workspace unchanged.")
           return false
+        }
+        if saved.patched {
+          // Edits apply only to the exact file they were made against.
+          same := stamp.ok && stamp.inode == saved.stamp[0] && stamp.size == saved.stamp[1] && stamp.modify_seconds == saved.stamp[2] && stamp.modify_nanos == saved.stamp[3]
+          if same && #len(saved.pieces) > 0 {
+            if !recovery_apply_pieces(doc, saved) {
+              notice(app, "Cannot apply recovered edits. Workspace and recovery record unchanged.")
+              return false
+            }
+          } else if same && saved.patch_high <= doc.length {
+            doc.anchor = saved.patch_low
+            doc.cursor = saved.patch_high
+            if !buffer.replace(doc, saved.patch) {
+              notice(app, "Cannot apply recovered edits. Workspace and recovery record unchanged.")
+              return false
+            }
+            buffer.checkpoint(doc)
+          } else {
+            notice(app, "A large file changed on disk since its unsaved edits were recorded. Workspace and recovery record unchanged.")
+            return false
+          }
         }
       }
       else {
@@ -284,6 +414,7 @@ fn session_restore(app: *App, argument: []const u8) bool {
     current.file.length = 0
     current.file.recovery_owned = false
     current.file.path[0] = 0
+    current.file.stamp = fs.Stamp{}
     current.scroll_x = 0.0
     current.scroll_y = 0.0
     current.insert = false
@@ -299,6 +430,7 @@ fn session_restore(app: *App, argument: []const u8) bool {
       }
       allocation_record(app, "document", #sizeof(buffer.Document) + buffer.Capacity + 129, current.arena_born, false)
       current.colors = restored[index].colors
+      current.file.stamp = restored[index].stamp
       current.disk_changed = false
       current.diagnostics.count = 0
       app.documents.next_identity += 1
@@ -360,6 +492,9 @@ fn cleanup_restored(documents: []RestoredDocument) {
   index: usize = 0
   for index < #len(documents) {
     if documents[index].arena != nil {
+      if documents[index].document != nil {
+        buffer.release(documents[index].document)
+      }
       arena_owner.release(documents[index].arena)
       documents[index].arena = nil
     }
@@ -413,6 +548,10 @@ fn recovery_tick(app: *App) {
     return
   }
   snapshot_size := workspace.encoded_size(&state)
+  if snapshot_size > RecoveryRecordLimit {
+    plugin_log(app, "Recovery snapshot exceeds its size limit. Previous recovery retained; save explicitly.")
+    return
+  }
   work := &app.operations.recovery_encode
   if !work_acquire(app, work, snapshot_size, "recovery_encode") {
     return

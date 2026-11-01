@@ -17,6 +17,7 @@ fn uniform(text: []const u8, byte: u8, scratch: []u8) bool {
   return buffer.equal(text, scratch[..#len(text)])
 }
 fn main() {
+  lazy_checks()
   arena := arena_owner.create(#sizeof(buffer.Document))
   defer arena_owner.release(arena)
   large := arena_owner.create(buffer.Capacity)
@@ -30,23 +31,17 @@ fn main() {
   mark := mem.arena_mark(arena)
   storage := mem.arena_push_uninit(arena, #sizeof(buffer.Document), #alignof(buffer.Document))
   probe := #cast(*buffer.Document, storage)
-  metadata := #cast(usize, &probe.bytes[0]) - #cast(usize, probe)
-  fill(storage[..metadata], 165)
-  probe.bytes[buffer.Capacity] = 165
-  probe.saved_storage[buffer.Capacity] = 165
-  probe.history_storage[#len(probe.history_storage) - 1] = 165
+  fill(storage[..#sizeof(buffer.Document)], 165)
   mem.arena_rewind(arena, mark)
   document := buffer.allocate(arena)
   if document != probe {
     #panic("document allocation must reuse poisoned payload")
   }
-  if buffer.dirty(document) || document.length != 0 || document.cursor != 0 || document.secondary.count != 0 || document.history_count != 1 || document.bytes[0] != 0 || buffer.saved_text(document)[0] != 0 {
+  if buffer.dirty(document) || document.length != 0 || document.cursor != 0 || document.secondary.count != 0 || document.history_count != 1 || buffer.byte_at(document, 0) != 0 || buffer.saved_text(document)[0] != 0 {
     #panic("document allocation initialization")
   }
-  if document.history_storage[#len(document.history_storage) - 1] != 165 || document.bytes[buffer.Capacity] != 165 || document.saved_storage[buffer.Capacity] != 165 {
-    #panic("unused document storage touched")
-  }
   observer_checks(document)
+  mapped_history_checks(document)
   snapshot_baseline_checks(document)
   compact_index_checks(document)
   same_size_line_checks(document)
@@ -65,7 +60,7 @@ fn main() {
     #panic("insert")
   }
   buffer.checkpoint(document)
-  if !buffer.equal(document.bytes[..document.length], "one\nXtwo\nthree") {
+  if !buffer.equal(buffer.all(document), "one\nXtwo\nthree") {
     #panic("middle insertion")
   }
   buffer.move_to(document, 4, false)
@@ -75,11 +70,11 @@ fn main() {
   }
   buffer.checkpoint(document)
   buffer.undo(document)
-  if !buffer.equal(document.bytes[..document.length], "one\nXtwo\nthree") {
+  if !buffer.equal(buffer.all(document), "one\nXtwo\nthree") {
     #panic("undo")
   }
   buffer.redo(document)
-  if !buffer.equal(document.bytes[..document.length], "one\nTWO\nthree") {
+  if !buffer.equal(buffer.all(document), "one\nTWO\nthree") {
     #panic("redo")
   }
   if !buffer.find(document, "one", false) || document.anchor != 0 {
@@ -98,7 +93,7 @@ fn main() {
   }
   buffer.move_to(document, 3, false)
   buffer.erase(document, true)
-  if !buffer.equal(document.bytes[..document.length], "a\nb中\n") {
+  if !buffer.equal(buffer.all(document), "a\nb中\n") {
     #panic("UTF8 backspace")
   }
   buffer.move_to(document, 1, false)
@@ -157,12 +152,13 @@ fn main() {
   fill(full, 'a')
   _ = buffer.load(document, full[..])
   buffer.move_to(document, document.length, false)
-  if buffer.replace(document, "b") || document.length != buffer.Capacity || buffer.dirty(document) {
-    #panic("capacity rollback")
+  // Documents have no fixed size: growing past the 256 MiB copy limit works.
+  if !buffer.replace(document, "b") || document.length != buffer.Capacity + 1 || !buffer.dirty(document) {
+    #panic("growth past copy limit")
   }
   buffer.erase(document, true)
-  if !buffer.replace(document, "b") || document.length != buffer.Capacity {
-    #panic("capacity boundary")
+  if buffer.dirty(document) || document.length != buffer.Capacity {
+    #panic("erase back to saved text")
   }
   // Compare indexed line lookup against a byte-scan oracle through edits/undo.
   _ = buffer.load(document, "aé\nb\n\nlast\n")
@@ -229,7 +225,7 @@ fn main() {
   }
   buffer.redo(document)
   buffer.redo(document)
-  if !buffer.equal(document.bytes[..document.length], "new.txt\nrenamed.txt\nbeta.txt\n") || buffer.row_id(document, 20) != 2 {
+  if !buffer.equal(buffer.all(document), "new.txt\nrenamed.txt\nbeta.txt\n") || buffer.row_id(document, 20) != 2 {
     #panic("row redo")
   }
   buffer.move_to(document, 8, false)
@@ -367,16 +363,16 @@ fn main() {
     #panic("add UTF8 cursor")
   }
   buffer.checkpoint(document)
-  if !buffer.replace_all(document, "!") || !buffer.equal(document.bytes[..document.length], "!é\n!b\n") {
+  if !buffer.replace_all(document, "!") || !buffer.equal(buffer.all(document), "!é\n!b\n") {
     #panic("multiple replacements")
   }
   buffer.checkpoint(document)
   buffer.undo(document)
-  if document.secondary.count != 1 || !buffer.equal(document.bytes[..document.length], "aé\n中b\n") {
+  if document.secondary.count != 1 || !buffer.equal(buffer.all(document), "aé\n中b\n") {
     #panic("undo restores selections")
   }
   buffer.redo(document)
-  if document.secondary.count != 1 || !buffer.equal(document.bytes[..document.length], "!é\n!b\n") {
+  if document.secondary.count != 1 || !buffer.equal(buffer.all(document), "!é\n!b\n") {
     #panic("redo restores selections")
   }
   _ = buffer.load(document, "abcdef")
@@ -384,7 +380,7 @@ fn main() {
   document.cursor = 3
   document.secondary.count = 1
   document.secondary.ranges[0] = buffer.Selection{anchor: 2, cursor: 5}
-  if !buffer.replace_all(document, "X") || !buffer.equal(document.bytes[..document.length], "Xf") || document.secondary.count != 0 {
+  if !buffer.replace_all(document, "X") || !buffer.equal(buffer.all(document), "Xf") || document.secondary.count != 0 {
     #panic("overlapping selections merge")
   }
   _ = buffer.load(document, "abcdef")
@@ -392,57 +388,58 @@ fn main() {
   document.cursor = 2
   document.secondary.count = 1
   document.secondary.ranges[0] = buffer.Selection{anchor: 2, cursor: 4}
-  if !buffer.replace_all(document, "!") || !buffer.equal(document.bytes[..document.length], "!!ef") || document.cursor != 1 || document.secondary.ranges[0].cursor != 2 {
+  if !buffer.replace_all(document, "!") || !buffer.equal(buffer.all(document), "!!ef") || document.cursor != 1 || document.secondary.ranges[0].cursor != 2 {
     #panic("adjacent selections remain distinct")
   }
-  // Capacity rejection is atomic, including selection state.
+  // Multicursor edits may grow a document past the 256 MiB copy limit.
   multi_full := full
   _ = buffer.load(document, multi_full[..])
   document.secondary.count = 1
   document.secondary.ranges[0] = buffer.Selection{anchor: buffer.Capacity, cursor: buffer.Capacity}
-  revision_before := document.revision
-  if buffer.replace_all(document, "x") || document.length != buffer.Capacity || document.revision != revision_before || document.secondary.count != 1 || document.cursor != 0 {
-    #panic("multicursor capacity rollback")
+  if !buffer.replace_all(document, "x") || document.length != buffer.Capacity + 2 || buffer.byte_at(document, 0) != 120 || buffer.byte_at(document, buffer.Capacity + 1) != 120 {
+    #panic("multicursor growth past copy limit")
   }
+  _ = buffer.load(document, multi_full[..])
+  document.secondary.count = 1
   // A high range grows and a lower range shrinks while the final size fits.
   document.anchor = 0
   document.cursor = 3
   document.secondary.ranges[0] = buffer.Selection{anchor: buffer.Capacity - 1, cursor: buffer.Capacity}
-  if !buffer.replace_all(document, "xy") || document.length != buffer.Capacity || document.bytes[0] != 120 || document.bytes[buffer.Capacity - 1] != 121 {
+  if !buffer.replace_all(document, "xy") || document.length != buffer.Capacity || buffer.byte_at(document, 0) != 120 || buffer.byte_at(document, buffer.Capacity - 1) != 121 {
     #panic("multicursor transient capacity")
   }
   _ = buffer.load(document, "a\nb\n")
   buffer.select_current(document)
   _ = buffer.add_cursor(document, true)
-  if !buffer.replace_characters(document, "é") || !buffer.equal(document.bytes[..document.length], "é\né\n") {
+  if !buffer.replace_characters(document, "é") || !buffer.equal(buffer.all(document), "é\né\n") {
     #panic("multiple character replacement")
   }
 
   _ = buffer.load(document, "a\n  b\nc")
   document.cursor = 4
-  if !buffer.indent_lines(document, false, 1) || !buffer.equal(document.bytes[..document.length], "    a\n      b\nc") {
+  if !buffer.indent_lines(document, false, 1) || !buffer.equal(buffer.all(document), "    a\n      b\nc") {
     #panic("indent selected lines")
   }
-  if !buffer.indent_lines(document, true, 1) || !buffer.equal(document.bytes[..document.length], "a\n  b\nc") {
+  if !buffer.indent_lines(document, true, 1) || !buffer.equal(buffer.all(document), "a\n  b\nc") {
     #panic("unindent selected lines")
   }
   buffer.move_to(document, 0, false)
   buffer.join_lines(document)
-  if !buffer.equal(document.bytes[..document.length], "a b\nc") {
+  if !buffer.equal(buffer.all(document), "a b\nc") {
     #panic("join line")
   }
   _ = buffer.load(document, "a\nb\n")
   document.cursor = document.length
-  if !buffer.indent_lines_by(document, false, 2, 2, false) || !buffer.equal(document.bytes[..document.length], "    a\n    b\n") {
+  if !buffer.indent_lines_by(document, false, 2, 2, false) || !buffer.equal(buffer.all(document), "    a\n    b\n") {
     #panic("counted two-space indentation")
   }
-  if !buffer.indent_lines_by(document, true, 2, 2, false) || !buffer.equal(document.bytes[..document.length], "a\nb\n") {
+  if !buffer.indent_lines_by(document, true, 2, 2, false) || !buffer.equal(buffer.all(document), "a\nb\n") {
     #panic("counted two-space unindentation")
   }
-  if !buffer.indent_lines_by(document, false, 2, 8, true) || !buffer.equal(document.bytes[..document.length], "\t\ta\n\t\tb\n") {
+  if !buffer.indent_lines_by(document, false, 2, 8, true) || !buffer.equal(buffer.all(document), "\t\ta\n\t\tb\n") {
     #panic("counted tab indentation")
   }
-  if !buffer.indent_lines_by(document, true, 2, 8, true) || !buffer.equal(document.bytes[..document.length], "a\nb\n") {
+  if !buffer.indent_lines_by(document, true, 2, 8, true) || !buffer.equal(buffer.all(document), "a\nb\n") {
     #panic("counted tab unindentation")
   }
   indent_revision := document.revision
@@ -452,13 +449,13 @@ fn main() {
   _ = buffer.load(document, "aéZ")
   document.cursor = document.length
   buffer.change_case(document, 0)
-  if !buffer.equal(document.bytes[..document.length], "Aéz") {
+  if !buffer.equal(buffer.all(document), "Aéz") {
     #panic("ASCII case preserves UTF8")
   }
   _ = buffer.load(document, " \té \n")
   document.cursor = document.length
   buffer.trim_selection(document)
-  if !buffer.equal(document.bytes[buffer.start(document)..buffer.end(document)], "é") {
+  if !buffer.equal(buffer.range(document, buffer.start(document), buffer.end(document)), "é") {
     #panic("trim selection")
   }
   _ = buffer.load(document, "abé cé\ndé")
@@ -479,15 +476,15 @@ fn main() {
 
   _ = buffer.load(document, "outer (a [é] z) tail")
   buffer.move_to(document, 11, false)
-  if !buffer.select_objects(document, 91, false, 1, false, false) || !buffer.equal(document.bytes[buffer.start(document)..buffer.end(document)], "é") {
+  if !buffer.select_objects(document, 91, false, 1, false, false) || !buffer.equal(buffer.range(document, buffer.start(document), buffer.end(document)), "é") {
     #panic("inside UTF8 brackets")
   }
-  if !buffer.select_objects(document, 40, true, 1, false, false) || !buffer.equal(document.bytes[buffer.start(document)..buffer.end(document)], "(a [é] z)") {
+  if !buffer.select_objects(document, 40, true, 1, false, false) || !buffer.equal(buffer.range(document, buffer.start(document), buffer.end(document)), "(a [é] z)") {
     #panic("around enclosing parentheses")
   }
   _ = buffer.load(document, "((x))")
   buffer.move_to(document, 2, false)
-  if !buffer.select_objects(document, 40, false, 2, false, false) || !buffer.equal(document.bytes[buffer.start(document)..buffer.end(document)], "(x)") {
+  if !buffer.select_objects(document, 40, false, 2, false, false) || !buffer.equal(buffer.range(document, buffer.start(document), buffer.end(document)), "(x)") {
     #panic("outer pair count")
   }
   _ = buffer.load(document, "(a < b)")
@@ -500,15 +497,15 @@ fn main() {
   }
   _ = buffer.load(document, "abc déf ghi")
   buffer.move_to(document, 5, false)
-  if !buffer.select_objects(document, 119, false, 1, false, false) || !buffer.equal(document.bytes[buffer.start(document)..buffer.end(document)], "déf") {
+  if !buffer.select_objects(document, 119, false, 1, false, false) || !buffer.equal(buffer.range(document, buffer.start(document), buffer.end(document)), "déf") {
     #panic("inside word")
   }
-  if !buffer.select_objects(document, 119, true, 1, false, false) || !buffer.equal(document.bytes[buffer.start(document)..buffer.end(document)], "déf ") {
+  if !buffer.select_objects(document, 119, true, 1, false, false) || !buffer.equal(buffer.range(document, buffer.start(document), buffer.end(document)), "déf ") {
     #panic("around word whitespace")
   }
   _ = buffer.load(document, "one\ntwo\n\nthree")
   buffer.move_to(document, 5, false)
-  if !buffer.select_objects(document, 112, false, 1, false, false) || !buffer.equal(document.bytes[buffer.start(document)..buffer.end(document)], "one\ntwo\n") {
+  if !buffer.select_objects(document, 112, false, 1, false, false) || !buffer.equal(buffer.range(document, buffer.start(document), buffer.end(document)), "one\ntwo\n") {
     #panic("paragraph object")
   }
   _ = buffer.load(document, "(one) (two)")
@@ -516,25 +513,25 @@ fn main() {
   document.cursor = 4
   document.secondary.count = 1
   document.secondary.ranges[0] = buffer.Selection{anchor: 7, cursor: 10}
-  if !buffer.surround(document, 2, 40, 91, 1) || !buffer.equal(document.bytes[..document.length], "[one] [two]") {
+  if !buffer.surround(document, 2, 40, 91, 1) || !buffer.equal(buffer.all(document), "[one] [two]") {
     #panic("multi surround replace")
   }
   buffer.undo(document)
-  if !buffer.equal(document.bytes[..document.length], "(one) (two)") || document.secondary.count != 1 {
+  if !buffer.equal(buffer.all(document), "(one) (two)") || document.secondary.count != 1 {
     #panic("surround one undo group")
   }
-  if !buffer.surround(document, 1, 40, 0, 1) || !buffer.equal(document.bytes[..document.length], "one two") {
+  if !buffer.surround(document, 1, 40, 0, 1) || !buffer.equal(buffer.all(document), "one two") {
     #panic("multi surround delete")
   }
   _ = buffer.load(document, "ab")
   document.cursor = 1
   document.secondary.count = 1
   document.secondary.ranges[0] = buffer.Selection{anchor: 1, cursor: 2}
-  if !buffer.surround(document, 0, 0, 40, 1) || !buffer.equal(document.bytes[..document.length], "(a)(b)") || document.anchor != 0 || document.cursor != 3 || document.secondary.ranges[0].anchor != 3 || document.secondary.ranges[0].cursor != 6 {
+  if !buffer.surround(document, 0, 0, 40, 1) || !buffer.equal(buffer.all(document), "(a)(b)") || document.anchor != 0 || document.cursor != 3 || document.secondary.ranges[0].anchor != 3 || document.secondary.ranges[0].cursor != 6 {
     #panic("adjacent surrounds")
   }
   _ = buffer.load(document, "")
-  if !buffer.surround(document, 0, 0, 34, 1) || !buffer.equal(document.bytes[..document.length], "\"\"") {
+  if !buffer.surround(document, 0, 0, 34, 1) || !buffer.equal(buffer.all(document), "\"\"") {
     #panic("surround empty selection")
   }
   _ = buffer.load(document, "(abc)")
@@ -542,19 +539,19 @@ fn main() {
   document.cursor = 2
   document.secondary.count = 1
   document.secondary.ranges[0] = buffer.Selection{anchor: 3, cursor: 4}
-  if !buffer.surround(document, 1, 40, 0, 1) || !buffer.equal(document.bytes[..document.length], "abc") {
+  if !buffer.surround(document, 1, 40, 0, 1) || !buffer.equal(buffer.all(document), "abc") {
     #panic("shared surround deleted once")
   }
   _ = buffer.load(document, "abcdef")
   document.cursor = 3
   document.secondary.count = 1
   document.secondary.ranges[0] = buffer.Selection{anchor: 2, cursor: 5}
-  if buffer.surround(document, 0, 0, 40, 1) || !buffer.equal(document.bytes[..document.length], "abcdef") {
+  if buffer.surround(document, 0, 0, 40, 1) || !buffer.equal(buffer.all(document), "abcdef") {
     #panic("crossing surround rejected atomically")
   }
   _ = buffer.load(document, multi_full[..])
-  if buffer.surround(document, 0, 0, 40, 1) || document.length != buffer.Capacity {
-    #panic("surround capacity rollback")
+  if !buffer.surround(document, 0, 0, 40, 1) || document.length != buffer.Capacity + 2 {
+    #panic("surround past copy limit")
   }
 
   _ = buffer.load(document, "(a) b")
@@ -562,17 +559,17 @@ fn main() {
   document.cursor = 2
   document.secondary.count = 1
   document.secondary.ranges[0] = buffer.Selection{anchor: 4, cursor: 5}
-  if buffer.surround(document, 1, 40, 0, 1) || !buffer.equal(document.bytes[..document.length], "(a) b") || document.cursor != 2 || document.secondary.count != 1 {
+  if buffer.surround(document, 1, 40, 0, 1) || !buffer.equal(buffer.all(document), "(a) b") || document.cursor != 2 || document.secondary.count != 1 {
     #panic("missing surround rejects whole batch")
   }
   _ = buffer.load(document, "foo bar baz")
   buffer.move_to(document, 1, false)
-  if !buffer.select_objects(document, 119, false, 2, false, false) || !buffer.equal(document.bytes[buffer.start(document)..buffer.end(document)], "foo bar") {
+  if !buffer.select_objects(document, 119, false, 2, false, false) || !buffer.equal(buffer.range(document, buffer.start(document), buffer.end(document)), "foo bar") {
     #panic("counted word object")
   }
   _ = buffer.load(document, "one\n  \nthree")
   buffer.move_to(document, 1, false)
-  if !buffer.select_objects(document, 112, true, 1, false, false) || !buffer.equal(document.bytes[buffer.start(document)..buffer.end(document)], "one\n  \n") {
+  if !buffer.select_objects(document, 112, true, 1, false, false) || !buffer.equal(buffer.range(document, buffer.start(document), buffer.end(document)), "one\n  \n") {
     #panic("paragraph whitespace separators")
   }
 
@@ -652,7 +649,7 @@ fn main() {
     buffer.checkpoint(document)
     history_step += 1
   }
-  if document.history_count != 25 || document.history_next > 1024 {
+  if document.history_count != 25 {
     #panic("tiny edits consume whole-file undo storage")
   }
   history_step = 0
@@ -660,7 +657,7 @@ fn main() {
     buffer.undo(document)
     history_step += 1
   }
-  if document.bytes[0] != full[0] || document.length != buffer.Capacity {
+  if buffer.byte_at(document, 0) != full[0] || document.length != buffer.Capacity {
     #panic("large history wrap undo")
   }
   history_step = 0
@@ -668,7 +665,7 @@ fn main() {
     buffer.redo(document)
     history_step += 1
   }
-  if document.bytes[0] != 56 {
+  if buffer.byte_at(document, 0) != 56 {
     #panic("large history wrap redo")
   }
   // Large replacement deltas still roll over safely within the byte budget.
@@ -692,7 +689,7 @@ fn main() {
     history_step += 1
   }
   expected := #cast(u8, (#cast(usize, 84) - retained_steps))
-  if !uniform(document.bytes[..document.length], expected, check_bytes) {
+  if !uniform(buffer.all(document), expected, check_bytes) {
     #panic("large delta rollover undo")
   }
   history_step = 0
@@ -700,7 +697,7 @@ fn main() {
     buffer.redo(document)
     history_step += 1
   }
-  if !uniform(document.bytes[..document.length], 84, check_bytes) {
+  if !uniform(buffer.all(document), 84, check_bytes) {
     #panic("large delta rollover redo")
   }
   // Repeated branches reuse discarded redo storage.
@@ -714,13 +711,53 @@ fn main() {
     buffer.undo(document)
     history_step += 1
   }
-  if document.history_next > 1024 {
-    #panic("undo branches grow storage")
-  }
 
   randomized_history(document)
   test_graphemes(document)
   line_selection_checks(document)
+}
+
+// A borrowed mapping costs no private text bytes; inserted text still does.
+// Backing stays alive until the document drops every retained root.
+fn mapped_history_unmap(bytes: *u8, length: u64) {
+  _ = bytes
+  _ = length
+}
+fn mapped_history_checks(document: *buffer.Document) {
+  backing: [32]u8 = []
+  fill(backing[..], 97)
+  storage := buffer.storage_mapped(&backing[0], #len(backing), mapped_history_unmap)
+  if !buffer.load_storage(document, &storage, #len(backing)) {
+    #panic("mapped history load")
+  }
+  document.anchor = 2
+  document.cursor = 30
+  _ = buffer.replace(document, "XYZ")
+  buffer.checkpoint(document)
+  if document.history[document.history_at].cost != 3 {
+    #panic("mapped removed bytes charged to undo")
+  }
+  document.anchor = 0
+  document.cursor = document.length
+  _ = buffer.replace(document, "Q")
+  buffer.checkpoint(document)
+  if document.history[document.history_at].cost != 4 {
+    #panic("mixed private and mapped undo cost")
+  }
+  buffer.undo(document)
+  if !buffer.equal(buffer.all(document), "aaXYZaa") {
+    #panic("mixed undo text")
+  }
+  buffer.undo(document)
+  if !buffer.equal(buffer.all(document), backing[..]) {
+    #panic("mapped undo text")
+  }
+  buffer.redo(document)
+  buffer.redo(document)
+  if !buffer.equal(buffer.all(document), "Q") {
+    #panic("mapped redo text")
+  }
+  _ = buffer.load(document, "")
 }
 
 fn same_size_line_checks(document: *buffer.Document) {
@@ -759,15 +796,15 @@ fn snapshot_baseline_checks(document: *buffer.Document) {
   _ = buffer.replace(document, "?")
   buffer.checkpoint(document)
   buffer.undo(document)
-  if !buffer.equal(document.bytes[..document.length], "Abcé") || !buffer.equal(buffer.saved_text(document)[..document.saved_length], "A!bcé") || !buffer.dirty(document) {
+  if !buffer.equal(buffer.all(document), "Abcé") || !buffer.equal(buffer.saved_text(document)[..document.saved_length], "A!bcé") || !buffer.dirty(document) {
     #panic("undo preserves separately saved text")
   }
   buffer.redo(document)
-  if !buffer.equal(document.bytes[..document.length], "A!?bcé") {
+  if !buffer.equal(buffer.all(document), "A!?bcé") {
     #panic("redo after lazy saved snapshot")
   }
   _ = buffer.load(document, buffer.saved_text(document)[..document.saved_length])
-  if buffer.dirty(document) || !buffer.equal(document.bytes[..document.length], "A!bcé") {
+  if buffer.dirty(document) || !buffer.equal(buffer.all(document), "A!bcé") {
     #panic("reload from saved snapshot")
   }
 }
@@ -829,7 +866,7 @@ fn assert_lines(document: *buffer.Document) {
     if buffer.row_at(document, at) != row {
       #panic("indexed row differs from scan")
     }
-    if at < document.length && document.bytes[at] == 10 {
+    if at < document.length && buffer.byte_at(document, at) == 10 {
       row += 1
       if buffer.row_start(document, row) != at + 1 {
         #panic("indexed line start differs")
@@ -864,16 +901,16 @@ fn test_graphemes(document: *buffer.Document) {
     #panic("save restores selections on redo")
   }
   _ = buffer.load(document, "first  \r\nsecond\t")
-  if !buffer.prepare_save(document, true, true) || !buffer.equal(document.bytes[..document.length], "first\r\nsecond\r\n") {
+  if !buffer.prepare_save(document, true, true) || !buffer.equal(buffer.all(document), "first\r\nsecond\r\n") {
     #panic("save policies")
   }
   buffer.undo(document)
-  if !buffer.equal(document.bytes[..document.length], "first  \r\nsecond\t") {
+  if !buffer.equal(buffer.all(document), "first  \r\nsecond\t") {
     #panic("save policies undo")
   }
 
   _ = buffer.load(document, "first\nsecond\r\nthird")
-  if !buffer.prepare_save(document, false, true) || !buffer.equal(document.bytes[..document.length], "first\nsecond\r\nthird\n") {
+  if !buffer.prepare_save(document, false, true) || !buffer.equal(buffer.all(document), "first\nsecond\r\nthird\n") {
     #panic("final newline follows first ending")
   }
   _ = buffer.load(document, "😀  \nx")
@@ -887,16 +924,6 @@ fn test_graphemes(document: *buffer.Document) {
   if !buffer.transform(document, "a\nx") || document.cursor != 1 || document.secondary.count != 1 {
     #panic("formatter clamps shorter line")
   }
-  _ = buffer.load(document, "a\r\n")
-  fill(document.bytes[document.length..buffer.Capacity], 'x')
-  document.length = buffer.Capacity
-  document.bytes[document.length] = 0
-  document.cursor = 3
-  document.anchor = 3
-  revision_before := document.revision
-  if buffer.prepare_save(document, false, true) || document.revision != revision_before || document.length != buffer.Capacity || document.cursor != 3 {
-    #panic("newline capacity failure is atomic")
-  }
 
   _ = buffer.load(document, "a b")
   document.anchor = 0
@@ -905,12 +932,12 @@ fn test_graphemes(document: *buffer.Document) {
   document.secondary.ranges[0] = buffer.Selection{anchor: 2, cursor: 3}
   fragments: [2][]const u8 = ["first", "second"]
   buffer.checkpoint(document)
-  if !buffer.replace_fragments(document, fragments[..]) || !buffer.equal(document.bytes[..document.length], "first second") || document.cursor != 5 || document.secondary.ranges[0].cursor != 12 {
+  if !buffer.replace_fragments(document, fragments[..]) || !buffer.equal(buffer.all(document), "first second") || document.cursor != 5 || document.secondary.ranges[0].cursor != 12 {
     #panic("distributed paste")
   }
   buffer.checkpoint(document)
   buffer.undo(document)
-  if !buffer.equal(document.bytes[..document.length], "a b") {
+  if !buffer.equal(buffer.all(document), "a b") {
     #panic("distributed paste undo")
   }
 
@@ -928,7 +955,7 @@ fn test_graphemes(document: *buffer.Document) {
   }
   buffer.move_to(document, 18, false)
   buffer.erase(document, true)
-  if !buffer.equal(document.bytes[..document.length], "á😀🇺🇸\r\nz") {
+  if !buffer.equal(buffer.all(document), "á😀🇺🇸\r\nz") {
     #panic("grapheme erase")
   }
   _ = buffer.load(document, "á b́")
@@ -937,7 +964,7 @@ fn test_graphemes(document: *buffer.Document) {
   document.secondary.count = 1
   document.secondary.ranges[0] = buffer.Selection{cursor: 7, anchor: 7}
   buffer.erase_all(document, true)
-  if !buffer.equal(document.bytes[..document.length], " ") {
+  if !buffer.equal(buffer.all(document), " ") {
     #panic("multicursor grapheme erase")
   }
 }
@@ -956,7 +983,7 @@ fn randomized_history(document: *buffer.Document) {
     before_length := document.length
     copied: usize = 0
     for copied < before_length {
-      before[copied] = document.bytes[copied]
+      before[copied] = buffer.byte_at(document, copied)
       copied += 1
     }
     low := buffer.boundary(document, random_value(&seed) % (before_length + 1))
@@ -988,16 +1015,16 @@ fn randomized_history(document: *buffer.Document) {
       #panic("random edit rejected")
     }
     buffer.checkpoint(document)
-    if !buffer.equal(document.bytes[..document.length], expected[..length]) {
+    if !buffer.equal(buffer.all(document), expected[..length]) {
       #panic("random edit differs from reference splice")
     }
     if !buffer.equal(before[..before_length], expected[..length]) {
       buffer.undo(document)
-      if !buffer.equal(document.bytes[..document.length], before[..before_length]) {
+      if !buffer.equal(buffer.all(document), before[..before_length]) {
         #panic("random undo")
       }
       buffer.redo(document)
-      if !buffer.equal(document.bytes[..document.length], expected[..length]) {
+      if !buffer.equal(buffer.all(document), expected[..length]) {
         #panic("random redo")
       }
     }
@@ -1007,12 +1034,12 @@ fn randomized_history(document: *buffer.Document) {
       if buffer.row_at(document, at) != row {
         #panic("random line index")
       }
-      if at < document.length && document.bytes[at] == 10 {
+      if at < document.length && buffer.byte_at(document, at) == 10 {
         row += 1
       }
       at += 1
     }
-    if !buffer.valid(document.bytes[..document.length]) {
+    if !buffer.valid(buffer.all(document)) {
       #panic("random UTF8 corruption")
     }
     round += 1
@@ -1031,21 +1058,21 @@ fn batch_edit_checks(doc: *buffer.Document) {
   if doc.marks[0] != 1 || doc.marks[1] != 7 {
     #panic("case changed split marks")
   }
-  if !buffer.equal(doc.bytes[..doc.length], "AB\ncd\nEF") || doc.secondary.count != 1 {
+  if !buffer.equal(buffer.all(doc), "AB\ncd\nEF") || doc.secondary.count != 1 {
     #panic("batch case")
   }
   buffer.undo(doc)
   if doc.marks[0] != 1 || doc.marks[1] != 7 {
     #panic("case undo changed split marks")
   }
-  if !buffer.equal(doc.bytes[..doc.length], "ab\ncd\nef") || doc.cursor != 2 || doc.secondary.ranges[0].cursor != 8 {
+  if !buffer.equal(buffer.all(doc), "ab\ncd\nef") || doc.cursor != 2 || doc.secondary.ranges[0].cursor != 8 {
     #panic("batch case undo")
   }
-  if !buffer.indent_lines(doc, false, 1) || !buffer.equal(doc.bytes[..doc.length], "    ab\ncd\n    ef") {
+  if !buffer.indent_lines(doc, false, 1) || !buffer.equal(buffer.all(doc), "    ab\ncd\n    ef") {
     #panic("batch indent")
   }
   buffer.undo(doc)
-  if !buffer.equal(doc.bytes[..doc.length], "ab\ncd\nef") || doc.secondary.count != 1 {
+  if !buffer.equal(buffer.all(doc), "ab\ncd\nef") || doc.secondary.count != 1 {
     #panic("batch indent undo")
   }
   _ = buffer.load(doc, "a\nb\nc\nd")
@@ -1054,11 +1081,11 @@ fn batch_edit_checks(doc: *buffer.Document) {
   doc.secondary.count = 1
   doc.secondary.ranges[0] = buffer.Selection{anchor: 4, cursor: 5}
   buffer.join_lines(doc)
-  if !buffer.equal(doc.bytes[..doc.length], "a b\nc d") || doc.secondary.count != 1 {
+  if !buffer.equal(buffer.all(doc), "a b\nc d") || doc.secondary.count != 1 {
     #panic("batch join")
   }
   buffer.undo(doc)
-  if !buffer.equal(doc.bytes[..doc.length], "a\nb\nc\nd") {
+  if !buffer.equal(buffer.all(doc), "a\nb\nc\nd") {
     #panic("batch join undo")
   }
 }
@@ -1078,11 +1105,11 @@ fn rotation_checks(doc: *buffer.Document) {
   if doc.anchor != 0 {
     #panic("rotate primary counted")
   }
-  if !buffer.rotate_contents(doc, false, 1) || !buffer.equal(doc.bytes[..doc.length], "中 a bb") || doc.anchor != 0 || doc.cursor != 3 {
+  if !buffer.rotate_contents(doc, false, 1) || !buffer.equal(buffer.all(doc), "中 a bb") || doc.anchor != 0 || doc.cursor != 3 {
     #panic("rotate contents UTF8")
   }
   buffer.undo(doc)
-  if !buffer.equal(doc.bytes[..doc.length], "a bb 中") || doc.secondary.count != 2 {
+  if !buffer.equal(buffer.all(doc), "a bb 中") || doc.secondary.count != 2 {
     #panic("rotate undo")
   }
   _ = buffer.load(doc, "ab\ncd")
@@ -1090,13 +1117,13 @@ fn rotation_checks(doc: *buffer.Document) {
   doc.cursor = 1
   doc.secondary.count = 1
   doc.secondary.ranges[0] = buffer.Selection{anchor: 3, cursor: 4}
-  if !buffer.open_lines(doc, true) || !buffer.equal(doc.bytes[..doc.length], "\nab\n\ncd") || doc.cursor != 0 || doc.secondary.ranges[0].cursor != 4 {
+  if !buffer.open_lines(doc, true) || !buffer.equal(buffer.all(doc), "\nab\n\ncd") || doc.cursor != 0 || doc.secondary.ranges[0].cursor != 4 {
     #panic("open above multi")
   }
   _ = buffer.replace_all(doc, "x")
   buffer.checkpoint(doc)
   buffer.undo(doc)
-  if !buffer.equal(doc.bytes[..doc.length], "ab\ncd") || doc.secondary.count != 1 {
+  if !buffer.equal(buffer.all(doc), "ab\ncd") || doc.secondary.count != 1 {
     #panic("open lines undo grouping")
   }
 }
@@ -1108,7 +1135,7 @@ fn batch_failure_checks(doc: *buffer.Document) {
   doc.secondary.count = 1
   doc.secondary.ranges[0] = buffer.Selection{anchor: 2, cursor: 6}
   buffer.change_case(doc, 0)
-  if !buffer.equal(doc.bytes[..doc.length], "AbCdé") || doc.secondary.count != 0 || doc.cursor != 0 || doc.anchor != 6 {
+  if !buffer.equal(buffer.all(doc), "AbCdé") || doc.secondary.count != 0 || doc.cursor != 0 || doc.anchor != 6 {
     #panic("overlap case applied twice or direction lost")
   }
   buffer.undo(doc)
@@ -1124,21 +1151,8 @@ fn batch_failure_checks(doc: *buffer.Document) {
   doc.cursor = 1
   doc.secondary.count = 1
   doc.secondary.ranges[0] = buffer.Selection{anchor: 3, cursor: 2}
-  if !buffer.open_lines_count(doc, false, 2) || !buffer.equal(doc.bytes[..doc.length], "a\n\n\nb\n\n") || doc.secondary.count != 1 {
+  if !buffer.open_lines_count(doc, false, 2) || !buffer.equal(buffer.all(doc), "a\n\n\nb\n\n") || doc.secondary.count != 1 {
     #panic("counted multi open")
-  }
-  large := arena_owner.create(buffer.Capacity)
-  defer arena_owner.release(large)
-  full := mem.arena_push_uninit(large, buffer.Capacity, 1)[..buffer.Capacity]
-  fill(full, 97)
-  _ = buffer.load(doc, full)
-  doc.anchor = 0
-  doc.cursor = 1
-  doc.secondary.count = 1
-  doc.secondary.ranges[0] = buffer.Selection{anchor: 3, cursor: 4}
-  revision := doc.revision
-  if buffer.indent_lines(doc, false, 1) || buffer.open_lines(doc, false) || doc.revision != revision || doc.anchor != 0 || doc.cursor != 1 || doc.secondary.ranges[0].cursor != 4 {
-    #panic("batch capacity mutation")
   }
 }
 
@@ -1184,7 +1198,7 @@ fn randomized_dirty_checks(document: *buffer.Document) {
   _ = buffer.load(document, "Alpha beta\nGamma delta\n")
   saved: [4096]u8 = []
   saved_length := document.length
-  _ = buffer.copy_bytes(&saved[0], &document.bytes[0], saved_length)
+  _ = buffer.copy_bytes(&saved[0], buffer.pointer(document, 0, saved_length), saved_length)
   seed: u64 = 817239
   for step in 0..3000 {
     action := random_value(&seed) % 9
@@ -1218,7 +1232,7 @@ fn randomized_dirty_checks(document: *buffer.Document) {
     }
     if action == 4 || action == 8 {
       saved_length = document.length
-      _ = buffer.copy_bytes(&saved[0], &document.bytes[0], saved_length)
+      _ = buffer.copy_bytes(&saved[0], buffer.pointer(document, 0, saved_length), saved_length)
     }
     if !buffer.saved_equal(document, saved[..saved_length]) {
       #panic("segmented saved baseline differs from independent snapshot")
@@ -1227,7 +1241,7 @@ fn randomized_dirty_checks(document: *buffer.Document) {
       #panic("materialized saved baseline differs from independent snapshot")
     }
     check_line_index(document)
-    expected := !buffer.equal(document.bytes[..document.length], saved[..saved_length])
+    expected := !buffer.equal(buffer.all(document), saved[..saved_length])
     if buffer.dirty(document) != expected || buffer.dirty_cached(document) != expected {
       #panic("dirty tracking must match full saved-text equality")
     }
@@ -1240,7 +1254,7 @@ fn revision_journal_checks(document: *buffer.Document) {
   state: u64 = 731
   for round in 0..100 {
     length := document.length
-    _ = buffer.copy_bytes(&baseline[0], &document.bytes[0], length)
+    _ = buffer.copy_bytes(&baseline[0], buffer.pointer(document, 0, length), length)
     revision := document.revision
     for edit in 0..5 {
       state = (state * 1664525 + 1013904223) % 4294967296
@@ -1255,11 +1269,11 @@ fn revision_journal_checks(document: *buffer.Document) {
       }
     }
     range := buffer.changes_since(document, revision)
-    if !range.found || range.old_length != length || !buffer.equal(baseline[..range.low], document.bytes[..range.low]) || !buffer.equal(baseline[range.old_high..length], document.bytes[range.high..document.length]) {
+    if !range.found || range.old_length != length || !buffer.equal(baseline[..range.low], buffer.range(document, 0, range.low)) || !buffer.equal(baseline[range.old_high..length], buffer.range(document, range.high, document.length)) {
       #panic("revision journal must bound all changed bytes")
     }
     buffer.checkpoint(document)
-    if !buffer.equal(document.bytes[..document.length], buffer.checkpoint_text(document)[..document.length]) {
+    if !buffer.equal(buffer.all(document), buffer.checkpoint_text(document)[..document.length]) {
       #panic("checkpoint mirror mismatch")
     }
   }
@@ -1280,7 +1294,7 @@ fn revision_journal_checks(document: *buffer.Document) {
   document.rows.offsets[0] = 0
   buffer.checkpoint(document)
   buffer.undo(document)
-  if !buffer.equal(document.bytes[..document.length], "new") {
+  if !buffer.equal(buffer.all(document), "new") {
     #panic("row-only checkpoint changes text")
   }
 }
@@ -1288,13 +1302,13 @@ fn revision_journal_checks(document: *buffer.Document) {
 fn check_line_index(document: *const buffer.Document) {
   row: usize = 0
   for offset in 0..=document.length {
-    if offset > 0 && document.bytes[offset - 1] == 10 {
+    if offset > 0 && buffer.byte_at(document, offset - 1) == 10 {
       row += 1
     }
     if buffer.row_at(document, offset) != row {
       #panic("line index row lookup")
     }
-    if (offset == 0 || document.bytes[offset - 1] == 10) && buffer.row_start(document, row) != offset {
+    if (offset == 0 || buffer.byte_at(document, offset - 1) == 10) && buffer.row_start(document, row) != offset {
       #panic("line index start lookup")
     }
   }
@@ -1311,9 +1325,6 @@ fn compact_index_checks(document: *buffer.Document) {
     }
   }
   _ = buffer.load(document, text[..])
-  if document.line_width != 2 {
-    #panic("ordinary line index is not compact")
-  }
   check_line_index(document)
   document.anchor = 1531
   document.cursor = 1531
@@ -1335,22 +1346,13 @@ fn compact_index_checks(document: *buffer.Document) {
   document.anchor = 0
   document.cursor = 0
   _ = buffer.replace(document, long[..])
-  if document.line_width != 4 {
-    #panic("large index shift must widen safely")
-  }
   buffer.checkpoint(document)
   check_line_index(document)
   buffer.undo(document)
-  if document.line_width != 2 {
-    #panic("rebuilt small index must compact")
-  }
   check_line_index(document)
   long[65536] = 10
   long[69999] = 10
   _ = buffer.load(document, long[..])
-  if document.line_width != 4 {
-    #panic("long line span must widen safely")
-  }
   check_line_index(document)
   // Removing a long prefix without deleting rows can put later offsets below
   // their fixed bases. Preflight must widen before a relative subtraction.
@@ -1361,23 +1363,14 @@ fn compact_index_checks(document: *buffer.Document) {
     }
   }
   _ = buffer.load(document, long[..])
-  if document.line_width != 2 {
-    #panic("biased-base fixture should compact")
-  }
   document.anchor = 0
   document.cursor = 50000
   _ = buffer.replace(document, "")
-  if document.line_width != 4 {
-    #panic("negative relative shift must widen")
-  }
   buffer.checkpoint(document)
   check_line_index(document)
   buffer.undo(document)
   check_line_index(document)
   _ = buffer.load(document, "a\nb\n")
-  if document.line_width != 2 {
-    #panic("small reload must compact index")
-  }
   check_line_index(document)
 }
 
@@ -1419,7 +1412,7 @@ fn indentation_equivalence_checks(document: *buffer.Document) {
               buffer.checkpoint(reference)
               reference.batching = true
               reference.anchor = buffer.line_start(reference, low)
-              if high > reference.anchor && reference.bytes[high - 1] == 10 {
+              if high > reference.anchor && buffer.byte_at(reference, high - 1) == 10 {
                 high -= 1
               }
               reference.cursor = buffer.line_end(reference, high)
@@ -1484,7 +1477,7 @@ fn indentation_equivalence_checks(document: *buffer.Document) {
   }
 }
 fn assert_indentation_equal(document: *buffer.Document, reference: *buffer.Document) {
-  if !buffer.equal(document.bytes[..document.length], reference.bytes[..reference.length]) || document.cursor != reference.cursor || document.anchor != reference.anchor || buffer.dirty(document) != buffer.dirty(reference) {
+  if !buffer.equal(buffer.all(document), buffer.all(reference)) || document.cursor != reference.cursor || document.anchor != reference.anchor || buffer.dirty(document) != buffer.dirty(reference) {
     #panic("bulk indentation text or selection mismatch")
   }
   for marker in 0..992 {
@@ -1503,7 +1496,7 @@ fn assert_indentation_equal(document: *buffer.Document, reference: *buffer.Docum
 fn reference_indentation(document: *buffer.Document, unindent: bool, count: usize, width: usize, tabs: bool) bool {
   low := buffer.line_start(document, buffer.start(document))
   last := buffer.end(document)
-  if last > low && document.bytes[last - 1] == 10 {
+  if last > low && buffer.byte_at(document, last - 1) == 10 {
     last -= 1
   }
   last = buffer.line_start(document, last)
@@ -1531,12 +1524,12 @@ fn reference_indentation(document: *buffer.Document, unindent: bool, count: usiz
     if unindent {
       // Each level is a tab or up to `width` spaces, whichever the line has.
       for level in 0..count {
-        if at + remove < document.length && document.bytes[at + remove] == 9 {
+        if at + remove < document.length && buffer.byte_at(document, at + remove) == 9 {
           remove += 1
           continue
         }
         removed: usize = 0
-        for at + remove < document.length && removed < width && document.bytes[at + remove] == 32 {
+        for at + remove < document.length && removed < width && buffer.byte_at(document, at + remove) == 32 {
           remove += 1
           removed += 1
         }
@@ -1653,4 +1646,66 @@ fn observer_checks(document: *buffer.Document) {
     #panic("observer detach")
   }
   _ = buffer.load(document, "")
+}
+
+// A background load shows a prefix first, then appends the rest to the
+// text, the saved baseline and undo entries, including after an early edit.
+fn lazy_checks() {
+  buffer.lazy_thresholds(1048576, 65536)
+  defer buffer.lazy_thresholds(268435456, 4194304)
+  size: usize = 9000000
+  owner := arena_owner.create(#sizeof(buffer.Document))
+  defer arena_owner.release(owner)
+  doc := buffer.allocate(owner)
+  defer buffer.release(doc)
+  storage := buffer.storage_create(size + 1)
+  for at in 0..size {
+    storage.bytes[at] = #cast(u8, 97 + at % 26)
+    if at % 61 == 60 {
+      storage.bytes[at] = 10
+    }
+  }
+  expected_lines: usize = size / 61 + 1
+  if !buffer.load_storage_lazy(doc, &storage, size) {
+    #panic("lazy load start")
+  }
+  if buffer.load_state(doc) != buffer.LoadRunning || doc.length >= size || doc.length == 0 {
+    #panic("lazy prefix")
+  }
+  // An edit while loading lands in the prefix and survives the attach.
+  doc.anchor = 0
+  doc.cursor = 0
+  if !buffer.replace(doc, "EDIT") {
+    #panic("lazy edit")
+  }
+  buffer.checkpoint(doc)
+  for buffer.load_state(doc) == buffer.LoadRunning {
+    _ = buffer.load_tick(doc)
+  }
+  if buffer.load_state(doc) != buffer.LoadComplete || doc.length != size + 4 || doc.line_count != expected_lines {
+    #panic("lazy attach")
+  }
+  buffer.checkpoint(doc)
+  if doc.length != size + 4 {
+    #panic("lazy checkpoint keeps the tail")
+  }
+  if buffer.row_at(doc, doc.length) != expected_lines - 1 || buffer.row_at(doc, doc.length / 2) != (doc.length / 2 - 4) / 61 {
+    #panic("lazy line lookups")
+  }
+  if !buffer.equal(buffer.range(doc, 0, 6), "EDITab") || buffer.byte_at(doc, size + 3) != storage_byte(size - 1) {
+    #panic("lazy content")
+  }
+  buffer.undo(doc)
+  if doc.length != size || buffer.byte_at(doc, 0) != 97 || buffer.byte_at(doc, size - 1) != storage_byte(size - 1) {
+    #panic("lazy undo keeps the tail")
+  }
+  if buffer.dirty(doc) {
+    #panic("lazy saved baseline keeps the tail")
+  }
+}
+fn storage_byte(at: usize) u8 {
+  if at % 61 == 60 {
+    return 10
+  }
+  return #cast(u8, 97 + at % 26)
 }

@@ -488,7 +488,7 @@ struct WinBasicInformation { created, accessed, written, changed: i64, attribute
 extern fn fs_get_security "GetSecurityInfo"(handle: rawptr, object_type: u32, information: u32, owner: *rawptr, group: *rawptr, dacl: *rawptr, sacl: rawptr, descriptor: *rawptr) u32
 extern fn fs_equal_sid "EqualSid"(first: rawptr, second: rawptr) i32
 extern fn fs_control "GetSecurityDescriptorControl"(descriptor: rawptr, control: *u16, revision: *u32) i32
-extern fn fs_set_basic "SetFileInformationByHandle"(handle: rawptr, information_class: u32, information: *WinBasicInformation, size: u32) i32
+extern fn fs_set_basic "SetFileInformationByHandle"(handle: rawptr, information_class: u32, information: rawptr, size: u32) i32
 
 // Intended for a sibling atomic-save temporary. Unlike POSIX mode emulation,
 // this retains the actual DACL and its inheritance policy. Never change owner
@@ -573,7 +573,7 @@ pub fn preserve_permissions(file: *File, source: []const u8) Result {
   if basic.attributes != 128 {
     basic.attributes &= ~#cast(u32, 128)
   }
-  if fs_set_basic(replacement, 0, &basic, #cast(u32, #sizeof(WinBasicInformation))) == 0 {
+  if fs_set_basic(replacement, 0, #cast(rawptr, &basic), #cast(u32, #sizeof(WinBasicInformation))) == 0 {
     return windows_failure(fs_error())
   }
   code = fs_set_security(replacement, 1, security_information, nil, nil, original_acl, nil)
@@ -585,4 +585,153 @@ pub fn preserve_permissions(file: *File, source: []const u8) Result {
 
 fn atomic_create_exclusive(path: []const u8) FileResult {
   return create_private_exclusive(path)
+}
+// Identity, size and last write time of an open file. Windows has no
+// change time; the volume serial stands in for it, so a file moved to
+// another volume never matches.
+pub fn file_stamp(file: *const File) Stamp {
+  information := WinInformation{}
+  if fs_info(#cast(rawptr, file.descriptor), &information) == 0 {
+    return Stamp{}
+  }
+  // FILETIME counts 100 ns intervals.
+  written := (#cast(u64, information.times[5]) << 32) | #cast(u64, information.times[4])
+  return Stamp{inode: (#cast(u64, information.index_high) << 32) | #cast(u64, information.index_low), size: (#cast(u64, information.size_high) << 32) | #cast(u64, information.size_low), modify_seconds: written / 10000000, modify_nanos: (written % 10000000) * 100, change_seconds: #cast(u64, information.volume), ok: true}
+}
+// ReFS block cloning accelerates aligned interiors. Unaligned edges use an
+// independently reopened source handle, leaving the origin's position alone.
+// Unsupported volumes/alignment fall back to the caller's immutable bytes.
+struct WinCloneRange { source: rawptr, source_offset, destination_offset, length: i64 }
+fn windows_copy_edge(source: *File, offset: u64, destination: *File, length: usize) Result {
+  if length == 0 {
+    return Result{ok: true}
+  }
+  positioned := std_fs.seek(source, #cast(isize, offset), 0)
+  if !positioned.ok {
+    return Result{error: positioned.error, kind: positioned.kind}
+  }
+  storage: [65536]u8 = []
+  done: usize = 0
+  for done < length {
+    part := std_fs.read(source, storage[..length - done])
+    if !part.ok || part.transferred == 0 {
+      return Result{transferred: done, error: part.error, kind: errors.Kind.System}
+    }
+    written := std_fs.write(destination, storage[..part.transferred])
+    done += written.transferred
+    if !written.ok {
+      return Result{transferred: done, error: written.error, kind: written.kind}
+    }
+  }
+  return Result{transferred: done, ok: true}
+}
+pub fn copy_range(source: *const File, offset: u64, destination: *File, length: usize) Result {
+  if !is_open(source) || !is_open(destination) {
+    return Result{kind: errors.Kind.InvalidState}
+  }
+  if length == 0 {
+    return Result{ok: true}
+  }
+  position := std_fs.seek(destination, 0, 1)
+  if !position.ok {
+    return Result{error: position.error, kind: position.kind}
+  }
+  // 64 KiB is a multiple of the supported ReFS cluster sizes. Other volumes
+  // reject the ioctl and retain the ordinary write fallback.
+  alignment: usize = 65536
+  if length > 9223372036854775807 {
+    return Result{kind: errors.Kind.Unsupported}
+  }
+  if #cast(usize, offset % #cast(u64, alignment)) != position.value % alignment || offset > 9223372036854775807 - #cast(u64, length) || position.value > 9223372036854775807 - length {
+    return Result{kind: errors.Kind.Unsupported}
+  }
+  head := (alignment - #cast(usize, offset % #cast(u64, alignment))) % alignment
+  if head > length {
+    head = length
+  }
+  middle := ((length - head) / alignment) * alignment
+  tail := length - head - middle
+  if middle == 0 {
+    return Result{kind: errors.Kind.Unsupported}
+  }
+  reopened := File{}
+  if head + tail != 0 {
+    handle := fs_reopen(#cast(rawptr, source.descriptor), 2147483648, 7, 0)
+    if #cast(isize, handle) == -1 {
+      return windows_failure(fs_error())
+    }
+    reopened = adopt_handle(#cast(isize, handle))
+  }
+  defer {
+    if is_open(&reopened) {
+      _ = close(&reopened)
+    }
+  }
+  end := #cast(i64, position.value + length)
+  existing := file_metadata(destination)
+  if !existing.ok {
+    return Result{error: existing.error, kind: existing.kind}
+  }
+  if existing.size < #cast(u64, end) && fs_set_basic(#cast(rawptr, destination.descriptor), 6, #cast(rawptr, &end), 8) == 0 {
+    return windows_failure(fs_error())
+  }
+  range := WinCloneRange{source: #cast(rawptr, source.descriptor), source_offset: #cast(i64, offset + #cast(u64, head)), destination_offset: #cast(i64, position.value + head), length: #cast(i64, middle)}
+  returned: u32 = 0
+  if fs_ioctl(#cast(rawptr, destination.descriptor), 623428, #cast(rawptr, &range), #cast(u32, #sizeof(WinCloneRange)), nil, 0, &returned, nil) == 0 {
+    // The transaction is private. The caller overwrites the entire requested
+    // range on fallback, including any extents changed by a failed ioctl.
+    return windows_failure(fs_error())
+  }
+  first := windows_copy_edge(&reopened, offset, destination, head)
+  if !first.ok {
+    first.transferred += middle
+    return first
+  }
+  skipped := std_fs.seek(destination, #cast(isize, middle), 1)
+  if !skipped.ok {
+    return Result{transferred: head + middle, error: skipped.error, kind: skipped.kind}
+  }
+  last := windows_copy_edge(&reopened, offset + #cast(u64, head + middle), destination, tail)
+  last.transferred += head + middle
+  return last
+}
+
+extern fn fs_mapping "CreateFileMappingW"(file: rawptr, security: rawptr, protection: u32, high: u32, low: u32, name: *const u16) rawptr
+extern fn fs_map_view "MapViewOfFile"(mapping: rawptr, access: u32, high: u32, low: u32, length: usize) *u8
+extern fn fs_unmap_view "UnmapViewOfFile"(bytes: *u8) i32
+// A view retains the section after its mapping handle closes. Windows refuses
+// SetEndOfFile while a view exists, so external truncation cannot invalidate it.
+pub fn map_file(descriptor: isize, length: u64) *u8 {
+  if descriptor == -1 || length == 0 {
+    return nil
+  }
+  mapping := fs_mapping(#cast(rawptr, descriptor), nil, 2, #cast(u32, length >> 32), #cast(u32, length & 4294967295), nil)
+  if mapping == nil {
+    return nil
+  }
+  bytes := fs_map_view(mapping, 4, 0, 0, #cast(usize, length))
+  _ = fs_close(mapping)
+  return bytes
+}
+pub fn unmap_file(bytes: *u8, length: u64) {
+  _ = length
+  _ = fs_unmap_view(bytes)
+}
+
+pub const WholeFileClones: bool = false
+pub fn clone_exclusive(source: *const File, path: []const u8) FileResult {
+  return FileResult{kind: errors.Kind.Unsupported}
+}
+pub fn resize(file: *File, length: usize) Result {
+  if !is_open(file) {
+    return Result{kind: errors.Kind.InvalidState}
+  }
+  if length > 9223372036854775807 {
+    return Result{kind: errors.Kind.InvalidInput}
+  }
+  end := #cast(i64, length)
+  if fs_set_basic(#cast(rawptr, file.descriptor), 6, #cast(rawptr, &end), 8) == 0 {
+    return windows_failure(fs_error())
+  }
+  return Result{ok: true}
 }

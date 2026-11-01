@@ -1,4 +1,7 @@
 #link("pcre2-8")
+use "../buffer"
+use "../owned_arena" arena_owner
+use "std/mem"
 // Opaque PCRE2 handles; no native structures escape this module.
 extern fn compile "pcre2_compile_8"(bytes: *const u8, length: usize, options: u32, error: *i32, offset: *usize, context: rawptr) rawptr
 extern fn code_free "pcre2_code_free_8"(code: rawptr)
@@ -14,6 +17,8 @@ extern fn offsets "pcre2_get_ovector_pointer_8"(data: rawptr) *usize
 
 pub struct Pattern { code, data, context: rawptr, ok: bool, error: i32, error_offset: usize }
 pub struct Match { found, error: bool, start, end: usize }
+// partial: a match may start at or after offset but needs text past the end.
+pub struct Window { found, partial, error: bool, start, end: usize }
 
 pub fn open(text: []const u8) Pattern {
   return open_options(text, 0x001a0000)
@@ -57,6 +62,12 @@ pub fn close(pattern: *Pattern) {
   pattern.ok = false
 }
 pub fn find(pattern: *Pattern, text: []const u8, offset: usize) Match {
+  return find_options(pattern, text, offset, 0)
+}
+// PCRE2_NO_UTF_CHECK: text is known valid UTF-8 with whole characters at both
+// ends, so PCRE2 need not validate it again on every call.
+const Checked: u32 = 0x40000000
+fn find_options(pattern: *Pattern, text: []const u8, offset: usize, options: u32) Match {
   if !pattern.ok || offset > #len(text) {
     return Match{error: true}
   }
@@ -65,7 +76,7 @@ pub fn find(pattern: *Pattern, text: []const u8, offset: usize) Match {
   if #len(text) > 0 {
     bytes = &text[0]
   }
-  result := match(pattern.code, bytes, #len(text), offset, 0, pattern.data, pattern.context)
+  result := match(pattern.code, bytes, #len(text), offset, options, pattern.data, pattern.context)
   if result == -1 {
     return Match{}
   }
@@ -74,4 +85,113 @@ pub fn find(pattern: *Pattern, text: []const u8, offset: usize) Match {
   }
   vector := offsets(pattern.data)[..2]
   return Match{found: true, start: vector[0], end: vector[1]}
+}
+// Search text that is one window of a longer subject. With PCRE2's hard
+// partial mode a match running into the window end, including end anchors,
+// reports partial instead of a match that more text could change.
+pub fn find_window(pattern: *Pattern, text: []const u8, offset: usize) Window {
+  return find_window_options(pattern, text, offset, 0)
+}
+fn find_window_options(pattern: *Pattern, text: []const u8, offset: usize, options: u32) Window {
+  if !pattern.ok || offset > #len(text) {
+    return Window{error: true}
+  }
+  empty: [1]u8 = [0]
+  bytes: *const u8 = &empty[0]
+  if #len(text) > 0 {
+    bytes = &text[0]
+  }
+  result := match(pattern.code, bytes, #len(text), offset, 0x00000020 | options, pattern.data, pattern.context)
+  if result == -1 {
+    return Window{}
+  }
+  if result == -2 {
+    vector := offsets(pattern.data)[..2]
+    return Window{partial: true, start: vector[0]}
+  }
+  if result < 0 {
+    return Window{error: true}
+  }
+  vector := offsets(pattern.data)[..2]
+  return Window{found: true, start: vector[0], end: vector[1]}
+}
+
+// Large documents are searched in windows copied from their storage, so a
+// search never flattens the whole text. PCRE2's hard partial mode reports a
+// match that could run past a window's end; that window grows and retries.
+const SearchWindow: usize = 1048576
+const SearchLookback: usize = 4096
+const SearchWindowLimit: usize = 67108864
+search_window_arena: *mem.Arena = nil
+search_window_bytes: []u8 = search_window_empty[..0]
+search_window_empty: [1]u8 = [0]
+search_window_document: *const buffer.Document = nil
+search_window_revision: u64 = 0
+search_window_low: usize = 0
+search_window_high: usize = 0
+pub fn find_document(compiled: *Pattern, doc: *const buffer.Document, offset: usize) Match {
+  if doc.length <= SearchWindow {
+    return find(compiled, buffer.all(doc), offset)
+  }
+  if offset > doc.length {
+    return Match{error: true}
+  }
+  if search_window_arena == nil {
+    search_window_arena = arena_owner.create(SearchWindowLimit)
+    search_window_bytes = mem.push_bytes_uninit(search_window_arena, SearchWindowLimit)
+  }
+  at := offset
+  size := SearchWindow
+  for true {
+    lookback := at
+    if lookback > SearchLookback {
+      lookback = SearchLookback
+    }
+    low := at - lookback
+    high := doc.length
+    if at + size < high {
+      high = at + size
+    }
+    // Repeated searches (backward search walks every match) reuse the copy.
+    cached := search_window_document == doc && search_window_revision == doc.revision && search_window_low <= low && at < search_window_high && search_window_high - search_window_low >= size
+    if cached {
+      low = search_window_low
+      high = search_window_high
+    } else {
+      buffer.copy_range(doc, low, high, search_window_bytes)
+      search_window_document = doc
+      search_window_revision = doc.revision
+      search_window_low = low
+      search_window_high = high
+    }
+    text := search_window_bytes[..high - low]
+    if high == doc.length {
+      // The window reaches the real end: anchors there are genuine.
+      found := find(compiled, text, at - low)
+      if found.found {
+        found.start += low
+        found.end += low
+      }
+      return found
+    }
+    window := find_window(compiled, text, at - low)
+    if window.error {
+      return Match{error: true}
+    }
+    if window.found {
+      return Match{found: true, start: low + window.start, end: low + window.end}
+    }
+    if window.partial {
+      at = low + window.start
+      if size * 2 + SearchLookback > SearchWindowLimit {
+        // A single match longer than the window limit: search the whole text.
+        return find(compiled, buffer.all(doc), offset)
+      }
+      size *= 2
+      continue
+    }
+    at = high
+    size = SearchWindow
+  }
+  return Match{}
 }

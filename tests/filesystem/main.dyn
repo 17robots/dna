@@ -1,5 +1,6 @@
 use "../../src/filesystem" fs
 use "std/io"
+use "../../src/host" host
 
 fn equal(a: []const u8, b: []const u8) bool {
   if #len(a) != #len(b) {
@@ -30,7 +31,116 @@ fn require(result: fs.Result, operation: []const u8) {
     #panic(operation)
   }
 }
+fn clone_and_patch() {
+  require(fs.write_all("clone-source.txt", "0123456789"), "clone fixture")
+  source := fs.open("clone-source.txt")
+  if !source.ok {
+    #panic("clone source open")
+  }
+  defer _ = fs.close(&source.value)
+  cloned := fs.clone_exclusive(&source.value, "clone-output.txt")
+  if !cloned.ok {
+    expected: [8]u8 = []
+    required := host.environment("DNA_TEST_REQUIRE_APFS", expected[..])
+    if required.ok && equal(required.value, "1") {
+      #panic("APFS clone required on this test volume")
+    }
+    return
+  }
+  // Editing a clone must not alter the source; shrinking removes its old tail.
+  require(fs.seek(&cloned.value, 5), "clone seek")
+  require(fs.write(&cloned.value, "EDIT"), "clone patch")
+  require(fs.resize(&cloned.value, 9), "clone resize")
+  require(fs.close(&cloned.value), "clone close")
+  content("clone-output.txt", "01234EDIT")
+  content("clone-source.txt", "0123456789")
+  if fs.clone_exclusive(&source.value, "clone-output.txt").ok {
+    #panic("clone replaced existing file")
+  }
+  content("clone-output.txt", "01234EDIT")
+  _ = io.println(io.stdout(), "PASS native exclusive whole-file clone, patch, resize and unchanged origin")
+}
+fn mapping_and_ranges() {
+  bytes: [262144]u8 = []
+  for index in 0..#len(bytes) {
+    bytes[index] = #cast(u8, index % 251 + 1)
+  }
+  require(fs.write_all("mapped.bin", bytes[..]), "mapping fixture")
+  source := fs.open("mapped.bin")
+  if !source.ok {
+    #panic("mapping open")
+  }
+  defer _ = fs.close(&source.value)
+  mapped := fs.map_file(source.value.descriptor, #cast(u64, #len(bytes)))
+  expected: [8]u8 = []
+  native := host.environment("DNA_TEST_FILE_MAPPING", expected[..])
+  if mapped == nil && native.ok && equal(native.value, "1") {
+    #panic("native mapping unavailable")
+  }
+  if mapped != nil {
+    if mapped[..#len(bytes)][0] != bytes[0] || mapped[..#len(bytes)][200000] != bytes[200000] {
+      #panic("mapping contents")
+    }
+    // Darwin zeroes inaccessible backing pages; Windows refuses truncation
+    // while views exist. Both must keep the process safe.
+    truncated := fs.create("mapped.bin")
+    if truncated.ok {
+      require(fs.close(&truncated.value), "truncate close")
+      if mapped[..#len(bytes)][200000] != 0 {
+        #panic("truncated mapping not resilient")
+      }
+    } else if mapped[..#len(bytes)][200000] != bytes[200000] {
+      #panic("mapping after refused truncation")
+    }
+    fs.unmap_file(mapped, #cast(u64, #len(bytes)))
+  }
+  require(fs.write_all("range-source.bin", bytes[..]), "range fixture")
+  origin := fs.open("range-source.bin")
+  target := fs.create("range-target.bin")
+  if !origin.ok || !target.ok {
+    #panic("range files")
+  }
+  require(fs.write(&target.value, "Z"), "range prefix")
+  copied := fs.copy_range(&origin.value, 1, &target.value, 200000)
+  if !copied.ok {
+    if copied.transferred != 0 {
+      #panic("partial range copy")
+    }
+    require(fs.write(&target.value, bytes[1..200001]), "range fallback")
+  }
+  one: [1]u8 = []
+  if !fs.read(&origin.value, one[..]).ok || one[0] != bytes[0] {
+    #panic("range changed source position")
+  }
+  require(fs.close(&origin.value), "range source close")
+  require(fs.close(&target.value), "range target close")
+  result := fs.open("range-target.bin")
+  if !result.ok || fs.metadata("range-target.bin").size != 200001 {
+    #panic("range output size")
+  }
+  offset: usize = 0
+  part: [16384]u8 = []
+  for offset < 200001 {
+    read := fs.read(&result.value, part[..])
+    if !read.ok || read.transferred == 0 {
+      #panic("range output read")
+    }
+    for index in 0..read.transferred {
+      wanted := bytes[offset + index]
+      if offset + index == 0 {
+        wanted = 90
+      }
+      if part[index] != wanted {
+        #panic("range output bytes")
+      }
+    }
+    offset += read.transferred
+  }
+  require(fs.close(&result.value), "range result close")
+}
 fn main() {
+  mapping_and_ranges()
+  clone_and_patch()
   private := fs.create_private_exclusive("private.txt")
   if !private.ok {
     _ = io.println(io.stderr(), "create private failed: {}", private.error)

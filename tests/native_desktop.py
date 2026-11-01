@@ -9,6 +9,10 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+from dyn_path import real_dyn
+from sdk_check import window_builder
+from sdk_compat import environment as sdk_environment
 
 def run(command, **kwargs):
     subprocess.run([str(part) for part in command], check=True, timeout=180, **kwargs)
@@ -16,13 +20,13 @@ def run(command, **kwargs):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--object-only', action='store_true', help='compile desktop objects without GUI execution')
+    parser.add_argument('--editor-objects', action='store_true', help='also compile full editor objects for macOS and Windows; excludes native service linking')
     parser.add_argument('--target', action='append', default=[], help='Dyn object target; repeatable')
     args = parser.parse_args()
-    compiler = Path(os.environ.get('DYN', ROOT.parent/'dyn/compiler/build/dyn-release')).resolve()
-    sdk = compiler.parent.parent
-    bridge_builder = sdk/'vendor/window/native/build.py'
-    if not bridge_builder.is_file():
-        raise SystemExit('DYN must identify a compiler checkout containing vendor/window/native/build.py')
+    compiler = real_dyn()
+    if compiler is None:
+        raise SystemExit('Install the pinned Dyn compiler first.')
+    bridge_builder = window_builder(compiler)
     with tempfile.TemporaryDirectory(prefix='dna-native-desktop-') as directory:
         work = Path(directory)
         stage = work/'probe'
@@ -30,11 +34,17 @@ def main():
         shutil.copytree(ROOT/'src/platform/native_present', stage/'presenter')
         for source in (stage/'presenter').rglob('*.dyn'):
             source.write_text(source.read_text().replace('"vendor/window/wayland"', '"vendor/window/native"').replace('"vendor/window"', '"vendor/window/native"'))
+        compile_environment = sdk_environment(compiler)
         targets = args.target or ['x86_64-windows', 'aarch64-windows', 'x86_64-macos', 'aarch64-macos']
         for target in targets:
             for mode in ('debug', 'release'):
-                run([compiler,'build',stage,'--'+mode,'--target',target,'--emit-object','--no-link','--quiet','--output',work/(target+'-'+mode)])
+                run([compiler,'build',stage,'--'+mode,'--target',target,'--emit-object','--no-link','--quiet','--output',work/(target+'-'+mode)], env=compile_environment)
             print('PASS isolated desktop object compilation: '+target, flush=True)
+        if args.editor_objects:
+            for target in ('x86_64-macos', 'aarch64-macos', 'x86_64-windows', 'aarch64-windows'):
+                for mode in ('debug', 'release'):
+                    run([compiler, 'build', ROOT/'src', '--'+mode, '--target', target, '--emit-object', '--no-link', '--quiet', '--output', work/('editor-'+target+'-'+mode)], env=compile_environment)
+                print('PASS full editor objects: '+target, flush=True)
         if args.object_only:
             print('QUALIFICATION GAP: object compilation does not qualify native window, events or GL runtime')
             return
@@ -65,7 +75,10 @@ def main():
                     raise SystemExit('Isolated desktop unexpectedly links editor/SDL/X11 services:\n'+dependencies)
             run([output],env=env)
             print('PASS isolated desktop runtime '+mode+': controls, ordered wake, GL upload/readback, presenter recreation',flush=True)
-        print('QUALIFICATION GAP: native Windows/macOS execution is unqualified on Linux; cross objects are not runtime qualification')
+        if sys.platform.startswith('linux'):
+            print('QUALIFICATION GAP: native Windows/macOS execution is unqualified on Linux; cross objects are not runtime qualification')
+        else:
+            print('QUALIFICATION GAP: this probe excludes the editor service bridge and full editor startup')
         print('QUALIFICATION GAP: keyboard layout/KEY.height producer snapshots are not tested; Win32/Cocoa snapshots require native runtime qualification. No clipboard qualification.')
 
 if __name__ == '__main__':

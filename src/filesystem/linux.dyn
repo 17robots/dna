@@ -133,3 +133,51 @@ pub fn preserve_permissions(file: *File, source: []const u8) Result {
   }
   return set_permissions(file, #cast(usize, (info.mode & 511)))
 }
+pub fn file_stamp(file: *const File) Stamp {
+  raw: [32]u64 = []
+  empty: [1]u8 = [0]
+  // statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS)
+  result := #syscall(332, file.descriptor, &empty[0], 4096, 2047, &raw[0])
+  if result < 0 {
+    return Stamp{}
+  }
+  return Stamp{inode: raw[4], size: raw[5], change_seconds: raw[12], change_nanos: raw[13] & 4294967295, modify_seconds: raw[14], modify_nanos: raw[15] & 4294967295, ok: true}
+}
+// Copy length bytes from source at offset to the end of destination. The
+// kernel shares extents (reflink) where the filesystem supports it.
+pub fn copy_range(source: *const File, offset: u64, destination: *File, length: usize) Result {
+  position := offset
+  done: usize = 0
+  for done < length {
+    copied := #syscall(326, source.descriptor, &position, destination.descriptor, 0, length - done, 0)
+    if copied == -4 {
+      continue
+    }
+    if copied <= 0 {
+      return Result{transferred: done, error: copied, kind: errors.linux(copied)}
+    }
+    done += #cast(usize, copied)
+  }
+  return Result{transferred: done, ok: true}
+}
+
+// Linux's native host installs its SIGBUS-guarded mapper. Library users
+// without that guard keep the ordinary read fallback.
+pub fn map_file(descriptor: isize, length: u64) *u8 {
+  return nil
+}
+pub fn unmap_file(bytes: *u8, length: u64) {}
+
+pub const WholeFileClones: bool = false
+pub fn clone_exclusive(source: *const File, path: []const u8) FileResult {
+  return FileResult{kind: errors.Kind.Unsupported}
+}
+pub fn resize(file: *File, length: usize) Result {
+  if !is_open(file) {
+    return Result{kind: errors.Kind.InvalidState}
+  }
+  if length > 9223372036854775807 {
+    return Result{kind: errors.Kind.InvalidInput}
+  }
+  return linux_result(#syscall(77, file.descriptor, length))
+}

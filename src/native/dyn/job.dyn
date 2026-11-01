@@ -1,5 +1,12 @@
+// Input text as runs the caller keeps alive until the job closes.
+pub struct JobChunk { bytes: *const u8, length: usize }
+// Formatter output limit; the buffer is mapped lazily, so only the bytes
+// written occupy memory.
+const JobOutputLimit: usize = 4294967296
 struct JobWorker {
   thread: rawptr,
+  chunks: *JobChunk,
+  chunk_count: usize,
   lock: rawptr,
   status: i32,
   stop: bool,
@@ -61,7 +68,25 @@ fn job_run(context: rawptr) i32 {
       if amount > 65536 {
         amount = 65536
       }
-      written := proc_write(child.input, &job.input[..job.length + 1][sent], amount)
+      source: *const u8 = nil
+      if job.chunks != nil {
+        // Find the chunk holding sent; chunks are few relative to writes.
+        base: usize = 0
+        for index in 0..job.chunk_count {
+          chunk := job.chunks[..job.chunk_count][index]
+          if sent < base + chunk.length {
+            source = &chunk.bytes[..chunk.length][sent - base]
+            if amount > base + chunk.length - sent {
+              amount = base + chunk.length - sent
+            }
+            break
+          }
+          base += chunk.length
+        }
+      } else {
+        source = &job.input[..job.length + 1][sent]
+      }
+      written := proc_write(child.input, source, amount)
       if written > 0 {
         sent += #cast(usize, written)
       }
@@ -85,11 +110,11 @@ fn job_run(context: rawptr) i32 {
         else if received > 0 {
           amount_read := #cast(usize, received)
           if stream == 1 {
-            if amount_read > #cast(usize, 268435455) - job.used {
+            if amount_read > JobOutputLimit - 1 - job.used {
               status = 4
               break
             }
-            _ = copy(&job.output[..268435456][job.used], &bytes[0], amount_read)
+            _ = copy(&job.output[..JobOutputLimit][job.used], &bytes[0], amount_read)
             job.used += amount_read
           } else {
             proc_log(job.errors[..], &job.error_length, bytes[..amount_read])
@@ -108,7 +133,7 @@ fn job_run(context: rawptr) i32 {
     }
   }
   proc_close(&child)
-  job.output[..268435456][job.used] = 0
+  job.output[..JobOutputLimit][job.used] = 0
   rec_lock(job.lock)
   job.status = status
   rec_unlock(job.lock)
@@ -119,6 +144,7 @@ fn job_free(job: *JobWorker) {
   rec_free(#cast(rawptr, job.command))
   rec_free(#cast(rawptr, job.directory))
   rec_free(#cast(rawptr, job.input))
+  rec_free(#cast(rawptr, job.chunks))
   rec_free(#cast(rawptr, job.output))
   if job.lock != nil {
     rec_mutex_free(job.lock)
@@ -126,7 +152,21 @@ fn job_free(job: *JobWorker) {
   rec_free(#cast(rawptr, job))
 }
 pub fn dna_job_open(command: *const u8, directory: *const u8, input: *const u8, length: usize, timeout: u32) *JobWorker {
-  if command == nil || command.* == 0 || directory == nil || directory.* != 47 || length > 268435455 || timeout == 0 || (length > 0 && input == nil) {
+  if length > 268435455 || (length > 0 && input == nil) {
+    return nil
+  }
+  return job_open(command, directory, input, nil, 0, length, timeout)
+}
+// Like dna_job_open, with input as runs read in place: the caller keeps
+// them alive until dna_job_close.
+pub fn dna_job_open_chunks(command: *const u8, directory: *const u8, chunks: *const JobChunk, count: usize, length: usize, timeout: u32) *JobWorker {
+  if count > 0 && chunks == nil {
+    return nil
+  }
+  return job_open(command, directory, nil, chunks, count, length, timeout)
+}
+fn job_open(command: *const u8, directory: *const u8, input: *const u8, chunks: *const JobChunk, count: usize, length: usize, timeout: u32) *JobWorker {
+  if command == nil || command.* == 0 || directory == nil || directory.* != 47 || timeout == 0 {
     return nil
   }
   job := #cast(*JobWorker, rec_alloc(1, #sizeof(JobWorker)))
@@ -135,19 +175,26 @@ pub fn dna_job_open(command: *const u8, directory: *const u8, input: *const u8, 
   }
   job.command = job_duplicate(command)
   job.directory = job_duplicate(directory)
-  job.input = rec_malloc(length + 1)
-  // Formatter output up to buffer.Capacity; large allocations are mapped
-  // lazily, so only the bytes written occupy memory.
-  job.output = rec_malloc(268435456)
+  if chunks != nil {
+    job.chunks = #cast(*JobChunk, rec_malloc(count * #sizeof(JobChunk) + 1))
+    if job.chunks != nil && count > 0 {
+      _ = copy(#cast(*u8, job.chunks), #cast(*const u8, chunks), count * #sizeof(JobChunk))
+    }
+    job.chunk_count = count
+    job.input = rec_malloc(1)
+  } else {
+    job.input = rec_malloc(length + 1)
+  }
+  job.output = rec_malloc(JobOutputLimit)
   job.lock = rec_mutex()
   job.length = length
   job.timeout = timeout
   job.status = 1
-  if job.command == nil || job.directory == nil || job.input == nil || job.output == nil || job.lock == nil {
+  if job.command == nil || job.directory == nil || job.input == nil || job.output == nil || job.lock == nil || (chunks != nil && job.chunks == nil) {
     job_free(job)
     return nil
   }
-  if length > 0 {
+  if length > 0 && chunks == nil {
     _ = copy(job.input, input, length)
   }
   job.thread = rec_thread(job_run, #cast(rawptr, job))
@@ -172,6 +219,13 @@ pub fn dna_job_output(job: *JobWorker, output: *u8, capacity: usize) usize {
   }
   _ = copy(output, job.output, job.used + 1)
   return job.used
+}
+// Output length once finished, or -1 while running.
+pub fn dna_job_output_length(job: *JobWorker) isize {
+  if job == nil || dna_job_status(job) == 1 {
+    return -1
+  }
+  return #cast(isize, job.used)
 }
 pub fn dna_job_error(job: *JobWorker, output: *u8, capacity: usize) usize {
   if job == nil || output == nil || capacity == 0 || dna_job_status(job) == 1 {

@@ -5,6 +5,9 @@ root=Path(__file__).resolve().parents[1]
 lib=c.CDLL(str(root/'build/deps/install/lib/libdna_native.so'))
 lib.dna_rpc_open.argtypes=[c.c_char_p,c.c_char_p];lib.dna_rpc_open.restype=c.c_void_p
 lib.dna_rpc_send.argtypes=[c.c_void_p,c.c_void_p,c.c_size_t]
+lib.dna_rpc_send_begin.argtypes=[c.c_void_p,c.c_size_t];lib.dna_rpc_send_begin.restype=c.c_void_p
+lib.dna_rpc_send_commit.argtypes=[c.c_void_p,c.c_size_t]
+lib.dna_rpc_send_abort.argtypes=[c.c_void_p]
 lib.dna_rpc_size.argtypes=[c.c_void_p];lib.dna_rpc_size.restype=c.c_long
 lib.dna_rpc_take.argtypes=[c.c_void_p,c.c_void_p,c.c_size_t];lib.dna_rpc_take.restype=c.c_long
 lib.dna_rpc_close.argtypes=[c.c_void_p]
@@ -22,7 +25,21 @@ p=lib.dna_rpc_open(('python3 '+shlex.quote(str(root/'tests/fake_lsp.py'))).encod
 try:
     request=b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
     assert lib.dna_rpc_send(p,request,len(request));assert receive(p)['result']['capabilities']['positionEncoding']=='utf-16'
-    assert not lib.dna_rpc_send(p,b'x',8388609)
+    assert not lib.dna_rpc_send(p,b'x',1073741825)
+    # Encode directly into the native queue, beyond the old 8 MiB send limit.
+    # Aborting a reservation must preserve preceding queued messages.
+    assert lib.dna_rpc_send(p,request,len(request))
+    target=lib.dna_rpc_send_begin(p,4096);assert target
+    assert not lib.dna_rpc_send_begin(p,32)
+    lib.dna_rpc_send_abort(p)
+    assert not lib.dna_rpc_send_commit(p,1)
+    assert receive(p)['id']==1
+    large=b'{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"padding":"'+b'a'*(17*1024*1024)+b'"}}'
+    target=lib.dna_rpc_send_begin(p,len(large)+512);assert target
+    c.memmove(target,large,len(large))
+    assert lib.dna_rpc_send_commit(p,len(large))
+    assert not lib.dna_rpc_send_commit(p,len(large))
+    assert receive(p)['id']==2
 finally:lib.dna_rpc_close(p)
 for frame in (b'Content-Length: 999999999\r\n\r\n',b'Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}',b'X: y\r\n\r\n{}',b'x'*9000):
     cmd='python3 -c '+shlex.quote('import sys,time;sys.stdout.buffer.write('+repr(frame)+');sys.stdout.flush();time.sleep(3)')

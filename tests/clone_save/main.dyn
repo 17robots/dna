@@ -1,0 +1,124 @@
+use "./owned_arena" arena_owner
+use "./buffer" buffer
+use "./files" files
+use "./filesystem" fs
+use "std/mem"
+
+extern fn probe_edit "probe_edit"() i32
+extern fn probe_clones "probe_clones"() i32
+extern fn probe_descriptors "probe_descriptors"() i32
+extern fn probe_expect_seed "probe_expect_seed"() bool
+
+fn main() {
+  before := probe_descriptors()
+  arena := arena_owner.create(#sizeof(buffer.Document) + 2097152)
+  doc := buffer.allocate(arena)
+  state := files.State{}
+  if #len(files.open(&state, doc, "original.txt", arena)) != 0 {
+    #panic("open clone fixture")
+  }
+  old_length := doc.length
+  middle := old_length / 2
+  edit := probe_edit()
+  if edit == 1 {
+    buffer.move_to(doc, middle, false)
+    buffer.move_to(doc, middle + 4, true)
+    if !buffer.replace(doc, "EDIT") {
+      #panic("replace")
+    }
+  } else if edit == 2 {
+    buffer.move_to(doc, middle, false)
+    if !buffer.replace(doc, "INSERT") {
+      #panic("insert")
+    }
+  } else if edit == 3 {
+    buffer.move_to(doc, middle, false)
+    buffer.move_to(doc, middle + 12345, true)
+    if !buffer.replace(doc, "") {
+      #panic("delete")
+    }
+  } else if edit == 4 {
+    buffer.move_to(doc, middle, false)
+    buffer.move_to(doc, doc.length, true)
+    if !buffer.replace(doc, "") {
+      #panic("truncate")
+    }
+  } else if edit == 5 {
+    buffer.move_to(doc, 0, false)
+    buffer.move_to(doc, 1, true)
+    if !buffer.replace(doc, "X") {
+      #panic("first byte")
+    }
+  } else if edit == 8 {
+    buffer.move_to(doc, 0, false)
+    if !buffer.replace(doc, "BEGIN") {
+      #panic("shift all origin bytes")
+    }
+  } else {
+    buffer.move_to(doc, doc.length, false)
+    if !buffer.replace(doc, "APPEND") {
+      #panic("append")
+    }
+  }
+  job := files.SaveJob{}
+  destination: []const u8 = "original.txt"
+  if edit == 6 {
+    destination = "copy.txt"
+  }
+  started := files.save_start(&job, &state, doc, destination, arena)
+  mode := fs.test_mode()
+  if mode == 2 {
+    if started {
+      #panic("existing temporary accepted")
+    }
+  } else {
+    if !started {
+      #panic("clone/fallback start failed")
+    }
+    seeded := job.seed.descriptor >= 0
+    if seeded != probe_expect_seed() {
+      #panic("wrong seed/fallback decision")
+    }
+    files.save_write(&job)
+    result := files.save_finish(&job, &state, doc, arena)
+    if mode == 4 || mode == 8 || mode == 9 || mode == 10 || mode == 11 {
+      if #len(result) == 0 || !buffer.dirty(doc) {
+        #panic("failed save accepted")
+      }
+    } else {
+      if #len(result) != 0 || buffer.dirty(doc) {
+        #panic("clone save failed")
+      }
+      if seeded && edit != 2 && edit != 3 && fs.test_written > 65536 {
+        #panic("unchanged ranges rewritten")
+      }
+      if seeded && fs.test_seeks == 0 {
+        #panic("clone was not reused")
+      }
+    }
+  }
+  if edit == 7 {
+    buffer.move_to(doc, doc.length, false)
+    if !buffer.replace(doc, "SECOND") {
+      #panic("second edit")
+    }
+    if #len(files.save(&state, doc, "original.txt", arena)) != 0 {
+      #panic("repeated clone save")
+    }
+  }
+  expected_clones: i32 = 1
+  if edit == 7 {
+    expected_clones = 2
+  }
+  if edit == 6 || edit == 8 || mode == 12 {
+    expected_clones = 0
+  }
+  if probe_clones() != expected_clones {
+    #panic("wrong clone attempts")
+  }
+  buffer.release(doc)
+  arena_owner.release(arena)
+  if probe_descriptors() != before {
+    #panic("clone save leaked a descriptor")
+  }
+}

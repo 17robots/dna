@@ -114,8 +114,12 @@ def window_bridge(compiler):
 
 
 def main():
+    if sys.platform == 'darwin':
+        from native_macos import dependencies
+        dependencies()
+        return
     if not sys.platform.startswith('linux'):
-        raise SystemExit('DNA native dependency builds currently target Linux.')
+        raise SystemExit('Native dependency builds support Linux and macOS; Windows services remain unfinished.')
     required = ('vterm', 'tree-sitter >= 0.25', 'libpcre2-8', 'libutf8proc')
     if subprocess.run(['pkg-config', '--exists', *required]).returncode:
         raise SystemExit('Install libvterm, Tree-sitter >= 0.25, PCRE2 and utf8proc development packages.')

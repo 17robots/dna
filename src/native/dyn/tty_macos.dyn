@@ -1,0 +1,55 @@
+#target(kernel: darwin)
+struct TtyTermios { input, output, control, local:u64, characters:[20]u8, input_speed, output_speed:u64 }
+struct TtySignalAction { handler:fn(i32), mask:u32, flags:i32 }
+const TtyGetSize:u64=1074295912
+const TtySuspendSignal:i32=18
+fn tty_fatal_signals() [8]i32 {
+  return [15, 1, 3, 11, 10, 6, 8, 4]
+}
+extern fn tty_darwin_raw "cfmakeraw"(raw:*TtyTermios)
+extern fn tty_darwin_argc "_NSGetArgc"() *i32
+extern fn tty_darwin_argv "_NSGetArgv"() ***const u8
+extern fn tty_darwin_executable "_NSGetExecutablePath"(output:*u8, size:*u32) i32
+fn tty_make_raw(raw:*TtyTermios) {
+  tty_darwin_raw(raw)
+}
+tty_wake_writer:i32
+tty_executable:[4096]u8
+fn tty_wake_create() i32 {
+  descriptors:[2]i32=[-1, -1]
+  if proc_pipe(&descriptors[0], 526336)!=0 {
+    return -1
+  }
+  tty_wake_writer=descriptors[1]
+  return descriptors[0]
+}
+fn tty_wake_signal(bytes:*const u8) {
+  _=rec_write(tty_wake_writer, bytes, 8)
+}
+fn tty_arguments() isize {
+  count:=tty_darwin_argc().*
+  arguments:=tty_darwin_argv().*
+  used:usize=0
+  for index in 0..count {
+    argument:=arguments[..#cast(usize, count)][#cast(usize, index)]
+    length:=string_length(argument)+1
+    if length>65535-used {
+      return -1
+    }
+    _=copy(&tty_command_line[used], argument, length)
+    used+=length
+  }
+  return #cast(isize, used)
+}
+fn tty_executable_path() *const u8 {
+  capacity:u32=4096
+  if tty_darwin_executable(&tty_executable[0], &capacity)!=0 {
+    return nil
+  }
+  return &tty_executable[0]
+}
+
+extern fn tty_darwin_ioctl "ioctl"(fd:i32, request:u64, ...) i32
+fn tty_ioctl(fd:i32, request:u64, output:rawptr) i32 {
+  return tty_darwin_ioctl(fd, request, #cast(*u8, output))
+}

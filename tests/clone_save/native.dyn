@@ -1,0 +1,62 @@
+use "../../src/owned_arena" arena_owner
+use "../../src/buffer" buffer
+use "../../src/files" files
+use "../../src/filesystem" fs
+use "std/mem"
+use "std/io"
+
+fn main() {
+  if !fs.WholeFileClones {
+    _ = io.println(io.stdout(), "PASS clone (whole-file cloning not selected on this host)")
+    return
+  }
+  size: usize = 17825792
+  arena := arena_owner.create(#sizeof(buffer.Document) + size + 2097152)
+  defer arena_owner.release(arena)
+  text := mem.push_bytes_uninit(arena, size)
+  for index in 0..size {
+    text[index] = 97
+  }
+  if !fs.write_all("original.txt", text).ok {
+    #panic("native clone fixture")
+  }
+  doc := buffer.allocate(arena)
+  defer buffer.release(doc)
+  state := files.State{}
+  if #len(files.open(&state, doc, "original.txt", arena)) != 0 {
+    #panic("native mapped open")
+  }
+  buffer.move_to(doc, doc.length, false)
+  if !buffer.replace(doc, "APPEND") {
+    #panic("native append")
+  }
+  job := files.SaveJob{}
+  if !files.save_start(&job, &state, doc, "original.txt", arena) || job.seed.descriptor < 0 {
+    #panic("APFS save was not seeded")
+  }
+  files.save_write(&job)
+  if #len(files.save_finish(&job, &state, doc, arena)) != 0 {
+    #panic("native cloned save")
+  }
+  // The retained origin is now unlinked. A second save must still be exact.
+  buffer.move_to(doc, doc.length, false)
+  if !buffer.replace(doc, "SECOND") {
+    #panic("native second edit")
+  }
+  if !files.save_start(&job, &state, doc, "original.txt", arena) {
+    #panic("native second start")
+  }
+  files.save_write(&job)
+  if #len(files.save_finish(&job, &state, doc, arena)) != 0 {
+    #panic("native second save")
+  }
+  disk := files.read_document("original.txt")
+  if !disk.ok || #len(disk.data) != size + 12 || !buffer.equal(disk.data[..size], text) || !buffer.equal(disk.data[size..], "APPENDSECOND") {
+    #panic("native clone bytes")
+  }
+  files.release_text(&disk)
+  if fs.metadata("original.txt.dna-write").ok {
+    #panic("native clone temporary leaked")
+  }
+  _ = io.println(io.stdout(), "PASS clone native APFS mapped document, seeded append, repeated save and exact bytes")
+}

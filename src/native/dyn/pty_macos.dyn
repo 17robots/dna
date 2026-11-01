@@ -1,0 +1,40 @@
+#target(kernel: darwin)
+#link("System")
+struct DarwinPtyAPI {
+  chdir: fn(*const u8) i32,
+  exit: fn(i32),
+  execve: fn(*const u8, **const u8, **const u8) i32,
+}
+pty_api: DarwinPtyAPI
+pty_ready: sync.Once
+extern fn pty_darwin_fork "forkpty"(fd:*i32, name:rawptr, termios:rawptr, size:*const TtySize) i32
+fn term_forkpty(fd:*i32, name:rawptr, termios:rawptr, size:*const TtySize) i32 {
+  // Finish every loader operation in the parent. The child calls only these
+  // inherited function pointers before exec, without locking or allocating.
+  darwin_io_prepare()
+  proc_prepare()
+  if sync.once_begin(&pty_ready) {
+    pty_api.chdir = #cast(fn(*const u8) i32, darwin_io_symbol("chdir"))
+    pty_api.exit = #cast(fn(i32), darwin_io_symbol("_exit"))
+    pty_api.execve = #cast(fn(*const u8, **const u8, **const u8) i32, darwin_io_symbol("execve"))
+    sync.once_complete(&pty_ready)
+  }
+  return pty_darwin_fork(fd, name, termios, size)
+}
+fn term_chdir(path:*const u8) i32 {
+  return pty_api.chdir(path)
+}
+fn term_exit(status:i32) {
+  pty_api.exit(status)
+}
+fn term_execve(path:*const u8, arguments:**const u8, environment:**const u8) i32 {
+  return pty_api.execve(path, arguments, environment)
+}
+fn terminal_exit_descriptor(pid:i32) i32 {
+  _ = pid
+  // Darwin has no pidfd; terminal_needs_poll retains bounded exit checking.
+  return -1
+}
+fn terminal_resize_native(fd:i32, size:*const TtySize) {
+  _ = tty_ioctl(fd, 2148037735, #cast(rawptr, size))
+}

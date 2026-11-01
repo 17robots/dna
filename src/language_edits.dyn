@@ -34,7 +34,7 @@ fn lsp_edit_file(app: *App, uri: []const u8, edits: *const json.Value, version: 
       item.identity = slot.identity
       item.revision = slot.document.revision
       storage := mem.push_bytes_uninit(plan.arena, slot.document.length + 1)
-      _ = copy_text(storage, slot.document.bytes[..slot.document.length])
+      _ = copy_text(storage, buffer.all(slot.document))
       item.before = storage[..slot.document.length]
       break
     }
@@ -240,14 +240,14 @@ fn lsp_completion(app: *App, item: *const json.Value) {
     if json.is_missing(range) {
       range = json.object_get(edit, "replace")
     }
-    start := lsp.json_offset(slot.document.bytes[..slot.document.length], json.object_get(range, "start"))
-    finish := lsp.json_offset(slot.document.bytes[..slot.document.length], json.object_get(range, "end"))
+    start := lsp.json_offset(buffer.all(slot.document), json.object_get(range, "start"))
+    finish := lsp.json_offset(buffer.all(slot.document), json.object_get(range, "end"))
     if !start.ok || !finish.ok || start.value > finish.value {
       notice(app, "Invalid completion range.")
       return
     }
     insertion_start = start.value
-    text := slot.document.bytes[..slot.document.length]
+    text := buffer.all(slot.document)
     add_text(message, &used, "{\"range\":{\"start\":")
     lsp_position(message, &used, lsp.position(text, start.value))
     add_text(message, &used, ",\"end\":")
@@ -260,20 +260,20 @@ fn lsp_completion(app: *App, item: *const json.Value) {
     doc := slot.document
     for prefix > 0 {
       previous := buffer.previous(doc, prefix)
-      byte := doc.bytes[previous]
+      byte := buffer.byte_at(doc, previous)
       if !((byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || (byte >= 48 && byte <= 57) || byte == 95 || byte >= 128) {
         break
       }
       prefix = previous
     }
-    if prefix > 0 && #len(content) > 0 && content[0] == '#' && doc.bytes[prefix - 1] == '#' {
+    if prefix > 0 && #len(content) > 0 && content[0] == '#' && buffer.byte_at(doc, prefix - 1) == '#' {
       prefix -= 1
     }
     insertion_start = prefix
     add_text(message, &used, "{\"range\":{\"start\":")
-    lsp_position(message, &used, lsp.position(doc.bytes[..doc.length], prefix))
+    lsp_position(message, &used, lsp.position(buffer.all(doc), prefix))
     add_text(message, &used, ",\"end\":")
-    lsp_position(message, &used, lsp.position(doc.bytes[..doc.length], state.position))
+    lsp_position(message, &used, lsp.position(buffer.all(doc), state.position))
     add_text(message, &used, "},\"newText\":")
     add_text(message, &used, lsp_json_string(encoded, content))
     add_text(message, &used, "}")
@@ -304,8 +304,8 @@ fn lsp_completion(app: *App, item: *const json.Value) {
     extra_edit := additional.first
     for extra_edit != nil {
       extra_range := json.object_get(extra_edit, "range")
-      extra_start := lsp.json_offset(slot.document.bytes[..slot.document.length], json.object_get(extra_range, "start"))
-      extra_end := lsp.json_offset(slot.document.bytes[..slot.document.length], json.object_get(extra_range, "end"))
+      extra_start := lsp.json_offset(buffer.all(slot.document), json.object_get(extra_range, "start"))
+      extra_end := lsp.json_offset(buffer.all(slot.document), json.object_get(extra_range, "end"))
       if extra_start.ok && extra_end.ok && extra_end.value <= insertion_start {
         adjusted = adjusted - (extra_end.value - extra_start.value) + #len(json_text(extra_edit, "newText"))
       }
@@ -383,8 +383,8 @@ fn lsp_accept(app: *App) {
   if app.prompt_state.panel == Panel.Message {
     return
   }
-  low := lsp.json_offset(app.documents.current.bytes[..app.documents.current.length], json.object_get(range, "start"))
-  high := lsp.json_offset(app.documents.current.bytes[..app.documents.current.length], json.object_get(range, "end"))
+  low := lsp.json_offset(buffer.all(app.documents.current), json.object_get(range, "start"))
+  high := lsp.json_offset(buffer.all(app.documents.current), json.object_get(range, "end"))
   if !low.ok || !high.ok {
     notice(app, "Language location is outside the current document.")
     return

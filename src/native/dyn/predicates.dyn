@@ -276,21 +276,28 @@ pub fn predicates_compile(query: rawptr) *Predicates {
   }
   return result
 }
-fn pred_capture_text(match: *const TsMatch, capture: u32, text: *const u8, length: u32, output: **const u8, output_length: *u32) bool {
+// Capture access supports both contiguous text and immutable chunked snapshots.
+struct PredicateSource { context: rawptr, length: u32, range: fn(rawptr, u32, u32, u32) *const u8 }
+fn pred_contiguous(context: rawptr, start: u32, end: u32, slot: u32) *const u8 {
+  _ = end
+  _ = slot
+  return #cast(*const u8, #cast(usize, context) + #cast(usize, start))
+}
+fn pred_capture_source(match: *const TsMatch, capture: u32, source: *const PredicateSource, slot: u32, output: **const u8, output_length: *u32) bool {
   for i in 0..#cast(usize, match.capture_count) {
     entry := &match.captures[..#cast(usize, match.capture_count)][i]
     if entry.index == capture {
       start := pred_start(entry.node)
       end := pred_end(entry.node)
-      if end > length {
-        end = length
+      if end > source.length {
+        end = source.length
       }
       if start > end {
         start = end
       }
-      output.* = &text[..#cast(usize, length) + 1][#cast(usize, start)]
+      output.* = source.range(source.context, start, end, slot)
       output_length.* = end - start
-      return true
+      return output.* != nil
     }
   }
   return false
@@ -305,6 +312,10 @@ fn pred_contains(value: []const u8, argument: []const u8) bool {
   return pred_find(&value[0], #len(value), &argument[0], #len(argument)) != nil
 }
 pub fn predicates_pass(predicates: *Predicates, match: *const TsMatch, text: *const u8, length: u32) bool {
+  source := PredicateSource{context: #cast(rawptr, text), length: length, range: pred_contiguous}
+  return predicates_pass_source(predicates, match, &source)
+}
+fn predicates_pass_source(predicates: *Predicates, match: *const TsMatch, source: *const PredicateSource) bool {
   if predicates == nil || #cast(u32, match.pattern_index) >= predicates.patterns {
     return true
   }
@@ -314,7 +325,7 @@ pub fn predicates_pass(predicates: *Predicates, match: *const TsMatch, text: *co
     item := &predicates.items[..#cast(usize, predicates.total)][i]
     value: *const u8 = nil
     value_length: u32 = 0
-    if !pred_capture_text(match, item.capture, text, length, &value, &value_length) {
+    if !pred_capture_source(match, item.capture, source, 0, &value, &value_length) {
       continue
     }
     result := false
@@ -324,7 +335,7 @@ pub fn predicates_pass(predicates: *Predicates, match: *const TsMatch, text: *co
     else if item.kind == 0 && item.other_capture {
       other: *const u8 = nil
       other_length: u32 = 0
-      result = pred_capture_text(match, item.other, text, length, &other, &other_length) && pred_equal(other[..#cast(usize, other_length)], value[..#cast(usize, value_length)])
+      result = pred_capture_source(match, item.other, source, 1, &other, &other_length) && pred_equal(other[..#cast(usize, other_length)], value[..#cast(usize, value_length)])
     } else {
       for a in 0..#cast(usize, item.argument_count) {
         if result {

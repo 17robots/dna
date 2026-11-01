@@ -26,8 +26,13 @@ fmt-check:
     find src tests examples -name '*.dyn' -printf '%h\n' | sort -u | xargs -n1 "$DYN" fmt --check
 test:
     python3 tests/sdk_requirements.py
+    python3 tests/sdk_compat.py
+    python3 tests/process_macos.py
+    python3 tests/disk_macos.py
     python3 tests/migrate_casts.py
     python3 tests/host_environment.py
+    python3 tests/platform_storage.py
+    python3 tests/darwin_errno.py
     python3 tests/json_scratch.py
     python3 tests/owned_arena.py
     python3 tests/font_startup.py
@@ -40,6 +45,9 @@ smoke:
 _smoke: deps test
     python3 scripts/test_host.py
     python3 scripts/test_host.py filesystem
+    python3 scripts/test_host.py threads
+    python3 scripts/test_host.py bulk_memory
+    python3 tests/bulk_memory.py
     python3 tests/build_guard.py
     python3 tests/benchmark_cleanup.py
     python3 tests/render_report_latency.py
@@ -90,6 +98,8 @@ _smoke: deps test
     python3 tests/process_transport.py
     python3 tests/process_close.py
     python3 tests/native_abi.py
+    python3 tests/native_desktop.py --object-only --editor-objects
+    python3 scripts/test_host.py threads --object-only
     python3 tests/terminal_review.py
     python3 tests/terminal_boundaries.py
     python3 tests/terminal_workset.py --expect-bounded
@@ -104,12 +114,16 @@ _smoke: deps test
     python3 tests/native.py
     python3 tests/project_search.py
     python3 tests/recovery_faults.py
+    python3 tests/recovery_capture.py
     python3 tests/save_failures.py
+    python3 tests/clone_save.py
+    python3 tests/save_completion.py
     python3 tests/resource_cycles.py
     python3 tests/native_memory.py
     python3 tests/syntax_memory.py
     python3 tests/syntax_changes.py
     python3 tests/syntax_consistency.py
+    python3 tests/syntax_stream.py
     python3 tests/syntax_dyn_fullfile.py
     python3 tests/thread_join.py
     python3 tests/picker_index.py
@@ -123,6 +137,8 @@ _smoke: deps test
     just build debug
     just build release
     python3 tests/tui_usability.py
+    python3 tests/large_file.py
+    python3 tests/syntax_window.py
     python3 tests/version.py --binary build/dna-debug --binary build/dna-release
     python3 scripts/build_native.py --backend wayland --release
     python3 scripts/build_native.py --backend x11 --release

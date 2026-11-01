@@ -1,3 +1,5 @@
+use "std/thread"
+use "std/sync"
 fn directory_refresh(app: *App) {
   if app.explorer.document != nil && buffer.dirty_cached(app.explorer.document) {
     notice(app, "Explorer has staged edits. Use :write to preview or discard explorer edits first.")
@@ -143,22 +145,120 @@ fn save_file_ready(app: *App, path: []const u8) {
     notice(app, "Save cleanup exceeds file capacity. Nothing changed.")
     return
   }
+  if app.documents.current.length >= buffer.LargeFile {
+    save_background(app, resolved)
+    return
+  }
   error := files.save(app.documents.file, app.documents.current, resolved, app.scratch)
   if #len(error) > 0 {
     save_cancel(app)
     notice(app, error)
     return
   }
-  document_lifecycle_changed(app, app.documents.active)
-  slot := app.documents.slots[app.documents.active]
+  save_completed(app, app.documents.active)
+}
+// Large documents write on a worker from a snapshot; editing continues, and
+// save_tick finishes the save when the worker is done.
+struct SaveTask {
+  arena: *mem.Arena,
+  job: files.SaveJob,
+  identity: u64,
+  done: sync.AtomicU32,
+  worker: *thread.Thread,
+}
+fn save_task_run(context: rawptr) isize {
+  task := #cast(*SaveTask, context)
+  files.save_write(&task.job)
+  sync.store_u32(&task.done, 1)
+  return 0
+}
+fn save_background(app: *App, path: []const u8) {
+  if app.documents.save_task != nil {
+    save_cancel(app)
+    notice(app, "A save is already writing; wait for it to finish.")
+    return
+  }
+  arena := arena_owner.create(#sizeof(SaveTask) + 4096)
+  task := mem.push(SaveTask, arena)
+  task.arena = arena
+  task.identity = app.documents.slots[app.documents.active].identity
+  if !files.save_start(&task.job, app.documents.file, app.documents.current, path, app.scratch) {
+    save_cancel(app)
+    notice(app, task.job.error)
+    arena_owner.release(arena)
+    return
+  }
+  spawned := thread.spawn_with_size(arena, 65536, save_task_run, #cast(rawptr, task))
+  if !spawned.ok {
+    // No worker: write here instead.
+    files.save_write(&task.job)
+    sync.store_u32(&task.done, 1)
+  } else {
+    task.worker = spawned.value
+  }
+  app.documents.save_task = task
+  notice(app, "Saving...")
+}
+// Finish a background save once its worker is done. Returns true when the
+// view changed.
+fn save_tick(app: *App) bool {
+  task := app.documents.save_task
+  if task == nil || sync.load_u32(&task.done) == 0 {
+    return false
+  }
+  save_join(app)
+  return true
+}
+fn save_join(app: *App) {
+  task := app.documents.save_task
+  if task.worker != nil && !thread.join(task.worker).ok {
+    #panic("cannot join save worker")
+  }
+  app.documents.save_task = nil
+  defer arena_owner.release(task.arena)
+  // The buffer may have closed meanwhile; the file is still committed only
+  // when its document is there to check against.
+  index := #len(app.documents.slots)
+  for candidate in 0..#len(app.documents.slots) {
+    if app.documents.slots[candidate].identity == task.identity && app.documents.slots[candidate].document != nil {
+      index = candidate
+    }
+  }
+  if index == #len(app.documents.slots) {
+    files.save_abort(&task.job)
+    save_cancel(app)
+    return
+  }
+  slot := app.documents.slots[index]
+  error := files.save_finish(&task.job, &slot.file, slot.document, app.scratch)
+  if #len(error) > 0 {
+    save_cancel(app)
+    notice(app, error)
+    return
+  }
+  notice(app, "Saved.")
+  save_completed(app, index)
+}
+// Wait for a background save, for shutdown.
+fn save_wait(app: *App) {
+  if app.documents.save_task != nil {
+    for sync.load_u32(&app.documents.save_task.done) == 0 {
+      search_pause()
+    }
+    save_join(app)
+  }
+}
+fn save_completed(app: *App, index: usize) {
+  document_lifecycle_changed(app, index)
+  slot := app.documents.slots[index]
   slot_syntax_release(slot)
   slot.syntax_checked = false
   slot.syntax_revision = 0
-  buffer.checkpoint(app.documents.current)
+  buffer.checkpoint(slot.document)
   app.prompt_state.panel = Panel.None
   plugin_event(app, "buffer-saved")
   // Saving a rules file changes other documents' settings.
-  leaf := files.name(app.documents.file)
+  leaf := files.name(&slot.file)
   leaf_start := #len(leaf)
   for leaf_start > 0 && leaf[leaf_start - 1] != '/' {
     leaf_start -= 1
@@ -173,7 +273,13 @@ fn save_file_ready(app: *App, path: []const u8) {
   if app.documents.quit_after_save {
     app.documents.quit_after_save = false
     if app.documents.closing_one {
-      close_clean(app)
+      // A background save may finish after another edit or a buffer switch.
+      // Never discard newer text or close whichever buffer now has focus.
+      if app.documents.active == index && !buffer.dirty_cached(slot.document) {
+        close_clean(app)
+      } else {
+        notice(app, "Saved snapshot. Buffer changed or focus moved; close it explicitly.")
+      }
     } else {
       request_quit(app)
     }

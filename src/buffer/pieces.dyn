@@ -1,0 +1,214 @@
+// The document described against its saved text: runs copied from the saved
+// text and runs of literal bytes. Edits build new leaves that point into the
+// old blocks, so a leaf whose bytes sit inside a leaf of the saved tree is a
+// copy without reading either; only bytes in new storage become literals.
+// Recovery stores this for large files: its size follows what was typed or
+// pasted, not where in the file the edits are.
+pub struct Piece { literal: bool, offset, length: usize }
+pub struct PieceList { pieces: []Piece, literals: []u8, ok: bool }
+
+struct SavedLeaf { address, length, offset: usize }
+
+fn saved_leaf_less(a: *const SavedLeaf, b: *const SavedLeaf) bool {
+  return a.address < b.address
+}
+// In-place heapsort by address; the saved tree's leaves need not be in
+// address order once text has moved.
+fn saved_leaves_sort(leaves: []SavedLeaf) {
+  count := #len(leaves)
+  start := count / 2
+  for start > 0 {
+    start -= 1
+    saved_leaves_sift(leaves, start, count)
+  }
+  end := count
+  for end > 1 {
+    end -= 1
+    swapped := leaves[0]
+    leaves[0] = leaves[end]
+    leaves[end] = swapped
+    saved_leaves_sift(leaves, 0, end)
+  }
+}
+fn saved_leaves_sift(leaves: []SavedLeaf, first: usize, end: usize) {
+  root := first
+  for root * 2 + 1 < end {
+    child := root * 2 + 1
+    if child + 1 < end && saved_leaf_less(&leaves[child], &leaves[child + 1]) {
+      child += 1
+    }
+    if !saved_leaf_less(&leaves[root], &leaves[child]) {
+      return
+    }
+    swapped := leaves[root]
+    leaves[root] = leaves[child]
+    leaves[child] = swapped
+    root = child
+  }
+}
+// The saved leaf holding address, or none.
+fn saved_leaf_find(leaves: []const SavedLeaf, address: usize) *const SavedLeaf {
+  low: usize = 0
+  high := #len(leaves)
+  for low < high {
+    middle := (low + high) / 2
+    if leaves[middle].address <= address {
+      low = middle + 1
+    } else {
+      high = middle
+    }
+  }
+  if low == 0 {
+    return nil
+  }
+  found := &leaves[low - 1]
+  if address >= found.address + found.length {
+    return nil
+  }
+  return found
+}
+// Describe the document against its saved text, in arena. Fails (ok false)
+// when literal bytes would exceed limit or the arena runs out.
+pub fn saved_pieces(document: *const Document, arena: *mem.Arena, limit: usize) PieceList {
+  saved_count: usize = 0
+  at: usize = 0
+  for at < document.saved_length {
+    run := rope_run(document.saved_root, at)
+    saved_count += 1
+    at = run.high
+  }
+  current_count: usize = 0
+  at = 0
+  for at < document.length {
+    run := rope_run(document.root, at)
+    current_count += 1
+    at = run.high
+  }
+  leaves_memory := mem.arena_try_push_uninit(arena, (saved_count + 1) * #sizeof(SavedLeaf), 8)
+  pieces_memory := mem.arena_try_push_uninit(arena, (current_count + 1) * #sizeof(Piece), 8)
+  if !leaves_memory.ok || !pieces_memory.ok {
+    return PieceList{}
+  }
+  leaves := (#cast(*SavedLeaf, leaves_memory.memory))[..saved_count]
+  pieces := (#cast(*Piece, pieces_memory.memory))[..current_count + 1]
+  at = 0
+  for index in 0..saved_count {
+    run := rope_run(document.saved_root, at)
+    leaves[index] = SavedLeaf{address: #cast(usize, run.data), length: run.high - run.low, offset: run.low}
+    at = run.high
+  }
+  saved_leaves_sort(leaves)
+  // First pass: classify runs and total the literal bytes.
+  count: usize = 0
+  literal_total: usize = 0
+  at = 0
+  for at < document.length {
+    run := rope_run(document.root, at)
+    length := run.high - run.low
+    address := #cast(usize, run.data)
+    found := saved_leaf_find(leaves, address)
+    piece := Piece{literal: true, offset: literal_total, length: length}
+    if found != nil && address + length <= found.address + found.length {
+      piece = Piece{offset: found.offset + (address - found.address), length: length}
+    } else {
+      literal_total += length
+    }
+    // Merge with a previous piece it continues.
+    if count > 0 && pieces[count - 1].literal == piece.literal && pieces[count - 1].offset + pieces[count - 1].length == piece.offset {
+      pieces[count - 1].length += piece.length
+    } else {
+      pieces[count] = piece
+      count += 1
+    }
+    at = run.high
+  }
+  if literal_total > limit {
+    return PieceList{}
+  }
+  literal_memory := mem.arena_try_push_uninit(arena, literal_total + 1, 1)
+  if !literal_memory.ok {
+    return PieceList{}
+  }
+  literals := (#cast(*u8, literal_memory.memory))[..literal_total]
+  // Second pass: copy the literal bytes, in document order.
+  written: usize = 0
+  at = 0
+  for at < document.length {
+    run := rope_run(document.root, at)
+    length := run.high - run.low
+    address := #cast(usize, run.data)
+    found := saved_leaf_find(leaves, address)
+    if found == nil || address + length > found.address + found.length {
+      _ = copy_bytes(&literals[written], run.data, length)
+      written += length
+    }
+    at = run.high
+  }
+  return PieceList{pieces: pieces[..count], literals: literals, ok: true}
+}
+// Replace the document's text with pieces against its current text (the
+// file as reloaded) as one undoable edit. Fails without changing anything
+// when a piece lies outside the text or the literals.
+pub fn apply_pieces(document: *Document, pieces: []const Piece, literals: []const u8) bool {
+  for piece in pieces {
+    if piece.literal {
+      if piece.offset > #len(literals) || piece.length > #len(literals) - piece.offset {
+        return false
+      }
+    } else if piece.offset > document.length || piece.length > document.length - piece.offset {
+      return false
+    }
+  }
+  if !valid(literals) {
+    return false
+  }
+  root: *RopeNode = nil
+  for piece in pieces {
+    part: *RopeNode = nil
+    if piece.literal {
+      part = rope_from(literals[piece.offset..piece.offset + piece.length])
+    } else {
+      split := rope_split(rope_retain(document.root), piece.offset)
+      rope_release(split.left)
+      tail := rope_split(split.right, piece.length)
+      rope_release(tail.right)
+      part = tail.left
+    }
+    root = rope_join(root, part)
+  }
+  // Pieces may join characters split across literal and copied runs; the
+  // whole result must still be valid text.
+  if !rope_valid(root) {
+    rope_release(root)
+    return false
+  }
+  transform_root(document, root)
+  return true
+}
+fn rope_valid(root: *const RopeNode) bool {
+  // Check each run with up to three bytes of context on both sides by
+  // validating overlapping windows of whole characters.
+  length := rope_length(root)
+  at: usize = 0
+  window: [65536]u8 = []
+  for at < length {
+    high := at + 65536
+    if high > length {
+      high = length
+    }
+    // Stop on a character start so the next window begins on one.
+    for high < length && high > at + 4 && (rope_byte(root, high) & 192) == 128 {
+      high -= 1
+    }
+    rope_copy(root, at, high, &window[0])
+    if !valid(window[..high - at]) {
+      return false
+    }
+    at = high
+  }
+  return true
+}
+fn rope_byte(root: *const RopeNode, offset: usize) u8 {
+  run := rope_run(root, offset)
+  return run.data[..run.high - run.low][offset - run.low]
+}

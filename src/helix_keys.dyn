@@ -135,10 +135,10 @@ fn goto_file(app: *App) {
   if high - low <= 1 {
     low = buffer.head(doc)
     high = low
-    for low > 0 && path_byte(doc.bytes[low - 1]) {
+    for low > 0 && path_byte(buffer.byte_at(doc, low - 1)) {
       low -= 1
     }
-    for high < doc.length && path_byte(doc.bytes[high]) {
+    for high < doc.length && path_byte(buffer.byte_at(doc, high)) {
       high += 1
     }
   }
@@ -146,7 +146,7 @@ fn goto_file(app: *App) {
     notice(app, "No file path under the cursor.")
     return
   }
-  name := doc.bytes[low..high]
+  name := buffer.range(doc, low, high)
   storage: [4096]u8 = []
   path := expand_home(name, storage[..])
   if #len(path) > 0 && path[0] != '/' {
@@ -216,7 +216,7 @@ fn diagnostic_edge(app: *App, last: bool) {
 fn blank_row(doc: *const buffer.Document, row: usize) bool {
   beginning := buffer.row_start(doc, row)
   for at in beginning..buffer.line_end(doc, beginning) {
-    if doc.bytes[at] != ' ' && doc.bytes[at] != 9 && doc.bytes[at] != 13 {
+    if buffer.byte_at(doc, at) != ' ' && buffer.byte_at(doc, at) != 9 && buffer.byte_at(doc, at) != 13 {
       return false
     }
   }
@@ -289,14 +289,14 @@ fn search_selection(app: *App, boundaries: bool) {
   text := app.search_history.text[..]
   capacity := #len(app.search_history.text)
   used: usize = 0
-  if boundaries && high > low && word_byte(doc.bytes[low]) && (low == 0 || !word_byte(doc.bytes[low - 1])) {
+  if boundaries && high > low && word_byte(buffer.byte_at(doc, low)) && (low == 0 || !word_byte(buffer.byte_at(doc, low - 1))) {
     text[0] = '\\'
     text[1] = 'b'
     used = 2
   }
   at := low
   for at < high && used + 5 < capacity {
-    byte := doc.bytes[at]
+    byte := buffer.byte_at(doc, at)
     if byte == '\\' || byte == '.' || byte == '^' || byte == '$' || byte == '*' || byte == '+' || byte == '?' || byte == '(' || byte == ')' || byte == '[' || byte == ']' || byte == '{' || byte == '}' || byte == '|' {
       text[used] = '\\'
       used += 1
@@ -305,7 +305,7 @@ fn search_selection(app: *App, boundaries: bool) {
     used += 1
     at += 1
   }
-  if boundaries && at == high && high > low && word_byte(doc.bytes[high - 1]) && (high >= doc.length || !word_byte(doc.bytes[high])) {
+  if boundaries && at == high && high > low && word_byte(buffer.byte_at(doc, high - 1)) && (high >= doc.length || !word_byte(buffer.byte_at(doc, high))) {
     text[used] = '\\'
     text[used + 1] = 'b'
     used += 2
@@ -325,7 +325,7 @@ fn shrink_to_lines(doc: *buffer.Document) {
     }
   }
   last := high
-  if high < doc.length && (high == 0 || doc.bytes[high - 1] != 10) {
+  if high < doc.length && (high == 0 || buffer.byte_at(doc, high - 1) != 10) {
     last = buffer.line_start(doc, high)
   }
   if last > first {
@@ -460,10 +460,10 @@ fn comment_toggle(app: *App) {
       continue
     }
     at := buffer.row_start(doc, row)
-    for at < doc.length && (doc.bytes[at] == ' ' || doc.bytes[at] == 9) {
+    for at < doc.length && (buffer.byte_at(doc, at) == ' ' || buffer.byte_at(doc, at) == 9) {
       at += 1
     }
-    if at + #len(token) > doc.length || !buffer.equal(doc.bytes[at..at + #len(token)], token) {
+    if at + #len(token) > doc.length || !buffer.equal(buffer.range(doc, at, at + #len(token)), token) {
       commented = false
     }
   }
@@ -474,12 +474,12 @@ fn comment_toggle(app: *App) {
       continue
     }
     at := buffer.row_start(doc, row)
-    for at < doc.length && (doc.bytes[at] == ' ' || doc.bytes[at] == 9) {
+    for at < doc.length && (buffer.byte_at(doc, at) == ' ' || buffer.byte_at(doc, at) == 9) {
       at += 1
     }
     if commented {
       remove := #len(token)
-      if at + remove < doc.length && doc.bytes[at + remove] == ' ' {
+      if at + remove < doc.length && buffer.byte_at(doc, at + remove) == ' ' {
         remove += 1
       }
       doc.anchor = at
@@ -516,20 +516,20 @@ fn number_range(doc: *const buffer.Document, selection: buffer.Selection) buffer
   }
   ending := buffer.line_end(doc, low)
   at := low
-  for at > buffer.line_start(doc, low) && at < doc.length && digit(doc.bytes[at]) && digit(doc.bytes[at - 1]) {
+  for at > buffer.line_start(doc, low) && at < doc.length && digit(buffer.byte_at(doc, at)) && digit(buffer.byte_at(doc, at - 1)) {
     at -= 1
   }
-  for at < ending && !digit(doc.bytes[at]) {
+  for at < ending && !digit(buffer.byte_at(doc, at)) {
     at += 1
   }
   if at >= ending {
     return buffer.Selection{anchor: 0, cursor: 0}
   }
   start := at
-  for at < ending && digit(doc.bytes[at]) {
+  for at < ending && digit(buffer.byte_at(doc, at)) {
     at += 1
   }
-  if start > 0 && doc.bytes[start - 1] == '-' {
+  if start > 0 && buffer.byte_at(doc, start - 1) == '-' {
     start -= 1
   }
   return buffer.Selection{anchor: start, cursor: at}
@@ -537,16 +537,16 @@ fn number_range(doc: *const buffer.Document, selection: buffer.Selection) buffer
 fn digit(byte: u8) bool {
   return byte >= '0' && byte <= '9'
 }
-// Formats value +/- amount for the digits in doc.bytes[low..high].
+// Formats value +/- amount for the digits in buffer.range(doc, low, high).
 fn number_text(doc: *const buffer.Document, low: usize, high: usize, amount: usize, decrease: bool, out: []u8) []const u8 {
-  negative := doc.bytes[low] == '-'
+  negative := buffer.byte_at(doc, low) == '-'
   value: usize = 0
   at := low
   if negative {
     at += 1
   }
   for at < high && value < 100000000000000 {
-    value = value * 10 + #cast(usize, (doc.bytes[at] - '0'))
+    value = value * 10 + #cast(usize, (buffer.byte_at(doc, at) - '0'))
     at += 1
   }
   down := decrease != negative
@@ -630,12 +630,12 @@ fn shell_command(app: *App, mode: u8, command: []const u8) {
     high := range.cursor
     input: []const u8 = ""
     if mode < 2 {
-      input = doc.bytes[low..high]
+      input = buffer.range(doc, low, high)
     }
     empty: [1]u8 = []
-    source := &empty[0]
+    source: *const u8 = &empty[0]
     if #len(input) > 0 {
-      source = &doc.bytes[low]
+      source = buffer.pointer(doc, low, high)
     }
     job := job_open(&command_text[0], &directory[0], source, #len(input), #cast(u32, app.config.lsp_timeout_ms))
     if job == nil {
@@ -713,7 +713,7 @@ fn join_select_spaces(app: *App) {
     joins: [32]usize = []
     join_count: usize = 0
     for at < high && at < doc.length && join_count < 32 {
-      if doc.bytes[at] == 10 {
+      if buffer.byte_at(doc, at) == 10 {
         joins[join_count] = at
         join_count += 1
       }
@@ -723,7 +723,7 @@ fn join_select_spaces(app: *App) {
       join_count -= 1
       newline := joins[join_count]
       after := newline + 1
-      for after < doc.length && (doc.bytes[after] == 32 || doc.bytes[after] == 9) {
+      for after < doc.length && (buffer.byte_at(doc, after) == 32 || buffer.byte_at(doc, after) == 9) {
         after += 1
       }
       length := doc.length

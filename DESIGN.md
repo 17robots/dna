@@ -221,15 +221,212 @@ apply to editor APIs, not OS filesystem/network access. See PLUGINS.md. Built-in
 features remain statically linked; converting every feature into an external
 process would add overhead without improving these ownership boundaries.
 
-Document capacity is 256 MiB minus one byte. Each document's storage (text,
-saved copy, undo checkpoint, line index and a 1 GiB circular undo byte store with
-up to 64 metadata entries) is one reserved `MAP_NORESERVE` mapping, so only the
-pages a file actually uses occupy memory. Documents of 16 MiB and more are plain
-text: no syntax highlighting, no language server, and recovery snapshots record
-them by path for reloading instead of rewriting their text. This keeps storage bounded while
-storing only removed/inserted bytes for each checkpoint. A retained checkpoint
-baseline lets grouped edits form one delta. Cursor/selection/explorer identities
-remain per-state metadata; discarded redo storage is reused immediately.
+Documents have no fixed size. Text lives in a persistent piece tree
+(`src/buffer/rope.dyn`): immutable blocks of up to 16 KiB per leaf, AVL-balanced
+internal nodes caching byte and newline counts, and a per-leaf table of newline
+offsets. Edits build new nodes along one path and share everything else, so the
+saved baseline and each of up to 64 undo entries are retained roots, not copies.
+Undo retains at most 64 states and budgets 1 GiB of private changed text;
+removed or inserted ranges still backed by a file mapping do not consume that
+byte budget. Small edits preserve mapped neighbors instead of copying them into
+private blocks. Tree metadata and retained baselines remain separate costs.
+`buffer.Capacity` (256 MiB) bounds individual contiguous insertion and clipboard
+operations, not document size. Formatter input uses retained storage chunks;
+output can grow to 4 GiB minus one byte and is adopted directly as text storage.
+
+Language-server shadows retain immutable roots. Opening and full-change messages
+escape document chunks directly into the native outgoing queue, with no separate
+flattened or escaped editor copy. Outgoing encoded messages are bounded at 1 GiB;
+incoming responses retain their independent 8 MiB bound. Ranges of 16 MiB and
+more are escaped from a snapshot by one thread per CPU (a measuring pass, then
+a writing pass) that skip plain runs a word at a time; the UI thread waits for
+them, about 140 ms for 1 GiB. Queued JSON still occupies memory until sent. Incremental
+changes send only the changed range.
+
+Large-file recovery records a stamped replacement patch against the saved file.
+Restore checks the stamp before applying the patch and transfers that stamp to
+the restored file state. A mismatch aborts restore without replacing the current
+workspace. The native recovery record remains bounded at 1 GiB total and
+256 MiB of new bytes;
+if edits cannot fit, capture fails and retains the previous record instead of
+silently replacing unsaved edits with a path-only entry.
+
+Syntax highlighting on large documents parses a shared snapshot, with colors
+queried around the last drawn view (`syntax_window_tick` in `src/syntax.dyn`).
+Tree queries for objects and syntax selections remain disabled for these
+documents. Cursor, selection and explorer identities remain per-state metadata.
+
+Single-line drawing is bounded at 1 MiB of text per displayed row. On a longer
+line, a window follows the primary cursor in half-window steps. Drawing, caret
+geometry, selections, syntax ink and mouse hit tests share its origin. Text
+outside the current window becomes visible when the cursor moves there.
+`tests/large_file.py --mib 1024 --binary build/dna-release` checks a real terminal
+open, end motion, visible insertion and byte-exact save on a 1 GiB single line.
+Native framebuffer tests cover windowed GUI drawing and selection consistency.
+
+Files of 256 MiB and more open lazily (`src/buffer/lazy.dyn`): the document
+appears after its first 4 MiB of whole lines are checked, while workers
+validate and index the rest; the scheduler polls `load_tick`, which appends the
+tail to the current text, the saved baseline and every undo root. Edits made
+meanwhile touch only the prefix, so all of them stay consistent. Saving, disk
+comparison and recovery patches wait for completion; a tail that is not UTF-8
+leaves the start open with saving disabled. A 1 GiB file shows its first frame
+in about 10 ms.
+
+Large-document syntax parses immutable piece-tree snapshots from the beginning
+of the document (`syntax_stream.dyn`). The worker reads chunks directly without
+flattening the document. Queries and color output stay confined to an 8 MiB
+view window, so comment and string openers retain their context regardless of
+their distance from the view. Scrolling at the same document revision reuses the
+complete tree. Edits cancel stale parsing; a new revision reparses in the worker.
+The UI releases snapshot references only after a completion acknowledgement,
+including cancellation and shutdown. Predicate captures spanning chunks are
+copied into worker scratch buffers and evaluated normally. Tests cover 12 MB
+comments and strings, range changes, predicates and source lifetime.
+
+Parse-tree memory and parse time now follow the full document's grammar
+structure; color storage remains bounded and the document text is shared. The
+Tree-sitter byte API is 32-bit: documents beyond 4 GiB minus 2 bytes remain
+uncolored, rather than parsing a window without its preceding grammar state.
+
+Recovery for large files records edits as pieces of the saved file plus only
+the new bytes (`buffer.saved_pieces`), found by matching leaf storage
+addresses, so edits far apart cost only what was typed; records stay bounded by
+256 MiB of new bytes per record (1 GiB total record size). Edited spans over
+1 MiB use pieces even when a contiguous patch would fit. Restore checks the
+file's stamp, then rebuilds the text from the pieces as one undoable edit.
+
+The disk watcher needs a hash of the saved text as its baseline. Files with a
+stamp from when they held that text (every opened or saved file) pass the
+stamp instead (`dna_disk_watch_stamped`): the watcher thread hashes the file
+itself while the stamp still matches and reports it changed otherwise, so the
+UI thread never hashes a large file. Reloads from disk refresh or drop the
+stamp.
+
+macOS and Windows report real file stamps (fstat, GetFileInformationByHandle)
+so unchanged-file checks skip rereads. The filesystem boundary now supplies
+read-only mappings on both platforms: Darwin uses MAP_RESILIENT_MEDIA so
+inaccessible backing pages become zeroes; Windows views prevent truncation
+until unmapped. Mapping failures retain the ordinary read fallback. The mapper
+callback carries an isize descriptor so Windows HANDLE values are not narrowed.
+Linux's editor still installs its native SIGBUS guard.
+
+Windows range copies try ReFS block cloning for 64 KiB-aligned interiors and
+copy partial edge blocks through a separately reopened source handle. Unsupported
+filesystems or incompatible source/destination alignment fall back to writing
+immutable document bytes. Failures after copying an edge abort the transaction.
+APFS saves can seed the exclusive temporary file from a whole-file clone
+(`fclonefileat`). The source stamp must match before and after cloning. The
+writer seeks past unchanged runs still at their original offsets, writes edited
+or shifted runs, resizes the clone to the snapshot length, then uses the existing
+sync/conflict-check/atomic-rename sequence. Read-only origins, unsupported volumes
+and failed clone setup retain the normal exclusive-create/full-write fallback.
+Existing temporary paths are never replaced. Save As keeps its original path and
+permission behavior. Mapped origin stamps are checked again after writing and
+before publication so an externally changed mapping cannot validate itself as
+its saved baseline. `tests/clone_save.py` runs the production Darwin setup and
+writer against a Linux clone emulator, checking exact bytes, write avoidance,
+shifted edits, truncation, repeated saves, mapped-source changes, failures,
+permissions and descriptor cleanup in debug and release.
+
+Platform seams have deterministic mocks and x86-64/arm64 target checks. Native
+filesystem CI exercises mapping, truncation, range-copy fallback and exclusive
+clones. macOS arm64 CI is configured to run a real mapped-buffer/APFS save test and
+the isolated window/presenter qualification. These native runs remain unverified locally on
+Linux. The desktop probe now locates installed SDKs as well as source checkouts;
+four target object checks run in smoke and do not imply runtime qualification.
+Window selection now keeps Wayland on Linux and selects the SDK Cocoa/Win32
+backend on macOS/Windows. The same selection applies to the event adapter and
+presenter. Renderer environment lookup uses the existing bounded host adapter;
+search polling uses the SDK sleep API. Full editor objects compile for both
+architectures on macOS and Windows in debug/release. The Windows SDK duplicate
+`dyn_win_last_error` declaration is repaired in a content-addressed build-local
+SDK copy. The same overlay unifies Darwin `__error` declarations without loader
+calls after failed IO. Installed SDK files are never changed. The Windows ARM64
+unwind limit exposed a large scratch-array initializer; static zero initialization
+now avoids that generated stack frame. Bulk memory transfers keep the Linux
+checked libc entry points, use libSystem's checked copies on macOS, and resolve
+CRT functions once on Windows so LLVM cannot fold them into byte-loop helpers.
+All object checks remain distinct from native linking and runtime qualification.
+
+The Darwin service bridge has native adapters for spawn/process groups,
+nonblocking transport, unreaped exit inspection, per-pipe SIGPIPE suppression,
+kqueue one-shot readiness, vnode change delivery, PTYs, terminal layouts/raw mode,
+suspend and frontend handoff. Disk watches register both parent directories and
+actual document/config vnodes; replacement retires the old file vnode, and an
+epoch sweep removes registrations for closed documents. A nonblocking event pipe
+coalesces rescan requests while preserving the existing worker ownership/status
+protocol. Registration failure retains explicit periodic fallback. Installation
+policy consumes normalized stat/dirent values, uses descriptor-relative nofollow
+checks and Darwin atomic exclusive/swap rename, and preserves version retention.
+Intel bindings select Apple's `$INODE64` stat/directory entry points. Mappings use
+Darwin resilient backing rather than a Linux signal-handler layout.
+
+`scripts/native_macos.py` supplies the Cocoa support-library/editor build path,
+including native SDK linking, explicit DNA exports and all text provider rpaths.
+The language installer has Darwin cwd, symlink/readlink and descriptor-relative
+nofollow tree removal adapters; its archive/timeout/hash commands use Homebrew
+GNU tools. Native prerequisites are pkgconf, libvterm, Tree-sitter >=0.25, PCRE2,
+utf8proc, HarfBuzz, FriBidi, FreeType, coreutils and gnu-tar, plus a supported
+TrueType monospace font. `tests/native_macos.py` checks native header layouts,
+full debug/release Cocoa startup/presentation/cleanup, process jobs, file changes,
+notification rearm and PTY lifecycle. CI is configured to execute it on macOS;
+these native runs have not been performed on this Linux workspace. Deterministic
+Darwin process/vnode mocks and both architecture object checks execute locally.
+
+Windows full service ports remain unfinished: process-tree/pipe ownership,
+ConPTY, console lifecycle/handoff, file/directory notifications, native filesystem
+transport for search/install/recovery, and safe plugin transactions still need
+implementation and native qualification. Windows build entry points remain
+closed until those services are present. Passing editor, thread and presenter
+objects does not imply a complete Windows editor build.
+
+Native thread lifecycle keeps pthreads on Linux and uses SDK desktop threads on
+macOS/Windows, including OS TLS, self-join detection, callback results and arena
+ownership through successful join. Failed joins retain ownership for retry.
+`test_host.py threads` exercises condition handoff and repeated create/join in
+debug/release; CI runs this on each native host. Four desktop object targets run
+in smoke. Linux join-fault tests still cover transient recovery, persistent
+retention, eventual reclamation and self-join rejection.
+
+Large-file worker counts use per-platform APIs: Linux sched_getaffinity, Darwin
+hw.activecpu via sysctlbyname, and Windows GetActiveProcessorCount across groups.
+The Linux-only hard-coded syscall number is gone from portable buffer code.
+The pinned SDK rejects duplicate foreign declarations of __error across its
+thread module and the filesystem adapter. The adapter resolves that accessor
+once through the process's libSystem, before any fallible libc call; a concurrent
+mock test checks that initialization never clobbers an I/O error. The installed SDK itself
+is unchanged; the build-local compatibility overlay is described above.
+
+Files of 16 MiB and more are mapped read-only instead of read
+(`files.read_mapped`), so unchanged text costs page cache, not private memory.
+The block keeps the file descriptor and its platform stamp; saving copies
+unchanged ranges through the filesystem adapter while the stamp holds, and
+refuses to write mapped text once the file changed. Linux uses a native SIGBUS
+guard (`src/native/dyn/mapping.dyn`) to replace truncated pages with zeroes until
+the disk watcher reports the change. Saves never truncate the mapped file:
+they write a temporary file and rename it.
+After a successful replacement, origin metadata is refreshed for the inode
+unlinked by that rename, only if its size and modification time still match.
+This preserves repeated saves from the retained mapping without accepting an
+external content change as a valid origin.
+
+Loading validates UTF-8 and builds per-leaf newline tables on all CPUs
+(`src/buffer/parallel.dyn`). Those workers are raw threads without libc thread
+state, so they never allocate: one pass validates and counts, the main thread
+allocates the tables, a second pass fills them.
+
+Search prompts on documents of 16 MiB and more run on a worker
+(`src/pattern/background.dyn`) over a `TextSnapshot`, a retained root that the
+document may move past meanwhile; a stale result reruns. Repeats (n/N) use the
+same windowed search and wait for it. Backward search walks windows back from
+the cursor instead of rescanning from the top. PCRE2 gets bump-allocating memory
+functions from the task's arena, so the worker never calls malloc.
+
+Code outside `src/buffer` reads text only through `src/buffer/text.dyn`:
+`byte_at`, `range`, `all`, `pointer` and `chunk_at`. A range inside one leaf is a
+direct view; a range crossing leaves is copied once into a document-owned view.
+Views stay valid until the next edit or `release_views`.
 Large replacements can exhaust the byte budget sooner than small edits.
 Saved and checkpoint views share the current text while unchanged. The first
 mutation preserves one copy shared by both baselines. Saving inside an edit group
@@ -316,16 +513,26 @@ preserve the original owner and retry after another eight small revisions.
 
 ## Storage decision and performance checks
 
-Keep contiguous document storage up to 256 MiB. Edits cost one memmove of the
-text after the cursor. Checkpoints compare the changed span and update a retained
-mirror; the first independent mirror still needs a full copy. Bulk operations go
-through glibc (`__memcpy_chk`/`__memmove_chk`, `memchr`, `memcmp`):
-the Dyn runtime's own memcpy/memmove/memset copy a byte at a time and are kept
-local to the executable (version script) so other libraries keep glibc's. On a
-100 MiB log, typing at the top of the file measured 8.6 ms from key to present,
-held j/k under 2 ms, and opening took 85 ms more than a small file. A piece table
-would make edit cost independent of size, but every direct `document.bytes`
-access would change with it.
+Contiguous storage up to 256 MiB was replaced by the piece tree. Edits no longer
+move the text after the cursor, and saving streams leaf chunks. Measured with
+`scripts/benchmark_workloads.py` (release, TUI), before and after:
+
+| 100 MiB file | contiguous | piece tree |
+|---|---|---|
+| open | 71 ms | 74 ms |
+| resident after open | 213 MiB | 115 MiB |
+| insert, key to screen | 4.8 ms | 0.09 ms |
+
+A 600 MiB file (previously refused) opens in 0.4 s at 635 MiB resident, inserts
+in 0.09 ms and saves in 0.26 s.
+
+With mapping and parallel loading, a 1 GiB file (17.9 million lines, btrfs, warm
+page cache) shows its first frame in 0.08 s (0.26 s single-threaded) with 49 MiB
+of private memory; the text itself is page cache. Each keystroke in its search
+prompt answers in about 1 ms instead of 0.5 s, and a backward repeat over
+millions of matches takes 0.01 s instead of more than a minute. Save cleanup
+(trailing whitespace, final newline) edits the tree in place instead of copying
+the text, so it no longer refuses files over 256 MiB.
 
 The rendering regression checks unchanged split redraws for zero large text
 reshaping, exercises a 1 MB line and a large Unicode selection, and bounds

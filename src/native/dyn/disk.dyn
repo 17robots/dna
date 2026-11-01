@@ -4,6 +4,10 @@
 struct DiskWatched {
   path: [4096]u8, identity: u64, generation: u64, baseline: u64,
   baseline_length: usize, stamp: InstallStat, stamped: bool, pending: bool,
+  // Set by dna_disk_watch_stamped: the baseline is not known yet, but the file
+  // held the saved text while it carried this stamp (inode, size, modified
+  // and changed seconds and nanoseconds). The first check adopts its hash.
+  trusted: bool, trust: [6]u64,
   status: i32, bytes: *u8, length: usize,
   ready_next: usize, queued: bool,
 }
@@ -12,13 +16,10 @@ struct DiskWorker {
   changes: i32, control: [2]i32, watches: []i32, files: []DiskWatched,
   ready_first, ready_last: usize,
 }
-struct DiskPathWatch { fd: i32 }
+struct DiskPathWatch { fd, parent:i32, path:[4096]u8 }
 struct DiskDirectoryWatch { fd: i32, count: usize, watches: [256]i32 }
 struct DiskEvent { descriptor: i32, mask: u32, cookie: u32, length: u32 }
-extern fn disk_stat "stat"(path: *const u8, output: *InstallStat) i32
-extern fn disk_inotify "inotify_init1"(flags: i32) i32
-extern fn disk_add "inotify_add_watch"(fd: i32, path: *const u8, mask: u32) i32
-extern fn disk_remove "inotify_rm_watch"(fd: i32, wd: i32) i32
+
 
 // Queue links are one-based stable slot indices; vector growth preserves them.
 fn disk_ready_push(d: *DiskWorker, index: usize) {
@@ -62,6 +63,7 @@ pub fn dna_disk_next_ready(d: *DiskWorker, output: *DiskReady) i32 {
   return 0
 }
 
+extern fn disk_lseek "lseek"(fd: i32, offset: i64, whence: i32) i64
 fn disk_hash(bytes: *const u8, length: usize) u64 {
   value: u64 = 1469598103934665603
   for i in 0..length {
@@ -69,6 +71,31 @@ fn disk_hash(bytes: *const u8, length: usize) u64 {
     value = #wrap((value ^ #cast(u64, bytes[..length][i])) * 1099511628211)
   }
   return value
+}
+struct DiskStreamHash { hash: u64, ok: bool }
+// FNV-1a over a file's first size bytes, read through a fixed buffer.
+fn disk_stream_hash(fd: i32, size: usize) DiskStreamHash {
+  chunk: [65536]u8 = []
+  value: u64 = 1469598103934665603
+  done: usize = 0
+  for done < size {
+    want := size - done
+    if want > #len(chunk) {
+      want = #len(chunk)
+    }
+    count := proc_read_raw(fd, &chunk[0], want)
+    if count < 0 && rec_errno().* == 4 {
+      continue
+    }
+    if count <= 0 {
+      return DiskStreamHash{}
+    }
+    for i in 0..#cast(usize, count) {
+      value = #wrap((value ^ #cast(u64, chunk[i])) * 1099511628211)
+    }
+    done += #cast(usize, count)
+  }
+  return DiskStreamHash{hash: value, ok: true}
 }
 fn disk_same(a: *const InstallStat, b: *const InstallStat) bool {
   return a.device == b.device && a.inode == b.inode && a.size == b.size && a.mode == b.mode && a.modify_seconds == b.modify_seconds && a.modify_nanos == b.modify_nanos && a.change_seconds == b.change_seconds && a.change_nanos == b.change_nanos
@@ -114,6 +141,7 @@ fn disk_directories(d: *DiskWorker) bool {
   for i in 0..count {
     d.watches[i] = -1
   }
+  disk_targets_begin(d.changes)
   for i in 0..count {
     if d.files[i].identity == 0 {
       continue
@@ -125,10 +153,11 @@ fn disk_directories(d: *DiskWorker) bool {
       wd = disk_add(d.changes, &parent[0], 16781262)
     }
     d.watches[i] = wd
-    if wd < 0 {
+    if wd < 0 || !disk_target_watch(d.changes, &d.files[i].path[0], wd) {
       complete = false
     }
   }
+  disk_targets_end(d.changes)
   for i in 0..count {
     used := false
     for j in 0..count {
@@ -197,6 +226,7 @@ fn disk_worker(context: rawptr) i32 {
       status: i32 = 0
       bytes: *u8 = nil
       length: usize = 0
+      unchanged_hash := false
       if install_lstat(&snapshot.path[0], &stamp) != 0 {
         status = 3
         if rec_errno().* == 2 {
@@ -205,7 +235,7 @@ fn disk_worker(context: rawptr) i32 {
       } else if (stamp.mode & 61440) != 32768 {
         status = 3
       }
-      else if stamp.size < 0 || stamp.size > 268435455 {
+      else if stamp.size < 0 || stamp.size > 1099511627776 {
         status = 4
       }
       if snapshot.stamped && disk_same(&snapshot.stamp, &stamp) && (snapshot.status == status || (status == 0 && snapshot.status == 5)) {
@@ -218,11 +248,27 @@ fn disk_worker(context: rawptr) i32 {
           status = 3
         }
         else {
-          bytes = search_alloc(#cast(usize, stamp.size) + 1, 3)
-          if bytes == nil {
+          // Hash in a small buffer first; most checks find the file unchanged
+          // and never hold its whole contents in memory.
+          streamed := disk_stream_hash(fd, #cast(usize, stamp.size))
+          if !streamed.ok {
             status = 3
+          } else if snapshot.trusted && disk_trusted(&snapshot, &stamp) {
+            length = #cast(usize, stamp.size)
+            unchanged_hash = true
+            snapshot.baseline = streamed.hash
+          } else if streamed.hash == snapshot.baseline && #cast(usize, stamp.size) == snapshot.baseline_length {
+            length = #cast(usize, stamp.size)
+            unchanged_hash = true
+          } else if disk_lseek(fd, 0, 0) != 0 {
+            status = 3
+          } else {
+            bytes = search_alloc(#cast(usize, stamp.size) + 1, 3)
+            if bytes == nil {
+              status = 3
+            }
           }
-          for status == 0 && length < #cast(usize, stamp.size) {
+          for status == 0 && !unchanged_hash && length < #cast(usize, stamp.size) {
             count := proc_read_raw(fd, &bytes[..#cast(usize, stamp.size) + 1][length], #cast(usize, stamp.size) - length)
             if count < 0 && rec_errno().* == 4 {
               continue
@@ -242,13 +288,19 @@ fn disk_worker(context: rawptr) i32 {
           _ = rec_close(fd)
         }
       }
-      changed := status != 0 || length != snapshot.baseline_length || disk_hash(bytes, length) != snapshot.baseline
+      // A trusted watch whose file no longer carries its stamp has no
+      // baseline to compare; report the contents as changed.
+      changed := status != 0 || (!unchanged_hash && (snapshot.trusted || length != snapshot.baseline_length || disk_hash(bytes, length) != snapshot.baseline))
       rec_lock(d.lock)
       target := &d.files[i]
       if target.generation == snapshot.generation {
         target.stamp = stamp
         target.stamped = true
         target.status = status
+        if target.trusted && unchanged_hash {
+          target.baseline = snapshot.baseline
+        }
+        target.trusted = false
         search_free(#cast(rawptr, target.bytes))
         target.bytes = nil
         target.length = 0
@@ -292,7 +344,7 @@ fn disk_release(d: *DiskWorker) {
     rec_mutex_free(d.lock)
   }
   if d.changes >= 0 {
-    _ = rec_close(d.changes)
+    disk_changes_close(d.changes)
   }
   if d.control[0] >= 0 {
     _ = rec_close(d.control[0])
@@ -379,6 +431,44 @@ pub fn dna_disk_watch_checked(d: *DiskWorker, index: usize, identity: u64, path:
   if identity != 0 {
     baseline = disk_hash(saved, length)
   }
+  return disk_watch_baseline(d, index, identity, path, baseline, length)
+}
+// Same as dna_disk_watch_checked with the saved text's FNV-1a hash computed
+// by the caller, which can hash its storage chunk by chunk.
+pub fn dna_disk_watch_hashed(d: *DiskWorker, index: usize, identity: u64, path: *const u8, baseline: u64, length: usize) i32 {
+  if d == nil {
+    return 0
+  }
+  if identity != 0 && (path == nil || string_length(path) >= 4096) {
+    return 0
+  }
+  return disk_watch_baseline(d, index, identity, path, baseline, length)
+}
+// Watch a file whose saved text is length bytes, without hashing it here:
+// stamp (six values, as filesystem.Stamp: inode, size, modified seconds and
+// nanoseconds, changed seconds and nanoseconds) is the file's state when it
+// held that text. The watcher thread hashes the file on its first check while
+// the stamp still matches; otherwise it reports the file changed.
+pub fn dna_disk_watch_stamped(d: *DiskWorker, index: usize, identity: u64, path: *const u8, stamp: *const u64, length: usize) i32 {
+  if d == nil || identity == 0 || stamp == nil || path == nil || string_length(path) >= 4096 {
+    return 0
+  }
+  if disk_watch_baseline(d, index, identity, path, 0, length) == 0 {
+    return 0
+  }
+  rec_lock(d.lock)
+  w := &d.files[index]
+  w.trusted = true
+  for i in 0..6 {
+    w.trust[i] = stamp[..6][i]
+  }
+  rec_unlock(d.lock)
+  return 1
+}
+fn disk_trusted(w: *const DiskWatched, stamp: *const InstallStat) bool {
+  return w.trust[0] == stamp.inode && w.trust[1] == #cast(u64, stamp.size) && w.trust[1] == #cast(u64, w.baseline_length) && w.trust[2] == #cast(u64, stamp.modify_seconds) && w.trust[3] == #cast(u64, stamp.modify_nanos) && w.trust[4] == #cast(u64, stamp.change_seconds) && w.trust[5] == #cast(u64, stamp.change_nanos)
+}
+fn disk_watch_baseline(d: *DiskWorker, index: usize, identity: u64, path: *const u8, baseline: u64, length: usize) i32 {
   rec_lock(d.lock)
   if !d.stop && identity == 0 && index >= #len(d.files) {
     rec_unlock(d.lock)
@@ -507,16 +597,20 @@ pub fn dna_path_watch_open(path: *const u8) *DiskPathWatch {
   if fd < 0 {
     return nil
   }
-  if disk_add(fd, &parent[0], 16781262) < 0 {
-    _ = rec_close(fd)
+  parent_watch := disk_add(fd, &parent[0], 16781262)
+  if parent_watch < 0 {
+    disk_changes_close(fd)
     return nil
   }
   watch := #cast(*DiskPathWatch, search_alloc(#sizeof(DiskPathWatch), 3))
   if watch == nil {
-    _ = rec_close(fd)
+    disk_changes_close(fd)
     return nil
   }
   watch.fd = fd
+  watch.parent = parent_watch
+  _=copy(&watch.path[0], path, string_length(path)+1)
+  _=disk_target_watch(fd, path, parent_watch)
   proc_watch(fd, 0)
   return watch
 }
@@ -533,7 +627,7 @@ pub fn dna_path_watch_poll(watch: *DiskPathWatch) i32 {
     if count < 0 && rec_errno().* == 4 {
       continue
     }
-    if count < 0 && rec_errno().* != 11 {
+    if count < 0 && !rec_retry() {
       invalid = true
     }
     if count <= 0 {
@@ -549,6 +643,9 @@ pub fn dna_path_watch_poll(watch: *DiskPathWatch) i32 {
       offset += #sizeof(DiskEvent) + #cast(usize, event.length)
     }
   }
+  if !disk_target_watch(watch.fd, &watch.path[0], watch.parent) {
+    invalid=true
+  }
   proc_watch(watch.fd, 0)
   if invalid {
     return -1
@@ -560,7 +657,7 @@ pub fn dna_path_watch_close(watch: *DiskPathWatch) {
     return
   }
   proc_unwatch(watch.fd)
-  _ = rec_close(watch.fd)
+  disk_changes_close(watch.fd)
   search_free(#cast(rawptr, watch))
 }
 pub fn dna_directory_watch_open() *DiskDirectoryWatch {
@@ -570,7 +667,7 @@ pub fn dna_directory_watch_open() *DiskDirectoryWatch {
   }
   watch := #cast(*DiskDirectoryWatch, search_calloc(1, #sizeof(DiskDirectoryWatch), 3))
   if watch == nil {
-    _ = rec_close(fd)
+    disk_changes_close(fd)
     return nil
   }
   watch.fd = fd
@@ -630,6 +727,6 @@ pub fn dna_directory_watch_close(watch: *DiskDirectoryWatch) {
     return
   }
   proc_unwatch(watch.fd)
-  _ = rec_close(watch.fd)
+  disk_changes_close(watch.fd)
   search_free(#cast(rawptr, watch))
 }

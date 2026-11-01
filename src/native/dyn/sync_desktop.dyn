@@ -1,0 +1,44 @@
+use "std/thread" thread
+use "std/mem" mem
+
+// SDK threads on macOS and Windows provide the native TLS required by libc
+// and the linked parser/font libraries. Each adapter owns its arena until join;
+// a failed join retains that owner for the common retirement/retry path.
+struct DesktopThread {
+  arena: *mem.Arena,
+  worker: *thread.Thread,
+  entry: fn(rawptr) rawptr,
+  state, result: rawptr,
+}
+fn desktop_thread_run(context: rawptr) isize {
+  owner := #cast(*DesktopThread, context)
+  owner.result = owner.entry(owner.state)
+  return 0
+}
+fn desktop_thread_create(output: *usize, attributes: rawptr, entry: fn(rawptr) rawptr, state: rawptr) i32 {
+  _ = attributes
+  arena := mem.arena_create(8192)
+  owner := mem.push(DesktopThread, arena)
+  owner.arena = arena
+  owner.entry = entry
+  owner.state = state
+  started := thread.spawn_with_size(arena, 1048576, desktop_thread_run, #cast(rawptr, owner))
+  if !started.ok {
+    mem.arena_release(arena)
+    return 1
+  }
+  owner.worker = started.value
+  output.* = #cast(usize, owner)
+  return 0
+}
+fn desktop_thread_join(handle: usize, result: rawptr) i32 {
+  owner := #cast(*DesktopThread, handle)
+  if !thread.join(owner.worker).ok {
+    return 1
+  }
+  if result != nil {
+    #cast(*rawptr, result).* = owner.result
+  }
+  mem.arena_release(owner.arena)
+  return 0
+}

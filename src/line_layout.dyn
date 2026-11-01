@@ -9,6 +9,8 @@ struct LineLayout {
   lines: [256]LineText,
   // Pool slot drawn on each visible row.
   rows: [256]usize,
+  origins: [256]usize,
+  window: usize,
   first_row: usize,
   count: usize,
   line: f32,
@@ -29,17 +31,52 @@ fn line_hash(bytes: []const u8) u64 {
   }
   return hash
 }
+// Shape a bounded window of each line. On the cursor line, the window follows
+// the cursor in half-window steps so distant text stays editable and visible.
+const LineDrawLimit: usize = 1048576
 fn line_bytes(doc: *const buffer.Document, row: usize) []const u8 {
   low := buffer.row_start(doc, row)
   high := doc.length
   if row + 1 < doc.line_count {
     high = buffer.row_start(doc, row + 1)
   }
-  return doc.bytes[low..high]
+  low = line_draw_start(doc, low, buffer.line_end(doc, low))
+  return buffer.range(doc, low, line_draw_end(doc, low, high))
+}
+// Share this origin across drawing, caret geometry, selections and hit tests.
+fn line_draw_start(doc: *const buffer.Document, low: usize, high: usize) usize {
+  position := buffer.head(doc)
+  half := LineDrawLimit / 2
+  if high - low <= LineDrawLimit || position < low || position > high || position - low < LineDrawLimit {
+    return low
+  }
+  start := low + ((position - low) / half - 1) * half
+  return buffer.boundary(doc, start)
+}
+fn line_window_key(doc: *const buffer.Document) usize {
+  position := buffer.head(doc)
+  low := buffer.line_start(doc, position)
+  start := line_draw_start(doc, low, buffer.line_end(doc, position))
+  if start == low {
+    return 0
+  }
+  return start
+}
+// End of the shaped part of the line low..high: high, or LineDrawLimit bytes
+// in at a character boundary.
+fn line_draw_end(doc: *const buffer.Document, low: usize, high: usize) usize {
+  if high - low <= LineDrawLimit {
+    return high
+  }
+  end := low + LineDrawLimit
+  for end > low && (buffer.byte_at(doc, end) & 192) == 128 {
+    end -= 1
+  }
+  return end
 }
 // Bring the visible rows up to date. Returns the number of lines shaped.
 fn line_layout_update(typography: *Typography, layout: *LineLayout, doc: *const buffer.Document, identity: u64, viewport: TextViewport) usize {
-  if layout.document == doc && layout.identity == identity && layout.start == viewport.start && layout.end == viewport.end && layout.line == typography.line {
+  if layout.document == doc && layout.identity == identity && layout.start == viewport.start && layout.end == viewport.end && layout.line == typography.line && layout.window == line_window_key(doc) {
     if layout.revision == doc.revision {
       return 0
     }
@@ -108,6 +145,12 @@ fn line_layout_update(typography: *Typography, layout: *LineLayout, doc: *const 
     entry.length = #len(bytes)
     shaped += 1
   }
+  for index in 0..count {
+    low := buffer.row_start(doc, first + index)
+    high := buffer.line_end(doc, low)
+    layout.origins[index] = line_draw_start(doc, low, high)
+  }
+  layout.window = line_window_key(doc)
   layout.first_row = first
   layout.count = count
   layout.line = typography.line
@@ -134,7 +177,11 @@ fn layout_substring(layout: *const LineLayout, doc: *const buffer.Document, posi
     return false
   }
   index := row - layout.first_row
-  if !ttf.substring(layout.lines[layout.rows[index]].text, #cast(i32, (position - buffer.row_start(doc, row))), output) {
+  origin := layout.origins[index]
+  if position < origin || position - origin > layout.lines[layout.rows[index]].length {
+    return false
+  }
+  if !ttf.substring(layout.lines[layout.rows[index]].text, #cast(i32, (position - origin)), output) {
     return false
   }
   output.y += #cast(i32, (#cast(f32, index) * layout.line))

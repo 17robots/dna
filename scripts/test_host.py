@@ -10,25 +10,54 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 from dyn_path import real_dyn
+from sdk_compat import environment as sdk_environment
 
 suite = sys.argv[1] if len(sys.argv) > 1 else 'host'
-if suite not in ('host', 'filesystem'):
-    raise SystemExit('usage: test_host.py [host|filesystem]')
+if suite not in ('host', 'filesystem', 'clone', 'threads', 'bulk_memory'):
+    raise SystemExit('usage: test_host.py [host|filesystem|clone|threads|bulk_memory]')
 compiler = real_dyn()
 if not compiler:
     raise SystemExit('Install the pinned Dyn SDK first.')
 stage = ROOT / ('build/test-' + suite)
 stage.mkdir(parents=True, exist_ok=True)
-for module in ('owned_arena', 'cstring', 'host', 'filesystem'):
+modules = () if suite in ('threads', 'bulk_memory') else ('owned_arena', 'cstring', 'host', 'filesystem')
+if suite == 'clone':
+    modules += ('files', 'buffer')
+for module in modules:
     shutil.copytree(ROOT / 'src' / module, stage / module, dirs_exist_ok=True)
-(stage / 'main.dyn').write_text((ROOT / 'tests' / suite / 'main.dyn').read_text().replace('../../src/', './'))
+fixture = ROOT / 'tests/clone_save/native.dyn' if suite == 'clone' else ROOT / 'tests' / suite / 'main.dyn'
+(stage / 'main.dyn').write_text(fixture.read_text().replace('../../src/', './'))
+if suite == 'threads':
+    native = ROOT / 'src/native/dyn'
+    (stage / 'sync.dyn').write_text((native / 'sync.dyn').read_text().split("// Dyn's current executable entry point")[0])
+    for name in ('clock.dyn', 'sync_linux.dyn', 'sync_desktop.dyn', 'sync_macos.dyn', 'sync_windows.dyn'):
+        shutil.copyfile(native / name, stage / name)
+if '--object-only' in sys.argv[2:]:
+    if suite != 'threads':
+        raise SystemExit('--object-only is supported for threads only')
+    for target in ('x86_64-windows', 'aarch64-windows', 'x86_64-macos', 'aarch64-macos'):
+        for mode in ('debug', 'release'):
+            subprocess.run([str(compiler), 'build', str(stage), '--' + mode, '--target', target,
+                            '--emit-object', '--no-link', '--quiet', '--output', str(stage / (target + '-' + mode))],
+                           check=True, timeout=120, env=sdk_environment(compiler))
+        print('PASS native thread objects: ' + target, flush=True)
+    raise SystemExit
+if suite == 'bulk_memory':
+    for source in (ROOT/'src/buffer').glob('memory_*.dyn'):
+        shutil.copyfile(source, stage/source.name)
+    for source in (ROOT/'tests/bulk_memory').glob('fill_*.dyn'):
+        shutil.copyfile(source, stage/source.name)
 # mise merges parent configuration. Do not leak Linux library paths into a
 # native-host test, even when the SDK was installed through a staged config.
-environment = dict(os.environ, DNA_HOST_TEST="value café 日本語", DNA_HOST_EMPTY="")
+environment = dict(os.environ, DNA_HOST_TEST="value café 日本語", DNA_HOST_EMPTY="",
+                   DNA_TEST_FILE_MAPPING="1" if sys.platform == "darwin" or os.name == "nt" else "0")
 environment.pop("DNA_HOST_MISSING_7ab218", None)
 for key in ('DYN_LIBRARY_PATH', 'LD_LIBRARY_PATH', 'DYLD_LIBRARY_PATH'):
     environment.pop(key, None)
 links = []
+if suite in ('threads', 'bulk_memory') and sys.platform.startswith('linux'):
+    libc = subprocess.check_output(['cc', '-print-file-name=libc.so.6'], text=True).strip()
+    links = ['--link', libc]
 if sys.platform == 'darwin':
     sdk = Path(subprocess.check_output(['xcrun', '--show-sdk-path'], text=True).strip())
     # These tests use APIs beyond Dyn's minimal libSystem stub. Select native
@@ -43,6 +72,10 @@ if sys.platform == 'darwin':
     linker.symlink_to(native_linker)
     environment['PATH'] = str(linker_directory) + os.pathsep + environment.get('PATH', '')
     links = ['--link', str(sdk / 'usr/lib/libSystem.tbd'), '--link', '-syslibroot', '--link', str(sdk)]
+    if suite == 'clone':
+        prefix = Path(subprocess.check_output(['brew', '--prefix', 'utf8proc'], text=True).strip())
+        environment['DYN_LIBRARY_PATH'] = str(prefix / 'lib')
+        links += ['--link', str(prefix / 'lib/libutf8proc.dylib')]
 elif os.name == 'nt':
     # Use the installed Windows SDK import library. Dyn's #link lookup expects
     # a GNU-style filename, but lld accepts the original COFF archive content.
@@ -72,7 +105,7 @@ for mode in ('debug', 'release'):
             else:
                 (directory / 'link-enabled').touch()
         arguments = ["argument café 日本語", "", "with space"] if suite == "host" else []
-        result = subprocess.run([str(binary), *arguments], cwd=directory, text=True, encoding='utf-8', capture_output=True, env=environment, timeout=20)
+        result = subprocess.run([str(binary), *arguments], cwd=directory, text=True, encoding='utf-8', capture_output=True, env=environment, timeout=60 if suite == 'clone' else 20)
         if result.returncode:
             raise SystemExit(result.stdout + result.stderr)
         if suite == 'host':

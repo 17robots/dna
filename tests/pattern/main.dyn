@@ -1,4 +1,8 @@
+use "std/fmt"
 use "../../src/pattern" pattern
+use "../../src/buffer" buffer
+use "../../src/owned_arena" arena_owner
+use "std/mem"
 fn main() {
   compiled := pattern.open("a(lpha)|é+")
   defer pattern.close(&compiled)
@@ -44,4 +48,208 @@ fn main() {
   if !later.found || later.start != 6 || later.end != 12 {
     #panic("project multiline semantics")
   }
+  window_checks()
+  task_checks()
+}
+// Windowed document search must agree with one search over the whole text,
+// including matches that cross 1 MiB window boundaries, end anchors and
+// lookbehind needing text before the window.
+fn window_checks() {
+  size: usize = 3500000
+  text_arena := arena_owner.create(size)
+  defer arena_owner.release(text_arena)
+  text := mem.push_bytes_uninit(text_arena, size)
+  for at in 0..size {
+    text[at] = #cast(u8, 97 + (at * 7 + at / 13) % 26)
+    if at % 61 == 60 {
+      text[at] = 10
+    }
+  }
+  // Plant matches straddling each window edge.
+  edges: [3]usize = [1048576, 2097152, 3145728]
+  for edge in edges {
+    planted: []const u8 = "NEEDLE-long-crossing-NEEDLE"
+    for index in 0..#len(planted) {
+      text[edge - 10 + index] = planted[index]
+    }
+  }
+  owner := arena_owner.create(#sizeof(buffer.Document))
+  defer arena_owner.release(owner)
+  doc := buffer.allocate(owner)
+  defer buffer.release(doc)
+  if !buffer.load(doc, text) {
+    #panic("window fixture load")
+  }
+  patterns: [6][]const u8 = ["NEEDLE-long-crossing-NEEDLE", "(?<=g)NEEDLE", "xyz$", "^abc", "q[a-z]{40}z", "NEEDLE.*?NEEDLE"]
+  for source in patterns {
+    compiled := pattern.open_lines(source)
+    if !compiled.ok {
+      #panic("window pattern compile")
+    }
+    at: usize = 0
+    for at <= size {
+      expected := pattern.find(&compiled, text, at)
+      got := pattern.find_document(&compiled, doc, at)
+      if expected.found != got.found || expected.error != got.error || (expected.found && (expected.start != got.start || expected.end != got.end)) {
+        #panic("windowed search differs from whole-text search")
+      }
+      if !expected.found {
+        break
+      }
+      at = expected.end + 1
+    }
+    pattern.close(&compiled)
+  }
+}
+
+
+// Worker searches agree with whole-text searches, forward and backward,
+// over multibyte text with matches straddling window edges.
+fn task_checks() {
+  size: usize = 3500000
+  text_arena := arena_owner.create(size)
+  defer arena_owner.release(text_arena)
+  text := mem.push_bytes_uninit(text_arena, size)
+  at: usize = 0
+  for at < size {
+    if at % 61 == 60 {
+      text[at] = 10
+      at += 1
+    } else if at % 5 == 0 && at + 2 < size && (at + 1) % 61 != 60 && (at + 2) % 61 != 60 {
+      // "é", so window edges often land inside a character.
+      text[at] = 195
+      text[at + 1] = 169
+      at += 2
+    } else {
+      text[at] = #cast(u8, 97 + (at * 7 + at / 13) % 26)
+      at += 1
+    }
+  }
+  edges: [3]usize = [1048576, 2097152, 3145728]
+  for edge in edges {
+    planted: []const u8 = "NEEDLE"
+    for index in 0..#len(planted) {
+      text[edge - 3 + index] = planted[index]
+    }
+    // Keep the "é" pairs around the plant whole.
+    if text[edge - 4] == 195 {
+      text[edge - 4] = 97
+    }
+    if text[edge + 3] == 169 {
+      text[edge + 3] = 97
+    }
+  }
+  owner := arena_owner.create(#sizeof(buffer.Document))
+  defer arena_owner.release(owner)
+  doc := buffer.allocate(owner)
+  defer buffer.release(doc)
+  if !buffer.load(doc, text) {
+    #panic("task fixture load")
+  }
+  // Few matches each: the expected values come from slow whole-text scans.
+  sources: [3][]const u8 = ["NEEDLE", "LE[a-z]?é|DLE", "ééé"]
+  // Line starts, so every offset begins a character.
+  offsets: [5]usize = [0, 1048529, 2000007, 3145770, 3499936]
+  for source in sources {
+    compiled := pattern.open(source)
+    for offset in offsets {
+      // Expected forward: first match at or after offset, else the first.
+      expected := pattern.find(&compiled, text, offset)
+      if !expected.found {
+        expected = pattern.find(&compiled, text, 0)
+      }
+      // Expected backward: last match starting before offset, else the last.
+      before := pattern.Match{}
+      last := pattern.Match{}
+      scan: usize = 0
+      for true {
+        found := pattern.find(&compiled, text, scan)
+        if !found.found {
+          break
+        }
+        if found.start < offset {
+          before = found
+        }
+        last = found
+        scan = found.end
+      }
+      if !before.found {
+        before = last
+      }
+      for backwards in [false, true] {
+        task := pattern.task_start(source, doc, offset, backwards)
+        if task == nil {
+          #panic("task start")
+        }
+        for !pattern.task_done(task) {
+        }
+        got := pattern.task_result(task)
+        pattern.task_finish(task)
+        want := expected
+        if backwards {
+          want = before
+        }
+        if got.found != want.found || got.error != want.error || (want.found && (got.start != want.start || got.end != want.end)) {
+          storage: [256]u8 = []
+          out := fmt.buffer(storage[..])
+          _ = fmt.write_values(&out, source, " offset ", offset, " back ", backwards, " got ", got.found, got.error, got.start, got.end, " want ", want.found, want.error, want.start, want.end, "\n")
+          _ = #syscall(1, 2, &fmt.bytes(&out)[0], #len(fmt.bytes(&out)))
+          #panic("worker search differs from whole-text search")
+        }
+      }
+    }
+    pattern.close(&compiled)
+  }
+  range_checks(doc, edges[..])
+}
+fn task_wait(task: *pattern.SearchTask) {
+  if task == nil {
+    #panic("range task start")
+  }
+  for !pattern.task_done(task) {
+  }
+}
+// Range modes on one whole-text selection: three planted NEEDLEs.
+fn range_checks(doc: *buffer.Document, edges: []const usize) {
+  ranges := buffer.Selections{count: 2}
+  ranges.items[0] = buffer.Selection{anchor: 0, cursor: 2000000}
+  ranges.items[1] = buffer.Selection{anchor: 2000000, cursor: doc.length}
+  select := pattern.task_start_ranges("NEEDLE", doc, &ranges, 1)
+  task_wait(select)
+  output := pattern.task_output(select)
+  if pattern.task_status(select) != 0 || output.count != 3 {
+    #panic("range select count")
+  }
+  for index in 0..3 {
+    if output.items[index].anchor != edges[index] - 3 || output.items[index].cursor != edges[index] + 3 {
+      #panic("range select position")
+    }
+  }
+  pattern.task_finish(select)
+  split := pattern.task_start_ranges("NEEDLE", doc, &ranges, 2)
+  task_wait(split)
+  // Range one splits into two pieces around one match, range two into three.
+  if pattern.task_status(split) != 0 || pattern.task_output(split).count != 5 || pattern.task_output(split).items[0].cursor != edges[0] - 3 {
+    #panic("range split")
+  }
+  pattern.task_finish(split)
+  // Anchors see the range edges: the second range starts a subject.
+  anchored := pattern.task_start_ranges("\\A", doc, &ranges, 1)
+  task_wait(anchored)
+  if pattern.task_status(anchored) != 0 || pattern.task_output(anchored).count != 2 || pattern.task_output(anchored).items[1].anchor != 2000000 {
+    #panic("range anchors")
+  }
+  pattern.task_finish(anchored)
+  keep := pattern.task_start_ranges("NEEDLE-absent", doc, &ranges, 3)
+  task_wait(keep)
+  if pattern.task_status(keep) != 1 {
+    #panic("range keep")
+  }
+  pattern.task_finish(keep)
+  remove := pattern.task_start_ranges("NEEDLE", doc, &ranges, 4)
+  task_wait(remove)
+  if pattern.task_status(remove) != 1 {
+    #panic("range remove")
+  }
+  pattern.task_finish(remove)
 }

@@ -13,7 +13,9 @@ fn bounded_string(storage: []u8, source: []const u8) c.StringResult {
 
 #link("c")
 
-pub struct State { path: [4096]u8, length: usize, recovery_owned: bool }
+// stamp: the file as last opened or saved; unchanged stamps let a save skip
+// re-reading the whole file to prove nothing else wrote it.
+pub struct State { path: [4096]u8, length: usize, recovery_owned: bool, stamp: fs.Stamp }
 
 extern fn realpath "realpath"(path: *const u8, output: *u8) *u8
 
@@ -105,31 +107,247 @@ pub fn metadata(path: []const u8) fs.Metadata {
 }
 // A whole file read into its own reserved mapping, outside the bounded frame
 // scratch. Release with release_text once copied; FileText owns its arena.
-pub struct FileText { arena: *mem.Arena, data: []const u8, ok: bool, too_large: bool }
+pub struct FileText { arena: *mem.Arena, storage: buffer.TextStorage, data: []const u8, stamp: fs.Stamp, ok: bool, too_large: bool }
 
+// Text that is copied whole elsewhere (formatters, language servers, project
+// edits) is bounded by buffer.Capacity.
+// The file's stamp as last opened or saved; ok is false when unknown.
+pub fn saved_stamp(state: *const State) fs.Stamp {
+  return state.stamp
+}
+// Replace the stamp after the document's saved text was replaced from disk:
+// the stamp read with that text, or none (fs.Stamp{}) when it is unknown.
+pub fn adopt_stamp(state: *State, stamp: fs.Stamp) {
+  state.stamp = stamp
+}
+pub fn forget_stamp(state: *State) {
+  state.stamp = fs.Stamp{}
+}
 pub fn read_text(path: []const u8) FileText {
-  reserved := arena_owner.create(buffer.Capacity + 1)
-  result := FileText{arena: reserved}
+  return read_bounded(path, buffer.Capacity)
+}
+// A file opened as a document: bounded only by DocumentLimit. The mapping is
+// sized from the file, with headroom for a file still growing while read.
+pub fn read_document(path: []const u8) FileText {
+  return read_bounded(path, DocumentLimit)
+}
+pub const DocumentLimit: usize = 1099511627776
+fn close_origin(descriptor: isize) {
+  file := fs.adopt_handle(descriptor)
+  _ = fs.close(&file)
+}
+// Smaller documents close their file at once instead of holding a descriptor.
+const OriginMinimum: usize = 16777216
+fn stamp_values(stamp: fs.Stamp) [6]u64 {
+  return [stamp.inode, stamp.size, stamp.modify_seconds, stamp.modify_nanos, stamp.change_seconds, stamp.change_nanos]
+}
+fn same_values(a: [6]u64, b: [6]u64) bool {
+  for index in 0..6 {
+    if a[index] != b[index] {
+      return false
+    }
+  }
+  return true
+}
+fn same_stamp(a: fs.Stamp, b: fs.Stamp) bool {
+  return a.inode == b.inode && a.size == b.size && a.modify_seconds == b.modify_seconds && a.modify_nanos == b.modify_nanos && a.change_seconds == b.change_seconds && a.change_nanos == b.change_nanos
+}
+struct CloneSeed { descriptor: isize = -1, stamp: [6]u64 }
+// Clone only an origin whose current stamp still matches its snapshot bytes.
+// A stamp change during cloning invalidates the seed before any edit is written.
+fn save_seed(destination: []const u8, temporary: []const u8, snapshot: *const buffer.TextSnapshot, seed: *CloneSeed) fs.AtomicResult {
+  at: usize = 0
+  for at < snapshot.length {
+    source := buffer.snapshot_source_at(snapshot, at)
+    if source.descriptor >= 0 && source.offset == #cast(u64, at) {
+      origin := fs.File{descriptor: source.descriptor, active: true, owned: false}
+      before := fs.file_stamp(&origin)
+      if before.ok && same_values(stamp_values(before), source.stamp) {
+        cloned := fs.clone_exclusive(&origin, temporary)
+        if cloned.ok {
+          transaction := fs.AtomicFile{file: cloned.value, destination: destination, temporary: temporary, active: true}
+          after := fs.file_stamp(&origin)
+          if after.ok && same_stamp(before, after) {
+            seed.descriptor = source.descriptor
+            seed.stamp = source.stamp
+            return fs.AtomicResult{transaction: transaction, ok: true}
+          }
+          _ = fs.atomic_abort(&transaction)
+        }
+      }
+      // One clone attempt per save; other origins still use the normal writer.
+      break
+    }
+    at += #len(source.bytes)
+  }
+  return fs.atomic_begin(destination, temporary)
+}
+// A mapped baseline can change underneath a shared snapshot. Recheck after
+// writing and immediately before publication, not only before reading a run.
+fn mapped_sources_current(snapshot: *const buffer.TextSnapshot) bool {
+  checked: isize = -1
+  checked_stamp: [6]u64 = []
+  at: usize = 0
+  for at < snapshot.length {
+    source := buffer.snapshot_source_at(snapshot, at)
+    if source.mapped && (source.descriptor != checked || !same_values(checked_stamp, source.stamp)) {
+      checked = source.descriptor
+      checked_stamp = source.stamp
+      origin := fs.File{descriptor: source.descriptor, active: true, owned: false}
+      now := fs.file_stamp(&origin)
+      if !now.ok || !same_values(stamp_values(now), source.stamp) {
+        return false
+      }
+    }
+    at += #len(source.bytes)
+  }
+  return true
+}
+// Write a document, copying ranges still identical to an open origin file
+// through the filesystem range-copy adapter, writing the rest from the snapshot.
+// Text mapped from a file that has since changed may no longer be the text
+// that was opened, so it is never written: mapped_changed reports that.
+fn write_document(file: *fs.File, snapshot: *const buffer.TextSnapshot, seed: *const CloneSeed, mapped_changed: *bool) bool {
+  checked: isize = -1
+  checked_stamp: [6]u64 = []
+  usable := false
+  current := false
+  at: usize = 0
+  for at < snapshot.length {
+    source := buffer.snapshot_source_at(snapshot, at)
+    length := #len(source.bytes)
+    if source.descriptor >= 0 {
+      origin := fs.File{descriptor: source.descriptor, active: true, owned: false}
+      if source.descriptor != checked || !same_values(checked_stamp, source.stamp) {
+        checked = source.descriptor
+        checked_stamp = source.stamp
+        now := fs.file_stamp(&origin)
+        usable = now.ok && same_values(stamp_values(now), source.stamp)
+        current = usable
+      }
+      if usable {
+        // Merge following runs that continue the same file range.
+        next := at + length
+        for next < snapshot.length {
+          following := buffer.snapshot_source_at(snapshot, next)
+          if following.descriptor != source.descriptor || following.offset != source.offset + #cast(u64, next - at) || !same_values(following.stamp, source.stamp) {
+            break
+          }
+          next += #len(following.bytes)
+        }
+        if seed.descriptor == source.descriptor && source.offset == #cast(u64, at) && same_values(seed.stamp, source.stamp) {
+          if !fs.seek(file, next).ok {
+            return false
+          }
+          at = next
+          continue
+        }
+        copied := fs.copy_range(&origin, source.offset, file, next - at)
+        if copied.ok {
+          at = next
+          continue
+        }
+        if copied.transferred > 0 {
+          return false
+        }
+        usable = false
+      }
+      if source.mapped && !current {
+        mapped_changed.* = true
+        return false
+      }
+    }
+    if !fs.write(file, source.bytes).ok {
+      return false
+    }
+    at += length
+  }
+  if !mapped_sources_current(snapshot) {
+    mapped_changed.* = true
+    return false
+  }
+  return true
+}
+// Maps a file read-only and unmaps it; set by the host when it can guard a
+// mapping against truncation. Platform defaults use resilient Darwin mappings
+// and Windows sections; Linux installs its native guard at editor startup.
+struct Mapper { map: fn(isize, u64) *u8, unmap: fn(*u8, u64) }
+mapper: Mapper = Mapper{map: fs.map_file, unmap: fs.unmap_file}
+pub fn set_mapper(map: fn(isize, u64) *u8, unmap: fn(*u8, u64)) {
+  mapper = Mapper{map: map, unmap: unmap}
+}
+// Map a large file instead of reading it: the page cache holds its text, so
+// unchanged parts cost no private memory and open time does not copy it.
+fn read_mapped(path: []const u8) FileText {
   opened := fs.open(path)
   if !opened.ok {
-    arena_owner.release(result.arena)
-    result.arena = nil
     return FileText{}
   }
-  storage := mem.push_bytes_uninit(reserved, buffer.Capacity + 1)
+  stamp := fs.file_stamp(&opened.value)
+  if stamp.ok && stamp.size >= #cast(u64, OriginMinimum) && #cast(usize, stamp.size) < DocumentLimit {
+    bytes := mapper.map(opened.value.descriptor, stamp.size)
+    if bytes != nil {
+      result := FileText{storage: buffer.storage_mapped(bytes, #cast(usize, stamp.size), mapper.unmap)}
+      if result.storage.block != nil {
+        buffer.storage_set_origin(&result.storage, opened.value.descriptor, stamp_values(stamp), close_origin)
+        result.stamp = stamp
+        result.data = result.storage.bytes
+        result.ok = true
+        return result
+      }
+      mapper.unmap(bytes, stamp.size)
+    }
+  }
+  _ = fs.close(&opened.value)
+  return FileText{}
+}
+fn read_bounded(path: []const u8, limit: usize) FileText {
+  if limit > buffer.Capacity && mapper.map != nil {
+    mapped := read_mapped(path)
+    if mapped.ok {
+      return mapped
+    }
+  }
+  room := limit
+  if limit > buffer.Capacity {
+    info := fs.metadata(path)
+    if info.ok && #cast(usize, info.size) < limit - 16777216 {
+      room = #cast(usize, info.size) + 16777216
+    }
+  }
+  // Documents read straight into text storage the buffer adopts; bounded
+  // reads use an owned arena.
+  result := FileText{}
+  storage: []u8 = result.storage.bytes
+  if limit > buffer.Capacity {
+    result.storage = buffer.storage_create(room + 1)
+    if result.storage.block == nil {
+      return FileText{}
+    }
+    storage = result.storage.bytes
+  } else {
+    result.arena = arena_owner.create(room + 1)
+    storage = mem.push_bytes_uninit(result.arena, room + 1)
+  }
+  opened := fs.open(path)
+  if !opened.ok {
+    release_text(&result)
+    return FileText{}
+  }
   total: usize = 0
   failed := false
+  before := fs.file_stamp(&opened.value)
   for {
-    room := #len(storage) - total
-    if room == 0 {
-      // One byte past Capacity proves the file is too large.
+    free := #len(storage) - total
+    if free == 0 {
+      // One byte past the limit proves the file is too large.
       result.too_large = true
       break
     }
-    if room > 1048576 {
-      room = 1048576
+    if free > 1048576 {
+      free = 1048576
     }
-    part := fs.read(&opened.value, storage[total..total + room])
+    part := fs.read(&opened.value, storage[total..total + free])
     if !part.ok {
       failed = true
       break
@@ -139,11 +357,23 @@ pub fn read_text(path: []const u8) FileText {
     }
     total += part.transferred
   }
+  // A large document keeps its file open: while the file's stamp is
+  // unchanged, saving copies untouched ranges from it in-kernel.
+  after := fs.file_stamp(&opened.value)
+  if !failed && !result.too_large && result.storage.block != nil && total >= OriginMinimum && before.ok && after.ok && same_stamp(before, after) && after.size == #cast(u64, total) {
+    buffer.storage_set_origin(&result.storage, opened.value.descriptor, stamp_values(after), close_origin)
+    result.stamp = after
+    result.data = storage[..total]
+    result.ok = true
+    return result
+  }
+  if before.ok && after.ok && same_stamp(before, after) && after.size == #cast(u64, total) {
+    result.stamp = after
+  }
   closed := fs.close(&opened.value)
-  if failed || result.too_large || total > buffer.Capacity || !closed.ok {
-    too_large := result.too_large || total > buffer.Capacity
-    arena_owner.release(result.arena)
-    result.arena = nil
+  if failed || result.too_large || total > room || !closed.ok {
+    too_large := result.too_large || total > room
+    release_text(&result)
     return FileText{too_large: too_large}
   }
   result.data = storage[..total]
@@ -179,7 +409,10 @@ pub fn read_prefix(arena: *mem.Arena, path: []const u8, maximum: usize) []const 
   return storage[..total]
 }
 pub fn release_text(text: *FileText) {
-  arena_owner.release(text.arena)
+  if text.arena != nil {
+    arena_owner.release(text.arena)
+  }
+  buffer.storage_release(&text.storage)
   text.arena = nil
   text.data = text.data[..0]
   text.ok = false
@@ -199,10 +432,10 @@ pub fn open(state: *State, document: *buffer.Document, path: []const u8, scratch
   if !info.ok || (info.mode & 61440) != 32768 {
     return "Cannot open: expected a readable regular file."
   }
-  read := read_text(path)
+  read := read_document(path)
   defer release_text(&read)
   if read.too_large {
-    return "File exceeds the 256 MiB limit."
+    return "File is too large to open."
   }
   if !read.ok {
     return "Read failed."
@@ -213,80 +446,170 @@ pub fn open(state: *State, document: *buffer.Document, path: []const u8, scratch
   if !set_name(&candidate, path) {
     return "Invalid file path."
   }
-  if !buffer.load(document, read.data) {
+  // Very large files appear after their first lines load; the rest follows.
+  if !buffer.load_storage_lazy(document, &read.storage, #len(read.data)) {
     return "File is not valid UTF-8 text, or contains NUL bytes."
   }
+  candidate.stamp = read.stamp
   discard_recovery(state)
   state.* = candidate
   return ""
 }
-fn unchanged(document: *const buffer.Document, path: []const u8, scratch: *mem.Arena) bool {
-  read := read_text(path)
+fn path_stamp(path: []const u8) fs.Stamp {
+  opened := fs.open(path)
+  if !opened.ok {
+    return fs.Stamp{}
+  }
+  stamp := fs.file_stamp(&opened.value)
+  _ = fs.close(&opened.value)
+  return stamp
+}
+fn unchanged(state: *const State, document: *const buffer.Document, path: []const u8, scratch: *mem.Arena) bool {
+  if state.stamp.ok {
+    current := path_stamp(path)
+    if current.ok && same_stamp(current, state.stamp) {
+      return true
+    }
+  }
+  read := read_document(path)
   defer release_text(&read)
   return read.ok && buffer.saved_equal(document, read.data)
 }
-pub fn save(state: *State, document: *buffer.Document, path: []const u8, scratch: *mem.Arena) []const u8 {
+// Saving runs in three steps so a large document can write on a worker:
+// save_start checks the destination and opens the temporary file,
+// save_write writes a snapshot of the text and flushes it (safe from any
+// thread: it only makes system calls), and save_finish checks the original is
+// unchanged, renames into place and marks the snapshot saved.
+pub struct SaveJob {
+  transaction: fs.AtomicFile,
+  same: bool,
+  path: [4096]u8,
+  path_length: usize,
+  temporary: [4096]u8,
+  snapshot: buffer.TextSnapshot,
+  seed: CloneSeed,
+  written, mapped_changed: bool,
+  error: []const u8,
+}
+pub fn save_start(job: *SaveJob, state: *State, document: *const buffer.Document, path: []const u8, scratch: *mem.Arena) bool {
+  job.* = SaveJob{}
+  job.seed.descriptor = -1
+  if buffer.load_state(document) == buffer.LoadRunning {
+    job.error = "This file is still loading; save when it finishes."
+    return false
+  }
+  if buffer.load_state(document) == buffer.LoadFailed {
+    job.error = "Only the start of this file loaded (later text is not valid UTF-8); saving would truncate it."
+    return false
+  }
   if #len(path) == 0 || #len(path) >= 4000 {
-    return "Enter a valid file path."
+    job.error = "Enter a valid file path."
+    return false
   }
   validation := State{}
   if !set_name(&validation, path) {
-    return "Invalid file path."
+    job.error = "Invalid file path."
+    return false
   }
-  same := buffer.equal(path, name(state))
+  job.same = buffer.equal(path, name(state))
   info := metadata(path)
   link_storage: [4096]u8 = []
   if fs.read_link(path, link_storage[..]).ok {
-    return "Refusing to replace a symlink."
+    job.error = "Refusing to replace a symlink."
+    return false
   }
-  if info.ok && (!same || !unchanged(document, path, scratch)) {
-    return "File exists or changed externally. Save As a different path."
+  if info.ok && (!job.same || !unchanged(state, document, path, scratch)) {
+    job.error = "File exists or changed externally. Save As a different path."
+    return false
   }
-  if same && !info.ok {
-    return "Original file disappeared; use Save As."
+  if job.same && !info.ok {
+    job.error = "Original file disappeared; use Save As."
+    return false
   }
   if info.ok && (info.mode & 61440) != 32768 {
-    return "Destination is not a regular file."
+    job.error = "Destination is not a regular file."
+    return false
   }
-  temporary_storage: [4096]u8 = []
-  temporary := suffix(path, ".dna-write", temporary_storage[..])
-  transaction := fs.atomic_begin(path, temporary)
+  job.path_length = #len(path)
+  _ = suffix(path, "", job.path[..])
+  temporary := suffix(path, ".dna-write", job.temporary[..])
+  job.snapshot = buffer.snapshot_take(document)
+  transaction := fs.AtomicResult{}
+  if job.same && fs.WholeFileClones {
+    transaction = save_seed(job.path[..job.path_length], temporary, &job.snapshot, &job.seed)
+  } else {
+    transaction = fs.atomic_begin(job.path[..job.path_length], temporary)
+  }
   if !transaction.ok {
-    return "Cannot create save temporary file; check permissions or a leftover .dna-write file."
+    buffer.snapshot_release(&job.snapshot)
+    job.error = "Cannot create save temporary file; check permissions or a leftover .dna-write file."
+    return false
   }
-  defer {
-    if transaction.transaction.active {
-      _ = fs.atomic_abort(&transaction.transaction)
+  job.transaction = transaction.transaction
+  if info.ok && !fs.preserve_permissions(&job.transaction.file, path).ok {
+    save_abort(job)
+    job.error = "Cannot preserve file permissions."
+    return false
+  }
+  return true
+}
+// Stream the snapshot's storage chunks (no flattened copy) and flush them.
+pub fn save_write(job: *SaveJob) {
+  job.written = write_document(&job.transaction.file, &job.snapshot, &job.seed, &job.mapped_changed) && (job.seed.descriptor < 0 || fs.resize(&job.transaction.file, job.snapshot.length).ok) && fs.sync(&job.transaction.file).ok
+}
+// Drop a started save without touching the destination.
+pub fn save_abort(job: *SaveJob) {
+  if job.transaction.active {
+    _ = fs.atomic_abort(&job.transaction)
+  }
+  buffer.snapshot_release(&job.snapshot)
+}
+// Returns "" on success. The document must be the one the job started from.
+pub fn save_finish(job: *SaveJob, state: *State, document: *buffer.Document, scratch: *mem.Arena) []const u8 {
+  defer save_abort(job)
+  path := job.path[..job.path_length]
+  if !job.written {
+    if job.mapped_changed {
+      return "File changed on disk while open; reload it before saving."
     }
-  }
-  if info.ok && !fs.preserve_permissions(&transaction.transaction.file, path).ok {
-    return "Cannot preserve file permissions."
-  }
-  written := fs.write(&transaction.transaction.file, document.bytes[..document.length])
-  if !written.ok {
     return "Write failed; original file was not replaced."
   }
-  if same {
-    if !unchanged(document, path, scratch) {
+  if !mapped_sources_current(&job.snapshot) {
+    return "File changed on disk while open; reload it before saving."
+  }
+  if job.same {
+    if !unchanged(state, document, path, scratch) {
       return "File changed during save; original was not replaced."
     }
-    if !fs.atomic_commit(&transaction.transaction).ok {
+    if !fs.atomic_commit(&job.transaction).ok {
       return "Atomic save failed."
     }
+    // Replacing the pathname changes the old inode's ctime even though the
+    // mapped bytes are unchanged. Refresh only that origin, after proving
+    // its inode, length and modification time still match the saved source.
+    at: usize = 0
+    checked: isize = -1
+    for at < job.snapshot.length {
+      source := buffer.snapshot_source_at(&job.snapshot, at)
+      if source.descriptor >= 0 && source.descriptor != checked && state.stamp.ok && same_values(source.stamp, stamp_values(state.stamp)) {
+        checked = source.descriptor
+        origin := fs.File{descriptor: source.descriptor, active: true, owned: false}
+        now := fs.file_stamp(&origin)
+        if now.ok && now.inode == state.stamp.inode && now.size == state.stamp.size && now.modify_seconds == state.stamp.modify_seconds && now.modify_nanos == state.stamp.modify_nanos {
+          buffer.snapshot_origin_stamp(&job.snapshot, at, source.descriptor, stamp_values(now))
+        }
+      }
+      at += #len(source.bytes)
+    }
   } else {
-    if !fs.sync(&transaction.transaction.file).ok || !fs.close(&transaction.transaction.file).ok {
+    if !fs.close(&job.transaction.file).ok {
       return "Cannot flush new file."
     }
-    destination_storage: [4096]u8 = []
-    destination := bounded_string(destination_storage[..], path)
-    if !destination.ok {
-      return "Invalid destination."
-    }
     // RENAME_NOREPLACE prevents a racing creator from being overwritten.
-    if !fs.rename_noreplace(temporary, path).ok {
+    if !fs.rename_noreplace(job.transaction.temporary, path).ok {
       return "Cannot create new file without replacing an existing destination."
     }
-    transaction.transaction.active = false
+    job.transaction.active = false
   }
   old_recovery: [4096]u8 = []
   old_path := suffix(name(state), ".dna-recovery", old_recovery[..])
@@ -295,8 +618,17 @@ pub fn save(state: *State, document: *buffer.Document, path: []const u8, scratch
   }
   _ = set_name(state, path)
   state.recovery_owned = false
-  buffer.mark_saved(document)
+  state.stamp = path_stamp(path)
+  buffer.mark_saved_snapshot(document, &job.snapshot)
   return ""
+}
+pub fn save(state: *State, document: *buffer.Document, path: []const u8, scratch: *mem.Arena) []const u8 {
+  job := SaveJob{}
+  if !save_start(&job, state, document, path, scratch) {
+    return job.error
+  }
+  save_write(&job)
+  return save_finish(&job, state, document, scratch)
 }
 pub fn recover(state: *State, document: *buffer.Document, scratch: *mem.Arena) []const u8 {
   if state.length == 0 {

@@ -2,6 +2,7 @@
 """Actual LSP JSON helper regression; no editor/native adapters required."""
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -19,6 +20,8 @@ helpers = source[source.index('// Preflight the complete encoding'):source.index
 fixture = '''use "std/encoding/json"
 use "std/mem"
 use "std/io"
+use "std/thread"
+use "./buffer" buffer
 ''' + helpers + '''
 fn same(a: []const u8, b: []const u8) bool {
   if #len(a) != #len(b) { return false }
@@ -67,6 +70,35 @@ fn aliased(input: []const u8) {
   if #len(lsp_json_encode(output[..64], &value)) != 0 || !same(output[..], saved[..]) { #panic("key alias") }
 }
 fn main() {
+  arena := mem.arena_create(#sizeof(buffer.Document) + 4096)
+  defer mem.arena_release(arena)
+  document := buffer.allocate(arena)
+  defer buffer.release(document)
+  if !buffer.load(document, "a\\\"\\\\\\n\\té😀") { #panic("document fixture") }
+  expected: []const u8 = "\\\"a\\\\\\\"\\\\\\\\\\\\n\\\\té😀\\\""
+  encoded: [128]u8
+  if !same(lsp_json_document(encoded[..#len(expected)], document, 0, document.length), expected) { #panic("document JSON exact fit") }
+  if #len(lsp_json_document(encoded[..#len(expected) - 1], document, 0, document.length)) != 0 { #panic("document JSON short output") }
+  if #len(lsp_json_document(encoded[..0], document, 0, document.length)) != 0 { #panic("document JSON empty output") }
+  // Past LspParallelEscape the encoder splits across threads; slices meet at
+  // arbitrary bytes, so the result must still match the serial encoding.
+  large_arena := mem.arena_create(160000000)
+  defer mem.arena_release(large_arena)
+  large := mem.push_bytes_uninit(large_arena, 20000003)
+  pattern: [10]u8 = [97, 98, 34, 92, 10, 9, 1, 195, 169, 122]
+  for index in 0..#len(large) { large[index] = pattern[index % 10] }
+  large_document := buffer.allocate(large_arena)
+  defer buffer.release(large_document)
+  if !buffer.load(large_document, large) { #panic("large fixture") }
+  parallel := mem.push_bytes_uninit(large_arena, #len(large) * 6 + 2)
+  serial := mem.push_bytes_uninit(large_arena, #len(large) * 6 + 2)
+  whole := lsp_json_document(parallel, large_document, 0, large_document.length)
+  serial_used: usize = 1
+  serial[0] = '"'
+  serial_used += lsp_escape(&serial[1], large)
+  serial[serial_used] = '"'
+  if #len(whole) == 0 || !same(whole, serial[..serial_used + 1]) { #panic("parallel document JSON") }
+  if #len(lsp_json_document(parallel[..#len(whole) - 1], large_document, 0, large_document.length)) != 0 { #panic("parallel short output") }
 '''
 strings = ['', 'plain', 'a"b\\c\n\r\t\b\f', ''.join(chr(i) for i in range(32)), 'é😀']
 for index, value in enumerate(strings):
@@ -104,6 +136,8 @@ fixture += '''  output: [16]u8
 '''
 with tempfile.TemporaryDirectory(prefix='dna-json-scratch-') as directory:
     stage = Path(directory)
+    shutil.copytree(ROOT / 'src/buffer', stage / 'buffer')
+    shutil.copytree(ROOT / 'src/owned_arena', stage / 'owned_arena')
     (stage / 'main.dyn').write_text(fixture)
     for mode in ('debug', 'release'):
         executable = stage / mode

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the Linux native GUI without SDL."""
+"""Build the Linux or macOS native GUI without SDL."""
 import argparse
 import ctypes
 import os
@@ -14,7 +14,7 @@ def run(command,**kwargs):
     subprocess.run([str(part) for part in command],check=True,**kwargs)
 def build():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--backend',choices=('auto','x11','wayland'),default='auto')
+    parser.add_argument('--backend',choices=('auto','x11','wayland','native'),default='auto')
     parser.add_argument('--release',action='store_true')
     parser.add_argument('--mode',choices=('debug','release'))
     parser.add_argument('--output',type=Path,help='Also publish the verified binary at this path')
@@ -22,9 +22,15 @@ def build():
     parser.add_argument('--no-cache',action='store_true')
     parser.add_argument('--source',type=Path,default=ROOT/'src',help='Native source tree, including a staged module profile')
     args=parser.parse_args()
+    if sys.platform=='darwin':
+        from native_macos import build as build_macos
+        build_macos(args)
+        return
+    if args.backend=='native':
+        raise SystemExit('The native backend selects Cocoa on macOS; Linux uses x11 or wayland.')
     if args.backend=='auto':
         args.backend='wayland' if os.environ.get('WAYLAND_DISPLAY') else 'x11'
-    if not sys.platform.startswith('linux'): raise SystemExit('Native GUI currently targets Linux.')
+    if not sys.platform.startswith('linux'): raise SystemExit('Full native GUI builds currently support Linux and macOS; Windows services remain unfinished.')
     # Fail before replacing build outputs
     # when the native text backend cannot load its runtime providers.
     for library in ('libharfbuzz.so.0', 'libfribidi.so.0', 'libfreetype.so.6'):
@@ -70,7 +76,7 @@ def build():
     shutil.copytree(args.source.resolve(),stage)
     shutil.copyfile(ROOT/f'modules/native/platform_{args.backend}.dyn',stage/'platform/backend/backend.dyn')
     if args.backend=='x11':
-        for source in [stage/'platform/gui.dyn',*(stage/'platform/native_present').rglob('*.dyn')]:
+        for source in (stage/'platform').rglob('*.dyn'):
             source.write_text(source.read_text().replace('"vendor/window/wayland"','"vendor/window"'))
     if args.smoke: shutil.copytree(ROOT/'tests/editor',stage,dirs_exist_ok=True)
     for source in stage.rglob('*.dyn'):

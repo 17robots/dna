@@ -1,0 +1,190 @@
+use "std/sync"
+use "std/io"
+extern fn string_length "strlen"(text:*const u8)usize
+extern fn copy "memcpy"(out:*u8, source:*const u8, count:usize)rawptr
+mock_error:i32
+next_fd:i32=0
+mock_lifted:i32=50
+closed:i32
+kills:i32
+waits:i32
+suppressed:bool
+spawned:bool
+exit_result:i32=0
+fn rec_errno()*i32 {
+  return &mock_error
+}
+fn rec_close(fd:i32)i32 {
+  if fd<0 {
+    #panic("closed invalid fd")
+  }
+  closed+=1
+  return 0
+}
+fn rec_write(fd:i32, bytes:*const u8, length:usize)isize {
+  _=fd
+  _=bytes
+  _=length
+  return -1
+}
+fn dna_ticks()u64 {
+  return 0
+}
+fn dna_watch(fd:i32, writing:i32) {
+  _=fd
+  _=writing
+}
+fn dna_unwatch(fd:i32) {
+  _=fd
+}
+fn fake_fcntl(fd:i32, operation:i32, value:i32)i32 {
+  if operation==67 {
+    duplicate:=mock_lifted
+    mock_lifted+=1
+    return duplicate
+  }
+  if operation==73 {
+    if fd!=51 || value!=1 {
+      #panic("bad SIGPIPE suppression")
+    }
+    suppressed=true
+    return 0
+  }
+  if operation==4 && value!=4 {
+    #panic("bad nonblocking flag")
+  }
+  return 0
+}
+fn fake_pipe(fds:*i32)i32 {
+  fds[..2][0]=next_fd
+  fds[..2][1]=next_fd+1
+  next_fd+=2
+  return 0
+}
+fn fake_actions_init(p:*rawptr)i32 {
+  p.*=#cast(rawptr, 123)
+  return 0
+}
+fn fake_attributes_init(p:*rawptr)i32 {
+  p.*=#cast(rawptr, 456)
+  return 0
+}
+fn fake_actions_destroy(p:*rawptr)i32 {
+  if #cast(usize, p.*)!=123 {
+    #panic("actions pointer ABI")
+  }
+  return 0
+}
+fn fake_attributes_destroy(p:*rawptr)i32 {
+  if #cast(usize, p.*)!=456 {
+    #panic("attributes pointer ABI")
+  }
+  return 0
+}
+fn fake_dup(p:*rawptr, fd:i32, target:i32)i32 {
+  _=fd
+  _=target
+  return fake_actions_destroy(p)
+}
+fn fake_chdir(p:*rawptr, path:*const u8)i32 {
+  if path.*!=47 {
+    #panic("cwd")
+  }
+  return fake_actions_destroy(p)
+}
+fn fake_flags(p:*rawptr, flags:i16)i32 {
+  if flags!=16386 {
+    #panic("spawn must close unrelated FDs and own group")
+  }
+  return fake_attributes_destroy(p)
+}
+fn fake_group(p:*rawptr, group:i32)i32 {
+  if group!=0 {
+    #panic("new group")
+  }
+  return fake_attributes_destroy(p)
+}
+env:rawptr
+fn fake_environment()*rawptr {
+  return &env
+}
+fn fake_spawn(pid:*i32, path:*const u8, actions:*const rawptr, attributes:*const rawptr, args:rawptr, environment:rawptr)i32 {
+  _=environment
+  if path.*!=47 || #cast(usize, actions.*)!=123 || #cast(usize, attributes.*)!=456 || #cast(**const u8, args).*.*!=47 {
+    #panic("spawn ABI")
+  }
+  pid.*=1234
+  spawned=true
+  return 0
+}
+fn fake_kill(pid:i32, signal:i32)i32 {
+  if signal!=9 || (kills==0 && pid != -1234) || (kills==1 && pid!=1234) {
+    #panic("process group ownership")
+  }
+  kills+=1
+  return 0
+}
+fn fake_wait(pid:i32, status:*i32, flags:i32)i32 {
+  _=status
+  if pid!=1234 || flags!=0 || kills!=2 {
+    #panic("reap before tree kill")
+  }
+  waits+=1
+  return pid
+}
+fn fake_wait_info(kind:i32, pid:u32, info:*DarwinChildInfo, flags:i32)i32 {
+  if kind!=1 || pid!=1234 || flags!=37 || #sizeof(DarwinChildInfo)!=104 {
+    #panic("Darwin waitid ABI")
+  }
+  if exit_result!=0 {
+    info.pid=1234
+    info.code=1
+    info.status=exit_result-1
+  }
+  return 0
+}
+fn fake_read(fd:i32, bytes:*u8, length:usize)isize {
+  _=fd
+  _=bytes
+  _=length
+  mock_error=35
+  return -1
+}
+fn main() {
+  proc_api=DarwinProcessAPI{pipe:fake_pipe, close:rec_close, actions_init:fake_actions_init, actions_destroy:fake_actions_destroy, attributes_init:fake_attributes_init, attributes_destroy:fake_attributes_destroy, dup_action:fake_dup, chdir_action:fake_chdir, flags:fake_flags, group:fake_group, spawn:fake_spawn, environment:fake_environment, kill:fake_kill, wait:fake_wait, wait_info:fake_wait_info, read:fake_read}
+  _=sync.once_begin(&proc_api_once)
+  sync.once_complete(&proc_api_once)
+  command:[]const u8="printf hello\0"
+  directory:[]const u8="/tmp\0"
+  child:=proc_open(&command[0], &directory[0], true)
+  if !spawned || !suppressed || child.pid!=1234 {
+    #panic("spawn setup")
+  }
+  bytes:[1]u8=[]
+  if proc_read(child.output, &bytes[0], 1)!= -11 {
+    #panic("read retry translation")
+  }
+  if proc_write(child.input, &bytes[0], 1)!= -11 {
+    #panic("write retry translation")
+  }
+  mock_error=32
+  if proc_write(child.input, &bytes[0], 1)!= -32 {
+    #panic("EPIPE translation")
+  }
+  if proc_peek(&child)!=0 {
+    #panic("running child")
+  }
+  exit_result=1
+  if proc_peek(&child)!=1 || waits!=0 {
+    #panic("successful exit must remain waitable")
+  }
+  exit_result=2
+  if proc_peek(&child)!=2 || waits!=0 {
+    #panic("failed exit must remain waitable")
+  }
+  proc_close(&child)
+  if child.pid!=0 || child.input!= -1 || kills!=2 || waits!=1 || closed!=9 {
+    #panic("transfer/cleanup")
+  }
+  _=io.println(io.stdout(), "PASS Darwin process mock: pointer spawn ABI, flags, stdio lift, SIGPIPE suppression setup, retry translation, unreaped child/group cleanup")
+}

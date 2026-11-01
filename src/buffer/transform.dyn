@@ -22,14 +22,38 @@ fn position_offset(document: *const Document, position: TextPosition) usize {
   return boundary(document, point)
 }
 pub fn transform(document: *Document, text: []const u8) bool {
-  begin_change(document)
-  defer end_change(document)
   if #len(text) > Capacity || !valid(text) {
     return false
   }
-  if equal(document.bytes[..document.length], text) {
+  if equal(all(document), text) {
     return true
   }
+  transform_root(document, rope_replace(rope_retain(document.root), 0, document.length, text))
+  return true
+}
+// transform with text already in storage (see load_storage): on success the
+// document owns it; on failure (not UTF-8) nothing changes.
+pub fn transform_storage(document: *Document, storage: *TextStorage, length: usize) bool {
+  if storage.block == nil {
+    return false
+  }
+  loaded := rope_load_block(storage.block, length)
+  if !loaded.ok {
+    return false
+  }
+  storage_release(storage)
+  if rope_length(loaded.root) == document.length && rope_equal(loaded.root, 0, document.root, 0, document.length) {
+    rope_release(loaded.root)
+    return true
+  }
+  transform_root(document, loaded.root)
+  return true
+}
+// Replace the whole text with root (owned) as one undoable edit, keeping
+// cursors, selections and marks at the same row and column.
+fn transform_root(document: *Document, root: *RopeNode) {
+  begin_change(document)
+  defer end_change(document)
   positions: [64 + MarkCount]TextPosition = []
   positions[0] = text_position(document, document.cursor)
   positions[1] = text_position(document, document.anchor)
@@ -44,9 +68,7 @@ pub fn transform(document: *Document, text: []const u8) bool {
   checkpoint(document)
   document.anchor = 0
   document.cursor = document.length
-  if !replace(document, text) {
-    #panic("validated document transformation")
-  }
+  replace_built(document, root, rope_length(root))
   document.cursor = position_offset(document, positions[0])
   document.anchor = position_offset(document, positions[1])
   for index in 0..count {
@@ -58,5 +80,4 @@ pub fn transform(document: *Document, text: []const u8) bool {
   }
   checkpoint(document)
   document.history[document.history_at].line_positions = true
-  return true
 }

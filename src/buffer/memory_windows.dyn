@@ -1,0 +1,43 @@
+#target(kernel: windows)
+use "std/dynlib" bulk_library
+use "std/sync" bulk_sync
+
+// Resolve the CRT routines through its own module. Calling function pointers
+// prevents LLVM from folding bulk transfers into the SDK's byte-loop helpers.
+struct BulkMemory {
+  copy, move: fn(*u8, *const u8, usize) rawptr,
+  fill: fn(*u8, i32, usize) rawptr,
+}
+bulk_memory: BulkMemory
+bulk_ready: bulk_sync.Once
+fn bulk_initialize() {
+  if bulk_sync.once_begin(&bulk_ready) {
+    library := bulk_library.open("ucrtbase.dll", bulk_library.Now)
+    if !library.ok {
+      #panic("cannot load Windows CRT memory routines")
+    }
+    copied := bulk_library.symbol(library.value, "memcpy")
+    moved := bulk_library.symbol(library.value, "memmove")
+    filled := bulk_library.symbol(library.value, "memset")
+    if !copied.ok || !moved.ok || !filled.ok {
+      #panic("missing Windows CRT memory routines")
+    }
+    // The library reference intentionally lives as long as these pointers.
+    bulk_memory.copy = #cast(fn(*u8, *const u8, usize) rawptr, copied.value)
+    bulk_memory.move = #cast(fn(*u8, *const u8, usize) rawptr, moved.value)
+    bulk_memory.fill = #cast(fn(*u8, i32, usize) rawptr, filled.value)
+    bulk_sync.once_complete(&bulk_ready)
+  }
+}
+pub fn copy_bytes(destination:*u8, source:*const u8, length:usize) rawptr {
+  bulk_initialize()
+  return bulk_memory.copy(destination, source, length)
+}
+pub fn move_bytes(destination:*u8, source:*const u8, length:usize) rawptr {
+  bulk_initialize()
+  return bulk_memory.move(destination, source, length)
+}
+pub fn fill_bytes(destination:*u8, value:i32, length:usize) rawptr {
+  bulk_initialize()
+  return bulk_memory.fill(destination, value, length)
+}

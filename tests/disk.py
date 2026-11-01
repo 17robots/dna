@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 import ctypes as c, tempfile, time
 from pathlib import Path
-root=Path(__file__).resolve().parents[1];lib=c.CDLL(str(root/'build/deps/install/lib/libdna_native.so'))
+import sys
+root=Path(__file__).resolve().parents[1];lib=c.CDLL(str(root/('build/deps/install/lib/libdna_native.dylib' if sys.platform == 'darwin' else 'build/deps/install/lib/libdna_native.so')))
 lib.dna_disk_open.restype=c.c_void_p
 lib.dna_disk_watch.argtypes=[c.c_void_p,c.c_uint,c.c_uint64,c.c_char_p,c.c_void_p,c.c_size_t]
 lib.dna_disk_pending.argtypes=[c.c_void_p,c.c_uint,c.c_uint64];lib.dna_disk_pending.restype=c.c_long
@@ -37,9 +38,26 @@ with tempfile.TemporaryDirectory() as d:
         lib.dna_disk_watch(p,0,3,str(nested).encode(),b'original',8);take(5,identity=3)
         parent.rename(Path(d)/'old-parent');take(2,identity=3)
         parent.mkdir();nested.write_bytes(b'recreated');take(1,b'recreated',identity=3)
+        # A stamped watch hashes the file on the watcher thread while its stamp
+        # matches, adopts that baseline, and reports a later change.
+        lib.dna_disk_watch_stamped.argtypes=[c.c_void_p,c.c_size_t,c.c_uint64,c.c_char_p,c.c_void_p,c.c_size_t]
+        lib.dna_disk_watch_stamped.restype=c.c_int
+        def stamp(target):
+            info=target.stat()
+            return (c.c_uint64*6)(info.st_ino,info.st_size,info.st_mtime_ns//10**9,info.st_mtime_ns%10**9,info.st_ctime_ns//10**9,info.st_ctime_ns%10**9)
+        stamped=Path(d)/'stamped';stamped.write_bytes(b'saved text')
+        assert lib.dna_disk_watch_stamped(p,0,4,str(stamped).encode(),stamp(stamped),10)==1;take(5,identity=4)
+        time.sleep(.2);assert lib.dna_disk_pending(p,0,4)==0
+        with stamped.open('wb') as writer:
+            writer.write(b'other text');writer.flush();take(1,b'other text',identity=4)
+        # Back to the adopted baseline: unchanged again.
+        stamped.write_bytes(b'saved text');take(5,identity=4)
+        # A stamp the file no longer carries cannot vouch for it.
+        stale=stamp(stamped);stale[2]-=1
+        assert lib.dna_disk_watch_stamped(p,0,5,str(stamped).encode(),stale,10)==1;take(1,b'saved text',identity=5)
 
     finally:lib.dna_disk_close(p)
-print('PASS background file changes, atomic replacement, deletion, symlink refusal, slot reuse')
+print('PASS background file changes, atomic replacement, deletion, symlink refusal, slot reuse, stamped baselines')
 
 lib.dna_path_watch_open.argtypes=[c.c_char_p];lib.dna_path_watch_open.restype=c.c_void_p
 lib.dna_path_watch_poll.argtypes=[c.c_void_p]

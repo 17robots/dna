@@ -117,12 +117,15 @@ fn selection_regions(doc:*const buffer.Document, text:*const LineLayout, viewpor
     if after<doc.length {
       after+=1
     }
-    if low<after && high>at {
-      beginning:=at
+    // Clip selections to the same slice that was shaped for this row.
+    origin:=line_draw_start(doc, at, ending)
+    shaped:=line_draw_end(doc, origin, ending)
+    if low<after && high>origin && (low<shaped || shaped==ending) {
+      beginning:=origin
       if low>beginning {
         beginning=low
       }
-      finish:=ending
+      finish:=shaped
       if high<finish {
         finish=high
       }
@@ -132,25 +135,25 @@ fn selection_regions(doc:*const buffer.Document, text:*const LineLayout, viewpor
       }
       handle:=text.lines[text.rows[logical_row-text.first_row]].text
       bands:=SelectionBands{emit:emit, data:data, x:x-scroll_x, y:y+viewport.y+#cast(f32, row)*typography.line-scroll_y, height:typography.line}
-      if !ttf.selection(handle, beginning-at, finish-at, selection_cell, #cast(rawptr, &bands)) {
+      if !ttf.selection(handle, beginning-origin, finish-origin, selection_cell, #cast(rawptr, &bands)) {
         return false
       }
-      if high>ending && after>ending {
+      if high>ending && after>ending && shaped==ending {
         tail:=ttf.Substring{}
-        if !ttf.substring(handle, #cast(i32, ending-at), &tail) {
+        if !ttf.substring(handle, #cast(i32, ending-origin), &tail) {
           return false
         }
         extent:=SelectionExtent{y:tail.y}
-        if beginning==at && finish==ending {
+        if beginning==origin && finish==ending {
           if bands.has_extent && bands.extent_y==tail.y {
             extent.value=bands.extent
           }
-        } else if !ttf.selection(handle, 0, ending-at, selection_extent, #cast(rawptr, &extent)) {
+        } else if !ttf.selection(handle, 0, ending-origin, selection_extent, #cast(rawptr, &extent)) {
           return false
         }
         left:=x+extent.value-scroll_x
         edge:=right
-        if high==low+1 && doc.bytes[low]==10 {
+        if high==low+1 && buffer.byte_at(doc, low)==10 {
           edge=left+typography.cell
         }
         if !selection_band_add(&bands, sdl.Rect{x:left, y:bands.y+#cast(f32, tail.y), width:edge-left, height:typography.line}) {

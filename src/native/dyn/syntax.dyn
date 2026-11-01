@@ -19,6 +19,7 @@ struct SyntaxWorker {
   thread, mutex, wake: rawptr, stopping, pending, ready, retry: bool, indent: u32,
   text: []u8, length: u32, revision, finished: u64,
   change: SyntaxChange, has_change: bool,
+  stream: SyntaxStream, stream_pending: bool,
   colors: []u8, cancel: sync.AtomicU32, small_revisions: u32,
 }
 struct SyntaxInput { text: []u8, length: u32, revision: u64 }
@@ -38,6 +39,7 @@ extern fn syntax_query_new "ts_query_new"(language: rawptr, source: *const u8, l
 extern fn syntax_query_delete "ts_query_delete"(query: rawptr)
 extern fn syntax_cursor_new "ts_query_cursor_new"() rawptr
 extern fn syntax_cursor_delete "ts_query_cursor_delete"(cursor: rawptr)
+extern fn syntax_cursor_range "ts_query_cursor_set_byte_range"(cursor: rawptr, start: u32, end: u32)
 extern fn syntax_cursor_limit "ts_query_cursor_set_match_limit"(cursor: rawptr, limit: u32)
 extern fn syntax_cursor_exceeded "ts_query_cursor_did_exceed_match_limit"(cursor: rawptr) bool
 extern fn syntax_cursor_exec "ts_query_cursor_exec_with_options"(cursor: rawptr, query: rawptr, node: TsNode, options: *const SyntaxQueryOptions)
@@ -56,8 +58,6 @@ fn syntax_trylock(lock: rawptr) i32 {
   return 16
 }
 extern fn syntax_fill "memset"(output: *u8, byte: i32, length: usize) rawptr
-extern fn syntax_dlopen "dlopen"(path: *const u8, flags: i32) rawptr
-extern fn syntax_dlclose "dlclose"(library: rawptr) i32
 extern fn syntax_dladdr "dladdr"(address: rawptr, info: *SyntaxLibraryInfo) i32
 extern fn syntax_realpath "realpath"(path: *const u8, output: *u8) *u8
 extern fn syntax_access "access"(path: *const u8, mode: i32) i32
@@ -210,6 +210,7 @@ fn syntax_worker(context: rawptr) i32 {
   scratch_empty: [0]u8 = []
   scratch_colors: []u8 = scratch_empty[..]
   retained: rawptr = nil
+  stream_cache := SyntaxStreamCache{}
   if input == nil || previous == nil {
     dna_memory_free(#cast(rawptr, input))
     dna_memory_free(#cast(rawptr, previous))
@@ -221,9 +222,25 @@ fn syntax_worker(context: rawptr) i32 {
       rec_wait(worker.wake, worker.mutex)
     }
     if worker.stopping {
+      syntax_stream_drop(worker)
       rec_unlock(worker.mutex)
       break
     }
+    if worker.stream_pending {
+      request := worker.stream
+      worker.stream_pending = false
+      worker.pending = false
+      sync.store_u32(&worker.cancel, 0)
+      rec_unlock(worker.mutex)
+      syntax_tree_delete(retained)
+      retained = nil
+      syntax_stream_run(worker, &request, &stream_cache)
+      request.done(request.context)
+      rec_notify()
+      continue
+    }
+    syntax_tree_delete(stream_cache.tree)
+    stream_cache = SyntaxStreamCache{}
     if !syntax_reserve(&input.text, #cast(usize, worker.length)) || !syntax_reserve(&previous.text, #cast(usize, worker.length)) || !syntax_reserve(&scratch_colors, #cast(usize, worker.length)) {
       worker.pending = false
       // The UI resubmits unfinished revisions; transient OOM must not suppress
@@ -405,6 +422,7 @@ fn syntax_worker(context: rawptr) i32 {
     rec_unlock(worker.mutex)
   }
   syntax_tree_delete(retained)
+  syntax_tree_delete(stream_cache.tree)
   syntax_buffer_free(previous.text)
   syntax_buffer_free(input.text)
   syntax_buffer_free(scratch_colors)
@@ -665,6 +683,7 @@ pub fn dna_syntax_update_changed(worker: *SyntaxWorker, text: *const u8, length:
       rec_unlock(worker.mutex)
       return
     }
+    syntax_stream_drop(worker)
     _ = copy(&worker.text[0], text, #cast(usize, length))
     worker.has_change = change != nil
     if change != nil {
@@ -678,6 +697,41 @@ pub fn dna_syntax_update_changed(worker: *SyntaxWorker, text: *const u8, length:
     sync.store_u32(&worker.cancel, 1)
     rec_signal(worker.wake)
   }
+  rec_unlock(worker.mutex)
+}
+// Two-step update for callers whose text is not contiguous: begin reserves
+// and returns the worker's text buffer with its lock held (nil when no update
+// is needed, lock released); the caller fills length bytes, then commit
+// publishes the revision and releases the lock.
+pub fn dna_syntax_update_begin(worker: *SyntaxWorker, length: u32, revision: u64) *u8 {
+  if length >= 16777216 {
+    return nil
+  }
+  rec_lock(worker.mutex)
+  if worker.revision != revision || worker.retry || (!worker.ready && !worker.pending && worker.revision == 0) {
+    if #cast(usize, length) + 1 > #len(worker.text) / 4 {
+      worker.small_revisions = 0
+    }
+    if syntax_reserve(&worker.text, #cast(usize, length)) && syntax_reserve(&worker.colors, #cast(usize, length)) {
+      return &worker.text[0]
+    }
+  }
+  rec_unlock(worker.mutex)
+  return nil
+}
+pub fn dna_syntax_update_commit(worker: *SyntaxWorker, length: u32, revision: u64, change: *const SyntaxChange) {
+  syntax_stream_drop(worker)
+  worker.has_change = change != nil
+  if change != nil {
+    worker.change = change.*
+  }
+  worker.length = length
+  worker.revision = revision
+  worker.pending = true
+  worker.retry = false
+  worker.ready = false
+  sync.store_u32(&worker.cancel, 1)
+  rec_signal(worker.wake)
   rec_unlock(worker.mutex)
 }
 pub fn dna_syntax_colors(worker: *SyntaxWorker, output: *u8, length: u32, revision: u64) i32 {
@@ -700,6 +754,7 @@ pub fn dna_syntax_close(worker: *SyntaxWorker) {
   }
   rec_lock(worker.mutex)
   worker.stopping = true
+  syntax_stream_drop(worker)
   sync.store_u32(&worker.cancel, 1)
   rec_signal(worker.wake)
   rec_unlock(worker.mutex)
