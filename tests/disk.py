@@ -65,15 +65,32 @@ lib.dna_path_watch_close.argtypes=[c.c_void_p]
 with tempfile.TemporaryDirectory() as directory:
     parent=Path(directory)/'config';parent.mkdir();path=parent/'settings'
     watcher=lib.dna_path_watch_open(str(path).encode())
-    # Forced inotify failure is separately checked by disk_idle.py.
+    # Forced inotify failure is separately checked by disk_idle.py. Native
+    # backends may relay events through a worker before the pipe is readable.
     if watcher:
         try:
+            def await_watch(expected):
+                deadline=time.monotonic()+3
+                while time.monotonic()<deadline:
+                    observed=lib.dna_path_watch_poll(watcher)
+                    if observed==expected:return
+                    assert observed==0, (expected,observed)
+                    time.sleep(.005)
+                raise AssertionError(('config watch event deadline',expected))
             assert lib.dna_path_watch_poll(watcher)==0
             path.write_text('font_size = 18')
-            assert lib.dna_path_watch_poll(watcher)==1
-            assert lib.dna_path_watch_poll(watcher)==0
+            await_watch(1)
+            # Drain coalesced asynchronous batches, then require a quiet window.
+            deadline=time.monotonic()+3
+            quiet_since=time.monotonic()
+            while time.monotonic()-quiet_since<.05:
+                assert time.monotonic()<deadline, 'config watch repeatedly notifies unchanged data'
+                observed=lib.dna_path_watch_poll(watcher)
+                assert observed in (0,1), observed
+                if observed:quiet_since=time.monotonic()
+                time.sleep(.005)
             parent.rename(Path(directory)/'moved')
-            assert lib.dna_path_watch_poll(watcher)==-1
+            await_watch(-1)
         finally:lib.dna_path_watch_close(watcher)
         parent.mkdir();watcher=lib.dna_path_watch_open(str(path).encode());assert watcher
         lib.dna_path_watch_close(watcher)
