@@ -34,7 +34,7 @@ struct InstallWinAPI {
   open: fn(*rawptr, u32, *InstallWinAttributes, *InstallWinStatus, *i64, u32, u32, u32, u32, rawptr, u32) i32,
   status_error: fn(i32) u32,
   information: fn(rawptr, u32, rawptr, u32) i32,
-  set: fn(rawptr, u32, rawptr, u32) i32,
+  rename: fn(rawptr, *InstallWinStatus, rawptr, u32, u32) i32,
   duplicate: fn(rawptr, rawptr, rawptr, *rawptr, u32, i32, u32) i32,
   process: fn() rawptr,
   remove_directory: fn(*const u16) i32,
@@ -52,7 +52,7 @@ fn install_win_prepare() {
     install_win_api.open = #cast(fn(*rawptr, u32, *InstallWinAttributes, *InstallWinStatus, *i64, u32, u32, u32, u32, rawptr, u32) i32, win_io_symbol(native.value, "NtCreateFile"))
     install_win_api.status_error = #cast(fn(i32) u32, win_io_symbol(native.value, "RtlNtStatusToDosError"))
     install_win_api.information = #cast(fn(rawptr, u32, rawptr, u32) i32, win_io_symbol(kernel.value, "GetFileInformationByHandleEx"))
-    install_win_api.set = #cast(fn(rawptr, u32, rawptr, u32) i32, win_io_symbol(kernel.value, "SetFileInformationByHandle"))
+    install_win_api.rename = #cast(fn(rawptr, *InstallWinStatus, rawptr, u32, u32) i32, win_io_symbol(native.value, "NtSetInformationFile"))
     install_win_api.duplicate = #cast(fn(rawptr, rawptr, rawptr, *rawptr, u32, i32, u32) i32, win_io_symbol(kernel.value, "DuplicateHandle"))
     install_win_api.process = #cast(fn() rawptr, win_io_symbol(kernel.value, "GetCurrentProcess"))
     install_win_api.remove_directory = #cast(fn(*const u16) i32, win_io_symbol(kernel.value, "RemoveDirectoryW"))
@@ -440,8 +440,13 @@ fn install_rename(source_fd: i32, source: *const u8, target_fd: i32, target: *co
     units += 1
   }
   rename.length = #cast(u32, units * 2)
-  if install_win_api.set(handle, 3, #cast(rawptr, &rename), #cast(u32, #sizeof(InstallWinRename))) == 0 {
-    return win_io_fail(win_io_api.error())
+  // Pass the retained root directly to the native rename operation. The
+  // Win32 wrapper also translates DOS paths, which is not this relative ABI.
+  status := InstallWinStatus{}
+  bytes := #cast(usize, &rename.name[0]) - #cast(usize, &rename) + #cast(usize, rename.length)
+  result := install_win_api.rename(handle, &status, #cast(rawptr, &rename), #cast(u32, bytes), 10)
+  if result < 0 {
+    return win_io_fail(install_win_api.status_error(result))
   }
   return 0
 }

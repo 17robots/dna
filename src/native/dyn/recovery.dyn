@@ -63,8 +63,9 @@ pub fn dna_make_directories(path: *const u8) i32 {
   }
   storage: [4096]u8 = []
   _ = copy(&storage[0], path, length + 1)
+  root := rec_path_root(path, length)
   for index in 1..=length {
-    if storage[index] == 47 || storage[index] == 0 {
+    if index >= root && (rec_path_separator(storage[index]) || storage[index] == 0) {
       end := storage[index]
       storage[index] = 0
       if rec_mkdir(&storage[0], 448) != 0 && rec_errno().* != 17 {
@@ -122,12 +123,12 @@ fn rec_snapshot(path: *const u8, bytes: *const u8, length: usize) bool {
   parent: [4096]u8 = []
   _ = copy(&parent[0], path, size + 1)
   slash := size
-  for slash > 0 && parent[slash - 1] != 47 {
+  for slash > 0 && !rec_path_separator(parent[slash - 1]) {
     slash -= 1
   }
   if slash > 0 {
-    if slash == 1 {
-      parent[1] = 0
+    if slash <= rec_path_root(path, size) {
+      parent[slash] = 0
     } else {
       parent[slash - 1] = 0
     }
@@ -135,7 +136,7 @@ fn rec_snapshot(path: *const u8, bytes: *const u8, length: usize) bool {
     if directory < 0 {
       return false
     }
-    ok = rec_sync(directory) == 0
+    ok = rec_sync_parent(directory)
     _ = rec_close(directory)
   }
   return ok
@@ -201,7 +202,7 @@ fn rec_worker(context: rawptr) i32 {
   return 0
 }
 pub fn dna_recovery_open(directory: *const u8) *RecoveryWorker {
-  if directory == nil || directory.* != 47 {
+  if directory == nil || !rec_absolute(directory) {
     return nil
   }
   size := string_length(directory)

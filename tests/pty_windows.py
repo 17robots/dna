@@ -55,6 +55,7 @@ pub fn test_poll(pointer:rawptr) i32 {
   if terminal_exit_native(terminal) { terminal.exited=1 }
   return terminal.exited
 }
+pub fn test_status(pointer:rawptr) i32 { return (#cast(*Terminal,pointer)).status }
 pub fn test_needs_poll(pointer:rawptr) i32 {
   if terminal_needs_exit_poll(#cast(*Terminal,pointer)) { return 1 }
   return 0
@@ -79,12 +80,13 @@ def native_tests(binary, work, mode):
     lib.test_write.argtypes = [c.c_void_p, c.c_void_p, c.c_size_t]
     lib.test_write.restype = c.c_ssize_t
     lib.test_resize.argtypes = [c.c_void_p, c.c_uint16, c.c_uint16]
-    for name in ('test_close', 'test_poll', 'test_needs_poll'):
+    for name in ('test_close', 'test_poll', 'test_needs_poll', 'test_status'):
         getattr(lib, name).argtypes = [c.c_void_p]
     cwd = work / ('PTY café 日本語-' + mode)
     cwd.mkdir()
     helper = cwd / 'console.py'
     helper.write_text('''import os, subprocess, sys, time
+assert all(os.isatty(fd) for fd in (0,1,2)), 'ConPTY must supply console stdio'
 print('READY',flush=True)
 for line in sys.stdin:
     request=line.strip()
@@ -122,7 +124,7 @@ for line in sys.stdin:
             elif got < 0:
                 assert got in (-11, -4), ('ConPTY read', got, bytes(output[-1000:]))
             time.sleep(.001)
-        raise AssertionError(('ConPTY output deadline', pattern, bytes(output[-2000:])))
+        raise AssertionError(('ConPTY output deadline', pattern, {'exited': lib.test_poll(terminal), 'status': lib.test_status(terminal)}, bytes(output[-2000:])))
     def write(terminal, data):
         sent = 0
         deadline = time.monotonic() + 5
@@ -249,7 +251,12 @@ def main():
                     command += ['--target', target, '--emit-object', '--no-link']
                 subprocess.run(command, check=True, env=environment, timeout=120)
                 if target == 'native':
-                    subprocess.run([sys.executable, str(Path(__file__).resolve()), "--native-library", str(binary), str(work), mode], check=True, env=environment, timeout=60)
+                    # Redirect all harness stdio: without STARTF_USESTDHANDLES,
+                    # Windows duplicates these parent pipes into a ConPTY child.
+                    result = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--native-library", str(binary), str(work), mode], stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", env=environment, timeout=60)
+                    print(result.stdout, end="", flush=True)
+                    print(result.stderr, end="", file=sys.stderr, flush=True)
+                    result.check_returncode()
                 else:
                     print(f'PASS ConPTY production objects: {target} {mode}', flush=True)
     if os.name != 'nt':

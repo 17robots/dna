@@ -335,3 +335,85 @@ fn syntax_dlclose(library: rawptr) i32 {
   }
   return -1
 }
+
+fn rec_path_separator(byte: u8) bool {
+  return byte == 47 || byte == 92
+}
+fn win_io_drive_letter(byte: u8) bool {
+  return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+}
+fn win_io_unc_root(path: *const u8, length: usize, first: usize) usize {
+  text := path[..length]
+  server := first
+  at := first
+  for at < length && !rec_path_separator(text[at]) {
+    if text[at] == 58 || text[at] == 42 || text[at] == 63 {
+      return 0
+    }
+    at += 1
+  }
+  if at == server || at == length || (at - server == 1 && text[server] == 46) || (at - server == 2 && text[server] == 46 && text[server + 1] == 46) {
+    return 0
+  }
+  at += 1
+  share := at
+  for at < length && !rec_path_separator(text[at]) {
+    if text[at] == 58 || text[at] == 42 || text[at] == 63 {
+      return 0
+    }
+    at += 1
+  }
+  if at == share || (at - share == 1 && text[share] == 46) || (at - share == 2 && text[share] == 46 && text[share + 1] == 46) {
+    return 0
+  }
+  if at < length {
+    return at + 1
+  }
+  return at
+}
+// The root includes its separator, when present. A bare UNC share is already
+// a complete root; mkdir must never try to create the server or share itself.
+fn rec_path_root(path: *const u8, length: usize) usize {
+  if path == nil || length < 3 {
+    return 0
+  }
+  text := path[..length]
+  if win_io_drive_letter(text[0]) && text[1] == 58 && rec_path_separator(text[2]) {
+    return 3
+  }
+  if !rec_path_separator(text[0]) || !rec_path_separator(text[1]) {
+    return 0
+  }
+  if length >= 4 && text[2] == 63 && rec_path_separator(text[3]) {
+    if length >= 7 && win_io_drive_letter(text[4]) && text[5] == 58 && rec_path_separator(text[6]) {
+      return 7
+    }
+    if length >= 8 && (text[4] == 85 || text[4] == 117) && (text[5] == 78 || text[5] == 110) && (text[6] == 67 || text[6] == 99) && rec_path_separator(text[7]) {
+      return win_io_unc_root(path, length, 8)
+    }
+    return 0
+  }
+  return win_io_unc_root(path, length, 2)
+}
+fn rec_absolute(path: *const u8) bool {
+  return path != nil && rec_path_root(path, string_length(path)) != 0
+}
+fn rec_sync_parent(fd: i32) bool {
+  if rec_sync(fd) == 0 {
+    return true
+  }
+  if rec_errno().* != 95 {
+    return false
+  }
+  info := WinIOInformation{}
+  if win_io_api.info(win_io_handle(fd), &info) == 0 {
+    _ = win_io_fail(win_io_api.error())
+    return false
+  }
+  // This is an acknowledged Windows publication policy, not a successful
+  // directory fsync: rec_sync still reports errno95. The file was flushed
+  // before same-volume MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH).
+  // Native tests establish process-crash survival; Windows exposes no POSIX
+  // parent-directory fsync contract, so power-loss durability is not claimed.
+  return (info.attributes & 16) != 0
+}

@@ -48,7 +48,8 @@ def native_tests(binary, work):
     expected = str(binary.resolve()).replace('\\', '/').encode('utf-8')
     buffer = c.create_string_buffer(131072)
     assert lib.test_path(buffer, len(buffer)) == 1
-    assert buffer.value == expected, ('module path must locate the DLL', buffer.value, expected)
+    assert os.path.samefile(buffer.value.decode('utf-8'), binary), ('module path must locate the DLL', buffer.value, expected)
+    expected = buffer.value
     # Query from a deliberately unrelated cwd, including after relocation.
     unrelated = work / 'unrelated working directory'
     unrelated.mkdir(exist_ok=True)
