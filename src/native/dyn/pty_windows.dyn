@@ -1,0 +1,383 @@
+#target(kernel: windows)
+
+// ConPTY owns its two blocking endpoints. The UI owns nonblocking CRT tokens.
+// A joined worker serializes resize and close while the UI drains output, so
+// final frames cannot deadlock ClosePseudoConsole on pre-24H2 Windows.
+struct WinPtyOwner {
+  console, event, thread: rawptr,
+  child: OwnedProcess,
+  input, output: i32,
+  stop, done, size: win_proc_sync.AtomicU32,
+}
+struct WinPtyAPI {
+  create: fn(u32, rawptr, rawptr, u32, *rawptr) i32,
+  resize: fn(rawptr, u32) i32,
+  close: fn(rawptr),
+  event: fn(rawptr, i32, i32, rawptr) rawptr,
+  signal: fn(rawptr) i32,
+}
+win_pty_api: WinPtyAPI
+win_pty_once: win_proc_sync.Once
+fn win_pty_prepare() {
+  win_proc_prepare()
+  if win_proc_sync.once_begin(&win_pty_once) {
+    kernel := win_proc_loader.open("kernel32.dll", 0)
+    if !kernel.ok {
+      #panic("missing ConPTY library")
+    }
+    // COORD is a four-byte value (two signed 16-bit fields) on both targets.
+    win_pty_api.create = #cast(fn(u32, rawptr, rawptr, u32, *rawptr) i32, win_io_symbol(kernel.value, "CreatePseudoConsole"))
+    win_pty_api.resize = #cast(fn(rawptr, u32) i32, win_io_symbol(kernel.value, "ResizePseudoConsole"))
+    win_pty_api.close = #cast(fn(rawptr), win_io_symbol(kernel.value, "ClosePseudoConsole"))
+    win_pty_api.event = #cast(fn(rawptr, i32, i32, rawptr) rawptr, win_io_symbol(kernel.value, "CreateEventW"))
+    win_pty_api.signal = #cast(fn(rawptr) i32, win_io_symbol(kernel.value, "SetEvent"))
+    win_proc_sync.once_complete(&win_pty_once)
+  }
+}
+fn win_pty_worker(context: rawptr) i32 {
+  owner := #cast(*WinPtyOwner, context)
+  for {
+    _ = win_proc_api.wait(owner.event, 4294967295)
+    if win_proc_sync.load_u32(&owner.stop) != 0 {
+      break
+    }
+    size := win_proc_sync.load_u32(&owner.size)
+    _ = win_pty_api.resize(owner.console, size)
+  }
+  win_pty_api.close(owner.console)
+  win_proc_sync.store_u32(&owner.done, 1)
+  return 0
+}
+fn win_pty_release(owner: *WinPtyOwner) {
+  if owner == nil {
+    return
+  }
+  proc_close(&owner.child)
+  if owner.input >= 0 {
+    _ = rec_close(owner.input)
+    owner.input = -1
+  }
+  if owner.thread != nil {
+    win_proc_sync.store_u32(&owner.stop, 1)
+    _ = win_pty_api.signal(owner.event)
+    bytes: [8192]u8 = []
+    for win_proc_sync.load_u32(&owner.done) == 0 {
+      // No UI retains these bytes once terminal_stop has taken ownership.
+      if owner.output >= 0 {
+        _ = proc_read_raw(owner.output, &bytes[0], #len(bytes))
+      }
+      win_proc_sleep(1)
+    }
+    dna_thread_join(owner.thread, nil)
+  } else if owner.console != nil {
+    // Thread creation failure has no concurrent reader. Closing the output
+    // endpoint first is the documented safe synchronous-close fallback.
+    if owner.output >= 0 {
+      _ = rec_close(owner.output)
+      owner.output = -1
+    }
+    win_pty_api.close(owner.console)
+  }
+  if owner.output >= 0 {
+    _ = rec_close(owner.output)
+  }
+  if owner.event != nil {
+    _ = win_proc_api.close(owner.event)
+  }
+  rec_free(#cast(rawptr, owner))
+}
+fn win_pty_ascii(text: []u16, used: *usize, value: []const u8) bool {
+  if #len(value) > #len(text) - used.* - 1 {
+    return false
+  }
+  for byte in value {
+    text[used.*] = #cast(u16, byte)
+    used.* += 1
+  }
+  text[used.*] = 0
+  return true
+}
+fn win_pty_unit(text: []u16, used: *usize, value: u16) bool {
+  if used.* >= #len(text) - 1 {
+    return false
+  }
+  text[used.*] = value
+  used.* += 1
+  text[used.*] = 0
+  return true
+}
+// Microsoft CRT argv quoting: double backslashes only before quotes or the
+// terminating quote. This preserves Unicode and embedded quotes in -c input.
+fn win_pty_quote(text: []u16, used: *usize, value: []const u16) bool {
+  if !win_pty_unit(text, used, 34) {
+    return false
+  }
+  slashes: usize = 0
+  for unit in value {
+    if unit == 92 {
+      slashes += 1
+      continue
+    }
+    copies := slashes
+    if unit == 34 {
+      copies = slashes * 2 + 1
+    }
+    for copies > 0 {
+      if !win_pty_unit(text, used, 92) {
+        return false
+      }
+      copies -= 1
+    }
+    slashes = 0
+    if !win_pty_unit(text, used, unit) {
+      return false
+    }
+  }
+  slashes *= 2
+  for slashes > 0 {
+    if !win_pty_unit(text, used, 92) {
+      return false
+    }
+    slashes -= 1
+  }
+  return win_pty_unit(text, used, 34)
+}
+fn win_pty_name_is(executable: []const u16, expected: []const u8) bool {
+  first: usize = 0
+  for index in 0..#len(executable) {
+    if executable[index] == 92 || executable[index] == 47 {
+      first = index + 1
+    }
+  }
+  if #len(executable) - first != #len(expected) {
+    return false
+  }
+  for index in 0..#len(expected) {
+    unit := executable[first + index]
+    if unit >= 65 && unit <= 90 {
+      unit += 32
+    }
+    if unit != #cast(u16, expected[index]) {
+      return false
+    }
+  }
+  return true
+}
+fn win_pty_command(space: *WinProcSpace, shell, command: *const u8) bool {
+  length: i32 = 0
+  // The inherited default remains /bin/sh in portable configuration files.
+  // On Windows an absent/default shell selects the trusted system cmd.exe.
+  default_shell := shell == nil || shell.* == 0
+  if !default_shell {
+    size := string_length(shell)
+    default_shell = size == 7 && shell[..size][0] == 47 && shell[..size][1] == 98 && shell[..size][2] == 105 && shell[..size][3] == 110 && shell[..size][4] == 47 && shell[..size][5] == 115 && shell[..size][6] == 104
+  }
+  if default_shell {
+    size := win_proc_api.system(&space.executable[0], 32760)
+    if size == 0 || size >= 32760 {
+      return false
+    }
+    used := #cast(usize, size)
+    if !win_pty_ascii(space.executable[..], &used, "\\cmd.exe") {
+      return false
+    }
+    length = #cast(i32, used)
+  } else {
+    if !win_proc_absolute(shell) {
+      return false
+    }
+    length = win_proc_utf16(shell, &space.executable[0], 32768)
+    if length <= 0 {
+      return false
+    }
+  }
+  executable := space.executable[..#cast(usize, length)]
+  for unit in executable {
+    if unit == 34 {
+      return false
+    }
+  }
+  used: usize = 0
+  if !win_pty_quote(space.command[..], &used, executable) {
+    return false
+  }
+  cmd := win_pty_name_is(executable, "cmd.exe")
+  powershell := win_pty_name_is(executable, "powershell.exe") || win_pty_name_is(executable, "pwsh.exe")
+  has_command := command != nil && command.* != 0
+  if cmd {
+    if !win_pty_ascii(space.command[..], &used, " /D") {
+      return false
+    }
+    if has_command {
+      if !win_pty_ascii(space.command[..], &used, " /S /C \"") {
+        return false
+      }
+      command_length := win_proc_utf16(command, &space.command[used], #cast(i32, 32767 - used))
+      if command_length <= 0 {
+        return false
+      }
+      used += #cast(usize, command_length)
+      if !win_pty_unit(space.command[..], &used, 34) {
+        return false
+      }
+    }
+  } else {
+    if powershell && !win_pty_ascii(space.command[..], &used, " -NoLogo -NoProfile") {
+      return false
+    }
+    if has_command {
+      if powershell {
+        if !win_pty_ascii(space.command[..], &used, " -Command ") {
+          return false
+        }
+      } else if !win_pty_ascii(space.command[..], &used, " -c ") {
+        return false
+      }
+      // The directory buffer is scratch until terminal_start converts cwd.
+      command_length := win_proc_utf16(command, &space.directory[0], 32768)
+      if command_length <= 0 || !win_pty_quote(space.command[..], &used, space.directory[..#cast(usize, command_length)]) {
+        return false
+      }
+    } else if !powershell && !win_pty_ascii(space.command[..], &used, " -i") {
+      return false
+    }
+  }
+  return true
+}
+fn terminal_start(t: *Terminal, cwd, shell, command: *const u8) bool {
+  win_pty_prepare()
+  if cwd == nil || !win_proc_absolute(cwd) {
+    return false
+  }
+  space := #cast(*WinProcSpace, rec_alloc(1, #sizeof(WinProcSpace)))
+  if space == nil {
+    return false
+  }
+  defer rec_free(#cast(rawptr, space))
+  if !win_pty_command(space, shell, command) || win_proc_utf16(cwd, &space.directory[0], 32768) <= 0 {
+    return false
+  }
+  owner := #cast(*WinPtyOwner, rec_alloc(1, #sizeof(WinPtyOwner)))
+  if owner == nil {
+    return false
+  }
+  owner.child = OwnedProcess{}
+  owner.input = -1
+  owner.output = -1
+  descriptors: [4]i32 = [-1, -1, -1, -1]
+  defer proc_close_fds(descriptors[..])
+  if proc_pipe(&descriptors[0], 0) != 0 || proc_pipe(&descriptors[2], 0) != 0 {
+    win_pty_release(owner)
+    return false
+  }
+  blocking: u32 = 0
+  if win_proc_api.pipe_mode(win_io_handle(descriptors[0]), &blocking, nil, nil) == 0 || win_proc_api.pipe_mode(win_io_handle(descriptors[3]), &blocking, nil, nil) == 0 {
+    win_pty_release(owner)
+    return false
+  }
+  // CreatePseudoConsole borrows these synchronous endpoints for its session.
+  if win_pty_api.create(1572944, win_io_handle(descriptors[0]), win_io_handle(descriptors[3]), 0, &owner.console) < 0 {
+    win_pty_release(owner)
+    return false
+  }
+  owner.input = descriptors[1]
+  owner.output = descriptors[2]
+  descriptors[1] = -1
+  descriptors[2] = -1
+  owner.event = win_pty_api.event(nil, 0, 0, nil)
+  if owner.event != nil {
+    owner.thread = dna_thread_create(win_pty_worker, #cast(rawptr, owner))
+  }
+  if owner.thread == nil {
+    win_pty_release(owner)
+    return false
+  }
+  attribute_size: usize = 0
+  _ = win_proc_api.attributes(nil, 1, 0, &attribute_size)
+  if attribute_size == 0 {
+    win_pty_release(owner)
+    return false
+  }
+  space.attributes = rec_alloc(1, attribute_size)
+  if space.attributes == nil {
+    win_pty_release(owner)
+    return false
+  }
+  defer rec_free(space.attributes)
+  if win_proc_api.attributes(space.attributes, 1, 0, &attribute_size) == 0 {
+    win_pty_release(owner)
+    return false
+  }
+  defer win_proc_attributes_free(space.attributes)
+  if win_proc_api.attribute(space.attributes, 0, 131094, owner.console, #sizeof(rawptr), nil, nil) == 0 {
+    win_pty_release(owner)
+    return false
+  }
+  owner.child.job = win_proc_api.job(nil, nil)
+  limits := WinProcLimits{}
+  limits.basic.flags = 8192
+  if owner.child.job == nil || win_proc_api.job_limits(owner.child.job, 9, #cast(rawptr, &limits), #cast(u32, #sizeof(WinProcLimits))) == 0 {
+    win_pty_release(owner)
+    return false
+  }
+  startup := WinProcStartup{size: #cast(u32, #sizeof(WinProcStartup)), attributes: space.attributes}
+  information := WinProcInformation{}
+  // ConPTY supplies stdio. No application handle is inherited by this child.
+  if win_proc_api.create(&space.executable[0], &space.command[0], nil, nil, 0, 524292, nil, #cast(rawptr, &space.directory[0]), &startup, &information) == 0 {
+    win_pty_release(owner)
+    return false
+  }
+  owner.child.process = information.process
+  owner.child.pid = 1
+  if win_proc_api.assign(owner.child.job, information.process) == 0 || win_proc_api.resume(information.thread) == 4294967295 {
+    _ = win_proc_api.close(information.thread)
+    win_pty_release(owner)
+    return false
+  }
+  _ = win_proc_api.close(information.thread)
+  t.platform = #cast(rawptr, owner)
+  t.pid = 1
+  t.fd = owner.output
+  t.input_fd = owner.input
+  t.exit_fd = -1
+  return true
+}
+fn terminal_exit_native(t: *Terminal) bool {
+  owner := #cast(*WinPtyOwner, t.platform)
+  if owner == nil || proc_peek(&owner.child) == 0 {
+    return false
+  }
+  code: u32 = 0
+  t.status = -1
+  if win_proc_api.exit(owner.child.process, &code) != 0 && code <= 2147483647 {
+    t.status = #cast(i32, code)
+  }
+  return true
+}
+fn terminal_needs_exit_poll(t: *Terminal) bool {
+  return t.platform != nil && t.exited == 0
+}
+fn terminal_resize_host(t: *Terminal, size: *const TtySize) {
+  owner := #cast(*WinPtyOwner, t.platform)
+  if owner == nil || size.columns == 0 || size.rows == 0 || size.columns > 32767 || size.rows > 32767 {
+    return
+  }
+  packed := #cast(u32, size.columns) | (#cast(u32, size.rows) << 16)
+  win_proc_sync.store_u32(&owner.size, packed)
+  _ = win_pty_api.signal(owner.event)
+}
+fn terminal_stop(t: *Terminal) {
+  owner := #cast(*WinPtyOwner, t.platform)
+  t.platform = nil
+  dna_unwatch(t.fd)
+  dna_unwatch(t.input_fd)
+  if t.exit_fd >= 0 {
+    dna_unwatch(t.exit_fd)
+    _ = rec_close(t.exit_fd)
+  }
+  t.fd = -1
+  t.input_fd = -1
+  t.exit_fd = -1
+  t.pid = 0
+  win_pty_release(owner)
+}

@@ -248,7 +248,7 @@ def main():
                     command += ['--target', target, '--emit-object', '--no-link']
                 subprocess.run(command, check=True, env=environment, timeout=120)
                 if target == 'native':
-                    native_tests(binary, work)
+                    subprocess.run([sys.executable, str(Path(__file__).resolve()), "--native-library", str(binary), str(work)], check=True, env=environment, timeout=40)
                 else:
                     print(f'PASS Windows process production object: {target} {mode}', flush=True)
     if os.name != 'nt':
@@ -256,4 +256,7 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    if len(sys.argv) == 4 and sys.argv[1] == '--native-library':
+        native_tests(Path(sys.argv[2]), Path(sys.argv[3]))
+    else:
+        main()

@@ -85,6 +85,15 @@ def main():
                                 '--emit-object', '--no-link', '--output', str(output)], env=env, check=True)
             print('PASS Windows readiness objects: ' + target, flush=True)
         if os.name == 'nt':
+            kits = Path(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')) / 'Windows Kits/10/Lib'
+            libraries = stage / 'lib'
+            libraries.mkdir()
+            for name, folder in (('kernel32', 'um'), ('ucrt', 'ucrt')):
+                candidates = sorted(kits.glob('*/' + folder + '/x64/' + name + '.lib'))
+                if not candidates:
+                    raise SystemExit('Windows SDK x64 ' + name + '.lib is required.')
+                shutil.copyfile(candidates[-1], libraries / ('lib' + name + '.dll.a'))
+            env['DYN_LIBRARY_PATH'] = str(libraries)
             for mode in ('debug', 'release'):
                 output = stage / (mode + '.exe')
                 subprocess.run([sys.executable, str(ROOT / 'scripts/compile.py'), str(compiler),

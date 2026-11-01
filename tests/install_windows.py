@@ -13,6 +13,7 @@ from dyn_path import real_dyn
 from sdk_compat import environment as sdk_environment
 
 SOURCE = r'''#link("ucrt")
+use "std/io"
 extern fn string_length "strlen"(text:*const u8) usize
 extern fn rec_alloc "calloc"(count:usize, size:usize) rawptr
 extern fn rec_free "free"(value:rawptr)
@@ -73,7 +74,12 @@ fn main() {
   fd=install_openat(root_fd,&leaf[0],655360,0)
   if fd<0 || install_fdopendir(fd)!=nil || install_fstat(fd,&info)!=0 || rec_close(fd)!=0 { #panic("failed fdopendir ownership") }
   destination:[]const u8="renamed.txt\0"
-  if install_rename(root_fd,&leaf[0],root_fd,&destination[0],1)!=0 || install_openat(root_fd,&leaf[0],655360,0)>=0 { #panic("relative no-replace rename") }
+  renamed:=install_rename(root_fd,&leaf[0],root_fd,&destination[0],1)
+  if renamed!=0 { _=io.println(io.stderr(), "relative rename failed: errno {}", rec_errno().*)
+    #panic("relative no-replace rename") }
+  old:=install_openat(root_fd,&leaf[0],655360,0)
+  if old>=0 { _=rec_close(old)
+    #panic("relative rename must retire old name") }
   fd=install_openat(root_fd,&destination[0],655360,0)
   if fd<0 || rec_close(fd)!=0 { #panic("relative renamed file") }
   occupied:[]const u8="occupied.txt\0"

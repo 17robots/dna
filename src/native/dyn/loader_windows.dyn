@@ -1,0 +1,73 @@
+#target(kernel: windows)
+use "std/sync" win_loader_sync
+use "std/dynlib" win_loader_dll
+
+struct WinSyntaxLoader {
+  module: fn(u32, rawptr, *rawptr) i32,
+  path: fn(rawptr, *u16, u32) u32,
+  utf8: fn(u32, u32, *const u16, i32, *u8, i32, rawptr, rawptr) i32,
+}
+win_syntax_loader: WinSyntaxLoader
+win_syntax_loader_once: win_loader_sync.Once
+fn syntax_loader_prepare() {
+  if win_loader_sync.once_begin(&win_syntax_loader_once) {
+    kernel := win_loader_dll.open("kernel32.dll", 0)
+    if !kernel.ok {
+      #panic("missing Windows module loader")
+    }
+    win_syntax_loader.module = #cast(fn(u32, rawptr, *rawptr) i32, win_io_symbol(kernel.value, "GetModuleHandleExW"))
+    win_syntax_loader.path = #cast(fn(rawptr, *u16, u32) u32, win_io_symbol(kernel.value, "GetModuleFileNameW"))
+    win_syntax_loader.utf8 = #cast(fn(u32, u32, *const u16, i32, *u8, i32, rawptr, rawptr) i32, win_io_symbol(kernel.value, "WideCharToMultiByte"))
+    win_loader_sync.once_complete(&win_syntax_loader_once)
+  }
+}
+fn syntax_module_path(output: *u8, capacity: usize) bool {
+  if output == nil || capacity == 0 || capacity > 2147483647 {
+    return false
+  }
+  output.* = 0
+  syntax_loader_prepare()
+  module: rawptr = nil
+  // FROM_ADDRESS | UNCHANGED_REFCOUNT locates this support library rather than
+  // the executable or current directory, without creating a module owner.
+  if win_syntax_loader.module(6, #cast(rawptr, dna_syntax_open), &module) == 0 {
+    return false
+  }
+  wide: [32768]u16 = []
+  length := win_syntax_loader.path(module, &wide[0], 32768)
+  if length == 0 || length >= 32768 {
+    return false
+  }
+  needed := win_syntax_loader.utf8(65001, 128, &wide[0], #cast(i32, length), nil, 0, nil, nil)
+  if needed <= 0 || #cast(usize, needed) >= capacity {
+    return false
+  }
+  used := win_syntax_loader.utf8(65001, 128, &wide[0], #cast(i32, length), output, #cast(i32, capacity - 1), nil, nil)
+  if used <= 0 {
+    output.* = 0
+    return false
+  }
+  bytes := output[..capacity]
+  for index in 0..#cast(usize, used) {
+    if bytes[index] == 92 {
+      bytes[index] = 47
+    }
+  }
+  bytes[#cast(usize, used)] = 0
+  return true
+}
+fn syntax_readable(path: *const u8) bool {
+  if path == nil {
+    return false
+  }
+  // rec_open verifies a readable disk file on the actual opened handle and
+  // rejects directories, rather than racing a metadata-only access check.
+  fd := rec_open(path, 0, 0)
+  if fd < 0 {
+    return false
+  }
+  return rec_close(fd) == 0
+}
+fn syntax_helper_name() []const u8 {
+  return "bin/dna-language.exe"
+}
