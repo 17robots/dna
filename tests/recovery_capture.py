@@ -61,9 +61,9 @@ fn recovery_error(worker:rawptr) i32 {return 0}
 fn recovery_open(path:*const u8) rawptr {return #cast(rawptr,1)}
 fn recovery_submit(worker:rawptr,bytes:*const u8,length:usize) i32 {
  if record_storage==nil {
-  record_arena:=mem.arena_create(60000000)
-  record_storage=&mem.push_bytes_uninit(record_arena,50000000)[0]
-  record_capacity=50000000
+  record_arena:=mem.arena_create(300000000)
+  record_storage=&mem.push_bytes_uninit(record_arena,290000000)[0]
+  record_capacity=290000000
  }
  check(length<=record_capacity)
  _=buffer.copy_bytes(record_storage,bytes,length)
@@ -182,10 +182,10 @@ fn main() {
  check(restore_patch(&app,restored,pieces,slot.file.stamp))
  check(restored.length==document.length && buffer.byte_at(restored,0)=='B' && buffer.byte_at(restored,restored.length-1)=='C')
  check(buffer.equal(buffer.range(restored,middle,middle+3),"XYZ"))
- // New text past the former 34 MB record bound still fits one record.
- inserted_arena:=mem.arena_create(40000000)
+ // New text past the former 256 MiB patch bound still fits one record.
+ inserted_arena:=mem.arena_create(290000000)
  defer mem.arena_release(inserted_arena)
- inserted:=mem.push_bytes_uninit(inserted_arena,36000000)
+ inserted:=mem.push_bytes_uninit(inserted_arena,280000000)
  _=fill(&inserted[0],98,#len(inserted),#len(inserted))
  document.anchor=1000
  document.cursor=1000
@@ -197,13 +197,13 @@ fn main() {
  check(workspace.decode(record_storage[..record_length],&large))
  load_original(restored,original)
  check(restore_patch(&app,restored,&large.buffers[0],slot.file.stamp))
- check(restored.length==document.length && buffer.byte_at(restored,1000)=='b' && buffer.byte_at(restored,1000+36000000-1)=='b' && buffer.byte_at(restored,1000+36000000)=='a')
+ check(restored.length==document.length && buffer.byte_at(restored,1000)=='b' && buffer.byte_at(restored,1000+280000000-1)=='b' && buffer.byte_at(restored,1000+280000000)=='a')
  check(buffer.byte_at(restored,0)=='B' && buffer.byte_at(restored,restored.length-1)=='C')
 }
 '''
 fixture += "\n".join(block(source, "fn " + name + "(") for name in
                      ("recovery_pieces", "recovery_apply_pieces", "recovery_patch", "session_capture", "recovery_tick"))
-fixture += "\nconst RecoveryPatchLimit: usize = buffer.Capacity\nconst RecoveryRecordLimit: usize = 1073741824\nconst RecoveryPiecesMinimum: usize = 1048576\n"
+fixture += "\nconst RecoveryPatchLimit: usize = 4026531840\nconst RecoveryRecordLimit: usize = 4294967295\nconst RecoveryPiecesMinimum: usize = 1048576\n"
 restore_source = source[source.index("fn session_restore("):]
 fixture += '''
 fn restore_patch(app:*App,doc:*buffer.Document,saved:*const workspace.SavedBuffer,stamp:fs.Stamp) bool {
@@ -234,4 +234,4 @@ pub fn name(state:*const State) []const u8 {return "/tmp/big.log"}
         subprocess.run([DYN, "build", str(stage), "--" + mode,
                         "--output", str(binary)], check=True, timeout=120)
         subprocess.run([str(binary)], check=True, timeout=30)
-print("PASS recovery capture: clean reload, stamped patch restore, rejected mismatch/invalid patch, missing stamp preserves prior record, distant edits restore from pieces, 36 MB insertion past the old bound (debug/release)")
+print("PASS recovery capture: clean reload, stamped patch restore, rejected mismatch/invalid patch, missing stamp preserves prior record, distant edits restore from pieces, 280 MB insertion past the old 256 MiB bound (debug/release)")
