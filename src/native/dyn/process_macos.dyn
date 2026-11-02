@@ -1,0 +1,308 @@
+#target(kernel: darwin)
+#link("System")
+use "std/dynlib" proc_loader
+
+// Darwin owns pointer-sized spawn objects. The child remains waitable until
+// close, pinning its PID while this adapter owns the process group.
+// ABI sources: apple-oss-distributions/xnu, bsd/sys/{fcntl,wait,signal}.h
+// and libsyscall/wrappers/spawn/spawn.h.
+struct OwnedProcess { pid: i32, input: i32 = -1, output: i32 = -1, error: i32 = -1 }
+struct PollDescriptor { fd: i32, events, returned: i16 }
+struct DarwinChildInfo {
+  signal, error, code, pid: i32,
+  uid: u32,
+  status: i32,
+  address, value, band: usize,
+  reserved: [7]usize,
+}
+struct DarwinProcessAPI {
+  pipe: fn(*i32) i32,
+  close: fn(i32) i32,
+  actions_init, actions_destroy: fn(*rawptr) i32,
+  dup_action: fn(*rawptr, i32, i32) i32,
+  chdir_action: fn(*rawptr, *const u8) i32,
+  attributes_init, attributes_destroy: fn(*rawptr) i32,
+  flags: fn(*rawptr, i16) i32,
+  group: fn(*rawptr, i32) i32,
+  spawn: fn(*i32, *const u8, *const rawptr, *const rawptr, rawptr, rawptr) i32,
+  kill: fn(i32, i32) i32,
+  wait: fn(i32, *i32, i32) i32,
+  wait_info: fn(i32, u32, *DarwinChildInfo, i32) i32,
+  poll: fn(*PollDescriptor, u32, i32) i32,
+  read: fn(i32, *u8, usize) isize,
+  resize: fn(*u8, usize) *u8,
+  move: fn(*u8, *const u8, usize) rawptr,
+  environment: fn() *rawptr,
+}
+proc_api: DarwinProcessAPI
+proc_api_once: sync.Once
+fn proc_library_symbol(name: []const u8) rawptr {
+  found := proc_loader.symbol(#cast(rawptr, #cast(isize, -2)), name)
+  if !found.ok || found.value == nil {
+    #panic("missing libSystem process routine")
+  }
+  return found.value
+}
+fn proc_prepare() {
+  // Resolve errno before IO; loader initialization can otherwise clobber it.
+  _ = rec_errno()
+  if sync.once_begin(&proc_api_once) {
+    proc_api.pipe = #cast(fn(*i32) i32, proc_library_symbol("pipe"))
+    proc_api.close = #cast(fn(i32) i32, proc_library_symbol("close"))
+    proc_api.actions_init = #cast(fn(*rawptr) i32, proc_library_symbol("posix_spawn_file_actions_init"))
+    proc_api.actions_destroy = #cast(fn(*rawptr) i32, proc_library_symbol("posix_spawn_file_actions_destroy"))
+    proc_api.dup_action = #cast(fn(*rawptr, i32, i32) i32, proc_library_symbol("posix_spawn_file_actions_adddup2"))
+    proc_api.chdir_action = #cast(fn(*rawptr, *const u8) i32, proc_library_symbol("posix_spawn_file_actions_addchdir_np"))
+    proc_api.attributes_init = #cast(fn(*rawptr) i32, proc_library_symbol("posix_spawnattr_init"))
+    proc_api.attributes_destroy = #cast(fn(*rawptr) i32, proc_library_symbol("posix_spawnattr_destroy"))
+    proc_api.flags = #cast(fn(*rawptr, i16) i32, proc_library_symbol("posix_spawnattr_setflags"))
+    proc_api.group = #cast(fn(*rawptr, i32) i32, proc_library_symbol("posix_spawnattr_setpgroup"))
+    proc_api.spawn = #cast(fn(*i32, *const u8, *const rawptr, *const rawptr, rawptr, rawptr) i32, proc_library_symbol("posix_spawn"))
+    proc_api.kill = #cast(fn(i32, i32) i32, proc_library_symbol("kill"))
+    proc_api.wait = #cast(fn(i32, *i32, i32) i32, proc_library_symbol("waitpid"))
+    proc_api.wait_info = #cast(fn(i32, u32, *DarwinChildInfo, i32) i32, proc_library_symbol("waitid"))
+    proc_api.poll = #cast(fn(*PollDescriptor, u32, i32) i32, proc_library_symbol("poll"))
+    proc_api.read = #cast(fn(i32, *u8, usize) isize, proc_library_symbol("read"))
+    proc_api.resize = #cast(fn(*u8, usize) *u8, proc_library_symbol("realloc"))
+    proc_api.move = #cast(fn(*u8, *const u8, usize) rawptr, proc_library_symbol("memmove"))
+    proc_api.environment = #cast(fn() *rawptr, proc_library_symbol("_NSGetEnviron"))
+    sync.once_complete(&proc_api_once)
+  }
+}
+// Darwin arm64 places variadic arguments on the stack. Function-pointer types
+// cannot express a C ellipsis in the pinned compiler. The native NOCANCEL alias
+// keeps this call variadic without redeclaring the SDK's fcntl foreign symbol.
+extern fn proc_fcntl_native "fcntl$NOCANCEL"(fd: i32, operation: i32, ...) i32
+fn proc_fcntl(fd: i32, operation: i32, value: i32) i32 {
+  proc_prepare()
+  if operation == 1030 {
+    operation = 67
+  } // F_DUPFD_CLOEXEC
+  if operation == 4 && (value & 2048) != 0 {
+    value = (value & ~#cast(i32, 2048)) | 4 // O_NONBLOCK
+  }
+  return proc_fcntl_native(fd, operation, value)
+}
+fn proc_pipe(fds: *i32, flags: i32) i32 {
+  proc_prepare()
+  if proc_api.pipe(fds) != 0 {
+    return -1
+  }
+  values := fds[..2]
+  if ((flags & 524288) != 0 && (proc_fcntl(values[0], 2, 1) != 0 || proc_fcntl(values[1], 2, 1) != 0)) || ((flags & 2048) != 0 && (!proc_nonblocking(values[0]) || !proc_nonblocking(values[1]))) {
+    saved := rec_errno().*
+    _ = proc_api.close(values[0])
+    _ = proc_api.close(values[1])
+    values[0] = -1
+    values[1] = -1
+    rec_errno().* = saved
+    return -1
+  }
+  return 0
+}
+fn proc_symbol(library: rawptr, name: *const u8) rawptr {
+  if library == nil {
+    library = #cast(rawptr, #cast(isize, -2))
+  }
+  found := proc_loader.symbol(library, name[..string_length(name)])
+  return found.value
+}
+fn proc_watch(fd: i32, writing: i32) {
+  dna_watch(fd, writing)
+}
+fn proc_unwatch(fd: i32) {
+  dna_unwatch(fd)
+}
+fn proc_realloc(bytes: *u8, length: usize) *u8 {
+  proc_prepare()
+  return proc_api.resize(bytes, length)
+}
+fn proc_move(output: *u8, source: *const u8, length: usize) rawptr {
+  proc_prepare()
+  return proc_api.move(output, source, length)
+}
+fn proc_ticks() u64 {
+  return dna_ticks()
+}
+fn proc_kill(pid: i32, signal: i32) i32 {
+  proc_prepare()
+  return proc_api.kill(pid, signal)
+}
+fn proc_wait(pid: i32, status: *i32, flags: i32) i32 {
+  proc_prepare()
+  return proc_api.wait(pid, status, flags)
+}
+fn proc_poll(fds: *PollDescriptor, count: usize, timeout: i32) i32 {
+  proc_prepare()
+  if count > 4294967295 {
+    return -1
+  }
+  return proc_api.poll(fds, #cast(u32, count), timeout)
+}
+fn proc_read_raw(fd: i32, bytes: *u8, length: usize) isize {
+  proc_prepare()
+  return proc_api.read(fd, bytes, length)
+}
+fn proc_nonblocking(fd: i32) bool {
+  flags := proc_fcntl(fd, 3, 0)
+  return flags >= 0 && proc_fcntl(fd, 4, flags | 4) == 0
+}
+fn proc_take(child: *OwnedProcess) OwnedProcess {
+  owned := child.*
+  child.* = OwnedProcess{}
+  return owned
+}
+fn proc_close(child: *OwnedProcess) {
+  owned := proc_take(child)
+  proc_unwatch(owned.input)
+  proc_unwatch(owned.output)
+  proc_unwatch(owned.error)
+  if owned.pid > 0 {
+    _ = proc_kill(-owned.pid, 9)
+    _ = proc_kill(owned.pid, 9)
+  }
+  for fd in [owned.input, owned.output, owned.error] {
+    if fd >= 0 {
+      _ = rec_close(fd)
+    }
+  }
+  if owned.pid > 0 {
+    for proc_wait(owned.pid, nil, 0) < 0 && rec_errno().* == 4 {}
+  }
+}
+fn proc_open(command: *const u8, directory: *const u8, shell: bool) OwnedProcess {
+  empty := OwnedProcess{}
+  if command == nil || command.* == 0 || directory == nil || directory.* != 47 || (!shell && command.* != 47) {
+    return empty
+  }
+  proc_prepare()
+  // Initialize the shared errno accessor before the first fallible native call.
+  _ = rec_errno()
+  descriptors: [6]i32 = [-1, -1, -1, -1, -1, -1]
+  defer proc_close_fds(descriptors[..])
+  if proc_pipe(&descriptors[0], 524288) != 0 || proc_pipe(&descriptors[2], 524288) != 0 || proc_pipe(&descriptors[4], 524288) != 0 {
+    return empty
+  }
+  for index in 0..6 {
+    if descriptors[index] < 3 {
+      lifted := proc_fcntl(descriptors[index], 67, 3)
+      if lifted < 0 {
+        return empty
+      }
+      _ = rec_close(descriptors[index])
+      descriptors[index] = lifted
+    }
+  }
+  actions: rawptr = nil
+  attributes: rawptr = nil
+  if proc_api.actions_init(&actions) != 0 {
+    return empty
+  }
+  defer _ = proc_api.actions_destroy(&actions)
+  if proc_api.attributes_init(&attributes) != 0 {
+    return empty
+  }
+  defer _ = proc_api.attributes_destroy(&attributes)
+  // Explicit dup2 actions survive CLOEXEC_DEFAULT; all unrelated descriptors
+  // close in the child, including concurrent threads' transient pipe handles.
+  if proc_api.dup_action(&actions, descriptors[0], 0) != 0 || proc_api.dup_action(&actions, descriptors[3], 1) != 0 || proc_api.dup_action(&actions, descriptors[5], 2) != 0 || proc_api.chdir_action(&actions, directory) != 0 || proc_api.flags(&attributes, 16386) != 0 || proc_api.group(&attributes, 0) != 0 {
+    return empty
+  }
+  // Suppress signal generation on this owned write endpoint only. Existing
+  // signal masks and pending SIGPIPE remain untouched, including on EPIPE.
+  if proc_fcntl(descriptors[1], 73, 1) != 0 {
+    return empty
+  }
+  shell_path: []const u8 = "/bin/sh\0"
+  shell_arg: []const u8 = "-c\0"
+  arguments: [4]*const u8 = [command, nil, nil, nil]
+  executable := command
+  if shell {
+    executable = &shell_path[0]
+    arguments[0] = executable
+    arguments[1] = &shell_arg[0]
+    arguments[2] = command
+  }
+  environment := proc_api.environment()
+  if environment == nil {
+    return empty
+  }
+  pid: i32 = 0
+  if proc_api.spawn(&pid, executable, &actions, &attributes, #cast(rawptr, &arguments[0]), environment.*) != 0 {
+    return empty
+  }
+  child := OwnedProcess{pid: pid, input: descriptors[1], output: descriptors[2], error: descriptors[4]}
+  descriptors[1] = -1
+  descriptors[2] = -1
+  descriptors[4] = -1
+  if !proc_nonblocking(child.input) || !proc_nonblocking(child.output) || !proc_nonblocking(child.error) {
+    proc_close(&child)
+    return empty
+  }
+  return child
+}
+fn proc_error_code() isize {
+  error := rec_errno().*
+  if error == 35 {
+    return -11
+  } // Shared transport callers use EAGAIN = 11.
+  return -#cast(isize, error)
+}
+fn proc_read(fd: i32, bytes: *u8, length: usize) isize {
+  value := proc_read_raw(fd, bytes, length)
+  if value < 0 {
+    return proc_error_code()
+  }
+  return value
+}
+fn proc_write(fd: i32, bytes: *const u8, length: usize) isize {
+  proc_prepare()
+  value := rec_write(fd, bytes, length)
+  if value < 0 {
+    return proc_error_code()
+  }
+  return value
+}
+// WNOWAIT pins the leader PID until proc_close kills the owned group and reaps.
+fn proc_peek(child: *const OwnedProcess) i32 {
+  proc_prepare()
+  info := DarwinChildInfo{}
+  if proc_api.wait_info(1, #cast(u32, child.pid), &info, 37) != 0 {
+    if rec_errno().* == 4 {
+      return 0
+    }
+    return -1
+  }
+  if info.pid != child.pid {
+    return 0
+  }
+  if info.code == 1 && info.status == 0 {
+    return 1
+  }
+  return 2
+}
+fn proc_log(log: []u8, used: *usize, bytes: []const u8) {
+  amount := #len(bytes)
+  if amount >= #len(log) {
+    amount = #len(log) - 1
+  }
+  keep := used.*
+  if keep > #len(log) - 1 - amount {
+    keep = #len(log) - 1 - amount
+  }
+  if keep > 0 {
+    _ = proc_move(&log[0], &log[used.* - keep], keep)
+  }
+  if amount > 0 {
+    _ = copy(&log[keep], &bytes[#len(bytes) - amount], amount)
+  }
+  used.* = keep + amount
+  log[used.*] = 0
+}
+fn proc_close_fds(fds: []i32) {
+  for fd in fds {
+    if fd >= 0 {
+      _ = rec_close(fd)
+    }
+  }
+}

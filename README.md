@@ -105,6 +105,27 @@ read format 3. Keep a separate session file when testing or rolling back.
 See [SDK-MIGRATION-20261024.md](SDK-MIGRATION-20261024.md) for validation,
 measurements, limits, and the preserved local baseline.
 
+### Native macOS and Windows source builds
+
+Native source builds use the pinned Dyn SDK. Install the platform providers
+listed in [native CI](.github/workflows/native-ports.yml). macOS uses Homebrew;
+Windows x64 uses native Python, the Windows SDK, and MSYS2 UCRT64. On macOS, run
+`python3 scripts/build_native.py --mode release` to build the Cocoa editor.
+
+On Windows, run from PowerShell after installing the UCRT64 providers:
+
+```powershell
+$env:DNA_WINDOWS_PREFIX = 'C:/msys64/ucrt64'
+mise exec -- python scripts/build_native.py --mode release --output build/dna.exe
+.\build\dna.exe --gui
+```
+
+Keep the generated adjacent DLLs, ConPTY host, licenses, language helper and
+`share/dna` data with the executable when moving it. Grammar builds and managed
+language-server installation also require the configured MSYS2 tools. Windows
+recovery flushes each atomic rename so it survives power loss as well as
+process crashes.
+
 ## Run
 
 `dna --version` (or `dna version`) prints the application version and exits
@@ -336,7 +357,8 @@ bracketed paste, a document inserts it as is (no auto-pairs or indentation)
 and nothing in it runs as a key. Shift, Alt and Ctrl held during a click
 come from the terminal's mouse report, so Shift-click extends a selection.
 `:suspend` (`:sus`, `:stop`, and Ctrl+Z with Vim keys) stops DNA as a shell
-job; `fg` brings it back.
+job; `fg` brings it back. On Windows it opens a command prompt (`%ComSpec%`) in
+the same console instead; `exit` returns to DNA.
 
 `:frontend tui` / `:frontend gui` (or `:module frontend tui`) moves the running
 session to the other frontend: unsaved text, splits, cursors and filetypes are
@@ -741,6 +763,7 @@ character, so `x` never highlights the first character of the following line. Wo
 | Focus window | `Space w h/j/k/l`; `Space w w` cycles; click a pane |
 | Close window / keep only current | `Space w c` / `Space w o`; `:wclose` / `:only` |
 | Buffer picker / next / previous | `Space b` / `Space n` / `Space p` |
+| Symbols in this file / workspace (language server) | `Space s` / `Space S`; `:symbols`, `:workspace-symbols [query]`; type to filter, Enter goes |
 | Go-to menu | `g` (Escape cancels) |
 | Close current buffer | `Space c` or `:bd` |
 | New empty buffer | `:enew` |
@@ -811,7 +834,8 @@ restores the original selections. Counts work for indentation and open lines.
 `(`/`)` rotate the primary selection in document order; `Alt-(`/`Alt-)` rotate
 selected text, including unequal-length UTF-8 fragments. Content rotation rejects
 overlapping ranges without mutation. Counts apply to both rotation commands.
-Named registers, syntax-aware selections, and macros are not yet implemented.
+Named registers, macros and syntax-aware selections are covered under Registers,
+macros, and syntax navigation below.
 The implementation queue and remaining compatibility work are tracked in
 [IMPLEMENTATION.md](IMPLEMENTATION.md).
 Command-key overrides are supported through config. Picker arrows also accept Ctrl-N/J and Ctrl-P/K; Ctrl-U clears a prompt.
@@ -834,7 +858,11 @@ Use `:resize 25` to give the focused side 25% of its parent split, `:equalize`
 (or Space w =) to balance splits, and `:layout-save path.toml` to save their shape.
 
 Line numbers are relative except for the current line, which shows its absolute
-number. The status line shows mode, filename, modified state, buffer count,
+number. In a git repository the gutter marks lines changed since the file's
+committed version: a green bar for added lines, yellow for modified, and a red
+line over the line that follows a deletion. Markers follow edits after a short
+pause and compare with `HEAD`, fetched again on save; untracked files, files
+outside a repository and files over 8 MiB show none. The status line shows mode, filename, modified state, buffer count,
 line/column, and selected codepoints. Palette commands independently toggle line
 numbers, relative numbering, the status line, and current-line highlighting.
 
@@ -867,16 +895,22 @@ keys and clickable guide entries follow the same Vim dispatch.
 | Visual | `v V` Ctrl-v; motions and text objects extend; `d x c s y > < ~ u U J r p P o`, `D X Y C S R` for lines, block `I A`, `gv` |
 | Registers | `"a`–`"z`, `"_` (black hole); the unnamed register is the system clipboard |
 | Macros | `q{a-z}` records, `q` stops, `@{a-z}` and `@@` replay |
+| Marks | `m{a-z}`; `` `{a-z} `` and `'{a-z}`, also after operators; `` `` `` and `''` |
 | Search | `/` and `?` (PCRE), `n N`, `* #` |
 | View | Ctrl-d Ctrl-u Ctrl-f Ctrl-b, Ctrl-e Ctrl-y, `zz zt zb` |
 | Language server | `K` hover, `gd gy gr gi` (definition, type, references, implementation) |
 | Buffers, files | `gt gT`, `ZZ` (`:x`), `ZQ` (`:qa`), `:w :q :wq :x :wa :qa`, `:e path` |
 | Ex | `:42`, `:[range]s/pattern/replacement/[gi]` with ranges `%`, `N,M`, `.`, `'<,'>`; `&` is the match, `\r` a line break |
 
-Ctrl-o / Ctrl-i walk the jump list (recorded by `gg`, `G`, searches and LSP
-goto). Not yet: marks (`m`, `` ` ``, `'`), Replace mode (`R`), `gq`, `=`, sentence and tag objects, `.` after a
-visual-mode change, `gJ` (joins with spaces like `J`), and capture groups in `:s` (patterns are PCRE, so write `a|b`,
-not `a\|b`). Ctrl-x closes the buffer only in the Helix keymap.
+Ctrl-o / Ctrl-i walk the jump list (recorded by `gg`, `G`, searches, marks and
+LSP goto). `m{a-z}` sets a mark in the current file; `` `{a-z} `` goes to it and
+`'{a-z}` to its line, as motions too (`d'a`, `` y`a ``); `` `` `` and `''`
+return to the last jump. Marks move with edits and last until the file is
+reloaded. `.` after a visual change repeats it on a region of the same size at
+the cursor (not after block mode). Not yet: uppercase (file) marks, Replace
+mode (`R`), `gq`, `=`, sentence and tag objects, `gJ` (joins with spaces like
+`J`), and capture groups in `:s` (patterns are PCRE, so write `a|b`, not
+`a\|b`). Ctrl-x closes the buffer only in the Helix keymap.
 
 ## Editable explorer
 
@@ -1025,8 +1059,11 @@ not a replacement for backups or version control.
 ## Current limits
 
 - Open-document storage grows with available memory; there is no fixed buffer-count limit.
-  Each document supports up to **268,435,455 UTF-8 bytes**; NUL/binary files are
-  refused. Unused text, line-index, and undo pages are not eagerly touched.
+  Files open, edit and save at any size (tested to 4 GiB); large files are
+  mapped, not copied. Operations that build text in one piece (clipboard text,
+  `:s` results, formatter output and language-server edits) are limited to
+  **268,435,455 UTF-8 bytes**. NUL/binary files are refused. Unused text,
+  line-index, and undo pages are not eagerly touched.
 - Up to 64 undo states within a 4 MiB changed-byte budget per document; large replacements retain
   fewer states. Insert runs group until movement/mode changes.
 - Movement/deletion follows Unicode grapheme clusters, including combining marks,
@@ -1035,17 +1072,20 @@ not a replacement for backups or version control.
   currently follows grapheme columns rather than visual tab stops. Vertical
   movement remembers the desired column across shorter lines, including in
   selection mode. Horizontal movement and text edits reset that preference.
-- Keyboard and mouse selection with cursor-following scrolling; no wheel scrolling yet.
+- Keyboard and mouse selection with cursor-following and mouse-wheel scrolling.
 - Word classes distinguish whitespace, identifier text, and punctuation. Non-ASCII
   categories distinguish letters/marks/numbers from separators and punctuation;
   full linguistic Unicode word segmentation is not implemented.
 - Directory listings and staged batches support at most 256 entries/operations.
   Explorer listings remain limited to 65,535 bytes and allocates its own undo arena.
 - Tree-sitter highlighting, LSP, command-key overrides and a Vim keymap profile
-  are available (see Vim keys for its gaps). A TUI and SSH remain unimplemented. An experimental process-based plugin
-  API and persistent sessions are available.
-- File operations currently target Linux x86-64. Windows/macOS are not supported
-  by this prototype yet, despite the native rendering layer.
+  are available (see Vim keys for its gaps). Native GUI and TUI frontends, an
+  experimental process-based plugin API, and persistent sessions are available.
+  Remote filesystem access over SSH is not implemented.
+- Linux remains the primary platform. Native macOS and Windows x64 builds run in
+  CI, including file operations and GUI startup. On Windows ARM64, CI runs the
+  native qualification tests as ARM64 programs; the full editor build there
+  still needs an ARM64 MSYS2 toolchain.
 
 ## Project tools, sessions, and extensions
 
@@ -1561,14 +1601,20 @@ Selections use the current parsed revision; a pending parse never blocks input.
 `gy` and `gi` request type definitions and implementations from the language
 server. Support depends on the server.
 
+`Space s` (`:symbols`) lists the file's symbols from the language server,
+nested as the server reports them; typing filters them by name (letters in
+order, any case) and Enter goes to one. `Space S` (`:workspace-symbols`) sends
+what you type to the server as the query, so it searches the whole project.
+
 Language packages may also contain `textobjects.scm` with predicate-free
 Tree-sitter captures named `function.inside`/`function.around`, `class`,
 `parameter`, or `comment` with the same suffixes. `mi`/`ma` followed by
-`f`, `t`, `a`, or `c` selects those objects. Captures run on the syntax worker,
-with bounded storage and work. Dyn ships a starter query; reinstall the Dyn
-syntax package with `:language-install dyn`, then `:language-reload` to get it.
-Other language packages need their own queries. Missing or stale results leave
-all selections unchanged.
+`f`, `t`, `a`, or `c` selects those objects (function, type, argument or
+parameter, comment). Captures run on the syntax worker. Queries ship for Dyn,
+Rust, C, C++, Python, Go, JavaScript, TypeScript, TSX and Bash; reinstall an
+existing package with `:language-install NAME`, then `:language-reload`, to get
+one. Other languages need their own `textobjects.scm`. Missing or stale results
+leave all selections unchanged.
 
 Selection normalization includes `Alt--` (merge all), `Alt-_` (merge touching or
 overlapping selections), and `Alt-:` (make selections forward). `_` trims every

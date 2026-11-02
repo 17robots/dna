@@ -1,10 +1,65 @@
 // More than the former sixteen tracking records and eighty buffer UI rows.
+fn language_large_document(app:*App) {
+  original:=app.documents.active
+  if !new_buffer(app) {
+    #panic("large LSP buffer allocation")
+  }
+  slot:=app.documents.slots[app.documents.active]
+  path:[4096]u8=[]
+  length:=copy_text(path[..], app.workspace.project[..app.workspace.project_length])
+  add_text(path[..], &length, "/large-sync.dyn")
+  if !files.set_name(&slot.file, path[..length]) {
+    #panic("large LSP path")
+  }
+  slot.filetype_length=copy_text(slot.filetype[..], "dyn")
+  storage:=buffer.storage_create(17825792)
+  for index in 0..#len(storage.bytes) {
+    storage.bytes[index]='a'
+  }
+  if !buffer.load_storage(slot.document, &storage, #len(storage.bytes)) {
+    #panic("large LSP fixture")
+  }
+  lsp_sync(app, 0, true)
+  deadline:=sdl.ticks()+5000
+  for slot.diagnostics.count==0 && sdl.ticks()<deadline {
+    _=lsp_tick(app)
+    language_test_delay(1)
+  }
+  if !app.lsp.servers[0].ready || slot.diagnostics.count==0 {
+    #panic("large LSP didOpen delivery")
+  }
+  buffer.move_to(slot.document, 0, false)
+  _=buffer.replace(slot.document, "Z")
+  slot.diagnostics.count=0
+  lsp_sync(app, 0, true)
+  deadline=sdl.ticks()+5000
+  for slot.diagnostics.count==0 && sdl.ticks()<deadline {
+    _=lsp_tick(app)
+    language_test_delay(1)
+  }
+  if !app.lsp.servers[0].ready || slot.diagnostics.count==0 {
+    #panic("large LSP incremental delivery")
+  }
+  app.lsp.log_length=0
+  buffer.mark_saved(slot.document)
+  lsp_sync(app, 0, true)
+  deadline=sdl.ticks()+5000
+  for !contains(app.lsp.log[..app.lsp.log_length], "fixture saved") && sdl.ticks()<deadline {
+    _=lsp_tick(app)
+    language_test_delay(1)
+  }
+  if !contains(app.lsp.log[..app.lsp.log_length], "fixture saved") {
+    #panic("large LSP didSave delivery")
+  }
+  close_clean(app)
+  activate(app, original)
+}
 fn language_many_documents(app:*App) {
   original:=app.documents.active
   if !app.lsp.servers[0].ready || app.lsp.servers[0].process==nil || original>=#len(app.lsp.servers[0].documents) {
     #panic("many LSP requires attached live peer")
   }
-  first_shadow:=app.lsp.servers[0].documents[original].shadow.arena
+  first_shadow:=app.lsp.servers[0].documents[original].shadow.snapshot.root
   identities:[84]u64=[]
   indices:[84]usize=[]
   for i in 0..84 {
@@ -27,7 +82,7 @@ fn language_many_documents(app:*App) {
     if !app.lsp.servers[0].ready {
       #panic("many LSP sync stopped")
     }
-    if app.lsp.servers[0].documents[original].shadow.arena!=first_shadow {
+    if app.lsp.servers[0].documents[original].shadow.snapshot.root!=first_shadow {
       #panic("LSP growth lost prior shadow owner")
     }
     if i%8==0 {
@@ -43,7 +98,7 @@ fn language_many_documents(app:*App) {
     }
     lsp_sync(app, 0, true)
     tracked:=&app.lsp.servers[0].documents[app.documents.active]
-    if tracked.identity!=identities[83-i] || tracked.revision!=doc.revision || !tracked.shadow.ready || !buffer.equal(tracked.shadow.bytes[..tracked.shadow.length], doc.bytes[..doc.length]) {
+    if tracked.identity!=identities[83-i] || tracked.revision!=doc.revision || !tracked.shadow.ready || (tracked.shadow.snapshot.length != doc.length || buffer.snapshot_common(&tracked.shadow.snapshot, doc).prefix != doc.length) {
       #panic("many LSP identity/version/shadow mismatch")
     }
     if i%8==0 {
@@ -86,7 +141,7 @@ fn language_incremental_budget(app: *App) {
   defer mem.arena_rewind(app.scratch, mark)
   original := (#cast(*u8, mem.arena_push_uninit(app.scratch, doc.length + 1, 1)))[..doc.length]
   if doc.length > 0 {
-    _ = buffer.copy_bytes(&original[0], &doc.bytes[0], doc.length)
+    _ = buffer.copy_bytes(&original[0], buffer.pointer(doc, 0, doc.length), doc.length)
   }
   text := (#cast(*u8, mem.arena_push_uninit(app.scratch, 262144, 1)))[..262144]
   for index in 0..#len(text) {
@@ -121,7 +176,7 @@ fn language_incremental_budget(app: *App) {
     _ = buffer.replace(doc, "x")
   }
   lsp_sync(app, 0, true)
-  if !buffer.equal(app.lsp.servers[0].documents[0].shadow.bytes[..app.lsp.servers[0].documents[0].shadow.length], doc.bytes[..doc.length]) {
+  if (app.lsp.servers[0].documents[0].shadow.snapshot.length != doc.length || buffer.snapshot_common(&app.lsp.servers[0].documents[0].shadow.snapshot, doc).prefix != doc.length) {
     #panic("incremental shadow diverged")
   }
   app.lsp.log_length = 0
@@ -235,7 +290,7 @@ fn language_smoke() {
   // the fixture server checks against its own copy (it exits on mismatch).
   incremental := app.documents.current
   original: [64]u8 = []
-  original_length := copy_text(original[..], incremental.bytes[..incremental.length])
+  original_length := copy_text(original[..], buffer.all(incremental))
   incremental.anchor = 3
   incremental.cursor = 3
   _ = buffer.replace(incremental, "XY😀")
@@ -248,7 +303,7 @@ fn language_smoke() {
   incremental.cursor = incremental.length
   _ = buffer.replace(incremental, "\nend é")
   lsp_sync(app, 0, true)
-  if !app.lsp.servers[0].documents[0].shadow.ready || app.lsp.servers[0].documents[0].shadow.length != incremental.length {
+  if !app.lsp.servers[0].documents[0].shadow.ready || app.lsp.servers[0].documents[0].shadow.snapshot.length != incremental.length {
     #panic("incremental sync keeps the sent text")
   }
   app.lsp.log_length = 0
@@ -280,7 +335,7 @@ fn language_smoke() {
   if app.lsp.pending != 0 {
     #panic("accepting completion left a refresh pending")
   }
-  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "alphabet é😀\n") || !app.view.insert || app.documents.current.cursor != 8 {
+  if !buffer.equal(buffer.all(app.documents.current), "alphabet é😀\n") || !app.view.insert || app.documents.current.cursor != 8 {
     #panic("completion apply")
   }
   buffer.undo(app.documents.current)
@@ -374,7 +429,7 @@ fn language_smoke() {
   // Escape now commits insert mode. Start the next completion scenarios from
   // their own baseline rather than undoing back across that mode boundary.
   buffer.checkpoint(app.documents.current)
-  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "al é😀\n") {
+  if !buffer.equal(buffer.all(app.documents.current), "al é😀\n") {
     #panic("completion scenarios must restore their initial prefix")
   }
   lsp_status(app)
@@ -444,7 +499,7 @@ fn language_smoke() {
   buffer.move_to(app.documents.current, 2, false)
   text_input(app, "x")
   buffer.checkpoint(app.documents.current)
-  if app.prompt_state.panel != Panel.None || !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "alx é😀\n") {
+  if app.prompt_state.panel != Panel.None || !buffer.equal(buffer.all(app.documents.current), "alx é😀\n") {
     #panic("typing through completion")
   }
   buffer.undo(app.documents.current)
@@ -452,7 +507,7 @@ fn language_smoke() {
   lsp_request(app, 1, "")
   language_wait(app)
   key_input(app, nil, 9, 0)
-  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "alphabet é😀\n") || !app.view.insert {
+  if !buffer.equal(buffer.all(app.documents.current), "alphabet é😀\n") || !app.view.insert {
     #panic("Tab accepts completion")
   }
   buffer.undo(app.documents.current)
@@ -476,7 +531,7 @@ fn language_smoke() {
     #panic("LSP formatting preview")
   }
   lsp_apply(app)
-  if !contains(app.documents.current.bytes[..app.documents.current.length], "formatted") {
+  if !contains(buffer.all(app.documents.current), "formatted") {
     #panic("LSP formatting apply")
   }
   buffer.undo(app.documents.current)
@@ -511,11 +566,11 @@ fn language_smoke() {
   app.prompt_state.panel = Panel.None
   lsp_request(app, 5, "renamed")
   language_wait(app)
-  if app.prompt_state.panel != Panel.LspEdit || !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "al é😀\n") {
+  if app.prompt_state.panel != Panel.LspEdit || !buffer.equal(buffer.all(app.documents.current), "al é😀\n") {
     #panic("rename must preview")
   }
   lsp_apply(app)
-  if !contains(app.documents.current.bytes[..app.documents.current.length], "renamed") {
+  if !contains(buffer.all(app.documents.current), "renamed") {
     #panic("rename apply")
   }
   buffer.undo(app.documents.current)
@@ -541,7 +596,7 @@ fn language_smoke() {
     #panic("resolved action preview")
   }
   lsp_apply(app)
-  if !contains(app.documents.current.bytes[..app.documents.current.length], "resolved") {
+  if !contains(buffer.all(app.documents.current), "resolved") {
     #panic("resolved action apply")
   }
   buffer.undo(app.documents.current)
@@ -560,7 +615,7 @@ fn language_smoke() {
   }
   lsp_apply(app)
   language_wait(app)
-  if !contains(app.documents.current.bytes[..app.documents.current.length], "command") {
+  if !contains(buffer.all(app.documents.current), "command") {
     #panic("command edit apply")
   }
   buffer.undo(app.documents.current)
@@ -572,7 +627,7 @@ fn language_smoke() {
   buffer.move_to(app.documents.current, 0, false)
   _ = buffer.replace(app.documents.current, "x")
   lsp_apply(app)
-  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "xal é😀\n") {
+  if !buffer.equal(buffer.all(app.documents.current), "xal é😀\n") {
     #panic("stale action applied")
   }
   app.prompt_state.panel = Panel.None
@@ -583,6 +638,7 @@ fn language_smoke() {
     #panic("stale hover opened popup")
   }
   lsp_sync(app, 0, true)
+  language_large_document(app)
   language_many_documents(app)
 }
 fn disk_smoke() {
@@ -614,11 +670,11 @@ fn disk_smoke() {
     #panic("external write")
   }
   deadline := sdl.ticks() + 3000
-  for !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "external") && sdl.ticks() < deadline {
+  for !buffer.equal(buffer.all(app.documents.current), "external") && sdl.ticks() < deadline {
     _ = disk_tick(app)
     language_test_delay(1)
   }
-  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "external") || buffer.dirty(app.documents.current) {
+  if !buffer.equal(buffer.all(app.documents.current), "external") || buffer.dirty(app.documents.current) {
     #panic("automatic clean reload")
   }
   buffer.move_to(app.documents.current, 0, false)
@@ -631,7 +687,7 @@ fn disk_smoke() {
     _ = disk_tick(app)
     language_test_delay(1)
   }
-  if !app.documents.slots[app.documents.active].disk_changed || !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "local external") {
+  if !app.documents.slots[app.documents.active].disk_changed || !buffer.equal(buffer.all(app.documents.current), "local external") {
     #panic("dirty buffer protection")
   }
   disk_reload(app, false)
@@ -640,11 +696,11 @@ fn disk_smoke() {
   }
   typography := Typography{}
   key_input(app, &typography, 27, 0)
-  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "local external") {
+  if !buffer.equal(buffer.all(app.documents.current), "local external") {
     #panic("reload cancel")
   }
   disk_reload(app, true)
-  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "conflicting") || buffer.dirty(app.documents.current) {
+  if !buffer.equal(buffer.all(app.documents.current), "conflicting") || buffer.dirty(app.documents.current) {
     #panic("confirmed reload")
   }
 }
@@ -670,11 +726,11 @@ fn clipboard_smoke() {
   doc.secondary.count = 1
   doc.secondary.ranges[0] = buffer.Selection{anchor: 2, cursor: 3}
   paste_selection(app, false, true)
-  if !buffer.equal(doc.bytes[..doc.length], "one two") {
+  if !buffer.equal(buffer.all(doc), "one two") {
     #panic("clipboard distributed roundtrip")
   }
   buffer.undo(doc)
-  if !buffer.equal(doc.bytes[..doc.length], "a b") {
+  if !buffer.equal(buffer.all(doc), "a b") {
     #panic("clipboard roundtrip undo")
   }
 }
@@ -713,18 +769,18 @@ fn formatting_smoke() {
   doc.marks[0] = 2
   format_start(app, false, "")
   formatting_wait(app)
-  if !buffer.equal(doc.bytes[..doc.length], "HELLO") || doc.anchor != 1 || doc.cursor != 4 || doc.secondary.count != 1 || doc.secondary.ranges[0].cursor != 1 || doc.marks[0] != 2 {
+  if !buffer.equal(buffer.all(doc), "HELLO") || doc.anchor != 1 || doc.cursor != 4 || doc.secondary.count != 1 || doc.secondary.ranges[0].cursor != 1 || doc.marks[0] != 2 {
     #panic("formatter apply preserves positions")
   }
   buffer.undo(doc)
-  if !buffer.equal(doc.bytes[..doc.length], "hello") {
+  if !buffer.equal(buffer.all(doc), "hello") {
     #panic("formatter undo")
   }
   format_start(app, false, "")
   buffer.move_to(doc, doc.length, false)
   _ = buffer.replace(doc, "!")
   formatting_wait(app)
-  if !buffer.equal(doc.bytes[..doc.length], "hello!") || !contains(app.prompt_state.message[..app.prompt_state.message_length], "discarded") {
+  if !buffer.equal(buffer.all(doc), "hello!") || !contains(app.prompt_state.message[..app.prompt_state.message_length], "discarded") {
     #panic("stale formatter protection")
   }
   before := mem.arena_mark(app.scratch)
@@ -753,7 +809,7 @@ fn composition_smoke(app: *App, typography: *Typography) {
     #panic("composition must not commit")
   }
   text_input(app, "日本")
-  if app.composition.length != 0 || !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "日本") {
+  if app.composition.length != 0 || !buffer.equal(buffer.all(app.documents.current), "日本") {
     #panic("IME commit")
   }
   key_input(app, typography, 27, 0)
@@ -1031,7 +1087,7 @@ fn dyn_language_smoke(renderer: rawptr, typography: *Typography) {
     #panic("real Dyn completion")
   }
   lsp_accept(app)
-  if !contains(app.documents.current.bytes[..app.documents.current.length], "helper(value)") || app.prompt_state.panel != Panel.None {
+  if !contains(buffer.all(app.documents.current), "helper(value)") || app.prompt_state.panel != Panel.None {
     #panic("real Dyn snippet completion acceptance")
   }
   _ = buffer.load(app.documents.current, "fn main() { #le }\n")
@@ -1053,7 +1109,7 @@ fn dyn_language_smoke(renderer: rawptr, typography: *Typography) {
     #panic("real Dyn builtin completion")
   }
   lsp_accept(app)
-  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], "fn main() { #len(array_or_slice) }\n") {
+  if !buffer.equal(buffer.all(app.documents.current), "fn main() { #len(array_or_slice) }\n") {
     #panic("builtin completion preserves one hash prefix")
   }
   // Exercise actual Dyn responses through DNA, against unsaved contents.
@@ -1097,7 +1153,7 @@ fn dyn_language_smoke(renderer: rawptr, typography: *Typography) {
     #panic("real Dyn rename preview")
   }
   lsp_apply(app)
-  if !contains(app.documents.current.bytes[..app.documents.current.length], "fn renamed_helper(") || !contains(app.documents.current.bytes[..app.documents.current.length], "result := renamed_helper(2)") {
+  if !contains(buffer.all(app.documents.current), "fn renamed_helper(") || !contains(buffer.all(app.documents.current), "result := renamed_helper(2)") {
     #panic("real Dyn rename application")
   }
   buffer.undo(app.documents.current)
@@ -1121,14 +1177,14 @@ fn dyn_language_smoke(renderer: rawptr, typography: *Typography) {
   lsp_apply(app)
   // Dyn's formatter places block bodies on their own lines.
   formatted_source := "fn helper(value: i32) i32 {\n  return value\n}\nfn main() {\n  result := helper(2)\n  _ = result\n}\n"
-  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], formatted_source) {
+  if !buffer.equal(buffer.all(app.documents.current), formatted_source) {
     #panic("real Dyn formatting application")
   }
   if app.documents.current.anchor != 3 || app.documents.current.cursor != 9 || app.documents.current.secondary.count != 1 || app.documents.current.secondary.ranges[0].cursor != 2 || app.documents.current.marks[0] != 6 {
     #panic("LSP formatting must preserve selections and pane marks")
   }
   buffer.undo(app.documents.current)
-  if !buffer.equal(app.documents.current.bytes[..app.documents.current.length], format_source) || app.documents.current.anchor != 3 || app.documents.current.cursor != 9 || app.documents.current.secondary.count != 1 {
+  if !buffer.equal(buffer.all(app.documents.current), format_source) || app.documents.current.anchor != 3 || app.documents.current.cursor != 9 || app.documents.current.secondary.count != 1 {
     #panic("LSP formatting undo must preserve selections")
   }
   disk_mark := mem.arena_mark(app.scratch)
@@ -1258,7 +1314,7 @@ fn completion_words_smoke(app: *App) {
   text_input(app, "p")
   key_input(app, nil, KeyBackspace, 0)
   key_input(app, nil, KeyBackspace, 0)
-  if !completion_visible(app) || doc.bytes[doc.cursor - 1] != 'a' {
+  if !completion_visible(app) || buffer.byte_at(doc, doc.cursor - 1) != 'a' {
     #panic("local completion must survive backspacing before request position")
   }
   text_input(app, "z")
@@ -1271,7 +1327,7 @@ fn completion_words_smoke(app: *App) {
   }
   app.lsp.pending = 0
   lsp_accept(app)
-  if !buffer.equal(doc.bytes[..doc.length], "alphabet alphabet alphabet") || app.operations.reserved != allocated {
+  if !buffer.equal(buffer.all(doc), "alphabet alphabet alphabet") || app.operations.reserved != allocated {
     #panic("local completion acceptance or ownership")
   }
   _ = buffer.load(doc, "école école éc")

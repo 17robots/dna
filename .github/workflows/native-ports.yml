@@ -15,9 +15,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15, windows-2022]
+        os: [ubuntu-24.04, macos-15, windows-2022, windows-11-arm]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    timeout-minutes: 30
+    env:
+      # ARM64 test programs, built by the emulated x64 compiler.
+      DNA_WINDOWS_TARGET: ${{ matrix.os == 'windows-11-arm' && 'aarch64-windows' || 'x86_64-windows' }}
+      # Windows PowerShell takes ~17 s per start there; see windows_target.py.
+      DNA_TEST_TIME_SCALE: ${{ matrix.os == 'windows-11-arm' && '4' || '1' }}
     defaults:
       run:
         shell: bash
@@ -40,8 +45,151 @@ jobs:
           version: '2026.9.9'
           working_directory: build/native-sdk
           cache: false
+      - name: Install native buffer dependency
+        if: runner.os == 'macOS'
+        run: |
+          brew install pkgconf utf8proc libvterm tree-sitter pcre2 harfbuzz fribidi freetype coreutils gnu-tar
+          brew install --cask font-dejavu-sans-mono-nerd-font
+      - name: Time Windows PowerShell starts on Windows on ARM
+        # Recorded because each start there is far slower than on x64; the
+        # tests' process deadlines scale by DNA_TEST_TIME_SCALE.
+        if: matrix.os == 'windows-11-arm'
+        run: |
+          for attempt in 1 2 3; do
+            start=$(date +%s.%N)
+            powershell.exe -NoProfile -NonInteractive -Command "exit 0"
+            python -c "import sys; print('PowerShell start', sys.argv[1], round(float(sys.argv[3]) - float(sys.argv[2]), 1), 's')" "$attempt" "$start" "$(date +%s.%N)"
+          done
       - name: Run debug and release host adapters in a Unicode directory
+        env:
+          DNA_TEST_REQUIRE_APFS: ${{ runner.os == 'macOS' && '1' || '0' }}
         working-directory: build/native-sdk
         run: |
           mise exec -- python ../../scripts/test_host.py
           mise exec -- python ../../scripts/test_host.py filesystem
+          mise exec -- python ../../scripts/test_host.py threads
+          mise exec -- python ../../scripts/test_host.py bulk_memory
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            mise exec -- python ../../scripts/test_host.py clone
+            mise exec -- python ../../tests/native_desktop.py
+          fi
+
+      - name: Build and exercise full native Cocoa editor
+        if: runner.os == 'macOS'
+        working-directory: build/native-sdk
+        run: |
+          mise exec -- python ../../tests/native_macos.py
+
+      - name: Qualify native ARM64 test programs on Windows on ARM
+        if: matrix.os == 'windows-11-arm' && !cancelled()
+        working-directory: build/native-sdk
+        run: mise exec -- python ../../tests/windows_arm64.py
+      - name: Qualify native Windows I/O
+        if: runner.os == 'Windows' && !cancelled()
+        working-directory: build/native-sdk
+        run: mise exec -- python ../../tests/rec_io_windows.py
+      - name: Qualify native Windows process ownership
+        if: runner.os == 'Windows' && !cancelled()
+        working-directory: build/native-sdk
+        run: mise exec -- python ../../tests/process_windows.py
+      - name: Qualify native Windows readiness
+        if: runner.os == 'Windows' && !cancelled()
+        working-directory: build/native-sdk
+        run: mise exec -- python ../../tests/notify_windows.py
+      - name: Qualify native Windows relative filesystem access
+        if: runner.os == 'Windows' && !cancelled()
+        working-directory: build/native-sdk
+        run: mise exec -- python ../../tests/install_windows.py
+      - name: Qualify native Windows ConPTY lifecycle
+        if: runner.os == 'Windows' && !cancelled()
+        working-directory: build/native-sdk
+        run: mise exec -- python ../../tests/pty_windows.py
+      - name: Qualify native Windows module paths
+        if: runner.os == 'Windows' && !cancelled()
+        working-directory: build/native-sdk
+        run: mise exec -- python ../../tests/loader_windows.py
+      - name: Qualify native Windows console lifecycle
+        if: runner.os == 'Windows' && !cancelled()
+        working-directory: build/native-sdk
+        run: mise exec -- python ../../tests/tty_windows.py
+      - name: Qualify native Windows directory notifications
+        if: runner.os == 'Windows' && !cancelled()
+        working-directory: build/native-sdk
+        run: mise exec -- python ../../tests/disk_windows.py
+      - name: Qualify native Windows recovery persistence
+        if: runner.os == 'Windows' && !cancelled()
+        working-directory: build/native-sdk
+        run: mise exec -- python ../../tests/recovery_windows.py
+      - name: Qualify native Windows private executable files
+        if: runner.os == 'Windows' && !cancelled()
+        working-directory: build/native-sdk
+        run: mise exec -- python ../../tests/private_executable_windows.py
+      - name: Qualify native Windows managed plugin publication
+        if: runner.os == 'Windows' && !cancelled()
+        working-directory: build/native-sdk
+        run: mise exec -- python ../../tests/plugin_versions_windows.py
+      - name: Qualify native Windows frontend environment and clocks
+        if: runner.os == 'Windows' && !cancelled()
+        working-directory: build/native-sdk
+        run: mise exec -- python ../../tests/frontend_windows.py
+      - name: Qualify native Windows file parent paths
+        if: runner.os == 'Windows' && !cancelled()
+        working-directory: build/native-sdk
+        run: mise exec -- python ../../tests/file_paths_windows.py
+      - name: Qualify native Windows language version pointers
+        if: runner.os == 'Windows' && !cancelled()
+        working-directory: build/native-sdk
+        run: mise exec -- python ../../tests/language_versions_windows.py
+      - name: Install native Windows editor providers
+        # The full editor links MSYS2 UCRT64 (x64) libraries.
+        if: runner.os == 'Windows' && runner.arch == 'X64' && !cancelled()
+        id: msys2
+        uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
+        with:
+          msystem: UCRT64
+          update: true
+          path-type: inherit
+          install: >-
+            curl tar gzip coreutils gawk
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-pkgconf
+            mingw-w64-ucrt-x86_64-libvterm
+            mingw-w64-ucrt-x86_64-libtree-sitter
+            mingw-w64-ucrt-x86_64-pcre2
+            mingw-w64-ucrt-x86_64-libutf8proc
+            mingw-w64-ucrt-x86_64-harfbuzz
+            mingw-w64-ucrt-x86_64-fribidi
+            mingw-w64-ucrt-x86_64-freetype
+            mingw-w64-ucrt-x86_64-mesa
+      - name: Build and exercise full native Win32 editor
+        if: runner.os == 'Windows' && !cancelled() && steps.msys2.outcome == 'success'
+        env:
+          DNA_WINDOWS_PREFIX: ${{ steps.msys2.outputs.msys2-location }}/ucrt64
+          LIBGL_ALWAYS_SOFTWARE: 'true'
+          GALLIUM_DRIVER: llvmpipe
+        working-directory: build/native-sdk
+        run: mise exec -- python ../../tests/native_windows.py
+      - name: Qualify native Windows installer workflows
+        if: runner.os == 'Windows' && !cancelled() && steps.msys2.outcome == 'success'
+        env:
+          DNA_WINDOWS_PREFIX: ${{ steps.msys2.outputs.msys2-location }}/ucrt64
+        working-directory: build/native-sdk
+        run: mise exec -- python ../../tests/installer_windows.py
+      - name: Qualify native Windows grammar and language-server workflows
+        if: runner.os == 'Windows' && !cancelled() && steps.msys2.outcome == 'success'
+        env:
+          DNA_WINDOWS_PREFIX: ${{ steps.msys2.outputs.msys2-location }}/ucrt64
+        working-directory: build/native-sdk
+        run: mise exec -- python ../../tests/installer_workflow_windows.py
+      - name: Retain failed native Windows link outputs
+        if: runner.os == 'Windows' && failure() && steps.msys2.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-native-failure
+          retention-days: 3
+          if-no-files-found: ignore
+          path: |
+            build/deps/install/lib/dna_native.dll
+            build/deps/install/lib/dna_native.dll.a
+            build/deps/install/lib/dyn_window.dll
+            build/deps/install/lib/dna-runtime.json

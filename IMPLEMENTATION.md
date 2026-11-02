@@ -20,7 +20,7 @@ Reviewed 2026-10-30 against the source tree.
 - [x] Multi-selection ASCII case conversion, indentation, joining and open-line commands.
 - [x] Primary selection rotation and content rotation.
 - [x] Named registers and bounded macro recording/playback.
-- [x] Syntax-node selections and query-backed language text objects (Dyn starter queries; other languages need queries).
+- [x] Syntax-node selections and query-backed language text objects (queries for Dyn, Rust, C, C++, Python, Go, JavaScript, TypeScript, TSX and Bash; `tests/textobject_queries.py`).
 - [ ] Binding-by-binding compatibility inventory and input-level behavior tests.
 - [x] Process/PTY API: working directory, nonblocking transport, cancellation and child cleanup (`process.dyn`, `tty.dyn`; `tests/process_transport.py`, `tests/process_close.py`). Children inherit `environ`; per-spawn environment overrides are not implemented.
 - [x] Worker API: synchronization, bounded queues, wakeups, explicit ownership (`sync.dyn`, `job.dyn`, `notify.dyn`; `tests/native_sync.py`).

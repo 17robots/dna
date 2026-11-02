@@ -5,6 +5,8 @@ extern fn disk_next "dna_disk_next_ready"(disk: rawptr, output: *DiskReady) i32
 
 extern fn disk_open "dna_disk_open"() rawptr
 extern fn disk_close "dna_disk_close"(disk: rawptr)
+extern fn disk_watch_hashed "dna_disk_watch_hashed"(disk: rawptr, index: usize, identity: u64, path: *const u8, baseline: u64, length: usize) i32
+extern fn disk_watch_stamped "dna_disk_watch_stamped"(disk: rawptr, index: usize, identity: u64, path: *const u8, stamp: *const u64, length: usize) i32
 extern fn disk_watch "dna_disk_watch_checked"(disk: rawptr, index: usize, identity: u64, path: *const u8, saved: *const u8, length: usize) i32
 extern fn disk_pending "dna_disk_pending_at"(disk: rawptr, index: usize, identity: u64) isize
 extern fn disk_take "dna_disk_take_at"(disk: rawptr, index: usize, identity: u64, bytes: *u8, capacity: usize) i32
@@ -29,10 +31,10 @@ fn disk_replace(doc: *buffer.Document, bytes: []const u8) {
   if anchor > doc.length {
     anchor = doc.length
   }
-  for cursor > 0 && cursor < doc.length && (doc.bytes[cursor] & 192) == 128 {
+  for cursor > 0 && cursor < doc.length && (buffer.byte_at(doc, cursor) & 192) == 128 {
     cursor -= 1
   }
-  for anchor > 0 && anchor < doc.length && (doc.bytes[anchor] & 192) == 128 {
+  for anchor > 0 && anchor < doc.length && (buffer.byte_at(doc, anchor) & 192) == 128 {
     anchor -= 1
   }
   doc.cursor = cursor
@@ -42,7 +44,7 @@ fn disk_replace(doc: *buffer.Document, bytes: []const u8) {
     if position > doc.length {
       position = doc.length
     }
-    for position > 0 && position < doc.length && (doc.bytes[position] & 192) == 128 {
+    for position > 0 && position < doc.length && (buffer.byte_at(doc, position) & 192) == 128 {
       position -= 1
     }
     doc.marks[index] = position
@@ -86,8 +88,22 @@ fn disk_register(app: *App, slot: *Slot) bool {
       return false
     }
   }
+  // A file still loading has only part of its text to compare; watch it
+  // once complete.
+  if buffer.load_state(slot.document) != buffer.LoadComplete {
+    return true
+  }
   if watched.identity != slot.identity || watched.epoch != slot.document.saved_epoch || !buffer.equal(watched.path[..watched.length], files.name(&slot.file)) {
-    if disk_watch(app.disk.worker, slot.index, slot.identity, &slot.file.path[0], &buffer.saved_text(slot.document)[0], slot.document.saved_length) == 0 {
+    // The watcher compares a hash. With the file's stamp from when it held
+    // the saved text, the watcher hashes the file itself on its own thread;
+    // otherwise hash the saved tree here.
+    stamp := files.saved_stamp(&slot.file)
+    if stamp.ok && stamp.size == #cast(u64, slot.document.saved_length) {
+      values: [6]u64 = [stamp.inode, stamp.size, stamp.modify_seconds, stamp.modify_nanos, stamp.change_seconds, stamp.change_nanos]
+      if disk_watch_stamped(app.disk.worker, slot.index, slot.identity, &slot.file.path[0], &values[0], slot.document.saved_length) == 0 {
+        return false
+      }
+    } else if disk_watch_hashed(app.disk.worker, slot.index, slot.identity, &slot.file.path[0], buffer.saved_hash(slot.document), slot.document.saved_length) == 0 {
       return false
     }
     watched.identity = slot.identity
@@ -123,6 +139,8 @@ fn disk_process(app: *App, slot: *Slot) bool {
     content := bytes[..#len(bytes) - 1]
     if app.config.reload_clean_buffers && !buffer.dirty_cached(slot.document) && #len(content) <= buffer.Capacity && buffer.valid(content) {
       disk_replace(slot.document, content)
+      // The bytes came from the watcher; their stamp is not known here.
+      files.forget_stamp(&slot.file)
       slot.disk_changed = false
       disk_dirty_slot(app, slot.index)
     } else {
@@ -189,13 +207,14 @@ fn disk_reload(app: *App, confirmed: bool) {
     notice(app, "File is missing or is not a regular file. Buffer preserved.")
     return
   }
-  read := files.read_text(path)
+  read := files.read_document(path)
   defer files.release_text(&read)
   if !read.ok || !buffer.valid(read.data) {
     notice(app, "File is unreadable, too large, or invalid text. Buffer preserved.")
     return
   }
   disk_replace(app.documents.current, read.data)
+  files.adopt_stamp(app.documents.file, read.stamp)
   document_lifecycle_changed(app, app.documents.active)
   app.documents.slots[app.documents.active].disk_changed = false
   app.prompt_state.panel = Panel.None

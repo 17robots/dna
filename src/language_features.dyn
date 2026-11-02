@@ -69,7 +69,7 @@ fn diagnostic_jump(app: *App, backwards: bool) {
   index: usize = 0
   for index < diagnostics.count {
     item := &diagnostics.items[index]
-    point := lsp.offset(doc.bytes[..doc.length], lsp.Position{line: item.line, character: item.character})
+    point := lsp.offset(buffer.all(doc), lsp.Position{line: item.line, character: item.character})
     if point.ok {
       if !fallback_set || (!backwards && point.value < fallback) || (backwards && point.value > fallback) {
         fallback = point.value
@@ -124,7 +124,7 @@ fn completion_request_compatible(app: *App) bool {
   if !change.found || change.low != state.position || change.old_high != state.position || change.high != doc.cursor {
     return false
   }
-  for byte in doc.bytes[change.low..change.high] {
+  for byte in buffer.range(doc, change.low, change.high) {
     if !completion_word_byte(byte) {
       return false
     }
@@ -140,7 +140,7 @@ fn completion_response_matches(app: *App, result: *const json.Value) bool {
     return false
   }
   doc := app.documents.current
-  prefix := doc.bytes[completion_prefix_start(doc, doc.cursor)..doc.cursor]
+  prefix := buffer.range(doc, completion_prefix_start(doc, doc.cursor), doc.cursor)
   item := items.first
   for item != nil {
     if completion_score(prefix, item) >= 0 {
@@ -198,10 +198,10 @@ fn completion_trigger(server: *const LanguageServer, doc: *const buffer.Document
   }
   // Triggers are Unicode characters, not grapheme clusters.
   beginning := position - 1
-  for beginning > 0 && (doc.bytes[beginning] & 192) == 128 {
+  for beginning > 0 && (buffer.byte_at(doc, beginning) & 192) == 128 {
     beginning -= 1
   }
-  text := doc.bytes[beginning..position]
+  text := buffer.range(doc, beginning, position)
   character := completion_character(text)
   for index in 0..server.completion_trigger_count {
     if character != 0 && server.completion_triggers[index] == character {
@@ -281,7 +281,7 @@ fn completion_tick(app: *App) {
   if state.completion_position != doc.cursor || state.completion_revision != doc.revision {
     return
   }
-  byte := doc.bytes[doc.cursor - 1]
+  byte := buffer.byte_at(doc, doc.cursor - 1)
   if #len(trigger) == 0 && !completion_word_byte(byte) && byte != '.' && byte != ':' && byte != '>' && byte != '#' && byte != '@' {
     return
   }
@@ -299,12 +299,12 @@ fn completion_prefix_start(doc: *buffer.Document, position: usize) usize {
   beginning := position
   for beginning > 0 {
     previous := buffer.previous(doc, beginning)
-    if !completion_word_byte(doc.bytes[previous]) {
+    if !completion_word_byte(buffer.byte_at(doc, previous)) {
       break
     }
     beginning = previous
   }
-  if beginning > 0 && doc.bytes[beginning - 1] == '#' {
+  if beginning > 0 && buffer.byte_at(doc, beginning - 1) == '#' {
     beginning -= 1
   }
   return beginning
@@ -378,7 +378,7 @@ fn completion_collect(state: *LspResults, doc: *buffer.Document) {
   if state.position > doc.length {
     return
   }
-  prefix := doc.bytes[completion_prefix_start(doc, state.position)..state.position]
+  prefix := buffer.range(doc, completion_prefix_start(doc, state.position), state.position)
   item := state.source
   for item != nil {
     // Backspacing before the response position invalidates explicit edit ranges.

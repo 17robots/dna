@@ -1,0 +1,396 @@
+use "std/thread"
+use "std/sync"
+
+// Searching a large document on a worker thread. The task searches a
+// snapshot of the text, so the document may change (or close) meanwhile; the
+// caller drops a result whose revision is stale.
+//
+// The worker is a raw thread without libc thread state, so it must not call
+// malloc. Window copies use the task's own arena, and PCRE2 gets memory
+// functions that bump-allocate from it as well.
+extern fn general_create "pcre2_general_context_create_8"(allocate: fn(usize, rawptr) rawptr, release: fn(rawptr, rawptr), data: rawptr) rawptr
+extern fn general_free "pcre2_general_context_free_8"(context: rawptr)
+
+// PCRE2 memory: the heap frame limit (4 MiB) plus match data, with room for
+// the vector to grow by doubling.
+const TaskHeap: usize = 16777216
+const TaskStack: usize = 1048576
+pub const BackgroundMinimum: usize = 16777216
+
+struct TaskHeapState { bytes: *u8, used, capacity: usize }
+fn task_allocate(size: usize, data: rawptr) rawptr {
+  heap := #cast(*TaskHeapState, data)
+  start := (heap.used + 15) & ~#cast(usize, 15)
+  if size > heap.capacity - start || start > heap.capacity {
+    return nil
+  }
+  heap.used = start + size
+  return #cast(rawptr, &heap.bytes[..heap.capacity][start])
+}
+fn task_release(pointer: rawptr, data: rawptr) {
+  _ = pointer
+  _ = data
+}
+
+pub struct SearchTask {
+  arena: *mem.Arena,
+  snapshot: buffer.TextSnapshot,
+  pattern: Pattern,
+  general: rawptr,
+  heap: TaskHeapState,
+  window: []u8,
+  // Snapshot bytes copied_low..copied_high currently held in window.
+  copied_low, copied_high: usize,
+  offset: usize,
+  backwards: bool,
+  // Matches are confined to subject_low..subject_high, as if that were the
+  // whole text: anchors and lookbehind see its edges.
+  subject_low, subject_high: usize,
+  // Range modes: 0 steps from offset; 1 selects matches, 2 splits on them,
+  // 3 keeps and 4 removes ranges containing one. They read ranges and write
+  // output and status (codes as in search.dyn: 0 applied, 1 nothing left,
+  // 3 work limit or error, 4 too many selections).
+  mode: u8,
+  ranges: buffer.Selections,
+  output: buffer.Selections,
+  status: u8,
+  cancel, done: sync.AtomicU32,
+  result: Match,
+  worker: *thread.Thread,
+  started: bool,
+}
+// Start searching document from offset like search_step: forward finds the
+// first match at or after offset, else the first one; backwards finds the
+// last match starting before offset, else the last one. Returns nil when the
+// pattern does not compile or no thread starts; search synchronously then.
+pub fn task_start(text: []const u8, document: *const buffer.Document, offset: usize, backwards: bool) *SearchTask {
+  task := task_create(text, document)
+  if task == nil {
+    return nil
+  }
+  task.offset = offset
+  task.backwards = backwards
+  return task_launch(task)
+}
+// Run a range mode (1 select, 2 split, 3 keep, 4 remove) over ranges on a
+// worker. Read task_status and task_output when done.
+pub fn task_start_ranges(text: []const u8, document: *const buffer.Document, ranges: *const buffer.Selections, mode: u8) *SearchTask {
+  task := task_create(text, document)
+  if task == nil {
+    return nil
+  }
+  task.mode = mode
+  task.ranges = ranges.*
+  return task_launch(task)
+}
+pub fn task_status(task: *const SearchTask) u8 {
+  return task.status
+}
+pub fn task_output(task: *const SearchTask) *const buffer.Selections {
+  return &task.output
+}
+fn task_create(text: []const u8, document: *const buffer.Document) *SearchTask {
+  arena := arena_owner.create(#sizeof(SearchTask) + TaskHeap + SearchWindowLimit + 4096)
+  task := mem.push(SearchTask, arena)
+  task.arena = arena
+  heap := mem.push_bytes_uninit(arena, TaskHeap)
+  task.heap = TaskHeapState{bytes: &heap[0], capacity: TaskHeap}
+  task.window = mem.push_bytes_uninit(arena, SearchWindowLimit)
+  task.general = general_create(task_allocate, task_release, #cast(rawptr, &task.heap))
+  if task.general == nil || #len(text) == 0 {
+    task_free(task)
+    return nil
+  }
+  task.pattern.code = compile(&text[0], #len(text), 0x001a0000, &task.pattern.error, &task.pattern.error_offset, nil)
+  if task.pattern.code != nil {
+    task.pattern.data = data_create(task.pattern.code, task.general)
+    task.pattern.context = context_create(task.general)
+  }
+  if task.pattern.data == nil || task.pattern.context == nil || match_limit(task.pattern.context, 10000) != 0 || depth_limit(task.pattern.context, 128) != 0 || heap_limit(task.pattern.context, 4096) != 0 {
+    task_free(task)
+    return nil
+  }
+  task.pattern.ok = true
+  task.snapshot = buffer.snapshot_take(document)
+  task.subject_high = task.snapshot.length
+  return task
+}
+fn task_launch(task: *SearchTask) *SearchTask {
+  spawned := thread.spawn_with_size(task.arena, TaskStack, task_run, #cast(rawptr, task))
+  if !spawned.ok {
+    task_free(task)
+    return nil
+  }
+  task.worker = spawned.value
+  task.started = true
+  return task
+}
+pub fn task_done(task: *const SearchTask) bool {
+  return sync.load_u32(&task.done) != 0
+}
+pub fn task_result(task: *const SearchTask) Match {
+  return task.result
+}
+pub fn task_revision(task: *const SearchTask) u64 {
+  return task.snapshot.revision
+}
+// Cancel if still running, wait for the worker, and free everything.
+pub fn task_finish(task: *SearchTask) {
+  if task == nil {
+    return
+  }
+  sync.store_u32(&task.cancel, 1)
+  task_free(task)
+}
+fn task_free(task: *SearchTask) {
+  if task.started {
+    if !thread.join(task.worker).ok {
+      #panic("cannot join search worker")
+    }
+    task.started = false
+  }
+  buffer.snapshot_release(&task.snapshot)
+  // Match data and contexts live in the task heap; only the code is malloc'd.
+  if task.pattern.code != nil {
+    code_free(task.pattern.code)
+  }
+  if task.general != nil {
+    general_free(task.general)
+  }
+  arena_owner.release(task.arena)
+}
+fn task_run(context: rawptr) isize {
+  task := #cast(*SearchTask, context)
+  if task.mode == 0 {
+    task.result = task_search(task)
+  } else {
+    task.status = task_ranges(task)
+  }
+  sync.store_u32(&task.done, 1)
+  return 0
+}
+fn task_search(task: *SearchTask) Match {
+  length := task.subject_high
+  if !task.backwards {
+    found := task_find(task, task.offset, length + 1)
+    if found.found || found.error || task.offset == 0 {
+      return found
+    }
+    return task_find(task, 0, length + 1)
+  }
+  found := task_last(task, 0, task.offset)
+  if found.found || found.error {
+    return found
+  }
+  return task_last(task, task.offset, length + 1)
+}
+fn task_cancelled(task: *const SearchTask) bool {
+  return sync.load_u32(&task.cancel) != 0
+}
+// First match starting in at..limit, searching windows of the snapshot.
+fn task_find(task: *SearchTask, from: usize, limit: usize) Match {
+  length := task.subject_high
+  at := from
+  size := SearchWindow
+  for at < limit && at <= length {
+    if task_cancelled(task) {
+      return Match{}
+    }
+    lookback := at - task.subject_low
+    if lookback > SearchLookback {
+      lookback = SearchLookback
+    }
+    low := at - lookback
+    high := length
+    if at + size < high {
+      high = at + size
+    }
+    // The character check below reads up to 3 bytes past high.
+    need := high + 4
+    if need > length {
+      need = length
+    }
+    if low < task.copied_low || need > task.copied_high || task.copied_high == 0 {
+      // Copy a window ahead as well: a scan stepping through many matches
+      // then reuses this copy instead of copying per match.
+      ahead := need + SearchWindow
+      if ahead > length {
+        ahead = length
+      }
+      if ahead - low > SearchWindowLimit {
+        ahead = low + SearchWindowLimit
+      }
+      buffer.snapshot_copy(&task.snapshot, low, ahead, &task.window[0])
+      task.copied_low = low
+      task.copied_high = ahead
+    }
+    // Whole characters only, so PCRE2 can skip its UTF-8 check: at is a
+    // character start, and the edges move inward to the nearest ones.
+    for low < at && (task.window[low - task.copied_low] & 192) == 128 {
+      low += 1
+    }
+    for high > at && high < length && (task.window[high - task.copied_low] & 192) == 128 {
+      high -= 1
+    }
+    text := task.window[low - task.copied_low..high - task.copied_low]
+    if high == length {
+      found := find_options(&task.pattern, text, at - low, Checked)
+      if found.found {
+        found.start += low
+        found.end += low
+        if found.start >= limit {
+          return Match{}
+        }
+      }
+      return found
+    }
+    window := find_window_options(&task.pattern, text, at - low, Checked)
+    if window.error {
+      return Match{error: true}
+    }
+    if window.found {
+      if low + window.start >= limit {
+        return Match{}
+      }
+      return Match{found: true, start: low + window.start, end: low + window.end}
+    }
+    if window.partial {
+      if low + window.start >= limit {
+        return Match{}
+      }
+      at = low + window.start
+      if size * 2 + SearchLookback > SearchWindowLimit {
+        // One match longer than the largest window cannot be found here.
+        return Match{error: true}
+      }
+      size *= 2
+      continue
+    }
+    at = high
+    size = SearchWindow
+  }
+  return Match{}
+}
+// Last match starting in low..high, walking windows back from high.
+fn task_last(task: *SearchTask, low: usize, high: usize) Match {
+  end := high
+  for end > low {
+    start := low
+    if end - low > SearchWindow {
+      start = end - SearchWindow
+    }
+    last := Match{}
+    at := start
+    for true {
+      found := task_find(task, at, end)
+      if found.error {
+        return found
+      }
+      if !found.found || task_cancelled(task) {
+        break
+      }
+      last = found
+      if found.end > at {
+        at = found.end
+      } else {
+        at = task_next(task, found.end)
+      }
+      if at > task.snapshot.length {
+        break
+      }
+    }
+    if last.found {
+      return last
+    }
+    end = start
+  }
+  return Match{}
+}
+// The next character start after offset.
+fn task_next(task: *SearchTask, offset: usize) usize {
+  at := offset + 1
+  byte: [1]u8 = [0]
+  for at < task.snapshot.length {
+    buffer.snapshot_copy(&task.snapshot, at, at + 1, &byte[0])
+    if (byte[0] & 192) != 128 {
+      break
+    }
+    at += 1
+  }
+  return at
+}
+// The range modes, mirroring select_matches and filter_selections in
+// search.dyn but searching each range in windows instead of one copy.
+fn task_ranges(task: *SearchTask) u8 {
+  for current in 0..task.ranges.count {
+    range := buffer.ordered(task.ranges.items[current])
+    task.subject_low = range.anchor
+    task.subject_high = range.cursor
+    if task.mode >= 3 {
+      found := task_find(task, range.anchor, range.cursor + 1)
+      if found.error {
+        return 3
+      }
+      if found.found != (task.mode == 4) {
+        task.output.items[task.output.count] = task.ranges.items[current]
+        task.output.count += 1
+      }
+      continue
+    }
+    at := range.anchor
+    segment := range.anchor
+    attempts: usize = 0
+    for at <= range.cursor {
+      if task_cancelled(task) {
+        return 3
+      }
+      if attempts == 4096 {
+        return 3
+      }
+      attempts += 1
+      found := task_find(task, at, range.cursor + 1)
+      if found.error {
+        return 3
+      }
+      if !found.found {
+        break
+      }
+      if task.mode == 2 {
+        if found.start > segment && !task_add(task, segment, found.start) {
+          return 4
+        }
+        segment = found.end
+      } else if !task_add(task, found.start, found.end) {
+        return 4
+      }
+      if found.end > at {
+        at = found.end
+      } else {
+        if found.end == range.cursor {
+          break
+        }
+        at = task_next(task, found.end)
+      }
+    }
+    if task.mode == 2 && segment < range.cursor && !task_add(task, segment, range.cursor) {
+      return 4
+    }
+  }
+  if task.output.count == 0 {
+    return 1
+  }
+  return 0
+}
+fn task_add(task: *SearchTask, low: usize, high: usize) bool {
+  for index in 0..task.output.count {
+    if task.output.items[index].anchor == low && task.output.items[index].cursor == high {
+      return true
+    }
+  }
+  if task.output.count == buffer.SelectionCapacity {
+    return false
+  }
+  task.output.items[task.output.count] = buffer.Selection{anchor: low, cursor: high}
+  task.output.count += 1
+  return true
+}

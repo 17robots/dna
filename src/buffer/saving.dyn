@@ -1,60 +1,111 @@
 use "../owned_arena" arena_owner
-// Save policies run as one undoable edit. A failed capacity check changes nothing.
+// Save policies run as one undoable edit built on the tree, so they cost
+// time proportional to the lines they touch, not a copy of the text.
 pub fn prepare_save(document: *Document, trim_whitespace: bool, final_newline: bool) bool {
   if !trim_whitespace && !final_newline {
     return true
   }
-  // The result is at most the text plus a final CRLF.
-  reserved := arena_owner.create((document.length + 3))
-  defer arena_owner.release(reserved)
-  output := mem.push_bytes_uninit(reserved, document.length + 3)
-  used: usize = 0
-  at: usize = 0
-  newline: []const u8 = "\n"
-  detected: bool = false
-  for at < document.length {
-    end := at
-    for end < document.length && document.bytes[end] != 10 {
-      end += 1
-    }
-    ending := end
-    crlf := ending > at && document.bytes[ending - 1] == 13
-    if crlf {
-      ending -= 1
-    }
-    if end < document.length && !detected {
-      if crlf {
-        newline = "\r\n"
-      }
-      detected = true
-    }
-    if trim_whitespace {
-      for ending > at && (document.bytes[ending - 1] == 32 || document.bytes[ending - 1] == 9) {
-        ending -= 1
-      }
-    }
-    for byte in document.bytes[at..ending] {
-      output[used] = byte
-      used += 1
-    }
-    if crlf {
-      output[used] = 13
-      used += 1
-    }
-    if end < document.length {
-      output[used] = 10
-      used += 1
-    }
-    at = end + 1
-  }
-  if final_newline && used > 0 && output[used - 1] != 10 {
-    if #len(newline) > Capacity - used {
+  // Trailing blanks to delete, as low/high pairs in ascending order. The
+  // first pass counts them, the second records them.
+  count := save_trims(document, trim_whitespace, nil)
+  edits: *usize = nil
+  if count > 0 {
+    edits = #cast(*usize, rope_malloc(count * 2 * #sizeof(usize)))
+    if edits == nil {
       return false
     }
-    for ending_byte in newline {
-      output[used] = ending_byte
-      used += 1
-    }
+    _ = save_trims(document, trim_whitespace, edits)
   }
-  return transform(document, output[..used])
+  appended := save_final_newline(document, final_newline, count, edits)
+  if count == 0 && #len(appended) == 0 {
+    return true
+  }
+  root := rope_retain(document.root)
+  if #len(appended) > 0 {
+    root = rope_replace(root, document.length, document.length, appended)
+  }
+  // Delete from the end so earlier offsets stay valid.
+  index := count
+  for index > 0 {
+    index -= 1
+    pair := edits[..count * 2][index * 2..index * 2 + 2]
+    root = rope_replace(root, pair[0], pair[1], "")
+  }
+  if edits != nil {
+    rope_free(#cast(rawptr, edits))
+  }
+  transform_root(document, root)
+  return true
+}
+// Count (and with edits, record) the runs of spaces and tabs ending each line
+// before its LF or CRLF, and ending the text.
+fn save_trims(document: *const Document, trim_whitespace: bool, edits: *usize) usize {
+  if !trim_whitespace {
+    return 0
+  }
+  count: usize = 0
+  // at: start of the current line; scan: where the search for its LF resumes.
+  at: usize = 0
+  scan: usize = 0
+  for at <= document.length {
+    // Line content ends at the next LF (before a CR) or at the end of text.
+    ending := document.length
+    found := scan < document.length
+    if found {
+      chunk := chunk_at(document, scan)
+      hit := find_byte(&chunk[0], 10, #len(chunk))
+      if hit == nil {
+        scan += #len(chunk)
+        continue
+      }
+      ending = scan + (#cast(usize, hit) - #cast(usize, &chunk[0]))
+    }
+    next := ending + 1
+    if ending > at && byte_at(document, ending - 1) == 13 {
+      ending -= 1
+    }
+    blank := ending
+    for blank > at && (byte_at(document, blank - 1) == 32 || byte_at(document, blank - 1) == 9) {
+      blank -= 1
+    }
+    if blank < ending {
+      if edits != nil {
+        edits[..(count + 1) * 2][count * 2] = blank
+        edits[..(count + 1) * 2][count * 2 + 1] = ending
+      }
+      count += 1
+    }
+    if !found {
+      break
+    }
+    at = next
+    scan = next
+  }
+  return count
+}
+// The line break to append for final_newline, in the document's own style,
+// or "" when the text (after trimming) already ends with one or is empty.
+fn save_final_newline(document: *const Document, final_newline: bool, count: usize, edits: *usize) []const u8 {
+  if !final_newline || document.length == 0 {
+    return ""
+  }
+  last := document.length
+  if count > 0 && edits[..count * 2][count * 2 - 1] == document.length {
+    last = edits[..count * 2][count * 2 - 2]
+  }
+  if last == 0 {
+    return ""
+  }
+  if byte_at(document, last - 1) == 10 {
+    return ""
+  }
+  // line_end may stop before a CR; find the LF itself.
+  first := line_end(document, 0)
+  for first < document.length && byte_at(document, first) != 10 {
+    first += 1
+  }
+  if first < document.length && first > 0 && byte_at(document, first - 1) == 13 {
+    return "\r\n"
+  }
+  return "\n"
 }

@@ -31,8 +31,8 @@ with tempfile.TemporaryDirectory(prefix='dna-fill-spans-') as directory:
  stage=Path(directory);names=['native_surface','native_clip','sdl_clear','sdl_fill','native_draw_alpha']
  if 'fn native_fill_span(' in SOURCE.read_text():names.append('native_fill_span')
  code='\n'.join(function(SOURCE,n) for n in names)
- if 'extern fn native_span_copy' in SOURCE.read_text():
-  code+='\n'+'\n'.join(x for x in SOURCE.read_text().splitlines() if x.startswith('extern fn native_span_'))
+ if (ROOT/'src/platform/memory_linux.dyn').is_file():
+  code+='\n'+'\n'.join(x for x in (ROOT/'src/platform/memory_linux.dyn').read_text().splitlines() if x.startswith('extern fn native_span_'))
  (stage/'main.dyn').write_text(HEADER+code+'\n'+REFERENCE.read_text())
  for mode in ('debug','release'):
   output=stage/(mode+'.so');subprocess.run(['python3',str(ROOT/'scripts/compile.py'),os.environ.get('DYN','dyn'),'build',str(stage),'--shared','--'+mode,'--output',str(output)],check=True)

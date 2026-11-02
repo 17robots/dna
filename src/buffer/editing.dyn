@@ -18,7 +18,7 @@ pub fn find_character(document: *Document, text: []const u8, backwards: bool, ti
     at = next(document, at)
   }
   for true {
-    if at + #len(text) <= document.length && equal(document.bytes[at..at + #len(text)], text) {
+    if at + #len(text) <= document.length && equal(range(document, at, at + #len(text)), text) {
       found += 1
       if found == count {
         destination := at
@@ -55,10 +55,10 @@ pub fn find_character(document: *Document, text: []const u8, backwards: bool, ti
 pub fn trim_selection(document: *Document) {
   low := start(document)
   high := end(document)
-  for low < high && (document.bytes[low] == 32 || document.bytes[low] == 9 || document.bytes[low] == 10 || document.bytes[low] == 13) {
+  for low < high && (byte_at(document, low) == 32 || byte_at(document, low) == 9 || byte_at(document, low) == 10 || byte_at(document, low) == 13) {
     low += 1
   }
-  for high > low && (document.bytes[high - 1] == 32 || document.bytes[high - 1] == 9 || document.bytes[high - 1] == 10 || document.bytes[high - 1] == 13) {
+  for high > low && (byte_at(document, high - 1) == 32 || byte_at(document, high - 1) == 9 || byte_at(document, high - 1) == 10 || byte_at(document, high - 1) == 13) {
     high -= 1
   }
   if document.cursor < document.anchor {
@@ -76,28 +76,34 @@ fn change_case_one(document: *Document, mode: u8) {
     high = next(document, high)
   }
   checkpoint(document)
-  changed: bool = false
   // ASCII case changes preserve byte lengths, line indexes and tracked marks.
-  // Edit in place instead of clearing a 1 MiB temporary for every selection.
+  size := high - low
+  output := #cast(*u8, rope_malloc(size + 1))
+  if output == nil {
+    #panic("cannot allocate case change")
+  }
+  changed: bool = false
   for at in low..high {
-    byte := document.bytes[at]
+    original := byte_at(document, at)
+    byte := original
     if byte >= 65 && byte <= 90 && mode != 2 {
       byte += 32
     }
     else if byte >= 97 && byte <= 122 && mode != 1 {
       byte -= 32
     }
-    if byte != document.bytes[at] {
-      if !changed {
-        before_change(document, low, high)
-      }
-      document.bytes[at] = byte
+    output[..size + 1][at - low] = byte
+    if byte != original {
       changed = true
     }
   }
   if changed {
+    root := rope_replace(rope_retain(document.root), low, high, output[..size])
+    before_change(document, low, high)
+    set_root(document, root)
     document.revision += 1
   }
+  rope_free(#cast(rawptr, output))
   document.anchor = low
   document.cursor = high
   checkpoint(document)
@@ -109,12 +115,12 @@ fn change_case_one(document: *Document, mode: u8) {
 fn indentation_removed(document: *const Document, at: usize, count: usize, width: usize) usize {
   remove: usize = 0
   for level in 0..count {
-    if at + remove < document.length && document.bytes[at + remove] == 9 {
+    if at + remove < document.length && byte_at(document, at + remove) == 9 {
       remove += 1
       continue
     }
     removed: usize = 0
-    for at + remove < document.length && removed < width && document.bytes[at + remove] == 32 {
+    for at + remove < document.length && removed < width && byte_at(document, at + remove) == 32 {
       remove += 1
       removed += 1
     }
@@ -129,7 +135,7 @@ fn indentation_removed(document: *const Document, at: usize, count: usize, width
 fn indent_lines_one(document: *Document, unindent: bool, count: usize, width: usize, tabs: bool) bool {
   low := line_start(document, start(document))
   last := end(document)
-  if last > low && document.bytes[last - 1] == 10 {
+  if last > low && byte_at(document, last - 1) == 10 {
     last -= 1
   }
   first_row := row_at(document, low)
@@ -143,7 +149,7 @@ fn indent_lines_one(document: *Document, unindent: bool, count: usize, width: us
   if tabs {
     spaces = count
   }
-  if !unindent && rows > (Capacity - document.length) / spaces {
+  if !unindent && rows > Capacity / spaces {
     return false
   }
   checkpoint(document)
@@ -210,74 +216,38 @@ fn indent_lines_one(document: *Document, unindent: bool, count: usize, width: us
   if unindent {
     changed_end += indentation_removed(document, changed_end, count, width)
   }
-  before_change(document, low, changed_end)
-  result_end := high
-  if unindent {
-    write := low
-    for row in first_row..=last_row {
-      at := row_start(document, row)
-      ending := high
-      if row < last_row {
-        ending = row_start(document, row + 1)
-      }
-      remove := indentation_removed(document, at, count, width)
-      if !line_fits(document, row, write) {
-        line_widen(document)
-      }
-      line_write(document, row, write)
-      size := ending - at - remove
-      if size > 0 && write != at + remove {
-        _ = move_bytes(&document.bytes[write], &document.bytes[at + remove], size)
-      }
-      write += size
-    }
-    result_end = write
-    if high < document.length && result_end != high {
-      _ = move_bytes(&document.bytes[result_end], &document.bytes[high], document.length - high)
-    }
-    document.length -= high - result_end
-  } else {
-    added := rows * spaces
-    result_end += added
-    if high < document.length {
-      _ = move_bytes(&document.bytes[result_end], &document.bytes[high], document.length - high)
-    }
-    row := last_row + 1
+  // Build the rewritten rows once, then swap them in as one tree edit.
+  capacity := high - low
+  if !unindent {
+    capacity += rows * spaces
+  }
+  output := #cast(*u8, rope_malloc(capacity + 1))
+  if output == nil {
+    #panic("cannot allocate indentation")
+  }
+  written: usize = 0
+  for row in first_row..=last_row {
+    at := row_start(document, row)
     ending := high
-    for row > first_row {
-      row -= 1
-      at := row_start(document, row)
-      destination := at + (row - first_row) * spaces
-      if !line_fits(document, row, destination) {
-        line_widen(document)
-      }
-      line_write(document, row, destination)
-      if ending > at {
-        _ = move_bytes(&document.bytes[destination + spaces], &document.bytes[at], ending - at)
-      }
-      _ = copy_bytes(&document.bytes[destination], &padding[0], spaces)
-      ending = at
+    if row < last_row {
+      ending = row_start(document, row + 1)
     }
-    document.length += added
-  }
-  document.bytes[document.length] = 0
-  record_text_storage(document)
-  // Newline count and row order are unchanged. Shift the unselected suffix
-  // once, leaving every prefix index untouched. Widen before a packed write
-  // overflows; fixed block bases leave unread source offsets intact.
-  for row in last_row + 1..document.line_count {
-    offset := row_start(document, row)
-    if result_end >= high {
-      offset += result_end - high
+    if unindent {
+      at += indentation_removed(document, at, count, width)
     } else {
-      offset -= high - result_end
+      _ = copy_bytes(&output[..capacity + 1][written], &padding[0], spaces)
+      written += spaces
     }
-    if !line_fits(document, row, offset) {
-      line_widen(document)
+    if ending > at {
+      rope_copy(document.root, at, ending, &output[..capacity + 1][written])
+      written += ending - at
     }
-    line_write(document, row, offset)
   }
-  record_line_storage(document)
+  root := rope_replace(rope_retain(document.root), low, high, output[..written])
+  rope_free(#cast(rawptr, output))
+  before_change(document, low, changed_end)
+  set_root(document, root)
+  result_end := low + written
   for marker in 0..MarkCount {
     document.marks[marker] = row_start(document, positions[marker].row) + positions[marker].column
   }
@@ -305,12 +275,12 @@ fn join_lines_one(document: *Document) {
   }
   checkpoint(document)
   for at < high && at < document.length {
-    if document.bytes[at] != 10 {
+    if byte_at(document, at) != 10 {
       at = next(document, at)
       continue
     }
     after := at + 1
-    for after < document.length && (document.bytes[after] == 32 || document.bytes[after] == 9) {
+    for after < document.length && (byte_at(document, after) == 32 || byte_at(document, after) == 9) {
       after += 1
     }
     document.anchor = at
@@ -379,7 +349,7 @@ fn batch_lines(document: *Document, operation: u8, mode: u8, repeats: usize, wid
     }
     if operation == 1 {
       entry.low = line_start(document, entry.low)
-      if entry.high > entry.low && document.bytes[entry.high - 1] == 10 {
+      if entry.high > entry.low && byte_at(document, entry.high - 1) == 10 {
         entry.high -= 1
       }
       entry.high = line_end(document, entry.high)
@@ -445,7 +415,7 @@ fn batch_lines(document: *Document, operation: u8, mode: u8, repeats: usize, wid
           rows += 1
         }
       }
-      if rows > (Capacity - document.length) / (repeats * level) {
+      if rows > Capacity / (repeats * level) {
         return false
       }
     }

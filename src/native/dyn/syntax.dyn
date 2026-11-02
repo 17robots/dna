@@ -15,10 +15,16 @@ struct SyntaxChange { revision: u64, low, old_high, high, old_length, row, colum
 struct SyntaxWorker {
   name: [65]u8, library, parser, query, published, objects: rawptr,
   query_predicates, object_predicates: *Predicates,
-  ranges: [1024]SyntaxRange, object_count: u32,
+  // Text-object ranges of the published tree: object_count SyntaxRange
+  // entries in byte storage, swapped in whole like colors.
+  ranges: []u8, object_count: u32,
   thread, mutex, wake: rawptr, stopping, pending, ready, retry: bool, indent: u32,
   text: []u8, length: u32, revision, finished: u64,
   change: SyntaxChange, has_change: bool,
+  stream: SyntaxStream, stream_pending: bool,
+  // Bytes the published tree covers: the whole document, also for streamed
+  // windows whose colors cover less.
+  tree_length: u32,
   colors: []u8, cancel: sync.AtomicU32, small_revisions: u32,
 }
 struct SyntaxInput { text: []u8, length: u32, revision: u64 }
@@ -38,6 +44,7 @@ extern fn syntax_query_new "ts_query_new"(language: rawptr, source: *const u8, l
 extern fn syntax_query_delete "ts_query_delete"(query: rawptr)
 extern fn syntax_cursor_new "ts_query_cursor_new"() rawptr
 extern fn syntax_cursor_delete "ts_query_cursor_delete"(cursor: rawptr)
+extern fn syntax_cursor_range "ts_query_cursor_set_byte_range"(cursor: rawptr, start: u32, end: u32)
 extern fn syntax_cursor_limit "ts_query_cursor_set_match_limit"(cursor: rawptr, limit: u32)
 extern fn syntax_cursor_exceeded "ts_query_cursor_did_exceed_match_limit"(cursor: rawptr) bool
 extern fn syntax_cursor_exec "ts_query_cursor_exec_with_options"(cursor: rawptr, query: rawptr, node: TsNode, options: *const SyntaxQueryOptions)
@@ -56,11 +63,6 @@ fn syntax_trylock(lock: rawptr) i32 {
   return 16
 }
 extern fn syntax_fill "memset"(output: *u8, byte: i32, length: usize) rawptr
-extern fn syntax_dlopen "dlopen"(path: *const u8, flags: i32) rawptr
-extern fn syntax_dlclose "dlclose"(library: rawptr) i32
-extern fn syntax_dladdr "dladdr"(address: rawptr, info: *SyntaxLibraryInfo) i32
-extern fn syntax_realpath "realpath"(path: *const u8, output: *u8) *u8
-extern fn syntax_access "access"(path: *const u8, mode: i32) i32
 extern fn syntax_atoi "atoi"(text: *const u8) i32
 syntax_memory_once: sync.Once = sync.Once{}
 syntax_retire_thread: rawptr = nil
@@ -209,7 +211,9 @@ fn syntax_worker(context: rawptr) i32 {
   previous := #cast(*SyntaxInput, dna_memory_calloc(1, #sizeof(SyntaxInput), 0))
   scratch_empty: [0]u8 = []
   scratch_colors: []u8 = scratch_empty[..]
+  scratch_ranges: []u8 = scratch_empty[..]
   retained: rawptr = nil
+  stream_cache := SyntaxStreamCache{}
   if input == nil || previous == nil {
     dna_memory_free(#cast(rawptr, input))
     dna_memory_free(#cast(rawptr, previous))
@@ -221,9 +225,25 @@ fn syntax_worker(context: rawptr) i32 {
       rec_wait(worker.wake, worker.mutex)
     }
     if worker.stopping {
+      syntax_stream_drop(worker)
       rec_unlock(worker.mutex)
       break
     }
+    if worker.stream_pending {
+      request := worker.stream
+      worker.stream_pending = false
+      worker.pending = false
+      sync.store_u32(&worker.cancel, 0)
+      rec_unlock(worker.mutex)
+      syntax_tree_delete(retained)
+      retained = nil
+      syntax_stream_run(worker, &request, &stream_cache)
+      request.done(request.context)
+      rec_notify()
+      continue
+    }
+    syntax_tree_delete(stream_cache.tree)
+    stream_cache = SyntaxStreamCache{}
     if !syntax_reserve(&input.text, #cast(usize, worker.length)) || !syntax_reserve(&previous.text, #cast(usize, worker.length)) || !syntax_reserve(&scratch_colors, #cast(usize, worker.length)) {
       worker.pending = false
       // The UI resubmits unfinished revisions; transient OOM must not suppress
@@ -328,20 +348,18 @@ fn syntax_worker(context: rawptr) i32 {
     } else {
       syntax_parser_reset(worker.parser)
     }
-    ranges: [1024]SyntaxRange = []
     object_count: u32 = 0
     if tree != nil && worker.objects != nil {
       cursor := syntax_cursor_new()
       if cursor != nil {
-        syntax_cursor_limit(cursor, 4096)
+        syntax_cursor_limit(cursor, 4294967295)
         query_options := SyntaxQueryOptions{payload: #cast(rawptr, &deadline), progress: syntax_query_progress}
         syntax_cursor_exec(cursor, worker.objects, syntax_root(tree), &query_options)
         match := TsMatch{}
         capture: u32 = 0
-        visits: u32 = 0
         names: [8][]const u8 = ["function.inside", "function.around", "class.inside", "class.around", "parameter.inside", "parameter.around", "comment.inside", "comment.around"]
-        for object_count < 1024 && visits < 32768 && !syntax_cooperate(&deadline) && syntax_cursor_next(cursor, &match, &capture) {
-          visits += 1
+        // Every object in the document: lookups may start anywhere.
+        for complete && !syntax_cooperate(&deadline) && syntax_cursor_next(cursor, &match, &capture) {
           if !predicates_pass(worker.object_predicates, &match, &input.text[0], input.length) {
             continue
           }
@@ -350,7 +368,12 @@ fn syntax_worker(context: rawptr) i32 {
           name := syntax_capture_name(worker.objects, entry.index, &size)
           for kind in 0..8 {
             if pred_equal(names[kind], name[..size]) {
-              ranges[object_count] = SyntaxRange{start: pred_start(entry.node), end: pred_end(entry.node), kind: #cast(u32, kind)}
+              if !syntax_reserve(&scratch_ranges, (#cast(usize, object_count) + 1) * #sizeof(SyntaxRange)) {
+                // Like any allocation failure: retry this revision later.
+                complete = false
+                break
+              }
+              #cast(*SyntaxRange, &scratch_ranges[0])[..#cast(usize, object_count) + 1][object_count] = SyntaxRange{start: pred_start(entry.node), end: pred_end(entry.node), kind: #cast(u32, kind)}
               object_count += 1
               break
             }
@@ -370,7 +393,9 @@ fn syntax_worker(context: rawptr) i32 {
     rec_lock(worker.mutex)
     if worker.revision == input.revision && complete && sync.load_u32(&worker.cancel) == 0 {
       worker.object_count = object_count
-      _ = copy(#cast(*u8, &worker.ranges[0]), #cast(*const u8, &ranges[0]), #cast(usize, object_count) * #sizeof(SyntaxRange))
+      spare_ranges := worker.ranges
+      worker.ranges = scratch_ranges
+      scratch_ranges = spare_ranges
       spare_colors := worker.colors
       worker.colors = scratch_colors
       scratch_colors = spare_colors
@@ -379,6 +404,7 @@ fn syntax_worker(context: rawptr) i32 {
       if tree != nil {
         worker.published = syntax_tree_copy(tree)
       }
+      worker.tree_length = input.length
       // Parsing and queries have finished; no reader retains these byte slices.
       // The mutex also protects published colors and the UI's pending text.
       if syntax_oversized(input.text, #cast(usize, input.length)) || syntax_oversized(previous.text, #cast(usize, previous.length)) || syntax_oversized(scratch_colors, #cast(usize, input.length)) || syntax_oversized(worker.text, #cast(usize, worker.length)) || syntax_oversized(worker.colors, #cast(usize, input.length)) {
@@ -405,9 +431,11 @@ fn syntax_worker(context: rawptr) i32 {
     rec_unlock(worker.mutex)
   }
   syntax_tree_delete(retained)
+  syntax_tree_delete(stream_cache.tree)
   syntax_buffer_free(previous.text)
   syntax_buffer_free(input.text)
   syntax_buffer_free(scratch_colors)
+  syntax_buffer_free(scratch_ranges)
   dna_memory_free(#cast(rawptr, previous))
   dna_memory_free(#cast(rawptr, input))
   return 0
@@ -445,14 +473,15 @@ fn syntax_put(output: []u8, used: *usize, text: []const u8) bool {
   used.* += #len(text)
   return true
 }
-fn syntax_path(output: []u8, root: *const u8, name: *const u8, leaf: []const u8) bool {
+fn syntax_path(output: []u8, directory: *const u8, leaf: []const u8) bool {
   used: usize = 0
-  if !syntax_put(output, &used, root[..string_length(root)]) || !syntax_put(output, &used, "/") || !syntax_put(output, &used, name[..string_length(name)]) || !syntax_put(output, &used, "/") || !syntax_put(output, &used, leaf) {
+  if !syntax_put(output, &used, directory[..string_length(directory)]) || !syntax_put(output, &used, "/") || !syntax_put(output, &used, leaf) {
     return false
   }
   output[used] = 0
   return true
 }
+
 fn syntax_list_matches(bytes: []const u8, name: []const u8) bool {
   start: usize = 0
   for i in 0..=#len(bytes) {
@@ -480,6 +509,7 @@ fn syntax_release(worker: *SyntaxWorker) {
   }
   syntax_buffer_free(worker.text)
   syntax_buffer_free(worker.colors)
+  syntax_buffer_free(worker.ranges)
   dna_memory_free(#cast(rawptr, worker))
 }
 fn syntax_open(root: *const u8, filename: *const u8, selected: *const u8) *SyntaxWorker {
@@ -490,7 +520,7 @@ fn syntax_open(root: *const u8, filename: *const u8, selected: *const u8) *Synta
   file := filename[..string_length(filename)]
   base: usize = 0
   for i in 0..#len(file) {
-    if file[i] == 47 {
+    if rec_path_separator(file[i]) {
       base = i + 1
     }
   }
@@ -521,19 +551,24 @@ fn syntax_open(root: *const u8, filename: *const u8, selected: *const u8) *Synta
     path: [4096]u8 = []
     extensions: [1024]u8 = []
     name := &entry.name[0]
+    package: [4096]u8 = []
+    version_directory: [4096]u8 = []
+    if !install_path(package[..], install_text(root), "/", install_text(name), "") || dna_language_resolve_directory(&package[0], &version_directory[0], #len(version_directory)) < 0 {
+      continue
+    }
     if selected != nil {
       if search_compare(name, selected) != 0 {
         continue
       }
     } else {
       matches := false
-      if syntax_path(path[..], root, name, "filenames") {
+      if syntax_path(path[..], &version_directory[0], "filenames") {
         length := syntax_readfile(&path[0], &extensions[0], 1024)
         if length >= 0 {
           matches = syntax_list_matches(extensions[..#cast(usize, length)], file[base..])
         }
       }
-      if !matches && extension <= #len(file) && syntax_path(path[..], root, name, "extensions") {
+      if !matches && extension <= #len(file) && syntax_path(path[..], &version_directory[0], "extensions") {
         length := syntax_readfile(&path[0], &extensions[0], 1024)
         if length >= 0 {
           matches = syntax_list_matches(extensions[..#cast(usize, length)], file[extension..])
@@ -543,7 +578,7 @@ fn syntax_open(root: *const u8, filename: *const u8, selected: *const u8) *Synta
         continue
       }
     }
-    if !syntax_path(path[..], root, name, "parser.so") {
+    if !syntax_path(path[..], &version_directory[0], "parser.so") {
       continue
     }
     library := syntax_dlopen(&path[0], 2)
@@ -574,7 +609,7 @@ fn syntax_open(root: *const u8, filename: *const u8, selected: *const u8) *Synta
     worker.parser = syntax_parser_new()
     query := #cast(*u8, dna_memory_alloc(262144, 0))
     length: i32 = -1
-    if query != nil && syntax_path(path[..], root, name, "highlights.scm") {
+    if query != nil && syntax_path(path[..], &version_directory[0], "highlights.scm") {
       length = syntax_readfile(&path[0], query, 262144)
     }
     offset: u32 = 0
@@ -583,7 +618,7 @@ fn syntax_open(root: *const u8, filename: *const u8, selected: *const u8) *Synta
       worker.query = syntax_query_new(language(), query, #cast(u32, length), &offset, &error)
     }
     object_length: i32 = -1
-    if query != nil && syntax_path(path[..], root, name, "textobjects.scm") {
+    if query != nil && syntax_path(path[..], &version_directory[0], "textobjects.scm") {
       object_length = syntax_readfile(&path[0], query, 262144)
     }
     if object_length > 0 {
@@ -610,7 +645,7 @@ fn syntax_open(root: *const u8, filename: *const u8, selected: *const u8) *Synta
     }
     indentation: [16]u8 = []
     worker.indent = 4
-    if syntax_path(path[..], root, name, "indent") && syntax_readfile(&path[0], &indentation[0], 16) > 0 {
+    if syntax_path(path[..], &version_directory[0], "indent") && syntax_readfile(&path[0], &indentation[0], 16) > 0 {
       width := syntax_atoi(&indentation[0])
       if width >= 1 && width <= 16 {
         worker.indent = #cast(u32, width)
@@ -665,6 +700,7 @@ pub fn dna_syntax_update_changed(worker: *SyntaxWorker, text: *const u8, length:
       rec_unlock(worker.mutex)
       return
     }
+    syntax_stream_drop(worker)
     _ = copy(&worker.text[0], text, #cast(usize, length))
     worker.has_change = change != nil
     if change != nil {
@@ -678,6 +714,41 @@ pub fn dna_syntax_update_changed(worker: *SyntaxWorker, text: *const u8, length:
     sync.store_u32(&worker.cancel, 1)
     rec_signal(worker.wake)
   }
+  rec_unlock(worker.mutex)
+}
+// Two-step update for callers whose text is not contiguous: begin reserves
+// and returns the worker's text buffer with its lock held (nil when no update
+// is needed, lock released); the caller fills length bytes, then commit
+// publishes the revision and releases the lock.
+pub fn dna_syntax_update_begin(worker: *SyntaxWorker, length: u32, revision: u64) *u8 {
+  if length >= 16777216 {
+    return nil
+  }
+  rec_lock(worker.mutex)
+  if worker.revision != revision || worker.retry || (!worker.ready && !worker.pending && worker.revision == 0) {
+    if #cast(usize, length) + 1 > #len(worker.text) / 4 {
+      worker.small_revisions = 0
+    }
+    if syntax_reserve(&worker.text, #cast(usize, length)) && syntax_reserve(&worker.colors, #cast(usize, length)) {
+      return &worker.text[0]
+    }
+  }
+  rec_unlock(worker.mutex)
+  return nil
+}
+pub fn dna_syntax_update_commit(worker: *SyntaxWorker, length: u32, revision: u64, change: *const SyntaxChange) {
+  syntax_stream_drop(worker)
+  worker.has_change = change != nil
+  if change != nil {
+    worker.change = change.*
+  }
+  worker.length = length
+  worker.revision = revision
+  worker.pending = true
+  worker.retry = false
+  worker.ready = false
+  sync.store_u32(&worker.cancel, 1)
+  rec_signal(worker.wake)
   rec_unlock(worker.mutex)
 }
 pub fn dna_syntax_colors(worker: *SyntaxWorker, output: *u8, length: u32, revision: u64) i32 {
@@ -700,6 +771,7 @@ pub fn dna_syntax_close(worker: *SyntaxWorker) {
   }
   rec_lock(worker.mutex)
   worker.stopping = true
+  syntax_stream_drop(worker)
   sync.store_u32(&worker.cancel, 1)
   rec_signal(worker.wake)
   rec_unlock(worker.mutex)
@@ -740,12 +812,8 @@ pub fn dna_syntax_retire(worker: *SyntaxWorker) i32 {
   return 1
 }
 fn syntax_installed_path(relative: []const u8, output: *u8, capacity: usize) i32 {
-  info := SyntaxLibraryInfo{}
-  if syntax_dladdr(#cast(rawptr, dna_syntax_open), &info) == 0 {
-    return 0
-  }
   path: [4096]u8 = []
-  if syntax_realpath(info.filename, &path[0]) == nil {
+  if !syntax_module_path(&path[0], #len(path)) {
     return 0
   }
   slash: usize = 0
@@ -762,20 +830,20 @@ fn syntax_installed_path(relative: []const u8, output: *u8, capacity: usize) i32
   // dladdr names the native library in shared builds and the editor itself
   // in static builds. Resolve package and development layouts from that file,
   // never from the current project directory.
-  for prefix in ["/../", "/deps/install/", "/build/deps/install/"] {
+  for prefix in ["/", "/../", "/../bin/", "/deps/install/", "/build/deps/install/"] {
     used: usize = 0
     if !syntax_put(output[..capacity], &used, path[..slash]) || !syntax_put(output[..capacity], &used, prefix) || !syntax_put(output[..capacity], &used, relative) {
       return 0
     }
     output[..capacity][used] = 0
-    if syntax_access(output, 4) == 0 {
+    if syntax_readable(output) {
       return 1
     }
   }
   return 0
 }
 pub fn dna_language_helper(output: *u8, capacity: usize) i32 {
-  return syntax_installed_path("bin/dna-language", output, capacity)
+  return syntax_installed_path(syntax_helper_name(), output, capacity)
 }
 pub fn dna_language_registry(output: *u8, capacity: usize) i32 {
   return syntax_installed_path("share/dna/languages.toml", output, capacity)
@@ -791,7 +859,7 @@ pub fn dna_syntax_select(worker: *SyntaxWorker, revision: u64, low: u32, high: u
     return 0
   }
   tree: rawptr = nil
-  if worker.ready && worker.finished == revision && high <= worker.length && worker.published != nil {
+  if worker.ready && worker.finished == revision && high <= worker.tree_length && worker.published != nil {
     tree = syntax_tree_copy(worker.published)
   }
   rec_unlock(worker.mutex)
@@ -830,19 +898,24 @@ pub fn dna_syntax_object(worker: *SyntaxWorker, revision: u64, low: u32, high: u
   if syntax_trylock(worker.mutex) != 0 {
     return 0
   }
-  ok := worker.ready && worker.finished == revision && high <= worker.length
+  ok := worker.ready && worker.finished == revision && high <= worker.tree_length
   previous_start: u32 = 0
   previous_end: u32 = 0
   current_low := low
   current_high := high
+  none: [0]SyntaxRange = []
+  ranges: []SyntaxRange = none[..]
+  if worker.object_count > 0 {
+    ranges = #cast(*SyntaxRange, &worker.ranges[0])[..#cast(usize, worker.object_count)]
+  }
   for step in 0..count {
     if !ok {
       break
     }
     found: i32 = -1
     width: u32 = 4294967295
-    for i in 0..worker.object_count {
-      range := worker.ranges[i]
+    for i in 0..#len(ranges) {
+      range := ranges[i]
       if range.kind != kind || range.start > current_low || range.end < current_high || (step > 0 && range.start == previous_start && range.end == previous_end) {
         continue
       }
@@ -855,9 +928,9 @@ pub fn dna_syntax_object(worker: *SyntaxWorker, revision: u64, low: u32, high: u
       ok = false
       break
     }
-    current_low = worker.ranges[#cast(usize, found)].start
+    current_low = ranges[#cast(usize, found)].start
     previous_start = current_low
-    current_high = worker.ranges[#cast(usize, found)].end
+    current_high = ranges[#cast(usize, found)].end
     previous_end = current_high
   }
   if ok {

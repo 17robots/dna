@@ -56,17 +56,35 @@ fn draw_chrome(renderer: rawptr, app: *App, typography: *Typography, width: i32,
     if app.view.status_line {
       bottom -= typography.line
     }
-    draw_gutter(doc, typography, margin + gutter, margin, bottom, scroll_y, app.view.relative_numbers, position)
+    draw_gutter(doc, typography, margin + gutter, margin, bottom, scroll_y, app.view.relative_numbers, position, app.documents.slots[app.documents.active].git)
   }
   if app.view.status_line {
     draw_status(renderer, app, typography, width, height, margin, current, position)
   }
 }
 
-fn draw_gutter(doc: *const buffer.Document, typography: *Typography, right: f32, top: f32, bottom: f32, scroll_y: f32, relative: bool, position: usize) {
+// Git markers sit in the gap between the numbers and the text.
+fn draw_git_sign(typography: *Typography, kind: u8, x: f32, y: f32) {
+  text: []const u8 = "▎"
+  color := theme().syntax_string
+  if kind == GitModified {
+    color = theme().diagnostic_warning
+  } else if kind == GitDeleted {
+    text = "▔"
+    color = theme().diagnostic_error
+  }
+  if !tint(typography.chrome, color) || !ttf.set(typography.chrome, &text[0], #len(text)) || !ttf.draw(typography.chrome, x, y) {
+    #panic("git sign draw failed")
+  }
+}
+fn draw_gutter(doc: *const buffer.Document, typography: *Typography, right: f32, top: f32, bottom: f32, scroll_y: f32, relative: bool, position: usize, diff: *const GitDiff) {
   current := line_at(doc, position)
   first := #cast(usize, (scroll_y / typography.line))
   row := first + 1
+  // Hunks are in row order; each covers its rows, a deletion the one row
+  // it precedes.
+  hunk: usize = 0
+  hunks := git_current(diff, doc)
   y := top + #cast(f32, first) * typography.line - scroll_y
   for true {
     if y >= bottom {
@@ -86,6 +104,19 @@ fn draw_gutter(doc: *const buffer.Document, typography: *Typography, right: f32,
       add_number(label[..], &length, number)
       x := right - (#cast(f32, length) + 2.0) * typography.cell
       chrome_text(typography, label[..length], x, y, row == current)
+      if hunks {
+        index := row - 1
+        for hunk < diff.hunk_count && git_hunk_end(diff.hunks[hunk]) <= index {
+          hunk += 1
+        }
+        if hunk < diff.hunk_count {
+          item := diff.hunks[hunk]
+          // A deletion after the last line shows on the last line.
+          if item.first <= index || (row >= doc.line_count && item.kind == GitDeleted) {
+            draw_git_sign(typography, item.kind, right - 1.75 * typography.cell, y)
+          }
+        }
+      }
     }
     if row >= doc.line_count {
       break

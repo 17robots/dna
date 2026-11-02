@@ -1,6 +1,5 @@
 use "../host"
 #link("dna_native")
-#link("c")
 // Terminal backend behind the platform and text APIs. DNA keeps laying out in
 // "pixels": every terminal cell is CellWidth x CellHeight of them, so the
 // editor's UI code runs unchanged. Fills paint cell backgrounds; thin
@@ -51,6 +50,7 @@ struct Tui {
   // Drawing into a popup texture goes straight to the grid; only clears skip.
   texture_target: bool,
   text_input: bool,
+  key_text_input: bool,
   // Insert-mode bar cursor drawn this frame, or -1; block for terminal panes.
   bar_column: i32,
   bar_row: i32,
@@ -1102,8 +1102,12 @@ fn queue_key(key: u32, modifiers: u16, character: u32) {
   key_event.scancode = character
   queue(event)
 }
+// Typed text is queued whatever the text-input state is when it is parsed:
+// one read can hold a key that starts text input (O, :) and the text after
+// it. take delivers it only if text input was on when its key was taken.
+const PendingText: u64 = 0x10303
 fn queue_text(bytes: []const u8) {
-  if !state.text_input || #len(bytes) == 0 || #len(bytes) >= 256 {
+  if #len(bytes) == 0 || #len(bytes) >= 256 {
     return
   }
   slot_index := state.text_next
@@ -1114,8 +1118,8 @@ fn queue_text(bytes: []const u8) {
   state.texts[slot_index][#len(bytes)] = 0
   event := Event{}
   text := #cast(*TextEvent, &event)
-  text.kind = 771
   text.text = &state.texts[slot_index][0]
+  event.words[0] = (event.words[0] & 0xFFFFFFFF00000000) | PendingText
   queue(event)
 }
 // A typed character: a key event, then text while text input is on.
@@ -1618,12 +1622,21 @@ fn read_input(timeout: i32) i32 {
   return count
 }
 fn take(event: *Event) bool {
-  if state.event_count == 0 {
-    return false
+  for {
+    if state.event_count == 0 {
+      return false
+    }
+    event.* = state.events[state.event_head]
+    state.event_head = (state.event_head + 1) % 64
+    state.event_count -= 1
+    if (event.words[0] & 4294967295) != PendingText {
+      break
+    }
+    if state.key_text_input {
+      event.words[0] = (event.words[0] & 0xFFFFFFFF00000000) | 771
+      break
+    }
   }
-  event.* = state.events[state.event_head]
-  state.event_head = (state.event_head + 1) % 64
-  state.event_count -= 1
   if (event.words[0] & 4294967295) == 768 {
     key := #cast(*KeyEvent, event)
     if key.scancode != 0 {
@@ -1633,6 +1646,9 @@ fn take(event: *Event) bool {
       state.last_character = 0
     }
     key.scancode = 0
+    // The key's text follows it; it counts as typed only if text input was
+    // already on when the key was handed out, before the key could change it.
+    state.key_text_input = state.text_input
   }
   return true
 }

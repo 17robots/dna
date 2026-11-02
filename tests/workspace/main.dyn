@@ -39,6 +39,47 @@ fn main() {
   if !reloaded.buffers[0].reload || !buffer.equal(reloaded.buffers[0].path, "/tmp/big.log") || !buffer.equal(reloaded.buffers[0].filetype, "log") || reloaded.buffers[0].cursor != 900 || reloaded.buffers[0].anchor != 12 || #len(reloaded.buffers[0].text) != 0 {
     #panic("reload entry fields")
   }
+  // Unsaved edits of a reloaded file travel as one stamped patch.
+  reload.buffers[0].patched = true
+  reload.buffers[0].patch_low = 7
+  reload.buffers[0].patch_high = 9
+  reload.buffers[0].patch = "αβ\n"
+  reload.buffers[0].stamp = [11, 12, 13, 14]
+  reload_length = workspace.encode(&reload, reload_bytes[..])
+  if reload_length == 0 || reload_length != workspace.encoded_size(&reload) || !workspace.decode(reload_bytes[..reload_length], &reloaded) {
+    #panic("patched reload roundtrip")
+  }
+  patched := &reloaded.buffers[0]
+  if !patched.reload || !patched.patched || patched.patch_low != 7 || patched.patch_high != 9 || !buffer.equal(patched.patch, "αβ\n") || patched.stamp[0] != 11 || patched.stamp[3] != 14 || patched.cursor != 900 {
+    #panic("patched reload fields")
+  }
+  for cut in 0..reload_length {
+    if workspace.decode(reload_bytes[..cut], &reloaded) {
+      #panic("truncated patched reload accepted")
+    }
+  }
+  // Edits far apart travel as pieces of the file plus literal bytes.
+  records: [72]u8 = []
+  words: [9]usize = [1, 0, 3, 0, 0, 300000000, 1, 3, 4]
+  for word in 0..9 {
+    for byte in 0..8 {
+      records[word * 8 + byte] = #cast(u8, (words[word] >> (byte * 8)) & 255)
+    }
+  }
+  reload.buffers[0].pieces = records[..]
+  reload.buffers[0].patch = "AAA\nZZZ"
+  reload_length = workspace.encode(&reload, reload_bytes[..])
+  if reload_length == 0 || reload_length != workspace.encoded_size(&reload) {
+    #panic("piece reload sizing")
+  }
+  if !workspace.decode(reload_bytes[..reload_length], &reloaded) {
+    #panic("piece reload roundtrip")
+  }
+  if #len(reloaded.buffers[0].pieces) != 72 || !buffer.equal(reloaded.buffers[0].patch, "AAA\nZZZ") {
+    #panic("piece reload fields")
+  }
+  reload.buffers[0].pieces = records[..0]
+  reload.buffers[0].patched = false
   reload.buffers[0].path = "relative.log"
   reload_length = workspace.encode(&reload, reload_bytes[..])
   if workspace.decode(reload_bytes[..reload_length], &reloaded) {

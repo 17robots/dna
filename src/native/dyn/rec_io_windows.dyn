@@ -1,0 +1,465 @@
+#target(kernel: windows)
+#link("kernel32")
+#link("advapi32")
+#link("ucrt")
+use "./filesystem" win_io_files
+use "./host" win_io_host
+use "std/dynlib" win_io_loader
+
+// Shared service policy uses Linux flags and errno values. Windows handles
+// enter the CRT descriptor table once, without inheritance or text conversion.
+// A successful adoption transfers ownership to _close; failure closes here.
+extern fn win_io_crt_adopt "_open_osfhandle"(handle: isize, flags: i32) i32
+extern fn win_io_crt_handle "_get_osfhandle"(fd: i32) isize
+extern fn win_io_crt_close "_close"(fd: i32) i32
+extern fn win_io_crt_errno "_errno"() *i32
+extern fn win_io_crt_environment "getenv"(name: *const u8) *u8
+use "std/sync" win_io_sync
+struct WinIOInformation { attributes: u32, times: [6]u32, volume, size_high, size_low, links, index_high, index_low: u32 }
+struct WinIOAPI {
+  create: fn(*const u16, u32, u32, rawptr, u32, u32, rawptr) rawptr,
+  close: fn(rawptr) i32,
+  error: fn() u32,
+  write: fn(rawptr, *const u8, u32, *u32, rawptr) i32,
+  flush: fn(rawptr) i32,
+  move: fn(*const u16, *const u16, u32) i32,
+  rename:fn(rawptr, u32, rawptr, u32)i32,
+  delete: fn(*const u16) i32,
+  reopen: fn(rawptr, u32, u32, u32) rawptr,
+  type: fn(rawptr) u32,
+  info: fn(rawptr, *WinIOInformation) i32,
+  random: fn(*u8, u32) u8,
+  load: fn(*const u16) rawptr,
+}
+win_io_api: WinIOAPI
+win_io_once: win_io_sync.Once
+fn win_io_symbol(library: rawptr, name: []const u8) rawptr {
+  result := win_io_loader.symbol(library, name)
+  if !result.ok || result.value == nil {
+    #panic("missing Windows IO routine")
+  }
+  return result.value
+}
+fn win_io_prepare() {
+  if win_io_sync.once_begin(&win_io_once) {
+    // Known ASCII system library names use the SDK loader. User-supplied DLL
+    // paths below use LoadLibraryW instead of the SDK's narrow loader wrapper.
+    kernel := win_io_loader.open("kernel32.dll", 0)
+    security := win_io_loader.open("advapi32.dll", 0)
+    if !kernel.ok || !security.ok {
+      #panic("missing Windows IO system library")
+    }
+    win_io_api.create = #cast(fn(*const u16, u32, u32, rawptr, u32, u32, rawptr) rawptr, win_io_symbol(kernel.value, "CreateFileW"))
+    win_io_api.close = #cast(fn(rawptr) i32, win_io_symbol(kernel.value, "CloseHandle"))
+    win_io_api.error = #cast(fn() u32, win_io_symbol(kernel.value, "GetLastError"))
+    win_io_api.write = #cast(fn(rawptr, *const u8, u32, *u32, rawptr) i32, win_io_symbol(kernel.value, "WriteFile"))
+    win_io_api.flush = #cast(fn(rawptr) i32, win_io_symbol(kernel.value, "FlushFileBuffers"))
+    win_io_api.move = #cast(fn(*const u16, *const u16, u32) i32, win_io_symbol(kernel.value, "MoveFileExW"))
+    win_io_api.rename=#cast(fn(rawptr, u32, rawptr, u32)i32, win_io_symbol(kernel.value, "SetFileInformationByHandle"))
+    win_io_api.delete = #cast(fn(*const u16) i32, win_io_symbol(kernel.value, "DeleteFileW"))
+    win_io_api.reopen = #cast(fn(rawptr, u32, u32, u32) rawptr, win_io_symbol(kernel.value, "ReOpenFile"))
+    win_io_api.type = #cast(fn(rawptr) u32, win_io_symbol(kernel.value, "GetFileType"))
+    win_io_api.info = #cast(fn(rawptr, *WinIOInformation) i32, win_io_symbol(kernel.value, "GetFileInformationByHandle"))
+    win_io_api.random = #cast(fn(*u8, u32) u8, win_io_symbol(security.value, "SystemFunction036"))
+    win_io_api.load = #cast(fn(*const u16) rawptr, win_io_symbol(kernel.value, "LoadLibraryW"))
+    win_io_sync.once_complete(&win_io_once)
+  }
+}
+
+fn rec_errno() *i32 {
+  return win_io_crt_errno()
+}
+fn rec_retry() bool {
+  return rec_errno().* == 11
+}
+fn win_io_fail(code: u32) i32 {
+  error: i32 = 5
+  if code == 2 || code == 3 || code == 15 {
+    error = 2
+  } else if code == 5 || code == 32 || code == 33 {
+    error = 13
+  } else if code == 6 {
+    error = 9
+  } else if code == 8 || code == 14 {
+    error = 12
+  } else if code == 80 || code == 183 {
+    error = 17
+  } else if code == 87 || code == 123 {
+    error = 22
+  } else if code == 109 || code == 232 {
+    error = 32
+  } else if code == 112 {
+    error = 28
+  } else if code == 206 {
+    error = 36
+  } else if code == 267 {
+    error = 20
+  } else if code == 50 || code == 1 {
+    error = 95
+  }
+  rec_errno().* = error
+  return -1
+}
+fn win_io_text(path: *const u8) []const u8 {
+  return path[..string_length(path)]
+}
+fn win_io_path(path: *const u8, output: []u16) bool {
+  if path == nil || path.* == 0 {
+    _ = win_io_fail(87)
+    return false
+  }
+  length := string_length(path)
+  if length > 2147483647 {
+    _ = win_io_fail(206)
+    return false
+  }
+  used := win_io_host.utf16(65001, 8, path, #cast(i32, length), &output[0], #cast(i32, #len(output)) - 1)
+  if used <= 0 {
+    _ = win_io_fail(win_io_api.error())
+    return false
+  }
+  output[#cast(usize, used)] = 0
+  return true
+}
+fn win_io_handle(fd: i32) rawptr {
+  return #cast(rawptr, win_io_crt_handle(fd))
+}
+fn win_io_adopt(handle: rawptr, flags: i32) i32 {
+  win_io_prepare()
+  fd := win_io_crt_adopt(#cast(isize, handle), flags | 32768 | 128)
+  if fd < 0 {
+    saved := rec_errno().*
+    _ = win_io_api.close(handle)
+    rec_errno().* = saved
+  }
+  return fd
+}
+fn rec_open(path: *const u8, flags: i32, mode: u32) i32 {
+  win_io_prepare()
+  // Append is unused by this policy; do not silently implement it as overwrite.
+  if (flags & 1024) != 0 || (flags & 3) == 3 {
+    return win_io_fail(50)
+  }
+  wide: [32768]u16 = []
+  if !win_io_path(path, wide[..]) {
+    return -1
+  }
+  handle: rawptr = nil
+  if (flags & 192) == 192 {
+    if (flags & 65536) != 0 || (flags & 3) == 0 {
+      return win_io_fail(50)
+    }
+    // Mode bits do not describe Windows ACLs. Restrict every private output at
+    // creation, including executable plugin payloads, before exposing a handle.
+    created := win_io_files.FileResult{}
+    if (mode & 0o111) != 0 {
+      created = win_io_files.create_private_executable_exclusive(win_io_text(path))
+    } else {
+      created = win_io_files.create_private_exclusive(win_io_text(path))
+    }
+    if !created.ok {
+      return win_io_fail(#cast(u32, 0 - created.error))
+    }
+    handle = #cast(rawptr, created.value.descriptor)
+    if (flags & 3) == 2 {
+      replacement := win_io_api.reopen(handle, 3221225472, 7, 0)
+      if #cast(isize, replacement) == -1 {
+        code := win_io_api.error()
+        _ = win_io_api.close(handle)
+        _ = win_io_api.delete(&wide[0])
+        return win_io_fail(code)
+      }
+      _ = win_io_api.close(handle)
+      handle = replacement
+    }
+  } else {
+    _ = mode
+    access: u32 = 2147483648
+    if (flags & 3) == 1 {
+      access = 1073741824
+    } else if (flags & 3) == 2 {
+      access = 3221225472
+    }
+    creation: u32 = 3
+    if (flags & 64) != 0 {
+      creation = 4
+      if (flags & 512) != 0 {
+        creation = 2
+      }
+    } else if (flags & 512) != 0 {
+      creation = 5
+    }
+    attributes: u32 = 128
+    if (flags & 65536) != 0 {
+      attributes |= 33554432
+    }
+    if (flags & 131072) != 0 {
+      attributes |= 2097152
+    }
+    handle = win_io_api.create(&wide[0], access, 7, nil, creation, attributes, nil)
+    if #cast(isize, handle) == -1 {
+      return win_io_fail(win_io_api.error())
+    }
+  }
+  info := WinIOInformation{}
+  failure: u32 = 0
+  if win_io_api.type(handle) != 1 {
+    failure = 50
+  } else if win_io_api.info(handle, &info) == 0 {
+    failure = win_io_api.error()
+  } else if (flags & 131072) != 0 && (info.attributes & 1024) != 0 {
+    failure = 50
+  } else if (flags & 65536) != 0 && (info.attributes & 16) == 0 {
+    failure = 267
+  } else if (flags & 65536) == 0 && (info.attributes & 16) != 0 {
+    failure = 50
+  }
+  if failure != 0 {
+    _ = win_io_api.close(handle)
+    return win_io_fail(failure)
+  }
+  return win_io_adopt(handle, flags & 3)
+}
+fn rec_close(fd: i32) i32 {
+  return win_io_crt_close(fd)
+}
+fn rec_write(fd: i32, bytes: *const u8, length: usize) isize {
+  win_io_prepare()
+  amount := length
+  if amount > 2147483647 {
+    amount = 2147483647
+  }
+  written: u32 = 0
+  if win_io_api.write(win_io_handle(fd), bytes, #cast(u32, amount), &written, nil) == 0 {
+    return #cast(isize, win_io_fail(win_io_api.error()))
+  }
+  return #cast(isize, written)
+}
+fn rec_sync(fd: i32) i32 {
+  win_io_prepare()
+  handle := win_io_handle(fd)
+  info := WinIOInformation{}
+  if win_io_api.info(handle, &info) == 0 {
+    return win_io_fail(win_io_api.error())
+  }
+  // Win32 has no POSIX parent-directory fsync contract. Keep this limitation
+  // explicit so recovery cannot report durability that was never established.
+  if (info.attributes & 16) != 0 {
+    return win_io_fail(50)
+  }
+  if win_io_api.flush(handle) == 0 {
+    return win_io_fail(win_io_api.error())
+  }
+  return 0
+}
+struct WinIORename { flags:u32, root:rawptr, length:u32, name:[32768]u16 }
+fn rec_rename_report(from:*const u8, to:*const u8, native_error:*u32)i32 {
+  native_error.*=0
+  win_io_prepare()
+  source:[32768]u16=[]
+  target:=WinIORename{flags:3}
+  if !win_io_path(from, source[..]) || !win_io_path(to, target.name[..]) {
+    return -1
+  }
+  // One atomic rename with POSIX replacement semantics keeps existing readers
+  // on the old generation. MoveFileEx can deny replacement while it is open.
+  // Do not emulate this with delete-then-move or an ACL-merging replacement.
+  // DELETE | FILE_READ_ATTRIBUTES | GENERIC_WRITE: write access lets the
+  // renamed file be flushed below.
+  handle:=win_io_api.create(&source[0], 1073807488, 7, nil, 3, 2097152, nil)
+  if #cast(isize, handle)==-1 {
+    native_error.*=win_io_api.error()
+    return win_io_fail(native_error.*)
+  }
+  defer _=win_io_api.close(handle)
+  info:=WinIOInformation{}
+  if win_io_api.info(handle, &info)==0 {
+    native_error.*=win_io_api.error()
+    return win_io_fail(native_error.*)
+  }
+  if (info.attributes&1040)!=0 {
+    return win_io_fail(50)
+  }
+  units:usize=0
+  for target.name[units]!=0 {
+    units+=1
+  }
+  target.length=#cast(u32, units*2)
+  size:=#cast(usize, &target.name[0])-#cast(usize, &target)+#cast(usize, target.length)
+  // FileRenameInfoEx=22, REPLACE_IF_EXISTS|POSIX_SEMANTICS=3.
+  if win_io_api.rename(handle, 22, #cast(rawptr, &target), #cast(u32, size))==0 {
+    native_error.*=win_io_api.error()
+    return win_io_fail(native_error.*)
+  }
+  // Commit the rename: flushing the renamed file forces the file system log
+  // that records it, as MoveFileEx(MOVEFILE_WRITE_THROUGH) does. This is the
+  // Windows counterpart of fsyncing the parent directory.
+  if win_io_api.flush(handle)==0 {
+    native_error.*=win_io_api.error()
+    return win_io_fail(native_error.*)
+  }
+  return 0
+}
+
+fn rec_unlink(path: *const u8) i32 {
+  win_io_prepare()
+  wide: [32768]u16 = []
+  if !win_io_path(path, wide[..]) {
+    return -1
+  }
+  if win_io_api.delete(&wide[0]) == 0 {
+    return win_io_fail(win_io_api.error())
+  }
+  return 0
+}
+fn rec_mkdir(path: *const u8, mode: u32) i32 {
+  win_io_prepare()
+  if path == nil || path.* == 0 {
+    return win_io_fail(87)
+  }
+  result := win_io_files.make_directory(win_io_text(path), #cast(usize, mode))
+  if !result.ok {
+    return win_io_fail(#cast(u32, 0 - result.error))
+  }
+  return 0
+}
+fn rec_temp(path: *u8) i32 {
+  win_io_prepare()
+  if path == nil {
+    return win_io_fail(87)
+  }
+  length := string_length(path)
+  if length < 6 {
+    return win_io_fail(87)
+  }
+  for at in length - 6..length {
+    if path[..length][at] != 88 {
+      return win_io_fail(87)
+    }
+  }
+  alphabet := "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_-"
+  for attempt in 0..128 {
+    random: [6]u8 = []
+    if win_io_api.random(&random[0], 6) == 0 {
+      return win_io_fail(5)
+    }
+    for index in 0..6 {
+      path[..length][length - 6 + index] = alphabet[#cast(usize, random[index] & 63)]
+    }
+    fd := rec_open(path, 524482, 384)
+    if fd >= 0 || rec_errno().* != 17 {
+      return fd
+    }
+  }
+  rec_errno().* = 17
+  return -1
+}
+// This optional diagnostic switch uses the CRT's narrow environment snapshot.
+// Its ASCII names/values are portable; use host.environment for Unicode data.
+fn memory_environment(name: *const u8) *u8 {
+  return win_io_crt_environment(name)
+}
+fn syntax_dlopen(path: *const u8, flags: i32) rawptr {
+  win_io_prepare()
+  _ = flags
+  wide: [32768]u16 = []
+  if !win_io_path(path, wide[..]) {
+    return nil
+  }
+  library := win_io_api.load(&wide[0])
+  if library == nil {
+    _ = win_io_fail(win_io_api.error())
+  }
+  return library
+}
+fn syntax_dlclose(library: rawptr) i32 {
+  if win_io_loader.close(&library).ok {
+    return 0
+  }
+  return -1
+}
+
+fn rec_path_separator(byte: u8) bool {
+  return byte == 47 || byte == 92
+}
+fn win_io_drive_letter(byte: u8) bool {
+  return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
+}
+fn win_io_unc_root(path: *const u8, length: usize, first: usize) usize {
+  text := path[..length]
+  server := first
+  at := first
+  for at < length && !rec_path_separator(text[at]) {
+    if text[at] == 58 || text[at] == 42 || text[at] == 63 {
+      return 0
+    }
+    at += 1
+  }
+  if at == server || at == length || (at - server == 1 && text[server] == 46) || (at - server == 2 && text[server] == 46 && text[server + 1] == 46) {
+    return 0
+  }
+  at += 1
+  share := at
+  for at < length && !rec_path_separator(text[at]) {
+    if text[at] == 58 || text[at] == 42 || text[at] == 63 {
+      return 0
+    }
+    at += 1
+  }
+  if at == share || (at - share == 1 && text[share] == 46) || (at - share == 2 && text[share] == 46 && text[share + 1] == 46) {
+    return 0
+  }
+  if at < length {
+    return at + 1
+  }
+  return at
+}
+// The root includes its separator, when present. A bare UNC share is already
+// a complete root; mkdir must never try to create the server or share itself.
+fn rec_path_root(path: *const u8, length: usize) usize {
+  if path == nil || length < 3 {
+    return 0
+  }
+  text := path[..length]
+  if win_io_drive_letter(text[0]) && text[1] == 58 && rec_path_separator(text[2]) {
+    return 3
+  }
+  if !rec_path_separator(text[0]) || !rec_path_separator(text[1]) {
+    return 0
+  }
+  if length >= 4 && text[2] == 63 && rec_path_separator(text[3]) {
+    if length >= 7 && win_io_drive_letter(text[4]) && text[5] == 58 && rec_path_separator(text[6]) {
+      return 7
+    }
+    if length >= 8 && (text[4] == 85 || text[4] == 117) && (text[5] == 78 || text[5] == 110) && (text[6] == 67 || text[6] == 99) && rec_path_separator(text[7]) {
+      return win_io_unc_root(path, length, 8)
+    }
+    return 0
+  }
+  return win_io_unc_root(path, length, 2)
+}
+fn rec_absolute(path: *const u8) bool {
+  return path != nil && rec_path_root(path, string_length(path)) != 0
+}
+fn rec_sync_parent(fd: i32) bool {
+  if rec_sync(fd) == 0 {
+    return true
+  }
+  if rec_errno().* != 95 {
+    return false
+  }
+  info := WinIOInformation{}
+  if win_io_api.info(win_io_handle(fd), &info) == 0 {
+    _ = win_io_fail(win_io_api.error())
+    return false
+  }
+  // Windows has no parent-directory fsync. rec_rename flushes the renamed
+  // file, which commits the rename itself; a directory handle here means the
+  // publication is already durable.
+  return (info.attributes & 16) != 0
+}
+
+fn rec_rename(from:*const u8, to:*const u8)i32 {
+  native_error:u32=0
+  return rec_rename_report(from, to, &native_error)
+}

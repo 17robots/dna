@@ -1,0 +1,107 @@
+#target(kernel: linux)
+extern fn tty_atexit "atexit"(handler: fn()) i32
+struct TtyTermios { input, output, control, local: u32, line: u8, characters: [32]u8, input_speed, output_speed: u32 }
+struct TtySignalAction { handler: fn(i32), mask: [16]u64, flags: i32, restore: fn() }
+const TtyGetSize:u64=21523
+const TtySuspendSignal:i32=20
+fn tty_fatal_signals() [8]i32 {
+  return [15, 1, 3, 11, 7, 6, 8, 4]
+}
+fn tty_make_raw(raw:*TtyTermios) {
+  raw.input &= ~#cast(u32, 1330) // BRKINT | ICRNL | INPCK | ISTRIP | IXON
+  raw.output &= ~#cast(u32, 1)
+  raw.control |= 48
+  raw.local &= ~#cast(u32, 32779) // ECHO | ICANON | IEXTEN | ISIG
+  raw.characters[6] = 0
+  raw.characters[5] = 0
+}
+fn tty_wake_create() i32 {
+  return notify_eventfd(0, 526336)
+}
+fn tty_wake_signal(bytes:*const u8) {
+  _=rec_write(tty_wake_descriptor, bytes, 8)
+}
+fn tty_arguments() isize {
+  command: []const u8 = "/proc/self/cmdline\0"
+  descriptor := rec_open(&command[0], 524288, 0)
+  if descriptor<0 {
+    return -1
+  }
+  defer _=rec_close(descriptor)
+  return proc_read_raw(descriptor, &tty_command_line[0], 65535)
+}
+fn tty_executable_path() *const u8 {
+  executable: []const u8 = "/proc/self/exe\0"
+  return &executable[0]
+}
+extern fn tty_ioctl "ioctl"(fd: i32, request: u64, output: rawptr) i32
+
+extern fn tty_getattr "tcgetattr"(fd: i32, value: *TtyTermios) i32
+extern fn tty_setattr "tcsetattr"(fd: i32, action: i32, value: *const TtyTermios) i32
+extern fn tty_isatty "isatty"(fd: i32) i32
+extern fn tty_signal "signal"(number: i32, handler: fn(i32)) rawptr
+extern fn tty_sigaction "sigaction"(number: i32, action: *const TtySignalAction, old: rawptr) i32
+extern fn tty_raise "raise"(number: i32) i32
+extern fn tty_setenv "setenv"(key: *const u8, value: *const u8, overwrite: i32) i32
+extern fn tty_execv "execv"(path: *const u8, arguments: **const u8) i32
+
+tty_saved: TtyTermios = TtyTermios{}
+fn tty_enter_host() bool {
+  if tty_isatty(tty_input) == 0 || tty_isatty(tty_output) == 0 || tty_getattr(tty_input, &tty_saved) != 0 {
+    return false
+  }
+  raw := tty_saved
+  tty_make_raw(&raw)
+  if tty_setattr(tty_input, 2, &raw) != 0 {
+    return false
+  }
+  return true
+}
+fn tty_leave_host() {
+  _ = tty_setattr(tty_input, 2, &tty_saved)
+}
+fn tty_register_handlers() {
+  _ = tty_atexit(tty_exit_handler)
+  fatal := tty_fatal_signals()
+  for number in fatal {
+    _ = tty_signal(number, tty_fatal)
+  }
+  // SIGBUS first tries to repair a truncated file mapping.
+  map_guard_install()
+  action := TtySignalAction{handler: tty_resize}
+  _ = tty_sigaction(28, &action, nil)
+}
+fn tty_fatal_host(number: i32) {
+  _ = tty_signal(number, nil)
+  _ = tty_raise(number)
+}
+fn tty_size_host(columns, rows: *i32) i32 {
+  size := TtySize{}
+  fd := tty_output
+  if fd < 0 {
+    fd = 1
+  }
+  if tty_ioctl(fd, TtyGetSize, #cast(rawptr, &size)) != 0 || size.columns == 0 || size.rows == 0 {
+    return 0
+  }
+  columns.* = #cast(i32, size.columns)
+  rows.* = #cast(i32, size.rows)
+  return 1
+}
+fn tty_read_host(buffer: *u8, capacity, timeout: i32) i32 {
+  return tty_read_posix(buffer, capacity, timeout)
+}
+fn tty_handoff_host(executable: *const u8, arguments: **const u8, session: *const u8) bool {
+  variable: []const u8 = "DNA_HANDOFF\0"
+  _ = tty_setenv(&variable[0], session, 1)
+  _ = tty_execv(executable, arguments)
+  return false
+}
+fn tty_suspend_host() i32 {
+  if sync.load_u32(&tty_active) == 0 {
+    return 0
+  }
+  dna_tty_leave()
+  _ = tty_raise(TtySuspendSignal)
+  return dna_tty_enter()
+}

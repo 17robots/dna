@@ -49,20 +49,38 @@ def functions(path, names):
         result.append(body)
     return '\n'.join(result)
 
-BUFFER = '''pub struct Document { bytes:[32]u8, length:usize, revision:u64, saved_epoch:u64, saved_length:usize }
+BUFFER = '''pub struct TextSnapshot { length:usize }
+pub fn snapshot_take(doc:*const Document) TextSnapshot { return TextSnapshot{length:doc.length} }
+pub fn snapshot_release(text:*TextSnapshot) {}
+pub struct Document { bytes:[32]u8, length:usize, revision:u64, saved_epoch:u64, saved_length:usize }
 pub const LargeFile:usize=100000
 pub const Capacity:usize=31
 pub struct Change { found:bool, old_length, low, old_high, high:usize }
 pub fn changes_since(doc:*Document, revision:u64) Change { return Change{} }
 pub fn row_at(doc:*Document, offset:usize) usize { return 0 }
 pub fn row_start(doc:*Document, row:usize) usize { return 0 }
+pub fn line_end(doc:*const Document, offset:usize) usize { return doc.length }
 pub fn saved_text(doc:*Document) []u8 { return doc.bytes[..] }
+pub fn range(doc:*const Document, low:usize, high:usize) []const u8 { return doc.bytes[low..high] }
+pub fn all(doc:*const Document) []const u8 { return doc.bytes[..doc.length] }
+pub fn byte_at(doc:*const Document, offset:usize) u8 { return doc.bytes[offset] }
+pub fn pointer(doc:*const Document, low:usize, high:usize) *const u8 { return &doc.bytes[low] }
+pub fn release_views(doc:*Document) {}
+pub fn copy_range(doc:*const Document, low:usize, high:usize, output:[]u8) {}
+pub fn saved_hash(doc:*const Document) u64 { return 0 }
+pub const LoadComplete:u8=0
+pub fn load_state(doc:*const Document) u8 { return 0 }
+pub fn chunk_at(doc:*const Document, offset:usize) []const u8 { return doc.bytes[offset..doc.length] }
 pub fn dirty_cached(doc:*Document) bool { return false }
 pub fn valid(bytes:[]const u8) bool { return true }
 pub fn equal(a:[]const u8,b:[]const u8) bool { if #len(a)!=#len(b) {return false} for i in 0..#len(a) { if a[i]!=b[i] {return false} } return true }
 '''
 FILES = '''pub struct State { path:[4096]u8, length:usize }
 pub fn name(file:*const State) []const u8 { return file.path[..file.length] }
+pub struct Stamp { inode, size, modify_seconds, modify_nanos, change_seconds, change_nanos: u64, ok: bool }
+pub fn saved_stamp(file:*const State) Stamp { _ = file
+  return Stamp{} }
+pub fn forget_stamp(file:*State) { _ = file }
 '''
 BASE = '''use "std/mem"
 use "./buffer"
@@ -82,11 +100,19 @@ probe_pending:usize=0
 probe_updates:usize=0
 probe_visits:usize=0
 probe_visible:usize=0
+struct SyntaxStream { context:rawptr,read:fn(rawptr,u32,*u32)*const u8,done:fn(rawptr),length,low,high:u32,revision,document_revision:u64 }
+struct SyntaxSnapshot { next:*SyntaxSnapshot,arena:*mem.Arena,text:buffer.TextSnapshot }
+syntax_snapshots:*SyntaxSnapshot=nil
+fn syntax_snapshot_read(context:rawptr,byte:u32,length:*u32) *const u8 { return nil }
+fn syntax_snapshot_done(context:rawptr) {}
+fn syntax_snapshot_collect() {}
+fn syntax_stream(handle:rawptr,request:*const SyntaxStream) i32 { probe_updates+=1 return 0 }
+fn syntax_stream_needed(handle:rawptr,revision:u64) i32 { return 0 }
 struct SyntaxChange { revision:u64, low, old_high, high, old_length, row, column:u32 }
 struct DiskWatch { identity,epoch:u64, path:[4096]u8,length:usize, dirty,ready:bool,next:*Slot }
 struct DiskState { worker:rawptr,retry:bool,first,last:*Slot, initialized:bool }
 struct SyntaxState { first,filetype_first,filetype_last:*Slot }
-struct Slot { document:*buffer.Document,file:files.State,terminal:Terminal,watch:DiskWatch,disk_changed:bool,colors:[]u8,identity:u64,index:usize,syntax:rawptr,syntax_checked:bool,syntax_revision,syntax_used:u64,syntax_owner:*App,syntax_next,syntax_previous:*Slot,filetype_length:usize,filetype:[65]u8,filetype_dirty:bool,filetype_next:*Slot,inferred_filetype:bool,recovery_revision,recovery_identity:u64 }
+struct Slot { document:*buffer.Document,file:files.State,terminal:Terminal,watch:DiskWatch,disk_changed:bool,colors:[]u8,identity:u64,index:usize,syntax:rawptr,syntax_checked:bool,syntax_revision,syntax_used:u64,syntax_window_low,syntax_window_high,syntax_shown_low,syntax_shown_high,syntax_view_low,syntax_view_high:usize,syntax_window_tag,syntax_shown_tag,syntax_window_revision:u64,syntax_owner:*App,syntax_next,syntax_previous:*Slot,filetype_length:usize,filetype:[65]u8,filetype_dirty:bool,filetype_next:*Slot,inferred_filetype:bool,recovery_revision,recovery_identity:u64 }
 struct Terminal {handle:rawptr}
 struct Pane {used,branch:bool,slot:usize}
 struct View {panes:[15]Pane,revision:u64}
@@ -100,6 +126,16 @@ struct DiskReady { index:usize,identity:u64 }
 struct SyntaxVisible { indices:[16]usize,count:usize }
 fn disk_open() rawptr {return #cast(rawptr,1)}
 fn disk_watch(worker:rawptr,index:usize,identity:u64,path:*const u8,saved:*const u8,length:usize) i32 {
+ probe_watch+=1
+ if probe_fail {return 0}
+ return 1
+}
+fn disk_watch_hashed(worker:rawptr,index:usize,identity:u64,path:*const u8,baseline:u64,length:usize) i32 {
+ probe_watch+=1
+ if probe_fail {return 0}
+ return 1
+}
+fn disk_watch_stamped(worker:rawptr,index:usize,identity:u64,path:*const u8,stamp:*const u64,length:usize) i32 {
  probe_watch+=1
  if probe_fail {return 0}
  return 1
@@ -121,6 +157,8 @@ fn slot_visible(app:*App,index:usize) bool {probe_visible+=1 return index==app.d
 fn syntax_open(root:*const u8,path:*const u8) rawptr {return #cast(rawptr,1)}
 fn syntax_open_named(root:*const u8,path:*const u8) rawptr {return #cast(rawptr,1)}
 fn syntax_update(handle:rawptr,text:*const u8,length:u32,revision:u64) {probe_updates+=1}
+fn syntax_update_begin(handle:rawptr,length:u32,revision:u64) *u8 {probe_updates+=1 return nil}
+fn syntax_update_commit(handle:rawptr,length:u32,revision:u64,hint:*const SyntaxChange) {}
 fn syntax_update_changed(handle:rawptr,text:*const u8,length:u32,revision:u64,hint:*const SyntaxChange) {probe_updates+=1}
 fn syntax_colors(handle:rawptr,colors:*u8,length:u32,revision:u64) i32 {
  if probe_colors_ready {return 1}
@@ -147,7 +185,8 @@ with tempfile.TemporaryDirectory(prefix='dna-worksets-') as temporary:
     (directory/'settings').mkdir(); (directory/'settings/settings.dyn').write_text('pub fn trim(value:[]const u8) []const u8 {return value}')
     source = BASE + '\nuse "./sdl"\nuse "./settings"\n'
     source += functions(args.source_root/'disk.dyn', ['disk_dirty_slot', 'disk_register', 'disk_process', 'disk_tick'])
-    source += '\n' + functions(args.source_root/'syntax.dyn', ['syntax_track', 'syntax_untrack', 'slot_syntax_release', 'syntax_trim', 'syntax_slot_tick', 'syntax_visible', 'syntax_tick', 'syntax_waiting', 'filetype_dirty_slot', 'configured_filetype_slot', 'configured_filetypes'])
+    source += '\n' + functions(args.source_root/'syntax.dyn', ['syntax_track', 'syntax_untrack', 'slot_syntax_release', 'syntax_trim', 'syntax_slot_tick', 'syntax_copy', 'syntax_window_needed', 'syntax_window_tick', 'syntax_visible', 'syntax_tick', 'syntax_waiting', 'filetype_dirty_slot', 'configured_filetype_slot', 'configured_filetypes'])
+    source += '\nconst SyntaxMargin: usize = 524288\nconst SyntaxWindowBit: u64 = 9223372036854775808\nconst SyntaxWindowLimit: usize = 8388608\n'
     source += '\n' + functions(args.source_root/'persistence.dyn', ['recovery_needed'])
     source += '''
 fn probe_number(value:usize) {
@@ -293,6 +332,16 @@ fn main() {
       probe_colors_ready=true
       _=syntax_tick(app)
       if syntax_waiting(app) {#panic("parser completion clears readiness")}
+      // A shrink may leave last frame's color origin beyond the new end.
+      // Reject the stale range without subtracting unsigned offsets backwards.
+      docs[79].length=20000000
+      docs[79].revision+=1
+      slots[79].syntax_window_tag=1
+      slots[79].syntax_window_low=24000000
+      slots[79].syntax_window_high=27000000
+      slots[79].syntax_view_low=25000000
+      slots[79].syntax_view_high=26000000
+      _=syntax_window_tick(&slots[79])
       slot_syntax_release(&slots[79])
       if slots[79].syntax_owner!=nil {#panic("parser owner untracked")}
     }

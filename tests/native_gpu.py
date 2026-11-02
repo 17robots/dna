@@ -320,10 +320,14 @@ with tempfile.TemporaryDirectory(prefix='dna-native-gpu-') as directory:
     gui=install_gpu_probe(gui)
     gui+='\nnative_probe_software:bool\n'
     (stage/'sdl.dyn').write_text(gui)
+    for module in ('host','owned_arena','cstring'):
+        shutil.copytree(ROOT/'src'/module,stage/module)
+    for selection in [*(ROOT/'src/platform').glob('window_*.dyn'), *(ROOT/'src/platform').glob('memory_*.dyn')]:
+        shutil.copyfile(selection,stage/selection.name)
     shutil.copytree(ROOT/'src/platform/native_present',stage/'native_present')
     (stage/'backend').mkdir();shutil.copyfile(ROOT/f'modules/native/platform_{BACKEND}.dyn',stage/'backend/backend.dyn')
     if BACKEND=='x11':
-        for source in [stage/'sdl.dyn',*(stage/'native_present').rglob('*.dyn')]:
+        for source in [stage/'sdl.dyn',*stage.glob('window_*.dyn'),*(stage/'native_present').rglob('*.dyn')]:
             source.write_text(source.read_text().replace('"vendor/window/wayland"','"vendor/window"'))
     (stage/'main.dyn').write_text(SOURCE)
     library=ROOT/('build/native-wayland' if BACKEND=='wayland' else 'build/native-gui')

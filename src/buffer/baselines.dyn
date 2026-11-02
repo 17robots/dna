@@ -1,91 +1,57 @@
-// Capture newly overwritten original bytes. Existing middle bytes already live
-// in storage; unchanged prefix/suffix bytes still come from the current text.
-fn preserve_baseline(document: *Document, length: usize, prefix: *usize, suffix: *usize, storage: *u8, used: *usize, low: usize, high: usize) {
-  old_prefix := prefix.*
-  old_end := length - suffix.*
-  if low < prefix.* {
-    prefix.* = low
+// Full saved/checkpoint text is assembled only on request (e.g. reload saved
+// text). Dirty checks and checkpoint diffs compare trees directly.
+fn tree_text(document: *Document, root: *RopeNode) []u8 {
+  length := rope_length(root)
+  bytes := #cast(*u8, rope_malloc(length + 1))
+  if bytes == nil {
+    #panic("cannot allocate baseline text")
   }
-  remaining := document.length - high
-  if remaining < suffix.* {
-    suffix.* = remaining
+  rope_copy(root, 0, length, bytes)
+  bytes[..length + 1][length] = 0
+  view := #cast(*TextView, rope_malloc(#sizeof(TextView)))
+  if view == nil {
+    #panic("cannot allocate baseline text")
   }
-  end := length - suffix.*
-  first := prefix.*
-  prefix_end := old_prefix
-  if prefix_end > end {
-    prefix_end = end
-  }
-  if prefix_end > first {
-    _ = copy_bytes(&storage[..length][first], &document.bytes[first], prefix_end - first)
-  }
-  suffix_start := old_end
-  if suffix_start < first {
-    suffix_start = first
-  }
-  if suffix_start < prefix_end {
-    suffix_start = prefix_end
-  }
-  if end > suffix_start {
-    source := document.length - (length - suffix_start)
-    _ = copy_bytes(&storage[..length][suffix_start], &document.bytes[source], end - suffix_start)
-  }
-  if end > first && end > used.* {
-    used.* = end
-  }
+  // Owned like a flattened view; never matched by range lookups.
+  view.low = 1
+  view.high = 0
+  view.bytes = bytes
+  view.next = document.views
+  document.views = view
+  document.view_count += 1
+  return bytes[..length + 1]
 }
-// Materialization is explicit and rare (e.g. reload saved text). Ordinary dirty
-// checks and checkpoint diffs read only preserved changed ranges.
-fn materialize_baseline(document: *Document, length: usize, prefix: usize, suffix: usize, storage: *u8, used: *usize) []u8 {
-  if prefix > 0 {
-    _ = copy_bytes(storage, &document.bytes[0], prefix)
-  }
-  if suffix > 0 {
-    _ = copy_bytes(&storage[..length + 1][length - suffix], &document.bytes[document.length - suffix], suffix)
-  }
-  storage[..length + 1][length] = 0
-  if length + 1 > used.* {
-    used.* = length + 1
-  }
-  return storage[..length + 1]
-}
+// Saved text plus a terminating NUL. Valid until the next edit or release_views.
 pub fn saved_text(document: *Document) []u8 {
-  if &document.saved_view[0] == &document.bytes[0] {
-    return document.bytes[..document.saved_length + 1]
-  }
-  document.saved_view = materialize_baseline(document, document.saved_length, document.saved_prefix, document.saved_suffix,
-    &document.saved_storage[0], &document.saved_storage_used)
-  return document.saved_view
+  return tree_text(document, document.saved_root)
 }
 pub fn checkpoint_text(document: *Document) []u8 {
-  length := document.history[document.history_at].length
-  if &document.checkpoint_view[0] == &document.bytes[0] {
-    return document.bytes[..length + 1]
-  }
-  document.checkpoint_view = materialize_baseline(document, length, document.checkpoint_prefix, document.checkpoint_suffix,
-    &document.checkpoint_storage[0], &document.checkpoint_storage_used)
-  return document.checkpoint_view
+  return tree_text(document, document.history[document.history_at].root)
 }
-// Three borrowed spans reconstruct the saved baseline without a full copy.
-// Invalidated by document mutation, saving, checkpointing, undo/redo or reload.
-pub fn saved_parts(document: *const Document) [3][]const u8 {
-  end := document.saved_length - document.saved_suffix
-  prefix := document.saved_prefix
-  if prefix > end {
-    prefix = end
-  }
-  return [document.bytes[..prefix], document.saved_view[prefix..end], document.bytes[document.length - document.saved_suffix..document.length]]
+// The saved baseline as spans. With a shared tree this is one span; callers
+// concatenate the parts. Valid until the next edit or release_views.
+pub fn saved_parts(document: *Document) [3][]const u8 {
+  text := saved_text(document)
+  empty := text[..0]
+  return [text[..document.saved_length], empty, empty]
 }
 pub fn saved_equal(document: *const Document, text: []const u8) bool {
   if #len(text) != document.saved_length {
     return false
   }
+  return rope_equal_bytes(document.saved_root, 0, text)
+}
+// FNV-1a hash of the saved text, walking the saved tree's leaves in place.
+pub fn saved_hash(document: *const Document) u64 {
+  value: u64 = 1469598103934665603
   at: usize = 0
-  for part in saved_parts(document) {
-    if !equal(part, text[at..at + #len(part)]) {
-      return false
+  for at < document.saved_length {
+    run := rope_run(document.saved_root, at)
+    bytes := run.data[..run.high - run.low]
+    for byte in bytes {
+      value = #wrap((value ^ #cast(u64, byte)) * 1099511628211)
     }
-    at += #len(part)
+    at = run.high
   }
-  return true
+  return value
 }

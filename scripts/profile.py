@@ -99,6 +99,8 @@ def main():
                 if source in STUBS:
                     shutil.copyfile(ROOT / STUBS[source], stage / source)
     if 'gui' not in chosen['frontends']:
+        for source in [*(stage / 'platform').glob('window_*.dyn'), *(stage / 'platform').glob('memory_*.dyn')]:
+            source.unlink()
         for folder in ('platform/native_present', 'platform/backend'):
             shutil.rmtree(stage / folder, ignore_errors=True)
     (stage / 'build_profile.dyn').write_text(
@@ -109,11 +111,24 @@ def main():
         f'const ProfileExplorers: []const u8 = "{" ".join(chosen["explorers"])}"\n'
         f'const ProfilePickers: []const u8 = "{" ".join(chosen["pickers"])}"\n')
     deps = ROOT / 'build/deps'
-    output = ROOT / 'build' / f'dna-{name}'
+    output = ROOT / 'build' / (f'dna-{name}.exe' if sys.platform == 'win32' else f'dna-{name}')
     if 'gui' in chosen['frontends']:
         subprocess.run([sys.executable, str(ROOT / 'scripts/build_native.py'),
                         '--source', str(stage), '--mode', mode,
                         '--output', str(output)], check=True)
+    elif sys.platform == 'win32':
+        from dyn_path import real_dyn
+        from native_windows import dependencies, environment as windows_environment, snapshot_runtime
+        dependencies()
+        subprocess.run([sys.executable, ROOT/'scripts/compile.py', real_dyn(), 'build', stage,
+                        '--'+mode, '--output', output], env=windows_environment(real_dyn()), check=True)
+        snapshot_runtime((deps/'install/lib/dna_native.dll',), output.parent, tools=True)
+    elif sys.platform == 'darwin':
+        from dyn_path import real_dyn
+        from native_macos import linker_environment
+        environment, links = linker_environment(real_dyn())
+        subprocess.run([sys.executable, ROOT/'scripts/compile.py', real_dyn(), 'build', stage,
+                        '--'+mode, '--output', output, *links], env=environment, check=True)
     else:
         environment = dict(os.environ, DYN_LIBRARY_PATH=str(deps / 'tui-static'))
         subprocess.run([sys.executable, str(ROOT / 'scripts/compile.py'), os.environ.get('DYN', 'dyn'),

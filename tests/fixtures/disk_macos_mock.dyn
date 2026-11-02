@@ -1,0 +1,173 @@
+use "std/sync"
+use "std/io"
+type NativeMutex=sync.Mutex
+struct DiskEvent { descriptor:i32, mask, cookie, length:u32 }
+struct NotifyKEvent { identity:usize, filter:i16, flags:u16, notes:u32, data:isize, user:rawptr }
+struct InstallStat { device, inode:u64 }
+#link("c")
+extern fn rec_alloc "calloc"(count:usize, size:usize) rawptr
+extern fn rec_free "free"(pointer:rawptr)
+extern fn string_length "strlen"(text:*const u8) usize
+extern fn copy "memcpy"(output:*u8, input:*const u8, size:usize) rawptr
+active:[4096]bool
+identities:[4096]u64
+next_fd:i32=100
+live:i32
+mock_errno:i32
+version:u64=20
+pump_step:i32
+fail_registration:bool
+writes:i32
+fn rec_lock(lock:rawptr) {
+  sync.lock(#cast(*NativeMutex, lock))
+}
+fn rec_unlock(lock:rawptr) {
+  sync.unlock(#cast(*NativeMutex, lock))
+}
+fn rec_errno() *i32 {
+  return &mock_errno
+}
+fn install_equal(text:*const u8, expected:[]const u8) bool {
+  if string_length(text)!=#len(expected) {
+    return false
+  }
+  for index in 0..#len(expected) {
+    if text[..#len(expected)][index]!=expected[index] {
+      return false
+    }
+  }
+  return true
+}
+fn darwin_io_open(path:*const u8, flags:i32, mode:i32) i32 {
+  _=mode
+  inode:=version
+  if install_equal(path, "/parent") {
+    if flags!=16809984 {
+      #panic("directory flags")
+    }
+    inode=10
+  } else {
+    if flags!=16810240 {
+      #panic("file flags must reject links")
+    }
+  }
+  fd:=next_fd
+  next_fd+=1
+  active[#cast(usize, fd)]=true
+  identities[#cast(usize, fd)]=inode
+  live+=1
+  return fd
+}
+fn rec_close(fd:i32) i32 {
+  if fd<100 || !active[#cast(usize, fd)] {
+    #panic("closed unowned descriptor")
+  }
+  active[#cast(usize, fd)]=false
+  live-=1
+  return 0
+}
+fn install_fstat(fd:i32, output:*InstallStat) i32 {
+  output.*=InstallStat{device:1, inode:identities[#cast(usize, fd)]}
+  return 0
+}
+fn notify_kevent(queue:i32, changes:*const NotifyKEvent, amount:i32, events:*NotifyKEvent, capacity:i32, timeout:rawptr) i32 {
+  _=queue
+  _=capacity
+  _=timeout
+  if amount>0 {
+    if changes.filter!=-4 || (changes.flags!=33 && changes.flags!=2) {
+      #panic("vnode registration flags")
+    }
+    if fail_registration {
+      return -1
+    }
+    return 0
+  }
+  if pump_step==0 {
+    events.*=NotifyKEvent{identity:100, filter:-4, notes:2}
+  }
+  else {
+    events.*=NotifyKEvent{identity:77, filter:-1}
+  }
+  pump_step+=1
+  return 1
+}
+fn rec_write(fd:i32, bytes:*const u8, length:usize) isize {
+  if fd!=56 || length!=#sizeof(DiskEvent) || #cast(*const DiskEvent, bytes).mask!=256 {
+    #panic("file write did not request rescan")
+  }
+  writes+=1
+  return #cast(isize, length)
+}
+fn notify_kqueue() i32 {
+  #panic("unexpected queue creation")
+}
+fn proc_pipe(fds:*i32, flags:i32) i32 {
+  _=fds
+  _=flags
+  #panic("unexpected pipe creation")
+}
+fn proc_close_fds(fds:[]i32) {
+  _=fds
+}
+fn proc_fcntl(fd, operation, value:i32) i32 {
+  _=fd
+  _=operation
+  _=value
+  return 0
+}
+fn dna_thread_create(entry:fn(rawptr)i32, context:rawptr) rawptr {
+  _=entry
+  _=context
+  #panic("unexpected thread creation")
+}
+fn dna_thread_join(thread:rawptr, status:*i32) {
+  _=thread
+  _=status
+}
+fn main() {
+  owner:=DarwinDiskQueue{events:[55, 56], stop:[77, 78]}
+  darwin_disk_queues=&owner
+  parent:[]const u8="/parent\0"
+  document:[]const u8="/parent/document\0"
+  directory:=disk_add(55, &parent[0], 0)
+  if directory<0 || live!=1 {
+    #panic("parent ownership")
+  }
+  disk_targets_begin(55)
+  if !disk_target_watch(55, &document[0], directory) || live!=2 {
+    #panic("existing file vnode missing")
+  }
+  disk_targets_end(55)
+  disk_targets_begin(55)
+  if !disk_target_watch(55, &document[0], directory) || live!=2 {
+    #panic("unchanged file leaked descriptor")
+  }
+  disk_targets_end(55)
+  version+=1
+  disk_targets_begin(55)
+  if !disk_target_watch(55, &document[0], directory) || live!=2 {
+    #panic("replacement did not retire old vnode")
+  }
+  disk_targets_end(55)
+  if disk_darwin_pump(#cast(rawptr, &owner))!=0 || writes!=1 {
+    #panic("event pump")
+  }
+  disk_targets_begin(55)
+  disk_targets_end(55)
+  if live!=1 {
+    #panic("closed document retained file vnode")
+  }
+  if !disk_target_watch(55, &document[0], directory) || live!=2 {
+    #panic("target re-registration")
+  }
+  if disk_remove(55, directory)!=0 || live!=0 || owner.nodes!=nil {
+    #panic("parent teardown leaked child vnode")
+  }
+  fail_registration=true
+  if disk_add(55, &parent[0], 0)>=0 || live!=0 {
+    #panic("failed registration leaked descriptor")
+  }
+  darwin_disk_queues=nil
+  _=io.println(io.stdout(), "PASS Darwin vnode mock: parent+file watches, replacement, epoch cleanup, pump and failed ownership")
+}

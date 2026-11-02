@@ -1,0 +1,211 @@
+// Opening a very large file without waiting for all of it. The document first
+// holds a prefix of whole lines; worker threads validate and index the rest of
+// the block, and load_tick attaches it as a tail. Edits made meanwhile only
+// touch the prefix, so the tail joins after the current text, the saved
+// baseline and every undo entry alike, and they all stay consistent.
+//
+// While loading, saving and disk comparison must wait: the document is not
+// yet the whole file. load_state reports that. A tail that turns out not to
+// be UTF-8 is dropped and the document stays incomplete for good.
+
+// Files below this load at once; the parallel loader takes a fraction of a
+// second for them.
+lazy_minimum: usize = 268435456
+// Bytes validated and indexed before the document appears.
+lazy_prefix: usize = 4194304
+// Lower both thresholds, for tests.
+pub fn lazy_thresholds(minimum: usize, prefix: usize) {
+  lazy_minimum = minimum
+  lazy_prefix = prefix
+}
+
+pub const LoadComplete: u8 = 0
+pub const LoadRunning: u8 = 1
+pub const LoadFailed: u8 = 2
+
+struct LazyLoad {
+  block: *RopeBlock,
+  // Tail bytes: block.bytes[offset..offset + total].
+  offset, total: usize,
+  leaves: usize,
+  counts: *usize,
+  tables: **u16,
+  jobs: [16]LoadJob,
+  workers: usize,
+  arena: *mem.Arena,
+  threads: [16]*thread.Thread,
+  started: [16]bool,
+  // 1: counting, 2: filling tables.
+  phase: u8,
+  done: sync.AtomicU32,
+}
+fn lazy_job_run(context: rawptr) isize {
+  job := #cast(*LoadJob, context)
+  _ = load_job_run(context)
+  _ = sync.fetch_add_u32(&job.owner.done, 1)
+  return 0
+}
+pub fn load_state(document: *const Document) u8 {
+  return document.load_state
+}
+// Like load_storage, but a large block appears after its first LazyPrefix
+// bytes are checked; call load_tick until it reports completion.
+pub fn load_storage_lazy(document: *Document, storage: *TextStorage, length: usize) bool {
+  if storage.block == nil || length < lazy_minimum || load_cpus() < 2 {
+    return load_storage(document, storage, length)
+  }
+  bytes := storage.block.bytes[..length]
+  // The prefix ends after a newline, so the document never shows half a line
+  // or half a character; a prefix without one loads at once instead.
+  shown := lazy_prefix
+  for shown > 0 && bytes[shown - 1] != 10 {
+    shown -= 1
+  }
+  if shown == 0 || !valid(bytes[..shown]) {
+    return load_storage(document, storage, length)
+  }
+  load := #cast(*LazyLoad, rope_malloc(#sizeof(LazyLoad)))
+  if load == nil {
+    return load_storage(document, storage, length)
+  }
+  load.* = LazyLoad{block: storage.block, offset: shown, total: length - shown}
+  storage.block.refs += 1
+  load.leaves = (load.total + LeafLimit - 1) / LeafLimit
+  load.counts = #cast(*usize, rope_malloc(load.leaves * #sizeof(usize)))
+  load.tables = #cast(**u16, rope_malloc(load.leaves * #sizeof(*u16)))
+  load.arena = mem.arena_create(4096)
+  if load.counts == nil || load.tables == nil {
+    #panic("cannot allocate text tables")
+  }
+  for leaf in 0..load.leaves {
+    load.tables[..load.leaves][leaf] = nil
+  }
+  load.workers = load_cpus()
+  if load.workers > ParallelWorkers {
+    load.workers = ParallelWorkers
+  }
+  for index in 0..load.workers {
+    load.jobs[index] = LoadJob{data: &bytes[shown], total: load.total, first: load.leaves * index / load.workers, last: load.leaves * (index + 1) / load.workers, counts: load.counts, tables: load.tables, owner: load}
+  }
+  root := rope_from_block(storage.block, shown)
+  storage_release(storage)
+  if !load_root(document, root) {
+    lazy_free(load)
+    return false
+  }
+  document.lazy = load
+  document.load_state = LoadRunning
+  lazy_launch(load, 1)
+  return true
+}
+fn lazy_launch(load: *LazyLoad, phase: u8) {
+  load.phase = phase
+  sync.store_u32(&load.done, 0)
+  for index in 0..load.workers {
+    load.jobs[index].fill = phase == 2
+    load.started[index] = false
+    spawned := thread.spawn_with_size(load.arena, ParallelStack, lazy_job_run, #cast(rawptr, &load.jobs[index]))
+    if spawned.ok {
+      load.threads[index] = spawned.value
+      load.started[index] = true
+    } else {
+      _ = lazy_job_run(#cast(rawptr, &load.jobs[index]))
+    }
+  }
+}
+fn lazy_join(load: *LazyLoad) {
+  for index in 0..load.workers {
+    if load.started[index] {
+      if !thread.join(load.threads[index]).ok {
+        #panic("cannot join text loader")
+      }
+      load.started[index] = false
+    }
+  }
+}
+fn lazy_free(load: *LazyLoad) {
+  lazy_join(load)
+  // Tables not yet adopted by leaves.
+  if load.phase != 0 {
+    for leaf in 0..load.leaves {
+      table := load.tables[..load.leaves][leaf]
+      if table != nil {
+        rope_free(#cast(rawptr, table))
+      }
+    }
+  }
+  rope_free(#cast(rawptr, load.counts))
+  rope_free(#cast(rawptr, load.tables))
+  mem.arena_release(load.arena)
+  rope_block_release(load.block)
+  rope_free(#cast(rawptr, load))
+}
+// Stop a running load, keeping the prefix only. For reload and release.
+fn lazy_cancel(document: *Document) {
+  if document.lazy != nil {
+    lazy_free(document.lazy)
+    document.lazy = nil
+  }
+  document.load_state = LoadComplete
+}
+// Advance a running load. Returns true when the document changed (the tail
+// attached, or loading failed and stopped).
+pub fn load_tick(document: *Document) bool {
+  load := document.lazy
+  if load == nil || sync.load_u32(&load.done) < #cast(u32, load.workers) {
+    return false
+  }
+  lazy_join(load)
+  if load.phase == 1 {
+    for index in 0..load.workers {
+      if !load.jobs[index].ok {
+        lazy_free(load)
+        document.lazy = nil
+        document.load_state = LoadFailed
+        return true
+      }
+    }
+    for leaf in 0..load.leaves {
+      count := load.counts[..load.leaves][leaf]
+      if count > 0 {
+        load.tables[..load.leaves][leaf] = #cast(*u16, rope_malloc(count * #sizeof(u16)))
+        if load.tables[..load.leaves][leaf] == nil {
+          #panic("cannot allocate text node")
+        }
+      }
+    }
+    lazy_launch(load, 2)
+    return false
+  }
+  tail := rope_build_prepared(load.block, &load.block.bytes[..load.offset + load.total][load.offset], load.total, 0, load.leaves, load.counts, load.tables)
+  // Leaves own the tables now.
+  load.phase = 0
+  lazy_free(load)
+  document.lazy = nil
+  lazy_attach(document, tail)
+  document.load_state = LoadComplete
+  return true
+}
+// Append tail (owned) after the current text, the saved text and every undo
+// entry: all of them end where the loaded prefix ended.
+fn lazy_attach(document: *Document, tail: *RopeNode) {
+  added := rope_length(tail)
+  for index in 0..document.history_count {
+    entry := &document.history[index]
+    if entry.root != nil {
+      entry.root = rope_join(entry.root, rope_retain(tail))
+      entry.length += added
+    }
+  }
+  document.saved_root = rope_join(document.saved_root, rope_retain(tail))
+  document.saved_length += added
+  // The saved baseline grew: observers keyed on the epoch (disk watcher,
+  // language servers) take the whole file now.
+  document.saved_epoch += 1
+  // An insertion at the end that no undo step contains.
+  old_length := document.length
+  note_change(document, old_length, old_length)
+  set_root(document, rope_join(rope_retain(document.root), tail))
+  document.revision += 1
+  notify_changed(document)
+}

@@ -8,7 +8,10 @@ struct Formatting {
   source_length: usize,
   slot: usize,
   path_length: usize,
+  // The text the formatter reads, kept alive until its process closes.
+  snapshot: buffer.TextSnapshot,
 }
+struct JobChunk { bytes: *const u8, length: usize }
 
 // Formatter processes own their input; results only apply to the captured revision.
 extern fn job_open "dna_job_open"(command: *const u8, directory: *const u8, input: *const u8, length: usize, timeout: u32) rawptr
@@ -16,12 +19,15 @@ extern fn job_status "dna_job_status"(job: rawptr) i32
 extern fn job_output "dna_job_output"(job: rawptr, output: *u8, capacity: usize) usize
 extern fn job_error "dna_job_error"(job: rawptr, output: *u8, capacity: usize) usize
 extern fn job_close "dna_job_close"(job: rawptr)
+extern fn job_open_chunks "dna_job_open_chunks"(command: *const u8, directory: *const u8, chunks: *const JobChunk, count: usize, length: usize, timeout: u32) rawptr
+extern fn job_output_length "dna_job_output_length"(job: rawptr) isize
 
 fn format_release(app: *App) {
   if app.formatting.process != nil {
     job_close(app.formatting.process)
     app.formatting.process = nil
   }
+  buffer.snapshot_release(&app.formatting.snapshot)
 }
 fn format_start(app: *App, save: bool, path: []const u8) {
   if app.formatting.process != nil {
@@ -57,12 +63,32 @@ fn format_start(app: *App, save: bool, path: []const u8) {
     root = "/"
   }
   _ = copy_text(directory[..4095], root)
-  process := job_open(&configured.formatter[0], &directory[0], &slot.document.bytes[0], slot.document.length, #cast(u32, app.config.lsp_timeout_ms))
+  // The formatter reads the text's storage runs in place from a snapshot.
+  snapshot := buffer.snapshot_take(slot.document)
+  count: usize = 0
+  at: usize = 0
+  for at < snapshot.length {
+    at += #len(buffer.snapshot_source_at(&snapshot, at).bytes)
+    count += 1
+  }
+  listing := arena_owner.create(count * #sizeof(JobChunk) + 64)
+  chunks := #cast(*JobChunk, &mem.push_bytes_uninit(listing, count * #sizeof(JobChunk) + 16)[0])
+  at = 0
+  for index in 0..count {
+    run := buffer.snapshot_source_at(&snapshot, at).bytes
+    chunks[..count][index] = JobChunk{bytes: &run[0], length: #len(run)}
+    at += #len(run)
+  }
+  process := job_open_chunks(&configured.formatter[0], &directory[0], chunks, count, snapshot.length, #cast(u32, app.config.lsp_timeout_ms))
+  arena_owner.release(listing)
   if process == nil {
+    buffer.snapshot_release(&snapshot)
     notice(app, "Could not start the formatter.")
     return
   }
   state := &app.formatting
+  buffer.snapshot_release(&state.snapshot)
+  state.snapshot = snapshot
   state.process = process
   state.slot = app.documents.active
   state.identity = slot.identity
@@ -106,18 +132,20 @@ fn format_tick(app: *App) bool {
     notice(app, "Formatter result discarded because the buffer changed or is no longer active. Run it again.")
     return true
   }
-  reserved := arena_owner.create((buffer.Capacity + 1))
-  defer arena_owner.release(reserved)
-  output := mem.push_bytes_uninit(reserved, buffer.Capacity + 1)
-  length := job_output(state.process, &output[0], #len(output))
-  if !buffer.valid(output[..length]) {
+  // Output goes straight into text storage the document adopts.
+  length := #cast(usize, job_output_length(state.process))
+  storage := buffer.storage_create(length + 1)
+  if storage.block == nil {
+    save_cancel(app)
+    notice(app, "Not enough memory for the formatter output; buffer unchanged.")
+    return true
+  }
+  _ = job_output(state.process, &storage.bytes[0], length + 1)
+  if !buffer.transform_storage(slot.document, &storage, length) {
+    buffer.storage_release(&storage)
     save_cancel(app)
     notice(app, "Formatter produced invalid text; buffer unchanged.")
     return true
-  }
-  doc := slot.document
-  if !buffer.transform(doc, output[..length]) {
-    #panic("validated formatter output")
   }
   if state.save {
     save_file_ready(app, state.path[..state.path_length])

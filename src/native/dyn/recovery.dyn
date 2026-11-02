@@ -1,4 +1,6 @@
-// Linux recovery worker. Ownership: UI owns handle, worker owns detached snapshots.
+// Recovery ownership: UI owns the handle; worker owns detached snapshots.
+// The first failed IO retains its stage and errno before cleanup can alter it.
+struct RecoveryFailure { stage, error: i32, length: usize, native_error:u32 }
 
 struct RecoveryWorker {
   thread: rawptr,
@@ -13,20 +15,13 @@ struct RecoveryWorker {
   spare_capacity: usize,
   stop: bool,
   error: bool,
+  failure: RecoveryFailure,
 }
 
 extern fn rec_alloc "calloc"(count: usize, size: usize) rawptr
 extern fn rec_malloc "malloc"(size: usize) *u8
 extern fn rec_free "free"(value: rawptr)
-extern fn rec_open "open"(path: *const u8, flags: i32, mode: u32) i32
-extern fn rec_close "close"(fd: i32) i32
-extern fn rec_write "write"(fd: i32, bytes: *const u8, length: usize) isize
-extern fn rec_sync "fsync"(fd: i32) i32
-extern fn rec_rename "rename"(from: *const u8, to: *const u8) i32
-extern fn rec_unlink "unlink"(path: *const u8) i32
-extern fn rec_mkdir "mkdir"(path: *const u8, mode: u32) i32
-extern fn rec_temp "mkstemp"(path: *u8) i32
-extern fn rec_errno "__errno_location"() *i32
+
 fn rec_mutex() rawptr {
   return dna_mutex_create()
 }
@@ -71,8 +66,9 @@ pub fn dna_make_directories(path: *const u8) i32 {
   }
   storage: [4096]u8 = []
   _ = copy(&storage[0], path, length + 1)
+  root := rec_path_root(path, length)
   for index in 1..=length {
-    if storage[index] == 47 || storage[index] == 0 {
+    if index >= root && (rec_path_separator(storage[index]) || storage[index] == 0) {
       end := storage[index]
       storage[index] = 0
       if rec_mkdir(&storage[0], 448) != 0 && rec_errno().* != 17 {
@@ -88,18 +84,29 @@ pub fn dna_make_directories(path: *const u8) i32 {
   }
   return 1
 }
-fn rec_snapshot(path: *const u8, bytes: *const u8, length: usize) bool {
+fn rec_failed(failure: *RecoveryFailure, stage: i32, error: i32) bool {
+  if failure.stage == 0 {
+    failure.stage = stage
+    failure.error = error
+    if error <= 0 {
+      failure.error = 5
+    }
+  }
+  return false
+}
+fn rec_snapshot_report(path: *const u8, bytes: *const u8, length: usize, failure: *RecoveryFailure) bool {
+  failure.length = length
   temporary: [4096]u8 = []
   size := string_length(path)
   if size + 4 >= 4096 {
-    return false
+    return rec_failed(failure, 2, 36)
   }
   _ = copy(&temporary[0], path, size)
   suffix: []const u8 = ".tmp\0"
   _ = copy(&temporary[size], &suffix[0], 5)
   fd := rec_open(&temporary[0], 524481, 384)
   if fd < 0 {
-    return false
+    return rec_failed(failure, 2, rec_errno().*)
   }
   offset: usize = 0
   ok := true
@@ -109,44 +116,59 @@ fn rec_snapshot(path: *const u8, bytes: *const u8, length: usize) bool {
       continue
     }
     if written <= 0 {
-      ok = false
+      error := rec_errno().*
+      if written == 0 {
+        error = 5
+      }
+      ok = rec_failed(failure, 3, error)
       break
     }
     offset += #cast(usize, written)
   }
   if rec_sync(fd) != 0 {
-    ok = false
+    ok = rec_failed(failure, 4, rec_errno().*)
   }
   if rec_close(fd) != 0 {
-    ok = false
+    ok = rec_failed(failure, 5, rec_errno().*)
   }
-  if ok && rec_rename(&temporary[0], path) != 0 {
-    ok = false
+  if ok && rec_rename_report(&temporary[0], path, &failure.native_error) != 0 {
+    ok = rec_failed(failure, 6, rec_errno().*)
   }
   if !ok {
     _ = rec_unlink(&temporary[0])
+    rec_errno().* = failure.error
     return false
   }
   parent: [4096]u8 = []
   _ = copy(&parent[0], path, size + 1)
   slash := size
-  for slash > 0 && parent[slash - 1] != 47 {
+  for slash > 0 && !rec_path_separator(parent[slash - 1]) {
     slash -= 1
   }
   if slash > 0 {
-    if slash == 1 {
-      parent[1] = 0
+    if slash <= rec_path_root(path, size) {
+      parent[slash] = 0
     } else {
       parent[slash - 1] = 0
     }
     directory := rec_open(&parent[0], 589824, 0)
     if directory < 0 {
-      return false
+      return rec_failed(failure, 7, rec_errno().*)
     }
-    ok = rec_sync(directory) == 0
+    ok = rec_sync_parent(directory)
+    if !ok {
+      _ = rec_failed(failure, 8, rec_errno().*)
+    }
     _ = rec_close(directory)
+    if !ok {
+      rec_errno().* = failure.error
+    }
   }
   return ok
+}
+fn rec_snapshot(path: *const u8, bytes: *const u8, length: usize) bool {
+  failure := RecoveryFailure{}
+  return rec_snapshot_report(path, bytes, length, &failure)
 }
 fn rec_path(state: *RecoveryWorker) bool {
   if state.path[0] != 0 {
@@ -168,7 +190,9 @@ fn rec_path(state: *RecoveryWorker) bool {
     return false
   }
   if rec_close(fd) != 0 {
+    saved := rec_errno().*
     _ = rec_unlink(&path[0])
+    rec_errno().* = saved
     return false
   }
   _ = copy(&state.path[0], &path[0], size + #len(suffix))
@@ -191,7 +215,13 @@ fn rec_worker(context: rawptr) i32 {
     state.pending = nil
     state.pending_capacity = 0
     rec_unlock(state.lock)
-    ok := rec_path(state) && rec_snapshot(&state.path[0], bytes, length)
+    failure := RecoveryFailure{length: length}
+    ok := rec_path(state)
+    if !ok {
+      _ = rec_failed(&failure, 1, rec_errno().*)
+    } else {
+      ok = rec_snapshot_report(&state.path[0], bytes, length, &failure)
+    }
     rec_lock(state.lock)
     if capacity <= 2097152 && capacity > state.spare_capacity {
       rec_free(#cast(rawptr, state.spare))
@@ -201,6 +231,9 @@ fn rec_worker(context: rawptr) i32 {
       rec_free(#cast(rawptr, bytes))
     }
     state.error = state.error || !ok
+    if !ok && state.failure.stage == 0 {
+      state.failure = failure
+    }
     rec_unlock(state.lock)
     if !ok {
       rec_notify()
@@ -209,7 +242,7 @@ fn rec_worker(context: rawptr) i32 {
   return 0
 }
 pub fn dna_recovery_open(directory: *const u8) *RecoveryWorker {
-  if directory == nil || directory.* != 47 {
+  if directory == nil || !rec_absolute(directory) {
     return nil
   }
   size := string_length(directory)
@@ -235,7 +268,7 @@ pub fn dna_recovery_open(directory: *const u8) *RecoveryWorker {
   return state
 }
 pub fn dna_recovery_submit(state: *RecoveryWorker, bytes: *const u8, length: usize) i32 {
-  if state == nil || bytes == nil || length == 0 || length > 34000000 {
+  if state == nil || bytes == nil || length == 0 || length > 4294967295 {
     return 0
   }
   // Pending snapshots may be replaced in place; the writer detaches its buffer

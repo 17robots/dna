@@ -1,0 +1,126 @@
+#target(kernel: darwin)
+extern fn tty_atexit "atexit"(handler: fn()) i32
+struct TtyTermios { input, output, control, local:u64, characters:[20]u8, input_speed, output_speed:u64 }
+struct TtySignalAction { handler:fn(i32), mask:u32, flags:i32 }
+const TtyGetSize:u64=1074295912
+const TtySuspendSignal:i32=18
+fn tty_fatal_signals() [8]i32 {
+  return [15, 1, 3, 11, 10, 6, 8, 4]
+}
+extern fn tty_darwin_raw "cfmakeraw"(raw:*TtyTermios)
+extern fn tty_darwin_argc "_NSGetArgc"() *i32
+extern fn tty_darwin_argv "_NSGetArgv"() ***const u8
+extern fn tty_darwin_executable "_NSGetExecutablePath"(output:*u8, size:*u32) i32
+fn tty_make_raw(raw:*TtyTermios) {
+  tty_darwin_raw(raw)
+}
+tty_wake_writer:i32
+tty_executable:[4096]u8
+fn tty_wake_create() i32 {
+  descriptors:[2]i32=[-1, -1]
+  if proc_pipe(&descriptors[0], 526336)!=0 {
+    return -1
+  }
+  tty_wake_writer=descriptors[1]
+  return descriptors[0]
+}
+fn tty_wake_signal(bytes:*const u8) {
+  _=rec_write(tty_wake_writer, bytes, 8)
+}
+fn tty_arguments() isize {
+  count:=tty_darwin_argc().*
+  arguments:=tty_darwin_argv().*
+  used:usize=0
+  for index in 0..count {
+    argument:=arguments[..#cast(usize, count)][#cast(usize, index)]
+    length:=string_length(argument)+1
+    if length>65535-used {
+      return -1
+    }
+    _=copy(&tty_command_line[used], argument, length)
+    used+=length
+  }
+  return #cast(isize, used)
+}
+fn tty_executable_path() *const u8 {
+  capacity:u32=4096
+  if tty_darwin_executable(&tty_executable[0], &capacity)!=0 {
+    return nil
+  }
+  return &tty_executable[0]
+}
+
+extern fn tty_darwin_ioctl "ioctl"(fd:i32, request:u64, ...) i32
+fn tty_ioctl(fd:i32, request:u64, output:rawptr) i32 {
+  return tty_darwin_ioctl(fd, request, #cast(*u8, output))
+}
+
+extern fn tty_getattr "tcgetattr"(fd: i32, value: *TtyTermios) i32
+extern fn tty_setattr "tcsetattr"(fd: i32, action: i32, value: *const TtyTermios) i32
+extern fn tty_isatty "isatty"(fd: i32) i32
+extern fn tty_signal "signal"(number: i32, handler: fn(i32)) rawptr
+extern fn tty_sigaction "sigaction"(number: i32, action: *const TtySignalAction, old: rawptr) i32
+extern fn tty_raise "raise"(number: i32) i32
+extern fn tty_setenv "setenv"(key: *const u8, value: *const u8, overwrite: i32) i32
+extern fn tty_execv "execv"(path: *const u8, arguments: **const u8) i32
+
+tty_saved: TtyTermios = TtyTermios{}
+fn tty_enter_host() bool {
+  if tty_isatty(tty_input) == 0 || tty_isatty(tty_output) == 0 || tty_getattr(tty_input, &tty_saved) != 0 {
+    return false
+  }
+  raw := tty_saved
+  tty_make_raw(&raw)
+  if tty_setattr(tty_input, 2, &raw) != 0 {
+    return false
+  }
+  return true
+}
+fn tty_leave_host() {
+  _ = tty_setattr(tty_input, 2, &tty_saved)
+}
+fn tty_register_handlers() {
+  _ = tty_atexit(tty_exit_handler)
+  fatal := tty_fatal_signals()
+  for number in fatal {
+    _ = tty_signal(number, tty_fatal)
+  }
+  // SIGBUS first tries to repair a truncated file mapping.
+  map_guard_install()
+  action := TtySignalAction{handler: tty_resize}
+  _ = tty_sigaction(28, &action, nil)
+}
+fn tty_fatal_host(number: i32) {
+  _ = tty_signal(number, nil)
+  _ = tty_raise(number)
+}
+fn tty_size_host(columns, rows: *i32) i32 {
+  size := TtySize{}
+  fd := tty_output
+  if fd < 0 {
+    fd = 1
+  }
+  if tty_ioctl(fd, TtyGetSize, #cast(rawptr, &size)) != 0 || size.columns == 0 || size.rows == 0 {
+    return 0
+  }
+  columns.* = #cast(i32, size.columns)
+  rows.* = #cast(i32, size.rows)
+  return 1
+}
+fn tty_read_host(buffer: *u8, capacity, timeout: i32) i32 {
+  return tty_read_posix(buffer, capacity, timeout)
+}
+fn tty_handoff_host(executable: *const u8, arguments: **const u8, session: *const u8) bool {
+  variable: []const u8 = "DNA_HANDOFF\0"
+  _ = tty_setenv(&variable[0], session, 1)
+  _ = tty_execv(executable, arguments)
+  return false
+}
+fn tty_suspend_host() i32 {
+  if sync.load_u32(&tty_active) == 0 {
+    return 0
+  }
+  dna_tty_leave()
+  _ = tty_raise(TtySuspendSignal)
+  return dna_tty_enter()
+}

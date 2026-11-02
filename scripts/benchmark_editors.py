@@ -100,8 +100,12 @@ class Session:
         os.waitpid(self.pid,0);os.close(self.fd);V.vterm_free(self.vt)
 
 def memory(pid):
-    """RSS and PSS of editor plus descendants; shared pages counted fairly by PSS."""
-    queue=[pid];rss=pss=0;seen=set()
+    """RSS and PSS of editor plus descendants; shared pages counted fairly by PSS.
+
+    Anonymous is heap and other memory not backed by a file: unlike PSS it
+    leaves out page-cache pages of a file the editor maps instead of copying.
+    """
+    queue=[pid];rss=pss=anonymous=private=0;seen=set()
     while queue:
         current=queue.pop()
         if current in seen:continue
@@ -109,10 +113,12 @@ def memory(pid):
         try:
             fields={line.split(':')[0]:line.split(':')[1].strip() for line in Path(f'/proc/{current}/smaps_rollup').read_text().splitlines() if ':' in line}
             rss+=int(fields['Rss'].split()[0]);pss+=int(fields['Pss'].split()[0])
+            anonymous+=int(fields['Anonymous'].split()[0])
+            private+=int(fields['Private_Clean'].split()[0])+int(fields['Private_Dirty'].split()[0])
             for task in Path(f'/proc/{current}/task').iterdir():
                 queue.extend(map(int,(task/'children').read_text().split()))
         except (FileNotFoundError,ProcessLookupError):pass
-    return {'rss_kib':rss,'pss_kib':pss,'processes':len(seen)}
+    return {'rss_kib':rss,'pss_kib':pss,'anonymous_kib':anonymous,'private_kib':private,'processes':len(seen)}
 
 def summary(values):
     ordered=sorted(values)

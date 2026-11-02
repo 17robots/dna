@@ -99,14 +99,14 @@ fn wants_text_input(app: *App) bool {
   if terminal_target(app) != nil {
     return terminal_mode(app).input
   }
-  return (app.prompt_state.panel == Panel.Hover && app.view.insert) || app.register_state.pending || completion_visible(app) || (app.prompt_state.panel == Panel.Match && app.match_state.stage != 0) || app.input_state.pending != 0 || prompting(app) || (app.prompt_state.panel == Panel.None && app.view.insert) || (app.prompt_state.panel == Panel.Directory && app.explorer.insert)
+  return (app.prompt_state.panel == Panel.LspResults && (app.lsp.results.kind == 13 || app.lsp.results.kind == 14)) || (app.prompt_state.panel == Panel.Hover && app.view.insert) || app.register_state.pending || completion_visible(app) || (app.prompt_state.panel == Panel.Match && app.match_state.stage != 0) || app.input_state.pending != 0 || prompting(app) || (app.prompt_state.panel == Panel.None && app.view.insert) || (app.prompt_state.panel == Panel.Directory && app.explorer.insert)
 }
 fn changed(app: *App, text: []const u8) {
   if snippet_replace(app, text) {
     return
   }
   if !buffer.replace_all(app.documents.current, text) {
-    notice(app, "Edit rejected: invalid UTF-8, NUL, or document exceeds 256 MiB.")
+    notice(app, "Edit rejected: invalid UTF-8, NUL, or an insertion over 256 MiB.")
   }
 }
 fn text_input(app: *App, text: []const u8) {
@@ -148,6 +148,10 @@ fn text_input(app: *App, text: []const u8) {
   }
   if app.prompt_state.panel==Panel.Tree && app.tree.searching {
     tree_search_text(app, text)
+    return
+  }
+  if app.prompt_state.panel == Panel.LspResults && (app.lsp.results.kind == 13 || app.lsp.results.kind == 14) {
+    lsp_symbol_query(app, text, false)
     return
   }
   target := terminal_target(app)
@@ -253,7 +257,7 @@ fn clipboard_copy(app: *App) bool {
     }
     offsets[index] = used
     lengths[index] = selected.cursor - selected.anchor
-    add_text(storage, &used, doc.bytes[selected.anchor..selected.cursor])
+    add_text(storage, &used, buffer.range(doc, selected.anchor, selected.cursor))
   }
   storage[used] = 0
   if app.register_state.selected == 0 && !sdl.clipboard_set(&storage[0]) {
@@ -554,7 +558,7 @@ fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
         diagnostics := &app.documents.slots[app.documents.active].diagnostics
         if app.prompt_state.selected < diagnostics.count && diagnostics.revision == app.documents.current.revision {
           item := &diagnostics.items[app.prompt_state.selected]
-          position := lsp.offset(app.documents.current.bytes[..app.documents.current.length], lsp.Position{line: item.line, character: item.character})
+          position := lsp.offset(buffer.all(app.documents.current), lsp.Position{line: item.line, character: item.character})
           if position.ok {
             jump_push(app)
             buffer.move_to(app.documents.current, position.value, false)
@@ -563,6 +567,10 @@ fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
         }
         app.prompt_state.panel = Panel.None
       }
+      return
+    }
+    if key == KeyBackspace && app.prompt_state.panel == Panel.LspResults && (app.lsp.results.kind == 13 || app.lsp.results.kind == 14) {
+      lsp_symbol_query(app, "", true)
       return
     }
     count := app.lsp.results.count
@@ -818,7 +826,7 @@ fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
       normalized = KeyColon
     }
     chosen := PluginCommandBase
-    for index in 0..12 {
+    for index in 0..LeaderCommands {
       id := leader_command(index)
       info := command_info(id)
       if #len(info.key) == 1 && normalized == #cast(u32, info.key[0]) {

@@ -3,7 +3,12 @@
 fn grammar_installed(root: []const u8, name: []const u8) bool {
   package_storage: [4096]u8 = []
   file_storage: [4096]u8 = []
-  package := append_path(package_storage[..], root, name)
+  active := append_path(package_storage[..], root, name)
+  version_storage: [4096]u8 = []
+  package := installer_package_path(active, version_storage[..])
+  if #len(package) == 0 {
+    return false
+  }
   for leaf in ["parser.so", "highlights.scm", "extensions"] {
     info := std_fs.metadata(append_path(file_storage[..], package, leaf))
     if !info.ok || (info.mode & 61440) != 32768 || info.size == 0 {
@@ -25,7 +30,7 @@ fn catalog(registry: *Registry, root: []const u8) {
     storage: [4096]u8 = []
     info := std_fs.metadata(server_executable(root, item, storage[..]))
     state: []const u8 = "available"
-    if info.ok && (info.mode & 73) != 0 {
+    if info.ok && installer_executable(server_executable(root, item, storage[..])) {
       state = "installed"
     }
     _ = io.println(io.stdout(), "server\t{}\t{}", item.name, state)
@@ -41,7 +46,7 @@ fn uninstall(root: []const u8, name: []const u8) {
   active := append_path(active_storage[..], root, name)
   target_space := mem.arena_create(4096)
   defer mem.arena_release(target_space)
-  target := std_fs.read_link(target_space, active)
+  target := installer_read_link(target_space, active)
   if !target.ok {
     #panic("refusing to remove a package not managed by DNA")
   }
@@ -61,9 +66,7 @@ fn uninstall(root: []const u8, name: []const u8) {
   if !std_fs.remove(active).ok {
     #panic("cannot deactivate package")
   }
-  frames: [128]std_fs.RemovalFrame = []
-  scratch: [65536]u8 = []
-  removed := std_fs.remove_tree(target.value, frames[..], scratch[..])
+  removed := installer_remove_tree(target.value)
   if !removed.ok && removed.error != -2 {
     #panic("package deactivated but cleanup failed; refresh the package list")
   }

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Deterministic stdio LSP peer, including fragmented frames and Unicode."""
-import json, sys
+import json, os, sys
 versions={}; texts={}; commands={}
 def send(message):
     body=json.dumps(dict(jsonrpc='2.0',**message),ensure_ascii=False).encode()
@@ -29,7 +29,7 @@ while True:
         key,value=line.decode().split(':',1);headers[key.lower()]=value.strip()
     message=json.loads(sys.stdin.buffer.read(int(headers['content-length'])))
     method=message.get('method');params=message.get('params',{});ident=message.get('id')
-    if method=='initialize':result={'capabilities':{'positionEncoding':'utf-16','textDocumentSync':{'openClose':True,'change':2,'save':{'includeText':True}},'completionProvider':{'triggerCharacters':['/', '😀']},'hoverProvider':True,'definitionProvider':True,'referencesProvider':True,'renameProvider':True,'codeActionProvider':True}}
+    if method=='initialize':initialize_params=params;result={'capabilities':{'positionEncoding':'utf-16','textDocumentSync':{'openClose':True,'change':2,'save':{'includeText':True}},'completionProvider':{'triggerCharacters':['/', '😀']},'hoverProvider':True,'definitionProvider':True,'referencesProvider':True,'renameProvider':True,'codeActionProvider':True}}
     elif method in ('textDocument/didOpen','textDocument/didChange'):
         doc=params['textDocument'];uri=doc['uri'];versions[uri]=doc['version']
         if method.endswith('didOpen'):texts[uri]=doc['text']
@@ -43,6 +43,9 @@ while True:
         send({'method':'textDocument/publishDiagnostics','params':{'uri':uri,'version':doc['version'],'diagnostics':[{'range':edit('')['range'],'severity':2,'message':'fixture diagnostic é😀'}]}})
         continue
     elif method=='textDocument/didSave':
+        if 'FAKE_LSP_SAVES' in os.environ:
+            with open(os.environ['FAKE_LSP_SAVES'],'a') as log:
+                log.write('%s %d\n'%('match' if params['text']==texts[params['textDocument']['uri']] else 'mismatch',len(params['text'])))
         assert params['text']==texts[params['textDocument']['uri']]
         send({'method':'window/logMessage','params':{'type':3,'message':'fixture saved'}});continue
     elif method is None and ident in commands:
@@ -54,6 +57,28 @@ while True:
         assert params['options']['tabSize'] > 0
         result=[edit('formatted')]
     elif method=='textDocument/hover':result={'contents':{'kind':'markdown','value':'**fixture hover**'}}
+    elif method=='textDocument/documentSymbol':
+        # Nested DocumentSymbols: every line naming 'fn NAME' becomes a symbol,
+        # and lines naming 'method NAME' become its children.
+        text=texts[params['textDocument']['uri']];result=[]
+        for number,line in enumerate(text.split('\n')):
+            words=line.split()
+            if len(words)>=2 and words[0] in ('fn','method'):
+                # Like real servers: nested symbols only for clients that
+                # declare support; the selection range covers just the name.
+                assert initialize_params['capabilities']['textDocument']['documentSymbol']['hierarchicalDocumentSymbolSupport']
+                where={'start':{'line':number,'character':0},'end':{'line':number,'character':len(line)}}
+                name_at=line.index(words[1])
+                name={'start':{'line':number,'character':name_at},'end':{'line':number,'character':name_at+len(words[1])}}
+                symbol={'name':words[1],'kind':12 if words[0]=='fn' else 6,'range':where,'selectionRange':name,'children':[]}
+                (result[-1]['children'] if words[0]=='method' and result else result).append(symbol)
+    elif method=='workspace/symbol':
+        query=params['query'].lower();result=[]
+        for uri,text in texts.items():
+            for number,line in enumerate(text.split('\n')):
+                words=line.split()
+                if len(words)>=2 and words[0]=='fn' and query in words[1].lower():
+                    result.append({'name':words[1],'kind':12,'location':{'uri':uri,'range':{'start':{'line':number,'character':0},'end':{'line':number,'character':len(line)}}}})
     elif method=='textDocument/completion':
         context=params.get('context', {})
         if context.get('triggerKind')==2:

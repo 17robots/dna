@@ -9,8 +9,14 @@ struct CompletionState {
   prefix_length: usize,
 }
 
+// Paths are NUL-terminated in names; offsets[row] is where each starts. Both
+// are lazily committed reservations, so memory follows the files indexed.
+const PickerIndexRows: usize = 262144
+const PickerIndexBytes: usize = 33554432
 struct PickerIndex {
-  entries: []Entry,
+  names: []u8,
+  offsets: []usize,
+  used: usize,
   count: usize,
   visited: usize,
   root: [4096]u8,
@@ -78,13 +84,15 @@ fn completion_refresh(app: *App) {
   }
   fragment := path[split..]
   if app.picker_state.index == nil {
-    allocated := arena_owner.create((#sizeof(PickerIndex) + #alignof(Entry) + #sizeof(Entry) * 2048))
+    allocated := arena_owner.create(#sizeof(PickerIndex) + #alignof(usize) + #sizeof(usize) * PickerIndexRows + PickerIndexBytes)
     app.picker_state.arena = allocated
     allocated = nil
     // A fresh mapping is already zero; only touched entries become resident.
     app.picker_state.index = #cast(*PickerIndex, mem.arena_push_uninit(app.picker_state.arena, #sizeof(PickerIndex), #alignof(PickerIndex)))
-    entries := #cast(*Entry, mem.arena_push_uninit(app.picker_state.arena, #sizeof(Entry) * 2048, #alignof(Entry)))
-    app.picker_state.index.entries = entries[..2048]
+    offsets := #cast(*usize, mem.arena_push_uninit(app.picker_state.arena, #sizeof(usize) * PickerIndexRows, #alignof(usize)))
+    app.picker_state.index.offsets = offsets[..PickerIndexRows]
+    names := #cast(*u8, mem.arena_push_uninit(app.picker_state.arena, PickerIndexBytes, 1))
+    app.picker_state.index.names = names[..PickerIndexBytes]
   }
   index := app.picker_state.index
   changed_root := !buffer.equal(directory, index.root[..index.root_length])
@@ -105,8 +113,7 @@ fn completion_refresh(app: *App) {
   for pass in 0..3 {
     row: usize = 0
     for row < index.count && app.completion.count < 128 {
-      entry := &index.entries[row]
-      name := entry.name[..entry.length]
+      name := picker_index_name(index, row)
       prefix := #len(fragment) <= #len(name) && contains(name[..#len(fragment)], fragment)
       substring := contains(name, fragment)
       if (pass == 0 && prefix) || (pass == 1 && !prefix && substring) || (pass == 2 && !substring && picker_match(name, fragment)) {

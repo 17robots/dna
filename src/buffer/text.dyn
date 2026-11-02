@@ -1,0 +1,393 @@
+// Read access to document text. Code outside this module reads text only
+// through these functions so storage can change without touching callers.
+//
+// byte_at reads one byte; offsets at or past the end read 0. range returns
+// bytes low..high as one slice. A range inside one leaf is a direct view; a
+// range crossing leaves is copied once into a document-owned view. Both stay
+// valid until the next edit or release_views, like any view of document text.
+// chunk_at returns the longest contiguous run starting at an offset, for hot
+// loops that should walk storage chunk by chunk instead of byte by byte.
+
+struct TextView { next: *TextView, low, high: usize, bytes: *u8 }
+// Flattened views kept before the oldest is reused. Callers never hold more
+// than a handful at once; this bounds memory when nothing edits for a while.
+const ViewLimit: usize = 256
+
+zero_byte: [1]u8 = [0]
+
+fn mutable(document: *const Document) *Document {
+  return #cast(*Document, document)
+}
+fn cache_run(document: *const Document, offset: usize) {
+  run := rope_run(document.root, offset)
+  writable := mutable(document)
+  writable.cache_data = run.data
+  writable.cache_low = run.low
+  writable.cache_high = run.high
+}
+pub fn byte_at(document: *const Document, offset: usize) u8 {
+  if offset >= document.length {
+    return 0
+  }
+  if offset < document.cache_low || offset >= document.cache_high {
+    cache_run(document, offset)
+  }
+  return document.cache_data[..document.cache_high - document.cache_low][offset - document.cache_low]
+}
+pub fn chunk_at(document: *const Document, offset: usize) []const u8 {
+  if offset >= document.length {
+    return ""
+  }
+  if offset < document.cache_low || offset >= document.cache_high {
+    cache_run(document, offset)
+  }
+  return document.cache_data[..document.cache_high - document.cache_low][offset - document.cache_low..]
+}
+pub fn range(document: *const Document, low: usize, high: usize) []const u8 {
+  if high <= low {
+    return zero_byte[..0]
+  }
+  if low < document.cache_low || low >= document.cache_high {
+    cache_run(document, low)
+  }
+  if high <= document.cache_high {
+    return document.cache_data[..document.cache_high - document.cache_low][low - document.cache_low..high - document.cache_low]
+  }
+  return flatten(document, low, high)
+}
+pub fn all(document: *const Document) []const u8 {
+  return range(document, 0, document.length)
+}
+// Pointer to bytes low..high as one run, for native calls taking pointer and
+// length. Valid for an empty range too; same lifetime as range.
+pub fn pointer(document: *const Document, low: usize, high: usize) *const u8 {
+  if high <= low {
+    return &zero_byte[0]
+  }
+  return &range(document, low, high)[0]
+}
+fn flatten(document: *const Document, low: usize, high: usize) []const u8 {
+  writable := mutable(document)
+  view := writable.views
+  for view != nil {
+    if view.low == low && view.high == high {
+      return view.bytes[..high - low]
+    }
+    view = view.next
+  }
+  if writable.view_count >= ViewLimit {
+    release_views(writable)
+  }
+  created := #cast(*TextView, rope_malloc(#sizeof(TextView)))
+  if created == nil {
+    #panic("cannot allocate text view")
+  }
+  // One spare byte keeps a terminating NUL for native callers.
+  created.bytes = #cast(*u8, rope_malloc(high - low + 1))
+  if created.bytes == nil {
+    #panic("cannot allocate text view")
+  }
+  rope_copy(document.root, low, high, created.bytes)
+  created.bytes[..high - low + 1][high - low] = 0
+  created.low = low
+  created.high = high
+  created.next = writable.views
+  writable.views = created
+  writable.view_count += 1
+  return created.bytes[..high - low]
+}
+// Drop flattened views. Call where no range from this document is still held.
+pub fn release_views(document: *Document) {
+  view := document.views
+  for view != nil {
+    next := view.next
+    rope_free(#cast(rawptr, view.bytes))
+    rope_free(#cast(rawptr, view))
+    view = next
+  }
+  document.views = nil
+  document.view_count = 0
+}
+// Install a new owned root. Views and the leaf cache refer to the old one.
+fn set_root(document: *Document, root: *RopeNode) {
+  release_views(document)
+  rope_release(document.root)
+  document.root = root
+  document.length = rope_length(root)
+  document.line_count = rope_lines(root) + 1
+  document.cache_low = 0
+  document.cache_high = 0
+}
+// Release everything the document owns outside its arena. The document must
+// not be used again until load.
+pub fn release(document: *Document) {
+  lazy_cancel(document)
+  set_root(document, nil)
+  rope_release(document.saved_root)
+  document.saved_root = nil
+  for index in 0..document.history_count {
+    rope_release(document.history[index].root)
+    document.history[index].root = nil
+  }
+  document.history_count = 0
+}
+// Copy bytes low..high into output (at least high - low bytes), for callers
+// that keep their own scratch instead of a document view.
+pub fn copy_range(document: *const Document, low: usize, high: usize, output: []u8) {
+  if high > low {
+    rope_copy(document.root, low, high, &output[0])
+  }
+}
+// Storage a file can be read into directly, so loading it needs no second
+// copy. Release unless consumed by load_storage.
+pub struct TextStorage { block: *RopeBlock, bytes: []u8 }
+pub fn storage_create(size: usize) TextStorage {
+  block := #cast(*RopeBlock, rope_malloc(#sizeof(RopeBlock)))
+  if block == nil {
+    return TextStorage{}
+  }
+  allocation := size
+  if allocation == 0 {
+    allocation = 1
+  }
+  block.bytes = #cast(*u8, rope_malloc(allocation))
+  if block.bytes == nil {
+    rope_free(#cast(rawptr, block))
+    return TextStorage{}
+  }
+  block.refs = 1
+  block.origin = -1
+  block.mapped = 0
+  return TextStorage{block: block, bytes: block.bytes[..size]}
+}
+// Storage over an existing read-only file mapping of length bytes; unmap
+// runs when the last piece referring to it is freed.
+pub fn storage_mapped(bytes: *u8, length: usize, unmap: fn(*u8, u64)) TextStorage {
+  block := #cast(*RopeBlock, rope_malloc(#sizeof(RopeBlock)))
+  if block == nil {
+    return TextStorage{}
+  }
+  block.* = RopeBlock{refs: 1, bytes: bytes, origin: -1, mapped: #cast(u64, length)}
+  rope_unmap = unmap
+  return TextStorage{block: block, bytes: bytes[..length]}
+}
+pub fn storage_release(storage: *TextStorage) {
+  if storage.block != nil {
+    rope_block_release(storage.block)
+  }
+  storage.block = nil
+  storage.bytes = storage.bytes[..0]
+}
+// Load the first length bytes of storage. On success the document owns the
+// storage; on failure the document is unchanged and storage stays the caller's.
+pub fn load_storage(document: *Document, storage: *TextStorage, length: usize) bool {
+  if storage.block == nil {
+    return false
+  }
+  loaded := rope_load_block(storage.block, length)
+  if !loaded.ok {
+    return false
+  }
+  storage_release(storage)
+  return load_root(document, loaded.root)
+}
+// Record the open file storage was read from; the block closes it when freed.
+pub fn storage_set_origin(storage: *TextStorage, descriptor: isize, stamp: [6]u64, close: fn(isize)) {
+  rope_origin_close = close
+  if storage.block != nil {
+    storage.block.origin = descriptor
+    storage.block.stamp = stamp
+  }
+}
+// The contiguous run at offset and, when it is still the bytes read from a
+// file, that file's descriptor, the run's offset in it and its stamp then.
+// mapped: the bytes are a file mapping, valid only while the stamp holds.
+pub struct TextSource { bytes: []const u8, descriptor: isize, offset: u64, stamp: [6]u64, mapped: bool }
+pub fn source_at(document: *const Document, offset: usize) TextSource {
+  return root_source_at(document.root, offset)
+}
+// source_at for a snapshot. Save workers may consult origin stamps while the
+// owner defers snapshot_origin_stamp until they have joined. Byte-only workers
+// use snapshot_copy or snapshot_byte_at and need no origin metadata.
+pub fn snapshot_source_at(snapshot: *const TextSnapshot, offset: usize) TextSource {
+  return root_source_at(snapshot.root, offset)
+}
+fn root_source_at(root: *const RopeNode, offset: usize) TextSource {
+  run := rope_run(root, offset)
+  bytes := run.data[..run.high - run.low][offset - run.low..]
+  if run.block.origin < 0 {
+    return TextSource{bytes: bytes, descriptor: -1}
+  }
+  start := #cast(usize, &bytes[0]) - #cast(usize, run.block.bytes)
+  return TextSource{bytes: bytes, descriptor: run.block.origin, offset: #cast(u64, start), stamp: run.block.stamp, mapped: run.block.mapped > 0}
+}
+// A read-only view of the text at one revision that another thread may read
+// while the document keeps changing: the tree is immutable and retained.
+// Take and release only on the thread that owns the document.
+pub struct TextSnapshot { root: *RopeNode, length: usize, revision: u64 }
+// Main-thread metadata update after our own atomic rename unlinks an origin.
+// Text remains immutable. Save workers have joined before this is called;
+// search workers read bytes and do not consult origin stamps.
+pub fn snapshot_origin_stamp(snapshot: *const TextSnapshot, offset: usize, descriptor: isize, stamp: [6]u64) {
+  if offset < snapshot.length {
+    run := rope_run(snapshot.root, offset)
+    if run.block.origin == descriptor {
+      run.block.stamp = stamp
+    }
+  }
+}
+pub fn snapshot_take(document: *const Document) TextSnapshot {
+  return TextSnapshot{root: rope_retain(document.root), length: document.length, revision: document.revision}
+}
+pub fn snapshot_release(snapshot: *TextSnapshot) {
+  rope_release(snapshot.root)
+  snapshot.root = nil
+  snapshot.length = 0
+}
+// Copy bytes low..high into output. Safe from any thread; allocates nothing.
+// The stored run holding offset, from offset on; empty at the end. Reads no
+// document state, so any thread may call it.
+pub fn snapshot_chunk(snapshot: *const TextSnapshot, offset: usize) []const u8 {
+  if offset >= snapshot.length {
+    return ""
+  }
+  run := rope_run(snapshot.root, offset)
+  return run.data[..run.high - run.low][offset - run.low..]
+}
+pub fn snapshot_copy(snapshot: *const TextSnapshot, low: usize, high: usize, output: *u8) {
+  if high > low {
+    rope_copy(snapshot.root, low, high, output)
+  }
+}
+// Mark the text a snapshot holds as saved, for a save that wrote it while
+// the document may have moved on.
+pub fn mark_saved_snapshot(document: *Document, snapshot: *const TextSnapshot) {
+  document.saved_epoch += 1
+  document.saved_rows = document.rows
+  document.saved_length = snapshot.length
+  retained := rope_retain(snapshot.root)
+  rope_release(document.saved_root)
+  document.saved_root = retained
+  // Edits since the snapshot bound where saved and current text may differ;
+  // without that journal, dirty checks compare everything.
+  document.saved_prefix = 0
+  document.saved_suffix = 0
+  change := changes_since(document, snapshot.revision)
+  if snapshot.root == document.root {
+    document.saved_prefix = document.length
+    document.saved_suffix = document.length
+  } else if change.found && change.old_length == snapshot.length && change.high <= document.length {
+    document.saved_prefix = change.low
+    document.saved_suffix = document.length - change.high
+  }
+  notify_changed(document)
+}
+// A position as language servers count it: a line, and UTF-16 code units
+// from that line's start. Line lookups use the newline index, so only the
+// part of the line before offset is read.
+pub struct TextPoint { line, character: usize }
+pub fn document_point(document: *const Document, offset: usize) TextPoint {
+  return root_point(document.root, offset)
+}
+pub fn snapshot_point(snapshot: *const TextSnapshot, offset: usize) TextPoint {
+  return root_point(snapshot.root, offset)
+}
+fn root_point(root: *const RopeNode, offset: usize) TextPoint {
+  if root == nil || offset == 0 {
+    return TextPoint{}
+  }
+  line := rope_newlines_before(root, offset)
+  at: usize = 0
+  if line > 0 {
+    at = rope_after_newline(root, line)
+  }
+  character: usize = 0
+  for at < offset {
+    run := rope_run(root, at)
+    end := run.high
+    if end > offset {
+      end = offset
+    }
+    bytes := run.data[..run.high - run.low][at - run.low..end - run.low]
+    for byte in bytes {
+      // One unit per character, two for those outside the BMP.
+      if (byte & 192) != 128 {
+        character += 1
+        if byte >= 240 {
+          character += 1
+        }
+      }
+    }
+    at = end
+  }
+  return TextPoint{line: line, character: character}
+}
+pub fn snapshot_byte_at(snapshot: *const TextSnapshot, offset: usize) u8 {
+  if offset >= snapshot.length {
+    return 0
+  }
+  run := rope_run(snapshot.root, offset)
+  return run.data[..run.high - run.low][offset - run.low]
+}
+// Lengths of the longest common prefix and suffix of a snapshot and the
+// document's text, comparing leaf runs, so shared storage costs no reads.
+pub struct CommonBounds { prefix, suffix: usize }
+pub fn snapshot_common(snapshot: *const TextSnapshot, document: *const Document) CommonBounds {
+  shorter := snapshot.length
+  if document.length < shorter {
+    shorter = document.length
+  }
+  prefix: usize = 0
+  for prefix < shorter {
+    left := rope_run(snapshot.root, prefix)
+    right := rope_run(document.root, prefix)
+    step := left.high - prefix
+    if right.high - prefix < step {
+      step = right.high - prefix
+    }
+    if shorter - prefix < step {
+      step = shorter - prefix
+    }
+    first := &left.data[..left.high - left.low][prefix - left.low]
+    second := &right.data[..right.high - right.low][prefix - right.low]
+    if first == second || compare_bytes(first, second, step) == 0 {
+      prefix += step
+      continue
+    }
+    for index in 0..step {
+      if first[..step][index] != second[..step][index] {
+        break
+      }
+      prefix += 1
+    }
+    break
+  }
+  suffix: usize = 0
+  for suffix < shorter - prefix {
+    // Runs holding the last byte before each suffix.
+    left := rope_run(snapshot.root, snapshot.length - suffix - 1)
+    right := rope_run(document.root, document.length - suffix - 1)
+    left_end := snapshot.length - suffix
+    right_end := document.length - suffix
+    step := left_end - left.low
+    if right_end - right.low < step {
+      step = right_end - right.low
+    }
+    if shorter - prefix - suffix < step {
+      step = shorter - prefix - suffix
+    }
+    first := &left.data[..left.high - left.low][left_end - step - left.low]
+    second := &right.data[..right.high - right.low][right_end - step - right.low]
+    if first == second || compare_bytes(first, second, step) == 0 {
+      suffix += step
+      continue
+    }
+    index := step
+    for index > 0 && first[..step][index - 1] == second[..step][index - 1] {
+      index -= 1
+      suffix += 1
+    }
+    break
+  }
+  return CommonBounds{prefix: prefix, suffix: suffix}
+}
