@@ -105,6 +105,8 @@ def handle_type(handle):
 
 
 def native_tests(binary, work, mode):
+    for name in ('conpty.dll', 'OpenConsole.exe'):
+        assert (binary.parent / name).is_file(), ('missing app-local ConPTY deployment', str(binary.parent / name))
     lib = c.CDLL(str(binary))
     lib.test_open.argtypes = [c.c_char_p] * 3
     lib.test_open.restype = c.c_void_p
@@ -276,6 +278,12 @@ def main():
                     raise SystemExit('Windows SDK x64 ' + name + '.lib is required.')
                 shutil.copyfile(candidates[-1], libraries / ('lib' + name + '.dll.a'))
             environment['DYN_LIBRARY_PATH'] = str(libraries)
+            # The production adapter intentionally refuses the inbox ConPTY.
+            # Its module-relative lookup requires the verified bundle beside
+            # this isolated fixture DLL, just as for the deployed editor.
+            from conpty import install as install_conpty
+            install_conpty(work)
+            print('Staged verified app-local ConPTY beside native fixture DLLs', flush=True)
         targets = ('native',) if os.name == 'nt' else ('x86_64-windows', 'aarch64-windows')
         for target in targets:
             for mode in ('debug', 'release'):

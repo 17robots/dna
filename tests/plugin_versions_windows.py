@@ -39,9 +39,22 @@ pub fn test_stage(root,name,manifest,executable,leaf:*const u8)i32 {
   return 0
 }
 test_last_errno:i32
+test_rename_status:i32
+test_real_rename:fn(rawptr,*InstallWinStatus,rawptr,u32,u32)i32
+fn test_tracked_rename(handle:rawptr,status:*InstallWinStatus,info:rawptr,length,kind:u32)i32 {
+  result:=test_real_rename(handle,status,info,length,kind)
+  if result<0 { test_rename_status=result }
+  return result
+}
+pub fn test_status()i32 { return test_rename_status }
 pub fn test_errno()i32 { return test_last_errno }
 pub fn test_install(manifest,executable,root,name,leaf:*const u8)i32 {
+  install_win_prepare()
+  test_rename_status=0
+  test_real_rename=install_win_api.rename
+  install_win_api.rename=test_tracked_rename
   result:=dna_plugin_install(manifest,executable,root,name,leaf)
+  install_win_api.rename=test_real_rename
   test_last_errno=rec_errno().*
   return result
 }
@@ -124,6 +137,7 @@ def native_tests(binary, work):
     installed = install()
     if installed != 1:
         first_errno = lib.test_errno()
+        native_status = hex(lib.test_status() & 0xffffffff)
         tree = []
         for path in sorted(root.rglob('*')) if root.exists() else []:
             if path.is_symlink():
@@ -138,7 +152,7 @@ def native_tests(binary, work):
         for label, directory, executable in (('directory', 1, 0), ('data', 0, 0), ('executable', 0, 1)):
             result = lib.test_private_primitive(encoded(parent), ('private-probe-' + label).encode(), directory, executable)
             probes.append((label, result, lib.test_errno()))
-        raise AssertionError(('first plugin install', installed, first_errno, tree, 'relative private primitives', probes))
+        raise AssertionError(('first plugin install', installed, first_errno, native_status, tree, 'relative private primitives', probes))
     first = active(lib, container)
     assert first[:2] == ('1', str(sources[0][0]))
     assert (container / '.dna-managed').read_bytes() == b'DNA plugin versions 1\n'

@@ -370,16 +370,27 @@ GNU tools. Native prerequisites are pkgconf, libvterm, Tree-sitter >=0.25, PCRE2
 utf8proc, HarfBuzz, FriBidi, FreeType, coreutils and gnu-tar, plus a supported
 TrueType monospace font. `tests/native_macos.py` checks native header layouts,
 full debug/release Cocoa startup/presentation/cleanup, process jobs, file changes,
-notification rearm and PTY lifecycle. CI is configured to execute it on macOS;
-these native runs have not been performed on this Linux workspace. Deterministic
-Darwin process/vnode mocks and both architecture object checks execute locally.
+notification rearm and PTY lifecycle. CI executes these checks on macOS, including native debug/release Cocoa builds.
+Deterministic Darwin process/vnode mocks and both architecture object checks
+also execute locally on Linux.
 
-Windows full service ports remain unfinished: process-tree/pipe ownership,
-ConPTY, console lifecycle/handoff, file/directory notifications, native filesystem
-transport for search/install/recovery, and safe plugin transactions still need
-implementation and native qualification. Windows build entry points remain
-closed until those services are present. Passing editor, thread and presenter
-objects does not imply a complete Windows editor build.
+Windows adapters implement Job-owned processes, nonblocking pipe transport,
+one-shot readiness, ConPTY, console input/handoff, directory notifications,
+retained-directory filesystem access and recovery persistence. Managed plugins
+publish immutable versions through an atomic current/previous record; language
+packages use signed regular-file pointers to immutable directories. Nofollow
+checks and private DACLs protect staging and cleanup. Directory fsync and terminal
+suspend remain explicitly unsupported; recovery does not claim directory
+power-loss durability.
+
+`scripts/native_windows.py` builds the native DLL, Win32 editor and language
+helper using MSYS2 UCRT64 providers. Runtime bundles capture the PE dependency
+closure, language data and pinned Microsoft ConPTY DLL/host with licenses.
+Language builds require the MSYS2 build tools. CI exercises native x64 services,
+editor startup/relocation and installer workflows; Windows qualification remains
+in progress while those gates expose failures. Both Windows architectures compile
+in debug/release, but ARM64 currently has object proof only. Passing objects does
+not imply a working native build.
 
 Native thread lifecycle keeps pthreads on Linux and uses SDK desktop threads on
 macOS/Windows, including OS TLS, self-join detection, callback results and arena

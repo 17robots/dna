@@ -220,8 +220,8 @@ with tempfile.TemporaryDirectory(prefix='dna-frontend-win-') as temporary:
                 assert command.startswith('"' + directory + '/WindowsPowerShell/v1.0/powershell.exe" ')
                 encoded = command.rsplit(' ', 1)[1]
                 decoded = base64.b64decode(encoded, validate=True).decode('utf-16-le')
-                assert "EnvironmentVariables['DNA_LANGUAGE_DIR']=" in decoded and "''" in decoded
-                assert 'UseShellExecute=$false' in decoded and 'RedirectStandard' not in decoded
+                assert '$env:DNA_LANGUAGE_DIR=' in decoded and "''" in decoded
+                assert 'Start-Process -FilePath' in decoded and '-NoNewWindow' in decoded and 'RedirectStandard' not in decoded
                 assert '%PATH%' not in command and '日本語' not in command
                 cmd = str(Path(system.value) / 'cmd.exe')
                 def execute(text, delayed='OFF'):
@@ -230,7 +230,20 @@ with tempfile.TemporaryDirectory(prefix='dna-frontend-win-') as temporary:
                 for delayed in ('OFF', 'ON'):
                     result = execute(command, delayed)
                     assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
-                    actual = json.loads(result.stdout.strip())
+                    try:
+                        actual = json.loads(result.stdout.strip())
+                    except (ValueError, UnicodeError) as error:
+                        # A direct launch distinguishes cmd quoting from missing
+                        # inherited handles inside the PowerShell child launcher.
+                        powershell = str(Path(system.value) / 'WindowsPowerShell/v1.0/powershell.exe')
+                        direct = subprocess.run([powershell, '-NoLogo', '-NoProfile', '-NonInteractive',
+                            '-EncodedCommand', encoded], cwd=working, env=child_env,
+                            capture_output=True, timeout=30)
+                        diagnostic = {'delayed_expansion': delayed, 'cmd_status': result.returncode,
+                            'cmd_stdout': repr(result.stdout), 'cmd_stderr': repr(result.stderr),
+                            'direct_status': direct.returncode, 'direct_stdout': repr(direct.stdout),
+                            'direct_stderr': repr(direct.stderr), 'decoded_script': decoded}
+                        raise AssertionError('helper JSON diagnostic: ' + json.dumps(diagnostic, ensure_ascii=True)) from error
                     assert actual['root'] == str(root), actual
                     assert actual['argv'] == ['-c'], actual
                     assert Path(actual['cwd']) == working, actual

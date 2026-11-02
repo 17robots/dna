@@ -301,12 +301,14 @@ fn platform_language_command(output: []u8, used: *usize, root, helper, verb, nam
     return false
   }
   script: usize = 0
-  if !frontend_language_text(space, &script, "$ErrorActionPreference='Stop'; $start=[System.Diagnostics.ProcessStartInfo]::new(); $start.UseShellExecute=$false; $start.CreateNoWindow=[Console]::IsOutputRedirected; $start.FileName=") || !frontend_language_literal(space, &script, helper) || !frontend_language_text(space, &script, "; $start.Arguments=") || !frontend_language_units(space, &script, space.arguments[..arguments]) || !frontend_language_text(space, &script, "; $start.EnvironmentVariables['DNA_LANGUAGE_DIR']=") || !frontend_language_literal(space, &script, root) {
+  if !frontend_language_text(space, &script, "$ErrorActionPreference='Stop'; $ProgressPreference='SilentlyContinue'; $env:DNA_LANGUAGE_DIR=") || !frontend_language_literal(space, &script, root) || !frontend_language_text(space, &script, "; $helper=") || !frontend_language_literal(space, &script, helper) || !frontend_language_text(space, &script, "; $arguments=") || !frontend_language_units(space, &script, space.arguments[..arguments]) {
     return false
   }
-  // No redirects and no PowerShell native-command pipeline: the helper inherits
-  // the original byte handles, preserving interactive LSP framing and stderr.
-  if !frontend_language_text(space, &script, "; $process=[System.Diagnostics.Process]::new(); $process.StartInfo=$start; if(-not $process.Start()){exit 1}; $process.WaitForExit(); $code=$process.ExitCode; $process.Dispose(); exit $code") {
+  // Framework Process.Start omits STARTF_USESTDHANDLES unless a stream is
+  // redirected. Start-Process -NoNewWindow explicitly inherits all three native
+  // handles, without a PowerShell text pipeline or managed stream copying.
+  // The environment assignment exists only inside this child PowerShell process.
+  if !frontend_language_text(space, &script, "; $process=Start-Process -FilePath $helper -ArgumentList $arguments -NoNewWindow -PassThru -Wait; $process.WaitForExit(); $code=$process.ExitCode; $process.Dispose(); exit $code") {
     return false
   }
   suffix := "/WindowsPowerShell/v1.0/powershell.exe\" -NoLogo -NoProfile -NonInteractive -EncodedCommand "

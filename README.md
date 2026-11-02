@@ -1044,8 +1044,9 @@ not a replacement for backups or version control.
 - Tree-sitter highlighting, LSP, command-key overrides and a Vim keymap profile
   are available (see Vim keys for its gaps). A TUI and SSH remain unimplemented. An experimental process-based plugin
   API and persistent sessions are available.
-- File operations currently target Linux x86-64. Windows/macOS are not supported
-  by this prototype yet, despite the native rendering layer.
+- Linux remains the primary platform. Native macOS builds run in CI. Windows
+  adapters and build tooling are implemented, with native qualification in progress;
+  Windows ARM64 currently has compile checks only.
 
 ## Project tools, sessions, and extensions
 

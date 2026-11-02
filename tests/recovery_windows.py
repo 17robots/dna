@@ -53,7 +53,7 @@ fn main() {}
 
 
 class RecoveryFailure(c.Structure):
-    _fields_ = [('stage', c.c_int32), ('error', c.c_int32), ('length', c.c_size_t)]
+    _fields_ = [('stage', c.c_int32), ('error', c.c_int32), ('length', c.c_size_t), ('native_error', c.c_uint32)]
 
 
 STAGES = {1: 'path initialization', 2: 'temporary open', 3: 'write',
@@ -65,7 +65,7 @@ def failure_detail(library, state):
     failure = RecoveryFailure()
     library.test_failure(state, c.byref(failure))
     return {'stage': STAGES.get(failure.stage, str(failure.stage)),
-            'errno': failure.error, 'snapshot_length': failure.length,
+            'errno': failure.error, 'native_error': failure.native_error, 'snapshot_length': failure.length,
             'error_flag': library.dna_recovery_error(state)}
 
 

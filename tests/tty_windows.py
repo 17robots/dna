@@ -136,15 +136,19 @@ fn main() {
   sync.store_u32(&tty_active,1)
   if tty_suspend_host()!=0 { #panic("Windows suspend unsupported") }
   mode:u32=0
-  if win_tty_api.mode(input,&mode)==0 || (mode&7)!=0 || (mode&512)==0 || win_tty_api.input_page()!=65001 || win_tty_api.output_page()!=65001 { #panic("raw VT console mode") }
+  if win_tty_api.mode(input,&mode)==0 || (mode&7)!=0 || (mode&512)!=0 || (mode&24)!=24 || win_tty_api.input_page()!=65001 || win_tty_api.output_page()!=65001 { #panic("raw record console mode") }
+  // The isolated console still has a real mouse/window. Suppress unsolicited
+  // physical mouse records while injecting exact keys; explicitly injected
+  // mouse records below still exercise the production SGR translation.
+  if win_tty_api.set_mode(input,mode & ~#cast(u32,16))==0 { #panic("isolate injected console input") }
   _=flush_input(input)
   bytes:[64]u8=[]
   record:=WinTtyRecord{kind:1}
   key:=#cast(*WinTtyKey,&record.data[0])
   key.*=WinTtyKey{down:1,repeat:1,key:65,character:233}
   written:u32=0
-  if write_input(input,&record,1,&written)==0 || tty_read_host(&bytes[0],64,100)!=2 { #panic("Unicode input") }
-  expect_bytes(bytes[..2],"é")
+  if write_input(input,&record,1,&written)==0 || written!=1 { #panic("Unicode input injection") }
+  fixture_read_exact("é",64)
   key.*=WinTtyKey{down:1,repeat:2,key:38,control:8}
   if write_input(input,&record,1,&written)==0 || written!=1 { #panic("repeated modified arrow injection") }
   fixture_read_exact("\x1b[1;5A\x1b[1;5A",64)
@@ -153,12 +157,22 @@ fn main() {
   key.repeat=3
   if write_input(input,&record,1,&written)==0 || written!=1 { #panic("partial repeat injection") }
   fixture_read_exact("\x1b[1;5A\x1b[1;5A\x1b[1;5A",1)
+  screen:=WinTtyScreen{}
+  if win_tty_api.screen(output,&screen)==0 { #panic("injected mouse coordinates") }
+  record=WinTtyRecord{kind:2}
+  mouse:=#cast(*WinTtyMouse,&record.data[0])
+  mouse.*=WinTtyMouse{position:WinTtyCoordinate{x:screen.window.left+4,y:screen.window.top+2},buttons:1}
+  if write_input(input,&record,1,&written)==0 || written!=1 { #panic("mouse press injection") }
+  fixture_read_exact("\x1b[<0;5;3M",64)
+  mouse.buttons=0
+  if write_input(input,&record,1,&written)==0 || written!=1 { #panic("mouse release injection") }
+  fixture_read_exact("\x1b[<0;5;3m",64)
+  record=WinTtyRecord{kind:1}
   key.*=WinTtyKey{down:1,repeat:1,character:55357}
   _=write_input(input,&record,1,&written)
   key.character=56898
   _=write_input(input,&record,1,&written)
-  if tty_read_host(&bytes[0],64,100)!=4 { #panic("surrogate input") }
-  expect_bytes(bytes[..4],"🙂")
+  fixture_read_exact("🙂",64)
   key.*=WinTtyKey{down:0,repeat:1,key:65,character:65}
   _=write_input(input,&record,1,&written)
   start:=win_tty_api.ticks()
@@ -192,6 +206,7 @@ fn main() {
   if handles(win_tty_api.process(),&before)==0 { #panic("handle count") }
   for attempt in 0..64 {
     if !tty_enter_host() { #panic("console reenter") }
+    if win_tty_api.mode(input,&mode)==0 || win_tty_api.set_mode(input,mode & ~#cast(u32,16))==0 { #panic("isolate reentered console input") }
     _=flush_input(input)
     tty_wake_signal(nil)
     if tty_read_host(&bytes[0],64,100)!=-2 { #panic("wake reenter") }
