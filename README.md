@@ -1588,11 +1588,12 @@ server. Support depends on the server.
 Language packages may also contain `textobjects.scm` with predicate-free
 Tree-sitter captures named `function.inside`/`function.around`, `class`,
 `parameter`, or `comment` with the same suffixes. `mi`/`ma` followed by
-`f`, `t`, `a`, or `c` selects those objects. Captures run on the syntax worker,
-with bounded storage and work. Dyn ships a starter query; reinstall the Dyn
-syntax package with `:language-install dyn`, then `:language-reload` to get it.
-Other language packages need their own queries. Missing or stale results leave
-all selections unchanged.
+`f`, `t`, `a`, or `c` selects those objects (function, type, argument or
+parameter, comment). Captures run on the syntax worker. Queries ship for Dyn,
+Rust, C, C++, Python, Go, JavaScript, TypeScript, TSX and Bash; reinstall an
+existing package with `:language-install NAME`, then `:language-reload`, to get
+one. Other languages need their own `textobjects.scm`. Missing or stale results
+leave all selections unchanged.
 
 Selection normalization includes `Alt--` (merge all), `Alt-_` (merge touching or
 overlapping selections), and `Alt-:` (make selections forward). `_` trims every

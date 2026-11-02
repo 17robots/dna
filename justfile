@@ -110,6 +110,7 @@ _smoke: deps test
     python3 tests/native_disk_dynamic.py
     python3 tests/disk_idle.py
     python3 tests/syntax_selection.py
+    python3 tests/textobject_queries.py
     python3 tests/syntax_retire.py
     python3 tests/native.py
     python3 tests/project_search.py
