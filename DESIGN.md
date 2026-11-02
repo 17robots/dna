@@ -614,3 +614,14 @@ in `buffer/buffer.dyn`; do not reorder that allocation contract either.
 The native job and RPC implementations are in `src/native/dyn/`; obsolete C
 copies have been removed. Native adapters keep their existing exported names so
 callers and process-lifecycle tests exercise the same implementation.
+
+## Git gutter
+
+`src/git_gutter.dyn` keeps, per document, the committed text's line hashes
+(from an asynchronous `git show HEAD:./NAME` job, refetched on save) and the
+hunks of the current text against them. After a 40 ms pause in edits the UI
+thread hashes the document's lines straight from its storage chunks, trims the
+common leading and trailing lines and runs Myers' diff on the rest; past 500
+edits the whole changed block is marked modified. Documents over 8 MiB are
+skipped. The gutter draws a marker per row from the hunks of the current
+revision only, so a stale diff never marks the wrong lines.

@@ -143,6 +143,7 @@ _smoke: deps test
     python3 tests/syntax_objects.py
     python3 tests/lsp_large.py
     python3 tests/lsp_symbols.py
+    python3 tests/git_gutter.py
     python3 tests/version.py --binary build/dna-debug --binary build/dna-release
     python3 scripts/build_native.py --backend wayland --release
     python3 scripts/build_native.py --backend x11 --release

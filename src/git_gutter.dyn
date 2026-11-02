@@ -1,0 +1,390 @@
+// Git change markers in the gutter: lines added, modified or deleted since
+// the file's committed version (HEAD), like Helix's diff gutter.
+//
+// The committed text comes from an asynchronous `git show HEAD:./NAME` job in
+// the file's directory, fetched again when the file is saved or renamed;
+// files outside a repository, untracked files and binary output get no
+// markers. The diff compares line hashes: common leading and trailing lines
+// are trimmed, then Myers' algorithm runs on the rest with a bounded number
+// of edits, beyond which the whole changed block is marked modified.
+
+const GitMaxBytes: usize = 8388608
+const GitMaxEdits: usize = 500
+const GitMaxHunks: usize = 1024
+const GitAdded: u8 = 1
+const GitModified: u8 = 2
+const GitDeleted: u8 = 3
+
+// Rows of the current text; a deletion has count 0 and marks the row after it.
+struct GitHunk { first: usize, count: usize, kind: u8 }
+struct GitDiff {
+  // owner holds this struct; arena owns base and is replaced on each fetch.
+  owner: *mem.Arena,
+  arena: *mem.Arena,
+  job: rawptr,
+  saved_epoch: u64,
+  path: [4096]u8,
+  path_length: usize,
+  // 0 nothing yet, 1 fetching, 2 ready, 3 unavailable (no repository, untracked, too large).
+  state: u8,
+  base: []u64,
+  hunks: [1024]GitHunk,
+  hunk_count: usize,
+  // The document revision the hunks describe, and when to recompute after edits.
+  revision: u64,
+  due: u64,
+}
+
+fn git_release(slot: *Slot) {
+  diff := slot.git
+  if diff == nil {
+    return
+  }
+  if diff.job != nil {
+    job_close(diff.job)
+  }
+  if diff.arena != nil {
+    arena_owner.release(diff.arena)
+  }
+  slot.git = nil
+  arena_owner.release(diff.owner)
+}
+fn git_waiting(app: *const App) bool {
+  for slot in app.documents.slots {
+    if slot.git != nil && (slot.git.state == 1 || (slot.git.state == 2 && slot.document != nil && slot.git.revision != slot.document.revision)) {
+      return true
+    }
+  }
+  return false
+}
+// FNV-1a over each row, rows split at newlines; the last row may be empty.
+fn git_hash_bytes(bytes: []const u8, output: []u64) usize {
+  count: usize = 0
+  hash: u64 = 14695981039346656037
+  for byte in bytes {
+    if byte == 10 {
+      if count < #len(output) {
+        output[count] = hash
+      }
+      count += 1
+      hash = 14695981039346656037
+    } else {
+      hash = #wrap((hash ^ #cast(u64, byte)) * 1099511628211)
+    }
+  }
+  if count < #len(output) {
+    output[count] = hash
+  }
+  return count + 1
+}
+fn git_hash_document(doc: *const buffer.Document, output: []u64) usize {
+  count: usize = 0
+  hash: u64 = 14695981039346656037
+  at: usize = 0
+  for at < doc.length {
+    chunk := buffer.chunk_at(doc, at)
+    if #len(chunk) == 0 {
+      break
+    }
+    for byte in chunk {
+      if byte == 10 {
+        if count < #len(output) {
+          output[count] = hash
+        }
+        count += 1
+        hash = 14695981039346656037
+      } else {
+        hash = #wrap((hash ^ #cast(u64, byte)) * 1099511628211)
+      }
+    }
+    at += #len(chunk)
+  }
+  if count < #len(output) {
+    output[count] = hash
+  }
+  return count + 1
+}
+fn git_hunk(diff: *GitDiff, first: usize, inserted: usize, deleted: usize) {
+  if (inserted == 0 && deleted == 0) || diff.hunk_count == GitMaxHunks {
+    return
+  }
+  kind := GitModified
+  if deleted == 0 {
+    kind = GitAdded
+  } else if inserted == 0 {
+    kind = GitDeleted
+  }
+  diff.hunks[diff.hunk_count] = GitHunk{first: first, count: inserted, kind: kind}
+  diff.hunk_count += 1
+}
+// Myers' shortest edit script between base[low..low+n] and current[low..low+m],
+// as hunks. False when it needs more than GitMaxEdits edits.
+fn git_myers(diff: *GitDiff, scratch: *mem.Arena, base: []const u64, current: []const u64, low: usize) bool {
+  n := #len(base)
+  m := #len(current)
+  limit := n + m
+  if limit > GitMaxEdits {
+    limit = GitMaxEdits
+  }
+  width := 2 * limit + 3
+  offset := limit + 1
+  trace := mem.push_array(i32, scratch, (limit + 1) * width)
+  v := mem.push_array(i32, scratch, width)
+  for index in 0..width {
+    v[index] = 0
+  }
+  found: usize = limit + 1
+  for d in 0..limit + 1 {
+    k: isize = -#cast(isize, d)
+    for k <= #cast(isize, d) {
+      at := #cast(usize, k + #cast(isize, offset))
+      x: i32 = 0
+      if k == -#cast(isize, d) || (k != #cast(isize, d) && v[at - 1] < v[at + 1]) {
+        x = v[at + 1]
+      } else {
+        x = v[at - 1] + 1
+      }
+      y := x - #cast(i32, k)
+      for #cast(usize, x) < n && y >= 0 && #cast(usize, y) < m && base[#cast(usize, x)] == current[#cast(usize, y)] {
+        x += 1
+        y += 1
+      }
+      v[at] = x
+      if #cast(usize, x) >= n && y >= 0 && #cast(usize, y) >= m {
+        found = d
+        break
+      }
+      k += 2
+    }
+    for index in 0..width {
+      trace[d * width + index] = v[index]
+    }
+    if found <= limit {
+      break
+    }
+  }
+  if found > limit {
+    return false
+  }
+  // Walk back from the end, recording each edit: insertions at their row of
+  // the current text, deletions at the row they precede.
+  edits := mem.push_array(usize, scratch, (found + 1) * 2)
+  edit_count: usize = 0
+  x := #cast(isize, n)
+  y := #cast(isize, m)
+  d := found
+  for d > 0 {
+    row := trace[(d - 1) * width..d * width]
+    k := x - y
+    previous: isize = k - 1
+    if k == -#cast(isize, d) || (k != #cast(isize, d) && row[#cast(usize, k - 1 + #cast(isize, offset))] < row[#cast(usize, k + 1 + #cast(isize, offset))]) {
+      previous = k + 1
+    }
+    previous_x := #cast(isize, row[#cast(usize, previous + #cast(isize, offset))])
+    previous_y := previous_x - previous
+    // Back along the diagonal run to the point just after this edit.
+    for x > previous_x && y > previous_y {
+      x -= 1
+      y -= 1
+    }
+    if previous == k + 1 {
+      // Inserted current[y - 1].
+      edits[edit_count * 2] = 1
+      edits[edit_count * 2 + 1] = #cast(usize, y - 1)
+    } else {
+      // Deleted base[x - 1], before current row y.
+      edits[edit_count * 2] = 0
+      edits[edit_count * 2 + 1] = #cast(usize, y)
+    }
+    edit_count += 1
+    x = previous_x
+    y = previous_y
+    d -= 1
+  }
+  // Forward: runs of edits at one place form a hunk.
+  start: usize = 0
+  inserted: usize = 0
+  deleted: usize = 0
+  open := false
+  index := edit_count
+  for index > 0 {
+    index -= 1
+    insert := edits[index * 2] == 1
+    at := edits[index * 2 + 1]
+    if !open || at != start + inserted {
+      if open {
+        git_hunk(diff, low + start, inserted, deleted)
+      }
+      open = true
+      start = at
+      inserted = 0
+      deleted = 0
+    }
+    if insert {
+      inserted += 1
+    } else {
+      deleted += 1
+    }
+  }
+  if open {
+    git_hunk(diff, low + start, inserted, deleted)
+  }
+  return true
+}
+fn git_compute(diff: *GitDiff, doc: *const buffer.Document) {
+  diff.hunk_count = 0
+  diff.revision = doc.revision
+  if doc.length > GitMaxBytes {
+    return
+  }
+  scratch := arena_owner.create(doc.line_count * 8 + 65536)
+  defer arena_owner.release(scratch)
+  rows := doc.line_count + 1
+  storage := mem.push_array(u64, scratch, rows)
+  m := git_hash_document(doc, storage)
+  if m > rows {
+    return
+  }
+  current := storage[..m]
+  base := diff.base
+  n := #len(base)
+  prefix: usize = 0
+  for prefix < n && prefix < m && base[prefix] == current[prefix] {
+    prefix += 1
+  }
+  suffix: usize = 0
+  for suffix < n - prefix && suffix < m - prefix && base[n - 1 - suffix] == current[m - 1 - suffix] {
+    suffix += 1
+  }
+  if prefix == n && prefix == m {
+    return
+  }
+  middle_base := base[prefix..n - suffix]
+  middle_current := current[prefix..m - suffix]
+  work := arena_owner.create((GitMaxEdits + 1) * (2 * GitMaxEdits + 3) * 4 + (GitMaxEdits + 1) * 16 + 65536)
+  defer arena_owner.release(work)
+  if !git_myers(diff, work, middle_base, middle_current, prefix) {
+    // Too many edits to align: mark the whole changed block.
+    diff.hunk_count = 0
+    git_hunk(diff, prefix, #len(middle_current), #len(middle_base))
+  }
+}
+fn git_fetch(slot: *Slot, path: []const u8) {
+  diff := slot.git
+  // Run in the file's directory with the bare name, so the repository and
+  // its relative path both come from git.
+  split := #len(path)
+  for split > 0 && path[split - 1] != '/' && path[split - 1] != 92 {
+    split -= 1
+  }
+  if split == 0 {
+    diff.state = 3
+    return
+  }
+  directory: [4096]u8 = []
+  directory_length := copy_text(directory[..4095], path[..split])
+  directory[directory_length] = 0
+  command: [16384]u8 = []
+  used: usize = 0
+  if !git_show_command(command[..16383], &used, path[split..]) {
+    diff.state = 3
+    return
+  }
+  command[used] = 0
+  diff.job = job_open(&command[0], &directory[0], nil, 0, 10000)
+  diff.state = 1
+  if diff.job == nil {
+    diff.state = 3
+  }
+}
+// Advance every document's diff; true when markers changed.
+fn git_tick(app: *App) bool {
+  changed := false
+  fetching := false
+  for slot in app.documents.slots {
+    if slot.git != nil && slot.git.state == 1 {
+      fetching = true
+    }
+  }
+  now := sdl.ticks()
+  for slot in app.documents.slots {
+    doc := slot.document
+    if doc == nil || slot.terminal.handle != nil {
+      continue
+    }
+    path := files.name(&slot.file)
+    if #len(path) == 0 {
+      continue
+    }
+    if slot.git == nil {
+      owner := arena_owner.create(#sizeof(GitDiff) + 4096)
+      slot.git = mem.push(GitDiff, owner)
+      slot.git.owner = owner
+    }
+    diff := slot.git
+    if diff.state == 1 {
+      status := job_status(diff.job)
+      if status == 1 {
+        continue
+      }
+      length := #cast(usize, job_output_length(diff.job))
+      if status != 2 || length > GitMaxBytes {
+        diff.state = 3
+      } else {
+        if diff.arena != nil {
+          arena_owner.release(diff.arena)
+        }
+        diff.arena = arena_owner.create(length * 9 + 65536)
+        bytes := mem.push_bytes_uninit(diff.arena, length + 1)
+        _ = job_output(diff.job, &bytes[0], length + 1)
+        rows: usize = 1
+        for byte in bytes[..length] {
+          if byte == 10 {
+            rows += 1
+          }
+        }
+        storage := mem.push_array(u64, diff.arena, rows)
+        diff.base = storage[..git_hash_bytes(bytes[..length], storage)]
+        diff.state = 2
+        diff.revision = 0
+        diff.due = 0
+      }
+      job_close(diff.job)
+      diff.job = nil
+      fetching = false
+      changed = true
+    }
+    if !fetching && (diff.saved_epoch != doc.saved_epoch || !buffer.equal(diff.path[..diff.path_length], path)) {
+      diff.saved_epoch = doc.saved_epoch
+      diff.path_length = copy_text(diff.path[..], path)
+      diff.hunk_count = 0
+      git_fetch(slot, path)
+      fetching = diff.state == 1
+      changed = true
+      continue
+    }
+    if diff.state == 2 && diff.revision != doc.revision {
+      // Wait for a pause in typing before diffing again.
+      if diff.due == 0 {
+        diff.due = now + 40
+      }
+      if now >= diff.due {
+        git_compute(diff, doc)
+        diff.due = 0
+        changed = true
+      }
+    }
+  }
+  return changed
+}
+// The row after a hunk's marked rows; a deletion marks one row.
+fn git_hunk_end(hunk: GitHunk) usize {
+  if hunk.count == 0 {
+    return hunk.first + 1
+  }
+  return hunk.first + hunk.count
+}
+// Whether diff's hunks describe doc's current text.
+fn git_current(diff: *const GitDiff, doc: *const buffer.Document) bool {
+  return diff != nil && doc != nil && diff.state == 2 && diff.revision == doc.revision
+}

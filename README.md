@@ -858,7 +858,11 @@ Use `:resize 25` to give the focused side 25% of its parent split, `:equalize`
 (or Space w =) to balance splits, and `:layout-save path.toml` to save their shape.
 
 Line numbers are relative except for the current line, which shows its absolute
-number. The status line shows mode, filename, modified state, buffer count,
+number. In a git repository the gutter marks lines changed since the file's
+committed version: a green bar for added lines, yellow for modified, and a red
+line over the line that follows a deletion. Markers follow edits after a short
+pause and compare with `HEAD`, fetched again on save; untracked files, files
+outside a repository and files over 8 MiB show none. The status line shows mode, filename, modified state, buffer count,
 line/column, and selected codepoints. Palette commands independently toggle line
 numbers, relative numbering, the status line, and current-line highlighting.
 
