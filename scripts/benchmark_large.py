@@ -5,7 +5,8 @@ Each editor opens one multi-line text file of the requested size, jumps to its
 end, inserts one character there, saves, and quits. Times are measured from the
 PTY key write to the screen (or file) acknowledging the action, as in
 benchmark_editors.py. Memory is the PSS of the editor and its children after
-opening and after saving. Files live on disk (not tmpfs) with a warm cache.
+opening and after saving. Files live on disk (not tmpfs), with a warm cache unless --cold.
+Anonymous memory leaves out page-cache pages of a file mapped in place.
 """
 import argparse
 import json
@@ -23,7 +24,14 @@ from benchmark_editors import Session, memory
 ROW = b'0123456789 abcdefghijklmnopqrstuvwxyz line of a large benchmark file.\n'
 
 
-def fixture(path, size):
+def evict(path):
+    """Drop the file's pages from the page cache (no root needed)."""
+    with path.open('rb') as stream:
+        os.fsync(stream.fileno())
+        os.posix_fadvise(stream.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+
+
+def fixture(path, size, cold=False):
     block = ROW * (1 << 14)
     with path.open('wb') as stream:
         stream.write(b'LARGE_START marker line\n')
@@ -32,6 +40,10 @@ def fixture(path, size):
             stream.write(block)
             written += len(block)
         stream.write(b'LARGE_END marker line\n')
+    if cold:
+        # Every editor reads the file from disk.
+        evict(path)
+        return
     # Warm the page cache so every editor reads from memory.
     with path.open('rb') as stream:
         while stream.read(1 << 24):
@@ -69,7 +81,9 @@ def run(editor, directory, path, binary, timeout):
     try:
         result['open_ms'] = session.wait(lambda: 'LARGE_START' in session.text(), session.started, timeout)
         session.settle(.5)
-        result['pss_open_kib'] = memory(session.pid)['pss_kib']
+        opened = memory(session.pid)
+        result['pss_open_kib'] = opened['pss_kib']
+        result['anonymous_open_kib'] = opened['anonymous_kib']
         end = b'G' if editor != 'helix' else b'ge'
         result['end_ms'] = session.send(end, lambda: 'LARGE_END' in session.text(), timeout)
         session.settle(.2)
@@ -87,7 +101,9 @@ def run(editor, directory, path, binary, timeout):
         session.wait(lambda: path.stat().st_mtime_ns != before and path.stat().st_size == size + 1, started, timeout)
         result['save_ms'] = (time.perf_counter_ns() - started) / 1e6
         session.settle(.5)
-        result['pss_saved_kib'] = memory(session.pid)['pss_kib']
+        saved = memory(session.pid)
+        result['pss_saved_kib'] = saved['pss_kib']
+        result['anonymous_saved_kib'] = saved['anonymous_kib']
         return result
     except Exception as error:
         result['error'] = str(error).splitlines()[0]
@@ -104,6 +120,7 @@ def main():
     parser.add_argument('--timeout', type=float, default=600)
     parser.add_argument('--directory', type=Path, default=Path('/var/tmp'))
     parser.add_argument('--output', type=Path, default=ROOT / 'build/large-benchmark.json')
+    parser.add_argument('--cold', action='store_true', help='evict the file from the page cache before each run')
     args = parser.parse_args()
     report = []
     with tempfile.TemporaryDirectory(prefix='dna-large-benchmark-', dir=args.directory) as temporary:
@@ -112,9 +129,11 @@ def main():
                 directory = Path(temporary) / f'{editor}-{mib}'
                 directory.mkdir()
                 path = directory / 'large.txt'
-                fixture(path, mib << 20)
+                fixture(path, mib << 20, args.cold)
+                result_cache = 'cold' if args.cold else 'warm'
                 result = run(editor, directory, path, args.dna.resolve(), args.timeout)
                 result['mib'] = mib
+                result['cache'] = result_cache
                 report.append(result)
                 print(json.dumps(result), flush=True)
                 path.unlink()
