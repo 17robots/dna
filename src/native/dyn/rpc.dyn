@@ -14,6 +14,14 @@ struct RpcTransport {
   body: usize,
   building: bool,
   build_capacity: usize,
+  // A parked reservation is still being written, by worker threads, after
+  // send_park. Messages begun meanwhile go to later, which follows the queue
+  // once the parked message is finished and written.
+  parked: bool,
+  parked_capacity: usize,
+  build_later: bool,
+  later: *u8,
+  later_length: usize,
   log_length: usize,
 }
 
@@ -41,6 +49,20 @@ pub fn dna_rpc_send_begin(state: *RpcTransport, capacity: usize) *u8 {
   if state == nil || state.failed || state.building || capacity == 0 || capacity > RpcOutgoingLimit {
     return nil
   }
+  if state.parked || state.later_length > 0 {
+    if state.later_length > RpcOutgoingLimit + 8192 - capacity - 64 {
+      return nil
+    }
+    later := proc_realloc(state.later, state.later_length + capacity + 64)
+    if later == nil {
+      return nil
+    }
+    state.later = later
+    state.building = true
+    state.build_later = true
+    state.build_capacity = capacity
+    return &later[..state.later_length + capacity + 64][state.later_length + 64]
+  }
   remaining := state.pending - state.sent
   if remaining > RpcOutgoingLimit + 8192 - capacity - 64 {
     return nil
@@ -56,6 +78,7 @@ pub fn dna_rpc_send_begin(state: *RpcTransport, capacity: usize) *u8 {
   }
   state.queue = queue
   state.building = true
+  state.build_later = false
   state.build_capacity = capacity
   return &queue[..remaining + capacity + 64][remaining + 64]
 }
@@ -64,17 +87,10 @@ pub fn dna_rpc_send_abort(state: *RpcTransport) {
     state.building = false
   }
 }
-pub fn dna_rpc_send_commit(state: *RpcTransport, length: usize) i32 {
-  if state == nil || !state.building {
-    return 0
-  }
-  state.building = false
-  if state.failed || length == 0 || length > state.build_capacity {
-    return 0
-  }
+// Content-Length header for length into header; returns its size.
+fn rpc_header(header: []u8, length: usize) usize {
   prefix: []const u8 = "Content-Length: "
   suffix: []const u8 = "\r\n\r\n"
-  header: [64]u8 = []
   _ = copy(&header[0], &prefix[0], #len(prefix))
   used := #len(prefix)
   digits: [20]u8 = []
@@ -91,13 +107,72 @@ pub fn dna_rpc_send_commit(state: *RpcTransport, length: usize) i32 {
     used += 1
   }
   _ = copy(&header[used], &suffix[0], 4)
-  used += 4
+  return used + 4
+}
+// Frame the reservation's length body bytes into the queue (or later).
+fn rpc_commit(state: *RpcTransport, length: usize) {
+  header: [64]u8 = []
+  used := rpc_header(header[..], length)
+  if state.build_later {
+    at := state.later_length
+    capacity := at + state.build_capacity + 64
+    _ = proc_move(&state.later[..capacity][at + used], &state.later[..capacity][at + 64], length)
+    _ = copy(&state.later[..capacity][at], &header[0], used)
+    state.later_length = at + used + length
+    proc_watch(state.child.input, 1)
+    return
+  }
   remaining := state.pending
   capacity := remaining + state.build_capacity + 64
+  if state.sent == remaining {
+    // Nothing left to write ahead: put the header right before the body,
+    // which then stays where it was written instead of moving.
+    _ = copy(&state.queue[..capacity][remaining + 64 - used], &header[0], used)
+    state.sent = remaining + 64 - used
+    state.pending = remaining + 64 + length
+    proc_watch(state.child.input, 1)
+    return
+  }
   _ = proc_move(&state.queue[..capacity][remaining + used], &state.queue[..capacity][remaining + 64], length)
   _ = copy(&state.queue[..capacity][remaining], &header[0], used)
   state.pending = remaining + used + length
   proc_watch(state.child.input, 1)
+}
+pub fn dna_rpc_send_commit(state: *RpcTransport, length: usize) i32 {
+  if state == nil || !state.building {
+    return 0
+  }
+  state.building = false
+  if state.failed || length == 0 || length > state.build_capacity {
+    return 0
+  }
+  rpc_commit(state, length)
+  return 1
+}
+// Hand the open reservation to other threads. Its view stays valid until
+// send_finish; messages begun meanwhile queue behind it, in order.
+pub fn dna_rpc_send_park(state: *RpcTransport) i32 {
+  if state == nil || !state.building || state.build_later {
+    return 0
+  }
+  state.building = false
+  state.parked = true
+  state.parked_capacity = state.build_capacity
+  return 1
+}
+// Frame the parked message, or drop it when length is 0. Fails while another
+// reservation is open.
+pub fn dna_rpc_send_finish(state: *RpcTransport, length: usize) i32 {
+  if state == nil || !state.parked || state.building {
+    return 0
+  }
+  state.parked = false
+  if state.failed || length == 0 || length > state.parked_capacity {
+    return 0
+  }
+  state.build_later = false
+  state.build_capacity = state.parked_capacity
+  rpc_commit(state, length)
   return 1
 }
 pub fn dna_rpc_send(state: *RpcTransport, bytes: *const u8, length: usize) i32 {
@@ -203,7 +278,16 @@ fn rpc_parse(state: *RpcTransport) bool {
 }
 fn rpc_flush(state: *RpcTransport) {
   if state.pending <= state.sent {
-    return
+    // Later messages follow once the queue (and any parked message) is out.
+    if state.parked || state.later_length == 0 || (state.building && state.build_later) {
+      return
+    }
+    rec_free(#cast(rawptr, state.queue))
+    state.queue = state.later
+    state.sent = 0
+    state.pending = state.later_length
+    state.later = nil
+    state.later_length = 0
   }
   amount := state.pending - state.sent
   if amount > 65536 {
@@ -216,7 +300,7 @@ fn rpc_flush(state: *RpcTransport) {
   else if written < 0 && written != -11 && written != -4 {
     state.failed = true
   }
-  if state.sent == state.pending {
+  if state.sent == state.pending && !state.parked && !state.building {
     rec_free(#cast(rawptr, state.queue))
     state.queue = nil
     state.sent = 0
@@ -278,7 +362,7 @@ pub fn dna_rpc_size(state: *RpcTransport) isize {
     }
     attempt += 1
   }
-  if state.pending > state.sent {
+  if state.pending > state.sent || (state.later_length > 0 && !state.parked) {
     proc_watch(state.child.input, 1)
   } else {
     proc_unwatch(state.child.input)
@@ -334,6 +418,7 @@ pub fn dna_rpc_close(state: *RpcTransport) {
   }
   proc_close(&state.child)
   rec_free(#cast(rawptr, state.queue))
+  rec_free(#cast(rawptr, state.later))
   rec_free(#cast(rawptr, state.incoming))
   rec_free(#cast(rawptr, state))
 }

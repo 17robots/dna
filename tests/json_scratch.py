@@ -21,6 +21,7 @@ fixture = '''use "std/encoding/json"
 use "std/mem"
 use "std/io"
 use "std/thread"
+use "std/sync"
 use "./buffer" buffer
 ''' + helpers + '''
 fn same(a: []const u8, b: []const u8) bool {

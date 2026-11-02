@@ -150,7 +150,7 @@ fn lsp_escape(out: *u8, bytes: []const u8) usize {
 // Documents at least this large are escaped by several threads.
 const LspParallelEscape: usize = 16777216
 const LspEscapeStack: usize = 65536
-struct LspEscapeJob { snapshot: *const buffer.TextSnapshot, low, high: usize, out: *u8, size: usize }
+struct LspEscapeJob { snapshot: *const buffer.TextSnapshot, low, high: usize, out: *u8, size: usize, done: *sync.AtomicU32 }
 fn lsp_escape_job(context: rawptr) isize {
   job := #cast(*LspEscapeJob, context)
   size: usize = 0
@@ -168,6 +168,9 @@ fn lsp_escape_job(context: rawptr) isize {
     at += #len(chunk)
   }
   job.size = size
+  if job.done != nil {
+    _ = sync.fetch_add_u32(job.done, 1)
+  }
   return 0
 }
 // Run every job, all but the first on new threads (or here when one cannot
@@ -256,6 +259,8 @@ extern fn rpc_send "dna_rpc_send"(rpc: rawptr, bytes: *const u8, length: usize) 
 extern fn rpc_send_begin "dna_rpc_send_begin"(rpc: rawptr, capacity: usize) *u8
 extern fn rpc_send_commit "dna_rpc_send_commit"(rpc: rawptr, length: usize) i32
 extern fn rpc_send_abort "dna_rpc_send_abort"(rpc: rawptr)
+extern fn rpc_send_park "dna_rpc_send_park"(rpc: rawptr) i32
+extern fn rpc_send_finish "dna_rpc_send_finish"(rpc: rawptr, length: usize) i32
 extern fn rpc_size "dna_rpc_size"(rpc: rawptr) isize
 extern fn rpc_take "dna_rpc_take"(rpc: rawptr, bytes: *u8, capacity: usize) isize
 extern fn rpc_log "dna_rpc_log"(rpc: rawptr, bytes: *u8, capacity: usize) usize
@@ -281,6 +286,130 @@ struct LspShadow {
   snapshot: buffer.TextSnapshot,
   ready: bool,
 }
+// A large document body escaped in the background, straight into a parked
+// transport reservation. Two phases, as in lsp_json_document: measure, then
+// write. lsp_encode_tick advances it; nothing else touches out meanwhile.
+struct LspEncode {
+  arena: *mem.Arena,
+  snapshot: buffer.TextSnapshot,
+  jobs: [16]LspEscapeJob,
+  threads: [16]*thread.Thread,
+  started: [16]bool,
+  workers: usize,
+  phase: u8,
+  done: sync.AtomicU32,
+  // The reservation; used bytes precede the body.
+  message: []u8,
+  used: usize,
+  opening: bool,
+}
+fn lsp_encode_launch(encode: *LspEncode) {
+  sync.store_u32(&encode.done, 0)
+  for index in 0..encode.workers {
+    encode.started[index] = false
+    spawned := thread.spawn_with_size(encode.arena, LspEscapeStack, lsp_escape_job, #cast(rawptr, &encode.jobs[index]))
+    if spawned.ok {
+      encode.threads[index] = spawned.value
+      encode.started[index] = true
+    } else {
+      _ = lsp_escape_job(#cast(rawptr, &encode.jobs[index]))
+    }
+  }
+}
+fn lsp_encode_join(encode: *LspEncode) {
+  for index in 0..encode.workers {
+    if encode.started[index] {
+      if !thread.join(encode.threads[index]).ok {
+        #panic("cannot join language-server encoder")
+      }
+      encode.started[index] = false
+    }
+  }
+}
+fn lsp_encode_free(server: *LanguageServer) {
+  encode := server.encode
+  if encode == nil {
+    return
+  }
+  lsp_encode_join(encode)
+  buffer.snapshot_release(&encode.snapshot)
+  server.encode = nil
+  arena_owner.release(encode.arena)
+}
+// Start escaping doc low..high after message[..used]; false when it cannot.
+fn lsp_encode_start(server: *LanguageServer, message: []u8, used: usize, doc: *const buffer.Document, low: usize, high: usize, opening: bool) bool {
+  workers := buffer.parallel_workers()
+  if workers < 2 || #len(message) < used + 32 {
+    return false
+  }
+  arena := arena_owner.create(#sizeof(LspEncode) + workers * LspEscapeStack + 65536)
+  encode := mem.push(LspEncode, arena)
+  encode.arena = arena
+  encode.snapshot = buffer.snapshot_take(doc)
+  encode.workers = workers
+  encode.phase = 1
+  encode.message = message
+  encode.used = used
+  encode.opening = opening
+  encode.message[used] = '"'
+  encode.used += 1
+  for index in 0..workers {
+    encode.jobs[index] = LspEscapeJob{snapshot: &encode.snapshot, low: low + (high - low) * index / workers, high: low + (high - low) * (index + 1) / workers, done: &encode.done}
+  }
+  server.encode = encode
+  lsp_encode_launch(encode)
+  return true
+}
+// Advance a background encode. Returns false when it failed and the server
+// was stopped (it already counts the parked change as sent).
+fn lsp_encode_tick(app: *App, index: usize) bool {
+  server := &app.lsp.servers[index]
+  encode := server.encode
+  if encode == nil || sync.load_u32(&encode.done) < #cast(u32, encode.workers) {
+    return true
+  }
+  lsp_encode_join(encode)
+  if encode.phase == 1 {
+    total: usize = 0
+    for job in 0..encode.workers {
+      total += encode.jobs[job].size
+    }
+    // Room for the closing quote and suffix within the reservation.
+    if total >= #len(encode.message) - encode.used - 16 {
+      _ = rpc_send_finish(server.process, 0)
+      lsp_encode_free(server)
+      lsp_note(app, "Document too large for the language server.")
+      lsp_stop(app, index)
+      return false
+    }
+    used := encode.used
+    for job in 0..encode.workers {
+      encode.jobs[job].out = &encode.message[used]
+      used += encode.jobs[job].size
+    }
+    encode.used = used
+    encode.phase = 2
+    lsp_encode_launch(encode)
+    return true
+  }
+  message := encode.message
+  used := encode.used
+  message[used] = '"'
+  used += 1
+  if encode.opening {
+    add_text(message, &used, "}}}")
+  } else {
+    add_text(message, &used, "}]}}")
+  }
+  delivered := rpc_send_finish(server.process, used) != 0
+  lsp_encode_free(server)
+  if !delivered {
+    lsp_note(app, "Language server queue full or disconnected. Use :lsp-restart.")
+    lsp_stop(app, index)
+    return false
+  }
+  return true
+}
 struct LanguageServer {
   managed: bool,
   completion_triggers: [128]u32,
@@ -292,6 +421,8 @@ struct LanguageServer {
   attach_scan: bool,
   next_document_version: usize,
   process: rawptr,
+  // A large didOpen/didChange still being escaped; see LspEncode.
+  encode: *LspEncode,
   command: [4096]u8,
   root: [4096]u8,
   language: [65]u8,
@@ -574,6 +705,7 @@ fn lsp_stop(app: *App, index: usize) {
   server.documents_arena=nil
   server.allocation_retry_due=0
   server.documents=server.documents[..0]
+  lsp_encode_free(server)
   if server.process != nil {
     rpc_close(server.process)
   }
@@ -765,6 +897,12 @@ fn lsp_sync_slot(app:*App, index:usize, slot_index:usize, force:bool) bool {
     sent_low = prefix
     sent_high = high
   }
+  // One background encode per server. Another large change waits for it
+  // (the slot stays dirty and the tick retries) unless a request needs this
+  // document current now; then it is escaped here, queued behind the first.
+  if server.encode != nil && !force && sent_high - sent_low >= LspParallelEscape {
+    return false
+  }
   // Versions are unique within this connection, including when a URI moves
   // to another slot. LSP's signed integer range must never wrap or repeat.
   if server.next_document_version>=2147483647 {
@@ -828,22 +966,31 @@ fn lsp_sync_slot(app:*App, index:usize, slot_index:usize, force:bool) bool {
     }
     add_text(message, &used, "\"text\":")
   }
-  quoted := lsp_json_document(message[used..capacity - 16], doc, sent_low, sent_high)
-  if #len(quoted) == 0 {
-    rpc_send_abort(server.process)
-    work_finish(app, work, "lsp_send")
-    lsp_note(app, "Cannot encode document for language server.")
-    lsp_allocation_retry(server, sdl.ticks())
-    return false
-  }
-  used += #len(quoted)
-  if opening {
-    add_text(message, &used, "}}}")
+  // Large bodies are escaped by worker threads while the editor keeps
+  // running; the transport holds later messages until this one is framed.
+  parked := server.encode == nil && sent_high - sent_low >= LspParallelEscape && lsp_encode_start(server, message, used, doc, sent_low, sent_high, opening)
+  if parked {
+    if rpc_send_park(server.process) == 0 {
+      #panic("cannot park language-server message")
+    }
   } else {
-    add_text(message, &used, "}]}")
-    add_text(message, &used, "}")
+    quoted := lsp_json_document(message[used..capacity - 16], doc, sent_low, sent_high)
+    if #len(quoted) == 0 {
+      rpc_send_abort(server.process)
+      work_finish(app, work, "lsp_send")
+      lsp_note(app, "Cannot encode document for language server.")
+      lsp_allocation_retry(server, sdl.ticks())
+      return false
+    }
+    used += #len(quoted)
+    if opening {
+      add_text(message, &used, "}}}")
+    } else {
+      add_text(message, &used, "}]}")
+      add_text(message, &used, "}")
+    }
   }
-  delivered := rpc_send_commit(server.process, used) != 0
+  delivered := parked || rpc_send_commit(server.process, used) != 0
   work_finish(app, work, "lsp_send")
   if !delivered {
     return false
@@ -1430,6 +1577,11 @@ fn lsp_tick(app: *App) bool {
         lsp_failure(app, "Language server initialization timed out.")
         changed = true
         lsp_stop(app, index)
+        index += 1
+        continue
+      }
+      if !lsp_encode_tick(app, index) {
+        changed = true
         index += 1
         continue
       }

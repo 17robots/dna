@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Deterministic stdio LSP peer, including fragmented frames and Unicode."""
-import json, sys
+import json, os, sys
 versions={}; texts={}; commands={}
 def send(message):
     body=json.dumps(dict(jsonrpc='2.0',**message),ensure_ascii=False).encode()
@@ -43,6 +43,9 @@ while True:
         send({'method':'textDocument/publishDiagnostics','params':{'uri':uri,'version':doc['version'],'diagnostics':[{'range':edit('')['range'],'severity':2,'message':'fixture diagnostic é😀'}]}})
         continue
     elif method=='textDocument/didSave':
+        if 'FAKE_LSP_SAVES' in os.environ:
+            with open(os.environ['FAKE_LSP_SAVES'],'a') as log:
+                log.write('%s %d\n'%('match' if params['text']==texts[params['textDocument']['uri']] else 'mismatch',len(params['text'])))
         assert params['text']==texts[params['textDocument']['uri']]
         send({'method':'window/logMessage','params':{'type':3,'message':'fixture saved'}});continue
     elif method is None and ident in commands:

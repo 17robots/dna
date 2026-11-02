@@ -8,6 +8,8 @@ lib.dna_rpc_send.argtypes=[c.c_void_p,c.c_void_p,c.c_size_t]
 lib.dna_rpc_send_begin.argtypes=[c.c_void_p,c.c_size_t];lib.dna_rpc_send_begin.restype=c.c_void_p
 lib.dna_rpc_send_commit.argtypes=[c.c_void_p,c.c_size_t]
 lib.dna_rpc_send_abort.argtypes=[c.c_void_p]
+lib.dna_rpc_send_park.argtypes=[c.c_void_p]
+lib.dna_rpc_send_finish.argtypes=[c.c_void_p,c.c_size_t]
 lib.dna_rpc_size.argtypes=[c.c_void_p];lib.dna_rpc_size.restype=c.c_long
 lib.dna_rpc_take.argtypes=[c.c_void_p,c.c_void_p,c.c_size_t];lib.dna_rpc_take.restype=c.c_long
 lib.dna_rpc_close.argtypes=[c.c_void_p]
@@ -40,13 +42,31 @@ try:
     assert lib.dna_rpc_send_commit(p,len(large))
     assert not lib.dna_rpc_send_commit(p,len(large))
     assert receive(p)['id']==2
+    # A parked reservation keeps its place: messages sent while it is being
+    # written follow it, and dropping it releases them.
+    def message(ident):return b'{"jsonrpc":"2.0","id":%d,"method":"initialize","params":{}}'%ident
+    assert lib.dna_rpc_send(p,message(3),len(message(3)))
+    target=lib.dna_rpc_send_begin(p,len(large)+512);assert target
+    assert lib.dna_rpc_send_park(p);assert not lib.dna_rpc_send_park(p)
+    for _ in range(50):assert lib.dna_rpc_size(p)>=0;time.sleep(.001)
+    assert lib.dna_rpc_send(p,message(5),len(message(5)))
+    later=lib.dna_rpc_send_begin(p,4096);assert later
+    assert not lib.dna_rpc_send_finish(p,len(large))
+    c.memmove(later,message(6),len(message(6)));assert lib.dna_rpc_send_commit(p,len(message(6)))
+    padded=large.replace(b'"id":2',b'"id":4');c.memmove(target,padded,len(padded))
+    assert lib.dna_rpc_send_finish(p,len(padded))
+    assert [receive(p)['id'] for _ in range(4)]==[3,4,5,6]
+    target=lib.dna_rpc_send_begin(p,4096);assert target and lib.dna_rpc_send_park(p)
+    assert lib.dna_rpc_send(p,message(7),len(message(7)))
+    assert not lib.dna_rpc_send_finish(p,0)
+    assert receive(p)['id']==7
 finally:lib.dna_rpc_close(p)
 for frame in (b'Content-Length: 999999999\r\n\r\n',b'Content-Length: 2\r\nContent-Length: 2\r\n\r\n{}',b'X: y\r\n\r\n{}',b'x'*9000):
     cmd='python3 -c '+shlex.quote('import sys,time;sys.stdout.buffer.write('+repr(frame)+');sys.stdout.flush();time.sleep(3)')
     p=lib.dna_rpc_open(cmd.encode(),b'/tmp');assert p
     try:assert receive(p) is None
     finally:lib.dna_rpc_close(p)
-print('PASS LSP framing, fragmented messages, queue bounds, malformed peers, cleanup')
+print('PASS LSP framing, fragmented messages, parked sends keep order, queue bounds, malformed peers, cleanup')
 
 # Exercise the same transport against an actual installed language server.
 with tempfile.TemporaryDirectory() as directory:
