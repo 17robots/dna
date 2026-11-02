@@ -13,6 +13,7 @@ import threading
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
+from windows_target import SDK_ARCH, TIME_SCALE, link_arguments
 from dyn_path import real_dyn
 from sdk_compat import environment
 
@@ -138,13 +139,13 @@ def protocol_oracle(line, cwd, env, initial, initial_error):
         except BaseException as error:
             failures.append(error)
     try:
-        assert ready[0].wait(10), ('helper must reply before stdin EOF', bytes(streams[0][:256]), bytes(streams[1][:256]))
-        assert ready[1].wait(10), ('raw initial stderr', bytes(streams[1][:256]))
+        assert ready[0].wait(10 * TIME_SCALE), ('helper must reply before stdin EOF', bytes(streams[0][:256]), bytes(streams[1][:256]))
+        assert ready[1].wait(10 * TIME_SCALE), ('raw initial stderr', bytes(streams[1][:256]))
         assert bytes(streams[0]) == initial and bytes(streams[1]) == initial_error, (bytes(streams[0][:256]), bytes(streams[1][:256]))
         assert process.poll() is None and not process.stdin.closed, 'helper remains interactive before request input'
         writer = threading.Thread(target=send, daemon=True)
         writer.start()
-        assert process.wait(timeout=20) == 0
+        assert process.wait(timeout=20 * TIME_SCALE) == 0
         writer.join(timeout=5)
         for worker in readers:
             worker.join(timeout=5)
@@ -185,7 +186,7 @@ with tempfile.TemporaryDirectory(prefix='dna-frontend-win-') as temporary:
         libraries = stage / 'lib'
         libraries.mkdir()
         for name, folder in (('kernel32', 'um'), ('advapi32', 'um'), ('ucrt', 'ucrt')):
-            candidates = sorted(kits.glob('*/'+folder+'/x64/'+name+'.lib'))
+            candidates = sorted(kits.glob('*/'+folder+'/' + SDK_ARCH + '/'+name+'.lib'))
             if not candidates:
                 raise SystemExit('Windows SDK '+name+'.lib required')
             shutil.copyfile(candidates[-1], libraries/('lib'+name+'.dll.a'))

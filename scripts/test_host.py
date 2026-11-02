@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
 from dyn_path import real_dyn
 from sdk_compat import environment as sdk_environment
+from windows_target import SDK_ARCH, TIME_SCALE
 
 suite = sys.argv[1] if len(sys.argv) > 1 else 'host'
 if suite not in ('host', 'filesystem', 'clone', 'threads', 'bulk_memory'):
@@ -83,9 +84,9 @@ elif os.name == 'nt':
     libraries = stage / 'lib'
     libraries.mkdir(exist_ok=True)
     for name in ('kernel32', 'advapi32'):
-        candidates = sorted(kits.glob('*/um/x64/' + name + '.lib'))
+        candidates = sorted(kits.glob('*/um/' + SDK_ARCH + '/' + name + '.lib'))
         if not candidates:
-            raise SystemExit('Windows SDK x64 ' + name + '.lib is required for native tests.')
+            raise SystemExit('Windows SDK ' + SDK_ARCH + ' ' + name + '.lib is required for native tests.')
         shutil.copyfile(candidates[-1], libraries / ('lib' + name + '.dll.a'))
     environment['DYN_LIBRARY_PATH'] = str(libraries)
 for mode in ('debug', 'release'):
@@ -127,7 +128,7 @@ for mode in ('debug', 'release'):
                 if ($original.Sddl -ne $copied.Sddl) { throw 'Source security descriptor was not preserved' }
                 """
                 subprocess.run(['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', check],
-                               env=dict(environment, DNA_TEST_DIR=str(directory)), check=True, timeout=20)
+                               env=dict(environment, DNA_TEST_DIR=str(directory)), check=True, timeout=20 * TIME_SCALE)
             else:
                 for name in ('private.txt', 'copied-permissions.txt', 'session.txt'):
                     assert (directory / name).stat().st_mode & 0o777 == 0o600, name

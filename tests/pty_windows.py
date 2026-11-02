@@ -12,6 +12,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
+from windows_target import SDK_ARCH, TIME_SCALE, link_arguments
 from dyn_path import real_dyn
 from sdk_compat import environment as sdk_environment
 
@@ -146,7 +147,7 @@ for line in sys.stdin:
         return terminal
     storage = c.create_string_buffer(65536)
     ansi = re.compile(rb'\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)')
-    def wait_for(terminal, pattern, timeout=15):
+    def wait_for(terminal, pattern, timeout=15 * TIME_SCALE):
         output = bytearray()
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -162,7 +163,7 @@ for line in sys.stdin:
         raise AssertionError(('ConPTY output deadline', pattern, {'exited': lib.test_poll(terminal), 'status': lib.test_status(terminal)}, bytes(output[-2000:])))
     def write(terminal, data):
         sent = 0
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 5 * TIME_SCALE
         while sent < len(data):
             assert time.monotonic() < deadline, 'ConPTY input deadline'
             got = lib.test_write(terminal, data[sent:], len(data) - sent)
@@ -178,7 +179,7 @@ for line in sys.stdin:
         assert lib.test_needs_poll(terminal) == 1
         lib.test_resize(terminal, 101, 37)
         # Resize runs independently while this thread services output.
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 10 * TIME_SCALE
         while True:
             write(terminal, b'size\r')
             result = wait_for(terminal, rb'SIZE\s+(\d+)\s+(\d+)')
@@ -187,7 +188,7 @@ for line in sys.stdin:
             assert time.monotonic() < deadline, 'ConPTY native resize deadline'
         write(terminal, b'exit\r')
         wait_for(terminal, rb'DONE')
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 10 * TIME_SCALE
         while lib.test_poll(terminal) == 0:
             assert time.monotonic() < deadline, 'ConPTY exit inspection'
             # Keep draining until the process itself reports exited.
@@ -273,9 +274,9 @@ def main():
             libraries = work / 'lib'
             libraries.mkdir()
             for name, folder in (('kernel32', 'um'), ('advapi32', 'um'), ('ucrt', 'ucrt')):
-                candidates = sorted(kits.glob('*/' + folder + '/x64/' + name + '.lib'))
+                candidates = sorted(kits.glob('*/' + folder + '/' + SDK_ARCH + '/' + name + '.lib'))
                 if not candidates:
-                    raise SystemExit('Windows SDK x64 ' + name + '.lib is required.')
+                    raise SystemExit('Windows SDK ' + SDK_ARCH + ' ' + name + '.lib is required.')
                 shutil.copyfile(candidates[-1], libraries / ('lib' + name + '.dll.a'))
             environment['DYN_LIBRARY_PATH'] = str(libraries)
             # The production adapter intentionally refuses the inbox ConPTY.
@@ -297,7 +298,7 @@ def main():
                 if target == 'native':
                     # Redirect all harness stdio: without STARTF_USESTDHANDLES,
                     # Windows duplicates these parent pipes into a ConPTY child.
-                    result = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--native-library", str(binary), str(work), mode], stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", env=environment, timeout=60)
+                    result = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--native-library", str(binary), str(work), mode], stdin=subprocess.DEVNULL, capture_output=True, text=True, encoding="utf-8", errors="replace", env=environment, timeout=60 * TIME_SCALE)
                     print(result.stdout, end="", flush=True)
                     print(result.stderr, end="", file=sys.stderr, flush=True)
                     result.check_returncode()

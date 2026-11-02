@@ -34,6 +34,11 @@ def main():
         from dyn_path import real_dyn
         executable = str(real_dyn() or executable)
     command[0] = executable
+    # Programs linked on Windows run here: build them for this machine's
+    # architecture, which on Windows on ARM is not the emulated compiler's.
+    if os.name == 'nt' and len(command) > 1 and command[1] in ('build', 'run') and '--target' not in command:
+        from windows_target import link_arguments
+        command.extend(link_arguments())
     target = command[command.index('--target') + 1] if '--target' in command else ''
     if os.name == 'nt' or sys.platform == 'darwin' or target.endswith(('-windows', '-macos')):
         from sdk_compat import environment

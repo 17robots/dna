@@ -15,9 +15,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-15, windows-2022]
+        os: [ubuntu-24.04, macos-15, windows-2022, windows-11-arm]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    env:
+      # ARM64 test programs, built by the emulated x64 compiler.
+      DNA_WINDOWS_TARGET: ${{ matrix.os == 'windows-11-arm' && 'aarch64-windows' || 'x86_64-windows' }}
+      # Windows PowerShell takes ~17 s per start there; see windows_target.py.
+      DNA_TEST_TIME_SCALE: ${{ matrix.os == 'windows-11-arm' && '4' || '1' }}
     defaults:
       run:
         shell: bash
@@ -45,6 +50,16 @@ jobs:
         run: |
           brew install pkgconf utf8proc libvterm tree-sitter pcre2 harfbuzz fribidi freetype coreutils gnu-tar
           brew install --cask font-dejavu-sans-mono-nerd-font
+      - name: Time Windows PowerShell starts on Windows on ARM
+        # Recorded because each start there is far slower than on x64; the
+        # tests' process deadlines scale by DNA_TEST_TIME_SCALE.
+        if: matrix.os == 'windows-11-arm'
+        run: |
+          for attempt in 1 2 3; do
+            start=$(date +%s.%N)
+            powershell.exe -NoProfile -NonInteractive -Command "exit 0"
+            python -c "import sys; print('PowerShell start', sys.argv[1], round(float(sys.argv[3]) - float(sys.argv[2]), 1), 's')" "$attempt" "$start" "$(date +%s.%N)"
+          done
       - name: Run debug and release host adapters in a Unicode directory
         env:
           DNA_TEST_REQUIRE_APFS: ${{ runner.os == 'macOS' && '1' || '0' }}
@@ -65,6 +80,10 @@ jobs:
         run: |
           mise exec -- python ../../tests/native_macos.py
 
+      - name: Qualify native ARM64 test programs on Windows on ARM
+        if: matrix.os == 'windows-11-arm' && !cancelled()
+        working-directory: build/native-sdk
+        run: mise exec -- python ../../tests/windows_arm64.py
       - name: Qualify native Windows I/O
         if: runner.os == 'Windows' && !cancelled()
         working-directory: build/native-sdk
@@ -122,7 +141,8 @@ jobs:
         working-directory: build/native-sdk
         run: mise exec -- python ../../tests/language_versions_windows.py
       - name: Install native Windows editor providers
-        if: runner.os == 'Windows' && !cancelled()
+        # The full editor links MSYS2 UCRT64 (x64) libraries.
+        if: runner.os == 'Windows' && runner.arch == 'X64' && !cancelled()
         id: msys2
         uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
         with:

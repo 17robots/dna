@@ -10,6 +10,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
+from windows_target import SDK_ARCH, link_arguments
 from dyn_path import real_dyn
 from sdk_compat import environment as sdk_environment
 
@@ -133,16 +134,16 @@ with tempfile.TemporaryDirectory(prefix='dna-rec-io-') as temporary:
     libraries = stage / 'lib'
     libraries.mkdir()
     for name, folder in (('kernel32', 'um'), ('advapi32', 'um'), ('ucrt', 'ucrt')):
-        candidates = sorted(kits.glob('*/' + folder + '/x64/' + name + '.lib'))
+        candidates = sorted(kits.glob('*/' + folder + '/' + SDK_ARCH + '/' + name + '.lib'))
         if not candidates:
-            raise SystemExit('Windows SDK x64 ' + name + '.lib is required.')
+            raise SystemExit('Windows SDK ' + SDK_ARCH + ' ' + name + '.lib is required.')
         shutil.copyfile(candidates[-1], libraries / ('lib' + name + '.dll.a'))
     environment['DYN_LIBRARY_PATH'] = str(libraries)
     environment['DNA_REC_IO_ASCII'] = '1'
     for mode in ('debug', 'release'):
         binary = stage / ('rec-io-' + mode + '.exe')
         subprocess.run([str(compiler), 'build', str(bridge), '--' + mode,
-            '--output', str(binary)], env=environment, check=True, timeout=120)
+            '--output', str(binary)] + link_arguments(), env=environment, check=True, timeout=120)
         working = stage / ('café 日本語-' + mode)
         working.mkdir()
         destination = working / 'real-directory'

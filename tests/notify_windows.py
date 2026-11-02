@@ -9,6 +9,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
+from windows_target import SDK_ARCH, link_arguments
 from dyn_path import real_dyn
 from sdk_compat import environment
 
@@ -89,9 +90,9 @@ def main():
             libraries = stage / 'lib'
             libraries.mkdir()
             for name, folder in (('kernel32', 'um'), ('ucrt', 'ucrt')):
-                candidates = sorted(kits.glob('*/' + folder + '/x64/' + name + '.lib'))
+                candidates = sorted(kits.glob('*/' + folder + '/' + SDK_ARCH + '/' + name + '.lib'))
                 if not candidates:
-                    raise SystemExit('Windows SDK x64 ' + name + '.lib is required.')
+                    raise SystemExit('Windows SDK ' + SDK_ARCH + ' ' + name + '.lib is required.')
                 shutil.copyfile(candidates[-1], libraries / ('lib' + name + '.dll.a'))
             env['DYN_LIBRARY_PATH'] = str(libraries)
             for mode in ('debug', 'release'):

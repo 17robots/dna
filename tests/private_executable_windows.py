@@ -10,6 +10,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))
+from windows_target import SDK_ARCH, link_arguments
 from dyn_path import real_dyn
 from sdk_compat import environment as sdk_environment
 
@@ -131,9 +132,9 @@ def main():
         libraries = work / 'lib'
         libraries.mkdir()
         for name in ('kernel32', 'advapi32'):
-            candidates = sorted(kits.glob('*/um/x64/' + name + '.lib'))
+            candidates = sorted(kits.glob('*/um/' + SDK_ARCH + '/' + name + '.lib'))
             if not candidates:
-                raise SystemExit('Windows SDK x64 ' + name + '.lib is required.')
+                raise SystemExit('Windows SDK ' + SDK_ARCH + ' ' + name + '.lib is required.')
             shutil.copyfile(candidates[-1], libraries / ('lib' + name + '.dll.a'))
         environment['DYN_LIBRARY_PATH'] = str(libraries)
         source = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/whoami.exe'
@@ -142,7 +143,7 @@ def main():
         for mode in ('debug', 'release'):
             binary = work / ('private-' + mode + '.exe')
             subprocess.run([str(compiler), 'build', str(stage), '--' + mode,
-                '--output', str(binary)], env=environment, check=True, timeout=120)
+                '--output', str(binary)] + link_arguments(), env=environment, check=True, timeout=120)
             working = work / ('café 日本語-' + mode)
             working.mkdir()
             (working / 'payload.exe').write_bytes(payload)
