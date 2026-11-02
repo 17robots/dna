@@ -264,7 +264,9 @@ fn rec_rename_report(from:*const u8, to:*const u8, native_error:*u32)i32 {
   // One atomic rename with POSIX replacement semantics keeps existing readers
   // on the old generation. MoveFileEx can deny replacement while it is open.
   // Do not emulate this with delete-then-move or an ACL-merging replacement.
-  handle:=win_io_api.create(&source[0], 65664, 7, nil, 3, 2097152, nil)
+  // DELETE | FILE_READ_ATTRIBUTES | GENERIC_WRITE: write access lets the
+  // renamed file be flushed below.
+  handle:=win_io_api.create(&source[0], 1073807488, 7, nil, 3, 2097152, nil)
   if #cast(isize, handle)==-1 {
     native_error.*=win_io_api.error()
     return win_io_fail(native_error.*)
@@ -286,6 +288,13 @@ fn rec_rename_report(from:*const u8, to:*const u8, native_error:*u32)i32 {
   size:=#cast(usize, &target.name[0])-#cast(usize, &target)+#cast(usize, target.length)
   // FileRenameInfoEx=22, REPLACE_IF_EXISTS|POSIX_SEMANTICS=3.
   if win_io_api.rename(handle, 22, #cast(rawptr, &target), #cast(u32, size))==0 {
+    native_error.*=win_io_api.error()
+    return win_io_fail(native_error.*)
+  }
+  // Commit the rename: flushing the renamed file forces the file system log
+  // that records it, as MoveFileEx(MOVEFILE_WRITE_THROUGH) does. This is the
+  // Windows counterpart of fsyncing the parent directory.
+  if win_io_api.flush(handle)==0 {
     native_error.*=win_io_api.error()
     return win_io_fail(native_error.*)
   }
@@ -444,11 +453,9 @@ fn rec_sync_parent(fd: i32) bool {
     _ = win_io_fail(win_io_api.error())
     return false
   }
-  // This is an acknowledged Windows publication policy, not a successful
-  // directory fsync: rec_sync still reports errno95. The file was flushed
-  // before same-volume FileRenameInfoEx(REPLACE_IF_EXISTS | POSIX_SEMANTICS).
-  // Native tests establish process-crash survival; Windows exposes no POSIX
-  // parent-directory fsync contract, so power-loss durability is not claimed.
+  // Windows has no parent-directory fsync. rec_rename flushes the renamed
+  // file, which commits the rename itself; a directory handle here means the
+  // publication is already durable.
   return (info.attributes & 16) != 0
 }
 

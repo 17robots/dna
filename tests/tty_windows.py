@@ -30,6 +30,9 @@ tty_command_line:[65536]u8
 fn dna_tty_leave() { tty_leave_host()
   sync.store_u32(&tty_active,0) }
 fn tty_exit_handler() { dna_tty_leave() }
+fn dna_tty_enter() i32 { if !tty_enter_host() { return 0 }
+  sync.store_u32(&tty_active,1)
+  return 1 }
 read_result:i32=100
 read_started:sync.AtomicU32
 fn read_worker(context:rawptr)isize {
@@ -134,7 +137,9 @@ fn main() {
   before_output_page:=win_tty_api.output_page()
   if !tty_enter_host() { #panic("console enter") }
   sync.store_u32(&tty_active,1)
-  if tty_suspend_host()!=0 { #panic("Windows suspend unsupported") }
+  // Suspend runs %ComSpec% (here a shell that exits at once) and must come
+  // back in the same raw console mode, checked just below.
+  if tty_suspend_host()!=1 || sync.load_u32(&tty_active)!=1 { #panic("Windows suspend round trip") }
   mode:u32=0
   if win_tty_api.mode(input,&mode)==0 || (mode&7)!=0 || (mode&512)!=0 || (mode&24)!=24 || win_tty_api.input_page()!=65001 || win_tty_api.output_page()!=65001 { #panic("raw record console mode") }
   // The isolated console still has a real mouse/window. Suppress unsolicited
@@ -268,6 +273,7 @@ with tempfile.TemporaryDirectory(prefix='dna-tty-win-') as temporary:
         shutil.copyfile(candidates[-1], libraries / ('lib' + name + '.dll.a'))
     environment['DYN_LIBRARY_PATH'] = str(libraries)
     environment['DNA_HANDOFF'] = 'parent value'
+    environment['ComSpec'] = 'cmd.exe /d /c exit 0'
     for mode in ('debug', 'release'):
         binary = stage / ('tty-' + mode + '.exe')
         subprocess.run([str(compiler), 'build', str(bridge), '--' + mode,

@@ -39,6 +39,7 @@ struct WinTtyAPI {
   compare: fn(*const u16, i32, *const u16, i32, i32) i32,
   create_process: fn(*const u16, *u16, rawptr, rawptr, i32, u32, rawptr, rawptr, *WinTtyStartup, *WinTtyProcess) i32,
   wait_process: fn(rawptr, u32) u32,
+  variable: fn(*const u16, *u16, u32) u32,
 }
 win_tty_api: WinTtyAPI
 win_tty_once: win_io_sync.Once
@@ -100,6 +101,7 @@ fn win_tty_prepare() {
     win_tty_api.compare = #cast(fn(*const u16, i32, *const u16, i32, i32)i32, win_io_symbol(kernel.value, "CompareStringOrdinal"))
     win_tty_api.create_process = #cast(fn(*const u16, *u16, rawptr, rawptr, i32, u32, rawptr, rawptr, *WinTtyStartup, *WinTtyProcess)i32, win_io_symbol(kernel.value, "CreateProcessW"))
     win_tty_api.wait_process = #cast(fn(rawptr, u32)u32, win_io_symbol(kernel.value, "WaitForSingleObject"))
+    win_tty_api.variable = #cast(fn(*const u16, *u16, u32)u32, win_io_symbol(kernel.value, "GetEnvironmentVariableW"))
     win_io_sync.once_complete(&win_tty_once)
   }
 }
@@ -242,7 +244,13 @@ fn tty_wake_signal(bytes:*const u8) {
   }
   win_io_sync.unlock(&win_tty_lock)
 }
+// Set while :suspend runs a shell in this console. Ctrl+C and Ctrl+Break
+// reach every process on the console; they are the shell's then.
+win_tty_suspended: sync.AtomicU32 = sync.AtomicU32{}
 fn win_tty_control(number:u32)i32 {
+  if number<=1 && sync.load_u32(&win_tty_suspended)!=0 {
+    return 1
+  }
   if number==2 || number==5 || number==6 {
     dna_tty_leave()
   }
@@ -257,8 +265,56 @@ fn tty_fatal_host(number:i32) {
   win_tty_prepare()
   win_tty_api.exit(#cast(u32, 128+number))
 }
+// Windows consoles have no job control. Like Vim there, suspending runs the
+// command interpreter (%ComSpec%, else cmd.exe) in this console and returns
+// to the editor when it exits.
 fn tty_suspend_host() i32 {
-  return 0
+  if sync.load_u32(&tty_active) == 0 {
+    return 0
+  }
+  win_tty_prepare()
+  storage := #cast(*u16, rec_alloc(32768, #sizeof(u16)))
+  if storage == nil {
+    return 0
+  }
+  defer rec_free(#cast(rawptr, storage))
+  command := storage[..32768]
+  name: [8]u16 = [67, 111, 109, 83, 112, 101, 99, 0]
+  length := win_tty_api.variable(&name[0], &command[0], 32767)
+  if length == 0 || length >= 32767 {
+    fallback: [8]u16 = [99, 109, 100, 46, 101, 120, 101, 0]
+    for index in 0..8 {
+      command[index] = fallback[index]
+    }
+  }
+  // The shell may leave the console in another mode or code page; exiting
+  // the editor later must still restore the user's, not the shell's.
+  win_io_sync.lock(&win_tty_lock)
+  saved_input := win_tty_saved_input
+  saved_output := win_tty_saved_output
+  saved_input_page := win_tty_saved_input_page
+  saved_output_page := win_tty_saved_output_page
+  win_io_sync.unlock(&win_tty_lock)
+  dna_tty_leave()
+  sync.store_u32(&win_tty_suspended, 1)
+  startup := WinTtyStartup{size: #cast(u32, #sizeof(WinTtyStartup))}
+  child := WinTtyProcess{}
+  if win_tty_api.create_process(nil, &command[0], nil, nil, 0, 1024, nil, nil, &startup, &child) != 0 {
+    _ = win_io_api.close(child.thread)
+    _ = win_tty_api.wait_process(child.process, 4294967295)
+    _ = win_io_api.close(child.process)
+  }
+  sync.store_u32(&win_tty_suspended, 0)
+  entered := dna_tty_enter()
+  win_io_sync.lock(&win_tty_lock)
+  if win_tty_entered {
+    win_tty_saved_input = saved_input
+    win_tty_saved_output = saved_output
+    win_tty_saved_input_page = saved_input_page
+    win_tty_saved_output_page = saved_output_page
+  }
+  win_io_sync.unlock(&win_tty_lock)
+  return entered
 }
 fn tty_size_host(columns, rows:*i32)i32 {
   win_tty_prepare()
