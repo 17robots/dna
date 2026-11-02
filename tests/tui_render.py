@@ -387,14 +387,15 @@ def check_language_manager(root, sample, environment):
         session.wait_for('first line')
         session.send(b':')
         session.send(b'languages\r', 0.5)
-        session.wait_for('Update all installed')
+        session.wait_for('Refresh status')
         session.wait_for('Installed')
         session.send(b'/')
         session.send(b'json')
-        session.wait_for('grammar json')
+        session.wait_for('json         syntax ✓')
         session.wait_for('Available')
         session.send(b'\r')
-        # Update, refresh, Installed heading, then the installed JSON grammar.
+        # Update, refresh, Installed heading, then the installed JSON language.
+        session.send(b'\x1b[A' * 20)
         session.send(b'\x1b[B' * 3)
         session.send(b'x', 0.5)
         deadline = time.time() + 5
@@ -412,11 +413,11 @@ def check_language_manager(root, sample, environment):
         session.wait_for('ixu_')
         assert not active.is_symlink()
         session.send(b'\x1b[27u')
-        session.wait_for('Update all installed')
+        session.wait_for('Refresh status')
         session.send(b'\x1b[27u')
         session.send(b':')
         session.send(b'languages\r', 0.5)
-        session.wait_for('Update all installed')
+        session.wait_for('Refresh status')
     finally:
         session.close()
 
@@ -457,39 +458,41 @@ done
         session.wait_for('first line')
         session.send(b':')
         session.send(b'languages\r', 0.5)
-        session.wait_for('server  python')
+        session.wait_for('python       syntax ·  server installed')
         def mark(name, installed):
             session.send(b'/')
-            session.send(('server ' + name).encode())
+            session.send(name.encode())
             session.send(b'\r')
-            session.send(b'\x1b[A' * 20)
-            session.send(b'\x1b[B' * (3 if installed else 5))
+            # The filter leaves one language; gg selects it in either section.
+            session.send(b'gg')
+            session.wait_for('installed' if installed else 'can install')
             session.send(b' ')
-            session.wait_for('[x] server  ' + name)
+            session.wait_for('* ' + name)
 
         def wait_packages(predicate):
             deadline = time.time() + 10
             while time.time() < deadline:
                 session.pump(0.1)
                 if predicate():
-                    session.wait_for('Update all installed')
+                    session.wait_for('Refresh status')
                     return
             fail('batch package operation did not finish', session.text())
 
-        session.send(b'/')
-        session.send(b'server')
-        session.send(b'\r')
+        def selected():
+            # The selected language's name; the scrollbar column moves.
+            return next(row.split('>')[1].split()[0] for row in session.text() if '>   ' in row)
         session.send(b'gg')
-        top = next(row for row in session.text() if '> [ ] server' in row)
+        top = selected()
         session.send(b'G')
-        bottom = next(row for row in session.text() if '> [ ] server' in row)
+        bottom = selected()
         assert top != bottom, session.text()
         session.send(b'\x1b[H')
-        assert top in session.text(), session.text()
+        assert selected() == top, session.text()
         session.send(b'\x1b[F')
-        assert bottom in session.text(), session.text()
-        session.send(b'\x1b[A' * 20)
-        session.send(b'\x1b[B' * 3)
+        assert selected() == bottom, session.text()
+        # gg then j: python, after json among installed languages.
+        session.send(b'gg')
+        session.send(b'j')
         session.send(b'v')
         session.wait_for('VISUAL (1 marked)')
         session.send(b'j')
@@ -515,12 +518,12 @@ done
         session.send(b'j')
         session.wait_for('VISUAL (1 marked)')
         rows = session.text()
-        assert any('> [x] server  yaml' in row for row in rows), rows
-        assert any('[ ] server  python' in row for row in rows), rows
+        assert any('> * yaml' in row for row in rows), rows
+        assert any('  python' in row and '* python' not in row for row in rows), rows
         session.send(b'k')
         session.send(b'\x1b[27u')
         session.send(b'r', 0.5)
-        session.wait_for('Update marked installed')
+        session.wait_for('languages (2 marked)')
         session.wait_for('2 marked')
         # Marks survive closing/reopening and filtering one marked package out.
         session.send(b'\x1b[27u')
@@ -543,9 +546,13 @@ done
         wait_packages(lambda: all(not (packages / name).is_symlink() for name in ('python', 'yaml')))
         mark('python', False)
         mark('yaml', False)
+        # i also tries each language's grammar, which cannot build here; the
+        # servers still install and the failed languages stay marked.
         session.send(b'i', 0.5)
         wait_packages(lambda: all((packages / name).is_symlink() for name in ('python', 'yaml')))
         assert (packages / 'json').resolve() == previous['json']
+        session.send(b'c')
+        session.wait_for('0 marked')
         mark('python', True)
         session.send(b'c')
         session.wait_for('0 marked')

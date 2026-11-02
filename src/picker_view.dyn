@@ -425,6 +425,28 @@ fn preview_update(app: *App, typography: *Typography, path: []const u8, doc: *bu
     #panic("picker preview text")
   }
 }
+// Show text in the preview pane, such as the language manager's details.
+fn preview_show(app: *App, typography: *Typography, text: []const u8) {
+  state := &app.picker_state.preview
+  length := #len(text)
+  if length > 8191 {
+    length = 8191
+  }
+  if state.ready && state.document == nil && state.path_length == 0 && state.length == length && buffer.equal(state.bytes[..length], text[..length]) {
+    return
+  }
+  // A file preview must not match this text's cache key later.
+  state.ready = false
+  state.path_length = 0
+  state.document = nil
+  // Pickers always have at least one row, so file previews never reuse this.
+  state.rows = 0
+  state.length = copy_text(state.bytes[..], text[..length])
+  state.ready = true
+  if !ttf.set(typography.preview_text, &state.bytes[0], state.length) {
+    #panic("picker preview text")
+  }
+}
 // Open buffers reuse their live highlighting; files use a pooled preview parser.
 fn picker_preview_colors(app: *App, path: []const u8, doc: *buffer.Document, shown: []const u8) []const u8 {
   if #len(shown) == 0 || !app.config.syntax_enabled {
@@ -504,10 +526,14 @@ fn picker_geometry(app: *const App, typography: *const Typography, width: i32, h
   if body_height > typography.line {
     rows = #cast(usize, (body_height / typography.line))
   }
-  preview := app.config.picker_preview && rect.width >= typography.cell * 80.0 && !app.resource_state.fonts && app.resource_state.kind == 0
+  // The language manager's details pane shows whatever the preview setting.
+  preview := rect.width >= typography.cell * 80.0 && !app.resource_state.fonts && ((app.config.picker_preview && app.resource_state.kind == 0) || app.resource_state.kind == 6)
   list_width := rect.width - padding * 2.0
   if preview {
     list_width = (rect.width - padding * 3.0) * 0.45
+    if app.resource_state.kind == 6 {
+      list_width = (rect.width - padding * 3.0) * 0.5
+    }
   }
   return PickerGeometry{rect: rect, padding: padding, body_y: body_y, rows: rows, preview: preview, footer: true, list_width: list_width}
 }
@@ -695,8 +721,8 @@ fn draw_picker(renderer: rawptr, app: *App, typography: *Typography, width: i32,
     ui_size(ui, item, UiAxisY, UiSizeKind.Pixels, line / scale, 1.0)
     highlighted := row == selected
     if !buffers && app.resource_state.kind == 6 {
-      package := app.language_manager.rows[row]
-      if package < app.language_manager.count && app.language_manager.packages[package].marked {
+      language := app.language_manager.rows[row]
+      if language < app.language_manager.entry_count && app.language_manager.entries[language].marked {
         highlighted = true
       }
     }
@@ -742,7 +768,7 @@ fn draw_picker(renderer: rawptr, app: *App, typography: *Typography, width: i32,
     add_text(footer[..], &footer_length, "/")
     add_number(footer[..], &footer_length, count)
     if app.resource_state.kind == 6 {
-      add_text(footer[..], &footer_length, "  gg/G top/end  v visual  space mark  i/x/u act  q clear  / filter")
+      add_text(footer[..], &footer_length, "  i install  x remove  u update  R server  space/v mark  / filter")
     } else {
       add_text(footer[..], &footer_length, "  arrows choose  enter opens  double-click opens")
     }
@@ -789,9 +815,22 @@ fn draw_picker(renderer: rawptr, app: *App, typography: *Typography, width: i32,
         add_text(path[..], &path_length, candidate.name[..candidate.length])
       }
     }
-    preview_update(app, typography, path[..path_length], doc)
+    colors: []const u8 = ""
+    if !buffers && app.resource_state.kind == 6 {
+      details: [8192]u8 = []
+      columns := #cast(usize, (area.width / typography.cell))
+      if columns > 1 {
+        columns -= 1
+      }
+      preview_show(app, typography, details[..language_manager_details(app, details[..], columns)])
+    }
+    else {
+      preview_update(app, typography, path[..path_length], doc)
+    }
     shown := app.picker_state.preview.bytes[..app.picker_state.preview.length]
-    colors := picker_preview_colors(app, path[..path_length], doc, shown)
+    if buffers || app.resource_state.kind != 6 {
+      colors = picker_preview_colors(app, path[..path_length], doc, shown)
+    }
     preview_spans_update(typography, &typography.picker_spans, typography.preview_text, shown, colors)
     preview_clip := sdl.PixelRect{x: #cast(i32, area.x), y: #cast(i32, area.y), width: #cast(i32, area.width), height: #cast(i32, area.height)}
     if !sdl.clip(renderer, &preview_clip) || !ttf.draw(typography.preview_text, area.x, area.y) {

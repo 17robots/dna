@@ -518,6 +518,15 @@ struct LspState {
   symbol_query: [256]u8,
   symbol_query_length: usize,
   symbol_requery: bool,
+  // Why each language's server last failed, until it starts again; the
+  // language manager shows these.
+  failures: [8]LspFailure,
+}
+struct LspFailure {
+  language: [65]u8,
+  length: usize,
+  reason: [256]u8,
+  reason_length: usize,
 }
 struct Diagnostic {
   text: [512]u8,
@@ -532,6 +541,105 @@ struct Diagnostics { items: [128]Diagnostic, count: usize, revision: u64 }
 
 fn lsp_note(app: *App, text: []const u8) {
   app.lsp.log_length = copy_text(app.lsp.log[..], text)
+}
+// The recorded failure for a language, or an empty slice.
+fn lsp_failure_of(app: *const App, language: []const u8) []const u8 {
+  for index in 0..8 {
+    failure := &app.lsp.failures[index]
+    if failure.length > 0 && buffer.equal(failure.language[..failure.length], language) {
+      return failure.reason[..failure.reason_length]
+    }
+  }
+  return ""
+}
+fn lsp_failure_clear(app: *App, language: []const u8) {
+  for index in 0..8 {
+    failure := &app.lsp.failures[index]
+    if failure.length > 0 && buffer.equal(failure.language[..failure.length], language) {
+      failure.length = 0
+    }
+  }
+}
+fn lsp_failure_record(app: *App, language: []const u8, reason: []const u8) {
+  if #len(language) == 0 || #len(language) > 64 {
+    return
+  }
+  lsp_failure_clear(app, language)
+  chosen: usize = 0
+  for chosen < 7 && app.lsp.failures[chosen].length > 0 {
+    chosen += 1
+  }
+  failure := &app.lsp.failures[chosen]
+  failure.length = copy_text(failure.language[..], language)
+  shown := reason
+  if #len(shown) > 255 {
+    shown = shown[..255]
+    for #len(shown) > 0 && (shown[#len(shown) - 1] & 192) == 128 {
+      shown = shown[..#len(shown) - 1]
+    }
+  }
+  failure.reason_length = copy_text(failure.reason[..], shown)
+}
+// One line explaining a server's stderr: the last line that mentions an
+// error, else the first nonblank line.
+fn lsp_failure_summary(log: []const u8) []const u8 {
+  first: []const u8 = ""
+  chosen: []const u8 = ""
+  at: usize = 0
+  for at < #len(log) {
+    end := at
+    for end < #len(log) && log[end] != 10 {
+      end += 1
+    }
+    line := log[at..end]
+    at = end + 1
+    for #len(line) > 0 && (line[0] == ' ' || line[0] == 9) {
+      line = line[1..]
+    }
+    for #len(line) > 0 && (line[#len(line) - 1] == ' ' || line[#len(line) - 1] == 13) {
+      line = line[..#len(line) - 1]
+    }
+    if #len(line) == 0 {
+      continue
+    }
+    if #len(first) == 0 {
+      first = line
+    }
+    for index in 0..#len(line) {
+      if index + 5 <= #len(line) && (line[index] == 'e' || line[index] == 'E') && (line[index + 1] | 32) == 'r' && (line[index + 2] | 32) == 'r' && (line[index + 3] | 32) == 'o' && (line[index + 4] | 32) == 'r' {
+        chosen = line
+        break
+      }
+    }
+  }
+  if #len(chosen) > 0 {
+    return chosen
+  }
+  return first
+}
+// A server failed: remember why for its language and report it in one line.
+fn lsp_server_failure(app: *App, index: usize, reason: []const u8) {
+  server := &app.lsp.servers[index]
+  lsp_failure_record(app, server.language[..server.length], reason)
+  command := server.command[..c.string_length(&server.command[0], 4096)]
+  program := command
+  for end in 0..#len(command) {
+    if command[end] == ' ' {
+      program = command[..end]
+      break
+    }
+  }
+  text: [512]u8 = []
+  used: usize = 0
+  add_text(text[..], &used, program)
+  add_text(text[..], &used, " stopped: ")
+  add_text(text[..], &used, reason)
+  add_text(text[..], &used, " (:lsp-log shows the full output; :languages shows every server)")
+  render_request(app, RenderLsp)
+  app.lsp.failed = true
+  if app.prompt_state.panel == Panel.None {
+    notice(app, text[..used])
+  }
 }
 // Stable slots own intrusive links: document callbacks can enqueue without
 // allocation or service execution, including while a slot is being replaced.
@@ -772,6 +880,7 @@ fn lsp_start(app: *App, language: []const u8, command: []const u8) {
     return
   }
   lsp_stop(app, index)
+  lsp_failure_clear(app, language)
   server := &app.lsp.servers[index]
   lsp_shadows_release(app, index)
   mem.clear(server)
@@ -781,6 +890,7 @@ fn lsp_start(app: *App, language: []const u8, command: []const u8) {
   server.process = rpc_open(&server.command[0], &server.root[0])
   server.attach_scan=true
   if server.process == nil {
+    lsp_failure_record(app, language, "could not start the server program")
     notice(app, "Could not start language server.")
     return
   }
@@ -1408,6 +1518,7 @@ fn lsp_handle(app: *App, index: usize, source: []const u8, arena: *mem.Arena) bo
   if id.value == 1 && !server.ready {
     if !json.is_missing(json.object_get(root, "error")) || !json.is_object(result) {
       lsp_failure(app, "Language server initialization failed.")
+      lsp_failure_record(app, server.language[..server.length], "initialization failed")
       lsp_stop(app, index)
       return false
     }
@@ -1415,6 +1526,7 @@ fn lsp_handle(app: *App, index: usize, source: []const u8, arena: *mem.Arena) bo
     encoding := json_text(caps, "positionEncoding")
     if #len(encoding) > 0 && !buffer.equal(encoding, "utf-16") {
       lsp_failure(app, "Server did not negotiate UTF-16 positions.")
+      lsp_failure_record(app, server.language[..server.length], "did not negotiate UTF-16 positions")
       lsp_stop(app, index)
       return false
     }
@@ -1614,6 +1726,7 @@ fn lsp_tick(app: *App) bool {
     if server.process != nil {
       if server.deadline > 0 && sdl.ticks() >= server.deadline {
         lsp_failure(app, "Language server initialization timed out.")
+        lsp_failure_record(app, server.language[..server.length], "initialization timed out")
         changed = true
         lsp_stop(app, index)
         index += 1
@@ -1636,10 +1749,7 @@ fn lsp_tick(app: *App) bool {
           if app.lsp.log_length == 0 {
             lsp_note(app, "Language server exited or sent an invalid frame. Use :lsp-restart.")
           }
-          app.lsp.failed = true
-          if app.prompt_state.panel == Panel.None {
-            notice(app, app.lsp.log[..app.lsp.log_length])
-          }
+          lsp_server_failure(app, index, lsp_failure_summary(app.lsp.log[..app.lsp.log_length]))
           changed = true
           lsp_stop(app, index)
           break
