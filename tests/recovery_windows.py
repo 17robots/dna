@@ -111,7 +111,7 @@ def private_acl(path):
         kernel.LocalFree(descriptor)
 
 
-def shared_read(path):
+def shared_read(path, publish=None):
     # Python's CRT file open can deny FILE_SHARE_DELETE. Permit replacement
     # while observing an older complete generation, as the editor's readers do.
     kernel = c.WinDLL('kernel32', use_last_error=True)
@@ -128,6 +128,8 @@ def shared_read(path):
     try:
         length = c.c_int64()
         assert kernel.GetFileSizeEx(handle, c.byref(length)) and 0 <= length.value <= 2097152
+        if publish is not None:
+            publish()
         output = c.create_string_buffer(length.value)
         received = c.c_uint32()
         assert kernel.ReadFile(handle, output, length.value, c.byref(received), None)
@@ -185,6 +187,13 @@ def native_tests(binary, work):
         payload = bytes((index, 0, 13, 10)) * (1024 + index)
         assert lib.test_snapshot(str(target).encode('utf-8'), payload, len(payload)) == 1
         assert target.read_bytes() == payload and not list(direct.glob('*.tmp'))
+    # Publish with an old generation still open, then read that old handle.
+    previous = payload
+    replacement = b'new generation while previous reader remains open'
+    def publish_with_reader():
+        assert lib.test_snapshot(str(target).encode('utf-8'), replacement, len(replacement)) == 1
+    assert shared_read(target, publish_with_reader) == previous
+    assert target.read_bytes() == replacement
     private_acl(target)
     kernel = c.WinDLL('kernel32', use_last_error=True)
     kernel.GetCurrentProcess.restype = c.c_void_p

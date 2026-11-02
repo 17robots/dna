@@ -58,6 +58,35 @@ pub fn test_install(manifest,executable,root,name,leaf:*const u8)i32 {
   test_last_errno=rec_errno().*
   return result
 }
+pub fn test_parent_sharing(root:*const u8)i32 {
+  plugin_win_prepare()
+  parent:=rec_open(root,720896,0)
+  if parent<0 { return -1 }
+  defer _=rec_close(parent)
+  name:[]const u8="rename-parent-sharing\0"
+  creator:=install_win_create_private(parent,&name[0],true,false)
+  if creator<0 { return -2 }
+  pointer:=PluginWinPointer{}
+  value:[]const u8=".v-probe0"
+  _=copy(&pointer.active[0],&value[0],9)
+  test_real_rename=install_win_api.rename
+  test_rename_status=0
+  install_win_api.rename=test_tracked_rename
+  first:=plugin_win_publish(creator,&pointer)
+  install_win_api.rename=test_real_rename
+  before:=test_rename_status
+  retained:=plugin_win_reopen(creator,160)
+  saved:=rec_errno().*
+  _=rec_close(creator)
+  rec_errno().*=saved
+  if retained<0 { return -3 }
+  defer _=rec_close(retained)
+  if !plugin_win_publish(retained,&pointer) { return -4 }
+  // Some Windows versions may permit the broad parent too. Record that result;
+  // all versions must publish through the narrowed handle to the same object.
+  if !first && before!=-1073741757 { return -5 }
+  return 1
+}
 pub fn test_private_primitive(root,name:*const u8,directory,executable:i32)i32 {
   plugin_win_prepare()
   parent:=rec_open(root,720896,0)
@@ -89,6 +118,7 @@ def configure(binary):
     library.test_stage.argtypes = [c.c_char_p] * 5
     library.test_install.argtypes = [c.c_char_p] * 5
     library.test_errno.argtypes = []
+    library.test_parent_sharing.argtypes = [c.c_char_p]
     library.test_private_primitive.argtypes = [c.c_char_p, c.c_char_p, c.c_int, c.c_int]
     return library
 
@@ -115,6 +145,7 @@ def active(library, container):
 
 def native_tests(binary, work):
     lib = configure(binary)
+    assert lib.test_parent_sharing(encoded(work)) == 1, ("directory parent rename sharing", lib.test_status())
     payload = (Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/whoami.exe').read_bytes()
     name = 'café 日本語'
     sources = []

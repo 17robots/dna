@@ -246,7 +246,9 @@ with tempfile.TemporaryDirectory(prefix='dna-frontend-win-') as temporary:
                         raise AssertionError('helper JSON diagnostic: ' + json.dumps(diagnostic, ensure_ascii=True)) from error
                     assert actual['root'] == str(root), actual
                     assert actual['argv'] == ['-c'], actual
-                    assert Path(actual['cwd']) == working, actual
+                    # PowerShell may expand RUNNER~1 to runneradmin. Compare
+                    # directory identity while retaining exact environment checks.
+                    assert Path(actual['cwd']).samefile(working), actual
                     assert Path(actual['executable']).samefile(sys.executable), actual
                 optional = execute((working / 'language-version-command.txt').read_text(encoding='ascii'))
                 assert optional.returncode == 0 and optional.stdout.startswith(b'Python '), (optional.stdout, optional.stderr)

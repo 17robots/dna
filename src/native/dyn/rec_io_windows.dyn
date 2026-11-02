@@ -23,6 +23,7 @@ struct WinIOAPI {
   write: fn(rawptr, *const u8, u32, *u32, rawptr) i32,
   flush: fn(rawptr) i32,
   move: fn(*const u16, *const u16, u32) i32,
+  rename:fn(rawptr, u32, rawptr, u32)i32,
   delete: fn(*const u16) i32,
   reopen: fn(rawptr, u32, u32, u32) rawptr,
   type: fn(rawptr) u32,
@@ -54,6 +55,7 @@ fn win_io_prepare() {
     win_io_api.write = #cast(fn(rawptr, *const u8, u32, *u32, rawptr) i32, win_io_symbol(kernel.value, "WriteFile"))
     win_io_api.flush = #cast(fn(rawptr) i32, win_io_symbol(kernel.value, "FlushFileBuffers"))
     win_io_api.move = #cast(fn(*const u16, *const u16, u32) i32, win_io_symbol(kernel.value, "MoveFileExW"))
+    win_io_api.rename=#cast(fn(rawptr, u32, rawptr, u32)i32, win_io_symbol(kernel.value, "SetFileInformationByHandle"))
     win_io_api.delete = #cast(fn(*const u16) i32, win_io_symbol(kernel.value, "DeleteFileW"))
     win_io_api.reopen = #cast(fn(rawptr, u32, u32, u32) rawptr, win_io_symbol(kernel.value, "ReOpenFile"))
     win_io_api.type = #cast(fn(rawptr) u32, win_io_symbol(kernel.value, "GetFileType"))
@@ -250,21 +252,46 @@ fn rec_sync(fd: i32) i32 {
   }
   return 0
 }
-fn rec_rename_report(from: *const u8, to: *const u8, native_error:*u32) i32 {
+struct WinIORename { flags:u32, root:rawptr, length:u32, name:[32768]u16 }
+fn rec_rename_report(from:*const u8, to:*const u8, native_error:*u32)i32 {
   native_error.*=0
   win_io_prepare()
-  source: [32768]u16 = []
-  target: [32768]u16 = []
-  if !win_io_path(from, source[..]) || !win_io_path(to, target[..]) {
+  source:[32768]u16=[]
+  target:=WinIORename{flags:3}
+  if !win_io_path(from, source[..]) || !win_io_path(to, target.name[..]) {
     return -1
   }
-  // Same-volume atomic file replacement; never permit COPY_ALLOWED fallback.
-  if win_io_api.move(&source[0], &target[0], 9) == 0 {
+  // One atomic rename with POSIX replacement semantics keeps existing readers
+  // on the old generation. MoveFileEx can deny replacement while it is open.
+  // Do not emulate this with delete-then-move or an ACL-merging replacement.
+  handle:=win_io_api.create(&source[0], 65664, 7, nil, 3, 2097152, nil)
+  if #cast(isize, handle)==-1 {
+    native_error.*=win_io_api.error()
+    return win_io_fail(native_error.*)
+  }
+  defer _=win_io_api.close(handle)
+  info:=WinIOInformation{}
+  if win_io_api.info(handle, &info)==0 {
+    native_error.*=win_io_api.error()
+    return win_io_fail(native_error.*)
+  }
+  if (info.attributes&1040)!=0 {
+    return win_io_fail(50)
+  }
+  units:usize=0
+  for target.name[units]!=0 {
+    units+=1
+  }
+  target.length=#cast(u32, units*2)
+  size:=#cast(usize, &target.name[0])-#cast(usize, &target)+#cast(usize, target.length)
+  // FileRenameInfoEx=22, REPLACE_IF_EXISTS|POSIX_SEMANTICS=3.
+  if win_io_api.rename(handle, 22, #cast(rawptr, &target), #cast(u32, size))==0 {
     native_error.*=win_io_api.error()
     return win_io_fail(native_error.*)
   }
   return 0
 }
+
 fn rec_unlink(path: *const u8) i32 {
   win_io_prepare()
   wide: [32768]u16 = []
@@ -419,7 +446,7 @@ fn rec_sync_parent(fd: i32) bool {
   }
   // This is an acknowledged Windows publication policy, not a successful
   // directory fsync: rec_sync still reports errno95. The file was flushed
-  // before same-volume MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH).
+  // before same-volume FileRenameInfoEx(REPLACE_IF_EXISTS | POSIX_SEMANTICS).
   // Native tests establish process-crash survival; Windows exposes no POSIX
   // parent-directory fsync contract, so power-loss durability is not claimed.
   return (info.attributes & 16) != 0
