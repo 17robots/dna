@@ -889,16 +889,22 @@ keys and clickable guide entries follow the same Vim dispatch.
 | Visual | `v V` Ctrl-v; motions and text objects extend; `d x c s y > < ~ u U J r p P o`, `D X Y C S R` for lines, block `I A`, `gv` |
 | Registers | `"a`–`"z`, `"_` (black hole); the unnamed register is the system clipboard |
 | Macros | `q{a-z}` records, `q` stops, `@{a-z}` and `@@` replay |
+| Marks | `m{a-z}`; `` `{a-z} `` and `'{a-z}`, also after operators; `` `` `` and `''` |
 | Search | `/` and `?` (PCRE), `n N`, `* #` |
 | View | Ctrl-d Ctrl-u Ctrl-f Ctrl-b, Ctrl-e Ctrl-y, `zz zt zb` |
 | Language server | `K` hover, `gd gy gr gi` (definition, type, references, implementation) |
 | Buffers, files | `gt gT`, `ZZ` (`:x`), `ZQ` (`:qa`), `:w :q :wq :x :wa :qa`, `:e path` |
 | Ex | `:42`, `:[range]s/pattern/replacement/[gi]` with ranges `%`, `N,M`, `.`, `'<,'>`; `&` is the match, `\r` a line break |
 
-Ctrl-o / Ctrl-i walk the jump list (recorded by `gg`, `G`, searches and LSP
-goto). Not yet: marks (`m`, `` ` ``, `'`), Replace mode (`R`), `gq`, `=`, sentence and tag objects, `.` after a
-visual-mode change, `gJ` (joins with spaces like `J`), and capture groups in `:s` (patterns are PCRE, so write `a|b`,
-not `a\|b`). Ctrl-x closes the buffer only in the Helix keymap.
+Ctrl-o / Ctrl-i walk the jump list (recorded by `gg`, `G`, searches, marks and
+LSP goto). `m{a-z}` sets a mark in the current file; `` `{a-z} `` goes to it and
+`'{a-z}` to its line, as motions too (`d'a`, `` y`a ``); `` `` `` and `''`
+return to the last jump. Marks move with edits and last until the file is
+reloaded. `.` after a visual change repeats it on a region of the same size at
+the cursor (not after block mode). Not yet: uppercase (file) marks, Replace
+mode (`R`), `gq`, `=`, sentence and tag objects, `gJ` (joins with spaces like
+`J`), and capture groups in `:s` (patterns are PCRE, so write `a|b`, not
+`a\|b`). Ctrl-x closes the buffer only in the Helix keymap.
 
 ## Editable explorer
 
