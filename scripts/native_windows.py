@@ -1,6 +1,8 @@
 """Native Windows DLL/editor build using the MSYS2 UCRT64 providers."""
 import hashlib
 import json
+import mmap
+import struct
 import os
 from pathlib import Path
 import re
@@ -100,6 +102,155 @@ def dll_imports(path):
     return re.findall(r'^\s*DLL Name:\s*(\S+)\s*$', listing, re.MULTILINE)
 
 
+def pe_interface(path):
+    """Read native PE imports/exports by name or ordinal without loading code."""
+    path = Path(path)
+    with path.open('rb') as stream, mmap.mmap(stream.fileno(), 0, access=mmap.ACCESS_READ) as image:
+        def unpack(form, offset):
+            if offset < 0 or offset + struct.calcsize(form) > len(image):
+                raise RuntimeError('Truncated PE record: ' + str(path))
+            return struct.unpack_from(form, image, offset)
+        if image[:2] != b'MZ':
+            raise RuntimeError('Not a PE image: ' + str(path))
+        header = unpack('<I', 60)[0]
+        if image[header:header+4] != b'PE\0\0':
+            raise RuntimeError('Invalid PE signature: ' + str(path))
+        sections = unpack('<H', header+6)[0]
+        optional_size = unpack('<H', header+20)[0]
+        optional = header+24
+        magic = unpack('<H', optional)[0]
+        if magic not in (0x10b, 0x20b):
+            raise RuntimeError('Unsupported PE optional header: ' + str(path))
+        stride, ordinal_flag = (8, 1 << 63) if magic == 0x20b else (4, 1 << 31)
+        directories = optional + (112 if magic == 0x20b else 96)
+        count = unpack('<I', directories-4)[0]
+        headers_size = unpack('<I', optional+60)[0]
+        mappings = []
+        for index in range(sections):
+            section = optional+optional_size+40*index
+            virtual_size, address, raw_size, raw = unpack('<IIII', section+8)
+            mappings.append((address, max(virtual_size, raw_size), raw, raw_size))
+        def offset(rva):
+            if rva < headers_size and rva < len(image):
+                return rva
+            for address, size, raw, raw_size in mappings:
+                if address <= rva < address+size and rva-address < raw_size:
+                    result = raw+rva-address
+                    if result < len(image):
+                        return result
+            raise RuntimeError('Unmapped PE RVA ' + hex(rva) + ': ' + str(path))
+        def text(rva):
+            first = offset(rva)
+            end = image.find(b'\0', first, min(len(image), first+4096))
+            if end < 0:
+                raise RuntimeError('Unterminated PE name: ' + str(path))
+            return image[first:end].decode('ascii')
+        def directory(index):
+            return unpack('<II', directories+index*8) if index < count else (0, 0)
+        imports = {}
+        import_rva, _ = directory(1)
+        if import_rva:
+            first = offset(import_rva)
+            for index in range(4096):
+                original, stamp, chain, name, thunk = unpack('<IIIII', first+20*index)
+                if not (original or stamp or chain or name or thunk):
+                    break
+                imported = imports.setdefault(text(name), set())
+                table = offset(original or thunk)
+                for entry in range(131072):
+                    value = unpack('<Q' if stride == 8 else '<I', table+entry*stride)[0]
+                    if value == 0:
+                        break
+                    imported.add(value & 65535 if value & ordinal_flag else text(value+2))
+                else:
+                    raise RuntimeError('Unbounded PE import table: ' + str(path))
+            else:
+                raise RuntimeError('Unbounded PE dependency table: ' + str(path))
+        exports, forwarders = set(), {}
+        export_rva, export_size = directory(0)
+        if export_rva:
+            record = unpack('<IIHHIIIIIII', offset(export_rva))
+            base, functions, names, addresses, name_table, ordinal_table = record[5:]
+            if functions > 1048576 or names > 1048576:
+                raise RuntimeError('Invalid PE export count: ' + str(path))
+            values = [unpack('<I', offset(addresses)+4*index)[0] for index in range(functions)]
+            for index, address in enumerate(values):
+                if address:
+                    exports.add(base+index)
+                    if export_rva <= address < export_rva+export_size:
+                        forwarders[base+index] = text(address)
+            for index in range(names):
+                name = text(unpack('<I', offset(name_table)+4*index)[0])
+                ordinal = unpack('<H', offset(ordinal_table)+2*index)[0]
+                if ordinal >= functions or not values[ordinal]:
+                    raise RuntimeError('Invalid PE named export: ' + str(path))
+                exports.add(name)
+                if base+ordinal in forwarders:
+                    forwarders[name] = forwarders[base+ordinal]
+        return {'imports': imports, 'exports': exports, 'forwarders': forwarders}
+
+
+def audit_runtime(roots):
+    """Report exact dependency paths and unresolved procedures before LoadLibrary."""
+    roots = [Path(path).resolve() for path in roots]
+    directories = list(dict.fromkeys(path.parent for path in roots))
+    system = Path(os.environ.get('SystemRoot', 'C:/Windows')) / 'System32'
+    cache, errors, visited = {}, [], set()
+    def contract(name):
+        return name.lower().startswith(('api-ms-win-', 'ext-ms-win-'))
+    def locate(name, owner):
+        for folder in dict.fromkeys((*directories, owner.parent, system)):
+            candidate = folder / name
+            if candidate.is_file():
+                return candidate.resolve()
+        return None
+    def interface(path):
+        if path not in cache:
+            cache[path] = pe_interface(path)
+        return cache[path]
+    def require(owner, dependency, symbol, chain=()):
+        if contract(dependency):
+            return
+        target = locate(dependency, owner)
+        if target is None:
+            errors.append(str(owner) + ' imports ' + dependency + '!' + str(symbol) + '; selected DLL: MISSING')
+            return
+        identity = (target, symbol)
+        if identity in chain:
+            errors.append('PE forwarder cycle: ' + str(identity))
+            return
+        view = interface(target)
+        if symbol not in view['exports']:
+            errors.append(str(owner) + ' imports ' + dependency + '!' + str(symbol) + '; selected DLL: ' + str(target) + '; procedure NOT EXPORTED')
+            return
+        forwarded = view['forwarders'].get(symbol)
+        if forwarded:
+            library, name = forwarded.rsplit('.', 1)
+            require(target, library if library.lower().endswith('.dll') else library+'.dll', int(name[1:]) if name.startswith('#') else name, (*chain, identity))
+    pending = list(roots)
+    while pending:
+        owner = pending.pop()
+        if owner in visited:
+            continue
+        visited.add(owner)
+        view = interface(owner)
+        print('PE audit: ' + str(owner) + ' (' + str(sum(map(len, view['imports'].values()))) + ' imports)', flush=True)
+        for dependency, symbols in sorted(view['imports'].items()):
+            if contract(dependency):
+                continue
+            target = locate(dependency, owner)
+            print('  ' + dependency + ' -> ' + (str(target) if target else 'MISSING'), flush=True)
+            if target is not None:
+                pending.append(target)
+            for symbol in sorted(symbols, key=str):
+                require(owner, dependency, symbol)
+    if errors:
+        for error in errors[:64]:
+            print('PE IMPORT ERROR: ' + error, file=sys.stderr, flush=True)
+        raise RuntimeError('PE import audit found ' + str(len(errors)) + ' unresolved procedures/dependencies')
+    print('PASS PE import/export audit: ' + str(len(visited)) + ' images', flush=True)
+
+
 def snapshot_runtime(roots, destination, tools=False):
     """Copy the real PE import closure plus explicitly loaded text providers."""
     destination.mkdir(parents=True, exist_ok=True)
@@ -147,7 +298,9 @@ def snapshot_runtime(roots, destination, tools=False):
             shutil.copyfile(source, target)
         manifest.append({'name': source.name, 'sha256': hashlib.sha256(target.read_bytes()).hexdigest()})
     (destination / 'dna-runtime.json').write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
-    return [destination / item['name'] for item in manifest]
+    captured = [destination / item['name'] for item in manifest]
+    audit_runtime(captured)
+    return captured
 
 
 def dependencies():

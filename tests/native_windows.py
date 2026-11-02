@@ -71,6 +71,7 @@ def private_acl(path):
 
 
 def service_tests(library, work):
+    native.audit_runtime([library])
     with contextlib.ExitStack() as directories:
         directories.enter_context(os.add_dll_directory(str(library.parent)))
         lib = c.CDLL(str(library))
