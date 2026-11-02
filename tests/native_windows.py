@@ -164,7 +164,7 @@ def test_picker_search(lib, work):
             count = lib.dna_search_count(search, c.byref(status))
             return (count, status.value) if status.value != 1 else None
         count, status = await_value(complete, 'content search completion')
-        assert status == 2 and count == 1, ('content search result', count, status)
+        assert status == 0 and count == 1, ('content search result', count, status)
         row = Row()
         assert lib.dna_search_row(search, 0, c.byref(row)) == 1
         assert bytes(row.path).endswith(b'cleanup.sh') and b'needle' in bytes(row.text)
