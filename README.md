@@ -282,8 +282,12 @@ containers, SSH). It always starts in the terminal.
 `explorer = "buffer"` (the default) is the editable explorer described under
 [Editable explorer](#editable-explorer). `explorer = "tree"` makes Space e
 open the project as a collapsible tree, docked on the left (`[place.explorer]`
-docks it elsewhere or floats it). A docked tree stays beside the panes after
-focus returns to the editor; Space e or a click moves focus back to it.
+docks it elsewhere or floats it). Like NERDTree, a docked tree stays beside the
+panes after you open a file, with focus on the file. **Space e** toggles the
+tree from anywhere: it closes an open tree, focused or not, and otherwise opens
+it on the current file. **Space E** (or a click) moves focus back to an open
+tree. Set `close_on_open = true` under `[explorer]` to close the tree whenever
+you open a file from it.
 
 | Key | Tree action |
 | --- | --- |
@@ -301,7 +305,7 @@ focus returns to the editor; Space e or a click moves focus back to it.
 | `R` | reload from disk |
 | `e` | edit the selected folder as text in the editable explorer |
 | Esc | back to the editor (a floating tree closes) |
-| `q` / Escape | close the tree (Space e opens it again) |
+| `q` / Escape | close the tree (Space e opens it again; Space e also closes it from the editor) |
 
 Tree search jumps through visible rows without changing folder expansion; Escape
 cancels an active query and restores the prior selection. While entering a query,
@@ -771,6 +775,7 @@ character, so `x` never highlights the first character of the following line. Wo
 | Save and close buffer | `:x` / `:wq` |
 | Save all / save all and exit | `:wa` / `:xa` |
 | Directory buffer | `Space e`; `Ctrl E` |
+| Focus the file tree (`explorer = "tree"`) | `Space E` |
 | Font larger/smaller/reset | `Ctrl +` / `Ctrl -` / `Ctrl 0` |
 | Close active buffer and its split | `:q` / `:quit` |
 | Close shared buffer | `:bd` (prompts if dirty) |
