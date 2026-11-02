@@ -366,18 +366,24 @@ fn lsp_accept(app: *App) {
     return
   }
   path: [4096]u8 = []
-  uri := json_text(item, "uri")
-  if #len(uri) == 0 {
-    uri = json_text(item, "targetUri")
+  decoded: []const u8 = path[..0]
+  range: *const json.Value = nil
+  if state.kind == 13 || state.kind == 14 {
+    decoded = lsp_symbol_location(app, item, path[..], &range)
+  } else {
+    uri := json_text(item, "uri")
+    if #len(uri) == 0 {
+      uri = json_text(item, "targetUri")
+    }
+    decoded = lsp.path(uri, path[..])
+    range = json.object_get(item, "range")
+    if json.is_missing(range) {
+      range = json.object_get(item, "targetSelectionRange")
+    }
   }
-  decoded := lsp.path(uri, path[..])
   if #len(decoded) == 0 {
     notice(app, "Language result is not a local file URI.")
     return
-  }
-  range := json.object_get(item, "range")
-  if json.is_missing(range) {
-    range = json.object_get(item, "targetSelectionRange")
   }
   open_file(app, decoded)
   if app.prompt_state.panel == Panel.Message {
@@ -391,6 +397,10 @@ fn lsp_accept(app: *App) {
   }
   app.documents.current.anchor = low.value
   app.documents.current.cursor = high.value
+  if state.kind == 13 || state.kind == 14 {
+    // A symbol jump lands on the name rather than selecting it.
+    app.documents.current.cursor = low.value
+  }
   app.view.insert = false
   app.view.extend = false
   app.prompt_state.panel = Panel.None

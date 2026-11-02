@@ -763,6 +763,7 @@ character, so `x` never highlights the first character of the following line. Wo
 | Focus window | `Space w h/j/k/l`; `Space w w` cycles; click a pane |
 | Close window / keep only current | `Space w c` / `Space w o`; `:wclose` / `:only` |
 | Buffer picker / next / previous | `Space b` / `Space n` / `Space p` |
+| Symbols in this file / workspace (language server) | `Space s` / `Space S`; `:symbols`, `:workspace-symbols [query]`; type to filter, Enter goes |
 | Go-to menu | `g` (Escape cancels) |
 | Close current buffer | `Space c` or `:bd` |
 | New empty buffer | `:enew` |
@@ -1595,6 +1596,11 @@ selects its first named child, and `Alt-p`/`Alt-n` select sibling nodes.
 Selections use the current parsed revision; a pending parse never blocks input.
 `gy` and `gi` request type definitions and implementations from the language
 server. Support depends on the server.
+
+`Space s` (`:symbols`) lists the file's symbols from the language server,
+nested as the server reports them; typing filters them by name (letters in
+order, any case) and Enter goes to one. `Space S` (`:workspace-symbols`) sends
+what you type to the server as the query, so it searches the whole project.
 
 Language packages may also contain `textobjects.scm` with predicate-free
 Tree-sitter captures named `function.inside`/`function.around`, `class`,
