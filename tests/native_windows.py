@@ -81,7 +81,6 @@ def service_tests(library, work):
         test_disk(lib, work)
         test_terminal(lib, work)
     print('PASS complete Windows service DLL: jobs, picker, content search, recovery, disk and ConPTY', flush=True)
-    print('QUALIFICATION GAP: language installer execution remains pending.', flush=True)
 
 
 def test_jobs(lib, work):
@@ -174,6 +173,7 @@ def test_picker_search(lib, work):
 
 
 def test_recovery(lib, work):
+    from recovery_windows import shared_read
     lib.dna_recovery_open.argtypes = [c.c_char_p]
     lib.dna_recovery_open.restype = c.c_void_p
     lib.dna_recovery_submit.argtypes = [c.c_void_p, c.c_char_p, c.c_size_t]
@@ -190,7 +190,7 @@ def test_recovery(lib, work):
             for path in root.glob('session-*'):
                 if not path.name.endswith('.tmp'):
                     try:
-                        if path.read_bytes() == payload:
+                        if shared_read(path) == payload:
                             return path
                     except (FileNotFoundError, PermissionError):
                         pass
@@ -294,7 +294,7 @@ def main():
             manifest = json.loads((binary.parent / 'dna-runtime.json').read_text(encoding='utf-8'))
             assert {'dna_native.dll', 'dyn_window.dll', 'conpty.dll', 'openconsole.exe', 'dna-language.exe', 'libharfbuzz-0.dll', 'libfribidi-0.dll', 'libfreetype-6.dll'} <= {entry['name'].lower() for entry in manifest}
             print('PASS full native Win32 editor startup, GL presentation and cleanup (' + mode + ')', flush=True)
-    print('PASS full Windows service/editor qualification; language installer remains explicitly unqualified.', flush=True)
+    print('PASS full Windows service/editor qualification; installer workflows run separately.', flush=True)
 
 
 if __name__ == '__main__':

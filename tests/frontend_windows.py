@@ -19,6 +19,7 @@ from sdk_compat import environment
 FIXTURE = r'''
 use "std/c"
 use "./host" host
+use "./servers" server_discovery
 use "std/fs" frontend_test_fs
 struct ThreadTime { seconds, nanoseconds: i64 }
 fn command_tests() {
@@ -67,6 +68,13 @@ fn command_tests() {
   for at in 0..#len(expected) { if value.value[at]!=expected[at] { #panic("command builder must not change parent environment") } }
 }
 fn main() {
+  if !server_discovery.on_path("dna-fixture-exe --stdio") || !server_discovery.on_path("dna-fixture-cmd --stdio") || !server_discovery.on_path("dna-fixture-exe.exe --stdio") { #panic("Windows PATH, PATHEXT and executable discovery") }
+  if server_discovery.on_path("dna-fixture-directory") || server_discovery.on_path("dna-nonexistent-language-server-7ab218") { #panic("server discovery must reject directories and missing commands") }
+  restricted:[]const u8="PATHEXT\0"
+  cmd_only:[]const u8=".CMD\0"
+  extensions:[]const u8=".EXE;.CMD\0"
+  if handoff_setenv(&restricted[0],&cmd_only[0],1)!=0 || server_discovery.on_path("dna-fixture-exe") || !server_discovery.on_path("dna-fixture-cmd") || !server_discovery.on_path("dna-fixture-exe.exe") || handoff_setenv(&restricted[0],&extensions[0],1)!=0 { #panic("configured Windows executable extensions") }
+
   key := "DNA_FRONTEND_QUALIFICATION\0"
   first := "session café 日本語\0"
   second := "changed\0"
@@ -162,7 +170,7 @@ def protocol_oracle(line, cwd, env, initial, initial_error):
 compiler = real_dyn()
 with tempfile.TemporaryDirectory(prefix='dna-frontend-win-') as temporary:
     stage = Path(temporary)
-    for module in ('host', 'cstring', 'owned_arena'):
+    for module in ('host', 'cstring', 'owned_arena', 'filesystem', 'servers'):
         shutil.copytree(ROOT / 'src' / module, stage / module)
     shutil.copyfile(ROOT / 'src/c_windows.dyn', stage / 'c_windows.dyn')
     (stage / 'main.dyn').write_text(FIXTURE, encoding='utf-8')
@@ -176,7 +184,7 @@ with tempfile.TemporaryDirectory(prefix='dna-frontend-win-') as temporary:
         kits = Path(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')) / 'Windows Kits/10/Lib'
         libraries = stage / 'lib'
         libraries.mkdir()
-        for name, folder in (('kernel32', 'um'), ('ucrt', 'ucrt')):
+        for name, folder in (('kernel32', 'um'), ('advapi32', 'um'), ('ucrt', 'ucrt')):
             candidates = sorted(kits.glob('*/'+folder+'/x64/'+name+'.lib'))
             if not candidates:
                 raise SystemExit('Windows SDK '+name+'.lib required')
@@ -196,6 +204,11 @@ with tempfile.TemporaryDirectory(prefix='dna-frontend-win-') as temporary:
             helper = helper_directory / Path(sys.executable).name
             root = working / "root %PATH%!&' 日本語 ‘a’‚‛"
             root.mkdir()
+            server_directory = working / 'server tools café 日本語'
+            server_directory.mkdir()
+            shutil.copyfile(sys.executable, server_directory / 'dna-fixture-exe.exe')
+            (server_directory / 'dna-fixture-cmd.cmd').write_text('@exit /b 0\n', encoding='ascii')
+            (server_directory / 'dna-fixture-directory.exe').mkdir()
             code = 'import json,os,sys; print(json.dumps({"root":os.environ["DNA_LANGUAGE_DIR"],"argv":sys.argv,"cwd":os.getcwd(),"executable":sys.executable},ensure_ascii=True)); # trailing slash \\\\'
             body = json.dumps({'ready': 'café 日本語🙂'}, ensure_ascii=False).encode('utf-8')
             initial = b'Content-Length: ' + str(len(body)).encode('ascii') + b'\r\n\r\n' + body
@@ -206,7 +219,8 @@ with tempfile.TemporaryDirectory(prefix='dna-frontend-win-') as temporary:
                         "while True:\n block=os.read(0,8192)\n if not block: break\n emit(1,block)\n emit(2,block)\n")
             child_env = dict(env, DNA_COMMAND_ROOT=str(root), DNA_COMMAND_HELPER=str(helper),
                              DNA_COMMAND_SCRIPT=code, DNA_COMMAND_PROTOCOL=protocol,
-                             DNA_LANGUAGE_DIR='parent unchanged')
+                             DNA_LANGUAGE_DIR='parent unchanged', PATHEXT='.EXE;.CMD',
+                             PATH='"'+str(server_directory)+'"'+os.pathsep+env['PATH'])
             try:
                 subprocess.run([str(output)], cwd=working, env=child_env, check=True, timeout=30)
                 command = (working / 'language-command.txt').read_text(encoding='ascii')
