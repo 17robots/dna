@@ -9,25 +9,30 @@ const PluginWinSignature: []const u8 = "DNA plugin versions 1\n"
 const PluginWinVersionSignature: []const u8 = "DNA plugin version 1\n"
 struct PluginWinPointer { active: [10]u8, previous: [10]u8, missing: bool }
 plugin_win_mutex: NativeMutex
-plugin_win_once: win_io_sync.Once
-plugin_win_reopen_api: fn(rawptr, u32, u32, u32)rawptr
 fn plugin_win_prepare() {
   install_win_prepare()
-  if win_io_sync.once_begin(&plugin_win_once) {
-    kernel:=win_io_loader.open("kernel32.dll", 0)
-    if !kernel.ok {
-      #panic("missing Windows file reopen library")
-    }
-    plugin_win_reopen_api=#cast(fn(rawptr, u32, u32, u32)rawptr, win_io_symbol(kernel.value, "ReOpenFile"))
-    win_io_sync.once_complete(&plugin_win_once)
-  }
 }
-fn plugin_win_reopen(fd:i32, access:u32)i32 {
-  // Reopen the retained object, rather than its pathname. DuplicateHandle would
-  // retain the original FILE_OBJECT's sharing reservation even with fewer rights.
-  handle:=plugin_win_reopen_api(win_io_handle(fd), access, 7, 35651584)
-  if #cast(isize, handle)==-1 {
+fn plugin_win_reopen(root:i32, name:*const u8, original:i32, access:u32)i32 {
+  // Open relative to a retained parent while retaining the original object.
+  // Validate identity before releasing either handle, including a swapped name.
+  before:=WinIOInformation{}
+  if win_io_api.info(win_io_handle(original), &before)==0 {
     return win_io_fail(win_io_api.error())
+  }
+  handle:=install_win_relative(root, name, access, 1, true)
+  if handle==nil {
+    return -1
+  }
+  after:=WinIOInformation{}
+  if win_io_api.info(handle, &after)==0 {
+    error:=win_io_api.error()
+    _=win_io_api.close(handle)
+    return win_io_fail(error)
+  }
+  if before.volume!=after.volume || before.index_high!=after.index_high || before.index_low!=after.index_low || (after.attributes&16)==0 || (after.attributes&1024)!=0 {
+    _=win_io_api.close(handle)
+    rec_errno().*=13
+    return -1
   }
   return win_io_adopt(handle, 0)
 }
@@ -320,7 +325,9 @@ fn plugin_win_pointer(parent:i32, pointer:*PluginWinPointer, allow_missing:bool)
 }
 fn plugin_win_rename_fd(fd, parent:i32, name:*const u8, replace:bool)bool {
   rename:=InstallWinRename{}
-  if parent>=0 { rename.root=win_io_handle(parent) }
+  if parent>=0 {
+    rename.root=win_io_handle(parent)
+  }
   if replace {
     rename.replace=1
   }
@@ -477,7 +484,7 @@ fn plugin_win_container(root:i32, name:*const u8, create:bool)i32 {
       }
       // The rename kernel opens the destination directory internally. Keeping
       // this creator's DELETE access can conflict with that internal open.
-      retained:=plugin_win_reopen(fd, 160)
+      retained:=plugin_win_reopen(root, name, fd, 160)
       saved:=rec_errno().*
       _=rec_close(fd)
       rec_errno().*=saved
@@ -585,7 +592,7 @@ pub fn dna_plugin_remove(root, name:*const u8)i32 {
   defer _=rec_close(container)
   // Removal renames the container itself and therefore needs DELETE. Other
   // users retain read-only handles so pointer publication can reopen its parent.
-  removal:=plugin_win_reopen(container, 65664)
+  removal:=plugin_win_reopen(parent, name, container, 65664)
   if removal<0 {
     return 0
   }

@@ -29,6 +29,7 @@ struct WinTtyAPI {
   ticks: fn() u64,
   control: fn(fn(u32) i32, i32) i32,
   exit: fn(u32),
+  at_exit:fn(fn())i32,
   command_line: fn() *const u16,
   arguments: fn(*const u16, *i32) **u16,
   local_free: fn(rawptr) rawptr,
@@ -67,9 +68,11 @@ fn win_tty_prepare() {
   if win_io_sync.once_begin(&win_tty_once) {
     kernel := win_io_loader.open("kernel32.dll", 0)
     shell := win_io_loader.open("shell32.dll", 0)
-    if !kernel.ok || !shell.ok {
+    runtime:=win_io_loader.open("ucrtbase.dll", 0)
+    if !kernel.ok || !shell.ok || !runtime.ok {
       #panic("missing Windows console library")
     }
+    win_tty_api.at_exit=#cast(fn(fn())i32, win_io_symbol(runtime.value, "_crt_atexit"))
     win_tty_api.standard = #cast(fn(u32) rawptr, win_io_symbol(kernel.value, "GetStdHandle"))
     win_tty_api.mode = #cast(fn(rawptr, *u32)i32, win_io_symbol(kernel.value, "GetConsoleMode"))
     win_tty_api.set_mode = #cast(fn(rawptr, u32)i32, win_io_symbol(kernel.value, "SetConsoleMode"))
@@ -247,7 +250,7 @@ fn win_tty_control(number:u32)i32 {
 }
 fn tty_register_handlers() {
   win_tty_prepare()
-  _=tty_atexit(tty_exit_handler)
+  _=win_tty_api.at_exit(tty_exit_handler)
   _=win_tty_api.control(win_tty_control, 1)
 }
 fn tty_fatal_host(number:i32) {

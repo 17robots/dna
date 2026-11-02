@@ -41,6 +41,13 @@ pub fn test_stage(root,name,manifest,executable,leaf:*const u8)i32 {
 test_last_errno:i32
 test_rename_status:i32
 test_force_root:rawptr
+test_open_status:i32
+test_real_open:fn(*rawptr,u32,*InstallWinAttributes,*InstallWinStatus,*i64,u32,u32,u32,u32,rawptr,u32)i32
+fn test_tracked_open(output:*rawptr,access:u32,attributes:*InstallWinAttributes,status:*InstallWinStatus,size:*i64,kind,share,disposition,options:u32,extra:rawptr,length:u32)i32 {
+  result:=test_real_open(output,access,attributes,status,size,kind,share,disposition,options,extra,length)
+  if result<0 { test_open_status=result }
+  return result
+}
 test_parent_diagnostics:[9]i32
 test_real_rename:fn(rawptr,*InstallWinStatus,rawptr,u32,u32)i32
 fn test_tracked_rename(handle:rawptr,status:*InstallWinStatus,info:rawptr,length,kind:u32)i32 {
@@ -77,6 +84,17 @@ pub fn test_parent_sharing(root:*const u8)i32 {
   creator:=install_win_create_private(parent,&name[0],true,false)
   if creator<0 { test_parent_diagnostics[0]=rec_errno().*
     return -2 }
+  wrong_name:[]const u8="rename-parent-other\0"
+  wrong:=install_win_create_private(parent,&wrong_name[0],true,false)
+  if wrong<0 { _=rec_close(creator)
+    return -6 }
+  _=rec_close(wrong)
+  substituted:=plugin_win_reopen(parent,&wrong_name[0],creator,160)
+  if substituted>=0 { _=rec_close(substituted)
+    _=rec_close(creator)
+    return -7 }
+  if rec_errno().*!=13 { _=rec_close(creator)
+    return -8 }
   pointer:=PluginWinPointer{}
   value:[]const u8=".v-probe0"
   _=copy(&pointer.active[0],&value[0],9)
@@ -90,8 +108,12 @@ pub fn test_parent_sharing(root:*const u8)i32 {
   test_parent_diagnostics[1]=test_rename_status
   test_parent_diagnostics[2]=rec_errno().*
   rec_errno().*=0
-  retained:=plugin_win_reopen(creator,160)
-  if retained<0 { test_parent_diagnostics[8]=#cast(i32,win_io_api.error()) }
+  test_open_status=0
+  test_real_open=install_win_api.open
+  install_win_api.open=test_tracked_open
+  retained:=plugin_win_reopen(parent,&name[0],creator,160)
+  install_win_api.open=test_real_open
+  test_parent_diagnostics[8]=test_open_status
   test_parent_diagnostics[3]=rec_errno().*
   _=rec_close(creator)
   if retained<0 { test_force_root=nil
@@ -173,7 +195,7 @@ def native_tests(binary, work):
     lib = configure(binary)
     probe = lib.test_parent_sharing(encoded(work))
     diagnostic = [lib.test_parent_diagnostic(at) for at in range(9)]
-    print('Directory rename comparison (result; early errno, broad NT/errno, reopen errno, narrow NT/errno, null-root NT/errno, reopen WinError):', probe, diagnostic, flush=True)
+    print('Directory rename comparison (result; early errno, broad NT/errno, reopen errno, narrow NT/errno, null-root NT/errno, relative reopen NTSTATUS):', probe, diagnostic, flush=True)
     assert probe == 1, ("directory parent rename sharing", probe, diagnostic)
     payload = (Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/whoami.exe').read_bytes()
     name = 'café 日本語'

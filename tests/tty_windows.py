@@ -81,6 +81,7 @@ fn fixture_read_exact(expected:[]const u8, chunk_limit:i32) {
 }
 fn main() {
   win_tty_prepare()
+  tty_register_handlers()
   // A child mode validates real argument parsing, quoting and per-child env.
   length:=tty_arguments()
   if length<=0 { #panic("native argv") }
