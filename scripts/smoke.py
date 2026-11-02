@@ -47,8 +47,9 @@ for mode in os.environ.get("DNA_SMOKE_MODES", "debug release").split():
         manager = fixtures / 'manager languages'
         manager.mkdir()
         for language in ('json', 'toml', 'python'):
-            target = (manager / ('.' + language + '-Ab123x') if language != 'python'
-                      else fixtures / 'unmanaged-python')
+            # toml is not managed by DNA, so removing it fails.
+            target = (manager / ('.' + language + '-Ab123x') if language != 'toml'
+                      else fixtures / 'unmanaged-toml')
             target.mkdir()
             for leaf in ('parser.so', 'highlights.scm', 'extensions'):
                 (target / leaf).write_text('fixture')

@@ -57,12 +57,12 @@ printf '{}' > "$prefix/package-lock.json"
     assert active.resolve() == second
     run('server-install', '../invalid', success=False)
     assert '  python\n' in run('list')
-    assert 'server\tpython\tinstalled\n' in run('catalog')
+    assert 'server\tpython\tinstalled\t' in run('catalog')
     env.pop('DNA_FAIL_INSTALL')
     run('server-uninstall', 'python')
     assert not active.is_symlink() and not second.exists()
     assert first.is_dir(), 'uninstall must not delete retained versions'
-    assert 'server\tpython\tavailable\n' in run('catalog')
+    assert 'server\tpython\tavailable\t' in run('catalog')
     run('server-run', 'python', success=False)
     # Do not follow a replacement symlink outside the managed package root.
     outside = base / 'outside'
@@ -77,7 +77,7 @@ printf '{}' > "$prefix/package-lock.json"
     for leaf in ('parser.so', 'highlights.scm', 'extensions'):
         (grammar / leaf).write_text('fixture')
     (languages / 'json').symlink_to(grammar)
-    assert 'grammar\tjson\tinstalled\n' in run('catalog')
+    assert 'grammar\tjson\tinstalled\t' in run('catalog')
     run('uninstall', 'json')
     assert not grammar.exists() and not (languages / 'json').is_symlink()
     run('uninstall', '../outside', success=False)

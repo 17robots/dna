@@ -282,8 +282,12 @@ containers, SSH). It always starts in the terminal.
 `explorer = "buffer"` (the default) is the editable explorer described under
 [Editable explorer](#editable-explorer). `explorer = "tree"` makes Space e
 open the project as a collapsible tree, docked on the left (`[place.explorer]`
-docks it elsewhere or floats it). A docked tree stays beside the panes after
-focus returns to the editor; Space e or a click moves focus back to it.
+docks it elsewhere or floats it). Like NERDTree, a docked tree stays beside the
+panes after you open a file, with focus on the file. **Space e** toggles the
+tree from anywhere: it closes an open tree, focused or not, and otherwise opens
+it on the current file. **Space E** (or a click) moves focus back to an open
+tree. Set `close_on_open = true` under `[explorer]` to close the tree whenever
+you open a file from it.
 
 | Key | Tree action |
 | --- | --- |
@@ -301,7 +305,7 @@ focus returns to the editor; Space e or a click moves focus back to it.
 | `R` | reload from disk |
 | `e` | edit the selected folder as text in the editable explorer |
 | Esc | back to the editor (a floating tree closes) |
-| `q` / Escape | close the tree (Space e opens it again) |
+| `q` / Escape | close the tree (Space e opens it again; Space e also closes it from the editor) |
 
 Tree search jumps through visible rows without changing folder expansion; Escape
 cancels an active query and restores the prior selection. While entering a query,
@@ -614,30 +618,43 @@ yielding and cancellation; capture counts and elapsed time do not silently
 publish a partially colored document as finished.
 
 
-Nothing downloads on startup. `:languages` opens a searchable package manager in
-both the GUI and TUI. Rows distinguish **grammar** packages from language
-**servers**, grouped into **Installed** and **Available** sections. Use arrows or
-`j`/`k` to select a package, `i` to install an available package, and `x` to uninstall
-an installed package. **gg / Home** jumps to the first visible package;
-**G / End** jumps to the last. These jumps also extend an active visual range;
-**Shift+Home/End** starts and extends a range. Press **v** on a package to start visual selection; arrows
-or `j`/`k` extend or shrink the highlighted range. **Shift+Up/Down** can also start
-and extend a range. **v** or **Escape** finishes the range and keeps its marks;
-`i`/`x`/`u` can act on it directly. Section headings are skipped when marking.
-Starting visual mode replaces earlier marks with a fresh range; moving back
-unselects packages outside it. The `>` marker identifies the focused row.
-**Space** marks or unmarks individual packages; **q** clears all marks and exits visual selection without closing the menu (**c** also works).
-When anything is marked, `i`, `x`, and `u` act only on eligible marked packages,
-including marks hidden by filtering. Marks survive filtering, refreshing, and
-reopening the menu. Successful operations clear their marks; failed operations
-keep them for retry. Without marks, `i`/`x` act on the focused package and `u` updates all
-installed grammars and managed servers, including packages hidden by the current filter. Updates use this DNA build's
-pinned catalogue versions, not unverified upstream releases. `r` refreshes status.
-Press `/` to filter; Enter or Escape finishes filtering and returns to package
-commands. Escape again closes the manager. Enter on a package uses the same
-install action as `i`. The editor stays usable while work runs; reopening
-`:languages` shows progress. Failures stay in the menu with an option to view details; other
-packages in a bulk update still run.
+Nothing downloads on startup. `:languages` opens the language manager in both
+the GUI and TUI: one row per language, grouped into **Installed** (highlighting
+or a DNA-managed server is installed) and **Available**. Each row shows whether
+highlighting works (`syntax ✓`) and the state of the language's server:
+**running**, **found** (on PATH; starts when you open a file), **installed** (by
+DNA), **configured** (in your config), **can install** (DNA can install it),
+**not found** (install it yourself) or **failed**. The pane beside the list
+describes the selected language: its file types, where its grammar is installed
+and which repository and version it comes from, the server command and where it
+was found, why it failed, and what `i` would fetch (for managed servers, the
+pinned npm packages, which may be shared with other languages). `/` filters by
+name or file extension (`/rs` finds Rust).
+
+`i` installs whatever the language is missing (its grammar and, when DNA
+manages one, its server); `x` removes what DNA installed; `u` updates them (with
+no marks, every installed language). `R` starts or restarts the language's
+server, `l` shows the server log, and `r` re-reads installation state and PATH.
+Enter installs, like `i`. A marker before the name shows queued work: `+`
+install, `-` remove, `↑` update, `*` marked.
+**gg / Home** jumps to the first visible language; **G / End** to the last.
+These jumps also extend an active visual range; **Shift+Home/End** starts and
+extends a range. **v** starts visual selection; arrows or `j`/`k` extend or
+shrink it, as do **Shift+Up/Down**. **v** or **Escape** finishes the range and
+keeps its marks, and `i`/`x`/`u` act on it directly. **Space** marks or unmarks
+one language; **q** (or **c**) clears all marks without closing the menu. With
+marks, `i`, `x` and `u` act only on marked languages, including ones hidden by
+the filter. Marks survive filtering, refreshing and reopening the menu;
+successful operations clear them and failed ones keep them for retry. Updates
+use this DNA build's pinned catalogue versions, not unverified upstream releases.
+Press `/` to filter; Enter or Escape finishes filtering. Escape again closes the
+manager. The editor stays usable while work runs; reopening `:languages` shows
+progress. Failures stay in the menu with an option to view details; other
+languages in a bulk operation still run.
+
+When a language server stops, DNA shows one line naming the program and the
+reason (the last error line it printed) instead of its whole output; `:lsp-log`
+has the full output and `:languages` keeps the reason beside the language.
 Incomplete packages remain available to install. The bundled
 catalogue contains 55 languages: **Dyn, C, C++, C#, Python, JavaScript/JSX,
 TypeScript, TSX, Rust, Go, Zig, Odin, Java, Kotlin, Scala, Dart,
@@ -702,8 +719,7 @@ Custom archives must have one top-level source directory; symlinks, hardlinks,
 and special archive entries are rejected before extraction. Only install native
 grammars you trust. The loader supports C scanners; C++ scanners fail
 validation. Language servers are configured separately
-from grammars (see below). Server installation, injected languages, and
-syntax-aware text objects remain follow-up work.
+from grammars (see below). Injected languages remain follow-up work.
 
 ## Keys
 
@@ -771,6 +787,7 @@ character, so `x` never highlights the first character of the following line. Wo
 | Save and close buffer | `:x` / `:wq` |
 | Save all / save all and exit | `:wa` / `:xa` |
 | Directory buffer | `Space e`; `Ctrl E` |
+| Focus the file tree (`explorer = "tree"`) | `Space E` |
 | Font larger/smaller/reset | `Ctrl +` / `Ctrl -` / `Ctrl 0` |
 | Close active buffer and its split | `:q` / `:quit` |
 | Close shared buffer | `:bd` (prompts if dirty) |

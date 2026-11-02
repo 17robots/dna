@@ -32,7 +32,7 @@ fn language_manager_smoke(typography: *Typography) {
   }
   app.resource_state.kind = 6
   app.prompt_state.panel = Panel.Open
-  app.language_manager.packages[0].marked = true
+  app.language_manager.entries[0].marked = true
   app.prompt_state.length = copy_text(app.prompt_state.text[..], "x")
   language_manager_refresh(app)
   for row in 0..app.completion.count {
@@ -42,12 +42,12 @@ fn language_manager_smoke(typography: *Typography) {
     }
   }
   app.prompt_state.length = 0
-  app.language_manager.packages[0].marked = false
-  app.language_manager.packages[2].marked = true
+  app.language_manager.entries[0].marked = false
+  app.language_manager.entries[2].marked = true
   language_manager_refresh(app)
   app.completion.selected = 4
   key_input(app, typography, KeyV, 0)
-  if language_manager_marked(app) != 1 || !app.language_manager.packages[1].marked {
+  if language_manager_marked(app) != 1 || !app.language_manager.entries[1].marked {
     #panic("visual replaces existing selection")
   }
   key_input(app, typography, KeyK, 0)
@@ -55,7 +55,7 @@ fn language_manager_smoke(typography: *Typography) {
     #panic("visual upward range")
   }
   key_input(app, typography, KeyJ, 0)
-  if app.language_manager.packages[0].marked || language_manager_marked(app) != 1 {
+  if app.language_manager.entries[0].marked || language_manager_marked(app) != 1 {
     #panic("visual shrink removes old selection")
   }
   key_input(app, typography, KeyK, 0)
@@ -134,30 +134,35 @@ fn language_manager_smoke(typography: *Typography) {
   if app.language_manager.searching || app.prompt_state.panel != Panel.Open {
     #panic("manager filter escape")
   }
-  // Direct uninstall follows package identity as rows change sections.
-  for name in ["json", "toml", "python"] {
+  // Rows are languages. Direct removal follows language identity as rows
+  // change sections; json removes, and toml (not managed by DNA) fails and
+  // stays marked for retry.
+  for name in ["json", "toml"] {
     app.prompt_state.length = copy_text(app.prompt_state.text[..], name)
     completion_refresh(app)
     found := false
     for row in 0..app.completion.count {
       id := app.language_manager.rows[row]
-      if id < app.language_manager.count {
-        item := &app.language_manager.packages[id]
-        if !item.server && buffer.equal(item.name[..item.length], name) {
-          if !item.installed {
+      if id < app.language_manager.entry_count {
+        entry := &app.language_manager.entries[id]
+        if buffer.equal(entry.name[..entry.length], name) {
+          if entry.grammar == NoPackage || !app.language_manager.packages[entry.grammar].installed {
             #panic("manager installed state")
           }
           app.completion.selected = row
-          key_input(app, typography, KeyI, 0)
-          if app.language_manager.process != nil {
-            #panic("install key must ignore installed packages")
+          // json's managed server is available, so i would install it.
+          if entry.server == NoPackage {
+            key_input(app, typography, KeyI, 0)
+            if app.language_manager.process != nil {
+              #panic("install key must ignore fully installed languages")
+            }
           }
           key_input(app, typography, KeySpace, 0)
-          if !item.marked {
+          if !entry.marked {
             #panic("manager mark")
           }
           key_input(app, typography, KeyX, 0)
-          if item.wanted || app.resource_state.kind != 6 || app.prompt_state.panel != Panel.Open {
+          if app.language_manager.packages[entry.grammar].wanted || app.resource_state.kind != 6 || app.prompt_state.panel != Panel.Open {
             #panic("manager uninstall shortcut")
           }
           // Work continues after closing without stealing focus.
@@ -166,7 +171,7 @@ fn language_manager_smoke(typography: *Typography) {
           if app.prompt_state.panel != Panel.None {
             #panic("manager completion stole focus")
           }
-          if item.marked != buffer.equal(name, "python") {
+          if entry.marked != buffer.equal(name, "toml") {
             #panic("manager marks clear on success and remain on failure")
           }
           language_manager_open(app)
@@ -185,17 +190,46 @@ fn language_manager_smoke(typography: *Typography) {
       continue
     }
     name := item.name[..item.length]
-    if (buffer.equal(name, "json") || buffer.equal(name, "toml")) && item.installed {
-      #panic("manager batch removal")
+    if buffer.equal(name, "json") && item.installed {
+      #panic("manager removal")
     }
-    if buffer.equal(name, "python") && !item.installed {
+    if (buffer.equal(name, "toml") || buffer.equal(name, "python")) && !item.installed {
       #panic("manager failed removal changed state")
     }
   }
   if app.language_manager.error_length == 0 {
     #panic("manager failure missing")
   }
-  // Bulk updates include installed entries hidden by the current filter.
+  // Each language row shows highlighting and its server; the details pane
+  // names what installing fetches.
+  python := language_manager_entry(&app.language_manager, "python")
+  if python == NoPackage || app.language_manager.entries[python].server == NoPackage {
+    #panic("manager groups a language's grammar and server")
+  }
+  app.prompt_state.length = copy_text(app.prompt_state.text[..], "python")
+  language_manager_refresh(app)
+  if app.language_manager.rows[app.completion.selected] != python {
+    #panic("manager starts on a language row")
+  }
+  label := app.completion.entries[app.completion.selected].name[..app.completion.entries[app.completion.selected].length]
+  if !contains(label, "syntax ✓") || !contains(label, "server installed") {
+    #panic("manager language row status")
+  }
+  details: [8192]u8 = []
+  shown := details[..language_manager_details(app, details[..], 60)]
+  if !contains(shown, "pyright") || !contains(shown, ".py") || !contains(shown, ".servers/python") {
+    #panic("manager details")
+  }
+  // A failed server's reason appears in its row and details.
+  lsp_failure_record(app, "python", "error: example failure")
+  language_manager_refresh(app)
+  label = app.completion.entries[app.completion.selected].name[..app.completion.entries[app.completion.selected].length]
+  shown = details[..language_manager_details(app, details[..], 60)]
+  if !contains(label, "server failed") || !contains(shown, "example failure") {
+    #panic("manager failure reason")
+  }
+  lsp_failure_clear(app, "python")
+  // Bulk updates include installed packages hidden by the current filter.
   app.prompt_state.length = copy_text(app.prompt_state.text[..], "not-a-language")
   language_manager_prepare(app, true)
   updates: usize = 0
@@ -208,7 +242,8 @@ fn language_manager_smoke(typography: *Typography) {
       updates += 1
     }
   }
-  if updates != 2 {
+  // toml and python grammars and the python server.
+  if updates != 3 {
     #panic("manager update-all ignores filter")
   }
   language_manager_prepare(app, false)

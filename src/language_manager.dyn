@@ -1,11 +1,49 @@
+// :languages: one row per language, grouped into Installed and Available.
+// Each row shows whether highlighting is installed and the state of the
+// language's server; the picker's preview pane shows details for the
+// selected language: its files, where its grammar and server come from, what
+// installing fetches and where it goes.
+//
+// The installer's catalogue lists packages (a grammar or a managed server
+// per language); the manager groups them into languages and acts on every
+// package of the chosen languages.
 struct LanguagePackage {
   name: [65]u8,
   length: usize,
-  server, installed, wanted, attempted, update, marked: bool,
+  server, installed, wanted, attempted, update, failed: bool,
+  // Grammar: extensions and file names (comma lists) and the archive URL.
+  // Server: the pinned npm packages and the executable name.
+  extensions: [192]u8,
+  extensions_length: usize,
+  filenames: [128]u8,
+  filenames_length: usize,
+  source: [256]u8,
+  source_length: usize,
 }
+const NoPackage: usize = 999
+struct LanguageEntry {
+  name: [65]u8,
+  length: usize,
+  grammar, server: usize,
+  marked: bool,
+  // Where the default server program was found on PATH, when it was.
+  found: [512]u8,
+  found_length: usize,
+}
+// Rows below the entry count are languages; these ids are the other rows.
+const RowUpdate: usize = 1000
+const RowRefresh: usize = 1001
+const RowWorking: usize = 1002
+const RowError: usize = 1003
+const RowInstalled: usize = 1004
+const RowAvailable: usize = 1005
+const RowNoneInstalled: usize = 1006
+const RowNoneAvailable: usize = 1007
 struct LanguageManager {
-  packages: [80]LanguagePackage,
+  packages: [96]LanguagePackage,
   count: usize,
+  entries: [96]LanguageEntry,
+  entry_count: usize,
   rows: [128]usize,
   process: rawptr,
   loading, applying, loaded, searching: bool,
@@ -74,17 +112,159 @@ fn language_manager_row(app: *App, id: usize, text: []const u8) {
 }
 fn language_manager_marked(app: *App) usize {
   count: usize = 0
-  for index in 0..app.language_manager.count {
-    if app.language_manager.packages[index].marked {
+  for index in 0..app.language_manager.entry_count {
+    if app.language_manager.entries[index].marked {
       count += 1
     }
   }
   return count
 }
+// The entry for a selected row, or NoPackage for headings and actions.
+fn language_manager_selected(app: *const App) usize {
+  if app.completion.selected >= app.completion.count {
+    return NoPackage
+  }
+  id := app.language_manager.rows[app.completion.selected]
+  if id >= app.language_manager.entry_count {
+    return NoPackage
+  }
+  return id
+}
+fn language_entry_installed(state: *const LanguageManager, entry: *const LanguageEntry) bool {
+  return (entry.grammar != NoPackage && state.packages[entry.grammar].installed) || (entry.server != NoPackage && state.packages[entry.server].installed)
+}
+// The default server command for a language, or "".
+fn language_default_command(name: []const u8) []const u8 {
+  if buffer.equal(name, "dyn") {
+    return "dyn lsp"
+  }
+  for index in 0..DefaultServers {
+    entry := default_server(index)
+    if buffer.equal(entry.language, name) {
+      return entry.command
+    }
+  }
+  return ""
+}
+// A server command configured in config.toml for the language, or "".
+fn language_configured_command(app: *const App, name: []const u8) []const u8 {
+  configured := settings.language(&app.config, name)
+  if configured != nil && (configured.seen & 16) != 0 {
+    return configured.server[..configured.server_length]
+  }
+  return ""
+}
+fn language_program(command: []const u8) []const u8 {
+  for end in 0..#len(command) {
+    if command[end] == ' ' {
+      return command[..end]
+    }
+  }
+  return command
+}
+// The running server for a language: 0 none, 1 starting, 2 running.
+fn language_server_running(app: *const App, name: []const u8) u8 {
+  for index in 0..8 {
+    server := &app.lsp.servers[index]
+    if server.process != nil && buffer.equal(server.language[..server.length], name) {
+      if server.ready {
+        return 2
+      }
+      return 1
+    }
+  }
+  return 0
+}
+// One word for a language's server, shown in its row.
+fn language_server_word(app: *const App, entry: *const LanguageEntry) []const u8 {
+  state := &app.language_manager
+  name := entry.name[..entry.length]
+  running := language_server_running(app, name)
+  if running == 2 {
+    return "running"
+  }
+  if running == 1 {
+    return "starting"
+  }
+  if #len(lsp_failure_of(app, name)) > 0 {
+    return "failed"
+  }
+  if #len(language_configured_command(app, name)) > 0 {
+    return "configured"
+  }
+  if entry.server != NoPackage && state.packages[entry.server].installed {
+    return "installed"
+  }
+  if entry.found_length > 0 {
+    return "found"
+  }
+  if entry.server != NoPackage {
+    return "can install"
+  }
+  if #len(language_default_command(name)) > 0 {
+    return "not found"
+  }
+  return "none"
+}
+// Look up each language's default server on PATH; run on load and refresh.
+fn language_manager_discover(app: *App) {
+  state := &app.language_manager
+  for index in 0..state.entry_count {
+    entry := &state.entries[index]
+    command := language_default_command(entry.name[..entry.length])
+    entry.found_length = 0
+    if #len(command) > 0 {
+      entry.found_length = servers.find_on_path(command, entry.found[..])
+    }
+  }
+}
+fn language_manager_entry(state: *LanguageManager, name: []const u8) usize {
+  for index in 0..state.entry_count {
+    entry := &state.entries[index]
+    if buffer.equal(entry.name[..entry.length], name) {
+      return index
+    }
+  }
+  if state.entry_count >= #len(state.entries) {
+    return NoPackage
+  }
+  entry := &state.entries[state.entry_count]
+  entry.* = LanguageEntry{grammar: NoPackage, server: NoPackage}
+  entry.length = copy_text(entry.name[..], name)
+  state.entry_count += 1
+  return state.entry_count - 1
+}
+// The marker before a language: a queued install, removal or update, else
+// whether it is marked.
+fn language_manager_pending(state: *const LanguageManager, entry: *const LanguageEntry) []const u8 {
+  for part in 0..2 {
+    index := entry.grammar
+    if part == 1 {
+      index = entry.server
+    }
+    if index == NoPackage {
+      continue
+    }
+    item := &state.packages[index]
+    if item.update {
+      return "↑ "
+    }
+    if item.wanted != item.installed {
+      if item.wanted {
+        return "+ "
+      }
+      return "- "
+    }
+  }
+  if entry.marked {
+    return "* "
+  }
+  return "  "
+}
 fn language_manager_refresh(app: *App) {
   state := &app.language_manager
   selected := app.completion.selected
-  selected_id: usize = 999
+  selected_id: usize = NoPackage
   if selected < app.completion.count {
     selected_id = state.rows[selected]
   }
@@ -92,63 +272,65 @@ fn language_manager_refresh(app: *App) {
   app.completion.prefix_length = 0
   app.completion.error = false
   if state.process != nil {
-    language_manager_row(app, 83, "Working… You can close this menu and keep editing.")
+    language_manager_row(app, RowWorking, "Working… You can close this menu and keep editing.")
   } else {
     if language_manager_marked(app) > 0 {
-      language_manager_row(app, 80, "Update marked installed packages (u)")
+      language_manager_row(app, RowUpdate, "Update marked languages (u)")
     }
     else {
-      language_manager_row(app, 80, "Update all installed packages (u)")
+      language_manager_row(app, RowUpdate, "Update everything installed (u)")
     }
-    language_manager_row(app, 82, "Refresh installed packages (r)")
+    language_manager_row(app, RowRefresh, "Refresh status (r)")
   }
   if state.error_length > 0 {
-    language_manager_row(app, 84, "Last operation failed — Enter to view details")
+    language_manager_row(app, RowError, "Last operation failed — Enter to view details")
   }
+  query := app.prompt_state.text[..app.prompt_state.length]
   for section in 0..2 {
     if section == 0 {
-      language_manager_row(app, 85, "── Installed ──")
+      language_manager_row(app, RowInstalled, "── Installed ──")
     }
     else {
-      language_manager_row(app, 86, "── Available ──")
+      language_manager_row(app, RowAvailable, "── Available ──")
     }
     matches: usize = 0
-    for index in 0..state.count {
-      item := &state.packages[index]
-      if item.installed != (section == 0) {
+    for index in 0..state.entry_count {
+      entry := &state.entries[index]
+      if language_entry_installed(state, entry) != (section == 0) {
+        continue
+      }
+      name := entry.name[..entry.length]
+      // Filter by name, or by a file extension such as "rs".
+      shown := picker_match(name, query)
+      if !shown && entry.grammar != NoPackage {
+        grammar := &state.packages[entry.grammar]
+        shown = #len(query) > 0 && language_list_has(grammar.extensions[..grammar.extensions_length], query)
+      }
+      if !shown {
         continue
       }
       label: [256]u8 = []
       used: usize = 0
-      if item.marked {
-        add_text(label[..], &used, "[x] ")
-      } else {
-        add_text(label[..], &used, "[ ] ")
-      }
-      if item.server {
-        add_text(label[..], &used, "server  ")
-      } else {
-        add_text(label[..], &used, "grammar ")
-      }
-      add_text(label[..], &used, item.name[..item.length])
-      match_end := used
-      if item.update {
-        add_text(label[..], &used, "  [update]")
-      }
-      else if item.wanted != item.installed {
-        if item.wanted {
-          add_text(label[..], &used, "  [install]")
-        } else {
-          add_text(label[..], &used, "  [uninstall]")
+      add_text(label[..], &used, language_manager_pending(state, entry))
+      add_text(label[..], &used, name)
+      for column in 0..12 {
+        if column >= #len(name) {
+          add_text(label[..], &used, " ")
         }
       }
-      if picker_match(label[4..match_end], app.prompt_state.text[..app.prompt_state.length]) {
-        language_manager_row(app, index, label[..used])
-        matches += 1
+      if entry.grammar != NoPackage && state.packages[entry.grammar].installed {
+        add_text(label[..], &used, " syntax ✓")
       }
+      else {
+        add_text(label[..], &used, " syntax ·")
+      }
+      add_text(label[..], &used, "  server ")
+      add_text(label[..], &used, language_server_word(app, entry))
+      language_manager_row(app, index, label[..used])
+      matches += 1
     }
     if matches == 0 {
-      language_manager_row(app, 87 + section, "  (none)")
+      language_manager_row(app, RowNoneInstalled + section, "  (none)")
     }
   }
   app.completion.selected = 0
@@ -158,15 +340,57 @@ fn language_manager_refresh(app: *App) {
       return
     }
   }
-  if selected < app.completion.count {
-    app.completion.selected = selected
+  // Otherwise start on a language, never on an action row, so Enter
+  // cannot update everything by accident.
+  for row in 0..app.completion.count {
+    if state.rows[row] < state.entry_count {
+      app.completion.selected = row
+      return
+    }
   }
+}
+// Whether a comma list contains item exactly.
+fn language_list_has(list: []const u8, item: []const u8) bool {
+  at: usize = 0
+  for at < #len(list) {
+    end := at
+    for end < #len(list) && list[end] != ',' {
+      end += 1
+    }
+    if buffer.equal(list[at..end], item) {
+      return true
+    }
+    at = end + 1
+  }
+  return false
+}
+fn language_catalog_field(line: []const u8, at: *usize) []const u8 {
+  start := at.*
+  end := start
+  for end < #len(line) && line[end] != 9 {
+    end += 1
+  }
+  at.* = end + 1
+  if start > #len(line) {
+    return line[..0]
+  }
+  return line[start..end]
 }
 fn language_manager_catalog(app: *App, text: []const u8) bool {
   state := &app.language_manager
-  previous := state.packages
-  previous_count := state.count
+  // Marks belong to languages and survive reloading the catalogue.
+  marked: [96][65]u8 = []
+  marked_lengths: [96]usize = []
+  marked_count: usize = 0
+  for index in 0..state.entry_count {
+    entry := &state.entries[index]
+    if entry.marked && marked_count < 96 {
+      marked_lengths[marked_count] = copy_text(marked[marked_count][..], entry.name[..entry.length])
+      marked_count += 1
+    }
+  }
   state.count = 0
+  state.entry_count = 0
   at: usize = 0
   for at < #len(text) {
     end := at
@@ -175,20 +399,16 @@ fn language_manager_catalog(app: *App, text: []const u8) bool {
     }
     line := text[at..end]
     at = end + 1
-    first: usize = 0
-    for first < #len(line) && line[first] != 9 {
-      first += 1
-    }
-    second := first + 1
-    for second < #len(line) && line[second] != 9 {
-      second += 1
-    }
-    if first >= #len(line) || second >= #len(line) || second <= first + 1 || second - first > 65 || state.count >= 80 {
+    field: usize = 0
+    kind := language_catalog_field(line, &field)
+    name := language_catalog_field(line, &field)
+    status := language_catalog_field(line, &field)
+    first := language_catalog_field(line, &field)
+    second := language_catalog_field(line, &field)
+    third := language_catalog_field(line, &field)
+    if #len(name) == 0 || #len(name) > 64 || state.count >= #len(state.packages) {
       return false
     }
-    kind := line[..first]
-    name := line[first + 1..second]
-    status := line[second + 1..]
     if !buffer.equal(kind, "grammar") && !buffer.equal(kind, "server") {
       return false
     }
@@ -206,14 +426,36 @@ fn language_manager_catalog(app: *App, text: []const u8) bool {
     item.server = buffer.equal(kind, "server")
     item.installed = buffer.equal(status, "installed")
     item.wanted = item.installed
-    for index in 0..previous_count {
-      old := &previous[index]
-      if old.marked && old.server == item.server && buffer.equal(old.name[..old.length], name) {
-        item.marked = true
-      }
+    if item.server {
+      item.source_length = copy_text(item.source[..], first)
+      item.extensions_length = copy_text(item.extensions[..], second)
+    }
+    else {
+      item.extensions_length = copy_text(item.extensions[..], first)
+      item.filenames_length = copy_text(item.filenames[..], second)
+      item.source_length = copy_text(item.source[..], third)
+    }
+    entry := language_manager_entry(state, name)
+    if entry == NoPackage {
+      return false
+    }
+    if item.server {
+      state.entries[entry].server = state.count
+    }
+    else {
+      state.entries[entry].grammar = state.count
     }
     state.count += 1
   }
+  for index in 0..state.entry_count {
+    entry := &state.entries[index]
+    for previous in 0..marked_count {
+      if buffer.equal(marked[previous][..marked_lengths[previous]], entry.name[..entry.length]) {
+        entry.marked = true
+      }
+    }
+  }
+  language_manager_discover(app)
   return true
 }
 fn language_manager_next(app: *App) {
@@ -246,7 +488,7 @@ fn language_manager_next(app: *App) {
   state.applying = false
 }
 // Start a fresh explicit action. Failed jobs do not silently retry when a
-// different package is selected. Bulk updates use all installed rows, not the filter.
+// different language is selected. Bulk updates use everything installed, not the filter.
 fn language_manager_prepare(app: *App, update_all: bool) {
   state := &app.language_manager
   state.error_length = 0
@@ -254,7 +496,27 @@ fn language_manager_prepare(app: *App, update_all: bool) {
     item := &state.packages[index]
     item.wanted = item.installed
     item.attempted = false
+    item.failed = false
     item.update = update_all && item.installed
+  }
+}
+// Clear a language's mark once all its parts finished successfully; a
+// failed part keeps the mark for retry.
+fn language_manager_settle(state: *LanguageManager, package: usize) {
+  for index in 0..state.entry_count {
+    entry := &state.entries[index]
+    if entry.grammar == package || entry.server == package {
+      for part in 0..2 {
+        other := entry.grammar
+        if part == 1 {
+          other = entry.server
+        }
+        if other != NoPackage && (state.packages[other].failed || state.packages[other].wanted != state.packages[other].installed || state.packages[other].update) {
+          return
+        }
+      }
+      entry.marked = false
+    }
   }
 }
 fn language_manager_action(app: *App, key: u32) {
@@ -270,32 +532,69 @@ fn language_manager_action(app: *App, key: u32) {
     return
   }
   marked := language_manager_marked(app) > 0
-  current: usize = 999
-  if app.completion.selected < app.completion.count {
-    current = state.rows[app.completion.selected]
-  }
+  current := language_manager_selected(app)
   language_manager_prepare(app, false)
-  for index in 0..state.count {
-    item := &state.packages[index]
-    chosen := item.marked
+  for index in 0..state.entry_count {
+    entry := &state.entries[index]
+    chosen := entry.marked
     if !marked {
       chosen = key == KeyU || index == current
     }
     if !chosen {
       continue
     }
-    if key == KeyU && item.installed {
-      item.update = true
-    }
-    else if key == KeyI && !item.installed {
-      item.wanted = true
-    }
-    else if key == KeyX && item.installed {
-      item.wanted = false
+    for part in 0..2 {
+      package := entry.grammar
+      if part == 1 {
+        package = entry.server
+      }
+      if package == NoPackage {
+        continue
+      }
+      item := &state.packages[package]
+      if key == KeyU && item.installed {
+        item.update = true
+      }
+      else if key == KeyI && !item.installed {
+        item.wanted = true
+      }
+      else if key == KeyX && item.installed {
+        item.wanted = false
+      }
     }
   }
   state.applying = true
   language_manager_next(app)
+  language_manager_refresh(app)
+}
+// Start or restart the selected language's server: the configured command,
+// else the managed install, else the default program on PATH.
+fn language_manager_restart(app: *App) {
+  chosen := language_manager_selected(app)
+  if chosen == NoPackage {
+    return
+  }
+  state := &app.language_manager
+  entry := &state.entries[chosen]
+  name: [65]u8 = []
+  name_length := copy_text(name[..], entry.name[..entry.length])
+  language := name[..name_length]
+  previous := app.prompt_state.panel
+  configured := language_configured_command(app, language)
+  if #len(configured) > 0 {
+    lsp_start(app, language, configured)
+  }
+  else if entry.server != NoPackage && state.packages[entry.server].installed {
+    server_tool(app, "server-start", language)
+  }
+  else if entry.found_length > 0 || buffer.equal(language, "dyn") {
+    lsp_start(app, language, language_default_command(language))
+  }
+  else {
+    notice(app, "This language has no server to start. Select it in :languages to see how to get one.")
+    return
+  }
+  app.prompt_state.panel = previous
   language_manager_refresh(app)
 }
 fn language_manager_select(app: *App) {
@@ -309,30 +608,28 @@ fn language_manager_select(app: *App) {
     return
   }
   id := state.rows[app.completion.selected]
-  if id == 84 {
+  if id == RowError {
     notice(app, state.error[..state.error_length])
     return
   }
-  if id == 80 {
+  if id == RowUpdate {
     language_manager_action(app, KeyU)
   }
-  else if id == 82 {
+  else if id == RowRefresh {
     language_manager_action(app, KeyR)
   }
-  else if id < state.count {
+  else if id < state.entry_count {
     language_manager_action(app, KeyI)
   }
 }
 fn language_manager_visual_start(app: *App) {
   state := &app.language_manager
-  if state.process != nil || app.completion.selected >= app.completion.count {
-    return
-  }
-  if state.rows[app.completion.selected] >= state.count {
+  chosen := language_manager_selected(app)
+  if state.process != nil || chosen == NoPackage {
     return
   }
   state.visual = true
-  state.visual_anchor = state.rows[app.completion.selected]
+  state.visual_anchor = chosen
   language_manager_visual_extend(app)
 }
 fn language_manager_visual_extend(app: *App) {
@@ -349,9 +646,9 @@ fn language_manager_visual_extend(app: *App) {
     return
   }
   // A visual selection is exactly one range, not a union with old marks.
-  // Resolve its anchor by package identity before clearing/rebuilding marks.
-  for index in 0..state.count {
-    state.packages[index].marked = false
+  // Resolve its anchor by language identity before clearing/rebuilding marks.
+  for index in 0..state.entry_count {
+    state.entries[index].marked = false
   }
   low := anchor
   high := app.completion.selected
@@ -362,8 +659,8 @@ fn language_manager_visual_extend(app: *App) {
   for row in low..high + 1 {
     if row < app.completion.count {
       id := state.rows[row]
-      if id < state.count {
-        state.packages[id].marked = true
+      if id < state.entry_count {
+        state.entries[id].marked = true
       }
     }
   }
@@ -390,8 +687,8 @@ fn language_manager_key(app: *App, key: u32, modifiers: u16) bool {
   if (modifiers & ModCtrlAlt) != 0 {
     return false
   }
+  shift := (modifiers & ModShift) != 0
   if key == KeyHome || key == KeyEnd || key == KeyG {
-    shift := (modifiers & ModShift) != 0
     if key == KeyG && !shift && !pending_g {
       state.pending_g = true
       return true
@@ -400,9 +697,9 @@ fn language_manager_key(app: *App, key: u32, modifiers: u16) bool {
       language_manager_visual_start(app)
     }
     bottom := key == KeyEnd || (key == KeyG && shift)
-    // Jump to package rows, skipping action rows, headings and empty sections.
+    // Jump to language rows, skipping action rows, headings and empty sections.
     for row in 0..app.completion.count {
-      if state.rows[row] < state.count {
+      if state.rows[row] < state.entry_count {
         app.completion.selected = row
         if !bottom {
           break
@@ -427,23 +724,27 @@ fn language_manager_key(app: *App, key: u32, modifiers: u16) bool {
     if state.process == nil {
       state.visual = false
       if key == KeyC || key == KeyQ {
-        for index in 0..state.count {
-          state.packages[index].marked = false
+        for index in 0..state.entry_count {
+          state.entries[index].marked = false
         }
-      } else if app.completion.selected < app.completion.count {
-        id := state.rows[app.completion.selected]
-        if id < state.count {
-          state.packages[id].marked = !state.packages[id].marked
+      } else {
+        chosen := language_manager_selected(app)
+        if chosen != NoPackage {
+          state.entries[chosen].marked = !state.entries[chosen].marked
         }
       }
       language_manager_refresh(app)
     }
+  } else if key == KeyR && shift {
+    language_manager_restart(app)
+  } else if key == KeyL {
+    lsp_status(app)
   } else if key == KeyI || key == KeyX || key == KeyU || key == KeyR {
     language_manager_action(app, key)
   } else if key == KeyReturn {
     language_manager_select(app)
   } else if key == KeyJ || key == KeyDown {
-    if (modifiers & ModShift) != 0 && !state.visual {
+    if shift && !state.visual {
       language_manager_visual_start(app)
     }
     if app.completion.selected + 1 < app.completion.count {
@@ -451,7 +752,7 @@ fn language_manager_key(app: *App, key: u32, modifiers: u16) bool {
     }
     language_manager_visual_extend(app)
   } else if key == KeyK || key == KeyUp {
-    if (modifiers & ModShift) != 0 && !state.visual {
+    if shift && !state.visual {
       language_manager_visual_start(app)
     }
     if app.completion.selected > 0 {
@@ -460,6 +761,290 @@ fn language_manager_key(app: *App, key: u32, modifiers: u16) bool {
     language_manager_visual_extend(app)
   }
   return true
+}
+// Details lines: a label column, then the value wrapped to the pane's width
+// in columns; words longer than a line are split.
+const DetailIndent: usize = 11
+fn language_detail(output: []u8, used: *usize, width: usize, label: []const u8, value: []const u8) {
+  add_text(output, used, label)
+  for column in #len(label)..DetailIndent {
+    add_text(output, used, " ")
+  }
+  line_start := DetailIndent
+  column := DetailIndent
+  at: usize = 0
+  for at < #len(value) {
+    // Next word, with the spaces before it.
+    end := at
+    for end < #len(value) && value[end] == ' ' {
+      end += 1
+    }
+    for end < #len(value) && value[end] != ' ' {
+      end += 1
+    }
+    word := value[at..end]
+    if column > line_start && column + language_text_width(word) > width {
+      language_detail_break(output, used)
+      column = DetailIndent
+      for #len(word) > 0 && word[0] == ' ' {
+        word = word[1..]
+      }
+    }
+    for #len(word) > 0 {
+      // Split a word longer than the space left on the line.
+      room := width - column
+      if width <= column {
+        room = 1
+      }
+      take: usize = 0
+      count: usize = 0
+      for take < #len(word) && count < room {
+        take += 1
+        for take < #len(word) && (word[take] & 192) == 128 {
+          take += 1
+        }
+        count += 1
+      }
+      add_text(output, used, word[..take])
+      column += count
+      word = word[take..]
+      if #len(word) > 0 {
+        language_detail_break(output, used)
+        column = DetailIndent
+      }
+    }
+    at = end
+  }
+  add_text(output, used, "\n")
+}
+fn language_detail_break(output: []u8, used: *usize) {
+  add_text(output, used, "\n")
+  for pad in 0..DetailIndent {
+    add_text(output, used, " ")
+  }
+}
+fn language_text_width(text: []const u8) usize {
+  width: usize = 0
+  for byte in text {
+    if (byte & 192) != 128 {
+      width += 1
+    }
+  }
+  return width
+}
+// A path with the home directory shown as ~.
+fn language_home_path(path: []const u8, output: []u8) []const u8 {
+  storage: [4096]u8 = []
+  home := host.environment("HOME", storage[..])
+  if home.ok && home.found && #len(home.value) > 1 && #len(path) > #len(home.value) && buffer.equal(path[..#len(home.value)], home.value) && path[#len(home.value)] == '/' {
+    used: usize = 0
+    add_text(output, &used, "~")
+    add_text(output, &used, path[#len(home.value)..])
+    return output[..used]
+  }
+  return path
+}
+// "OWNER/REPO" and the revision from a codeload archive URL.
+fn language_source_parts(url: []const u8, repository: *[]const u8, revision: *[]const u8) bool {
+  prefix: []const u8 = "https://codeload.github.com/"
+  if #len(url) <= #len(prefix) || !buffer.equal(url[..#len(prefix)], prefix) {
+    return false
+  }
+  rest := url[#len(prefix)..]
+  slashes: [3]usize = []
+  count: usize = 0
+  for index in 0..#len(rest) {
+    if rest[index] == '/' && count < 3 {
+      slashes[count] = index
+      count += 1
+    }
+  }
+  if count < 3 {
+    return false
+  }
+  repository.* = rest[..slashes[1]]
+  revision.* = rest[slashes[2] + 1..]
+  if #len(revision.*) > 12 {
+    revision.* = revision.*[..12]
+  }
+  return true
+}
+fn language_list_text(list: []const u8, prefix: []const u8, output: []u8, used: *usize) {
+  at: usize = 0
+  first := true
+  for at < #len(list) {
+    end := at
+    for end < #len(list) && list[end] != ',' {
+      end += 1
+    }
+    if !first {
+      add_text(output, used, " ")
+    }
+    first = false
+    add_text(output, used, prefix)
+    add_text(output, used, list[at..end])
+    at = end + 1
+  }
+}
+// The details pane for the selected language.
+fn language_manager_details(app: *App, output: []u8, columns: usize) usize {
+  width := columns
+  if width < DetailIndent + 16 {
+    width = DetailIndent + 16
+  }
+  state := &app.language_manager
+  used: usize = 0
+  chosen := language_manager_selected(app)
+  if chosen == NoPackage {
+    if state.loading {
+      add_text(output, &used, "Loading the language catalogue…")
+      return used
+    }
+    add_text(output, &used, "Select a language to see what it installs.\n\n")
+    add_text(output, &used, "Installed: highlighting or a DNA-managed\nserver is installed.\n\n")
+    add_text(output, &used, "syntax ✓   highlighting works\n\n")
+    add_text(output, &used, "server     the language server:\n")
+    add_text(output, &used, "  running      running for an open file\n")
+    add_text(output, &used, "  found        on PATH; starts with a file\n")
+    add_text(output, &used, "  installed    installed by DNA\n")
+    add_text(output, &used, "  configured   set in your config\n")
+    add_text(output, &used, "  can install  i installs it\n")
+    add_text(output, &used, "  not found    install it yourself\n")
+    add_text(output, &used, "  failed       select it for the reason\n\n")
+    add_text(output, &used, "+ install  - remove  ↑ update  * marked\n")
+    return used
+  }
+  entry := &state.entries[chosen]
+  name := entry.name[..entry.length]
+  text: [2048]u8 = []
+  text_used: usize = 0
+  path: [4096]u8 = []
+  add_text(output, &used, name)
+  add_text(output, &used, "\n\n")
+  if entry.grammar != NoPackage {
+    grammar := &state.packages[entry.grammar]
+    language_list_text(grammar.extensions[..grammar.extensions_length], ".", text[..], &text_used)
+    if grammar.filenames_length > 0 {
+      add_text(text[..], &text_used, " ")
+      language_list_text(grammar.filenames[..grammar.filenames_length], "", text[..], &text_used)
+    }
+    language_detail(output, &used, width, "Files", text[..text_used])
+    add_text(output, &used, "\n")
+    if grammar.installed {
+      language_detail(output, &used, width, "Syntax", "installed")
+      text_used = 0
+      add_text(text[..], &text_used, app.workspace.language_root[..app.workspace.language_root_length])
+      add_text(text[..], &text_used, "/")
+      add_text(text[..], &text_used, name)
+      language_detail(output, &used, width, "  in", language_home_path(text[..text_used], path[..]))
+    }
+    else {
+      language_detail(output, &used, width, "Syntax", "not installed; i installs a tree-sitter grammar, built locally with a C compiler")
+    }
+    repository: []const u8 = ""
+    revision: []const u8 = ""
+    if language_source_parts(grammar.source[..grammar.source_length], &repository, &revision) {
+      text_used = 0
+      add_text(text[..], &text_used, "github.com/")
+      add_text(text[..], &text_used, repository)
+      language_detail(output, &used, width, "  from", text[..text_used])
+      language_detail(output, &used, width, "  version", revision)
+    }
+    else {
+      language_detail(output, &used, width, "  from", grammar.source[..grammar.source_length])
+    }
+  }
+  else {
+    language_detail(output, &used, width, "Syntax", "no grammar in the catalogue")
+  }
+  add_text(output, &used, "\n")
+  configured := language_configured_command(app, name)
+  command := language_default_command(name)
+  managed: *LanguagePackage = nil
+  if entry.server != NoPackage {
+    managed = &state.packages[entry.server]
+  }
+  if #len(configured) > 0 {
+    command = configured
+  }
+  else if managed != nil && #len(command) == 0 {
+    command = managed.extensions[..managed.extensions_length]
+  }
+  if #len(command) == 0 {
+    language_detail(output, &used, width, "Server", "none known")
+    text_used = 0
+    add_text(text[..], &text_used, "[languages.")
+    add_text(text[..], &text_used, name)
+    add_text(text[..], &text_used, "] server = \"…\" in your config")
+    language_detail(output, &used, width, "  add one", text[..text_used])
+  }
+  else {
+    language_detail(output, &used, width, "Server", language_program(command))
+    language_detail(output, &used, width, "  status", language_server_word(app, entry))
+    failure := lsp_failure_of(app, name)
+    if #len(failure) > 0 {
+      language_detail(output, &used, width, "  reason", failure)
+    }
+    language_detail(output, &used, width, "  command", command)
+    if #len(configured) > 0 {
+      text_used = 0
+      add_text(text[..], &text_used, "your config ([languages.")
+      add_text(text[..], &text_used, name)
+      add_text(text[..], &text_used, "])")
+      language_detail(output, &used, width, "  from", text[..text_used])
+    }
+    else if managed != nil && managed.installed {
+      text_used = 0
+      add_text(text[..], &text_used, app.workspace.language_root[..app.workspace.language_root_length])
+      add_text(text[..], &text_used, "/.servers/")
+      add_text(text[..], &text_used, name)
+      language_detail(output, &used, width, "  in", language_home_path(text[..text_used], path[..]))
+    }
+    else if entry.found_length > 0 {
+      text_used = 0
+      add_text(text[..], &text_used, "PATH: ")
+      add_text(text[..], &text_used, language_home_path(entry.found[..entry.found_length], path[..]))
+      language_detail(output, &used, width, "  from", text[..text_used])
+    }
+    else if buffer.equal(name, "dyn") {
+      language_detail(output, &used, width, "  from", "the Dyn compiler (install it with mise)")
+    }
+    if managed != nil {
+      text_used = 0
+      add_text(text[..], &text_used, "npm ")
+      add_text(text[..], &text_used, managed.source[..managed.source_length])
+      add_text(text[..], &text_used, " (needs Node and npm)")
+      if managed.installed {
+        language_detail(output, &used, width, "  package", text[..text_used])
+      }
+      else {
+        language_detail(output, &used, width, "  i gets", text[..text_used])
+      }
+      shared: [512]u8 = []
+      shared_length: usize = 0
+      for index in 0..state.count {
+        other := &state.packages[index]
+        if other.server && index != entry.server && buffer.equal(other.source[..other.source_length], managed.source[..managed.source_length]) {
+          if shared_length > 0 {
+            add_text(shared[..], &shared_length, ", ")
+          }
+          add_text(shared[..], &shared_length, other.name[..other.length])
+        }
+      }
+      if shared_length > 0 {
+        language_detail(output, &used, width, "  also for", shared[..shared_length])
+      }
+    }
+    else if entry.found_length == 0 && #len(configured) == 0 && !buffer.equal(name, "dyn") {
+      text_used = 0
+      add_text(text[..], &text_used, "not managed by DNA: install ")
+      add_text(text[..], &text_used, language_program(command))
+      add_text(text[..], &text_used, " with your package manager or toolchain, then press r")
+      language_detail(output, &used, width, "  install", text[..text_used])
+    }
+  }
+  add_text(output, &used, "\ni install  x remove  u update\nR start server  l server log  r refresh")
+  return used
 }
 fn language_manager_tick(app: *App) bool {
   state := &app.language_manager
@@ -475,24 +1060,26 @@ fn language_manager_tick(app: *App) bool {
       item := &state.packages[state.active]
       item.wanted = item.installed
       item.update = false
+      item.failed = true
     }
     state.error_length = job_error(state.process, &state.error[0], 4096)
     if state.error_length == 0 {
       state.error_length = copy_text(state.error[..], "Language operation failed or timed out. Check the installer dependencies and retry.")
     }
   } else if state.loading {
-    output: [16384]u8 = []
-    length := job_output(state.process, &output[0], 16384)
+    output: [32768]u8 = []
+    length := job_output(state.process, &output[0], 32768)
     state.loaded = length > 0 && language_manager_catalog(app, output[..length])
     if !state.loaded {
       state.count = 0
+      state.entry_count = 0
       state.error_length = copy_text(state.error[..], "Invalid language catalogue. Rebuild the editor and installer together.")
     }
   } else {
     item := &state.packages[state.active]
     item.installed = item.wanted
     item.update = false
-    item.marked = false
+    language_manager_settle(state, state.active)
     if !item.server {
       syntax_release(app)
     }
