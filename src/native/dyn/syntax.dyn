@@ -15,11 +15,16 @@ struct SyntaxChange { revision: u64, low, old_high, high, old_length, row, colum
 struct SyntaxWorker {
   name: [65]u8, library, parser, query, published, objects: rawptr,
   query_predicates, object_predicates: *Predicates,
-  ranges: [1024]SyntaxRange, object_count: u32,
+  // Text-object ranges of the published tree: object_count SyntaxRange
+  // entries in byte storage, swapped in whole like colors.
+  ranges: []u8, object_count: u32,
   thread, mutex, wake: rawptr, stopping, pending, ready, retry: bool, indent: u32,
   text: []u8, length: u32, revision, finished: u64,
   change: SyntaxChange, has_change: bool,
   stream: SyntaxStream, stream_pending: bool,
+  // Bytes the published tree covers: the whole document, also for streamed
+  // windows whose colors cover less.
+  tree_length: u32,
   colors: []u8, cancel: sync.AtomicU32, small_revisions: u32,
 }
 struct SyntaxInput { text: []u8, length: u32, revision: u64 }
@@ -206,6 +211,7 @@ fn syntax_worker(context: rawptr) i32 {
   previous := #cast(*SyntaxInput, dna_memory_calloc(1, #sizeof(SyntaxInput), 0))
   scratch_empty: [0]u8 = []
   scratch_colors: []u8 = scratch_empty[..]
+  scratch_ranges: []u8 = scratch_empty[..]
   retained: rawptr = nil
   stream_cache := SyntaxStreamCache{}
   if input == nil || previous == nil {
@@ -342,20 +348,18 @@ fn syntax_worker(context: rawptr) i32 {
     } else {
       syntax_parser_reset(worker.parser)
     }
-    ranges: [1024]SyntaxRange = []
     object_count: u32 = 0
     if tree != nil && worker.objects != nil {
       cursor := syntax_cursor_new()
       if cursor != nil {
-        syntax_cursor_limit(cursor, 4096)
+        syntax_cursor_limit(cursor, 4294967295)
         query_options := SyntaxQueryOptions{payload: #cast(rawptr, &deadline), progress: syntax_query_progress}
         syntax_cursor_exec(cursor, worker.objects, syntax_root(tree), &query_options)
         match := TsMatch{}
         capture: u32 = 0
-        visits: u32 = 0
         names: [8][]const u8 = ["function.inside", "function.around", "class.inside", "class.around", "parameter.inside", "parameter.around", "comment.inside", "comment.around"]
-        for object_count < 1024 && visits < 32768 && !syntax_cooperate(&deadline) && syntax_cursor_next(cursor, &match, &capture) {
-          visits += 1
+        // Every object in the document: lookups may start anywhere.
+        for complete && !syntax_cooperate(&deadline) && syntax_cursor_next(cursor, &match, &capture) {
           if !predicates_pass(worker.object_predicates, &match, &input.text[0], input.length) {
             continue
           }
@@ -364,7 +368,12 @@ fn syntax_worker(context: rawptr) i32 {
           name := syntax_capture_name(worker.objects, entry.index, &size)
           for kind in 0..8 {
             if pred_equal(names[kind], name[..size]) {
-              ranges[object_count] = SyntaxRange{start: pred_start(entry.node), end: pred_end(entry.node), kind: #cast(u32, kind)}
+              if !syntax_reserve(&scratch_ranges, (#cast(usize, object_count) + 1) * #sizeof(SyntaxRange)) {
+                // Like any allocation failure: retry this revision later.
+                complete = false
+                break
+              }
+              #cast(*SyntaxRange, &scratch_ranges[0])[..#cast(usize, object_count) + 1][object_count] = SyntaxRange{start: pred_start(entry.node), end: pred_end(entry.node), kind: #cast(u32, kind)}
               object_count += 1
               break
             }
@@ -384,7 +393,9 @@ fn syntax_worker(context: rawptr) i32 {
     rec_lock(worker.mutex)
     if worker.revision == input.revision && complete && sync.load_u32(&worker.cancel) == 0 {
       worker.object_count = object_count
-      _ = copy(#cast(*u8, &worker.ranges[0]), #cast(*const u8, &ranges[0]), #cast(usize, object_count) * #sizeof(SyntaxRange))
+      spare_ranges := worker.ranges
+      worker.ranges = scratch_ranges
+      scratch_ranges = spare_ranges
       spare_colors := worker.colors
       worker.colors = scratch_colors
       scratch_colors = spare_colors
@@ -393,6 +404,7 @@ fn syntax_worker(context: rawptr) i32 {
       if tree != nil {
         worker.published = syntax_tree_copy(tree)
       }
+      worker.tree_length = input.length
       // Parsing and queries have finished; no reader retains these byte slices.
       // The mutex also protects published colors and the UI's pending text.
       if syntax_oversized(input.text, #cast(usize, input.length)) || syntax_oversized(previous.text, #cast(usize, previous.length)) || syntax_oversized(scratch_colors, #cast(usize, input.length)) || syntax_oversized(worker.text, #cast(usize, worker.length)) || syntax_oversized(worker.colors, #cast(usize, input.length)) {
@@ -423,6 +435,7 @@ fn syntax_worker(context: rawptr) i32 {
   syntax_buffer_free(previous.text)
   syntax_buffer_free(input.text)
   syntax_buffer_free(scratch_colors)
+  syntax_buffer_free(scratch_ranges)
   dna_memory_free(#cast(rawptr, previous))
   dna_memory_free(#cast(rawptr, input))
   return 0
@@ -496,6 +509,7 @@ fn syntax_release(worker: *SyntaxWorker) {
   }
   syntax_buffer_free(worker.text)
   syntax_buffer_free(worker.colors)
+  syntax_buffer_free(worker.ranges)
   dna_memory_free(#cast(rawptr, worker))
 }
 fn syntax_open(root: *const u8, filename: *const u8, selected: *const u8) *SyntaxWorker {
@@ -845,7 +859,7 @@ pub fn dna_syntax_select(worker: *SyntaxWorker, revision: u64, low: u32, high: u
     return 0
   }
   tree: rawptr = nil
-  if worker.ready && worker.finished == revision && high <= worker.length && worker.published != nil {
+  if worker.ready && worker.finished == revision && high <= worker.tree_length && worker.published != nil {
     tree = syntax_tree_copy(worker.published)
   }
   rec_unlock(worker.mutex)
@@ -884,19 +898,24 @@ pub fn dna_syntax_object(worker: *SyntaxWorker, revision: u64, low: u32, high: u
   if syntax_trylock(worker.mutex) != 0 {
     return 0
   }
-  ok := worker.ready && worker.finished == revision && high <= worker.length
+  ok := worker.ready && worker.finished == revision && high <= worker.tree_length
   previous_start: u32 = 0
   previous_end: u32 = 0
   current_low := low
   current_high := high
+  none: [0]SyntaxRange = []
+  ranges: []SyntaxRange = none[..]
+  if worker.object_count > 0 {
+    ranges = #cast(*SyntaxRange, &worker.ranges[0])[..#cast(usize, worker.object_count)]
+  }
   for step in 0..count {
     if !ok {
       break
     }
     found: i32 = -1
     width: u32 = 4294967295
-    for i in 0..worker.object_count {
-      range := worker.ranges[i]
+    for i in 0..#len(ranges) {
+      range := ranges[i]
       if range.kind != kind || range.start > current_low || range.end < current_high || (step > 0 && range.start == previous_start && range.end == previous_end) {
         continue
       }
@@ -909,9 +928,9 @@ pub fn dna_syntax_object(worker: *SyntaxWorker, revision: u64, low: u32, high: u
       ok = false
       break
     }
-    current_low = worker.ranges[#cast(usize, found)].start
+    current_low = ranges[#cast(usize, found)].start
     previous_start = current_low
-    current_high = worker.ranges[#cast(usize, found)].end
+    current_high = ranges[#cast(usize, found)].end
     previous_end = current_high
   }
   if ok {

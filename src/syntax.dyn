@@ -253,7 +253,7 @@ fn syntax_slot_tick(app: *App, slot: *Slot) bool {
 // Color output extends beyond the drawn view. Parsing reads the whole snapshot.
 const SyntaxMargin: usize = 524288
 // Parser revisions for windows carry this bit, so they never match a document
-// revision: tree queries (objects, selections) stay off in window mode.
+// revision; tree queries use the window tag (syntax_tree_revision).
 const SyntaxWindowBit: u64 = 9223372036854775808
 fn syntax_window_needed(slot: *const Slot) bool {
   doc := slot.document
@@ -829,6 +829,16 @@ fn configured_filetypes(app: *App) {
     configured_filetype_slot(app, slot)
   }
 }
+// The parser revision whose tree reflects the document now. Large documents
+// parse as streamed windows tagged with SyntaxWindowBit; their tree covers the
+// whole document once the window for this document revision is shown.
+fn syntax_tree_revision(slot: *const Slot) u64 {
+  doc := slot.document
+  if doc.length >= buffer.LargeFile && slot.syntax_window_tag != 0 && slot.syntax_window_revision == doc.revision && slot.syntax_shown_tag == slot.syntax_window_tag {
+    return slot.syntax_window_tag
+  }
+  return doc.revision
+}
 fn syntax_selection(app: *App, mode: u32) {
   slot := app.documents.slots[app.documents.active]
   doc := app.documents.current
@@ -838,7 +848,7 @@ fn syntax_selection(app: *App, mode: u32) {
   }
   selections := buffer.collect(doc)
   for index in 0..selections.count {
-    if !syntax_range(&selections.items[index], slot.syntax, doc.revision, mode, 0, 0, false) {
+    if !syntax_range(&selections.items[index], slot.syntax, syntax_tree_revision(slot), mode, 0, 0, false) {
       notice(app, "No syntax node available; parsing may still be pending.")
       return
     }
@@ -864,7 +874,7 @@ fn syntax_textobject(app: *App, key: u8, around: bool, count: usize) bool {
   }
   selections := buffer.collect(doc)
   for index in 0..selections.count {
-    if !syntax_range(&selections.items[index], slot.syntax, doc.revision, 0, kind, count, true) {
+    if !syntax_range(&selections.items[index], slot.syntax, syntax_tree_revision(slot), 0, kind, count, true) {
       return false
     }
   }
@@ -911,13 +921,13 @@ fn syntax_select_all(app: *App, children: bool) {
     start: u32 = 0
     end: u32 = 0
     if !children {
-      if syntax_select(slot.syntax, doc.revision, low, high, 0, &start, &end) == 0 {
+      if syntax_select(slot.syntax, syntax_tree_revision(slot), low, high, 0, &start, &end) == 0 {
         continue
       }
       low = start
       high = end
     }
-    if syntax_select(slot.syntax, doc.revision, low, high, 1, &start, &end) == 0 {
+    if syntax_select(slot.syntax, syntax_tree_revision(slot), low, high, 1, &start, &end) == 0 {
       continue
     }
     for results.count < buffer.SelectionCapacity {
@@ -932,7 +942,7 @@ fn syntax_select_all(app: *App, children: bool) {
       }
       results.items[results.count] = buffer.Selection{anchor: #cast(usize, start), cursor: #cast(usize, end)}
       results.count += 1
-      if syntax_select(slot.syntax, doc.revision, start, end, 3, &start, &end) == 0 {
+      if syntax_select(slot.syntax, syntax_tree_revision(slot), start, end, 3, &start, &end) == 0 {
         break
       }
     }

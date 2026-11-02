@@ -128,6 +128,44 @@ fn syntax_stream_run(worker: *SyntaxWorker, request: *const SyntaxStream, cache:
       complete = false
     }
   }
+  // Every text object overlapping the colored window, from the same full
+  // tree. The window bounds the count; the storage replaces the worker's.
+  no_ranges: [0]u8 = []
+  ranges: []u8 = no_ranges[..]
+  object_count: u32 = 0
+  if complete && worker.objects != nil {
+    cursor := syntax_cursor_new()
+    if cursor != nil {
+      defer syntax_cursor_delete(cursor)
+      syntax_cursor_limit(cursor, 4294967295)
+      syntax_cursor_range(cursor, request.low, request.high)
+      options := SyntaxQueryOptions{payload: #cast(rawptr, &deadline), progress: syntax_query_progress}
+      syntax_cursor_exec(cursor, worker.objects, syntax_root(cache.tree), &options)
+      source := PredicateSource{context: #cast(rawptr, &input), length: request.length, range: syntax_stream_capture}
+      match := TsMatch{}
+      capture: u32 = 0
+      names: [8][]const u8 = ["function.inside", "function.around", "class.inside", "class.around", "parameter.inside", "parameter.around", "comment.inside", "comment.around"]
+      for complete && !syntax_cooperate(&deadline) && syntax_cursor_next(cursor, &match, &capture) {
+        if !predicates_pass_source(worker.object_predicates, &match, &source) {
+          continue
+        }
+        entry := match.captures[..match.capture_count][capture]
+        size: u32 = 0
+        name := syntax_capture_name(worker.objects, entry.index, &size)
+        for kind in 0..8 {
+          if pred_equal(names[kind], name[..size]) {
+            if !syntax_reserve(&ranges, (#cast(usize, object_count) + 1) * #sizeof(SyntaxRange)) {
+              complete = false
+              break
+            }
+            #cast(*SyntaxRange, &ranges[0])[..#cast(usize, object_count) + 1][object_count] = SyntaxRange{start: pred_start(entry.node), end: pred_end(entry.node), kind: #cast(u32, kind)}
+            object_count += 1
+            break
+          }
+        }
+      }
+    }
+  }
   rec_lock(worker.mutex)
   if worker.revision == request.revision && sync.load_u32(&worker.cancel) == 0 {
     if complete {
@@ -135,8 +173,13 @@ fn syntax_stream_run(worker: *SyntaxWorker, request: *const SyntaxStream, cache:
       worker.colors = stream_colors
       stream_colors = spare
       syntax_tree_delete(worker.published)
-      worker.published = nil
-      worker.object_count = 0
+      // Selections and objects walk the full tree; it covers the document.
+      worker.published = syntax_tree_copy(cache.tree)
+      worker.tree_length = request.length
+      worker.object_count = object_count
+      spare_ranges := worker.ranges
+      worker.ranges = ranges
+      ranges = spare_ranges
       worker.finished = request.revision
       worker.ready = true
     } else {
@@ -144,6 +187,8 @@ fn syntax_stream_run(worker: *SyntaxWorker, request: *const SyntaxStream, cache:
     }
   }
   rec_unlock(worker.mutex)
+  // The worker's previous ranges, or these when they were not published.
+  syntax_buffer_free(ranges)
 }
 pub fn dna_syntax_stream_needed(worker: *SyntaxWorker, revision: u64) i32 {
   if syntax_trylock(worker.mutex) != 0 {
