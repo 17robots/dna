@@ -94,7 +94,18 @@ def import_libraries(destination):
         source = next((path for path in candidates if path.is_file()), None)
         if source is None:
             raise SystemExit('Missing native import library: ' + name)
-        shutil.copyfile(source, destination / ('lib' + name + '.dll.a'))
+        output = destination / ('lib' + name + '.dll.a')
+        if name in ('vterm', 'tree-sitter', 'pcre2-8', 'utf8proc'):
+            # GNU long import objects interleave their .idata sections in Dyn's
+            # PE linker. Build its supported short imports from the actual DLL.
+            names = {item.lower(): item for item in re.findall(rb'([A-Za-z0-9][A-Za-z0-9_.+\-]*\.dll)\x00', source.read_bytes(), re.I)}.values()
+            providers = [prefix() / 'bin' / item.decode('ascii') for item in names]
+            providers = [path for path in providers if path.is_file()]
+            if len(providers) != 1:
+                raise SystemExit('Expected one native DLL in import archive: ' + str(source))
+            short_import_library(providers[0], output)
+        else:
+            shutil.copyfile(source, output)
 
 
 def dll_imports(path):
@@ -126,10 +137,13 @@ def pe_interface(path):
         count = unpack('<I', directories-4)[0]
         headers_size = unpack('<I', optional+60)[0]
         mappings = []
+        code_sections = []
         for index in range(sections):
             section = optional+optional_size+40*index
             virtual_size, address, raw_size, raw = unpack('<IIII', section+8)
             mappings.append((address, max(virtual_size, raw_size), raw, raw_size))
+            if unpack('<I', section+36)[0] & 0x20000020:
+                code_sections.append((address, address+max(virtual_size,raw_size)))
         def offset(rva):
             if rva < headers_size and rva < len(image):
                 return rva
@@ -166,7 +180,7 @@ def pe_interface(path):
                     raise RuntimeError('Unbounded PE import table: ' + str(path))
             else:
                 raise RuntimeError('Unbounded PE dependency table: ' + str(path))
-        exports, forwarders = set(), {}
+        exports, forwarders, kinds = set(), {}, {}
         export_rva, export_size = directory(0)
         if export_rva:
             record = unpack('<IIHHIIIIIII', offset(export_rva))
@@ -185,9 +199,46 @@ def pe_interface(path):
                 if ordinal >= functions or not values[ordinal]:
                     raise RuntimeError('Invalid PE named export: ' + str(path))
                 exports.add(name)
+                kinds[name] = 0 if any(first <= values[ordinal] < last for first, last in code_sections) or base+ordinal in forwarders else 1
                 if base+ordinal in forwarders:
                     forwarders[name] = forwarders[base+ordinal]
-        return {'imports': imports, 'exports': exports, 'forwarders': forwarders}
+        return {'imports': imports, 'exports': exports, 'forwarders': forwarders, 'kinds': kinds, 'machine': unpack('<H', header+4)[0]}
+
+
+
+def short_import_library(dll, destination):
+    """Write deterministic indexed short COFF imports for Dyn's native linker."""
+    dll, destination = Path(dll), Path(destination)
+    view = pe_interface(dll)
+    if view['machine'] not in (0x8664, 0xaa64):
+        raise RuntimeError('Unsupported native DLL architecture: ' + str(dll))
+    records, symbols = [], []
+    for name in sorted(view['kinds']):
+        kind = view['kinds'][name]
+        body = name.encode('ascii')+b'\0'+dll.name.encode('ascii')+b'\0'
+        record = struct.pack('<HHHHIIHH', 0, 0xffff, 0, view['machine'], 0, len(body), 0, 4 | kind)+body
+        records.append(record)
+        if kind == 0:
+            symbols.append((name, len(records)-1))
+        symbols.append(('__imp_'+name, len(records)-1))
+    if not records:
+        raise RuntimeError('No named DLL exports: ' + str(dll))
+    names = b''.join(name.encode('ascii')+b'\0' for name, _ in symbols)
+    index_size = 4+4*len(symbols)+len(names)
+    position = 8+60+index_size+(index_size & 1)
+    offsets = []
+    for record in records:
+        offsets.append(position)
+        position += 60+len(record)+(len(record) & 1)
+    index = struct.pack('>I',len(symbols))+b''.join(struct.pack('>I',offsets[number]) for _,number in symbols)+names
+    def member(name, data):
+        header = (name.ljust(16)+'0'.ljust(12)+'0'.ljust(6)+'0'.ljust(6)+'644'.ljust(8)+str(len(data)).ljust(10)+'`\n').encode('ascii')
+        assert len(header) == 60
+        return header+data+(b'\n' if len(data) & 1 else b'')
+    archive = b'!<arch>\n'+member('/',index)
+    archive += b''.join(member('i'+str(number)+'/',record) for number,record in enumerate(records))
+    destination.write_bytes(archive)
+    print('Built short COFF imports: ' + dll.name + ' (' + str(len(records)) + ' exports)', flush=True)
 
 
 def audit_runtime(roots):
@@ -334,6 +385,7 @@ def dependencies():
         shutil.copyfile(generated_import, library / 'libdna_native.dll.a')
         window = library / 'dyn_window.dll'
         run([sys.executable, window_builder(compiler), '--output', window], env=env)
+        short_import_library(window, library / 'libdyn_window.dll.a')
         if not (library / 'libdyn_window.dll.a').is_file():
             raise SystemExit('Native Win32 window import library was not generated')
         snapshot_runtime((support, window), library)
