@@ -386,11 +386,13 @@ power-loss durability.
 `scripts/native_windows.py` builds the native DLL, Win32 editor and language
 helper using MSYS2 UCRT64 providers. Runtime bundles capture the PE dependency
 closure, language data and pinned Microsoft ConPTY DLL/host with licenses.
-Language builds require the MSYS2 build tools. CI exercises native x64 services,
-editor startup/relocation and installer workflows; Windows qualification remains
-in progress while those gates expose failures. Both Windows architectures compile
-in debug/release, but ARM64 currently has object proof only. Passing objects does
-not imply a working native build.
+Language builds require the MSYS2 build tools. Provider DLL exports are converted
+into short COFF import archives for Dyn's native PE linker; a transitive PE
+import/export audit checks the captured runtime before loading it. CI executes
+native x64 services, debug/release editor startup, presentation, relocation and
+cleanup, plus grammar and offline npm/LSP installation workflows. Both Windows
+architectures compile in debug/release, but ARM64 currently has object proof only.
+Passing objects does not imply a working native build.
 
 Native thread lifecycle keeps pthreads on Linux and uses SDK desktop threads on
 macOS/Windows, including OS TLS, self-join detection, callback results and arena

@@ -105,6 +105,27 @@ read format 3. Keep a separate session file when testing or rolling back.
 See [SDK-MIGRATION-20261024.md](SDK-MIGRATION-20261024.md) for validation,
 measurements, limits, and the preserved local baseline.
 
+### Native macOS and Windows source builds
+
+Native source builds use the pinned Dyn SDK. Install the platform providers
+listed in [native CI](.github/workflows/native-ports.yml). macOS uses Homebrew;
+Windows x64 uses native Python, the Windows SDK, and MSYS2 UCRT64. On macOS, run
+`python3 scripts/build_native.py --mode release` to build the Cocoa editor.
+
+On Windows, run from PowerShell after installing the UCRT64 providers:
+
+```powershell
+$env:DNA_WINDOWS_PREFIX = 'C:/msys64/ucrt64'
+mise exec -- python scripts/build_native.py --mode release --output build/dna.exe
+.\build\dna.exe --gui
+```
+
+Keep the generated adjacent DLLs, ConPTY host, licenses, language helper and
+`share/dna` data with the executable when moving it. Grammar builds and managed
+language-server installation also require the configured MSYS2 tools. Windows
+recovery supports atomic process-crash persistence; directory power-loss
+synchronization and terminal suspend remain unsupported.
+
 ## Run
 
 `dna --version` (or `dna version`) prints the application version and exits
@@ -1042,11 +1063,12 @@ not a replacement for backups or version control.
 - Directory listings and staged batches support at most 256 entries/operations.
   Explorer listings remain limited to 65,535 bytes and allocates its own undo arena.
 - Tree-sitter highlighting, LSP, command-key overrides and a Vim keymap profile
-  are available (see Vim keys for its gaps). A TUI and SSH remain unimplemented. An experimental process-based plugin
-  API and persistent sessions are available.
-- Linux remains the primary platform. Native macOS builds run in CI. Windows
-  adapters and build tooling are implemented, with native qualification in progress;
-  Windows ARM64 currently has compile checks only.
+  are available (see Vim keys for its gaps). Native GUI and TUI frontends, an
+  experimental process-based plugin API, and persistent sessions are available.
+  Remote filesystem access over SSH is not implemented.
+- Linux remains the primary platform. Native macOS and Windows x64 builds run in
+  CI, including file operations and GUI startup. Windows ARM64 currently has
+  compile checks only.
 
 ## Project tools, sessions, and extensions
 
