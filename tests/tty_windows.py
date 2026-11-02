@@ -20,7 +20,6 @@ use "std/io"
 extern fn string_length "strlen"(text:*const u8) usize
 extern fn rec_alloc "calloc"(count:usize,size:usize) rawptr
 extern fn rec_free "free"(value:rawptr)
-extern fn tty_atexit "atexit"(handler:fn())i32
 struct TtySize { rows,columns,width,height:u16 }
 tty_input:i32=0
 tty_output:i32=1
