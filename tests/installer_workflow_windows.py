@@ -13,6 +13,7 @@ from pathlib import Path
 import queue
 import re
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -357,9 +358,14 @@ def server_workflow(library, helper, root, work, env):
     wrapper.mkdir()
     forward = wrapper / 'npm-forward.js'
     forward.write_text(FORWARD_JS, encoding='utf-8')
+    # Managed server execution intentionally filters its environment. Keep the
+    # fixture's resolved launch targets in the wrappers so runtime Node does not
+    # depend on installer-only DNA_FIXTURE variables surviving that boundary.
+    node_command = shlex.quote(node.as_posix())
+    forward_command = shlex.quote(forward.as_posix())
     for name, text in {
-        'node': '#!/usr/bin/env bash\nexec "$DNA_FIXTURE_NODE" "$@"\n',
-        'npm': '#!/usr/bin/env bash\nexec "$DNA_FIXTURE_NODE" "$DNA_FIXTURE_NPM_FORWARD" "$@"\n',
+        'node': '#!/usr/bin/env bash\nexec ' + node_command + ' "$@"\n',
+        'npm': '#!/usr/bin/env bash\nexec ' + node_command + ' ' + forward_command + ' "$@"\n',
     }.items():
         path = wrapper / name
         path.write_text(text, encoding='utf-8', newline='\n')
@@ -370,8 +376,7 @@ def server_workflow(library, helper, root, work, env):
     pin = re.search(r'packages: "(pyright@[^" ]+)"', servers)
     assert pin, 'the managed Python catalogue must name one pinned pyright package'
     env = dict(env, PATH=str(wrapper) + os.pathsep + env['PATH'],
-        DNA_FIXTURE_NODE=str(node), DNA_FIXTURE_NPM_CLI=str(npm_cli),
-        DNA_FIXTURE_NPM_FORWARD=str(forward), DNA_FIXTURE_LIFECYCLE_MARKER=str(marker),
+        DNA_FIXTURE_NPM_CLI=str(npm_cli), DNA_FIXTURE_LIFECYCLE_MARKER=str(marker),
         DNA_FIXTURE_NPM_LOG=str(log), DNA_FIXTURE_PIN=pin[1], npm_config_offline='true',
         npm_config_audit='false', npm_config_fund='false',
         npm_config_cache=str(work / 'npm cache'), npm_config_userconfig=str(work / 'isolated npmrc'))
