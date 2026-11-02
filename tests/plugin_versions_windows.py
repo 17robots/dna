@@ -40,8 +40,13 @@ pub fn test_stage(root,name,manifest,executable,leaf:*const u8)i32 {
 }
 test_last_errno:i32
 test_rename_status:i32
+test_force_root:rawptr
+test_parent_diagnostics:[9]i32
 test_real_rename:fn(rawptr,*InstallWinStatus,rawptr,u32,u32)i32
 fn test_tracked_rename(handle:rawptr,status:*InstallWinStatus,info:rawptr,length,kind:u32)i32 {
+  if kind==10 && test_force_root!=nil {
+    #cast(*InstallWinRename,info).root=test_force_root
+  }
   result:=test_real_rename(handle,status,info,length,kind)
   if result<0 { test_rename_status=result }
   return result
@@ -58,33 +63,53 @@ pub fn test_install(manifest,executable,root,name,leaf:*const u8)i32 {
   test_last_errno=rec_errno().*
   return result
 }
+pub fn test_parent_diagnostic(index:usize)i32 {
+  if index>=9 { return -1 }
+  return test_parent_diagnostics[index]
+}
 pub fn test_parent_sharing(root:*const u8)i32 {
   plugin_win_prepare()
   parent:=rec_open(root,720896,0)
-  if parent<0 { return -1 }
+  if parent<0 { test_parent_diagnostics[0]=rec_errno().*
+    return -1 }
   defer _=rec_close(parent)
   name:[]const u8="rename-parent-sharing\0"
   creator:=install_win_create_private(parent,&name[0],true,false)
-  if creator<0 { return -2 }
+  if creator<0 { test_parent_diagnostics[0]=rec_errno().*
+    return -2 }
   pointer:=PluginWinPointer{}
   value:[]const u8=".v-probe0"
   _=copy(&pointer.active[0],&value[0],9)
   test_real_rename=install_win_api.rename
-  test_rename_status=0
   install_win_api.rename=test_tracked_rename
-  first:=plugin_win_publish(creator,&pointer)
-  install_win_api.rename=test_real_rename
-  before:=test_rename_status
+  defer install_win_api.rename=test_real_rename
+  test_force_root=win_io_handle(creator)
+  test_rename_status=0
+  rec_errno().*=0
+  _=plugin_win_publish(creator,&pointer)
+  test_parent_diagnostics[1]=test_rename_status
+  test_parent_diagnostics[2]=rec_errno().*
+  rec_errno().*=0
   retained:=plugin_win_reopen(creator,160)
-  saved:=rec_errno().*
+  if retained<0 { test_parent_diagnostics[8]=#cast(i32,win_io_api.error()) }
+  test_parent_diagnostics[3]=rec_errno().*
   _=rec_close(creator)
-  rec_errno().*=saved
-  if retained<0 { return -3 }
+  if retained<0 { test_force_root=nil
+    return -3 }
   defer _=rec_close(retained)
-  if !plugin_win_publish(retained,&pointer) { return -4 }
-  // Some Windows versions may permit the broad parent too. Record that result;
-  // all versions must publish through the narrowed handle to the same object.
-  if !first && before!=-1073741757 { return -5 }
+  test_force_root=win_io_handle(retained)
+  test_rename_status=0
+  rec_errno().*=0
+  _=plugin_win_publish(retained,&pointer)
+  test_parent_diagnostics[4]=test_rename_status
+  test_parent_diagnostics[5]=rec_errno().*
+  test_force_root=nil
+  test_rename_status=0
+  rec_errno().*=0
+  final:=plugin_win_publish(retained,&pointer)
+  test_parent_diagnostics[6]=test_rename_status
+  test_parent_diagnostics[7]=rec_errno().*
+  if !final { return -4 }
   return 1
 }
 pub fn test_private_primitive(root,name:*const u8,directory,executable:i32)i32 {
@@ -119,6 +144,7 @@ def configure(binary):
     library.test_install.argtypes = [c.c_char_p] * 5
     library.test_errno.argtypes = []
     library.test_parent_sharing.argtypes = [c.c_char_p]
+    library.test_parent_diagnostic.argtypes = [c.c_size_t]
     library.test_private_primitive.argtypes = [c.c_char_p, c.c_char_p, c.c_int, c.c_int]
     return library
 
@@ -145,7 +171,10 @@ def active(library, container):
 
 def native_tests(binary, work):
     lib = configure(binary)
-    assert lib.test_parent_sharing(encoded(work)) == 1, ("directory parent rename sharing", lib.test_status())
+    probe = lib.test_parent_sharing(encoded(work))
+    diagnostic = [lib.test_parent_diagnostic(at) for at in range(9)]
+    print('Directory rename comparison (result; early errno, broad NT/errno, reopen errno, narrow NT/errno, null-root NT/errno, reopen WinError):', probe, diagnostic, flush=True)
+    assert probe == 1, ("directory parent rename sharing", probe, diagnostic)
     payload = (Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/whoami.exe').read_bytes()
     name = 'café 日本語'
     sources = []

@@ -80,7 +80,14 @@ def import_libraries(destination):
         candidates = [prefix() / 'lib' / ('lib' + name + '.dll.a')]
         if name in ('kernel32', 'advapi32', 'ucrt'):
             folder = 'ucrt' if name == 'ucrt' else 'um'
-            candidates += sorted(kits.glob('*/' + folder + '/x64/' + name + '.lib'), reverse=True)
+            sdk = sorted(kits.glob('*/' + folder + '/x64/' + name + '.lib'), reverse=True)
+            # Dyn links without the MinGW CRT startup objects. The SDK UCRT
+            # library supplies conveniences such as atexit that MinGW's bare
+            # DLL import archive expects its own startup libraries to provide.
+            if name == 'ucrt':
+                candidates = sdk + candidates
+            else:
+                candidates += sdk
             candidates += [prefix() / 'lib' / ('lib' + name + '.a')]
         source = next((path for path in candidates if path.is_file()), None)
         if source is None:
