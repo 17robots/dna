@@ -68,6 +68,15 @@ fn command_history_move(app: *App, older: bool) bool {
   prompt.selected = 0
   return true
 }
+// True while the prompt still shows a recalled history entry unchanged.
+fn command_history_browsing(app: *App) bool {
+  prompt := &app.prompt_state
+  if prompt.history_depth == 0 {
+    return false
+  }
+  at := (prompt.history_next + 32 - prompt.history_depth) % 32
+  return buffer.equal(prompt.text[..prompt.length], prompt.history[at][..prompt.history_lengths[at]])
+}
 fn command_palette_move(app: *App, older: bool) {
   matches(app)
   if older {
@@ -132,9 +141,15 @@ fn prompt_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
     submit(app, typography)
     return
   }
+  // Arrows move through the suggestion list like every other picker. Up at the
+  // top of the list steps into command history; while a recalled command is
+  // shown, both arrows keep walking history until it is edited.
   if app.prompt_state.panel == Panel.Commands && !control && (key == KeyUp || key == KeyDown) {
-    if command_history_move(app, key == KeyUp) {
-      return
+    if command_history_browsing(app) || (key == KeyUp && app.prompt_state.selected == 0) {
+      if command_history_move(app, key == KeyUp) {
+        app.command_menu.cached = false
+        return
+      }
     }
   }
   if (app.prompt_state.panel == Panel.Open || app.prompt_state.panel == Panel.Buffers) && (key == KeyPageDown || key == KeyPageUp) {
