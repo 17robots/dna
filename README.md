@@ -123,8 +123,8 @@ mise exec -- python scripts/build_native.py --mode release --output build/dna.ex
 Keep the generated adjacent DLLs, ConPTY host, licenses, language helper and
 `share/dna` data with the executable when moving it. Grammar builds and managed
 language-server installation also require the configured MSYS2 tools. Windows
-recovery supports atomic process-crash persistence; directory power-loss
-synchronization and terminal suspend remain unsupported.
+recovery flushes each atomic rename so it survives power loss as well as
+process crashes.
 
 ## Run
 
@@ -357,7 +357,8 @@ bracketed paste, a document inserts it as is (no auto-pairs or indentation)
 and nothing in it runs as a key. Shift, Alt and Ctrl held during a click
 come from the terminal's mouse report, so Shift-click extends a selection.
 `:suspend` (`:sus`, `:stop`, and Ctrl+Z with Vim keys) stops DNA as a shell
-job; `fg` brings it back.
+job; `fg` brings it back. On Windows it opens a command prompt (`%ComSpec%`) in
+the same console instead; `exit` returns to DNA.
 
 `:frontend tui` / `:frontend gui` (or `:module frontend tui`) moves the running
 session to the other frontend: unsaved text, splits, cursors and filetypes are

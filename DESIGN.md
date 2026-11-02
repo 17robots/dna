@@ -239,22 +239,33 @@ escape document chunks directly into the native outgoing queue, with no separate
 flattened or escaped editor copy. Outgoing encoded messages are bounded at 1 GiB;
 incoming responses retain their independent 8 MiB bound. Ranges of 16 MiB and
 more are escaped from a snapshot by one thread per CPU (a measuring pass, then
-a writing pass) that skip plain runs a word at a time; the UI thread waits for
-them, about 140 ms for 1 GiB. Queued JSON still occupies memory until sent. Incremental
-changes send only the changed range.
+a writing pass) that skip plain runs a word at a time. These run in the
+background (`LspEncode` in `src/language_server.dyn`): the message's queue
+reservation is parked (`dna_rpc_send_park`) while workers write into it, and
+`lsp_encode_tick` frames it once they finish. Messages sent meanwhile go to a
+second buffer that the transport writes only after the parked message, so the
+server sees the same order as before. The editor records the change as sent
+when it parks it; a body that turns out not to fit stops the server rather than
+let it drift. One such encode runs per server; another large change waits for
+it, unless a request needs that document current, which escapes it on the UI
+thread behind the first.
+A message committed with nothing ahead of it keeps its body in place; the header
+goes in reserved space before it. Queued JSON still occupies memory until sent.
+Incremental changes send only the changed range.
 
 Large-file recovery records a stamped replacement patch against the saved file.
 Restore checks the stamp before applying the patch and transfers that stamp to
 the restored file state. A mismatch aborts restore without replacing the current
-workspace. The native recovery record remains bounded at 1 GiB total and
-256 MiB of new bytes;
+workspace. The native recovery record is bounded at 4 GiB;
 if edits cannot fit, capture fails and retains the previous record instead of
 silently replacing unsaved edits with a path-only entry.
 
 Syntax highlighting on large documents parses a shared snapshot, with colors
 queried around the last drawn view (`syntax_window_tick` in `src/syntax.dyn`).
-Tree queries for objects and syntax selections remain disabled for these
-documents. Cursor, selection and explorer identities remain per-state metadata.
+The full tree from that parse is published with each window, so text objects
+(every one overlapping the window) and syntax selections work on these documents
+too; smaller documents keep every text object in the file; queries
+use the window's parser revision (`syntax_tree_revision`). Cursor, selection and explorer identities remain per-state metadata.
 
 Single-line drawing is bounded at 64 KiB of text per displayed row. On a longer
 line, a window follows the primary cursor in half-window steps. Drawing, caret
@@ -292,7 +303,7 @@ uncolored, rather than parsing a window without its preceding grammar state.
 Recovery for large files records edits as pieces of the saved file plus only
 the new bytes (`buffer.saved_pieces`), found by matching leaf storage
 addresses, so edits far apart cost only what was typed; records stay bounded by
-256 MiB of new bytes per record (1 GiB total record size). Edited spans over
+the 4 GiB record size; piece literals decode with the record as their bound. Edited spans over
 1 MiB use pieces even when a contiguous patch would fit. Restore checks the
 file's stamp, then rebuilds the text from the pieces as one undoable edit.
 
@@ -379,9 +390,11 @@ one-shot readiness, ConPTY, console input/handoff, directory notifications,
 retained-directory filesystem access and recovery persistence. Managed plugins
 publish immutable versions through an atomic current/previous record; language
 packages use signed regular-file pointers to immutable directories. Nofollow
-checks and private DACLs protect staging and cleanup. Directory fsync and terminal
-suspend remain explicitly unsupported; recovery does not claim directory
-power-loss durability.
+checks and private DACLs protect staging and cleanup. Windows has no directory
+fsync; renames flush the renamed file afterwards, which commits the rename as
+MoveFileEx(MOVEFILE_WRITE_THROUGH) does, and stands in for the parent sync.
+`:suspend` runs %ComSpec% (else cmd.exe) in the console and returns when it
+exits; Ctrl+C and Ctrl+Break go to that shell meanwhile.
 
 `scripts/native_windows.py` builds the native DLL, Win32 editor and language
 helper using MSYS2 UCRT64 providers. Runtime bundles capture the PE dependency

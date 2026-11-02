@@ -27,6 +27,7 @@ for suite in ("objects", "buffer", "files", "layout", "motion", "pattern", "sett
             with open(fixtures / "large.txt", "wb") as large:
                 large.truncate(268435456)
             # The debug buffer suite takes ~8 s locally; shared CI runners
-            # are several times slower, so allow a wide margin.
-            subprocess.run([str(binary)], cwd=temporary, check=True, timeout=60)
+            # have taken 27 s to over 60 s for the same code, so allow a wide
+            # margin.
+            subprocess.run([str(binary)], cwd=temporary, check=True, timeout=180)
         print(f"PASS {suite} ({mode})", flush=True)
