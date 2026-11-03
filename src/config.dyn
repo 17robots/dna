@@ -11,7 +11,7 @@ struct ConfigurationState {
   shell_path: [4096]u8,
   path: [4096]u8,
   path_length: usize,
-  binding_commands: [2048]u8,
+  binding_commands: [16384]u8,
   task_commands: [3072]u8,
   setting_key: [128]u8,
   setting_key_length: usize,
@@ -408,49 +408,278 @@ fn configured_navigation(command:[]const u8)u32 {
   }
   return 0
 }
-fn configured_binding(app:*const App, key:u32, modifiers:u16, scope:u8)*const settings.Binding {
-  normalized:u16=0
-  if (modifiers&ModShift)!=0 {
-    normalized|=3
+// A key sequence in progress ("g" of "g x"): its keys wait here until the
+// sequence completes, another key breaks it, or the timeout passes. Then
+// they run as if no binding had seen them.
+struct BindingState {
+  pending: [4]settings.Stroke,
+  pending_keys: [4]u32,
+  pending_modifiers: [4]u16,
+  count: usize,
+  scope: u8,
+  deadline: u64,
+  // A shorter binding the pending keys already complete, run on timeout.
+  exact: usize,
+  has_exact: bool,
+  // Pending keys being replayed: no binding sees them again.
+  bypass: bool,
+  // The typed character of a key a binding took; its text event is dropped.
+  swallow: u32,
+}
+const BindingTimeoutMs: u64 = 1000
+fn binding_modifiers(modifiers: u16) u16 {
+  normalized: u16 = 0
+  if (modifiers & ModShift) != 0 {
+    normalized |= 3
   }
-  if (modifiers&ModCtrl)!=0 {
-    normalized|=192
+  if (modifiers & ModCtrl) != 0 {
+    normalized |= 192
   }
-  if (modifiers&ModAlt)!=0 {
-    normalized|=768
+  if (modifiers & ModAlt) != 0 {
+    normalized |= 768
   }
-  for index in 0..app.config.binding_count {
-    binding:=&app.config.bindings[index]
-    if binding.scope==scope && binding.key==key && binding.modifiers==normalized {
-      return binding
+  return normalized
+}
+fn binding_stroke(app: *const App, key: u32, modifiers: u16) settings.Stroke {
+  normalized := binding_modifiers(modifiers)
+  character := app.input_state.character
+  if character == 0 && key >= 32 && key < 127 && (normalized & 960) == 0 {
+    character = key
+    if (normalized & 3) != 0 && key >= 'a' && key <= 'z' {
+      character = key - 32
     }
   }
-  return nil
+  if (normalized & 960) != 0 {
+    character = 0
+  }
+  return settings.Stroke{key: key, modifiers: normalized, character: character}
+}
+fn binding_step(binding: *const settings.Binding, index: usize) settings.Stroke {
+  if binding.count == 0 {
+    return settings.Stroke{key: binding.key, modifiers: binding.modifiers}
+  }
+  return binding.steps[index]
+}
+fn binding_length(binding: *const settings.Binding) usize {
+  if binding.count == 0 {
+    return 1
+  }
+  return binding.count
+}
+fn stroke_matches(want: settings.Stroke, typed: settings.Stroke) bool {
+  if want.character != 0 {
+    return typed.character == want.character
+  }
+  return want.key == typed.key && want.modifiers == typed.modifiers
+}
+fn binding_applies(app: *const App, binding: *const settings.Binding, scope: u8) bool {
+  if binding.scope != scope {
+    return false
+  }
+  if binding.keymap == 1 {
+    return !app.config.vim_keys
+  }
+  if binding.keymap == 2 {
+    return app.config.vim_keys
+  }
+  return true
+}
+struct BindingMatch { exact: usize, has_exact: bool, longer: bool }
+// Bindings for this keymap win over shared ones with the same keys.
+fn binding_search(app: *const App, keys: []const settings.Stroke, scope: u8) BindingMatch {
+  result := BindingMatch{}
+  exact_specific := false
+  for index in 0..app.config.binding_count {
+    binding := &app.config.bindings[index]
+    if !binding_applies(app, binding, scope) {
+      continue
+    }
+    length := binding_length(binding)
+    if length < #len(keys) {
+      continue
+    }
+    matched := true
+    for step in 0..#len(keys) {
+      if !stroke_matches(binding_step(binding, step), keys[step]) {
+        matched = false
+        break
+      }
+    }
+    if !matched {
+      continue
+    }
+    if length > #len(keys) {
+      result.longer = true
+    }
+    else if !result.has_exact || (!exact_specific && binding.keymap != 0) {
+      result.exact = index
+      result.has_exact = true
+      exact_specific = binding.keymap != 0
+    }
+  }
+  return result
+}
+fn configured_binding(app:*const App, key:u32, modifiers:u16, scope:u8)*const settings.Binding {
+  keys: [1]settings.Stroke = [binding_stroke(app, key, modifiers)]
+  found := binding_search(app, keys[..], scope)
+  if !found.has_exact {
+    return nil
+  }
+  return &app.config.bindings[found.exact]
+}
+fn binding_scope(app: *App) u8 {
+  if app.prompt_state.panel==Panel.Tree && !app.tree.searching && !app.tree.goto_pending {
+    return settings.ScopeNormal
+  }
+  if app.prompt_state.panel==Panel.Directory && !app.explorer.insert && !app.explorer.extend && (!app.config.vim_keys || vim_idle(app)) {
+    return settings.ScopeNormal
+  }
+  if app.prompt_state.panel == Panel.Leader && !app.input_state.leader_explorer {
+    return settings.ScopeSpace
+  }
+  if app.prompt_state.panel != Panel.None || app.documents.slots[app.documents.active].terminal.handle != nil || app.input_state.pending != 0 || app.register_state.pending {
+    return 0
+  }
+  if app.view.insert {
+    return settings.ScopeInsert
+  }
+  if app.config.vim_keys {
+    // A count may come first: 3Y with Y = "keys:y$" yanks three lines.
+    if vim_binding_blocked(app) {
+      return 0
+    }
+    if vim_visual(app) {
+      return settings.ScopeSelect
+    }
+    return settings.ScopeNormal
+  }
+  if app.view.extend {
+    return settings.ScopeSelect
+  }
+  return settings.ScopeNormal
+}
+// Keys typed by a "keys:" binding are never remapped (like Vim's noremap).
+fn binding_replaying_mapping(app: *const App) bool {
+  state := &app.macro_state
+  return state.replaying && state.depth > 0 && state.frames[state.depth - 1].mapping
 }
 fn configured_key(app: *App, typography: *Typography, key: u32, modifiers: u16) bool {
+  if app.binding_state.bypass || binding_replaying_mapping(app) || vim_replaying(app) {
+    return false
+  }
   explorer_borrow:=explorer_vim_begin(app)
   defer explorer_vim_finish(app, typography, &explorer_borrow)
-  scope: u8 = 0
-  if app.prompt_state.panel==Panel.Tree && !app.tree.searching && !app.tree.goto_pending {
-    scope=1
-  }
-  else if app.prompt_state.panel==Panel.Directory && !app.explorer.insert && !app.explorer.extend && (!app.config.vim_keys || vim_idle(app)) {
-    scope=1
-  }
-  else if app.prompt_state.panel == Panel.None && !app.view.insert && !app.view.extend && app.documents.slots[app.documents.active].terminal.handle == nil && (!app.config.vim_keys || vim_idle(app)) {
-    scope = 1
-  }
-  else if app.prompt_state.panel == Panel.Leader && !app.input_state.leader_explorer {
-    scope = 2
+  scope := binding_scope(app)
+  state := &app.binding_state
+  if state.count > 0 && scope != state.scope {
+    binding_flush(app, typography)
+    scope = binding_scope(app)
   }
   if scope == 0 {
     return false
   }
-  binding:=configured_binding(app, key, modifiers, scope)
-  if binding==nil {
+  typed := binding_stroke(app, key, modifiers)
+  keys: [5]settings.Stroke = []
+  for index in 0..state.count {
+    keys[index] = state.pending[index]
+  }
+  keys[state.count] = typed
+  found := binding_search(app, keys[..state.count + 1], scope)
+  if found.longer && state.count + 1 < settings.BindingSteps {
+    state.pending[state.count] = typed
+    state.pending_keys[state.count] = key
+    state.pending_modifiers[state.count] = modifiers
+    state.count += 1
+    state.scope = scope
+    state.exact = found.exact
+    state.has_exact = found.has_exact
+    state.deadline = sdl.ticks() + BindingTimeoutMs
+    state.swallow = typed.character
+    binding_unrecord(app)
+    return true
+  }
+  if found.has_exact {
+    state.count = 0
+    state.swallow = typed.character
+    binding_unrecord(app)
+    binding_run(app, typography, found.exact)
+    return true
+  }
+  if state.count == 0 {
     return false
   }
-  navigation:=configured_navigation(binding.command)
+  // The new key breaks the sequence: the waiting keys run first, then this
+  // key is looked at afresh.
+  binding_flush(app, typography)
+  return configured_key(app, typography, key, modifiers)
+}
+// A key a binding took is not part of the change . repeats: what the
+// binding does records itself, and the pending keys record when replayed.
+fn binding_unrecord(app: *App) {
+  if app.config.vim_keys {
+    vim_unrecord_key(app)
+  }
+}
+// Run or replay the pending keys (timeout, or a key that broke the sequence).
+fn binding_flush(app: *App, typography: *Typography) {
+  state := &app.binding_state
+  count := state.count
+  if count == 0 {
+    return
+  }
+  state.count = 0
+  if state.has_exact {
+    state.has_exact = false
+    binding_run(app, typography, state.exact)
+    return
+  }
+  keys: [4]u32 = state.pending_keys
+  mods: [4]u16 = state.pending_modifiers
+  strokes: [4]settings.Stroke = state.pending
+  saved_character := app.input_state.character
+  feeding := app.macro_state.feeding
+  // These keys were recorded when typed; replaying must not record them again.
+  app.macro_state.feeding = true
+  state.bypass = true
+  for index in 0..count {
+    app.input_state.character = strokes[index].character
+    key_input(app, typography, keys[index], mods[index])
+    app.input_state.character = 0
+    if strokes[index].character >= 32 && wants_text_input(app) {
+      encoded: [4]u8 = []
+      app.binding_state.swallow = 0
+      text_input(app, encoded[..vim_encode(strokes[index].character, encoded[..])])
+    }
+  }
+  app.binding_state.bypass = false
+  app.macro_state.feeding = feeding
+  app.input_state.character = saved_character
+}
+fn binding_tick(app: *App, typography: *Typography) bool {
+  if app.binding_state.count == 0 || sdl.ticks() < app.binding_state.deadline {
+    return false
+  }
+  binding_flush(app, typography)
+  return true
+}
+fn binding_run(app: *App, typography: *Typography, index: usize) {
+  binding := &app.config.bindings[index]
+  command := binding.command
+  if buffer.equal(command, "none") {
+    if app.prompt_state.panel == Panel.Leader {
+      app.prompt_state.panel = Panel.None
+    }
+    return
+  }
+  if #len(command) > 5 && buffer.equal(command[..5], "keys:") {
+    if app.prompt_state.panel == Panel.Leader {
+      app.prompt_state.panel = Panel.None
+      app.input_state.leader_explorer = false
+    }
+    macro_feed(app, typography, command[5..])
+    return
+  }
+  navigation:=configured_navigation(command)
   if navigation!=0 {
     character:=app.input_state.character
     app.input_state.character=0
@@ -471,13 +700,13 @@ fn configured_key(app: *App, typography: *Typography, key: u32, modifiers: u16) 
         edit_key(app, navigation, 0)
       }
     }
-    return true
+    return
   }
   if app.prompt_state.panel==Panel.Directory {
     app.explorer.commands=true
   }
   app.prompt_state.panel=Panel.Commands
-  app.prompt_state.length=copy_text(app.prompt_state.text[..], binding.command)
+  app.prompt_state.length=copy_text(app.prompt_state.text[..], command)
   app.prompt_state.selected=0
   if app.explorer.vim_borrowed {
     app.explorer.dispatch_pending=2
@@ -485,7 +714,6 @@ fn configured_key(app: *App, typography: *Typography, key: u32, modifiers: u16) 
   else {
     command_execute(app, typography)
   }
-  return true
 }
 fn cleanup_config_fonts(typography: *Typography) {
   release_pane_text(typography)

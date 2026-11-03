@@ -14,8 +14,18 @@ extern fn depth_limit "pcre2_set_depth_limit_8"(context: rawptr, limit: u32) i32
 extern fn heap_limit "pcre2_set_heap_limit_8"(context: rawptr, limit: u32) i32
 extern fn match "pcre2_match_8"(code: rawptr, bytes: *const u8, length: usize, offset: usize, options: u32, data: rawptr, context: rawptr) i32
 extern fn offsets "pcre2_get_ovector_pointer_8"(data: rawptr) *usize
+extern fn offset_count "pcre2_get_ovector_count_8"(data: rawptr) u32
+extern fn callout_set "pcre2_set_callout_8"(context: rawptr, callout: fn(rawptr, rawptr) i32, data: rawptr) i32
+// The start of pcre2_callout_block (PCRE2 10.x), as far as it is read here.
+struct CalloutBlock {
+  version, callout_number, capture_top, capture_last: u32,
+  offset_vector, mark, subject: rawptr,
+  subject_length, start_match, current_position: usize,
+}
 
-pub struct Pattern { code, data, context: rawptr, ok: bool, error: i32, error_offset: usize }
+// base: where the text of the last find_document call starts in the
+// document, for callouts that need document positions.
+pub struct Pattern { code, data, context: rawptr, ok: bool, error: i32, error_offset: usize, base: usize }
 pub struct Match { found, error: bool, start, end: usize }
 // partial: a match may start at or after offset but needs text past the end.
 pub struct Window { found, partial, error: bool, start, end: usize }
@@ -86,6 +96,24 @@ fn find_options(pattern: *Pattern, text: []const u8, offset: usize, options: u32
   vector := offsets(pattern.data)[..2]
   return Match{found: true, start: vector[0], end: vector[1]}
 }
+// Capture group index of the last successful find on this pattern, relative
+// to the text passed to find. An unset group is not found. Read it before the
+// next find on the same pattern.
+pub fn group(pattern: *const Pattern, index: usize) Match {
+  if !pattern.ok {
+    return Match{}
+  }
+  count := #cast(usize, offset_count(pattern.data))
+  if index >= count {
+    return Match{}
+  }
+  vector := offsets(pattern.data)[..2 * count]
+  // PCRE2_UNSET is the all-ones offset.
+  if vector[2 * index] == 0xffffffffffffffff || vector[2 * index] > vector[2 * index + 1] {
+    return Match{}
+  }
+  return Match{found: true, start: vector[2 * index], end: vector[2 * index + 1]}
+}
 // Search text that is one window of a longer subject. With PCRE2's hard
 // partial mode a match running into the window end, including end anchors,
 // reports partial instead of a match that more text could change.
@@ -130,6 +158,7 @@ search_window_revision: u64 = 0
 search_window_low: usize = 0
 search_window_high: usize = 0
 pub fn find_document(compiled: *Pattern, doc: *const buffer.Document, offset: usize) Match {
+  compiled.base = 0
   if doc.length <= SearchWindow {
     return find(compiled, buffer.all(doc), offset)
   }
@@ -165,6 +194,7 @@ pub fn find_document(compiled: *Pattern, doc: *const buffer.Document, offset: us
       search_window_high = high
     }
     text := search_window_bytes[..high - low]
+    compiled.base = low
     if high == doc.length {
       // The window reaches the real end: anchors there are genuine.
       found := find(compiled, text, at - low)
@@ -185,6 +215,7 @@ pub fn find_document(compiled: *Pattern, doc: *const buffer.Document, offset: us
       at = low + window.start
       if size * 2 + SearchLookback > SearchWindowLimit {
         // A single match longer than the window limit: search the whole text.
+        compiled.base = 0
         return find(compiled, buffer.all(doc), offset)
       }
       size *= 2
@@ -194,4 +225,19 @@ pub fn find_document(compiled: *Pattern, doc: *const buffer.Document, offset: us
     size = SearchWindow
   }
   return Match{}
+}
+
+// Call callout at each (?Cn) of the pattern with data; it returns 0 to go on
+// matching there and 1 to fail at that point.
+pub fn set_callout(pattern: *Pattern, callout: fn(rawptr, rawptr) i32, data: rawptr) {
+  if pattern.context != nil {
+    _ = callout_set(pattern.context, callout, data)
+  }
+}
+pub fn callout_number(block: rawptr) u32 {
+  return #cast(*const CalloutBlock, block).callout_number
+}
+// The callout's position, relative to the text passed to find.
+pub fn callout_position(block: rawptr) usize {
+  return #cast(*const CalloutBlock, block).current_position
 }

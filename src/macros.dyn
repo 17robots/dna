@@ -1,150 +1,463 @@
+// Macros are text, as in Vim: qa records keys into register a, @a types the
+// register's text back. Yanking into a register makes it a macro, "ap pastes
+// one for editing, and qA appends.
+//
+// Encoding, one key per unit:
+//   a typed character        its UTF-8 (Shift is implied for A-Z)
+//   Esc Return Tab BS Del     27 13 9 8 127; 10 also replays as Return
+//   Ctrl-a .. Ctrl-z          bytes 1-26 (except h i j m, which use the escape)
+//   anything else             U+F8FF then "key,modifiers,character;"
+// Text the backend sends for a typed character is not stored: replay sends it
+// again whenever text input is on, which is when the backend would.
 struct MacroState {
-  slots: [27]Macro,
   recording: bool,
   replaying: bool,
+  // Register being recorded: 0 is the keymap's default macro, 1-26 are a-z.
   slot: usize,
-  play_slot: usize,
-  index: usize,
-  remaining: usize,
+  append: bool,
+  record: MacroBuffer,
+  // Where the last recorded key starts, so q can drop itself.
+  unit_start: usize,
+  // The last key's character, whose text event is not recorded again.
+  companion: u32,
+  // The default macro (Q/q with no register); a-z live in the registers.
+  default_text: MacroBuffer,
+  // Replay: a stack of macro texts, the innermost last.
+  play: MacroBuffer,
+  frames: [MacroDepth]MacroFrame,
+  depth: usize,
+  // Keys replayed by this @, bounding a recursive macro that never fails.
+  steps: usize,
+  // Keys typed by :normal are not recorded; the command that typed them was.
+  feeding: bool,
+  // Set when a replayed command fails; the replay stops, as in Vim.
+  failed: bool,
 }
+struct MacroBuffer { arena: *mem.Arena, owned: bool, bytes: []u8, length: usize }
+// mapping: typed by a "keys:" binding, whose keys are not remapped.
+struct MacroFrame { start: usize, length: usize, position: usize, repeats: usize, mapping: bool }
 
-// Lazy storage: at most 1024 events per register, with bounded text payloads.
-struct MacroEvent { key: u32, modifiers: u16, character: u32, text_length: usize, text: [64]u8 }
-struct Macro { arena: *mem.Arena, owned: bool, events: []MacroEvent, count: usize }
+const MacroCapacity: usize = 65536
+const MacroDepth: usize = 64
+const MacroMaxSteps: usize = 1000000
+const MacroEscape: u32 = 0xf8ff
 
+fn macro_buffer_ready(app: *App, storage: *MacroBuffer) {
+  if !storage.owned {
+    allocated := arena_owner.create(MacroCapacity)
+    storage.arena = allocated
+    allocated = nil
+    storage.owned = true
+    storage.bytes = mem.push_bytes_uninit(storage.arena, MacroCapacity)
+    storage.length = 0
+  }
+}
+fn macro_buffer_release(storage: *MacroBuffer) {
+  if storage.owned {
+    arena_owner.release(storage.arena)
+    storage.arena = nil
+    storage.owned = false
+  }
+  storage.length = 0
+}
+fn macro_active(app: *const App) bool {
+  return app.macro_state.depth > 0
+}
+fn macro_register_text(app: *App, slot: usize) []const u8 {
+  if slot == 0 {
+    return app.macro_state.default_text.bytes[..app.macro_state.default_text.length]
+  }
+  register := &app.register_state.named[slot - 1]
+  if !register.owned {
+    return ""
+  }
+  return register.text
+}
+// qa starts recording into a; qA (append) keeps a's text and adds to it.
+fn macro_start(app: *App, slot: usize, append: bool) {
+  if app.macro_state.replaying || app.macro_state.recording {
+    return
+  }
+  if slot > 26 {
+    notice(app, "Macros use registers a-z.")
+    return
+  }
+  macro_buffer_ready(app, &app.macro_state.record)
+  app.macro_state.record.length = 0
+  if append {
+    existing := macro_register_text(app, slot)
+    if #len(existing) > MacroCapacity {
+      notice(app, "Register is too long to append a macro to.")
+      return
+    }
+    for index in 0..#len(existing) {
+      app.macro_state.record.bytes[index] = existing[index]
+    }
+    app.macro_state.record.length = #len(existing)
+  }
+  app.macro_state.slot = slot
+  app.macro_state.append = append
+  app.macro_state.unit_start = app.macro_state.record.length
+  app.macro_state.companion = 0
+  app.macro_state.recording = true
+}
+// Store what was recorded in its register.
+fn macro_stop(app: *App) {
+  if !app.macro_state.recording {
+    return
+  }
+  app.macro_state.recording = false
+  text := app.macro_state.record.bytes[..app.macro_state.record.length]
+  slot := app.macro_state.slot
+  if slot == 0 {
+    macro_buffer_ready(app, &app.macro_state.default_text)
+    for index in 0..#len(text) {
+      app.macro_state.default_text.bytes[index] = text[index]
+    }
+    app.macro_state.default_text.length = #len(text)
+    return
+  }
+  register := &app.register_state.named[slot - 1]
+  if #len(text) == 0 {
+    if register.owned {
+      arena_owner.release(register.arena)
+      register.arena = nil
+      register.owned = false
+    }
+    register.text = ""
+    register.count = 0
+    register.linewise = false
+    return
+  }
+  allocated := arena_owner.create((#len(text) + 1))
+  storage := mem.push_bytes_uninit(allocated, #len(text) + 1)
+  _ = buffer.copy_bytes(&storage[0], &text[0], #len(text))
+  storage[#len(text)] = 0
+  if register.owned {
+    arena_owner.release(register.arena)
+    register.arena = nil
+  }
+  register.arena = allocated
+  allocated = nil
+  register.owned = true
+  register.text = storage[..#len(text)]
+  register.count = 1
+  register.starts[0] = 0
+  register.lengths[0] = #len(text)
+  register.linewise = false
+}
+// Helix keymap: Q toggles recording into the selected register.
 fn macro_toggle(app: *App) {
   if app.macro_state.replaying {
     return
   }
   if app.macro_state.recording {
-    app.macro_state.recording = false
+    macro_stop(app)
     app.register_state.selected = 0
-    return
-  }
-  if app.register_state.selected > 26 {
-    app.register_state.selected = 0
-    notice(app, "Macros use registers a-z.")
-    return
-  }
-  slot := &app.macro_state.slots[app.register_state.selected]
-  if !slot.owned {
-    allocated := arena_owner.create((1024 * #sizeof(MacroEvent)))
-    slot.arena = allocated
-    allocated = nil
-    slot.owned = true
-    slot.events = mem.push_array(MacroEvent, slot.arena, 1024)
-  }
-  slot.count = 0
-  app.macro_state.slot = app.register_state.selected
-  app.register_state.selected = 0
-  app.macro_state.recording = true
-}
-fn macro_event(app: *App) *MacroEvent {
-  if !app.macro_state.recording || app.macro_state.replaying {
-    return nil
-  }
-  slot := &app.macro_state.slots[app.macro_state.slot]
-  if slot.count == 1024 {
-    app.macro_state.recording = false
-    slot.count = 0
-    notice(app, "Macro exceeded 1024 events; recording discarded.")
-    return nil
-  }
-  event := &slot.events[slot.count]
-  slot.count += 1
-  event.key = 0
-  event.modifiers = 0
-  event.text_length = 0
-  return event
-}
-fn macro_key(app: *App, key: u32, modifiers: u16) {
-  event := macro_event(app)
-  if event == nil {
-    return
-  }
-  event.key = key
-  event.modifiers = modifiers
-  event.character = app.input_state.character
-}
-fn macro_text(app: *App, text: []const u8) {
-  if !app.macro_state.recording || app.macro_state.replaying {
-    return
-  }
-  if #len(text) > 64 {
-    app.macro_state.recording = false
-    app.macro_state.slots[app.macro_state.slot].count = 0
-    notice(app, "Macro text event exceeded 64 bytes; recording discarded.")
-    return
-  }
-  event := macro_event(app)
-  if event == nil {
-    return
-  }
-  event.text_length = #len(text)
-  for index in 0..#len(text) {
-    event.text[index] = text[index]
-  }
-}
-fn macro_play(app: *App, typography: *Typography) {
-  if app.macro_state.replaying || app.macro_state.recording {
     return
   }
   selected := app.register_state.selected
-  if selected > 26 {
-    app.register_state.selected = 0
-    notice(app, "Macros use registers a-z.")
+  app.register_state.selected = 0
+  macro_start(app, selected, false)
+}
+// The key that ended recording (q) is not part of the macro.
+fn macro_drop_last(app: *App) {
+  if app.macro_state.recording {
+    app.macro_state.record.length = app.macro_state.unit_start
+  }
+}
+fn macro_recording_input(app: *App) bool {
+  return app.macro_state.recording && !app.macro_state.replaying && !app.macro_state.feeding
+}
+fn macro_put(app: *App, bytes: []const u8) {
+  record := &app.macro_state.record
+  if record.length + #len(bytes) > MacroCapacity {
+    app.macro_state.recording = false
+    record.length = 0
+    notice(app, "Macro exceeded 64 KiB; recording discarded.")
     return
   }
-  slot := &app.macro_state.slots[selected]
+  for index in 0..#len(bytes) {
+    record.bytes[record.length + index] = bytes[index]
+  }
+  record.length += #len(bytes)
+}
+fn macro_put_number(app: *App, value: usize, end: u8) {
+  digits: [24]u8 = []
+  used: usize = 0
+  for {
+    digits[23 - used] = #cast(u8, (value % 10)) + '0'
+    used += 1
+    value /= 10
+    if value == 0 {
+      break
+    }
+  }
+  macro_put(app, digits[24 - used..])
+  ending: [1]u8 = [end]
+  macro_put(app, ending[..])
+}
+fn macro_key(app: *App, key: u32, modifiers: u16) {
+  if !macro_recording_input(app) {
+    return
+  }
+  app.macro_state.unit_start = app.macro_state.record.length
+  app.macro_state.companion = 0
+  character := app.input_state.character
+  // Lock keys (Num, Caps) do not change what a key does here.
+  normal: u16 = modifiers & 0x0c00
+  if (modifiers & ModShift) != 0 {
+    normal = normal | ModShift
+  }
+  if (modifiers & ModCtrl) != 0 {
+    normal = normal | ModCtrl
+  }
+  if (modifiers & ModAlt) != 0 {
+    normal = normal | ModAlt
+  }
+  modifiers = normal
+  plain := (modifiers & (ModCtrl | ModAlt | 0x0c00)) == 0
+  if plain && character >= 32 && character != 127 && character != MacroEscape {
+    bytes: [4]u8 = []
+    macro_put(app, bytes[..vim_encode(character, bytes[..])])
+    app.macro_state.companion = character
+    return
+  }
+  byte: u8 = 0
+  if modifiers == 0 && character == 0 {
+    if key == KeyEscape || key == KeyReturn || key == KeyTab || key == KeyBackspace || key == KeyDelete {
+      byte = #cast(u8, key)
+    }
+  }
+  else if modifiers == ModCtrl && key >= 'a' && key <= 'z' && key != 'h' && key != 'i' && key != 'j' && key != 'm' {
+    byte = #cast(u8, (key - 96))
+  }
+  if byte != 0 {
+    single: [1]u8 = [byte]
+    macro_put(app, single[..])
+    return
+  }
+  marker: [3]u8 = []
+  macro_put(app, marker[..vim_encode(MacroEscape, marker[..])])
+  macro_put_number(app, #cast(usize, key), ',')
+  macro_put_number(app, #cast(usize, modifiers), ',')
+  macro_put_number(app, #cast(usize, character), ';')
+}
+fn macro_text(app: *App, text: []const u8) {
+  if !macro_recording_input(app) {
+    return
+  }
+  companion := app.macro_state.companion
+  app.macro_state.companion = 0
+  if companion != 0 {
+    bytes: [4]u8 = []
+    if buffer.equal(text, bytes[..vim_encode(companion, bytes[..])]) {
+      return
+    }
+  }
+  // Other text (an IME commit, a paste) replays as typed characters.
+  app.macro_state.unit_start = app.macro_state.record.length
+  macro_put(app, text)
+}
+// @a: type register a's text count times. Inside a replay the text runs
+// where the @a was, as in Vim, so a macro may call itself.
+fn macro_play(app: *App, typography: *Typography) {
+  selected := app.register_state.selected
   app.register_state.selected = 0
   count := app.input_state.repeat_count
   app.input_state.repeat_count = 0
   if count == 0 {
     count = 1
   }
-  if slot.count == 0 {
-    notice(app, "Macro is empty.")
+  if selected > 26 {
+    macro_fail(app)
+    notice(app, "Macros use registers a-z.")
     return
   }
-  if count > 10000 / slot.count {
-    notice(app, "Macro replay exceeds 10000 events.")
+  text := macro_register_text(app, selected)
+  if #len(text) == 0 {
+    // Silent, as in Vim: @a while recording a (qa...@aq) is the usual way
+    // to write a recursive macro.
+    macro_fail(app)
     return
   }
-  app.macro_state.play_slot = selected
-  app.macro_state.index = 0
-  app.macro_state.remaining = count * slot.count
-  _ = macro_tick(app, typography)
+  macro_push(app, typography, text, count, false)
+}
+fn macro_push(app: *App, typography: *Typography, text: []const u8, count: usize, mapping: bool) {
+  macro_buffer_ready(app, &app.macro_state.play)
+  state := &app.macro_state
+  // A finished frame (a tail call such as @a ending a) gives its room back.
+  for state.depth > 0 && state.frames[state.depth - 1].position == state.frames[state.depth - 1].length && state.frames[state.depth - 1].repeats == 0 {
+    state.depth -= 1
+    state.play.length = state.frames[state.depth].start
+  }
+  if state.depth == MacroDepth || state.play.length + #len(text) > MacroCapacity {
+    macro_fail(app)
+    notice(app, "E223: Macro nested too deeply")
+    return
+  }
+  start := state.play.length
+  for index in 0..#len(text) {
+    state.play.bytes[start + index] = text[index]
+  }
+  state.play.length += #len(text)
+  state.frames[state.depth] = MacroFrame{start: start, length: #len(text), position: 0, repeats: count - 1, mapping: mapping}
+  state.depth += 1
+  if state.replaying {
+    return
+  }
+  state.failed = false
+  state.steps = 0
+  // Replay runs to its end before any other input or asynchronous UI
+  // (completion, hover) can interleave. A pending explorer activation yields
+  // to the scheduler, which resumes the rest; so does a macro still running
+  // after half a second, so Escape can stop it.
+  deadline := sdl.ticks() + 500
+  for state.depth > 0 && app.running && app.explorer.dispatch_pending == 0 && sdl.ticks() < deadline {
+    _ = macro_tick(app, typography)
+  }
+  if state.depth > 0 && app.explorer.dispatch_pending == 0 {
+    notice(app, "Macro still running; Escape stops it.")
+  }
+}
+// A "keys:" binding: type its keys (Vim notation) without remapping them.
+fn macro_feed(app: *App, typography: *Typography, notation: []const u8) {
+  encoded: [1024]u8 = []
+  used: usize = 0
+  at: usize = 0
+  for at < #len(notation) && used + 40 < #len(encoded) {
+    stroke := settings.notation_next(notation, &at)
+    if stroke.key == 0 && stroke.character == 0 {
+      break
+    }
+    if (stroke.key == 0 || (stroke.key == 32 && stroke.modifiers == 0)) && stroke.character != MacroEscape {
+      if stroke.character == 0 {
+        stroke.character = 32
+      }
+      used += vim_encode(stroke.character, encoded[used..])
+      continue
+    }
+    used += vim_encode(MacroEscape, encoded[used..])
+    add_number(encoded[..], &used, #cast(usize, stroke.key))
+    add_text(encoded[..], &used, ",")
+    add_number(encoded[..], &used, #cast(usize, stroke.modifiers))
+    add_text(encoded[..], &used, ",")
+    add_number(encoded[..], &used, 0)
+    add_text(encoded[..], &used, ";")
+  }
+  if used == 0 {
+    return
+  }
+  macro_push(app, typography, encoded[..used], 1, true)
+}
+// A motion, search or ex command failed. During replay this aborts the
+// macro and the rest of its count, so 100@a stops at the end of the file.
+fn macro_fail(app: *App) {
+  if app.macro_state.replaying {
+    app.macro_state.failed = true
+  }
+}
+fn macro_cancel(app: *App) {
+  app.macro_state.depth = 0
+  app.macro_state.play.length = 0
+}
+fn macro_number(bytes: []const u8, at: *usize, end: u8) u32 {
+  value: u32 = 0
+  for at.* < #len(bytes) && bytes[at.*] != end {
+    value = value * 10 + #cast(u32, (bytes[at.*] - '0'))
+    at.* += 1
+  }
+  if at.* < #len(bytes) {
+    at.* += 1
+  }
+  return value
+}
+// Type one key from the innermost frame.
+fn macro_step(app: *App, typography: *Typography) {
+  state := &app.macro_state
+  frame := &state.frames[state.depth - 1]
+  if frame.position == frame.length {
+    if frame.repeats == 0 {
+      state.depth -= 1
+      state.play.length = frame.start
+      return
+    }
+    frame.repeats -= 1
+    frame.position = 0
+  }
+  bytes := state.play.bytes[frame.start..frame.start + frame.length]
+  at := frame.position
+  byte := bytes[at]
+  size := rx_char_size(byte)
+  if at + size > #len(bytes) {
+    size = #len(bytes) - at
+  }
+  character := #cast(u32, byte)
+  if size > 1 {
+    character = vim_decode(bytes[at..at + size])
+  }
+  at += size
+  key := character
+  modifiers: u16 = 0
+  typed := true
+  if character == MacroEscape {
+    key = macro_number(bytes, &at, ',')
+    modifiers = #cast(u16, macro_number(bytes, &at, ','))
+    character = macro_number(bytes, &at, ';')
+    typed = false
+  }
+  else if byte == 10 || byte == 13 {
+    key = KeyReturn
+    character = 0
+  }
+  else if byte == 27 || byte == 9 || byte == 8 || byte == 127 {
+    character = 0
+  }
+  else if byte >= 1 && byte <= 26 {
+    key = #cast(u32, byte) + 96
+    modifiers = ModCtrl
+    character = 0
+  }
+  else if byte >= 'A' && byte <= 'Z' {
+    key = character + 32
+    modifiers = ModShift
+  }
+  frame.position = at
+  // Text follows a typed character when text input is on before and after
+  // the key, matching the native backend.
+  typing := typed && character >= 32 && wants_text_input(app)
+  app.input_state.character = character
+  key_input(app, typography, key, modifiers)
+  app.input_state.character = 0
+  if typing && wants_text_input(app) {
+    encoded: [4]u8 = []
+    text_input(app, encoded[..vim_encode(character, encoded[..])])
+  }
 }
 fn macro_tick(app: *App, typography: *Typography) bool {
-  if app.macro_state.remaining == 0 {
+  if app.macro_state.depth == 0 {
     return false
   }
-  slot := &app.macro_state.slots[app.macro_state.play_slot]
   app.macro_state.replaying = true
-  deadline := sdl.ticks() + 2
   processed: usize = 0
-  for app.macro_state.remaining > 0 && app.running && processed < 64 {
-    event := &slot.events[app.macro_state.index]
-    if event.key != 0 {
-      app.input_state.character = event.character
-      key_input(app, typography, event.key, event.modifiers)
-    }
-    else {
-      text_input(app, event.text[..event.text_length])
-    }
-    app.macro_state.index += 1
-    if app.macro_state.index == slot.count {
-      app.macro_state.index = 0
-    }
-    app.macro_state.remaining -= 1
+  deadline := sdl.ticks() + 8
+  for app.macro_state.depth > 0 && app.running && processed < 4096 && (processed == 0 || sdl.ticks() < deadline) {
+    macro_step(app, typography)
     processed += 1
+    app.macro_state.steps += 1
+    if app.macro_state.steps > MacroMaxSteps {
+      notice(app, "Macro replay exceeded a million keys; stopped.")
+      app.macro_state.failed = true
+    }
+    if app.macro_state.failed {
+      app.macro_state.failed = false
+      macro_cancel(app)
+      break
+    }
     // A nested explorer event may queue activation until its outer draft
     // borrow ends. Yield at that completed event, retaining the next event;
     // otherwise later macro input would still target the old draft.
-    if app.explorer.dispatch_pending!=0 {
-      break
-    }
-    if sdl.ticks() >= deadline {
+    if app.explorer.dispatch_pending != 0 {
       break
     }
   }
@@ -152,11 +465,8 @@ fn macro_tick(app: *App, typography: *Typography) bool {
   return true
 }
 fn macros_release(app: *App) {
-  for index in 0..27 {
-    if app.macro_state.slots[index].owned {
-      arena_owner.release(app.macro_state.slots[index].arena)
-      app.macro_state.slots[index].arena = nil
-      app.macro_state.slots[index].owned = false
-    }
-  }
+  macro_buffer_release(&app.macro_state.record)
+  macro_buffer_release(&app.macro_state.default_text)
+  macro_buffer_release(&app.macro_state.play)
+  app.macro_state.depth = 0
 }

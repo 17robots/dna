@@ -1,7 +1,19 @@
 use "std/mem"
 use "../buffer"
 
-pub struct Binding { key: u32, modifiers: u16, scope: u8, from_project: bool, command: []const u8 }
+// One key of a binding. A printable character without Ctrl or Alt matches
+// the typed character (so "$" and "A" work on any layout); other keys match
+// the keycode and modifiers.
+pub struct Stroke { key: u32, modifiers: u16, character: u32 }
+pub const BindingSteps: usize = 4
+pub const BindingLimit: usize = 128
+// Scopes: 1 normal, 2 Space menu, 6 insert, 7 select/visual.
+pub const ScopeNormal: u8 = 1
+pub const ScopeSpace: u8 = 2
+pub const ScopeInsert: u8 = 6
+pub const ScopeSelect: u8 = 7
+// keymap: 0 both, 1 helix only, 2 vim only.
+pub struct Binding { key: u32, modifiers: u16, scope: u8, keymap: u8, from_project: bool, command: []const u8, steps: [4]Stroke, count: usize }
 // Where a surface shows: float at one of nine anchors, docked to a side
 // (taking space from the editor panes), or next to the cursor. Sizes at or
 // below 1 are fractions of the window; above 1, logical pixels.
@@ -110,7 +122,7 @@ fn place_apply(place: *Placement, key: []const u8, value: []const u8) bool {
 pub struct Settings {
   languages: [16]Language,
   places: [8]Placement,
-  bindings: [16]Binding,
+  bindings: [128]Binding,
   completion_delay_ms: f32 = 25.0,
   document_padding: f32 = 18.0,
   scroll_margin: f32 = 3.0,
@@ -427,6 +439,7 @@ pub fn parse_layer(source: []const u8, result: *Settings, layer: *Layer) bool {
   seen: u32 = 0
   extra_seen: u64 = 0
   scope: u8 = 0
+  keymap: u8 = 0
   language_index: usize = 16
   place_index: usize = PlaceSurfaces
   section: []const u8 = ""
@@ -441,12 +454,14 @@ pub fn parse_layer(source: []const u8, result: *Settings, layer: *Layer) bool {
     if #len(line) == 0 || line[0] == 35 {
       continue
     }
-    if buffer.equal(line, "[keys.normal]") {
-      scope = 1
-      continue
-    }
-    if buffer.equal(line, "[keys.space]") {
-      scope = 2
+    if line[0] == 91 && #len(line) > 7 && buffer.equal(line[..6], "[keys.") && line[#len(line) - 1] == 93 {
+      keys_scope := keys_section(line[6..#len(line) - 1])
+      if keys_scope.scope == 0 {
+        return false
+      }
+      section = line[1..#len(line) - 1]
+      scope = keys_scope.scope
+      keymap = keys_scope.keymap
       continue
     }
     if line[0] == 91 {
@@ -527,19 +542,23 @@ pub fn parse_layer(source: []const u8, result: *Settings, layer: *Layer) bool {
       continue
     }
     if scope != 0 {
-      if #len(key) < 3 || key[0] != 34 || key[#len(key) - 1] != 34 || #len(value) < 3 || #len(value) > 129 || value[0] != 34 || value[#len(value) - 1] != 34 || result.binding_count == 16 {
+      if #len(key) < 3 || key[0] != 34 || key[#len(key) - 1] != 34 || #len(value) < 3 || #len(value) > 129 || value[0] != 34 || value[#len(value) - 1] != 34 || result.binding_count == BindingLimit {
         return false
       }
-      binding := parse_key(key[1..#len(key) - 1])
-      if binding.key == 0 {
+      binding := parse_sequence(key[1..#len(key) - 1])
+      if binding.count == 0 {
         return false
       }
       binding.scope = scope
+      binding.keymap = keymap
       binding.command = value[1..#len(value) - 1]
+      if #len(binding.command) > 5 && buffer.equal(binding.command[..5], "keys:") && !notation_valid(binding.command[5..]) {
+        return false
+      }
       replaced := false
       for previous in 0..result.binding_count {
         existing := &result.bindings[previous]
-        if existing.scope == scope && existing.key == binding.key && existing.modifiers == binding.modifiers {
+        if existing.scope == scope && existing.keymap == keymap && same_sequence(existing, &binding) {
           // A project binding overrides the global one; within a file it is a duplicate.
           if !layer.project || existing.from_project {
             return false
@@ -788,4 +807,325 @@ pub fn parse_key(text: []const u8) Binding {
     }
   }
   return result
+}
+
+pub struct KeysScope { scope: u8, keymap: u8 }
+// [keys.MODE] or [keys.KEYMAP.MODE]: MODE is normal, insert, select (or
+// visual) or space; KEYMAP is vim or helix.
+pub fn keys_section(name: []const u8) KeysScope {
+  result := KeysScope{}
+  mode := name
+  if #len(name) > 4 && buffer.equal(name[..4], "vim.") {
+    result.keymap = 2
+    mode = name[4..]
+  }
+  else if #len(name) > 6 && buffer.equal(name[..6], "helix.") {
+    result.keymap = 1
+    mode = name[6..]
+  }
+  if buffer.equal(mode, "normal") {
+    result.scope = ScopeNormal
+  }
+  else if buffer.equal(mode, "space") {
+    result.scope = ScopeSpace
+  }
+  else if buffer.equal(mode, "insert") {
+    result.scope = ScopeInsert
+  }
+  else if buffer.equal(mode, "select") || buffer.equal(mode, "visual") {
+    result.scope = ScopeSelect
+  }
+  return result
+}
+fn same_sequence(left: *const Binding, right: *const Binding) bool {
+  if left.count != right.count {
+    return false
+  }
+  for index in 0..left.count {
+    a := left.steps[index]
+    b := right.steps[index]
+    if a.key != b.key || a.modifiers != b.modifiers || a.character != b.character {
+      return false
+    }
+  }
+  return true
+}
+// "g x", "space f f", "ctrl-w v": up to four keys separated by spaces.
+pub fn parse_sequence(text: []const u8) Binding {
+  result := Binding{}
+  at: usize = 0
+  for at < #len(text) {
+    if text[at] == ' ' {
+      at += 1
+      continue
+    }
+    end := at
+    for end < #len(text) && text[end] != ' ' {
+      end += 1
+    }
+    if result.count == BindingSteps {
+      result.count = 0
+      return result
+    }
+    stroke := parse_stroke(text[at..end])
+    if stroke.key == 0 && stroke.character == 0 {
+      result.count = 0
+      return result
+    }
+    result.steps[result.count] = stroke
+    result.count += 1
+    at = end
+  }
+  if result.count > 0 {
+    result.key = result.steps[0].key
+    result.modifiers = result.steps[0].modifiers
+  }
+  return result
+}
+fn lower_ascii(text: []const u8, out: []u8) []const u8 {
+  if #len(text) > #len(out) {
+    return text
+  }
+  for index in 0..#len(text) {
+    byte := text[index]
+    if byte >= 'A' && byte <= 'Z' {
+      byte += 32
+    }
+    out[index] = byte
+  }
+  return out[..#len(text)]
+}
+// A named key's keycode, or 0.
+pub fn key_named(name: []const u8) u32 {
+  storage: [16]u8 = []
+  lowered := lower_ascii(name, storage[..])
+  if buffer.equal(lowered, "space") {
+    return 32
+  }
+  if buffer.equal(lowered, "backslash") {
+    return 92
+  }
+  if buffer.equal(lowered, "esc") || buffer.equal(lowered, "escape") {
+    return 27
+  }
+  if buffer.equal(lowered, "enter") || buffer.equal(lowered, "ret") || buffer.equal(lowered, "return") || buffer.equal(lowered, "cr") {
+    return 13
+  }
+  if buffer.equal(lowered, "tab") {
+    return 9
+  }
+  if buffer.equal(lowered, "backspace") || buffer.equal(lowered, "bs") {
+    return 8
+  }
+  if buffer.equal(lowered, "del") || buffer.equal(lowered, "delete") {
+    return 127
+  }
+  if buffer.equal(lowered, "minus") {
+    return '-'
+  }
+  if buffer.equal(lowered, "lt") || buffer.equal(lowered, "less") {
+    return '<'
+  }
+  if buffer.equal(lowered, "insert") || buffer.equal(lowered, "ins") {
+    return 1073741897
+  }
+  if buffer.equal(lowered, "home") {
+    return 1073741898
+  }
+  if buffer.equal(lowered, "pageup") {
+    return 1073741899
+  }
+  if buffer.equal(lowered, "end") {
+    return 1073741901
+  }
+  if buffer.equal(lowered, "pagedown") {
+    return 1073741902
+  }
+  if buffer.equal(lowered, "right") {
+    return 1073741903
+  }
+  if buffer.equal(lowered, "left") {
+    return 1073741904
+  }
+  if buffer.equal(lowered, "down") {
+    return 1073741905
+  }
+  if buffer.equal(lowered, "up") {
+    return 1073741906
+  }
+  if #len(lowered) >= 2 && lowered[0] == 'f' {
+    n := number(lowered[1..])
+    if n >= 1.0 && n <= 12.0 && #cast(f32, (#cast(u32, n))) == n {
+      return #cast(u32, 1073741881) + #cast(u32, n)
+    }
+  }
+  return 0
+}
+// One key: optional ctrl-/alt-/shift- (or C-/A-/M-/S-) prefixes, then a
+// character or a key name.
+pub fn parse_stroke(text: []const u8) Stroke {
+  result := Stroke{}
+  remaining := text
+  for #len(remaining) > 2 {
+    if #len(remaining) > 5 && buffer.equal(remaining[..5], "ctrl-") {
+      result.modifiers |= 192
+      remaining = remaining[5..]
+    }
+    else if #len(remaining) > 4 && buffer.equal(remaining[..4], "alt-") {
+      result.modifiers |= 768
+      remaining = remaining[4..]
+    }
+    else if #len(remaining) > 6 && buffer.equal(remaining[..6], "shift-") {
+      result.modifiers |= 3
+      remaining = remaining[6..]
+    }
+    else if remaining[1] == '-' && (remaining[0] == 'C' || remaining[0] == 'c') {
+      result.modifiers |= 192
+      remaining = remaining[2..]
+    }
+    else if remaining[1] == '-' && (remaining[0] == 'A' || remaining[0] == 'a' || remaining[0] == 'M' || remaining[0] == 'm') {
+      result.modifiers |= 768
+      remaining = remaining[2..]
+    }
+    else if remaining[1] == '-' && (remaining[0] == 'S' || remaining[0] == 's') {
+      result.modifiers |= 3
+      remaining = remaining[2..]
+    }
+    else {
+      break
+    }
+  }
+  if #len(remaining) == 0 {
+    return result
+  }
+  named := key_named(remaining)
+  if named != 0 {
+    if named > 32 && named < 127 && named != 92 && (result.modifiers & 960) == 0 {
+      // minus, lt: characters.
+      result.character = named
+      return result
+    }
+    result.key = named
+    return result
+  }
+  size := utf8_size(remaining[0])
+  if size != #len(remaining) {
+    return result
+  }
+  character := utf8_value(remaining)
+  if character < 33 || character == 127 {
+    return result
+  }
+  if (result.modifiers & 960) == 0 {
+    // shift-a is A; a plain character matches whatever produced it.
+    if (result.modifiers & 3) != 0 && character >= 'a' && character <= 'z' {
+      character -= 32
+    }
+    result.modifiers = 0
+    result.character = character
+    return result
+  }
+  if character >= 'A' && character <= 'Z' {
+    character += 32
+    result.modifiers |= 3
+  }
+  result.key = character
+  return result
+}
+fn utf8_size(byte: u8) usize {
+  if byte < 128 {
+    return 1
+  }
+  if byte >= 240 {
+    return 4
+  }
+  if byte >= 224 {
+    return 3
+  }
+  if byte >= 192 {
+    return 2
+  }
+  return 0
+}
+pub fn utf8_value(bytes: []const u8) u32 {
+  size := #len(bytes)
+  if size == 1 {
+    return #cast(u32, bytes[0])
+  }
+  value: u32 = 0
+  if size == 2 {
+    value = #cast(u32, (bytes[0] & 31))
+  }
+  else if size == 3 {
+    value = #cast(u32, (bytes[0] & 15))
+  }
+  else {
+    value = #cast(u32, (bytes[0] & 7))
+  }
+  for index in 1..size {
+    value = (value << 6) | #cast(u32, (bytes[index] & 63))
+  }
+  return value
+}
+// Vim key notation for "keys:" values: characters type themselves, <Name>
+// is a key (<Esc>, <CR>, <C-w>, <lt> for a literal <). Returns the key at
+// at, advancing past it; a zero stroke ends the text or marks an error.
+pub fn notation_next(text: []const u8, at: *usize) Stroke {
+  result := Stroke{}
+  if at.* >= #len(text) {
+    return result
+  }
+  if text[at.*] == '<' {
+    end := at.* + 1
+    for end < #len(text) && text[end] != '>' {
+      end += 1
+    }
+    if end < #len(text) && end > at.* + 1 {
+      stroke := parse_stroke(text[at.* + 1..end])
+      if stroke.key != 0 || stroke.character != 0 {
+        at.* = end + 1
+        return stroke
+      }
+    }
+    // A lone < types itself.
+  }
+  size := utf8_size(text[at.*])
+  if size == 0 || at.* + size > #len(text) {
+    at.* = #len(text) + 1
+    return result
+  }
+  result.character = utf8_value(text[at.*..at.* + size])
+  if result.character == 32 {
+    result.key = 32
+  }
+  at.* += size
+  return result
+}
+fn notation_valid(text: []const u8) bool {
+  at: usize = 0
+  count: usize = 0
+  for at < #len(text) {
+    stroke := notation_next(text, &at)
+    if stroke.key == 0 && stroke.character == 0 {
+      return false
+    }
+    count += 1
+  }
+  return count > 0
+}
+pub fn key_display(key: u32) []const u8 {
+  names: []const u8 = "esc enter tab backspace delete insert home pageup end pagedown right left down up"
+  codes: [14]u32 = [27, 13, 9, 8, 127, 1073741897, 1073741898, 1073741899, 1073741901, 1073741902, 1073741903, 1073741904, 1073741905, 1073741906]
+  at: usize = 0
+  for index in 0..14 {
+    end := at
+    for end < #len(names) && names[end] != ' ' {
+      end += 1
+    }
+    if codes[index] == key {
+      return names[at..end]
+    }
+    at = end + 1
+  }
+  return ""
 }

@@ -115,8 +115,17 @@ fn text_input(app: *App, text: []const u8) {
   if app.prompt_state.panel == Panel.Open && app.resource_state.kind == 6 && !app.language_manager.searching {
     return
   }
-  if app.macro_state.remaining > 0 && !app.macro_state.replaying {
+  if macro_active(app) && !app.macro_state.replaying {
     return
+  }
+  // The text of a key a binding took (insert-mode "j k") does not type.
+  swallow := app.binding_state.swallow
+  app.binding_state.swallow = 0
+  if swallow != 0 {
+    encoded: [4]u8 = []
+    if buffer.equal(text, encoded[..vim_encode(swallow, encoded[..])]) {
+      return
+    }
   }
   macro_text(app, text)
   vim_record_text(app, text)
@@ -425,9 +434,9 @@ fn input_normal_mode(app: *App) {
 }
 fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
   key_trace(app, key, modifiers)
-  if app.macro_state.remaining > 0 && !app.macro_state.replaying {
+  if macro_active(app) && !app.macro_state.replaying {
     if key == KeyEscape {
-      app.macro_state.remaining = 0
+      macro_cancel(app)
     } else {
       return
     }
@@ -455,6 +464,10 @@ fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
     return
   }
   macro_key(app, key, modifiers)
+  // :s///c owns the keyboard until it finishes.
+  if app.vim.ex.confirming && vim_confirm_key(app, typography, key, modifiers) {
+    return
+  }
   if app.prompt_state.panel == Panel.None && snippet_valid(app) {
     if key == KeyTab {
       _ = snippet_jump(app, (modifiers & ModShift) != 0)
@@ -638,6 +651,7 @@ fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
     }
     return
   }
+  app.binding_state.swallow = 0
   if configured_key(app, typography, key, modifiers) {
     return
   }

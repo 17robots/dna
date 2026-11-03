@@ -456,14 +456,50 @@ labels and clipped menu rows legible at fractional scales; larger configured
 line spacing is preserved.
 
 This is a deliberately restricted TOML reader: flat assignments, decimal numbers,
-booleans, quoted strings without escapes, full-line comments, and `[keys.normal]`
-/ `[keys.space]` tables. Unknown/duplicate settings and invalid values report a
-line number and preserve working settings. Up to 16 key overrides map key names
-(single characters, F1–F12, `space`, `backslash`, optionally prefixed with
-`ctrl-`, `alt-`, or `shift-`) to palette commands or the shared navigation actions
-`move-up`, `move-down`, `move-left`, `move-right`, `page-up`, and `page-down`.
-Navigation overrides work in documents and both explorers. Normal overrides do
-not run while typing, selecting, completing a Vim prefix, or entering terminal text.
+booleans, quoted strings without escapes, full-line comments, and the tables
+described here. Unknown/duplicate settings and invalid values report a line
+number and preserve working settings.
+
+### Custom keys
+
+```toml
+[keys.normal]            # both keymaps
+"f2" = "terminal"
+[keys.vim.normal]        # Vim only; wins over [keys.normal]
+"Y" = "keys:y$"
+"g x" = "keys:dd"
+"s" = "none"
+[keys.helix.select]      # Helix only
+"ctrl-a" = "keys:<Esc>"
+[keys.insert]
+"j k" = "keys:<Esc>"
+[keys.space]
+"f f" = "file-picker"
+```
+
+Tables are `[keys.MODE]` for both keymaps and `[keys.vim.MODE]` /
+`[keys.helix.MODE]` for one; MODE is `normal`, `insert`, `select` (alias
+`visual`, Vim's visual modes and Helix select mode) or `space` (after Space).
+Up to 128 bindings.
+
+- **Keys** are a character (`$`, `A`, `é`; matched by what you type, so any
+  layout works) or a name: `space`, `backslash`, `esc`, `enter`, `tab`,
+  `backspace`, `delete`, `insert`, `home`, `end`, `pageup`, `pagedown`, arrows
+  (`up` …), `minus`, `lt`, `f1`–`f12`. Prefix `ctrl-`, `alt-`, `shift-` (or
+  `C-`, `A-`/`M-`, `S-`).
+- **Sequences**: up to four keys separated by spaces. The keys wait up to one
+  second; a key that breaks the sequence, or the timeout, lets them act as
+  usual (in insert mode they type). A binding that is also the start of a
+  longer one runs on timeout.
+- **Values**: a palette command (with arguments, as typed after `:`), `none` to
+  disable the key, `move-up`/`move-down`/`move-left`/`move-right`/`page-up`/
+  `page-down`, or `keys:` followed by keys in Vim notation (`<Esc>`, `<CR>`,
+  `<C-w>`, `<lt>` for `<`). `keys:` keys are typed without remapping, use a
+  count typed before the binding (`3Y`), and repeat with `.` like the keys
+  themselves.
+- Normal bindings work in documents and both explorers, but not partway
+  through a Vim operator or prefix, while choosing a register, or in terminal
+  input. Custom Space bindings show in the Space menu.
 
 Layout files remain separate. Existing layout files containing font/display
 settings remain compatible; loading one can override those settings until config
