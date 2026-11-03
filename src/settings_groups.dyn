@@ -8,7 +8,10 @@ fn setting_key_name(out: []u8, used: *usize, key: u32, modifiers: u16) {
   if (modifiers & ModShift) != 0 {
     add_text(out, used, "shift-")
   }
-  if key == KeyBackslash {
+  named := settings.key_display(key)
+  if #len(named) > 0 {
+    add_text(out, used, named)
+  } else if key == KeyBackslash {
     add_text(out, used, "backslash")
   } else if key == KeySpace {
     add_text(out, used, "space")
@@ -28,26 +31,44 @@ fn setting_group_finish(app: *App, key: []const u8) {
   app.prompt_state.panel = Panel.Setting
 }
 fn setting_group(app: *App, key: []const u8) bool {
-  if buffer.equal(key, "[keys.normal]") || buffer.equal(key, "[keys.space]") {
-    scope: u8 = 1
-    if buffer.equal(key, "[keys.space]") {
-      scope = 2
+  if #len(key) > 7 && buffer.equal(key[..6], "[keys.") && key[#len(key) - 1] == ']' {
+    scope := settings.keys_section(key[6..#len(key) - 1])
+    if scope.scope == 0 || scope.keymap != 0 {
+      return false
     }
     app.prompt_state.message_length = copy_text(app.prompt_state.message[..], key)
-    add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\n\nCustom bindings override built-in commands in this scope.\nDefault: no custom overrides.\nConfigured overrides:\n")
-    index: usize = 0
+    add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\n\nCustom bindings override built-in keys in this mode.\n[keys.vim.MODE] and [keys.helix.MODE] apply to one keymap and win over this table.\nValues: a palette command, keys:<Vim key notation>, none, or a move/page action.\nConfigured overrides:\n")
     count: usize = 0
-    for index < app.config.binding_count {
+    for index in 0..app.config.binding_count {
       binding := &app.config.bindings[index]
-      if binding.scope == scope {
-        add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\n\"")
-        setting_key_name(app.prompt_state.message[..], &app.prompt_state.message_length, binding.key, binding.modifiers)
-        add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\" = \"")
-        add_text(app.prompt_state.message[..], &app.prompt_state.message_length, binding.command)
-        add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\"")
-        count += 1
+      if binding.scope != scope.scope {
+        continue
       }
-      index += 1
+      add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\n")
+      if binding.keymap == 1 {
+        add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "(helix) ")
+      }
+      if binding.keymap == 2 {
+        add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "(vim) ")
+      }
+      add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\"")
+      for step in 0..binding_length(binding) {
+        if step > 0 {
+          add_text(app.prompt_state.message[..], &app.prompt_state.message_length, " ")
+        }
+        stroke := binding_step(binding, step)
+        if stroke.character != 0 {
+          encoded: [4]u8 = []
+          add_text(app.prompt_state.message[..], &app.prompt_state.message_length, encoded[..vim_encode(stroke.character, encoded[..])])
+        }
+        else {
+          setting_key_name(app.prompt_state.message[..], &app.prompt_state.message_length, stroke.key, stroke.modifiers)
+        }
+      }
+      add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\" = \"")
+      add_text(app.prompt_state.message[..], &app.prompt_state.message_length, binding.command)
+      add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\"")
+      count += 1
     }
     if count == 0 {
       add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "none")

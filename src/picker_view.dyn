@@ -162,7 +162,7 @@ fn key_menu_count(app: *const App) usize {
     return 10
   }
   if app.prompt_state.panel == Panel.Leader {
-    return LeaderCommands
+    return LeaderCommands + leader_custom_count(app)
   }
   if app.prompt_state.panel == Panel.Goto {
     return 16
@@ -191,7 +191,17 @@ fn key_menu_hint(app: *const App, index: usize) KeyHint {
   if vim_menu_active(app) {
     return vim_key_hint(app, index)
   }
+  if app.prompt_state.panel == Panel.Leader && index >= LeaderCommands {
+    return leader_custom_hint(app, index - LeaderCommands)
+  }
   hint := key_hint(app.prompt_state.panel == Panel.Goto, index)
+  if app.prompt_state.panel == Panel.Leader && #len(hint.key) == 1 {
+    // A [keys.space] binding on a built-in key shows what it does now.
+    custom := leader_custom_for(app, #cast(u32, hint.key[0]))
+    if custom != nil {
+      hint.label = leader_custom_label(custom)
+    }
+  }
   if app.prompt_state.panel == Panel.Windows {
     hint = window_hint(index)
   }
@@ -208,6 +218,98 @@ fn key_menu_hint(app: *const App, index: usize) KeyHint {
     hint.label = "hide explorer"
   }
   return hint
+}
+const PrintableKeys: []const u8 = "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+// Space-menu bindings shown as hints: those starting with a plain ASCII
+// character, once per first key.
+fn leader_custom_first(binding: *const settings.Binding) u32 {
+  step := binding_step(binding, 0)
+  if step.character >= 33 && step.character < 127 {
+    return step.character
+  }
+  return 0
+}
+fn leader_builtin(key: u32) bool {
+  for index in 0..LeaderCommands {
+    info := command_info(leader_command(index))
+    if #len(info.key) == 1 && #cast(u32, info.key[0]) == key {
+      return true
+    }
+  }
+  return false
+}
+fn leader_custom_shown(app: *const App, index: usize) bool {
+  binding := &app.config.bindings[index]
+  if !binding_applies(app, binding, settings.ScopeSpace) {
+    return false
+  }
+  first := leader_custom_first(binding)
+  if first == 0 || leader_builtin(first) {
+    return false
+  }
+  for earlier in 0..index {
+    other := &app.config.bindings[earlier]
+    if binding_applies(app, other, settings.ScopeSpace) && leader_custom_first(other) == first {
+      return false
+    }
+  }
+  return true
+}
+fn leader_custom_count(app: *const App) usize {
+  if app.input_state.leader_explorer {
+    return 0
+  }
+  count: usize = 0
+  for index in 0..app.config.binding_count {
+    if leader_custom_shown(app, index) {
+      count += 1
+    }
+  }
+  return count
+}
+fn leader_custom_label(binding: *const settings.Binding) []const u8 {
+  if binding_length(binding) > 1 {
+    return "+more keys"
+  }
+  if #len(binding.command) > 5 && buffer.equal(binding.command[..5], "keys:") {
+    return binding.command[5..]
+  }
+  return binding.command
+}
+fn leader_custom_for(app: *const App, key: u32) *const settings.Binding {
+  if app.input_state.leader_explorer {
+    return nil
+  }
+  typed: [1]settings.Stroke = [settings.Stroke{key: key, character: key}]
+  found := binding_search(app, typed[..], settings.ScopeSpace)
+  if found.longer {
+    for index in 0..app.config.binding_count {
+      binding := &app.config.bindings[index]
+      if binding_applies(app, binding, settings.ScopeSpace) && binding_length(binding) > 1 && leader_custom_first(binding) == key {
+        return binding
+      }
+    }
+  }
+  if found.has_exact {
+    return &app.config.bindings[found.exact]
+  }
+  return nil
+}
+fn leader_custom_hint(app: *const App, wanted: usize) KeyHint {
+  seen: usize = 0
+  for index in 0..app.config.binding_count {
+    if !leader_custom_shown(app, index) {
+      continue
+    }
+    if seen == wanted {
+      first := leader_custom_first(&app.config.bindings[index])
+      at := #cast(usize, first - 33)
+      shown := leader_custom_for(app, first)
+      return KeyHint{key: PrintableKeys[at..at + 1], label: leader_custom_label(shown)}
+    }
+    seen += 1
+  }
+  return KeyHint{}
 }
 fn key_menu_is(panel: Panel) bool {
   return panel == Panel.Leader || panel == Panel.Goto || panel == Panel.Windows || panel == Panel.Match || panel == Panel.View || panel == Panel.Bracket

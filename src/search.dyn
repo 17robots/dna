@@ -3,6 +3,35 @@ use "std/time"
 
 struct SearchHistory { text: [4096]u8, length: usize }
 
+// The PCRE2 pattern for a search. The Vim keymap searches with Vim's
+// pattern syntax, shared with :s and :g; other keymaps use PCRE2 directly.
+fn search_query(app: *App, text: []const u8, output: []u8, regex: *VimRegex) []const u8 {
+  if !app.config.vim_keys || #len(text) == 0 {
+    return text
+  }
+  length := vim_regex_query(text, true, vim_ignore(app, text), app.vim.ex.replacement[..app.vim.ex.replacement_length], output, regex)
+  if !regex.ok {
+    // Not a valid PCRE2 pattern either, so the search reports it invalid.
+    return "("
+  }
+  return output[..length]
+}
+// Vim \% position items in a / search are callouts checked at their place
+// in the pattern, in document positions.
+struct SearchCallout { app: *App, doc: *buffer.Document, regex: VimRegex, cursor: usize, compiled: *pattern.Pattern }
+fn search_callout(block: rawptr, data: rawptr) i32 {
+  context := #cast(*SearchCallout, data)
+  number := #cast(usize, pattern.callout_number(block))
+  if number == 0 || number > context.regex.filter_count {
+    return 0
+  }
+  position := context.compiled.base + pattern.callout_position(block)
+  if vim_filter_check(context.app, context.doc, context.regex.filters[number - 1], position, context.cursor) {
+    return 0
+  }
+  return 1
+}
+
 struct SearchState {
   document: *buffer.Document,
   primary: buffer.Selection,
@@ -245,21 +274,32 @@ fn search_preview(app: *App) {
       return
     }
   }
-  if app.prompt_state.panel == Panel.Search && doc.length >= pattern.BackgroundMinimum && doc.secondary.count == 0 {
+  preview_regex := VimRegex{}
+  preview_query: [4400]u8 = []
+  typed: []const u8 = app.prompt_state.text[..app.prompt_state.length]
+  if app.prompt_state.panel == Panel.Search {
+    typed = search_query(app, typed, preview_query[..], &preview_regex)
+  }
+  // Position items need the document, so those searches stay here.
+  if app.prompt_state.panel == Panel.Search && doc.length >= pattern.BackgroundMinimum && doc.secondary.count == 0 && preview_regex.filter_count == 0 {
     backwards := app.input_state.search_backwards
     base := search_base(doc, buffer.Selection{anchor: doc.anchor, cursor: doc.cursor}, backwards)
-    state.task = pattern.task_start(app.prompt_state.text[..app.prompt_state.length], doc, base, backwards)
+    state.task = pattern.task_start(typed, doc, base, backwards)
     if state.task != nil {
       state.status = 5
       return
     }
   }
-  compiled := pattern.open(app.prompt_state.text[..app.prompt_state.length])
+  compiled := pattern.open(typed)
   defer pattern.close(&compiled)
   if !compiled.ok {
     state.status = 2
     state.error_offset = compiled.error_offset
     return
+  }
+  callout := SearchCallout{app: app, doc: state.document, regex: preview_regex, cursor: state.primary.cursor, compiled: &compiled}
+  if preview_regex.filter_count > 0 {
+    pattern.set_callout(&compiled, search_callout, #cast(rawptr, &callout))
   }
   if app.prompt_state.panel == Panel.Search {
     state.status = search_apply(state.document, &compiled, state.extend, app.input_state.search_backwards)
@@ -337,6 +377,7 @@ fn search_submit(app: *App) {
     return
   }
   if app.search_state.status != 0 {
+    macro_fail(app)
     return
   }
   if app.prompt_state.panel == Panel.Search {
@@ -358,16 +399,24 @@ fn search_repeat(app: *App, backwards: bool, explorer: bool) {
     doc = app.explorer.document
     extending = app.explorer.extend
   }
-  if doc.length >= pattern.BackgroundMinimum && doc.secondary.count == 0 && search_repeat_windowed(app, doc, extending, backwards) {
+  regex := VimRegex{}
+  query: [4400]u8 = []
+  typed := search_query(app, app.search_history.text[..app.search_history.length], query[..], &regex)
+  if doc.length >= pattern.BackgroundMinimum && doc.secondary.count == 0 && regex.filter_count == 0 && search_repeat_windowed(app, doc, extending, backwards) {
     return
   }
-  compiled := pattern.open(app.search_history.text[..app.search_history.length])
+  compiled := pattern.open(typed)
   defer pattern.close(&compiled)
   if !compiled.ok {
     return
   }
+  callout := SearchCallout{app: app, doc: doc, regex: regex, cursor: buffer.head(doc), compiled: &compiled}
+  if regex.filter_count > 0 {
+    pattern.set_callout(&compiled, search_callout, #cast(rawptr, &callout))
+  }
   result := search_apply(doc, &compiled, extending, backwards)
   if result != 0 {
+    macro_fail(app)
     notice(app, "No match, or search exceeded its work limit.")
   }
 }
@@ -375,7 +424,9 @@ fn search_repeat(app: *App, backwards: bool, explorer: bool) {
 // waiting for it: a backward step there never rescans from the top.
 fn search_repeat_windowed(app: *App, doc: *buffer.Document, extending: bool, backwards: bool) bool {
   original := buffer.Selection{anchor: doc.anchor, cursor: doc.cursor}
-  task := pattern.task_start(app.search_history.text[..app.search_history.length], doc, search_base(doc, original, backwards), backwards)
+  query: [4400]u8 = []
+  regex := VimRegex{}
+  task := pattern.task_start(search_query(app, app.search_history.text[..app.search_history.length], query[..], &regex), doc, search_base(doc, original, backwards), backwards)
   if task == nil {
     return false
   }
@@ -389,6 +440,7 @@ fn search_repeat_windowed(app: *App, doc: *buffer.Document, extending: bool, bac
     doc.anchor = selection.anchor
     doc.cursor = selection.cursor
   } else {
+    macro_fail(app)
     notice(app, "No match, or search exceeded its work limit.")
   }
   return true
