@@ -237,7 +237,7 @@ fn vim_leave_visual(app: *App) {
 // ---------------------------------------------------------------------------
 // Motions
 
-struct VimMotion { target: usize, linewise: bool, inclusive: bool, ok: bool, vertical: bool }
+struct VimMotion { target: usize, linewise: bool, inclusive: bool, valid: bool, vertical: bool }
 
 fn vim_class(doc: *const buffer.Document, at: usize, big: bool) u8 {
   if at >= doc.length {
@@ -393,7 +393,7 @@ fn vim_match(doc: *const buffer.Document, position: usize) VimMotion {
     else if byte == close {
       depth -= 1
       if depth == 0 {
-        return VimMotion{target: scan, inclusive: true, ok: true}
+        return VimMotion{target: scan, inclusive: true, valid: true}
       }
     }
     if forward {
@@ -455,7 +455,7 @@ fn vim_find(doc: *const buffer.Document, position: usize, kind: u32, text: []con
       at = buffer.next(doc, at)
     }
   }
-  return VimMotion{target: at, inclusive: forward, ok: true}
+  return VimMotion{target: at, inclusive: forward, valid: true}
 }
 // Rows on screen for H, M and L.
 fn vim_screen_row(app: *App, typography: *Typography, which: u32, count: usize) usize {
@@ -497,7 +497,7 @@ fn vim_search_target(app: *App, backwards: bool) VimMotion {
   doc.anchor = saved_anchor
   doc.cursor = saved_cursor
   doc.secondary.count = saved_secondary
-  return VimMotion{target: target, ok: target != before}
+  return VimMotion{target: target, valid: target != before}
 }
 
 // Motion for a character (or special key) from the head position.
@@ -519,14 +519,14 @@ fn vim_motion(app: *App, typography: *Typography, character: u32, key: u32, coun
       if target_row > vim_last_row(doc) {
         target_row = vim_last_row(doc)
       }
-      return VimMotion{target: vim_first_nonblank(doc, target_row), linewise: true, ok: true}
+      return VimMotion{target: vim_first_nonblank(doc, target_row), linewise: true, valid: true}
     }
     if character == 'e' || character == 'E' {
       at := head
       for step in 0..count {
         at = vim_word_end_back(doc, at, character == 'E')
       }
-      return VimMotion{target: at, inclusive: true, ok: true}
+      return VimMotion{target: at, inclusive: true, valid: true}
     }
     if character == '_' {
       last_row := row + count - 1
@@ -541,13 +541,13 @@ fn vim_motion(app: *App, typography: *Typography, character: u32, key: u32, coun
       if at > beginning {
         at = buffer.previous(doc, at)
       }
-      return VimMotion{target: at, inclusive: true, ok: true}
+      return VimMotion{target: at, inclusive: true, valid: true}
     }
     if character == 'j' || character == 'k' {
       return vim_motion(app, typography, character, key, count, has_count, false, operating)
     }
     if character == '0' {
-      return VimMotion{target: buffer.line_start(doc, head), ok: true}
+      return VimMotion{target: buffer.line_start(doc, head), valid: true}
     }
     return VimMotion{}
   }
@@ -560,7 +560,7 @@ fn vim_motion(app: *App, typography: *Typography, character: u32, key: u32, coun
       }
       at = buffer.previous(doc, at)
     }
-    return VimMotion{target: at, ok: at != head}
+    return VimMotion{target: at, valid: at != head}
   }
   if character == 'l' || key == KeyRight {
     at := head
@@ -573,7 +573,7 @@ fn vim_motion(app: *App, typography: *Typography, character: u32, key: u32, coun
       }
       at = following
     }
-    return VimMotion{target: at, ok: at != head || operating}
+    return VimMotion{target: at, valid: at != head || operating}
   }
   if character == 'j' || character == 'k' || key == KeyDown || key == KeyUp || key == KeyReturn || character == '+' || character == '-' || character == '_' {
     down := character == 'j' || key == KeyDown || key == KeyReturn || character == '+'
@@ -599,19 +599,19 @@ fn vim_motion(app: *App, typography: *Typography, character: u32, key: u32, coun
       return VimMotion{}
     }
     if key == KeyReturn || character == '+' || character == '-' || character == '_' {
-      return VimMotion{target: vim_first_nonblank(doc, target_row), linewise: true, ok: true}
+      return VimMotion{target: vim_first_nonblank(doc, target_row), linewise: true, valid: true}
     }
     if !app.vim.goal_valid {
       app.vim.goal = vim_column(doc, head)
       app.vim.goal_valid = true
     }
-    return VimMotion{target: vim_at_column(doc, target_row, app.vim.goal), linewise: true, ok: true, vertical: true}
+    return VimMotion{target: vim_at_column(doc, target_row, app.vim.goal), linewise: true, valid: true, vertical: true}
   }
   if character == '0' || key == KeyHome {
-    return VimMotion{target: buffer.line_start(doc, head), ok: true}
+    return VimMotion{target: buffer.line_start(doc, head), valid: true}
   }
   if character == '^' {
-    return VimMotion{target: buffer.line_nonblank(doc, head), ok: true}
+    return VimMotion{target: buffer.line_nonblank(doc, head), valid: true}
   }
   if character == '$' || key == KeyEnd {
     last_row := row + count - 1
@@ -625,45 +625,45 @@ fn vim_motion(app: *App, typography: *Typography, character: u32, key: u32, coun
     }
     app.vim.goal = VimLineEnd
     app.vim.goal_valid = true
-    return VimMotion{target: target, inclusive: true, ok: true, vertical: true}
+    return VimMotion{target: target, inclusive: true, valid: true, vertical: true}
   }
   if character == '|' {
-    return VimMotion{target: vim_at_column(doc, row, count - 1), ok: true}
+    return VimMotion{target: vim_at_column(doc, row, count - 1), valid: true}
   }
   if character == 'w' || character == 'W' {
     at := head
     for step in 0..count {
       at = vim_word_forward(doc, at, character == 'W')
     }
-    return VimMotion{target: at, ok: true}
+    return VimMotion{target: at, valid: true}
   }
   if character == 'b' || character == 'B' {
     at := head
     for step in 0..count {
       at = vim_word_back(doc, at, character == 'B')
     }
-    return VimMotion{target: at, ok: true}
+    return VimMotion{target: at, valid: true}
   }
   if character == 'e' || character == 'E' {
     at := head
     for step in 0..count {
       at = vim_word_end(doc, at, character == 'E')
     }
-    return VimMotion{target: at, inclusive: true, ok: true}
+    return VimMotion{target: at, inclusive: true, valid: true}
   }
   if character == 'G' {
     target_row := vim_last_row(doc)
     if has_count && count - 1 <= vim_last_row(doc) {
       target_row = count - 1
     }
-    return VimMotion{target: vim_first_nonblank(doc, target_row), linewise: true, ok: true}
+    return VimMotion{target: vim_first_nonblank(doc, target_row), linewise: true, valid: true}
   }
   if character == 'H' || character == 'M' || character == 'L' {
     screen_row := vim_screen_row(app, typography, character, count)
-    return VimMotion{target: vim_first_nonblank(doc, screen_row), linewise: true, ok: true}
+    return VimMotion{target: vim_first_nonblank(doc, screen_row), linewise: true, valid: true}
   }
   if character == '}' || character == '{' {
-    return VimMotion{target: vim_paragraph(doc, head, character == '}', count), ok: true}
+    return VimMotion{target: vim_paragraph(doc, head, character == '}', count), valid: true}
   }
   if character == '%' {
     if has_count {
@@ -674,7 +674,7 @@ fn vim_motion(app: *App, typography: *Typography, character: u32, key: u32, coun
       if percent_row > 0 {
         percent_row -= 1
       }
-      return VimMotion{target: vim_first_nonblank(doc, percent_row), linewise: true, ok: true}
+      return VimMotion{target: vim_first_nonblank(doc, percent_row), linewise: true, valid: true}
     }
     return vim_match(doc, head)
   }
@@ -1714,17 +1714,17 @@ fn vim_pending(app: *App, typography: *Typography, character: u32, key: u32) {
       index := #cast(usize, (character - 'a'))
       if (doc.named_marks & (#cast(u32, 1) << #cast(u32, index))) != 0 {
         motion.target = buffer.boundary(doc, doc.marks[buffer.NamedMarkBase + index])
-        motion.ok = true
+        motion.valid = true
       }
     }
     else if character == '`' || character == 39 {
-      motion.ok = vim_last_jump(app, &motion.target)
+      motion.valid = vim_last_jump(app, &motion.target)
     }
-    if motion.ok && pending == 39 {
+    if motion.valid && pending == 39 {
       motion.target = buffer.line_nonblank(doc, motion.target)
       motion.linewise = true
     }
-    if motion.ok && app.vim.operator == 0 && !vim_visual(app) {
+    if motion.valid && app.vim.operator == 0 && !vim_visual(app) {
       jump_push(app)
     }
     vim_finish_motion(app, motion, 1)
@@ -1900,7 +1900,7 @@ fn vim_last_jump(app: *App, target: *usize) bool {
   return true
 }
 fn vim_finish_motion(app: *App, motion: VimMotion, count: usize) {
-  if !motion.ok {
+  if !motion.valid {
     macro_fail(app)
     if app.vim.operator != 0 {
       app.vim.operator = 0
@@ -1938,7 +1938,7 @@ fn vim_apply_motion(app: *App, motion: VimMotion, character: u32, prefix_g: bool
   operator := app.vim.operator
   app.vim.operator = 0
   app.vim.operator_g = false
-  if !motion.ok {
+  if !motion.valid {
     vim_register_done(app)
     return
   }
@@ -2089,7 +2089,7 @@ fn vim_operator_key(app: *App, typography: *Typography, character: u32, key: u32
     for step in 1..count {
       at = vim_word_end(doc, at, big)
     }
-    vim_apply_motion(app, VimMotion{target: at, inclusive: true, ok: true}, character, false)
+    vim_apply_motion(app, VimMotion{target: at, inclusive: true, valid: true}, character, false)
     return
   }
   motion := vim_motion(app, typography, character, key, count, has_count, false, true)

@@ -70,8 +70,8 @@ struct VimExState {
   printed: [4096]u8,
   printed_length: usize,
 }
-struct VimRange { first, last: usize, given: usize, ok: bool }
-struct VimAddress { found, ok: bool, row: usize }
+struct VimRange { first, last: usize, given: usize, valid: bool }
+struct VimAddress { found, valid: bool, row: usize }
 
 fn vim_number(text: []const u8, at: *usize) usize {
   value: usize = 0
@@ -177,7 +177,7 @@ fn vim_compile(app: *App, source: []const u8, case: u8, regex: *VimRegex) patter
   query: [4400]u8 = []
   ignore := case == 'i' || (case == 0 && vim_ignore(app, source))
   length := vim_regex_query(source, true, ignore, app.vim.ex.replacement[..app.vim.ex.replacement_length], query[..], regex)
-  if !regex.ok {
+  if !regex.valid {
     return pattern.Pattern{}
   }
   return pattern.open(query[..length])
@@ -192,8 +192,8 @@ fn vim_search_row(app: *App, doc: *buffer.Document, source: []const u8, row: usi
   regex := VimRegex{}
   compiled := vim_compile(app, source, 0, &regex)
   defer pattern.close(&compiled)
-  if !compiled.ok {
-    if !regex.ok {
+  if !compiled.valid {
+    if !regex.valid {
       notice(app, regex.message)
     }
     else {
@@ -277,7 +277,7 @@ fn vim_mark_row(app: *App, doc: *buffer.Document, mark: u8, row: *usize) bool {
 }
 // One address with its offsets. base is the line . means.
 fn vim_address(app: *App, doc: *buffer.Document, text: []const u8, at: *usize, base: usize) VimAddress {
-  result := VimAddress{ok: true, row: base}
+  result := VimAddress{valid: true, row: base}
   vim_ex_skip_space(text, at)
   if at.* >= #len(text) {
     return result
@@ -304,7 +304,7 @@ fn vim_address(app: *App, doc: *buffer.Document, text: []const u8, at: *usize, b
   else if byte == 39 {
     if at.* + 1 >= #len(text) || !vim_mark_row(app, doc, text[at.* + 1], &result.row) {
       notice(app, "E20: Mark not set")
-      result.ok = false
+      result.valid = false
       return result
     }
     at.* += 2
@@ -318,11 +318,11 @@ fn vim_address(app: *App, doc: *buffer.Document, text: []const u8, at: *usize, b
     }
     if #len(source) == 0 {
       notice(app, "E35: No previous regular expression")
-      result.ok = false
+      result.valid = false
       return result
     }
     if !vim_search_row(app, doc, source, base, byte == '?', &result.row) {
-      result.ok = false
+      result.valid = false
       return result
     }
     vim_set_last_search(app, source)
@@ -339,11 +339,11 @@ fn vim_address(app: *App, doc: *buffer.Document, text: []const u8, at: *usize, b
     }
     if #len(source) == 0 {
       notice(app, "E35: No previous regular expression")
-      result.ok = false
+      result.valid = false
       return result
     }
     if !vim_search_row(app, doc, source, base, text[at.* + 1] == '?', &result.row) {
-      result.ok = false
+      result.valid = false
       return result
     }
     at.* += 2
@@ -368,7 +368,7 @@ fn vim_address(app: *App, doc: *buffer.Document, text: []const u8, at: *usize, b
     }
     else if amount > result.row {
       notice(app, "E16: Invalid range")
-      result.ok = false
+      result.valid = false
       return result
     }
     else {
@@ -379,7 +379,7 @@ fn vim_address(app: *App, doc: *buffer.Document, text: []const u8, at: *usize, b
 }
 fn vim_range(app: *App, doc: *buffer.Document, text: []const u8, at: *usize) VimRange {
   cursor_row := buffer.row_at(doc, buffer.head(doc))
-  result := VimRange{first: cursor_row, last: cursor_row, ok: true}
+  result := VimRange{first: cursor_row, last: cursor_row, valid: true}
   for at.* < #len(text) && (text[at.*] == ':' || text[at.*] == ' ' || text[at.*] == 9) {
     at.* += 1
   }
@@ -391,8 +391,8 @@ fn vim_range(app: *App, doc: *buffer.Document, text: []const u8, at: *usize) Vim
     return result
   }
   first := vim_address(app, doc, text, at, cursor_row)
-  if !first.ok {
-    result.ok = false
+  if !first.valid {
+    result.valid = false
     return result
   }
   if first.found {
@@ -408,8 +408,8 @@ fn vim_range(app: *App, doc: *buffer.Document, text: []const u8, at: *usize) Vim
     }
     at.* += 1
     second := vim_address(app, doc, text, at, base)
-    if !second.ok {
-      result.ok = false
+    if !second.valid {
+      result.valid = false
       return result
     }
     result.last = base
@@ -470,7 +470,7 @@ fn vim_ex_command(app: *App, typography: *Typography, text: []const u8) bool {
     return false
   }
   range := vim_range(app, doc, text, &at)
-  if !range.ok {
+  if !range.valid {
     return true
   }
   vim_ex_skip_space(text, &at)
@@ -879,9 +879,9 @@ fn vim_ex_substitute(app: *App, typography: *Typography, doc: *buffer.Document, 
   }
   job.replacement_length = state.replacement_length
   job.compiled = vim_compile(app, effective, flags.case, &job.regex)
-  if !job.compiled.ok {
+  if !job.compiled.valid {
     pattern.close(&job.compiled)
-    if !job.regex.ok {
+    if !job.regex.valid {
       return vim_ex_fail(app, job.regex.message)
     }
     return vim_ex_fail(app, "Invalid substitute pattern.")
@@ -1649,9 +1649,9 @@ fn vim_ex_global(app: *App, typography: *Typography, doc: *buffer.Document, rang
   // down, following the marks through the command's edits.
   job := VimSub{}
   job.compiled = vim_compile(app, saved[..saved_length], 0, &job.regex)
-  if !job.compiled.ok {
+  if !job.compiled.valid {
     pattern.close(&job.compiled)
-    if !job.regex.ok {
+    if !job.regex.valid {
       return vim_ex_fail(app, job.regex.message)
     }
     return vim_ex_fail(app, "Invalid pattern.")
@@ -2023,7 +2023,7 @@ fn vim_ex_destination(app: *App, doc: *buffer.Document, text: []const u8, at: *u
     return true
   }
   address := vim_address(app, doc, text, at, buffer.row_at(doc, buffer.head(doc)))
-  if !address.ok {
+  if !address.valid {
     return false
   }
   if address.row > vim_last_row(doc) {

@@ -27,7 +27,7 @@ fn write_payload(executable:bool, path:[]const u8) {
   buffer:[16384]u8=[]
   for {
     read:=fs.read(&opened.value,buffer[..])
-    if !read.ok { #panic("PE fixture read") }
+    if !read.valid { #panic("PE fixture read") }
     if read.transferred==0 { break }
     at:usize=0
     for at<read.transferred {

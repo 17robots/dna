@@ -93,7 +93,7 @@ fn main(){
  pixels:[4096]u8=[]
  surface:=software.Surface{pixels:pixels[..],width:16,height:8,stride:64}
  present:=renderer()
- for frame in 0..64{testing.expect(draw(&present,surface).ok,"warm present")}
+ for frame in 0..64{testing.expect(draw(&present,surface).failure.kind == io.Kind.Ok,"warm present")}
  // This is the red-cap: the old presenter reallocates 64 times here.
  testing.expect(images==1,"same-size frames must allocate texture once")
  testing.expect(updates==64 && quads==64,"each frame updates and draws")
@@ -102,7 +102,7 @@ fn main(){
  surface.width=24
 surface.height=10
 surface.stride=96
- testing.expect(draw(&present,surface).ok,"resize present")
+ testing.expect(draw(&present,surface).failure.kind == io.Kind.Ok,"resize present")
  testing.expect(images==2 && updates==65 && image_width==24 && image_height==10 && update_width==24 && update_height==10,"resize storage and full update")
  testing.expect(buffers==1,"resize must keep static vertex storage")
  surface.width=32
@@ -110,24 +110,24 @@ surface.height=12
 surface.stride=128
  fail_image=true
  before:=quads
- testing.expect(!draw(&present,surface).ok,"allocation error surfaced")
+ testing.expect(draw(&present,surface).failure.kind != io.Kind.Ok,"allocation error surfaced")
  testing.expect(images==3 && updates==65 && quads==before,"failed allocation never updates or draws")
- testing.expect(draw(&present,surface).ok,"allocation retry")
+ testing.expect(draw(&present,surface).failure.kind == io.Kind.Ok,"allocation retry")
  testing.expect(images==4 && updates==66 && quads==before+1,"allocation failure does not cache dimensions")
  fail_update=true
- testing.expect(!draw(&present,surface).ok,"upload error surfaced")
- testing.expect(draw(&present,surface).ok,"upload retry")
+ testing.expect(draw(&present,surface).failure.kind != io.Kind.Ok,"upload error surfaced")
+ testing.expect(draw(&present,surface).failure.kind == io.Kind.Ok,"upload retry")
  testing.expect(images==4 && updates==68,"upload failure preserves storage and retries content")
  surface.width=1025
  before=images
- testing.expect(!draw(&present,surface).ok && images==before,"over-limit input rejected before allocation")
+ testing.expect(draw(&present,surface).failure.kind != io.Kind.Ok && images==before,"over-limit input rejected before allocation")
  close(&present)
  testing.expect(present.program==0 && present.texture==0,"close clears resource state")
  present=renderer()
  surface.width=16
 surface.height=8
 surface.stride=64
- testing.expect(draw(&present,surface).ok && images==before+1,"recreated presenter allocates fresh storage")
+ testing.expect(draw(&present,surface).failure.kind == io.Kind.Ok && images==before+1,"recreated presenter allocates fresh storage")
  // A failed vertex allocation must retry even when texture storage succeeded.
  close(&present)
  present=renderer()
@@ -136,16 +136,16 @@ surface.stride=64
  before=quads
  vertex_attempts:=buffers
  fail_buffer=true
- testing.expect(!draw(&present,surface).ok && quads==before,"vertex allocation error surfaced before drawing")
- testing.expect(draw(&present,surface).ok && buffers==vertex_attempts+2,"vertex allocation retried")
+ testing.expect(draw(&present,surface).failure.kind != io.Kind.Ok && quads==before,"vertex allocation error surfaced before drawing")
+ testing.expect(draw(&present,surface).failure.kind == io.Kind.Ok && buffers==vertex_attempts+2,"vertex allocation retried")
  close(&present)
 }
 '''
 source=SOURCE.read_text()
 header='use "vendor/opengl" gl\nuse "std/ui"\nuse "std/ui/software"\nuse "std/io"\n'
 header+=re.search(r'pub struct Presenter \{[^\n]+',source).group()+'\n'
-header+='pub struct Result {kind:io.Kind,ok:bool}\n'
-header+='\n'.join(function(source,name) for name in ('healthy','quad','draw','close'))+'\n'
+header+='pub struct Result {failure:io.Failure}\n'
+header+='\n'.join(function(source,name) for name in ('healthy','healthy_result','quad','draw','close'))+'\n'
 with tempfile.TemporaryDirectory(prefix='dna-present-reuse-') as temporary:
     stage=Path(temporary)
     (stage/'main.dyn').write_text(header+FIXTURE)

@@ -39,7 +39,7 @@ pub fn test_read(path:*const u8,output:*u8,capacity:usize) isize {
   arena:=installer_windows_mem.arena_create(16384)
   defer installer_windows_mem.arena_release(arena)
   read:=installer_read_link(arena,path[..installer_windows_c.string_length(path,4096)])
-  if !read.ok { return read.error }
+  if !read.valid { return read.error }
   if #len(read.value)>=capacity { return -28 }
   for index in 0..#len(read.value) { output[..capacity][index]=read.value[index] }
   output[..capacity][#len(read.value)]=0

@@ -124,10 +124,10 @@ fn main() {''']
   if failure.ok || failure.error != -5 || failure.kind != errors.Kind.System || failure.found || calls() != 1 { #panic("native diagnostic") }
   set(3)
   missing := host.environment("valid", output[..0])
-  if !missing.ok || missing.found || #len(missing.value) != 0 || calls() != 1 { #panic("missing") }
+  if missing.failure.kind != io.Kind.Ok || missing.found || #len(missing.value) != 0 || calls() != 1 { #panic("missing") }
   set(4)
   empty := host.environment("valid", output[..0])
-  if !empty.ok || !empty.found || #len(empty.value) != 0 || calls() != 1 { #panic("empty") }
+  if empty.failure.kind != io.Kind.Ok || !empty.found || #len(empty.value) != 0 || calls() != 1 { #panic("empty") }
 }''']
     (stage / 'main.dyn').write_text('\n'.join(source))
     for mode in ('debug', 'release'):

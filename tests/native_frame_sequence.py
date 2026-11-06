@@ -16,6 +16,7 @@ ROOT=Path(__file__).resolve().parents[1]
 FIXTURE=r'''use "vendor/window/wayland" window_api
 use "vendor/window/events"
 use "std/ui/software"
+use "std/io" io
 use "std/mem"
 use "./presenter" presenter
 #link("c")
@@ -41,7 +42,7 @@ fn main() {
  window_api.listen_events(&host,true)
  _=window_api.set_swap_interval(&host,0)
  renderer:=presenter.Presenter{}
- check(presenter.open(&renderer).ok,"sequence presenter")
+ check(presenter.open(&renderer).failure.kind == io.Kind.Ok,"sequence presenter")
  defer presenter.close(&renderer)
  owner:=mem.arena_create(0)
  defer mem.arena_release(owner)
@@ -83,12 +84,12 @@ fn main() {
    height=max_height/2}
   length:=#cast(usize,width)*#cast(usize,height)*4
   surface:=software.Surface{pixels:pixels[..length],width:width,height:height,stride:#cast(usize,width)*4}
-  check(presenter.draw(&renderer,surface).ok,"sequence upload")
+  check(presenter.draw(&renderer,surface).failure.kind == io.Kind.Ok,"sequence upload")
   verify(&renderer,surface,readback[..length])
   check(window_api.swap(&host).ok,"sequence swap")
   if frame%53==27 {
    presenter.close(&renderer)
-   check(presenter.open(&renderer).ok,"sequence recreate")
+   check(presenter.open(&renderer).failure.kind == io.Kind.Ok,"sequence recreate")
   }
  }
 }

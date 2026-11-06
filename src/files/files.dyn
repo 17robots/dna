@@ -112,7 +112,7 @@ pub fn metadata(path: []const u8) fs.Metadata {
 }
 // A whole file read into its own reserved mapping, outside the bounded frame
 // scratch. Release with release_text once copied; FileText owns its arena.
-pub struct FileText { arena: *mem.Arena, storage: buffer.TextStorage, data: []const u8, stamp: fs.Stamp, ok: bool, too_large: bool }
+pub struct FileText { arena: *mem.Arena, storage: buffer.TextStorage, data: []const u8, stamp: fs.Stamp, valid: bool, too_large: bool }
 
 // Text that is copied whole elsewhere (formatters, language servers, project
 // edits) is bounded by buffer.Capacity.
@@ -167,12 +167,12 @@ fn save_seed(destination: []const u8, temporary: []const u8, snapshot: *const bu
     if source.descriptor >= 0 && source.offset == #cast(u64, at) {
       origin := fs.File{descriptor: source.descriptor, active: true, owned: false}
       before := fs.file_stamp(&origin)
-      if before.ok && same_values(stamp_values(before), source.stamp) {
+      if before.valid && same_values(stamp_values(before), source.stamp) {
         cloned := fs.clone_exclusive(&origin, temporary)
         if cloned.failure.kind == io.Kind.Ok {
           transaction := fs.AtomicFile{file: cloned.value, destination: destination, temporary: temporary, active: true}
           after := fs.file_stamp(&origin)
-          if after.ok && same_stamp(before, after) {
+          if after.valid && same_stamp(before, after) {
             seed.descriptor = source.descriptor
             seed.stamp = source.stamp
             return fs.AtomicResult{transaction: transaction}
@@ -200,7 +200,7 @@ fn mapped_sources_current(snapshot: *const buffer.TextSnapshot) bool {
       checked_stamp = source.stamp
       origin := fs.File{descriptor: source.descriptor, active: true, owned: false}
       now := fs.file_stamp(&origin)
-      if !now.ok || !same_values(stamp_values(now), source.stamp) {
+      if !now.valid || !same_values(stamp_values(now), source.stamp) {
         return false
       }
     }
@@ -227,7 +227,7 @@ fn write_document(file: *fs.File, snapshot: *const buffer.TextSnapshot, seed: *c
         checked = source.descriptor
         checked_stamp = source.stamp
         now := fs.file_stamp(&origin)
-        usable = now.ok && same_values(stamp_values(now), source.stamp)
+        usable = now.valid && same_values(stamp_values(now), source.stamp)
         current = usable
       }
       if usable {
@@ -289,7 +289,7 @@ fn read_mapped(path: []const u8) FileText {
     return FileText{}
   }
   stamp := fs.file_stamp(&opened.value)
-  if stamp.ok && stamp.size >= #cast(u64, OriginMinimum) && #cast(usize, stamp.size) < DocumentLimit {
+  if stamp.valid && stamp.size >= #cast(u64, OriginMinimum) && #cast(usize, stamp.size) < DocumentLimit {
     bytes := mapper.map(opened.value.descriptor, stamp.size)
     if bytes != nil {
       result := FileText{storage: buffer.storage_mapped(bytes, #cast(usize, stamp.size), mapper.unmap)}
@@ -297,7 +297,7 @@ fn read_mapped(path: []const u8) FileText {
         buffer.storage_set_origin(&result.storage, opened.value.descriptor, stamp_values(stamp), close_origin)
         result.stamp = stamp
         result.data = result.storage.bytes
-        result.ok = true
+        result.valid = true
         return result
       }
       mapper.unmap(bytes, stamp.size)
@@ -309,7 +309,7 @@ fn read_mapped(path: []const u8) FileText {
 fn read_bounded(path: []const u8, limit: usize) FileText {
   if limit > buffer.Capacity && mapper.map != nil {
     mapped := read_mapped(path)
-    if mapped.ok {
+    if mapped.valid {
       return mapped
     }
   }
@@ -365,14 +365,14 @@ fn read_bounded(path: []const u8, limit: usize) FileText {
   // A large document keeps its file open: while the file's stamp is
   // unchanged, saving copies untouched ranges from it in-kernel.
   after := fs.file_stamp(&opened.value)
-  if !failed && !result.too_large && result.storage.block != nil && total >= OriginMinimum && before.ok && after.ok && same_stamp(before, after) && after.size == #cast(u64, total) {
+  if !failed && !result.too_large && result.storage.block != nil && total >= OriginMinimum && before.valid && after.valid && same_stamp(before, after) && after.size == #cast(u64, total) {
     buffer.storage_set_origin(&result.storage, opened.value.descriptor, stamp_values(after), close_origin)
     result.stamp = after
     result.data = storage[..total]
-    result.ok = true
+    result.valid = true
     return result
   }
-  if before.ok && after.ok && same_stamp(before, after) && after.size == #cast(u64, total) {
+  if before.valid && after.valid && same_stamp(before, after) && after.size == #cast(u64, total) {
     result.stamp = after
   }
   fs.close(&opened.value)
@@ -382,7 +382,7 @@ fn read_bounded(path: []const u8, limit: usize) FileText {
     return FileText{too_large: too_large}
   }
   result.data = storage[..total]
-  result.ok = true
+  result.valid = true
   return result
 }
 // The start of a file for previews: up to maximum bytes from arena, cut back
@@ -420,7 +420,7 @@ pub fn release_text(text: *FileText) {
   buffer.storage_release(&text.storage)
   text.arena = nil
   text.data = text.data[..0]
-  text.ok = false
+  text.valid = false
 }
 pub fn open(state: *State, document: *buffer.Document, path: []const u8, scratch: *mem.Arena) []const u8 {
   if buffer.dirty(document) {
@@ -442,7 +442,7 @@ pub fn open(state: *State, document: *buffer.Document, path: []const u8, scratch
   if read.too_large {
     return "File is too large to open."
   }
-  if !read.ok {
+  if !read.valid {
     return "Read failed."
   }
   // Stage the name before loading: load validates once and leaves the old
@@ -470,15 +470,15 @@ fn path_stamp(path: []const u8) fs.Stamp {
   return stamp
 }
 fn unchanged(state: *const State, document: *const buffer.Document, path: []const u8, scratch: *mem.Arena) bool {
-  if state.stamp.ok {
+  if state.stamp.valid {
     current := path_stamp(path)
-    if current.ok && same_stamp(current, state.stamp) {
+    if current.valid && same_stamp(current, state.stamp) {
       return true
     }
   }
   read := read_document(path)
   defer release_text(&read)
-  return read.ok && buffer.saved_equal(document, read.data)
+  return read.valid && buffer.saved_equal(document, read.data)
 }
 // Saving runs in three steps so a large document can write on a worker:
 // save_start checks the destination and opens the temporary file,
@@ -596,11 +596,11 @@ pub fn save_finish(job: *SaveJob, state: *State, document: *buffer.Document, scr
     checked: isize = -1
     for at < job.snapshot.length {
       source := buffer.snapshot_source_at(&job.snapshot, at)
-      if source.descriptor >= 0 && source.descriptor != checked && state.stamp.ok && same_values(source.stamp, stamp_values(state.stamp)) {
+      if source.descriptor >= 0 && source.descriptor != checked && state.stamp.valid && same_values(source.stamp, stamp_values(state.stamp)) {
         checked = source.descriptor
         origin := fs.File{descriptor: source.descriptor, active: true, owned: false}
         now := fs.file_stamp(&origin)
-        if now.ok && now.inode == state.stamp.inode && now.size == state.stamp.size && now.modify_seconds == state.stamp.modify_seconds && now.modify_nanos == state.stamp.modify_nanos {
+        if now.valid && now.inode == state.stamp.inode && now.size == state.stamp.size && now.modify_seconds == state.stamp.modify_seconds && now.modify_nanos == state.stamp.modify_nanos {
           buffer.snapshot_origin_stamp(&job.snapshot, at, source.descriptor, stamp_values(now))
         }
       }
@@ -654,7 +654,7 @@ pub fn recover(state: *State, document: *buffer.Document, scratch: *mem.Arena) [
   }
   result := read_text(path)
   defer release_text(&result)
-  if !result.ok || !buffer.valid(result.data) {
+  if !result.valid || !buffer.valid(result.data) {
     return "No readable text recovery snapshot."
   }
   document.anchor = 0

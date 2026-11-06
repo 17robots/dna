@@ -30,7 +30,7 @@ fn command_tests() {
   root:=host.environment("DNA_COMMAND_ROOT",root_storage[..])
   helper:=host.environment("DNA_COMMAND_HELPER",helper_storage[..])
   script:=host.environment("DNA_COMMAND_SCRIPT",script_storage[..])
-  if !root.ok || !root.found || !helper.ok || !helper.found || !script.ok || !script.found { #panic("command fixture environment") }
+  if root.failure.kind != io.Kind.Ok || !root.found || !helper.ok || !helper.found || !script.ok || !script.found { #panic("command fixture environment") }
   command:[32768]u8=[]
   used:usize=0
   if !platform_language_command(command[..],&used,root.value,helper.value,"-c",script.value) || used==0 || command[used]!=0 { #panic("language command builder") }

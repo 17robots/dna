@@ -6,8 +6,14 @@ use "std/io"
 // blending, scissor, depth/cull/stencil and unpack state. Caller resets as needed.
 // Target framebuffer must be opaque for conventional straight-alpha blending.
 pub struct Presenter { api: gl.Api, program: u32, vao: u32, buffer: u32, texture: u32, sampler: i32, vertices_ready: bool, max_texture: i32, texture_width: i32, texture_height: i32 }
-pub struct Result { kind: io.Kind, ok: bool }
+pub struct Result { failure: io.Failure }
 // Drains the context error flags. Preexisting errors also fail the operation.
+fn healthy_result(api: *const gl.Api) Result {
+  if healthy(api) {
+    return Result{}
+  }
+  return Result{ failure: io.Failure{ kind: io.Kind.System } }
+}
 fn healthy(api: *const gl.Api) bool {
   ok := true
   error := api.get_error()
@@ -37,15 +43,15 @@ fn shader(api: *const gl.Api, kind: u32, source: []const u8) u32 {
 pub fn open(renderer: *Presenter) Result {
   loaded := gl.load(window_api.gl_proc)
   if !loaded.ok {
-    return Result{kind:io.Kind.System}
+    return Result{ failure: io.Failure{ kind: io.Kind.System } }
   }
   api := loaded.api
   if renderer.program != 0 {
-    return Result{kind:io.Kind.InvalidState}
+    return Result{ failure: io.Failure{ kind: io.Kind.InvalidState } }
   }
   // Pass a successfully loaded GL 3.3 table from vendor/opengl.load.
   if !healthy(&api) {
-    return Result{kind:io.Kind.System}
+    return Result{ failure: io.Failure{ kind: io.Kind.System } }
   }
   vertex := shader(&api, gl.VertexShader, "#version 330 core\nlayout(location=0) in vec2 p; layout(location=1) in vec2 t; out vec2 uv; void main(){uv=t;gl_Position=vec4(p.x*2.-1.,1.-p.y*2.,0.,1.);}")
   fragment := shader(&api, gl.FragmentShader, "#version 330 core\nin vec2 uv; uniform sampler2D image; out vec4 color; void main(){color=texture(image,uv);}")
@@ -56,7 +62,7 @@ pub fn open(renderer: *Presenter) Result {
     if fragment != 0 {
       api.delete_shader(fragment)
     }
-    return Result{kind:io.Kind.System}
+    return Result{ failure: io.Failure{ kind: io.Kind.System } }
   }
   renderer.api = api
   api.get_integer(gl.MaxTextureSize, &renderer.max_texture)
@@ -70,7 +76,7 @@ pub fn open(renderer: *Presenter) Result {
   api.get_program_iv(renderer.program, gl.LinkStatus, &valid)
   if valid == 0 {
     close(renderer)
-    return Result{kind:io.Kind.System}
+    return Result{ failure: io.Failure{ kind: io.Kind.System } }
   }
   sampler_name := "image\x00"
   renderer.sampler = api.get_uniform_location(renderer.program, &sampler_name[0])
@@ -87,9 +93,9 @@ pub fn open(renderer: *Presenter) Result {
   valid_api := healthy(&api)
   if !valid_resources || !valid_api {
     close(renderer)
-    return Result{kind:io.Kind.System}
+    return Result{ failure: io.Failure{ kind: io.Kind.System } }
   }
-  return Result{ok:true}
+  return Result{}
 }
 pub fn close(renderer: *Presenter) {
   if renderer.program == 0 {
@@ -116,7 +122,7 @@ fn quad(renderer: *Presenter) bool {
 }
 pub fn draw(renderer: *Presenter, surface: software.Surface) Result {
   if renderer.program==0 || surface.width<=0 || surface.height<=0 || surface.width>renderer.max_texture || surface.height>renderer.max_texture {
-    return Result{kind:io.Kind.InvalidState}
+    return Result{ failure: io.Failure{ kind: io.Kind.InvalidState } }
   }
   api:=&renderer.api
   api.viewport(0, 0, surface.width, surface.height)
@@ -148,14 +154,14 @@ pub fn draw(renderer: *Presenter, surface: software.Surface) Result {
     }
     api.tex_image_2d(gl.Texture2d, 0, #cast(i32, gl.Rgba8), surface.width, surface.height, 0, gl.Rgba, gl.UnsignedByte, nil)
     if !healthy(api) {
-      return Result{kind:io.Kind.System}
+      return Result{ failure: io.Failure{ kind: io.Kind.System } }
     }
     renderer.texture_width = surface.width
     renderer.texture_height = surface.height
   }
   api.tex_sub_image_2d(gl.Texture2d, 0, 0, 0, surface.width, surface.height, gl.Rgba, gl.UnsignedByte, #cast(rawptr, &surface.pixels[0]))
   if !quad(renderer) {
-    return Result{kind:io.Kind.System}
+    return Result{ failure: io.Failure{ kind: io.Kind.System } }
   }
-  return Result{ok:healthy(api)}
+  return healthy_result(api)
 }

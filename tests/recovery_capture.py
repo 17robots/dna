@@ -130,7 +130,7 @@ fn main() {
  check(clean.buffers[0].reload && !clean.buffers[0].patched)
  // Capture an actual small replacement in a document larger than the old
  // recovery threshold, then decode and apply the production restore branch.
- slot.file.stamp=fs.Stamp{ok:true,inode:11,size:#cast(u64,original),modify_seconds:13,modify_nanos:14}
+ slot.file.stamp=fs.Stamp{valid:true,inode:11,size:#cast(u64,original),modify_seconds:13,modify_nanos:14}
  middle:=original/2
  document.anchor=middle
  document.cursor=middle+3
@@ -159,10 +159,10 @@ fn main() {
  check(!restore_patch(&app,restored,&invalid,slot.file.stamp))
  // Missing baseline identity fails before submission, preserving the exact
  // previously encoded recovery record.
- slot.file.stamp.ok=false
+ slot.file.stamp.valid=false
  capture(&app)
  assert_retained(previous[..previous_length],2,&app)
- slot.file.stamp.ok=true
+ slot.file.stamp.valid=true
  // Two distant one-byte edits span 40 MiB: capture records pieces of the
  // file plus only the new bytes, and restore rebuilds the same text.
  document.anchor=0
@@ -216,7 +216,7 @@ with tempfile.TemporaryDirectory(prefix="dna-recovery-capture-") as temporary:
     for module in ("buffer", "workspace", "owned_arena"):
         shutil.copytree(ROOT / "src" / module, stage / module)
     for name, contents in {
-        "fs": '''pub struct Stamp {inode:u64,size:u64,modify_seconds:u64,modify_nanos:u64,ok:bool}
+        "fs": '''pub struct Stamp {inode:u64,size:u64,modify_seconds:u64,modify_nanos:u64,valid: bool}
 ''',
         "files": '''use "../fs" fs
 pub struct State {length:usize,stamp:fs.Stamp}

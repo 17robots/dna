@@ -77,7 +77,7 @@ pub fn equal(a:[]const u8,b:[]const u8) bool { if #len(a)!=#len(b) {return false
 '''
 FILES = '''pub struct State { path:[4096]u8, length:usize }
 pub fn name(file:*const State) []const u8 { return file.path[..file.length] }
-pub struct Stamp { inode, size, modify_seconds, modify_nanos, change_seconds, change_nanos: u64, ok: bool }
+pub struct Stamp { inode, size, modify_seconds, modify_nanos, change_seconds, change_nanos: u64, valid: bool }
 pub fn saved_stamp(file:*const State) Stamp { _ = file
   return Stamp{} }
 pub fn forget_stamp(file:*State) { _ = file }

@@ -105,8 +105,8 @@ pub fn release(state: *State) {
   }
   state.additional = state.additional[..0]
 }
-struct Reader { bytes: []const u8, at: usize, ok: bool}
-struct Writer { bytes: []u8, at: usize, ok: bool}
+struct Reader { bytes: []const u8, at: usize, valid: bool}
+struct Writer { bytes: []u8, at: usize, valid: bool}
 
 fn flag(value: bool) usize {
   if value {
@@ -116,7 +116,7 @@ fn flag(value: bool) usize {
 }
 fn number(out: *Writer, value: usize) {
   if #len(out.bytes) - out.at < 8 {
-    out.ok = false
+    out.valid = false
     return
   }
   for offset in 0..8 {
@@ -127,7 +127,7 @@ fn number(out: *Writer, value: usize) {
 fn text(out: *Writer, value: []const u8) {
   number(out, #len(value))
   if #len(value) > #len(out.bytes) - out.at {
-    out.ok = false
+    out.valid = false
     return
   }
   if #len(value) > 0 {
@@ -137,7 +137,7 @@ fn text(out: *Writer, value: []const u8) {
 }
 fn get_number(input: *Reader) usize {
   if #len(input.bytes) - input.at < 8 {
-    input.ok = false
+    input.valid = false
     return 0
   }
   value: usize = 0
@@ -151,7 +151,7 @@ fn get_number(input: *Reader) usize {
 fn get_bytes(input: *Reader, limit: usize) []const u8 {
   length := get_number(input)
   if length > limit || length > #len(input.bytes) - input.at {
-    input.ok = false
+    input.valid = false
     return ""
   }
   result := input.bytes[input.at..input.at + length]
@@ -161,23 +161,23 @@ fn get_bytes(input: *Reader, limit: usize) []const u8 {
 fn get_text(input: *Reader, limit: usize) []const u8 {
   length := get_number(input)
   if length > limit || length > #len(input.bytes) - input.at {
-    input.ok = false
+    input.valid = false
     return ""
   }
   result := input.bytes[input.at..input.at + length]
   input.at += length
   if !utf8.valid(result) {
-    input.ok = false
+    input.valid = false
   }
   for byte in result {
     if byte == 0 {
-      input.ok = false
+      input.valid = false
     }
   }
   return result
 }
 pub fn encode(state: *const State, output: []u8) usize {
-  writer := Writer{bytes: output, ok: true}
+  writer := Writer{bytes: output, valid: true}
   if #len(state.additional) > 0 {
     text(&writer, "DNA session 3")
   }
@@ -230,7 +230,7 @@ pub fn encode(state: *const State, output: []u8) usize {
         }
         number(&writer, length)
         if length > #len(writer.bytes) - writer.at {
-          writer.ok = false
+          writer.valid = false
         } else {
           for part in item.saved_parts {
             if #len(part) > 0 {
@@ -266,7 +266,7 @@ pub fn encode(state: *const State, output: []u8) usize {
       selections(&writer, &pane.secondary)
     }
   }
-  if !writer.ok {
+  if !writer.valid {
     return 0
   }
   return writer.at
@@ -309,7 +309,7 @@ pub fn decode(source: []const u8, state: *State) bool {
       release(state)
     }
   }
-  reader := Reader{bytes: source, ok: true}
+  reader := Reader{bytes: source, valid: true}
   version := get_text(&reader, 32)
   dynamic := buffer.equal(version, "DNA session 3")
   newer := dynamic || buffer.equal(version, "DNA session 2")
@@ -321,7 +321,7 @@ pub fn decode(source: []const u8, state: *State) bool {
   state.focused = get_number(&reader)
   if dynamic {
     count := get_number(&reader)
-    if !reader.ok || count <= 16 || count > (#len(source) - reader.at) / 8 || !prepare(state, count) {
+    if !reader.valid || count <= 16 || count > (#len(source) - reader.at) / 8 || !prepare(state, count) {
       return false
     }
   }
@@ -431,7 +431,7 @@ pub fn decode(source: []const u8, state: *State) bool {
       }
     }
   }
-  if !reader.ok || reader.at != #len(source) || state.active >= buffer_count(state) || state.focused >= 15 || !buffer_at(state, state.active).used || !state.panes[state.focused].used || state.panes[state.focused].branch || state.panes[state.focused].slot != state.active {
+  if !reader.valid || reader.at != #len(source) || state.active >= buffer_count(state) || state.focused >= 15 || !buffer_at(state, state.active).used || !state.panes[state.focused].used || state.panes[state.focused].branch || state.panes[state.focused].slot != state.active {
     return false
   }
   seen: u32 = 0
@@ -486,7 +486,7 @@ pub fn encoded_size(state: *const State) usize {
 }
 fn selections(out: *Writer, set: *const buffer.SelectionSet) {
   if set.count > 31 {
-    out.ok = false
+    out.valid = false
     return
   }
   number(out, set.count)
@@ -510,5 +510,5 @@ fn get_selections(input: *Reader, set: *buffer.SelectionSet, limit: usize) bool 
     set.ranges[index] = buffer.Selection{cursor: cursor, anchor: anchor}
     index += 1
   }
-  return input.ok
+  return input.valid
 }

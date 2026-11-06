@@ -19,7 +19,7 @@ struct LoadJob {
   counts: *usize,
   tables: **u16,
   fill: bool,
-  ok: bool,
+  valid: bool,
   // Set for background loads (lazy.dyn), which count finished jobs.
   owner: *LazyLoad,
 }
@@ -62,7 +62,7 @@ fn load_job_run(context: rawptr) isize {
   for high < job.total && (text[high] & 192) == 128 {
     high += 1
   }
-  job.ok = valid(text[low..high])
+  job.valid = valid(text[low..high])
   for leaf in job.first..job.last {
     #slice(job.counts, job.last)[leaf] = rope_newlines_in(&text[leaf * LeafLimit], leaf_length(job.total, leaf))
   }
@@ -111,10 +111,10 @@ fn load_run(jobs: []LoadJob) {
 }
 // Validate a block's first total bytes and build its tree, using every CPU
 // for large blocks. Returns nil with ok false for text that is not UTF-8.
-struct LoadResult { root: *RopeNode, ok: bool }
+struct LoadResult { root: *RopeNode, valid: bool }
 fn rope_load_block(block: *RopeBlock, total: usize) LoadResult {
   if total == 0 {
-    return LoadResult{ok: true}
+    return LoadResult{valid: true}
   }
   workers := load_cpus()
   if workers > ParallelWorkers {
@@ -124,7 +124,7 @@ fn rope_load_block(block: *RopeBlock, total: usize) LoadResult {
     if !valid(#slice(block.bytes, total)) {
       return LoadResult{}
     }
-    return LoadResult{root: rope_from_block(block, total), ok: true}
+    return LoadResult{root: rope_from_block(block, total), valid: true}
   }
   leaves := (total + LeafLimit - 1) / LeafLimit
   counts := #cast(*usize, rope_malloc(leaves * #sizeof(usize)))
@@ -141,7 +141,7 @@ fn rope_load_block(block: *RopeBlock, total: usize) LoadResult {
   }
   load_run(jobs)
   for index in 0..workers {
-    if !jobs[index].ok {
+    if !jobs[index].valid {
       return LoadResult{}
     }
   }
@@ -159,7 +159,7 @@ fn rope_load_block(block: *RopeBlock, total: usize) LoadResult {
     jobs[index].fill = true
   }
   load_run(jobs)
-  return LoadResult{root: rope_build_prepared(block, block.bytes, total, 0, leaves, counts, tables), ok: true}
+  return LoadResult{root: rope_build_prepared(block, block.bytes, total, 0, leaves, counts, tables), valid: true}
 }
 // Leaves over data (inside block) of total bytes, LeafLimit each from data.
 fn rope_build_prepared(block: *RopeBlock, data: *const u8, total: usize, first: usize, count: usize, counts: *usize, tables: **u16) *RopeNode {

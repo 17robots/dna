@@ -47,7 +47,7 @@ fn main() {
  destination.x=40.0
  native_check(sdl_render_texture(renderer,texture,nil,&destination) && native_pixel(40,10,0,64,0,255),"modulated texture alpha")
  sdl_destroy_texture(texture)
- native_check(native_present.draw(&native_gui.presenter,native_gui.surface).ok,"GPU upload")
+ native_check(native_present.draw(&native_gui.presenter,native_gui.surface).failure.kind == io.Kind.Ok,"GPU upload")
  pixel: [4]u8=[]
  api:=&native_gui.presenter.api
  api.pixel_store_i(3333,1)
@@ -56,7 +56,7 @@ fn main() {
  // Reuse existing texture storage but replace its content on the next frame.
  changed:=Rect{x:20.0,y:10.0,width:1.0,height:1.0}
  native_check(sdl_color(renderer,17,83,201,255) && sdl_fill(renderer,&changed),"changed second frame")
- native_check(native_present.draw(&native_gui.presenter,native_gui.surface).ok,"same-size GPU update")
+ native_check(native_present.draw(&native_gui.presenter,native_gui.surface).failure.kind == io.Kind.Ok,"same-size GPU update")
  api.read_pixels(20,native_gui.surface.height-1-10,1,1,6408,5121,#cast(rawptr,&pixel[0]))
  native_check(pixel[0]==17 && pixel[1]==83 && pixel[2]==201,"same-size upload replaces GPU pixel")
  // Exercise resized texture storage without relying on compositor window sizing.
@@ -71,12 +71,12 @@ fn main() {
  resized_pixels[3069]=31
  resized_pixels[3070]=19
  resized:=software.Surface{pixels:resized_pixels[..],width:32,height:24,stride:128}
- native_check(native_present.draw(&native_gui.presenter,resized).ok,"resized GPU upload")
+ native_check(native_present.draw(&native_gui.presenter,resized).failure.kind == io.Kind.Ok,"resized GPU upload")
  api.read_pixels(0,23,1,1,6408,5121,#cast(rawptr,&pixel[0]))
  native_check(pixel[0]==51 && pixel[1]==129 && pixel[2]==207,"resized top-left GPU pixel")
  api.read_pixels(31,0,1,1,6408,5121,#cast(rawptr,&pixel[0]))
  native_check(pixel[0]==201 && pixel[1]==31 && pixel[2]==19,"resized bottom-right GPU pixel")
- native_check(native_present.draw(&native_gui.presenter,native_gui.surface).ok,"restore full-size GPU upload")
+ native_check(native_present.draw(&native_gui.presenter,native_gui.surface).failure.kind == io.Kind.Ok,"restore full-size GPU upload")
  api.read_pixels(20,native_gui.surface.height-1-10,1,1,6408,5121,#cast(rawptr,&pixel[0]))
  native_check(pixel[0]==17 && pixel[1]==83 && pixel[2]==201,"restored full-size GPU pixel")
  // One A8 source texel must cover the scaled 2 by 3 destination rectangle.
