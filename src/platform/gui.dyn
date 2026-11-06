@@ -31,7 +31,8 @@ struct NativeGui {
   requested_width: i32,
   requested_height: i32,
   injected: [128]Event,
-  injected_text: [128][4097]u8,
+  injected_arena: *mem.Arena,
+  injected_text: []u8,
   injected_count: usize,
   deferred: [128]events.Event,
   deferred_count: usize,
@@ -47,6 +48,7 @@ struct NativeGui {
   click_valid: bool,
   character: u32,
   payload: [65537]u8,
+  closed: bool,
 }
 native_gui: NativeGui
 pub fn init(flags: u32) bool {
@@ -60,7 +62,10 @@ fn sdl_create_window(title: *const u8, width, height: i32, flags: u64) rawptr {
   if native_gui.presenter.program!=0 || native_gui.gpu.program!=0 {
     return nil
   }
-  native_gui=NativeGui{}
+  // Static storage starts zero. Clearing it again would touch every page.
+  if native_gui.closed {
+    native_gui=NativeGui{}
+  }
   native_gui.draw_alpha=255
   result := window_api.open(&native_gui.window, #slice(title, c.string_length(title, 4096)), width, height)
   if !result.ok {
@@ -145,6 +150,11 @@ fn sdl_destroy_renderer(renderer: rawptr) {
   native_present.gpu_close(&native_gui.gpu)
   mem.arena_release(native_gui.pixels)
   native_gui.pixels = nil
+  if native_gui.injected_arena!=nil {
+    mem.arena_release(native_gui.injected_arena)
+    native_gui.injected_arena=nil
+  }
+  native_gui.closed=true
   native_gui.surface=software.Surface{}
   native_gui.viewport=PixelRect{}
   native_gui.target=nil
@@ -828,14 +838,17 @@ fn sdl_poll(event:*Event) bool {
     event.*=native_gui.injected[0]
     kind:=#cast(u32, event.words[0]&4294967295)
     if kind==770 || kind==771 {
-      n:=c.string_length(&native_gui.injected_text[0][0], 4097)
-      _=mem.copy(native_gui.payload[..n+1], native_gui.injected_text[0][..n+1])
+      slot:=injected_slot(0)
+      n:=c.string_length(&slot[0], 4097)
+      _=mem.copy(native_gui.payload[..n+1], slot[..n+1])
       #cast(*TextEvent, event).text=&native_gui.payload[0]
     }
     native_gui.injected_count-=1
     for i in 0..native_gui.injected_count {
       native_gui.injected[i]=native_gui.injected[i+1]
-      native_gui.injected_text[i]=native_gui.injected_text[i+1]
+      if native_gui.injected_arena!=nil {
+        _=mem.copy(injected_slot(i), injected_slot(i+1))
+      }
     }
     return true
   }
@@ -880,6 +893,14 @@ fn sdl_wait_timeout(event:*Event, milliseconds:i32) bool {
 fn sdl_wait(event:*Event) bool {
   return sdl_wait_timeout(event, -1)
 }
+// Injected text is rare, so its 525 KB table exists only after the first use.
+fn injected_slot(index:usize) []u8 {
+  if native_gui.injected_arena==nil {
+    native_gui.injected_arena=mem.arena_create(128*4097+65536)
+    native_gui.injected_text=#slice(mem.arena_push(native_gui.injected_arena, 128*4097, 1), 128*4097)
+  }
+  return native_gui.injected_text[index*4097..(index+1)*4097]
+}
 fn sdl_push(event:*Event) bool {
   if event==nil || native_gui.injected_count>=128 {
     return false
@@ -896,8 +917,9 @@ fn sdl_push(event:*Event) bool {
     if n>4096 {
       return false
     }
-    _=mem.copy(native_gui.injected_text[at][..n], #slice(text, n))
-    native_gui.injected_text[at][n]=0
+    slot:=injected_slot(at)
+    _=mem.copy(slot[..n], #slice(text, n))
+    slot[n]=0
   }
   native_gui.injected_count+=1
   return window_api.wake(&native_gui.window).ok

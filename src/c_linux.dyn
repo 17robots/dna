@@ -5,6 +5,51 @@ extern fn frontend_isatty "isatty"(descriptor: i32) i32
 extern fn handoff_unsetenv "unsetenv"(name: *const u8) i32
 extern fn handoff_setenv "setenv"(name: *const u8, value: *const u8, overwrite: i32) i32
 extern fn thread_clock "clock_gettime"(kind: i32, time: *ThreadTime) i32
+// libglvnd maps every EGL vendor it finds. With only NVIDIA GPUs present, Mesa
+// and its LLVM add 24 MB that nothing uses. Hybrid machines keep both, and the
+// variable is cleared after the window opens so child processes never see it.
+fn egl_vendor_set() bool {
+  storage: [256]u8 = []
+  files := host.environment("__EGL_VENDOR_LIBRARY_FILENAMES", storage[..])
+  directories := host.environment("__EGL_VENDOR_LIBRARY_DIRS", storage[..])
+  if (files.ok && files.found) || (directories.ok && directories.found) {
+    return false
+  }
+  if fs.metadata(egl_nvidia_vendor[..#len(egl_nvidia_vendor) - 1]).failure.kind != io.Kind.Ok {
+    return false
+  }
+  backing: [512 + mem.ArenaBufferOverhead]u8 = []
+  arena := mem.arena_from_buffer(backing[..])
+  nvidia := 0
+  for card in 0..8 {
+    path: [40]u8 = []
+    used := copy_text(path[..], "/sys/class/drm/card")
+    path[used] = #cast(u8, 48 + card)
+    used += 1
+    used += copy_text(path[used..], "/device/vendor")
+    read := fs.read_all(arena, path[..used], 16)
+    if read.failure.kind == io.Kind.Ok {
+      if #len(read.value) < 6 || !egl_is_nvidia(read.value) {
+        return false
+      }
+      nvidia += 1
+    }
+    mem.arena_reset(arena)
+  }
+  if nvidia == 0 {
+    return false
+  }
+  name: []const u8 = "__EGL_VENDOR_LIBRARY_FILENAMES\0"
+  return handoff_setenv(&name[0], &egl_nvidia_vendor[0], 1) == 0
+}
+fn egl_is_nvidia(vendor: []const u8) bool {
+  return vendor[2] == '1' && vendor[3] == '0' && vendor[4] == 'd' && vendor[5] == 'e'
+}
+fn egl_vendor_clear() {
+  name: []const u8 = "__EGL_VENDOR_LIBRARY_FILENAMES\0"
+  _ = handoff_unsetenv(&name[0])
+}
+const egl_nvidia_vendor: []const u8 = "/usr/share/glvnd/egl_vendor.d/10_nvidia.json\0"
 fn frontend_display_available() bool {
   storage: [256]u8 = []
   wayland := host.environment("WAYLAND_DISPLAY", storage[..])
