@@ -37,7 +37,7 @@ fn verify(renderer:*presenter.Presenter,surface:software.Surface,readback:[]u8) 
 }
 fn main() {
  host:=window_api.Window{}
- check(window_api.open(&host,"DNA native frame sequence",320,160).ok,"sequence window")
+ check(window_api.open(&host,"DNA native frame sequence",320,160).kind == io.Kind.Ok,"sequence window")
  defer window_api.close(&host)
  window_api.listen_events(&host,true)
  _=window_api.set_swap_interval(&host,0)
@@ -65,7 +65,7 @@ fn main() {
   }
  }
  for frame in 0..FRAME_COUNT {
-  check(window_api.poll(&host).ok,"sequence event poll")
+  check(window_api.poll(&host).kind == io.Kind.Ok,"sequence event poll")
   event:=events.Event{}
   for window_api.next_event(&host,&event) {}
   // Keep CPU memory allocated and reuse it immediately after prior swap.
@@ -86,7 +86,7 @@ fn main() {
   surface:=software.Surface{pixels:pixels[..length],width:width,height:height,stride:#cast(usize,width)*4}
   check(presenter.draw(&renderer,surface).failure.kind == io.Kind.Ok,"sequence upload")
   verify(&renderer,surface,readback[..length])
-  check(window_api.swap(&host).ok,"sequence swap")
+  check(window_api.swap(&host).kind == io.Kind.Ok,"sequence swap")
   if frame%53==27 {
    presenter.close(&renderer)
    check(presenter.open(&renderer).failure.kind == io.Kind.Ok,"sequence recreate")

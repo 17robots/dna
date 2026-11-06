@@ -45,16 +45,20 @@ pub fn elapsed(start,end:Instant) DurationResult {
     (stage / 'window/window.dyn').write_text('''use "std/io" io
 use "vendor/window/events"
 pub struct Window {}
-pub struct Result {ok:bool}
+pub type Result = io.Failure
 pub polls:usize=0
 pub goal:usize=200
 pub success:bool=true
 pub fn request_paste_snapshot(window:*Window) {polls=0}
 pub fn poll(window:*Window) Result {polls+=1
- return Result{ok:true}}
+ return Result{}}
 pub fn next_event(window:*Window,event:*events.Event) bool {return false}
 pub fn paste_pending(window:*Window) bool {return polls<goal}
-pub fn paste_status(window:*Window) Result {return Result{ok:success}}
+fn window_status(value:bool) Result {
+ if value {return Result{}}
+ return Result{kind:io.Kind.System}
+}
+pub fn paste_status(window:*Window) Result {return window_status(success)}
 pub fn clipboard(window:*Window) []const u8 {return "slow clipboard"}
 pub fn wait(window:*Window,milliseconds:i32) {}
 ''')
