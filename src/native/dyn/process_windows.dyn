@@ -4,7 +4,7 @@
 
 // CRT descriptor tokens own pipe handles. Process and Job handles stay pointer
 // sized; the positive pid is only the shared policy's live-owner marker.
-struct OwnedProcess { pid: i32, process, job: rawptr, input: i32 = -1, output: i32 = -1, error: i32 = -1 }
+struct OwnedProcess { pid: i32, process, job: rawptr, input: i32, output: i32, error: i32}
 struct PollDescriptor { fd: i32, events, returned: i16 }
 struct WinProcStartup {
   size: u32, reserved, desktop, title: rawptr,
@@ -229,19 +229,19 @@ fn proc_pipe(fds: *i32, flags: i32) i32 {
   client := win_proc_api.open_pipe(&name[0], 3221225472, 0, nil, 3, 0, nil)
   if !win_proc_valid(client) {
     saved := win_proc_api.error()
-    _ = win_proc_api.close(server)
+    win_proc_api.close(server)
     _ = win_proc_errno(saved)
     return -1
   }
   if win_proc_api.connect(server, nil) == 0 && win_proc_api.error() != 535 {
-    _ = win_proc_api.close(client)
-    _ = win_proc_api.close(server)
+    win_proc_api.close(client)
+    win_proc_api.close(server)
     return -1
   }
   mode: u32 = 1
   if win_proc_api.pipe_mode(client, &mode, nil, nil) == 0 {
-    _ = win_proc_api.close(client)
-    _ = win_proc_api.close(server)
+    win_proc_api.close(client)
+    win_proc_api.close(server)
     return -1
   }
   read_fd := win_proc_descriptor(server)
@@ -265,9 +265,12 @@ fn proc_nonblocking(fd: i32) bool {
   mode: u32 = 1
   return win_proc_valid(handle) && win_proc_api.pipe_mode(handle, &mode, nil, nil) != 0
 }
+fn proc_none() OwnedProcess {
+  return OwnedProcess{ input: -1, output: -1, error: -1 }
+}
 fn proc_take(child: *OwnedProcess) OwnedProcess {
   owned := child.*
-  child.* = OwnedProcess{}
+  child.* = proc_none()
   return owned
 }
 fn proc_close(child: *OwnedProcess) {
@@ -287,10 +290,10 @@ fn proc_close(child: *OwnedProcess) {
   proc_close_fds(descriptors[..])
   if owned.process != nil {
     _ = win_proc_api.wait(owned.process, 4294967295)
-    _ = win_proc_api.close(owned.process)
+    win_proc_api.close(owned.process)
   }
   if owned.job != nil {
-    _ = win_proc_api.close(owned.job)
+    win_proc_api.close(owned.job)
   }
 }
 fn win_proc_absolute(path: *const u8) bool {
@@ -303,21 +306,21 @@ fn win_proc_absolute(path: *const u8) bool {
 fn proc_open(command: *const u8, directory: *const u8, shell: bool) OwnedProcess {
   win_proc_prepare()
   if command == nil || directory == nil || command.* == 0 || !win_proc_absolute(directory) || (!shell && !win_proc_absolute(command)) {
-    return OwnedProcess{}
+    return proc_none()
   }
   space := #cast(*WinProcSpace, rec_alloc(1, #sizeof(WinProcSpace)))
   if space == nil {
-    return OwnedProcess{}
+    return proc_none()
   }
   defer rec_free(#cast(rawptr, space))
   if win_proc_utf16(directory, &space.directory[0], 32768) == 0 {
-    return OwnedProcess{}
+    return proc_none()
   }
   used: usize = 0
   if shell {
     size := win_proc_api.system(&space.executable[0], 32760)
     if size == 0 || size >= 32760 {
-      return OwnedProcess{}
+      return proc_none()
     }
     used = #cast(usize, size)
     suffix: []const u8 = "\\cmd.exe"
@@ -329,17 +332,17 @@ fn proc_open(command: *const u8, directory: *const u8, shell: bool) OwnedProcess
   } else {
     size := win_proc_utf16(command, &space.executable[0], 32768)
     if size == 0 {
-      return OwnedProcess{}
+      return proc_none()
     }
     used = #cast(usize, size)
     for unit in space.executable[..used] {
       if unit == 34 {
-        return OwnedProcess{}
+        return proc_none()
       }
     }
   }
   if used > 32740 {
-    return OwnedProcess{}
+    return proc_none()
   }
   space.command[0] = 34
   for index in 0..used {
@@ -356,7 +359,7 @@ fn proc_open(command: *const u8, directory: *const u8, shell: bool) OwnedProcess
     }
     size := win_proc_utf16(command, &space.command[used], #cast(i32, 32767 - used))
     if size <= 0 {
-      return OwnedProcess{}
+      return proc_none()
     }
     used += #cast(usize, size)
     space.command[used] = 34
@@ -366,55 +369,55 @@ fn proc_open(command: *const u8, directory: *const u8, shell: bool) OwnedProcess
   descriptors: [6]i32 = [-1, -1, -1, -1, -1, -1]
   defer proc_close_fds(descriptors[..])
   if proc_pipe(&descriptors[0], 0) != 0 || proc_pipe(&descriptors[2], 0) != 0 || proc_pipe(&descriptors[4], 0) != 0 {
-    return OwnedProcess{}
+    return proc_none()
   }
   handles: [3]rawptr = [win_io_handle(descriptors[0]), win_io_handle(descriptors[3]), win_io_handle(descriptors[5])]
   for handle in handles {
     blocking: u32 = 0
     if win_proc_api.flags(handle, 1, 1) == 0 || win_proc_api.pipe_mode(handle, &blocking, nil, nil) == 0 {
-      return OwnedProcess{}
+      return proc_none()
     }
   }
   attribute_size: usize = 0
   _ = win_proc_api.attributes(nil, 1, 0, &attribute_size)
   if attribute_size == 0 {
-    return OwnedProcess{}
+    return proc_none()
   }
   space.attributes = rec_alloc(1, attribute_size)
   if space.attributes == nil {
-    return OwnedProcess{}
+    return proc_none()
   }
   defer rec_free(space.attributes)
   if win_proc_api.attributes(space.attributes, 1, 0, &attribute_size) == 0 {
-    return OwnedProcess{}
+    return proc_none()
   }
   defer win_proc_attributes_free(space.attributes)
   if win_proc_api.attribute(space.attributes, 0, 131074, #cast(rawptr, &handles[0]), #sizeof(handles), nil, nil) == 0 {
-    return OwnedProcess{}
+    return proc_none()
   }
   job := win_proc_api.job(nil, nil)
   if job == nil {
-    return OwnedProcess{}
+    return proc_none()
   }
   limits := WinProcLimits{}
   limits.basic.flags = 8192
   if win_proc_api.job_limits(job, 9, #cast(rawptr, &limits), #cast(u32, #sizeof(WinProcLimits))) == 0 {
-    _ = win_proc_api.close(job)
-    return OwnedProcess{}
+    win_proc_api.close(job)
+    return proc_none()
   }
   startup := WinProcStartup{size: #cast(u32, #sizeof(WinProcStartup)), flags: 256, input: handles[0], output: handles[1], error: handles[2], attributes: space.attributes}
   information := WinProcInformation{}
   if win_proc_api.create(&space.executable[0], &space.command[0], nil, nil, 1, 134742020, nil, #cast(rawptr, &space.directory[0]), &startup, &information) == 0 {
-    _ = win_proc_api.close(job)
-    return OwnedProcess{}
+    win_proc_api.close(job)
+    return proc_none()
   }
-  owned := OwnedProcess{pid: 1, process: information.process, job: job}
+  owned := OwnedProcess{pid: 1, input: -1, output: -1, error: -1, process: information.process, job: job}
   if win_proc_api.assign(job, information.process) == 0 || win_proc_api.resume(information.thread) == 4294967295 {
-    _ = win_proc_api.close(information.thread)
+    win_proc_api.close(information.thread)
     proc_close(&owned)
-    return OwnedProcess{}
+    return proc_none()
   }
-  _ = win_proc_api.close(information.thread)
+  win_proc_api.close(information.thread)
   owned.input = descriptors[1]
   owned.output = descriptors[2]
   owned.error = descriptors[4]

@@ -9,8 +9,8 @@ s = (ROOT / 'src/explorer.dyn').read_text()
 start = s.index('fn explorer_columns_progress(')
 end = s.index('\nfn draw_explorer(', start)
 source = '''use "./motion" motion
-struct Config {popup_animation_ms:f32=40.0,popup_transitions:bool=true}
-struct Animation {now:f32,active,surfaces_ready,resized,geometry_active:bool,geometry_elapsed:f32=8.0}
+struct Config {popup_animation_ms:f32,popup_transitions:bool}
+struct Animation {now:f32,active,surfaces_ready,resized,geometry_active:bool,geometry_elapsed:f32}
 struct View {animation:Animation,reduced_motion:bool}
 struct Pointer {dragging:bool}
 struct Ui {frame:u64}
@@ -26,7 +26,7 @@ terminal:bool
 fn surface_motion_enabled(app:*const App)bool{return !terminal && !app.view.reduced_motion && app.config.popup_transitions && app.config.popup_animation_ms>0.0 && !app.pointer.dragging}
 ''' + s[start:end] + '''
 fn main() {
- app:=App{config:Config{}}
+ app:=App{config:Config{popup_animation_ms:40.0,popup_transitions:true}}
  app.view.animation.surfaces_ready=true
  app.view.animation.geometry_elapsed=8.0
  app.ui.frame=10

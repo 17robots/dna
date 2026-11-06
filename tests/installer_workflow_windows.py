@@ -298,7 +298,7 @@ if (!prefix || !path.basename(prefix).startsWith('.install-')) process.exit(84);
 fs.appendFileSync(process.env.DNA_FIXTURE_NPM_LOG, JSON.stringify({args,prefix})+'\n');
 const forwarded = args.map(value => value === pin ? process.env.DNA_FIXTURE_TARBALL : value);
 const result = cp.spawnSync(process.execPath, [process.env.DNA_FIXTURE_NPM_CLI, ...forwarded], {stdio:'inherit',env:process.env});
-if (result.error) { console.error(result.error); process.exit(85); }
+if (result.failure.native) { console.error(result.failure.native); process.exit(85); }
 process.exit(result.status === null ? 86 : result.status);
 '''
 

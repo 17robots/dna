@@ -6,7 +6,7 @@ use "std/dynlib" proc_loader
 // close, pinning its PID while this adapter owns the process group.
 // ABI sources: apple-oss-distributions/xnu, bsd/sys/{fcntl,wait,signal}.h
 // and libsyscall/wrappers/spawn/spawn.h.
-struct OwnedProcess { pid: i32, input: i32 = -1, output: i32 = -1, error: i32 = -1 }
+struct OwnedProcess { pid: i32, input: i32, output: i32, error: i32}
 struct PollDescriptor { fd: i32, events, returned: i16 }
 struct DarwinChildInfo {
   signal, error, code, pid: i32,
@@ -38,7 +38,7 @@ proc_api: DarwinProcessAPI
 proc_api_once: sync.Once
 fn proc_library_symbol(name: []const u8) rawptr {
   found := proc_loader.symbol(#cast(rawptr, #cast(isize, -2)), name)
-  if !found.ok || found.value == nil {
+  if found.failure.kind != io.Kind.Ok || found.value == nil {
     #panic("missing libSystem process routine")
   }
   return found.value
@@ -88,11 +88,11 @@ fn proc_pipe(fds: *i32, flags: i32) i32 {
   if proc_api.pipe(fds) != 0 {
     return -1
   }
-  values := fds[..2]
+  values := #slice(fds, 2)
   if ((flags & 524288) != 0 && (proc_fcntl(values[0], 2, 1) != 0 || proc_fcntl(values[1], 2, 1) != 0)) || ((flags & 2048) != 0 && (!proc_nonblocking(values[0]) || !proc_nonblocking(values[1]))) {
     saved := rec_errno().*
-    _ = proc_api.close(values[0])
-    _ = proc_api.close(values[1])
+    proc_api.close(values[0])
+    proc_api.close(values[1])
     values[0] = -1
     values[1] = -1
     rec_errno().* = saved
@@ -104,7 +104,7 @@ fn proc_symbol(library: rawptr, name: *const u8) rawptr {
   if library == nil {
     library = #cast(rawptr, #cast(isize, -2))
   }
-  found := proc_loader.symbol(library, name[..string_length(name)])
+  found := proc_loader.symbol(library, #slice(name, string_length(name)))
   return found.value
 }
 fn proc_watch(fd: i32, writing: i32) {
@@ -147,9 +147,12 @@ fn proc_nonblocking(fd: i32) bool {
   flags := proc_fcntl(fd, 3, 0)
   return flags >= 0 && proc_fcntl(fd, 4, flags | 4) == 0
 }
+fn proc_none() OwnedProcess {
+  return OwnedProcess{ input: -1, output: -1, error: -1 }
+}
 fn proc_take(child: *OwnedProcess) OwnedProcess {
   owned := child.*
-  child.* = OwnedProcess{}
+  child.* = proc_none()
   return owned
 }
 fn proc_close(child: *OwnedProcess) {
@@ -171,7 +174,7 @@ fn proc_close(child: *OwnedProcess) {
   }
 }
 fn proc_open(command: *const u8, directory: *const u8, shell: bool) OwnedProcess {
-  empty := OwnedProcess{}
+  empty := proc_none()
   if command == nil || command.* == 0 || directory == nil || directory.* != 47 || (!shell && command.* != 47) {
     return empty
   }

@@ -142,9 +142,9 @@ surface.stride=64
 }
 '''
 source=SOURCE.read_text()
-header='use "vendor/opengl" gl\nuse "std/ui"\nuse "std/ui/software"\nuse "std/errors"\n'
+header='use "vendor/opengl" gl\nuse "std/ui"\nuse "std/ui/software"\nuse "std/io"\n'
 header+=re.search(r'pub struct Presenter \{[^\n]+',source).group()+'\n'
-header+='pub struct Result {kind:errors.Kind,ok:bool}\n'
+header+='pub struct Result {kind:io.Kind,ok:bool}\n'
 header+='\n'.join(function(source,name) for name in ('healthy','quad','draw','close'))+'\n'
 with tempfile.TemporaryDirectory(prefix='dna-present-reuse-') as temporary:
     stage=Path(temporary)

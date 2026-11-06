@@ -61,14 +61,14 @@ pub fn dna_rpc_send_begin(state: *RpcTransport, capacity: usize) *u8 {
     state.building = true
     state.build_later = true
     state.build_capacity = capacity
-    return &later[..state.later_length + capacity + 64][state.later_length + 64]
+    return &#slice(later, state.later_length + capacity + 64)[state.later_length + 64]
   }
   remaining := state.pending - state.sent
   if remaining > RpcOutgoingLimit + 8192 - capacity - 64 {
     return nil
   }
   if remaining > 0 && state.sent > 0 {
-    _ = proc_move(state.queue, &state.queue[..state.pending][state.sent], remaining)
+    _ = proc_move(state.queue, &#slice(state.queue, state.pending)[state.sent], remaining)
   }
   state.pending = remaining
   state.sent = 0
@@ -80,7 +80,7 @@ pub fn dna_rpc_send_begin(state: *RpcTransport, capacity: usize) *u8 {
   state.building = true
   state.build_later = false
   state.build_capacity = capacity
-  return &queue[..remaining + capacity + 64][remaining + 64]
+  return &#slice(queue, remaining + capacity + 64)[remaining + 64]
 }
 pub fn dna_rpc_send_abort(state: *RpcTransport) {
   if state != nil {
@@ -116,8 +116,8 @@ fn rpc_commit(state: *RpcTransport, length: usize) {
   if state.build_later {
     at := state.later_length
     capacity := at + state.build_capacity + 64
-    _ = proc_move(&state.later[..capacity][at + used], &state.later[..capacity][at + 64], length)
-    _ = copy(&state.later[..capacity][at], &header[0], used)
+    _ = proc_move(&#slice(state.later, capacity)[at + used], &#slice(state.later, capacity)[at + 64], length)
+    _ = copy(&#slice(state.later, capacity)[at], &header[0], used)
     state.later_length = at + used + length
     proc_watch(state.child.input, 1)
     return
@@ -127,14 +127,14 @@ fn rpc_commit(state: *RpcTransport, length: usize) {
   if state.sent == remaining {
     // Nothing left to write ahead: put the header right before the body,
     // which then stays where it was written instead of moving.
-    _ = copy(&state.queue[..capacity][remaining + 64 - used], &header[0], used)
+    _ = copy(&#slice(state.queue, capacity)[remaining + 64 - used], &header[0], used)
     state.sent = remaining + 64 - used
     state.pending = remaining + 64 + length
     proc_watch(state.child.input, 1)
     return
   }
-  _ = proc_move(&state.queue[..capacity][remaining + used], &state.queue[..capacity][remaining + 64], length)
-  _ = copy(&state.queue[..capacity][remaining], &header[0], used)
+  _ = proc_move(&#slice(state.queue, capacity)[remaining + used], &#slice(state.queue, capacity)[remaining + 64], length)
+  _ = copy(&#slice(state.queue, capacity)[remaining], &header[0], used)
   state.pending = remaining + used + length
   proc_watch(state.child.input, 1)
 }
@@ -193,7 +193,7 @@ fn rpc_parse(state: *RpcTransport) bool {
   if state.used < 4 {
     return false
   }
-  text := state.incoming[..state.used]
+  text := #slice(state.incoming, state.used)
   header: usize = 0
   at: usize = 0
   for at + 3 < state.used && at < 8192 {
@@ -293,7 +293,7 @@ fn rpc_flush(state: *RpcTransport) {
   if amount > 65536 {
     amount = 65536
   }
-  written := proc_write(state.child.input, &state.queue[..state.pending][state.sent], amount)
+  written := proc_write(state.child.input, &#slice(state.queue, state.pending)[state.sent], amount)
   if written > 0 {
     state.sent += #cast(usize, written)
   }
@@ -348,7 +348,7 @@ pub fn dna_rpc_size(state: *RpcTransport) isize {
       state.incoming = bytes
       state.capacity = need
     }
-    received := proc_read(state.child.output, &state.incoming[..state.capacity][state.used], need - state.used)
+    received := proc_read(state.child.output, &#slice(state.incoming, state.capacity)[state.used], need - state.used)
     if received > 0 {
       state.used += #cast(usize, received)
       ready = rpc_parse(state)
@@ -387,10 +387,10 @@ pub fn dna_rpc_take(state: *RpcTransport, output: *u8, capacity: usize) isize {
   }
   length := state.body
   total := state.header + length
-  _ = copy(output, &state.incoming[..state.capacity][state.header], length)
-  output[..capacity][length] = 0
+  _ = copy(output, &#slice(state.incoming, state.capacity)[state.header], length)
+  #slice(output, capacity)[length] = 0
   if state.used > total {
-    _ = proc_move(state.incoming, &state.incoming[..state.capacity][total], state.used - total)
+    _ = proc_move(state.incoming, &#slice(state.incoming, state.capacity)[total], state.used - total)
   }
   state.used -= total
   state.header = 0
@@ -409,7 +409,7 @@ pub fn dna_rpc_log(state: *RpcTransport, output: *u8, capacity: usize) usize {
     length = capacity - 1
   }
   _ = copy(output, &state.log[0], length)
-  output[..capacity][length] = 0
+  #slice(output, capacity)[length] = 0
   return length
 }
 pub fn dna_rpc_close(state: *RpcTransport) {

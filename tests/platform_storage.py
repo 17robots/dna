@@ -8,8 +8,8 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 DYN = os.environ.get('DYN', 'dyn')
-FAKE = '''use "std/errors"
-pub struct File { descriptor:isize=-1,active,owned:bool }
+FAKE = '''use "std/io"
+pub struct File {descriptor:isize,active,owned:bool}
 pub struct Result { transferred:usize,error:isize,kind:errors.Kind,ok:bool }
 pub struct OffsetResult { value:usize,error:isize,kind:errors.Kind,ok:bool }
 extern fn probe_seek "probe_seek"(file:isize,offset:isize,origin:usize) isize
@@ -35,7 +35,7 @@ pub fn close(file:*File) Result { _=probe_close(file.descriptor) file.active=fal
 '''.replace(') file.active', ')\n file.active').replace('false return', 'false\n return')
 BASE = '''#link("c")
 use "./fake" std_fs
-use "std/errors"
+use "std/io"
 type File=std_fs.File
 type Result=std_fs.Result
 struct Metadata { size:u64,error:isize,kind:errors.Kind,ok:bool }
@@ -110,7 +110,7 @@ fn main() {
   offset:u64=1
   if mode==2 {offset=2}
   result:=copy_range(&origin,offset,&target,200000)
-  if probe_check(result.transferred,result.ok)!=1 {#panic("range result")}
+  if probe_check(result.transferred,result.failure.kind == parse.Kind.Ok)!=1 {#panic("range result")}
  }
  for mode in 0..3 {
   probe_reset(#cast(i32,mode))

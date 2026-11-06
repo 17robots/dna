@@ -11,18 +11,19 @@ from native_software_source import function as software_function
 def function(name):
     return software_function(SOURCE,name)
 
-HEADER='''use "std/ui"
+HEADER='''use "std/io" io
+use "std/ui"
 use "std/ui/software"
 struct PixelRect {x,y,width,height:i32}
 struct Rect {x,y,width,height:f32}
 struct Vertex {x,y,red,green,blue,alpha,u,v:f32}
-struct NativeTexture {pixels:[]u8,width,height:i32,alpha:u8=255}
-struct Gui {surface:software.Surface,target:*NativeTexture,viewport,clip:PixelRect,clipped:bool,draw_alpha:u8=255,sx,sy:f32,color:ui.Color}
-native_gui:Gui
-cached:NativeTexture
+struct NativeTexture {pixels:[]u8,width,height:i32,alpha:u8}
+struct Gui {surface:software.Surface,target:*NativeTexture,viewport,clip:PixelRect,clipped:bool,draw_alpha:u8,sx,sy:f32,color:ui.Color}
+native_gui: Gui = Gui{draw_alpha:255}
+cached: NativeTexture = NativeTexture{alpha:255}
 pub fn probe_setup(pixels:*u8,target:i32,opacity:u8) {
- native_gui=Gui{surface:software.Surface{pixels:pixels[..256],width:8,height:8,stride:32},viewport:PixelRect{width:8,height:8},sx:1.0,sy:1.0}
- cached=NativeTexture{pixels:pixels[..256],width:8,height:8}
+ native_gui=Gui{draw_alpha:255,surface:software.Surface{pixels:#slice(pixels, 256),width:8,height:8,stride:32},viewport:PixelRect{width:8,height:8},sx:1.0,sy:1.0}
+ cached=NativeTexture{pixels:#slice(pixels, 256),width:8,height:8,alpha:255}
  if target!=0 {native_gui.target=&cached}
  _=sdl_draw_opacity(nil,opacity)
 }
@@ -37,7 +38,7 @@ pub fn probe_draw(kind:i32,alpha:u8,texture:*u8) bool {
   return native_text_bitmap(nil,&mask[0],8,8,0.0,0.0,color.r,color.g,color.b,alpha)
  }
  if kind==2 {
-  t:=NativeTexture{pixels:texture[..256],width:8,height:8,alpha:alpha}
+  t:=NativeTexture{pixels:#slice(texture, 256),width:8,height:8,alpha:alpha}
   return sdl_render_texture(nil,&t,nil,nil)
  }
  if kind==3 {

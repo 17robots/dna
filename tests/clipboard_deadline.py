@@ -22,22 +22,28 @@ with tempfile.TemporaryDirectory(prefix='dna-clipboard-deadline-') as directory:
     stage = Path(directory)
     for module in ('clock', 'window'):
         (stage / module).mkdir()
-    (stage / 'clock/clock.dyn').write_text('''use "std/time" real_time
+    (stage / 'clock/clock.dyn').write_text('''use "std/io" io
+use "std/time" real_time
+fn clock_failure(is_failed:bool) io.Failure {
+ if is_failed {return io.Failure{kind:io.Kind.System}}
+ return io.Failure{}
+}
 pub const Second:i64=real_time.Second
 pub struct Instant {value:i64}
-pub struct ClockResult {ok:bool,value:Instant}
-pub struct DurationResult {ok:bool,value:i64}
+pub struct ClockResult {failure:io.Failure,value:Instant}
+pub struct DurationResult {failure:io.Failure,value:i64}
 pub tick:i64=0
 pub failed:bool=false
 pub fn monotonic_now() ClockResult {
  tick+=10000000
- return ClockResult{ok:!failed,value:Instant{value:tick}}
+ return ClockResult{failure:clock_failure(failed),value:Instant{value:tick}}
 }
 pub fn elapsed(start,end:Instant) DurationResult {
- return DurationResult{ok:true,value:end.value-start.value}
+ return DurationResult{value:end.value-start.value}
 }
 ''')
-    (stage / 'window/window.dyn').write_text('''use "vendor/window/events"
+    (stage / 'window/window.dyn').write_text('''use "std/io" io
+use "vendor/window/events"
 pub struct Window {}
 pub struct Result {ok:bool}
 pub polls:usize=0
@@ -52,7 +58,8 @@ pub fn paste_status(window:*Window) Result {return Result{ok:success}}
 pub fn clipboard(window:*Window) []const u8 {return "slow clipboard"}
 pub fn wait(window:*Window,milliseconds:i32) {}
 ''')
-    (stage / 'main.dyn').write_text('''use "std/mem"
+    (stage / 'main.dyn').write_text('''use "std/io" io
+use "std/mem"
 use "./clock" time
 use "./window" window_api
 use "vendor/window/events"

@@ -33,7 +33,7 @@ struct Rgb {red,green,blue:u8}
 struct Theme {selection:Rgb}
 fn theme() Theme {return Theme{selection:Rgb{red:53,green:65,blue:80}}}
 struct Box {value:usize,padding:[2]f32,flags:u32,fill:Rgb}
-struct UiState {boxes:[2]Box,cell:f32=8.0}
+struct UiState {boxes:[2]Box,cell:f32}
 enum UiSizeKind {Text,Percent}
 fn ui_key(ui:*UiState,name:[]const u8) u64 {return 0}
 fn ui_make(ui:*UiState,key:u64,flags:u32) usize {ui.boxes[1].flags=flags
@@ -44,7 +44,7 @@ fn ui_animate(app:*App,ui:*UiState,index:usize,selected:bool) {}
 ''' + function((ROOT / 'src/chrome.dyn').read_text(), 'status_segment') + '''
 fn main() {
  app:=App{}
- ui:=UiState{}
+ ui:=UiState{cell:8.0}
  status_segment(&app,&ui,0,"mode","NORMAL",0,0)
  if (ui.boxes[1].flags & UiBackground)==0 || ui.boxes[1].fill.red!=53 {#panic("focused mode has no selection background")}
  if (ui.boxes[1].flags & UiMuted)!=0 {#panic("focused mode is muted")}

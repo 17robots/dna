@@ -87,7 +87,7 @@ fn explorer_load(app: *App) {
     entry.inode = info.inode
     entry.device = info.device
     entry.mode = info.mode
-    if info.ok {
+    if info.failure.kind == io.Kind.Ok {
       entry.directory = (info.mode & 61440) == 16384
     }
     if used + entry.length + 16 >= 65536 {
@@ -278,7 +278,7 @@ fn explorer_validate(app: *App) []const u8 {
     return "Draft changed after preview. Run :write again."
   }
   root := files.metadata(app.directory_state.path[..app.directory_state.length])
-  if !root.ok || root.inode != state.root_inode || root.device != state.root_device {
+  if root.failure.kind != io.Kind.Ok || root.inode != state.root_inode || root.device != state.root_device {
     return "Directory changed externally; refresh before applying."
   }
   trash_storage: [4096]u8 = []
@@ -297,7 +297,7 @@ fn explorer_validate(app: *App) []const u8 {
     if edit.original > 0 {
       original := &app.directory_state.entries[edit.original - 1]
       info := files.metadata(source[..source_length])
-      if !info.ok || info.inode != original.inode || info.device != original.device || info.mode != original.mode {
+      if info.failure.kind != io.Kind.Ok || info.inode != original.inode || info.device != original.device || info.mode != original.mode {
         return "A source entry changed externally. Nothing further will be applied."
       }
       for slot_index in 0..#len(app.documents.slots) {
@@ -312,10 +312,10 @@ fn explorer_validate(app: *App) []const u8 {
         }
       }
     }
-    if edit.kind == FileAction.Trash && trash.ok && (trash.mode & 61440) != 16384 {
+    if edit.kind == FileAction.Trash && trash.failure.kind == io.Kind.Ok && (trash.mode & 61440) != 16384 {
       return ".dna-trash must be a real directory, not a symlink or file."
     }
-    if files.metadata(destination[..destination_length]).ok {
+    if files.metadata(destination[..destination_length]).failure.kind == io.Kind.Ok {
       return "A destination already exists. Renames cannot overwrite files or swap names in one batch."
     }
     index += 1
@@ -404,25 +404,21 @@ fn explorer_apply(app: *App) {
     source_length := c.string_length(&source[0], 4096)
     destination_length := c.string_length(&destination[0], 4096)
     if edit.kind == FileAction.CreateDirectory {
-      if !fs.make_directory(destination[..destination_length], 493).ok {
+      if fs.make_directory(destination[..destination_length], 493).failure.kind != io.Kind.Ok {
         failed = true
         break
       }
     } else if edit.kind == FileAction.Create {
       created := fs.create_exclusive(destination[..destination_length])
-      if !created.ok {
+      if created.failure.kind != io.Kind.Ok {
         failed = true
         break
       }
-      if !fs.close(&created.value).ok {
-        completed += 1
-        failed = true
-        break
-      }
+      fs.close(&created.value)
     } else {
       original := &app.directory_state.entries[edit.original - 1]
       current := files.metadata(source[..source_length])
-      if !current.ok || current.inode != original.inode || current.device != original.device {
+      if current.failure.kind != io.Kind.Ok || current.inode != original.inode || current.device != original.device {
         failed = true
         break
       }
@@ -430,8 +426,8 @@ fn explorer_apply(app: *App) {
         trash_storage: [4096]u8 = []
         trash_path := joined(app, ".dna-trash", trash_storage[..])
         info := files.metadata(trash_path)
-        if !info.ok {
-          if !fs.make_directory(trash_path, 448).ok {
+        if info.failure.kind != io.Kind.Ok {
+          if fs.make_directory(trash_path, 448).failure.kind != io.Kind.Ok {
             failed = true
             break
           }
@@ -441,7 +437,7 @@ fn explorer_apply(app: *App) {
           break
         }
       }
-      if !fs.rename_noreplace(source[..source_length], destination[..destination_length]).ok {
+      if fs.rename_noreplace(source[..source_length], destination[..destination_length]).failure.kind != io.Kind.Ok {
         failed = true
         break
       }

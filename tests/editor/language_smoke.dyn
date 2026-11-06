@@ -1,3 +1,5 @@
+use "std/io" io
+use "std/parse" parse
 // More than the former sixteen tracking records and eighty buffer UI rows.
 fn language_large_document(app:*App) {
   original:=app.documents.active
@@ -139,11 +141,11 @@ fn language_incremental_budget(app: *App) {
   doc := app.documents.current
   mark := mem.arena_mark(app.scratch)
   defer mem.arena_rewind(app.scratch, mark)
-  original := (#cast(*u8, mem.arena_push_uninit(app.scratch, doc.length + 1, 1)))[..doc.length]
+  original := #slice((#cast(*u8, mem.arena_push_uninit(app.scratch, doc.length + 1, 1))), doc.length)
   if doc.length > 0 {
     _ = buffer.copy_bytes(&original[0], buffer.pointer(doc, 0, doc.length), doc.length)
   }
-  text := (#cast(*u8, mem.arena_push_uninit(app.scratch, 262144, 1)))[..262144]
+  text := #slice((#cast(*u8, mem.arena_push_uninit(app.scratch, 262144, 1))), 262144)
   for index in 0..#len(text) {
     text[index] = 'a'
     if index % 64 == 63 {
@@ -231,7 +233,7 @@ fn language_smoke() {
   defer arena_owner.release(scratch)
   app := #cast(*App, mem.arena_push(owned, #sizeof(App), #alignof(App)))
   app.scratch = scratch
-  app.config = settings.Settings{}
+  settings.defaults(&app.config)
   defer operations_release(app)
   defer release_editor_state(app)
   defer lsp_release(app)
@@ -243,7 +245,7 @@ fn language_smoke() {
   path: [4096]u8 = []
   length := copy_text(path[..], root.value)
   add_text(path[..], &length, "/language test.dyn")
-  if !fs.write_all(path[..length], "al é😀\n").ok {
+  if fs.write_all(path[..length], "al é😀\n").failure.kind != io.Kind.Ok {
     #panic("language fixture")
   }
   if #len(files.open(app.documents.file, app.documents.current, path[..length], app.scratch)) != 0 {
@@ -653,7 +655,7 @@ fn disk_smoke() {
   defer arena_owner.release(scratch)
   app := #cast(*App, mem.arena_push(owned, #sizeof(App), #alignof(App)))
   app.scratch = scratch
-  app.config = settings.Settings{}
+  settings.defaults(&app.config)
   defer release_editor_state(app)
   defer disk_release(app)
   if !new_buffer(app) {
@@ -662,11 +664,11 @@ fn disk_smoke() {
   path: [4096]u8 = []
   length := copy_text(path[..], root.value)
   add_text(path[..], &length, "/watched.txt")
-  if !fs.write_all(path[..length], "original").ok || #len(files.open(app.documents.file, app.documents.current, path[..length], app.scratch)) != 0 {
+  if fs.write_all(path[..length], "original").failure.kind != io.Kind.Ok || #len(files.open(app.documents.file, app.documents.current, path[..length], app.scratch)) != 0 {
     #panic("disk fixture")
   }
   _ = disk_tick(app)
-  if !fs.write_all(path[..length], "external").ok {
+  if fs.write_all(path[..length], "external").failure.kind != io.Kind.Ok {
     #panic("external write")
   }
   deadline := sdl.ticks() + 3000
@@ -679,7 +681,7 @@ fn disk_smoke() {
   }
   buffer.move_to(app.documents.current, 0, false)
   _ = buffer.replace(app.documents.current, "local ")
-  if !fs.write_all(path[..length], "conflicting").ok {
+  if fs.write_all(path[..length], "conflicting").failure.kind != io.Kind.Ok {
     #panic("conflicting write")
   }
   deadline = sdl.ticks() + 3000
@@ -800,7 +802,7 @@ fn composition_smoke(app: *App, typography: *Typography) {
   app.view.insert = true
   text: [32]u8 = []
   encoded := cstring.bounded(text[..], "にほん")
-  if !encoded.ok {
+  if encoded.failure.kind != parse.Kind.Ok {
     #panic("IME fixture string capacity")
   }
   event := sdl.EditingEvent{text: encoded.value, start: 0, length: 3}
@@ -849,7 +851,7 @@ fn format_save_smoke() {
   formatting_wait(app)
   mark := mem.arena_mark(app.scratch)
   read := fs.read_all(app.scratch, path[..length], 32)
-  if !read.ok || !buffer.equal(read.value, "HELLO") || buffer.dirty(app.documents.current) {
+  if read.failure.kind != io.Kind.Ok || !buffer.equal(read.value, "HELLO") || buffer.dirty(app.documents.current) {
     #panic("format before save")
   }
   mem.arena_rewind(app.scratch, mark)
@@ -857,12 +859,12 @@ fn format_save_smoke() {
   buffer.move_to(app.documents.current, app.documents.current.length, false)
   _ = buffer.replace(app.documents.current, " changed")
   save_file(app, path[..length])
-  if !fs.write_all(path[..length], "external").ok {
+  if fs.write_all(path[..length], "external").failure.kind != io.Kind.Ok {
     #panic("format conflict fixture")
   }
   formatting_wait(app)
   verify := fs.read_all(app.scratch, path[..length], 32)
-  if !verify.ok || !buffer.equal(verify.value, "external") || !buffer.dirty(app.documents.current) {
+  if verify.failure.kind != io.Kind.Ok || !buffer.equal(verify.value, "external") || !buffer.dirty(app.documents.current) {
     #panic("formatter overwrote external edit")
   }
 }
@@ -1044,13 +1046,13 @@ fn dyn_language_smoke(renderer: rawptr, typography: *Typography) {
   path: [4096]u8 = []
   used := copy_text(path[..], root.value)
   add_text(path[..], &used, "/real-dyn")
-  if !fs.make_directory(path[..used], 448).ok {
+  if fs.make_directory(path[..used], 448).failure.kind != io.Kind.Ok {
     #panic("real Dyn fixture directory")
   }
   app.workspace.project_length = copy_text(app.workspace.project[..], path[..used])
   add_text(path[..], &used, "/main.dyn")
   source := "fn helper(value: i32) i32 { return value }\nfn main() { hel }\n"
-  if !fs.write_all(path[..used], source).ok || !new_buffer(app) {
+  if fs.write_all(path[..used], source).failure.kind != io.Kind.Ok || !new_buffer(app) {
     #panic("real Dyn fixture")
   }
   if #len(files.open(app.documents.file, app.documents.current, path[..used], app.scratch)) != 0 {
@@ -1189,7 +1191,7 @@ fn dyn_language_smoke(renderer: rawptr, typography: *Typography) {
   }
   disk_mark := mem.arena_mark(app.scratch)
   disk_source := fs.read_all(app.scratch, path[..used], buffer.Capacity)
-  if !disk_source.ok || !buffer.equal(disk_source.value, source) {
+  if disk_source.failure.kind != io.Kind.Ok || !buffer.equal(disk_source.value, source) {
     #panic("language edits must remain unsaved")
   }
   mem.arena_rewind(app.scratch, disk_mark)
@@ -1338,7 +1340,7 @@ fn completion_words_smoke(app: *App) {
   }
   // A server edit ending at the old UTF-16 cursor is invalid after backspace.
   ranged := json.parse(app.scratch, "[{\"label\":\"école\",\"textEdit\":{\"range\":{\"start\":{\"line\":0,\"character\":12},\"end\":{\"line\":0,\"character\":14}},\"newText\":\"école\"}}]")
-  if !ranged.ok {
+  if ranged.failure.kind != parse.Kind.Ok {
     #panic("completion range fixture")
   }
   app.lsp.results.source = ranged.root.first

@@ -14,10 +14,10 @@ use "std/ui/software"
 struct PixelRect {x,y,width,height:i32}
 struct Rect {x,y,width,height:f32}
 struct NativeTexture {pixels:[]u8,width,height:i32}
-struct Gui {surface:software.Surface,target:*NativeTexture,viewport,clip:PixelRect,clipped:bool,draw_alpha:u8=255,sx,sy:f32,color:ui.Color}
-native_gui:Gui
+struct Gui {surface:software.Surface,target:*NativeTexture,viewport,clip:PixelRect,clipped:bool,draw_alpha:u8,sx,sy:f32,color:ui.Color}
+native_gui: Gui = Gui{draw_alpha:255}
 pub fn probe_setup(pixels:*u8,vx,vy,vw,vh,cx,cy,cw,ch:i32,sx,sy:f32,r,g,b,a:u8) {
- native_gui=Gui{surface:software.Surface{pixels:pixels[..64*48*4],width:64,height:48,stride:64*4},viewport:PixelRect{x:vx,y:vy,width:vw,height:vh},clip:PixelRect{x:cx,y:cy,width:cw,height:ch},clipped:true,sx:sx,sy:sy,color:ui.Color{r:r,g:g,b:b,a:a}}
+ native_gui=Gui{draw_alpha:255,surface:software.Surface{pixels:#slice(pixels, 64*48*4),width:64,height:48,stride:64*4},viewport:PixelRect{x:vx,y:vy,width:vw,height:vh},clip:PixelRect{x:cx,y:cy,width:cw,height:ch},clipped:true,sx:sx,sy:sy,color:ui.Color{r:r,g:g,b:b,a:a}}
 }
 pub fn probe_draw(reference,clear:i32,rect:*const Rect) bool {
  if reference!=0 {if clear!=0 {return reference_clear(nil)};return reference_fill(nil,rect)}

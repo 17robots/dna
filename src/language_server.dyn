@@ -1,3 +1,4 @@
+use "std/parse" parse
 use "./lsp"
 use "std/io"
 use "std/thread"
@@ -27,7 +28,7 @@ fn lsp_json_sources(out: []u8, value: *const json.Value, depth: usize) bool {
   if value.kind == json.KindMissing || value.kind > json.KindObject {
     return false
   }
-  if lsp_json_overlap(out, (#cast(*const u8, value))[..#sizeof(json.Value)]) || lsp_json_overlap(out, value.text) || lsp_json_overlap(out, value.key) {
+  if lsp_json_overlap(out, #slice((#cast(*const u8, value)), #sizeof(json.Value))) || lsp_json_overlap(out, value.text) || lsp_json_overlap(out, value.key) {
     return false
   }
   if !utf8.valid(value.key) {
@@ -96,7 +97,7 @@ fn lsp_escape(out: *u8, bytes: []const u8) usize {
       word := #cast(*const u64, &bytes[plain]).*
       quote := word ^ 0x2222222222222222
       slash := word ^ 0x5c5c5c5c5c5c5c5c
-      special := (#wrap(word - 0x2020202020202020) & ~word) | (#wrap(quote - 0x0101010101010101) & ~quote) | (#wrap(slash - 0x0101010101010101) & ~slash)
+      special := ((word - 0x2020202020202020) & ~word) | ((quote - 0x0101010101010101) & ~quote) | ((slash - 0x0101010101010101) & ~slash)
       if (special & 0x8080808080808080) != 0 {
         break
       }
@@ -104,7 +105,7 @@ fn lsp_escape(out: *u8, bytes: []const u8) usize {
     }
     if plain > at {
       if out != nil {
-        _ = buffer.copy_bytes(&out[..used + plain - at][used], &bytes[at], plain - at)
+        _ = buffer.copy_bytes(&#slice(out, used + plain - at)[used], &bytes[at], plain - at)
       }
       used += plain - at
       at = plain
@@ -121,7 +122,7 @@ fn lsp_escape(out: *u8, bytes: []const u8) usize {
       needed = 6
     }
     if out != nil {
-      target := out[..used + needed]
+      target := #slice(out, used + needed)
       if needed == 1 {
         target[used] = byte
       } else if needed == 6 {
@@ -163,7 +164,7 @@ fn lsp_escape_job(context: rawptr) isize {
     if job.out == nil {
       size += lsp_escape(nil, chunk)
     } else {
-      size += lsp_escape(&job.out[..size + 1][size], chunk)
+      size += lsp_escape(&#slice(job.out, size + 1)[size], chunk)
     }
     at += #len(chunk)
   }
@@ -182,7 +183,7 @@ fn lsp_escape_run(jobs: []LspEscapeJob) {
   started: [16]bool = []
   for index in 1..#len(jobs) {
     spawned := thread.spawn_with_size(arena, LspEscapeStack, lsp_escape_job, #cast(rawptr, &jobs[index]))
-    if spawned.ok {
+    if spawned.failure.kind == io.Kind.Ok {
       threads[index] = spawned.value
       started[index] = true
     }
@@ -190,7 +191,7 @@ fn lsp_escape_run(jobs: []LspEscapeJob) {
   _ = lsp_escape_job(#cast(rawptr, &jobs[0]))
   for index in 1..#len(jobs) {
     if started[index] {
-      if !thread.join(threads[index]).ok {
+      if thread.join(threads[index]).failure.kind != io.Kind.Ok {
         #panic("cannot join language-server encoder")
       }
     } else {
@@ -308,7 +309,7 @@ fn lsp_encode_launch(encode: *LspEncode) {
   for index in 0..encode.workers {
     encode.started[index] = false
     spawned := thread.spawn_with_size(encode.arena, LspEscapeStack, lsp_escape_job, #cast(rawptr, &encode.jobs[index]))
-    if spawned.ok {
+    if spawned.failure.kind == io.Kind.Ok {
       encode.threads[index] = spawned.value
       encode.started[index] = true
     } else {
@@ -319,7 +320,7 @@ fn lsp_encode_launch(encode: *LspEncode) {
 fn lsp_encode_join(encode: *LspEncode) {
   for index in 0..encode.workers {
     if encode.started[index] {
-      if !thread.join(encode.threads[index]).ok {
+      if thread.join(encode.threads[index]).failure.kind != io.Kind.Ok {
         #panic("cannot join language-server encoder")
       }
       encode.started[index] = false
@@ -768,7 +769,7 @@ fn lsp_documents_ensure(server:*LanguageServer, count:usize)bool {
     arena_owner.release(arena)
     return false
   }
-  records:=(#cast(*LspDocument, allocated.memory))[..count]
+  records:=#slice((#cast(*LspDocument, allocated.memory)), count)
   for i in 0..#len(server.documents) {
     records[i]=server.documents[i]
   }
@@ -1047,7 +1048,7 @@ fn lsp_sync_slot(app:*App, index:usize, slot_index:usize, force:bool) bool {
     lsp_allocation_retry(server, sdl.ticks())
     return false
   }
-  message := target[..capacity]
+  message := #slice(target, capacity)
   escaped := mem.push_bytes_uninit(work.arena, 65536)
   used: usize = 0
   if opening {
@@ -1443,7 +1444,7 @@ fn lsp_markup(out: []u8, used: *usize, value: *const json.Value) {
 }
 fn lsp_handle(app: *App, index: usize, source: []const u8, arena: *mem.Arena) bool {
   parsed := json.parse(arena, source)
-  if !parsed.ok || !json.is_object(parsed.root) {
+  if parsed.failure.kind != parse.Kind.Ok || !json.is_object(parsed.root) {
     lsp_note(app, "Malformed JSON from language server; stopped.")
     lsp_stop(app, index)
     return false
@@ -2001,15 +2002,15 @@ fn lsp_config(app: *App) {
   allocated := arena_owner.create((262144))
   defer arena_owner.release(allocated)
   read := fs.read_all(allocated, path[..length], 32768)
-  if !read.ok && configured_count > 0 {
+  if read.failure.kind != io.Kind.Ok && configured_count > 0 {
     return
   }
-  if !read.ok {
+  if read.failure.kind != io.Kind.Ok {
     notice(app, "Create lsp.json beside config.toml, e.g. {\"dyn\":\"dyn lsp\",\"python\":\"pyright-langserver --stdio\"}. Commands run only when you use :lsp-config.")
     return
   }
   parsed := json.parse(allocated, read.value)
-  if !parsed.ok || !json.is_object(parsed.root) {
+  if parsed.failure.kind != parse.Kind.Ok || !json.is_object(parsed.root) {
     notice(app, "lsp.json must map filetypes to trusted server command strings.")
     return
   }
@@ -2203,7 +2204,7 @@ fn lsp_saved(app: *App, index: usize, slot_index: usize) {
     lsp_stop(app, index)
     return
   }
-  message := target[..capacity]
+  message := #slice(target, capacity)
   used: usize = 0
   lsp_header(message, &used, "textDocument/didSave", 0)
   add_text(message, &used, "{\"textDocument\":{\"uri\":")

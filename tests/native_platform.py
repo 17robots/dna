@@ -153,7 +153,7 @@ fn main() {
  native_check(native_event(&source,&event),"text mapping")
  received:=#cast(*TextEvent,&event)
  source.text[0]=120
- native_check(received.kind==771 && received.text[..3][0]==0xc3 && received.text[..3][1]==0xa9 && received.text[..3][2]==0,"owned event text")
+ native_check(received.kind==771 && #slice(received.text, 3)[0]==0xc3 && #slice(received.text, 3)[1]==0xa9 && #slice(received.text, 3)[2]==0,"owned event text")
  native_check(native_cursor(8)==window_api.Cursor.ResizeX && native_cursor(9)==window_api.Cursor.ResizeY,"split resize cursor shapes")
  step:=48.0*window_api.scale(&native_gui.window)
  source=events.Event{kind:events.Kind.Wheel,scroll_x:step,scroll_y:0.0-step}
@@ -167,7 +167,7 @@ fn main() {
  second_bytes: [7]u8=[115,101,99,111,110,100,0]
  native_check(sdl_clipboard_set(&second_bytes[0]),"second clipboard offer")
  second_clip:=sdl_clipboard_get()
- native_check(second_clip!=nil && first_clip!=second_clip && first_clip[..5][0]==102 && first_clip[..5][4]==116 && second_clip[..6][0]==115,"clipboard results remain independently owned")
+ native_check(second_clip!=nil && first_clip!=second_clip && #slice(first_clip, 5)[0]==102 && #slice(first_clip, 5)[4]==116 && #slice(second_clip, 6)[0]==115,"clipboard results remain independently owned")
  sdl_free(#cast(rawptr,first_clip))
  sdl_free(#cast(rawptr,second_clip))
  native_check(native_gui.clipboards==nil,"clipboard free balances owners")
@@ -177,7 +177,7 @@ fn main() {
  large[1200001]=0
  native_check(sdl_clipboard_set(&large[0]),"large clipboard offer without truncation")
  large_copy:=sdl_clipboard_get()
- native_check(large_copy!=nil && c.string_length(large_copy,1200002)==1200001 && large_copy[..1200001][1200000]==97,"large complete clipboard allocation")
+ native_check(large_copy!=nil && c.string_length(large_copy,1200002)==1200001 && #slice(large_copy, 1200001)[1200000]==97,"large complete clipboard allocation")
  sdl_free(#cast(rawptr,large_copy))
  mem.arena_release(large_owner)
  source=events.Event{kind:events.Kind.Overflow,dropped:2}

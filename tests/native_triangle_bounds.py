@@ -28,11 +28,11 @@ use "std/ui/software"
 struct PixelRect {x,y,width,height:i32}
 struct Vertex {x,y,red,green,blue,alpha,u,v:f32}
 struct NativeTexture {pixels:[]u8,width,height:i32}
-struct Gui {surface:software.Surface,target:*NativeTexture,viewport,clip:PixelRect,clipped:bool,draw_alpha:u8=255,sx,sy:f32}
-native_gui:Gui
+struct Gui {surface:software.Surface,target:*NativeTexture,viewport,clip:PixelRect,clipped:bool,draw_alpha:u8,sx,sy:f32}
+native_gui: Gui = Gui{draw_alpha:255}
 visits:u64=0
 pub fn probe_setup(pixels:*u8,width,height:i32) {
- native_gui=Gui{surface:software.Surface{pixels:pixels[..#cast(usize,width)*#cast(usize,height)*4],width:width,height:height,stride:#cast(usize,width)*4},viewport:PixelRect{width:width,height:height},sx:1.0,sy:1.0}
+ native_gui=Gui{draw_alpha:255,surface:software.Surface{pixels:#slice(pixels, #cast(usize,width)*#cast(usize,height)*4),width:width,height:height,stride:#cast(usize,width)*4},viewport:PixelRect{width:width,height:height},sx:1.0,sy:1.0}
 }
 pub fn probe_viewport(x,y,width,height:i32) {native_gui.viewport=PixelRect{x:x,y:y,width:width,height:height}}
 pub fn probe_clip(x,y,width,height:i32,enabled:i32) {native_gui.clipped=enabled!=0

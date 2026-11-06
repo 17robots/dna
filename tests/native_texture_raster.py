@@ -15,27 +15,27 @@ HEADER='''use "std/ui"
 use "std/ui/software"
 struct PixelRect {x,y,width,height:i32}
 struct Rect {x,y,width,height:f32}
-struct NativeTexture {pixels:[]u8,width,height:i32,alpha:u8=255}
-struct Gui {surface:software.Surface,target:*NativeTexture,viewport,clip:PixelRect,clipped:bool,draw_alpha:u8=255,sx,sy:f32}
-native_gui:Gui
+struct NativeTexture {pixels:[]u8,width,height:i32,alpha:u8}
+struct Gui {surface:software.Surface,target:*NativeTexture,viewport,clip:PixelRect,clipped:bool,draw_alpha:u8,sx,sy:f32}
+native_gui: Gui = Gui{draw_alpha:255}
 clips:u64
 span_copies:u64
 blends:u64
 pub fn probe_setup(pixels:*u8,width,height:i32,vx,vy,vw,vh,cx,cy,cw,ch:i32,clipped:i32,sx,sy:f32) {
- native_gui=Gui{surface:software.Surface{pixels:pixels[..#cast(usize,width)*#cast(usize,height)*4],width:width,height:height,stride:#cast(usize,width)*4},viewport:PixelRect{x:vx,y:vy,width:vw,height:vh},clip:PixelRect{x:cx,y:cy,width:cw,height:ch},clipped:clipped!=0,sx:sx,sy:sy}
+ native_gui=Gui{draw_alpha:255,surface:software.Surface{pixels:#slice(pixels, #cast(usize,width)*#cast(usize,height)*4),width:width,height:height,stride:#cast(usize,width)*4},viewport:PixelRect{x:vx,y:vy,width:vw,height:vh},clip:PixelRect{x:cx,y:cy,width:cw,height:ch},clipped:clipped!=0,sx:sx,sy:sy}
  clips=0
  span_copies=0
  blends=0
 }
 pub fn probe_texture(reference:i32,pixels:*u8,width,height:i32,alpha:u8,alias:i32,source,destination:*const Rect,checks:*u64) bool {
- texture:=NativeTexture{pixels:pixels[..#cast(usize,width)*#cast(usize,height)*4],width:width,height:height,alpha:alpha}
+ texture:=NativeTexture{pixels:#slice(pixels, #cast(usize,width)*#cast(usize,height)*4),width:width,height:height,alpha:alpha}
  if alias!=0 {texture.pixels=native_gui.surface.pixels}
  result:=false
  if reference!=0 {result=reference_texture(nil,&texture,source,destination)}
  else {result=sdl_render_texture(nil,&texture,source,destination)}
- checks[..3][0]=clips
- checks[..3][1]=span_copies
- checks[..3][2]=blends
+ #slice(checks, 3)[0]=clips
+ #slice(checks, 3)[1]=span_copies
+ #slice(checks, 3)[2]=blends
  return result
 }
 '''

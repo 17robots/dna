@@ -32,7 +32,7 @@ pub fn byte_at(document: *const Document, offset: usize) u8 {
   if offset < document.cache_low || offset >= document.cache_high {
     cache_run(document, offset)
   }
-  return document.cache_data[..document.cache_high - document.cache_low][offset - document.cache_low]
+  return #slice(document.cache_data, document.cache_high - document.cache_low)[offset - document.cache_low]
 }
 pub fn chunk_at(document: *const Document, offset: usize) []const u8 {
   if offset >= document.length {
@@ -41,7 +41,7 @@ pub fn chunk_at(document: *const Document, offset: usize) []const u8 {
   if offset < document.cache_low || offset >= document.cache_high {
     cache_run(document, offset)
   }
-  return document.cache_data[..document.cache_high - document.cache_low][offset - document.cache_low..]
+  return #slice(document.cache_data, document.cache_high - document.cache_low)[offset - document.cache_low..]
 }
 pub fn range(document: *const Document, low: usize, high: usize) []const u8 {
   if high <= low {
@@ -51,7 +51,7 @@ pub fn range(document: *const Document, low: usize, high: usize) []const u8 {
     cache_run(document, low)
   }
   if high <= document.cache_high {
-    return document.cache_data[..document.cache_high - document.cache_low][low - document.cache_low..high - document.cache_low]
+    return #slice(document.cache_data, document.cache_high - document.cache_low)[low - document.cache_low..high - document.cache_low]
   }
   return flatten(document, low, high)
 }
@@ -71,7 +71,7 @@ fn flatten(document: *const Document, low: usize, high: usize) []const u8 {
   view := writable.views
   for view != nil {
     if view.low == low && view.high == high {
-      return view.bytes[..high - low]
+      return #slice(view.bytes, high - low)
     }
     view = view.next
   }
@@ -88,13 +88,13 @@ fn flatten(document: *const Document, low: usize, high: usize) []const u8 {
     #panic("cannot allocate text view")
   }
   rope_copy(document.root, low, high, created.bytes)
-  created.bytes[..high - low + 1][high - low] = 0
+  #slice(created.bytes, high - low + 1)[high - low] = 0
   created.low = low
   created.high = high
   created.next = writable.views
   writable.views = created
   writable.view_count += 1
-  return created.bytes[..high - low]
+  return #slice(created.bytes, high - low)
 }
 // Drop flattened views. Call where no range from this document is still held.
 pub fn release_views(document: *Document) {
@@ -158,7 +158,7 @@ pub fn storage_create(size: usize) TextStorage {
   block.refs = 1
   block.origin = -1
   block.mapped = 0
-  return TextStorage{block: block, bytes: block.bytes[..size]}
+  return TextStorage{block: block, bytes: #slice(block.bytes, size)}
 }
 // Storage over an existing read-only file mapping of length bytes; unmap
 // runs when the last piece referring to it is freed.
@@ -169,7 +169,7 @@ pub fn storage_mapped(bytes: *u8, length: usize, unmap: fn(*u8, u64)) TextStorag
   }
   block.* = RopeBlock{refs: 1, bytes: bytes, origin: -1, mapped: #cast(u64, length)}
   rope_unmap = unmap
-  return TextStorage{block: block, bytes: bytes[..length]}
+  return TextStorage{block: block, bytes: #slice(bytes, length)}
 }
 pub fn storage_release(storage: *TextStorage) {
   if storage.block != nil {
@@ -214,7 +214,7 @@ pub fn snapshot_source_at(snapshot: *const TextSnapshot, offset: usize) TextSour
 }
 fn root_source_at(root: *const RopeNode, offset: usize) TextSource {
   run := rope_run(root, offset)
-  bytes := run.data[..run.high - run.low][offset - run.low..]
+  bytes := #slice(run.data, run.high - run.low)[offset - run.low..]
   if run.block.origin < 0 {
     return TextSource{bytes: bytes, descriptor: -1}
   }
@@ -252,7 +252,7 @@ pub fn snapshot_chunk(snapshot: *const TextSnapshot, offset: usize) []const u8 {
     return ""
   }
   run := rope_run(snapshot.root, offset)
-  return run.data[..run.high - run.low][offset - run.low..]
+  return #slice(run.data, run.high - run.low)[offset - run.low..]
 }
 pub fn snapshot_copy(snapshot: *const TextSnapshot, low: usize, high: usize, output: *u8) {
   if high > low {
@@ -308,7 +308,7 @@ fn root_point(root: *const RopeNode, offset: usize) TextPoint {
     if end > offset {
       end = offset
     }
-    bytes := run.data[..run.high - run.low][at - run.low..end - run.low]
+    bytes := #slice(run.data, run.high - run.low)[at - run.low..end - run.low]
     for byte in bytes {
       // One unit per character, two for those outside the BMP.
       if (byte & 192) != 128 {
@@ -327,7 +327,7 @@ pub fn snapshot_byte_at(snapshot: *const TextSnapshot, offset: usize) u8 {
     return 0
   }
   run := rope_run(snapshot.root, offset)
-  return run.data[..run.high - run.low][offset - run.low]
+  return #slice(run.data, run.high - run.low)[offset - run.low]
 }
 // Lengths of the longest common prefix and suffix of a snapshot and the
 // document's text, comparing leaf runs, so shared storage costs no reads.
@@ -348,14 +348,14 @@ pub fn snapshot_common(snapshot: *const TextSnapshot, document: *const Document)
     if shorter - prefix < step {
       step = shorter - prefix
     }
-    first := &left.data[..left.high - left.low][prefix - left.low]
-    second := &right.data[..right.high - right.low][prefix - right.low]
+    first := &#slice(left.data, left.high - left.low)[prefix - left.low]
+    second := &#slice(right.data, right.high - right.low)[prefix - right.low]
     if first == second || compare_bytes(first, second, step) == 0 {
       prefix += step
       continue
     }
     for index in 0..step {
-      if first[..step][index] != second[..step][index] {
+      if #slice(first, step)[index] != #slice(second, step)[index] {
         break
       }
       prefix += 1
@@ -376,14 +376,14 @@ pub fn snapshot_common(snapshot: *const TextSnapshot, document: *const Document)
     if shorter - prefix - suffix < step {
       step = shorter - prefix - suffix
     }
-    first := &left.data[..left.high - left.low][left_end - step - left.low]
-    second := &right.data[..right.high - right.low][right_end - step - right.low]
+    first := &#slice(left.data, left.high - left.low)[left_end - step - left.low]
+    second := &#slice(right.data, right.high - right.low)[right_end - step - right.low]
     if first == second || compare_bytes(first, second, step) == 0 {
       suffix += step
       continue
     }
     index := step
-    for index > 0 && first[..step][index - 1] == second[..step][index - 1] {
+    for index > 0 && #slice(first, step)[index - 1] == #slice(second, step)[index - 1] {
       index -= 1
       suffix += 1
     }

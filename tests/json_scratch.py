@@ -47,7 +47,7 @@ fn check_value(input: []const u8, expected: []const u8) {
   arena := mem.arena_create(4096)
   defer mem.arena_release(arena)
   parsed := json.parse(arena, input)
-  if !parsed.ok { #panic("invalid test input") }
+  if parsed.failure.kind != parse.Kind.Ok { #panic("invalid test input") }
   output: [1024]u8
   for index in 0..#len(output) { output[index] = 165 }
   if #len(lsp_json_encode(output[..#len(expected) - 1], parsed.root)) != 0 { #panic("short nested output accepted") }

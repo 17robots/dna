@@ -14,6 +14,7 @@ from dyn_path import real_dyn
 from sdk_compat import environment as sdk_environment
 
 SOURCE = r'''#link("ucrt")
+use "std/parse" parse
 use "std/sync" sync
 use "std/thread"
 use "std/mem"
@@ -98,7 +99,7 @@ fn main() {
     }
     value:[128]u8=[]
     result:=win_io_host.environment("DNA_HANDOFF",value[..])
-    if !result.ok || !result.found { #panic("handoff environment") }
+    if result.failure.kind != parse.Kind.Ok || !result.found { #panic("handoff environment") }
     expect_bytes(result.value,"session café 日本語")
     file:[]const u8="handoff-ok.txt\0"
     fd:=rec_open(&file[0],524481,384)

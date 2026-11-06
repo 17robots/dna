@@ -15,11 +15,11 @@ HEADER='''use "std/ui"
 use "std/ui/software"
 struct PixelRect {x,y,width,height:i32}
 struct NativeTexture {pixels:[]u8,width,height:i32}
-struct Gui {surface:software.Surface,target:*NativeTexture,viewport,clip:PixelRect,clipped:bool,draw_alpha:u8=255,sx,sy:f32}
-native_gui:Gui
+struct Gui {surface:software.Surface,target:*NativeTexture,viewport,clip:PixelRect,clipped:bool,draw_alpha:u8,sx,sy:f32}
+native_gui: Gui = Gui{draw_alpha:255}
 clips:u64
 pub fn probe_setup(pixels:*u8,width,height:i32,vx,vy,vw,vh,cx,cy,cw,ch:i32,sx,sy:f32) {
- native_gui=Gui{surface:software.Surface{pixels:pixels[..#cast(usize,width)*#cast(usize,height)*4],width:width,height:height,stride:#cast(usize,width)*4},viewport:PixelRect{x:vx,y:vy,width:vw,height:vh},clip:PixelRect{x:cx,y:cy,width:cw,height:ch},clipped:true,sx:sx,sy:sy}
+ native_gui=Gui{draw_alpha:255,surface:software.Surface{pixels:#slice(pixels, #cast(usize,width)*#cast(usize,height)*4),width:width,height:height,stride:#cast(usize,width)*4},viewport:PixelRect{x:vx,y:vy,width:vw,height:vh},clip:PixelRect{x:cx,y:cy,width:cw,height:ch},clipped:true,sx:sx,sy:sy}
  clips=0
 }
 pub fn probe_bitmap(reference:i32,pixels:*const u8,width,height:i32,x,y:f32,r,g,b,a:u8,checks:*u64) bool {

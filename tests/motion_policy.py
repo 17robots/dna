@@ -21,12 +21,12 @@ use "./sdl" sdl
 struct Animation { now:f32, line:f32, active:bool, reset:bool, panel:Panel }
 enum Panel { None }
 struct View { reduced_motion:bool, insert:bool, animation:Animation, scroll_x,scroll_y:f32 }
-struct Config { popup_animation_ms:f32=40.0, smooth_cursor:bool=true, smooth_scroll:bool=true, scroll_animation_ms:f32=100.0, cursor_animation_ms:f32=100.0, cursor_thickness:f32=2.0 }
+struct Config {popup_animation_ms:f32,smooth_cursor:bool,smooth_scroll:bool,scroll_animation_ms:f32,cursor_animation_ms:f32,cursor_thickness:f32}
 struct Explorer {insert:bool,scroll_x,scroll_y:f32}
 struct App { view:View, config:Config, explorer:Explorer }
 struct UiBox { hot:motion.Tween, selected:motion.Tween }
 struct UiState { boxes:[1]UiBox, menu_open:motion.Tween }
-struct Typography { cell:f32=8.0, line:f32=20.0, points:f32=16.0, scale:f32=1.0 }
+struct Typography {cell:f32,line:f32,points:f32,scale:f32}
 struct CursorTrail { unused:u32 }
 struct Visual { cursor_x:motion.Tween, cursor_y:motion.Tween, trail:CursorTrail }
 struct AnimatedView {x,y,cursor_x,cursor_y:motion.Tween,trail:CursorTrail}
@@ -120,7 +120,7 @@ CASES={
 fn main() {
  app:=App{}
  visual:=Visual{}
- typography:=Typography{}
+ typography:=Typography{cell:8.0,line:20.0,points:16.0,scale:1.0}
  motion.snap(&visual.cursor_x,0.0)
  motion.snap(&visual.cursor_y,0.0)
  draw_primary(&app,&visual,&typography)
@@ -136,10 +136,10 @@ explorer=(ROOT/'src/explorer.dyn').read_text()
 start=explorer.index('  cursor_x := animated_follow(')
 end=explorer.index('  line_layout_draw(',start)
 CASES['explorer_caret']='''fn main() {
- app_value:=App{config:Config{}}
+ app_value:=App{config:Config{popup_animation_ms:40.0,smooth_cursor:true,smooth_scroll:true,scroll_animation_ms:100.0,cursor_animation_ms:100.0,cursor_thickness:2.0}}
  app:=&app_value
  visual:=Visual{}
- typography:=Typography{}
+ typography:=Typography{cell:8.0,line:20.0,points:16.0,scale:1.0}
  motion.snap(&visual.cursor_x,0.0)
  motion.snap(&visual.cursor_y,0.0)
  renderer:rawptr=nil
@@ -165,10 +165,10 @@ captured_y:f32
 fn terminal_cursor_rect(target:rawptr,x,y,width,height:f32) {captured_x=x
  captured_y=y}
 fn main() {
- app_value:=App{config:Config{}}
+ app_value:=App{config:Config{popup_animation_ms:40.0,smooth_cursor:true,smooth_scroll:true,scroll_animation_ms:100.0,cursor_animation_ms:100.0,cursor_thickness:2.0}}
  app:=&app_value
  slot:=Slot{}
- typography:=Typography{}
+ typography:=Typography{cell:8.0,line:20.0,points:16.0,scale:1.0}
  motion.snap(&slot.terminal.cursor_x,0.0)
  motion.snap(&slot.terminal.cursor_y,0.0)
  column:i32=10
@@ -184,7 +184,7 @@ end=view.index('  scroll_x := visual.x.value',start)
 CASES['editing_viewport']='''fn draw_edit_scroll(app:*App,visual:*AnimatedView,focused:bool,caret_x,caret_y:f32) {
  visible_width:f32=100.0
  visible_height:f32=500.0
- typography:=Typography{}
+ typography:=Typography{cell:8.0,line:20.0,points:16.0,scale:1.0}
 '''+view[start:end]+'''}
 fn main() {
  app:=App{}
@@ -222,7 +222,7 @@ fn main() {
 start=explorer.index('  animated_scroll(app, visual, app.explorer.scroll_x')
 end=explorer.index('  scroll_x := visual.x.value',start)
 CASES['editing_explorer_viewport']='''fn main() {
- app_value:=App{config:Config{}}
+ app_value:=App{config:Config{popup_animation_ms:40.0,smooth_cursor:true,smooth_scroll:true,scroll_animation_ms:100.0,cursor_animation_ms:100.0,cursor_thickness:2.0}}
  app:=&app_value
  app.view.animation.line=20.0
  app.explorer.insert=true
@@ -232,7 +232,7 @@ CASES['editing_explorer_viewport']='''fn main() {
  visual:=&storage
  motion.snap(&visual.x,0.0)
  motion.snap(&visual.y,0.0)
- typography:=Typography{}
+ typography:=Typography{cell:8.0,line:20.0,points:16.0,scale:1.0}
  x:f32=150.0
  y:f32=400.0
  body_height:f32=500.0
@@ -309,7 +309,7 @@ with tempfile.TemporaryDirectory(prefix='dna-motion-policy-') as directory:
         stage=work/name;stage.mkdir()
         shutil.copytree(ROOT/'src/motion',stage/'motion')
         (stage/'sdl').mkdir();(stage/'sdl/sdl.dyn').write_text(SDL)
-        (stage/'main.dyn').write_text(BASE+helpers+body.replace('app:=App{}','app:=App{config:Config{}}'))
+        (stage/'main.dyn').write_text(BASE+helpers+body.replace('app:=App{}','app:=App{config:Config{popup_animation_ms:40.0,smooth_cursor:true,smooth_scroll:true,scroll_animation_ms:100.0,cursor_animation_ms:100.0,cursor_thickness:2.0}}'))
         for mode in ('debug','release'):
             output=work/(name+'-'+mode)
             subprocess.run(['python3',str(ROOT/'scripts/compile.py'),DYN,'build',str(stage),'--'+mode,'--output',str(output)],check=True,timeout=60,stdout=subprocess.DEVNULL)

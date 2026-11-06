@@ -29,7 +29,7 @@ with tempfile.TemporaryDirectory(prefix='dna-host-environment-') as directory:
     process = stage / 'process'
     process.mkdir()
     (process / 'process.dyn').write_text('''use "std/mem"
-use "std/errors"
+use "std/io"
 extern fn invoked "probe_invoked"() i32
 pub struct EnvironmentResult { value: []u8, found: bool, error: isize, kind: errors.Kind, ok: bool }
 pub struct ArgumentsResult { value: [][]const u8, error: isize, kind: errors.Kind, ok: bool }
@@ -65,22 +65,23 @@ int probe_invoked(void) { ++calls; if (!mode) __builtin_trap(); return mode; }
 int probe_calls(void) { return calls; }
 ''')
     subprocess.run(['cc', '-c', str(stage / 'probe.c'), '-o', str(stage / 'probe.o')], check=True, timeout=30)
-    source = ['''use "./host" host
-use "std/errors"
+    source = ['''use "std/parse" parse
+use "./host" host
+use "std/io"
 extern fn set "probe_set"(mode: i32)
 extern fn calls "probe_calls"() i32
 fn rejected(name: []const u8, kind: errors.Kind, error: isize) {
   set(0)
   output: [4]u8 = [90,90,90,90]
   result := host.environment(name, output[..3])
-  if result.ok || result.found || result.kind != kind || result.error != error || #len(result.value) != 0 || calls() != 0 { #panic("rejection") }
+  if result.failure.kind == parse.Kind.Ok || result.found || result.kind != kind || result.failure.native != error || #len(result.value) != 0 || calls() != 0 { #panic("rejection") }
   for byte in output { if byte != 90 { #panic("rejected output changed") } }
 }
 fn accepted(name: []const u8) {
   set(1)
   output: [4]u8 = [90,90,90,90]
   result := host.environment(name, output[..3])
-  if !result.ok || !result.found || #len(result.value) != 3 || calls() != 1 { #panic("accepted boundary") }
+  if result.failure.kind != parse.Kind.Ok || !result.found || #len(result.value) != 3 || calls() != 1 { #panic("accepted boundary") }
   if &result.value[0] != &output[0] || output[0] != 97 || output[2] != 99 || output[3] != 90 { #panic("destination ownership") }
 }
 fn main() {''']

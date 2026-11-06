@@ -1,3 +1,4 @@
+use "std/parse" parse
 use "std/encoding/json"
 
 struct PluginState {
@@ -107,17 +108,17 @@ fn plugin_prepare(app: *App, manifest: []const u8) {
   mark := mem.arena_mark(app.scratch)
   defer mem.arena_rewind(app.scratch, mark)
   manifest_info := files.metadata(path)
-  if !manifest_info.ok || (manifest_info.mode & 61440) != 32768 {
+  if manifest_info.failure.kind != io.Kind.Ok || (manifest_info.mode & 61440) != 32768 {
     notice(app, "Plugin manifest must be a regular file.")
     return
   }
   read := fs.read_all(app.scratch, path, 16384)
-  if !read.ok {
+  if read.failure.kind != io.Kind.Ok {
     notice(app, "Cannot read plugin manifest (maximum 16 KiB).")
     return
   }
   parsed := json.parse(app.scratch, read.value)
-  if !parsed.ok || !json.is_object(parsed.root) {
+  if parsed.failure.kind != parse.Kind.Ok || !json.is_object(parsed.root) {
     notice(app, "Plugin manifest must be a JSON object.")
     return
   }
@@ -183,7 +184,7 @@ fn plugin_prepare(app: *App, manifest: []const u8) {
   used := copy_text(pending.executable[..], path[..parent])
   add_text(pending.executable[..], &used, executable)
   info := files.metadata(pending.executable[..used])
-  if !info.ok || (info.mode & 61440) != 32768 || !fs.executable(pending.executable[..used]) {
+  if info.failure.kind != io.Kind.Ok || (info.mode & 61440) != 32768 || !fs.executable(pending.executable[..used]) {
     notice(app, "Plugin executable must be a regular executable file beside its manifest.")
     return
   }
@@ -320,7 +321,7 @@ fn plugin_message(app: *App, index: usize, source: []const u8) {
   mark := mem.arena_mark(app.scratch)
   defer mem.arena_rewind(app.scratch, mark)
   parsed := json.parse(app.scratch, source)
-  if !parsed.ok || !json.is_object(parsed.root) {
+  if parsed.failure.kind != parse.Kind.Ok || !json.is_object(parsed.root) {
     plugin_stop(app, index, "Invalid plugin JSON; disabled.")
     return
   }
@@ -518,11 +519,11 @@ fn plugin_list(app: *App) {
   add_text(directory[..], &length, "plugins")
   storage: [8192]u8 = []
   opened := fs.open_directory(directory[..length], storage[..])
-  if opened.ok {
-    defer _ = fs.close_directory(&opened.directory)
+  if opened.failure.kind == io.Kind.Ok {
+    defer fs.close_directory(&opened.directory)
     for used < 7000 {
       entry := fs.directory_next(&opened.directory)
-      if !entry.ok {
+      if !entry.found {
         break
       }
       if entry.kind == 4 && #len(entry.name) > 0 && entry.name[0] != '.' && valid_leaf(entry.name) {
@@ -545,7 +546,7 @@ fn plugin_list(app: *App) {
         add_text(installed[..], &installed_length, candidate.key)
         add_text(installed[..], &installed_length, "/plugin.json")
         active_manifest: [4096]u8 = []
-        if plugin_resolve_native(&installed[0], &active_manifest[0], #len(active_manifest)) == 0 || !files.metadata(active_manifest[..c.string_length(&active_manifest[0], #len(active_manifest))]).ok {
+        if plugin_resolve_native(&installed[0], &active_manifest[0], #len(active_manifest)) == 0 || files.metadata(active_manifest[..c.string_length(&active_manifest[0], #len(active_manifest))]).failure.kind != io.Kind.Ok {
           add_text(text[..], &used, "  ")
           add_text(text[..], &used, candidate.key)
           add_text(text[..], &used, "\n")
@@ -647,7 +648,7 @@ fn plugin_update(app: *App, name: []const u8) {
   mark := mem.arena_mark(app.scratch)
   defer mem.arena_rewind(app.scratch, mark)
   read := fs.read_all(app.scratch, resolved_source[..c.string_length(&resolved_source[0], #len(resolved_source))], 4095)
-  if !read.ok || #len(read.value) == 0 {
+  if read.failure.kind != io.Kind.Ok || #len(read.value) == 0 {
     notice(app, "This installation has no recorded source. Use :plugin-install /path/plugin.json first.")
     return
   }
@@ -666,11 +667,11 @@ fn plugin_catalog(app: *App, arena: *mem.Arena) *const json.Value {
   length := copy_text(path[..], app.configuration.path[..parent])
   add_text(path[..], &length, "plugin-catalog.json")
   read := fs.read_all(arena, path[..length], 32768)
-  if !read.ok {
+  if read.failure.kind != io.Kind.Ok {
     return nil
   }
   parsed := json.parse(arena, read.value)
-  if !parsed.ok || !json.is_object(parsed.root) {
+  if parsed.failure.kind != parse.Kind.Ok || !json.is_object(parsed.root) {
     return nil
   }
   return parsed.root

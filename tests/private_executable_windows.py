@@ -14,7 +14,8 @@ from windows_target import SDK_ARCH, link_arguments
 from dyn_path import real_dyn
 from sdk_compat import environment as sdk_environment
 
-SOURCE = r'''use "./filesystem" fs
+SOURCE = r'''use "std/io" io
+use "./filesystem" fs
 use "std/dynlib" loader
 fn write_payload(executable:bool, path:[]const u8) {
   created:=fs.FileResult{}
@@ -22,7 +23,7 @@ fn write_payload(executable:bool, path:[]const u8) {
   } else { created=fs.create_private_exclusive(path) }
   if !created.ok { #panic("private output creation") }
   opened:=fs.open("payload.exe")
-  if !opened.ok { #panic("PE fixture open") }
+  if opened.failure.kind != io.Kind.Ok { #panic("PE fixture open") }
   buffer:[16384]u8=[]
   for {
     read:=fs.read(&opened.value,buffer[..])
@@ -35,7 +36,7 @@ fn write_payload(executable:bool, path:[]const u8) {
       at+=written.transferred
     }
   }
-  if !fs.close(&opened.value).ok || !fs.sync(&created.value).ok || !fs.close(&created.value).ok { #panic("private PE close") }
+  if fs.close(&opened.value).failure.kind != io.Kind.Ok || fs.sync(&created.value).failure.kind != io.Kind.Ok { #panic("private PE close") }
 }
 fn main() {
   // Both files contain the same valid PE. Their only intended difference is
@@ -43,7 +44,7 @@ fn main() {
   write_payload(true,"private café 日本語.exe")
   write_payload(false,"data café 日本語.exe")
   if !fs.executable("private café 日本語.exe") || fs.executable("data café 日本語.exe") || fs.executable("missing.exe") || fs.executable(".") || fs.executable("reparse-payload.exe") { #panic("effective executable access must match private DACL and reject non-regular paths") }
-  if fs.create_private_executable_exclusive("private café 日本語.exe").ok || fs.create_private_exclusive("data café 日本語.exe").ok { #panic("private creation must not overwrite") }
+  if fs.create_private_executable_exclusive("private café 日本語.exe").failure.kind == io.Kind.Ok || fs.create_private_exclusive("data café 日本語.exe").failure.kind == io.Kind.Ok { #panic("private creation must not overwrite") }
   kernel:=loader.open("kernel32.dll",0)
   process_symbol:=loader.symbol(kernel.value,"GetCurrentProcess")
   count_symbol:=loader.symbol(kernel.value,"GetProcessHandleCount")
@@ -53,16 +54,16 @@ fn main() {
   // Warm both creation paths before checking steady ownership.
   for attempt in 0..2 {
     file:=fs.create_private_executable_exclusive("temporary.exe")
-    if !file.ok || !fs.close(&file.value).ok || !fs.remove("temporary.exe").ok { #panic("warmup") }
+    if !file.ok || fs.remove("temporary.exe").failure.kind != io.Kind.Ok { #panic("warmup") }
   }
   before:u32=0
   after:u32=0
   if handles(process(),&before)==0 { #panic("initial handle count") }
   for attempt in 0..128 {
     file:=fs.create_private_executable_exclusive("temporary.exe")
-    if !file.ok || !fs.close(&file.value).ok || !fs.remove("temporary.exe").ok { #panic("executable creation lifecycle") }
+    if !file.ok || fs.remove("temporary.exe").failure.kind != io.Kind.Ok { #panic("executable creation lifecycle") }
     file=fs.create_private_exclusive("temporary.data")
-    if !file.ok || !fs.close(&file.value).ok || !fs.remove("temporary.data").ok { #panic("data creation lifecycle") }
+    if !file.ok || fs.remove("temporary.data").failure.kind != io.Kind.Ok { #panic("data creation lifecycle") }
     if !fs.executable("private café 日本語.exe") || fs.executable("data café 日本語.exe") || fs.executable("missing.exe") || fs.executable(".") || fs.executable("reparse-payload.exe") { #panic("effective executable access lifecycle") }
   }
   if handles(process(),&after)==0 || before!=after { #panic("private creation handle leak") }
