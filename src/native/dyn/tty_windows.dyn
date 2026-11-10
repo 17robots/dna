@@ -1,4 +1,5 @@
 #target(kernel: windows)
+use "std/io"
 
 // Console records provide bounded raw input without a detached blocking reader.
 // The wake event is first in the wait set, so ignored/key-up floods cannot
@@ -70,7 +71,7 @@ fn win_tty_prepare() {
     kernel := win_io_loader.open("kernel32.dll", 0)
     shell := win_io_loader.open("shell32.dll", 0)
     runtime:=win_io_loader.open("ucrtbase.dll", 0)
-    if !kernel.ok || !shell.ok || !runtime.ok {
+    if kernel.failure.kind != io.Kind.Ok || shell.failure.kind != io.Kind.Ok || runtime.failure.kind != io.Kind.Ok {
       #panic("missing Windows console library")
     }
     win_tty_api.at_exit=#cast(fn(fn())i32, win_io_symbol(runtime.value, "_crt_atexit"))
@@ -278,7 +279,7 @@ fn tty_suspend_host() i32 {
     return 0
   }
   defer rec_free(#cast(rawptr, storage))
-  command := storage[..32768]
+  command := #slice(storage, 32768)
   name: [8]u16 = [67, 111, 109, 83, 112, 101, 99, 0]
   length := win_tty_api.variable(&name[0], &command[0], 32767)
   if length == 0 || length >= 32767 {
@@ -300,9 +301,9 @@ fn tty_suspend_host() i32 {
   startup := WinTtyStartup{size: #cast(u32, #sizeof(WinTtyStartup))}
   child := WinTtyProcess{}
   if win_tty_api.create_process(nil, &command[0], nil, nil, 0, 1024, nil, nil, &startup, &child) != 0 {
-    win_io_api.close(child.thread)
+    _ = win_io_api.close(child.thread)
     _ = win_tty_api.wait_process(child.process, 4294967295)
-    win_io_api.close(child.process)
+    _ = win_io_api.close(child.process)
   }
   sync.store_u32(&win_tty_suspended, 0)
   entered := dna_tty_enter()
@@ -536,7 +537,7 @@ fn win_tty_mouse(mouse:*const WinTtyMouse) {
 fn win_tty_drain(buffer:*u8, capacity:i32)i32 {
   used:usize=0
   for used<#cast(usize, capacity) && win_tty_repeat>0 {
-    buffer[..#cast(usize, capacity)][used]=win_tty_pending[win_tty_offset]
+    #slice(buffer, #cast(usize, capacity))[used]=win_tty_pending[win_tty_offset]
     used+=1
     win_tty_offset+=1
     if win_tty_offset==win_tty_length {
@@ -655,9 +656,9 @@ fn tty_arguments() isize {
   defer _=win_tty_api.local_free(#cast(rawptr, arguments))
   used:usize=0
   for index in 0..count {
-    argument:=arguments[..#cast(usize, count)][#cast(usize, index)]
+    argument:=#slice(arguments, #cast(usize, count))[#cast(usize, index)]
     units:usize=0
-    for argument[..32768][units]!=0 && units<32767 {
+    for #slice(argument, 32768)[units]!=0 && units<32767 {
       units+=1
     }
     amount:=win_io_host.utf8(65001, 128, argument, #cast(i32, units), &tty_command_line[used], #cast(i32, 65535-used), nil, nil)
@@ -700,11 +701,11 @@ fn win_tty_quote(output:[]u16, used:*usize, argument:*const u16) bool {
   at:usize=0
   for {
     slashes:usize=0
-    for argument[..32768][at]==92 {
+    for #slice(argument, 32768)[at]==92 {
       slashes+=1
       at+=1
     }
-    unit:=argument[..32768][at]
+    unit:=#slice(argument, 32768)[at]
     count:=slashes
     if unit==34 || unit==0 {
       count*=2
@@ -752,9 +753,9 @@ fn win_tty_environment(space:*WinTtyHandoff, session:*const u8) bool {
   used:usize=0
   at:usize=0
   inserted:bool=false
-  for source[..65536][at]!=0 {
+  for #slice(source, 65536)[at]!=0 {
     length:usize=0
-    for at+length<65535 && source[..65536][at+length]!=0 {
+    for at+length<65535 && #slice(source, 65536)[at+length]!=0 {
       length+=1
     }
     if at+length>=65535 {
@@ -763,7 +764,7 @@ fn win_tty_environment(space:*WinTtyHandoff, session:*const u8) bool {
     same:bool=length>=#len(key)
     if same {
       for index in 0..#len(key) {
-        value:=source[..65536][at+index]
+        value:=#slice(source, 65536)[at+index]
         if value>=97 && value<=122 {
           value-=32
         }
@@ -774,7 +775,7 @@ fn win_tty_environment(space:*WinTtyHandoff, session:*const u8) bool {
       }
     }
     if !same {
-      if !inserted && win_tty_api.compare(&source[..65536][at], #cast(i32, length), &space.argument[0], #cast(i32, extra-1), 1)==3 {
+      if !inserted && win_tty_api.compare(&#slice(source, 65536)[at], #cast(i32, length), &space.argument[0], #cast(i32, extra-1), 1)==3 {
         if extra>=65536-used {
           return false
         }
@@ -788,7 +789,7 @@ fn win_tty_environment(space:*WinTtyHandoff, session:*const u8) bool {
         return false
       }
       for index in 0..=length {
-        space.environment[used+index]=source[..65536][at+index]
+        space.environment[used+index]=#slice(source, 65536)[at+index]
       }
       used+=length+1
     }
@@ -818,8 +819,8 @@ fn tty_handoff_host(executable:*const u8, arguments:**const u8, session:*const u
   }
   used:usize=0
   count:usize=0
-  for count<256 && arguments[..256][count]!=nil {
-    argument:=arguments[..256][count]
+  for count<256 && #slice(arguments, 256)[count]!=nil {
+    argument:=#slice(arguments, 256)[count]
     if argument.*==0 {
       space.argument[0]=0
     } else if !win_io_path(argument, space.argument[..]) {

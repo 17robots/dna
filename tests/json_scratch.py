@@ -22,6 +22,7 @@ use "std/mem"
 use "std/io"
 use "std/thread"
 use "std/sync"
+use "std/parse"
 use "./buffer" buffer
 ''' + helpers + '''
 fn same(a: []const u8, b: []const u8) bool {
@@ -131,7 +132,7 @@ fixture += '''  output: [16]u8
   node := #cast(*json.Value, &node_storage[0])
   node.* = json.Value{ kind: json.KindNull }
   before := node_storage
-  if #len(lsp_json_encode((#cast(*u8, node))[..#sizeof(json.Value)], node)) != 0 { #panic("node alias accepted") }
+  if #len(lsp_json_encode(#slice(#cast(*u8, node), #sizeof(json.Value)), node)) != 0 { #panic("node alias accepted") }
   for index in 0..#len(before) { if before[index] != node_storage[index] { #panic("node alias changed metadata") } }
 }
 '''

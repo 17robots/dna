@@ -52,6 +52,7 @@ extern fn proc_realloc "realloc"(bytes: *u8, length: usize) *u8
 extern fn proc_move "memmove"(output: *u8, source: *const u8, length: usize) rawptr
 use "std/sync" win_proc_sync
 use "std/dynlib" win_proc_loader
+use "std/io"
 struct WinProcAPI {
   create: fn(*const u16, *u16, rawptr, rawptr, i32, u32, rawptr, rawptr, *WinProcStartup, *WinProcInformation) i32,
   job: fn(rawptr, rawptr) rawptr,
@@ -85,7 +86,7 @@ win_proc_once: win_proc_sync.Once
 fn win_proc_prepare() {
   if win_proc_sync.once_begin(&win_proc_once) {
     kernel := win_proc_loader.open("kernel32.dll", 0)
-    if !kernel.ok {
+    if kernel.failure.kind != io.Kind.Ok {
       #panic("missing Windows process library")
     }
     win_proc_api.create = #cast(fn(*const u16, *u16, rawptr, rawptr, i32, u32, rawptr, rawptr, *WinProcStartup, *WinProcInformation) i32, win_io_symbol(kernel.value, "CreateProcessW"))
@@ -155,7 +156,7 @@ fn win_proc_utf16(text: *const u8, output: *u16, capacity: i32) i32 {
   if size <= 0 {
     return 0
   }
-  output[..#cast(usize, capacity)][#cast(usize, size)] = 0
+  #slice(output, #cast(usize, capacity))[#cast(usize, size)] = 0
   return size
 }
 // Keep descriptors out of stdio even when the embedding process closed them.
@@ -207,8 +208,8 @@ fn win_proc_append_decimal(output: []u16, used: *usize, value: u32) {
 fn proc_pipe(fds: *i32, flags: i32) i32 {
   win_proc_prepare()
   _ = flags
-  fds[..2][0] = -1
-  fds[..2][1] = -1
+  #slice(fds, 2)[0] = -1
+  #slice(fds, 2)[1] = -1
   name: [128]u16 = []
   prefix: []const u8 = "\\\\.\\pipe\\dna-"
   used: usize = 0
@@ -229,19 +230,19 @@ fn proc_pipe(fds: *i32, flags: i32) i32 {
   client := win_proc_api.open_pipe(&name[0], 3221225472, 0, nil, 3, 0, nil)
   if !win_proc_valid(client) {
     saved := win_proc_api.error()
-    win_proc_api.close(server)
+    _ = win_proc_api.close(server)
     _ = win_proc_errno(saved)
     return -1
   }
   if win_proc_api.connect(server, nil) == 0 && win_proc_api.error() != 535 {
-    win_proc_api.close(client)
-    win_proc_api.close(server)
+    _ = win_proc_api.close(client)
+    _ = win_proc_api.close(server)
     return -1
   }
   mode: u32 = 1
   if win_proc_api.pipe_mode(client, &mode, nil, nil) == 0 {
-    win_proc_api.close(client)
-    win_proc_api.close(server)
+    _ = win_proc_api.close(client)
+    _ = win_proc_api.close(server)
     return -1
   }
   read_fd := win_proc_descriptor(server)
@@ -255,8 +256,8 @@ fn proc_pipe(fds: *i32, flags: i32) i32 {
     }
     return -1
   }
-  fds[..2][0] = read_fd
-  fds[..2][1] = write_fd
+  #slice(fds, 2)[0] = read_fd
+  #slice(fds, 2)[1] = write_fd
   return 0
 }
 fn proc_nonblocking(fd: i32) bool {
@@ -290,18 +291,18 @@ fn proc_close(child: *OwnedProcess) {
   proc_close_fds(descriptors[..])
   if owned.process != nil {
     _ = win_proc_api.wait(owned.process, 4294967295)
-    win_proc_api.close(owned.process)
+    _ = win_proc_api.close(owned.process)
   }
   if owned.job != nil {
-    win_proc_api.close(owned.job)
+    _ = win_proc_api.close(owned.job)
   }
 }
 fn win_proc_absolute(path: *const u8) bool {
   size := string_length(path)
-  if size >= 3 && path[..size][1] == 58 && (path[..size][2] == 92 || path[..size][2] == 47) {
+  if size >= 3 && #slice(path, size)[1] == 58 && (#slice(path, size)[2] == 92 || #slice(path, size)[2] == 47) {
     return true
   }
-  return size >= 2 && ((path[..size][0] == 92 && path[..size][1] == 92) || (path[..size][0] == 47 && path[..size][1] == 47))
+  return size >= 2 && ((#slice(path, size)[0] == 92 && #slice(path, size)[1] == 92) || (#slice(path, size)[0] == 47 && #slice(path, size)[1] == 47))
 }
 fn proc_open(command: *const u8, directory: *const u8, shell: bool) OwnedProcess {
   win_proc_prepare()
@@ -402,22 +403,22 @@ fn proc_open(command: *const u8, directory: *const u8, shell: bool) OwnedProcess
   limits := WinProcLimits{}
   limits.basic.flags = 8192
   if win_proc_api.job_limits(job, 9, #cast(rawptr, &limits), #cast(u32, #sizeof(WinProcLimits))) == 0 {
-    win_proc_api.close(job)
+    _ = win_proc_api.close(job)
     return proc_none()
   }
   startup := WinProcStartup{size: #cast(u32, #sizeof(WinProcStartup)), flags: 256, input: handles[0], output: handles[1], error: handles[2], attributes: space.attributes}
   information := WinProcInformation{}
   if win_proc_api.create(&space.executable[0], &space.command[0], nil, nil, 1, 134742020, nil, #cast(rawptr, &space.directory[0]), &startup, &information) == 0 {
-    win_proc_api.close(job)
+    _ = win_proc_api.close(job)
     return proc_none()
   }
   owned := OwnedProcess{pid: 1, input: -1, output: -1, error: -1, process: information.process, job: job}
   if win_proc_api.assign(job, information.process) == 0 || win_proc_api.resume(information.thread) == 4294967295 {
-    win_proc_api.close(information.thread)
+    _ = win_proc_api.close(information.thread)
     proc_close(&owned)
     return proc_none()
   }
-  win_proc_api.close(information.thread)
+  _ = win_proc_api.close(information.thread)
   owned.input = descriptors[1]
   owned.output = descriptors[2]
   owned.error = descriptors[4]
@@ -506,7 +507,7 @@ fn proc_poll(fds: *PollDescriptor, count: usize, timeout: i32) i32 {
   for {
     ready: i32 = 0
     for index in 0..count {
-      target := &fds[..count][index]
+      target := &#slice(fds, count)[index]
       target.returned = 0
       if target.fd < 0 {
         continue
@@ -599,8 +600,8 @@ fn proc_symbol(library: rawptr, name: *const u8) rawptr {
   if library == nil {
     return nil
   }
-  result := win_proc_loader.symbol(library, name[..string_length(name)])
-  if !result.ok {
+  result := win_proc_loader.symbol(library, #slice(name, string_length(name)))
+  if result.failure.kind != io.Kind.Ok {
     return nil
   }
   return result.value

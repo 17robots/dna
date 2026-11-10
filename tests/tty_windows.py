@@ -74,11 +74,11 @@ fn fixture_read_exact(expected:[]const u8, chunk_limit:i32) {
   valid:=used==#len(expected)
   for at in 0..used { if bytes[at]!=expected[at] { valid=false } }
   if !valid {
-    _=io.println(io.stderr(),"console exact read: expected {} bytes, received {}, last {}, pending length {}, offset {}, repeat {}",#len(expected),used,last,win_tty_length,win_tty_offset,win_tty_repeat)
-    for at in 0..used { _=io.println(io.stderr(),"console byte {} = {}",at,bytes[at]) }
+    io.eprintln("console exact read: expected {} bytes, received {}, last {}, pending length {}, offset {}, repeat {}",#len(expected),used,last,win_tty_length,win_tty_offset,win_tty_repeat)
+    for at in 0..used { io.eprintln("console byte {} = {}",at,bytes[at]) }
     for at in 0..#cast(usize,record_count) {
       key:=#cast(*WinTtyKey,&records[at].data[0])
-      _=io.println(io.stderr(),"queued record kind {}: down {}, repeat {}, key {}, scan {}, character {}, control {}",records[at].kind,key.down,key.repeat,key.key,key.scan,key.character,key.control)
+      io.eprintln("queued record kind {}: down {}, repeat {}, key {}, scan {}, character {}, control {}",records[at].kind,key.down,key.repeat,key.key,key.scan,key.character,key.control)
     }
     #panic("console exact input bytes")
   }
@@ -99,7 +99,7 @@ fn main() {
     }
     value:[128]u8=[]
     result:=win_io_host.environment("DNA_HANDOFF",value[..])
-    if result.failure.kind != parse.Kind.Ok || !result.found { #panic("handoff environment") }
+    if result.failure.kind != io.Kind.Ok || !result.found { #panic("handoff environment") }
     expect_bytes(result.value,"session café 日本語")
     file:[]const u8="handoff-ok.txt\0"
     fd:=rec_open(&file[0],524481,384)
@@ -192,7 +192,7 @@ fn main() {
   _=flush_input(input)
   owner:=mem.arena_create(8192)
   worker:=thread.spawn_with_size(owner,1048576,read_worker,nil)
-  if !worker.ok { #panic("pending reader thread") }
+  if worker.failure.kind != io.Kind.Ok { #panic("pending reader thread") }
   for sync.load_u32(&read_started)==0 { sleep(1) }
   deadline:=win_tty_api.ticks()+1000
   for {
@@ -204,7 +204,7 @@ fn main() {
     sleep(1)
   }
   tty_leave_host()
-  if !thread.join(worker.value).ok || (read_result!=-1 && read_result!=-2) { #panic("leave must release pending reader") }
+  if thread.join(worker.value).failure.kind != io.Kind.Ok || (read_result!=-1 && read_result!=-2) { #panic("leave must release pending reader") }
   mem.arena_release(owner)
   if win_tty_api.mode(input,&mode)==0 || mode!=before_input || win_tty_api.input_page()!=before_input_page || win_tty_api.output_page()!=before_output_page { #panic("input mode and page restoration") }
   if win_tty_api.mode(output,&mode)==0 || mode!=before_output { #panic("output mode restoration") }
@@ -233,7 +233,7 @@ fn main() {
   if !tty_handoff_host(executable,&arguments[0],&session[0]) { #panic("frontend handoff") }
   parent_value:[128]u8=[]
   parent_environment:=win_io_host.environment("DNA_HANDOFF",parent_value[..])
-  if !parent_environment.ok || !parent_environment.found { #panic("parent handoff environment") }
+  if parent_environment.failure.kind != io.Kind.Ok || !parent_environment.found { #panic("parent handoff environment") }
   expect_bytes(parent_environment.value,"parent value")
   _=standard(4294967286,original_input)
   _=standard(4294967285,original_output)

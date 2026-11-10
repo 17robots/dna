@@ -11,6 +11,7 @@ DYN = os.environ.get('DYN', 'dyn')
 SOURCE = r'''use "./owned_arena" owner
 use "./cstring" cstring
 use "std/mem"
+use "std/parse"
 fn check(ok: bool) { if !ok { #panic("arena ownership contract") } }
 fn main() {
   check(owner.try_create(#cast(usize, -1)) == nil)
@@ -37,9 +38,9 @@ fn main() {
   _ = mem.push_bytes_uninit(lazy, 32)
   owner.release(lazy)
   storage: [5]u8 = [7,7,7,7,7]
-  check(!cstring.bounded(storage[..], "large").ok && storage[0] == 7)
-  check(!cstring.bounded(storage[..], "a\0b").ok && storage[0] == 7)
-  check(cstring.bounded(storage[..], "text").ok && storage[4] == 0)
+  check(cstring.bounded(storage[..], "large").failure.kind != parse.Kind.Ok && storage[0] == 7)
+  check(cstring.bounded(storage[..], "a\0b").failure.kind != parse.Kind.Ok && storage[0] == 7)
+  check(cstring.bounded(storage[..], "text").failure.kind == parse.Kind.Ok && storage[4] == 0)
 }
 '''
 with tempfile.TemporaryDirectory(prefix='dna-arena-') as directory:

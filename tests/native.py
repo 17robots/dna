@@ -79,7 +79,7 @@ if (root/'dyn').exists():
         assert not lib.dna_syntax_colors(p,output,len(text),2),'stale colors accepted'
         # The installed parser and bundled query must agree on builtin and type parameter syntax.
         builtins = ('sizeof', 'alignof')
-        source = 'fn layout($T: type) usize {\n'
+        source = 'fn layout(T: type) usize {\n'
         source += '  fixed: [4 * 1024]u8 = []\n'
         source += '  return #sizeof(T) + #alignof(T)\n}\n'
         text = source.encode()

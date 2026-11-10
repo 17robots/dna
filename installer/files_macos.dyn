@@ -1,7 +1,12 @@
 #target(kernel: darwin)
 use "std/dynlib" installer_loader
 use "std/sync" installer_sync
-struct InstallerPathResult { value:[]u8, error:isize, ok:bool }
+use "std/parse"
+use "std/io"
+struct InstallerPathResult { value: []u8, failure: io.Failure }
+fn installer_darwin_failure(code: isize) io.Failure {
+  return io.Failure{ kind: io.darwin(code), native: code }
+}
 struct InstallerRemoval { directory:rawptr, parent:i32, name:*const u8 }
 struct InstallerDarwinEntry { inode, seek:u64, record_length, name_length:u16, kind:u8, name:[1024]u8 }
 installer_errno_once:installer_sync.Once
@@ -9,7 +14,7 @@ installer_errno_get:fn() *i32
 fn installer_mac_prepare() {
   if installer_sync.once_begin(&installer_errno_once) {
     result:=installer_loader.symbol(#cast(rawptr, #cast(isize, -2)), "__error")
-    if !result.ok {
+    if result.failure.kind != io.Kind.Ok {
       #panic("missing libSystem errno accessor")
     }
     installer_errno_get=#cast(fn() *i32, result.value)
@@ -32,29 +37,29 @@ fn installer_symbolic_link(target, path:[]const u8) std_fs.Result {
   defer mem.arena_release(arena)
   old:=c.string_from_bytes(arena, target)
   name:=c.string_from_bytes(arena, path)
-  if !old.ok || !name.ok {
-    return std_fs.Result{error:-22}
+  if old.failure.kind != parse.Kind.Ok || name.failure.kind != parse.Kind.Ok {
+    return std_fs.Result{failure: installer_darwin_failure(-22)}
   }
   if installer_symlink(old.value, name.value)!=0 {
-    return std_fs.Result{error:0-#cast(isize, installer_errno_get().*)}
+    return std_fs.Result{failure: installer_darwin_failure(0-#cast(isize, installer_errno_get().*))}
   }
-  return std_fs.Result{ok:true}
+  return std_fs.Result{}
 }
 fn installer_read_link(arena:*mem.Arena, path:[]const u8) InstallerPathResult {
   installer_mac_prepare()
   name:=c.string_from_bytes(arena, path)
-  if !name.ok {
-    return InstallerPathResult{error:-22}
+  if name.failure.kind != parse.Kind.Ok {
+    return InstallerPathResult{failure: installer_darwin_failure(-22)}
   }
   output:=mem.push_array(u8, arena, 4096)
   count:=installer_readlink(name.value, &output[0], #len(output))
   if count<0 {
-    return InstallerPathResult{error:0-#cast(isize, installer_errno_get().*)}
+    return InstallerPathResult{failure: installer_darwin_failure(0-#cast(isize, installer_errno_get().*))}
   }
   if count>=4096 {
-    return InstallerPathResult{error:-28}
+    return InstallerPathResult{failure: installer_darwin_failure(-28)}
   }
-  return InstallerPathResult{value:output[..#cast(usize, count)], ok:true}
+  return InstallerPathResult{value:output[..#cast(usize, count)]}
 }
 // Every descent is relative to an owned directory and refuses symlinks.
 // Parent directory buffers keep each child's name alive until it is removed.
@@ -64,8 +69,8 @@ fn installer_remove_tree(path:[]const u8) std_fs.Result {
   defer mem.arena_release(arena)
   frames:=mem.push_array(InstallerRemoval, arena, 128)
   root:=c.string_from_bytes(arena, path)
-  if !root.ok {
-    return std_fs.Result{error:-22}
+  if root.failure.kind != parse.Kind.Ok {
+    return std_fs.Result{failure: installer_darwin_failure(-22)}
   }
   parent:i32=-2
   name:=root.value
@@ -83,21 +88,21 @@ fn installer_remove_tree(path:[]const u8) std_fs.Result {
     if descriptor<0 {
       error:=installer_errno_get().*
       if error!=20 && error!=62 {
-        return std_fs.Result{error:0-#cast(isize, error)}
+        return std_fs.Result{failure: installer_darwin_failure(0-#cast(isize, error))}
       }
       if installer_unlinkat(parent, name, 0)!=0 {
-        return std_fs.Result{error:0-#cast(isize, installer_errno_get().*)}
+        return std_fs.Result{failure: installer_darwin_failure(0-#cast(isize, installer_errno_get().*))}
       }
     } else {
       if depth==128 {
         installer_close_fd(descriptor)
-        return std_fs.Result{error:-28}
+        return std_fs.Result{failure: installer_darwin_failure(-28)}
       }
       directory:=installer_fdopendir(descriptor)
       if directory==nil {
         error:=installer_errno_get().*
         installer_close_fd(descriptor)
-        return std_fs.Result{error:0-#cast(isize, error)}
+        return std_fs.Result{failure: installer_darwin_failure(0-#cast(isize, error))}
       }
       frames[depth]=InstallerRemoval{directory:directory, parent:parent, name:name}
       depth+=1
@@ -110,13 +115,13 @@ fn installer_remove_tree(path:[]const u8) std_fs.Result {
       if entry==nil {
         error:=installer_errno_get().*
         if error!=0 {
-          return std_fs.Result{error:0-#cast(isize, error)}
+          return std_fs.Result{failure: installer_darwin_failure(0-#cast(isize, error))}
         }
         _=installer_closedir(frame.directory)
         frame.directory=nil
         depth-=1
         if installer_unlinkat(frame.parent, frame.name, 128)!=0 {
-          return std_fs.Result{error:0-#cast(isize, installer_errno_get().*)}
+          return std_fs.Result{failure: installer_darwin_failure(0-#cast(isize, installer_errno_get().*))}
         }
         continue
       }
@@ -129,8 +134,8 @@ fn installer_remove_tree(path:[]const u8) std_fs.Result {
       break
     }
     if !descend {
-      return std_fs.Result{ok:true}
+      return std_fs.Result{}
     }
   }
-  return std_fs.Result{ok:true}
+  return std_fs.Result{}
 }

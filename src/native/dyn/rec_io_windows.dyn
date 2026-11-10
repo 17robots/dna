@@ -15,6 +15,7 @@ extern fn win_io_crt_close "_close"(fd: i32) i32
 extern fn win_io_crt_errno "_errno"() *i32
 extern fn win_io_crt_environment "getenv"(name: *const u8) *u8
 use "std/sync" win_io_sync
+use "std/io"
 struct WinIOInformation { attributes: u32, times: [6]u32, volume, size_high, size_low, links, index_high, index_low: u32 }
 struct WinIOAPI {
   create: fn(*const u16, u32, u32, rawptr, u32, u32, rawptr) rawptr,
@@ -35,7 +36,7 @@ win_io_api: WinIOAPI
 win_io_once: win_io_sync.Once
 fn win_io_symbol(library: rawptr, name: []const u8) rawptr {
   result := win_io_loader.symbol(library, name)
-  if !result.ok || result.value == nil {
+  if result.failure.kind != io.Kind.Ok || result.value == nil {
     #panic("missing Windows IO routine")
   }
   return result.value
@@ -46,7 +47,7 @@ fn win_io_prepare() {
     // paths below use LoadLibraryW instead of the SDK's narrow loader wrapper.
     kernel := win_io_loader.open("kernel32.dll", 0)
     security := win_io_loader.open("advapi32.dll", 0)
-    if !kernel.ok || !security.ok {
+    if kernel.failure.kind != io.Kind.Ok || security.failure.kind != io.Kind.Ok {
       #panic("missing Windows IO system library")
     }
     win_io_api.create = #cast(fn(*const u16, u32, u32, rawptr, u32, u32, rawptr) rawptr, win_io_symbol(kernel.value, "CreateFileW"))
@@ -101,7 +102,7 @@ fn win_io_fail(code: u32) i32 {
   return -1
 }
 fn win_io_text(path: *const u8) []const u8 {
-  return path[..string_length(path)]
+  return #slice(path, string_length(path))
 }
 fn win_io_path(path: *const u8, output: []u16) bool {
   if path == nil || path.* == 0 {
@@ -129,7 +130,7 @@ fn win_io_adopt(handle: rawptr, flags: i32) i32 {
   fd := win_io_crt_adopt(#cast(isize, handle), flags | 32768 | 128)
   if fd < 0 {
     saved := rec_errno().*
-    win_io_api.close(handle)
+    _ = win_io_api.close(handle)
     rec_errno().* = saved
   }
   return fd
@@ -157,19 +158,19 @@ fn rec_open(path: *const u8, flags: i32, mode: u32) i32 {
     } else {
       created = win_io_files.create_private_exclusive(win_io_text(path))
     }
-    if !created.ok {
-      return win_io_fail(#cast(u32, 0 - created.error))
+    if created.failure.kind != io.Kind.Ok {
+      return win_io_fail(#cast(u32, 0 - created.failure.native))
     }
     handle = #cast(rawptr, created.value.descriptor)
     if (flags & 3) == 2 {
       replacement := win_io_api.reopen(handle, 3221225472, 7, 0)
       if #cast(isize, replacement) == -1 {
         code := win_io_api.error()
-        win_io_api.close(handle)
+        _ = win_io_api.close(handle)
         _ = win_io_api.delete(&wide[0])
         return win_io_fail(code)
       }
-      win_io_api.close(handle)
+      _ = win_io_api.close(handle)
       handle = replacement
     }
   } else {
@@ -215,7 +216,7 @@ fn rec_open(path: *const u8, flags: i32, mode: u32) i32 {
     failure = 50
   }
   if failure != 0 {
-    win_io_api.close(handle)
+    _ = win_io_api.close(handle)
     return win_io_fail(failure)
   }
   return win_io_adopt(handle, flags & 3)
@@ -318,8 +319,8 @@ fn rec_mkdir(path: *const u8, mode: u32) i32 {
     return win_io_fail(87)
   }
   result := win_io_files.make_directory(win_io_text(path), #cast(usize, mode))
-  if !result.ok {
-    return win_io_fail(#cast(u32, 0 - result.error))
+  if result.failure.kind != io.Kind.Ok {
+    return win_io_fail(#cast(u32, 0 - result.failure.native))
   }
   return 0
 }
@@ -333,7 +334,7 @@ fn rec_temp(path: *u8) i32 {
     return win_io_fail(87)
   }
   for at in length - 6..length {
-    if path[..length][at] != 88 {
+    if #slice(path, length)[at] != 88 {
       return win_io_fail(87)
     }
   }
@@ -344,7 +345,7 @@ fn rec_temp(path: *u8) i32 {
       return win_io_fail(5)
     }
     for index in 0..6 {
-      path[..length][length - 6 + index] = alphabet[#cast(usize, random[index] & 63)]
+      #slice(path, length)[length - 6 + index] = alphabet[#cast(usize, random[index] & 63)]
     }
     fd := rec_open(path, 524482, 384)
     if fd >= 0 || rec_errno().* != 17 {
@@ -386,7 +387,7 @@ fn win_io_drive_letter(byte: u8) bool {
   return (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122)
 }
 fn win_io_unc_root(path: *const u8, length: usize, first: usize) usize {
-  text := path[..length]
+  text := #slice(path, length)
   server := first
   at := first
   for at < length && !rec_path_separator(text[at]) {
@@ -420,7 +421,7 @@ fn rec_path_root(path: *const u8, length: usize) usize {
   if path == nil || length < 3 {
     return 0
   }
-  text := path[..length]
+  text := #slice(path, length)
   if win_io_drive_letter(text[0]) && text[1] == 58 && rec_path_separator(text[2]) {
     return 3
   }

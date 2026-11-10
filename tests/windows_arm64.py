@@ -35,7 +35,7 @@ assert compiler, 'Install the pinned Dyn SDK first.'
 with tempfile.TemporaryDirectory(prefix='dna-arm64-') as temporary:
     stage = Path(temporary) / 'app'
     stage.mkdir()
-    (stage / 'main.dyn').write_text('use "std/io"\nfn main() { _ = io.println(io.stdout(), "arm64 ok") }\n')
+    (stage / 'main.dyn').write_text('use "std/io"\nfn main() { io.println("arm64 ok") }\n')
     for mode, shared in (('debug', False), ('release', False), ('release', True)):
         output = Path(temporary) / (mode + ('.dll' if shared else '.exe'))
         command = [sys.executable, str(ROOT / 'scripts/compile.py'), str(compiler), 'build', str(stage),

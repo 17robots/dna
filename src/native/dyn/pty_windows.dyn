@@ -1,4 +1,5 @@
 #target(kernel: windows)
+use "std/io"
 
 // ConPTY owns its two blocking endpoints. The UI owns nonblocking CRT tokens.
 // A joined worker serializes resize and close while the UI drains output, so
@@ -26,7 +27,7 @@ win_pty_api: WinPtyAPI
 win_pty_once: win_proc_sync.Once
 fn win_pty_symbol(library: rawptr, name: []const u8) rawptr {
   result := win_proc_loader.symbol(library, name)
-  if result.ok {
+  if result.failure.kind == io.Kind.Ok {
     return result.value
   }
   return nil
@@ -44,7 +45,7 @@ fn win_pty_bundle_file(path: []u16, directory: usize, name: []const u8) bool {
 }
 fn win_pty_configure() bool {
   kernel := win_proc_loader.open("kernel32.dll", 0)
-  if !kernel.ok {
+  if kernel.failure.kind != io.Kind.Ok {
     return false
   }
   win_pty_api.module = #cast(fn(u32, rawptr, *rawptr) i32, win_pty_symbol(kernel.value, "GetModuleHandleExW"))
@@ -89,7 +90,7 @@ fn win_pty_configure() bool {
   win_pty_api.resize = #cast(fn(rawptr, u32) i32, win_pty_symbol(library, "ConptyResizePseudoConsole"))
   win_pty_api.close = #cast(fn(rawptr), win_pty_symbol(library, "ConptyClosePseudoConsole"))
   if win_pty_api.create == nil || win_pty_api.resize == nil || win_pty_api.close == nil {
-    win_proc_loader.close(&library)
+    _ = win_proc_loader.close(&library)
     return false
   }
   win_pty_api.library = library
@@ -151,7 +152,7 @@ fn win_pty_release(owner: *WinPtyOwner) {
     _ = rec_close(owner.output)
   }
   if owner.event != nil {
-    win_proc_api.close(owner.event)
+    _ = win_proc_api.close(owner.event)
   }
   rec_free(#cast(rawptr, owner))
 }
@@ -239,7 +240,7 @@ fn win_pty_command(space: *WinProcSpace, shell, command: *const u8) bool {
   default_shell := shell == nil || shell.* == 0
   if !default_shell {
     size := string_length(shell)
-    default_shell = size == 7 && shell[..size][0] == 47 && shell[..size][1] == 98 && shell[..size][2] == 105 && shell[..size][3] == 110 && shell[..size][4] == 47 && shell[..size][5] == 115 && shell[..size][6] == 104
+    default_shell = size == 7 && #slice(shell, size)[0] == 47 && #slice(shell, size)[1] == 98 && #slice(shell, size)[2] == 105 && #slice(shell, size)[3] == 110 && #slice(shell, size)[4] == 47 && #slice(shell, size)[5] == 115 && #slice(shell, size)[6] == 104
   }
   if default_shell {
     size := win_proc_api.system(&space.executable[0], 32760)
@@ -403,11 +404,11 @@ fn terminal_start(t: *Terminal, cwd, shell, command: *const u8) bool {
   owner.child.process = information.process
   owner.child.pid = 1
   if win_proc_api.assign(owner.child.job, information.process) == 0 || win_proc_api.resume(information.thread) == 4294967295 {
-    win_proc_api.close(information.thread)
+    _ = win_proc_api.close(information.thread)
     win_pty_release(owner)
     return false
   }
-  win_proc_api.close(information.thread)
+  _ = win_proc_api.close(information.thread)
   t.platform = #cast(rawptr, owner)
   t.pid = 1
   t.fd = owner.output

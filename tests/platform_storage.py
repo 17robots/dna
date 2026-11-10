@@ -10,41 +10,41 @@ ROOT = Path(__file__).resolve().parents[1]
 DYN = os.environ.get('DYN', 'dyn')
 FAKE = '''use "std/io"
 pub struct File {descriptor:isize,active,owned:bool}
-pub struct Result { transferred:usize,error:isize,kind:errors.Kind,ok:bool }
-pub struct OffsetResult { value:usize,error:isize,kind:errors.Kind,ok:bool }
+pub struct Result { transferred:usize,failure:io.Failure }
+pub struct OffsetResult { value:usize,failure:io.Failure }
 extern fn probe_seek "probe_seek"(file:isize,offset:isize,origin:usize) isize
 extern fn probe_read "probe_read"(file:isize,bytes:*u8,length:usize) isize
 extern fn probe_write "probe_write"(file:isize,bytes:*const u8,length:usize) isize
 extern fn probe_close "probe_close"(file:isize) i32
 pub fn seek(file:*File,offset:isize,origin:usize) OffsetResult {
  n:=probe_seek(file.descriptor,offset,origin)
- if n<0 {return OffsetResult{error:n,kind:errors.Kind.System}}
- return OffsetResult{value:#cast(usize,n),ok:true}
+ if n<0 {return OffsetResult{failure:io.Failure{kind:io.Kind.System,native:n}}}
+ return OffsetResult{value:#cast(usize,n)}
 }
 pub fn read(file:*File,bytes:[]u8) Result {
  n:=probe_read(file.descriptor,&bytes[0],#len(bytes))
- if n<0 {return Result{error:n,kind:errors.Kind.System}}
- return Result{transferred:#cast(usize,n),ok:true}
+ if n<0 {return Result{failure:io.Failure{kind:io.Kind.System,native:n}}}
+ return Result{transferred:#cast(usize,n)}
 }
 pub fn write(file:*File,bytes:[]const u8) Result {
  n:=probe_write(file.descriptor,&bytes[0],#len(bytes))
- if n<0 {return Result{error:n,kind:errors.Kind.System}}
- return Result{transferred:#cast(usize,n),ok:true}
+ if n<0 {return Result{failure:io.Failure{kind:io.Kind.System,native:n}}}
+ return Result{transferred:#cast(usize,n)}
 }
-pub fn close(file:*File) Result { _=probe_close(file.descriptor) file.active=false return Result{ok:true} }
+pub fn close(file:*File) Result { _=probe_close(file.descriptor) file.active=false return Result{} }
 '''.replace(') file.active', ')\n file.active').replace('false return', 'false\n return')
 BASE = '''#link("c")
 use "./fake" std_fs
 use "std/io"
 type File=std_fs.File
 type Result=std_fs.Result
-struct Metadata { size:u64,error:isize,kind:errors.Kind,ok:bool }
+struct Metadata { size:u64,failure:io.Failure }
 fn is_open(file:*const File) bool {return file.active}
 fn adopt_handle(value:isize) File {return File{descriptor:value,active:true,owned:true}}
 fn close(file:*File) Result {return std_fs.close(file)}
 extern fn probe_size "probe_size"() u64
-fn file_metadata(file:*const File) Metadata {return Metadata{size:probe_size(),ok:true}}
-fn windows_failure(code:u32) Result {return Result{error:0-#cast(isize,code),kind:errors.Kind.System}}
+fn file_metadata(file:*const File) Metadata {return Metadata{size:probe_size()}}
+fn windows_failure(code:u32) Result {return Result{failure:io.Failure{kind:io.Kind.System,native:0-#cast(isize,code)}}}
 extern fn fs_reopen "ReOpenFile"(file:rawptr,access:u32,share:u32,flags:u32) rawptr
 extern fn fs_set_basic "SetFileInformationByHandle"(file:rawptr,kind:u32,data:rawptr,size:u32) i32
 extern fn fs_ioctl "DeviceIoControl"(file:rawptr,code:u32,input:rawptr,input_length:u32,output:rawptr,output_length:u32,returned:*u32,overlapped:rawptr) i32
@@ -110,7 +110,7 @@ fn main() {
   offset:u64=1
   if mode==2 {offset=2}
   result:=copy_range(&origin,offset,&target,200000)
-  if probe_check(result.transferred,result.failure.kind == parse.Kind.Ok)!=1 {#panic("range result")}
+  if probe_check(result.transferred,result.failure.kind == io.Kind.Ok)!=1 {#panic("range result")}
  }
  for mode in 0..3 {
   probe_reset(#cast(i32,mode))

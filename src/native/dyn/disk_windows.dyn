@@ -1,5 +1,6 @@
 #target(kernel: windows)
 use "std/dynlib" disk_windows_loader
+use "std/io"
 
 // Windows change handles cover child names and in-place writes. The queue
 // emits the shared rescan records; no callback holds a document pointer.
@@ -33,7 +34,7 @@ fn disk_windows_prepare() {
   if sync.once_begin(&disk_windows_once) {
     kernel := disk_windows_loader.open("kernel32.dll", 0)
     runtime := disk_windows_loader.open("ucrtbase.dll", 0)
-    if !kernel.ok || !runtime.ok {
+    if kernel.failure.kind != io.Kind.Ok || runtime.failure.kind != io.Kind.Ok {
       #panic("missing Windows disk APIs")
     }
     disk_windows_api.first = #cast(fn(*const u16, i32, u32) rawptr, win_io_symbol(kernel.value, "FindFirstChangeNotificationW"))
@@ -60,8 +61,8 @@ fn disk_windows_find(fd: i32) *WindowsDiskQueue {
 // Message mode preserves each 16-byte rescan record. PIPE_NOWAIT byte pipes
 // may perform short writes, which would shift all following shared records.
 fn disk_windows_pipe(fds: *i32) bool {
-  fds[..2][0] = -1
-  fds[..2][1] = -1
+  #slice(fds, 2)[0] = -1
+  #slice(fds, 2)[1] = -1
   name: [128]u16 = []
   prefix: []const u8 = "\\\\.\\pipe\\dna-disk-"
   used: usize = 0
@@ -81,18 +82,18 @@ fn disk_windows_pipe(fds: *i32) bool {
   }
   client := win_proc_api.open_pipe(&name[0], 3221225472, 0, nil, 3, 0, nil)
   if !win_proc_valid(client) {
-    win_proc_api.close(server)
+    _ = win_proc_api.close(server)
     return false
   }
   if win_proc_api.connect(server, nil) == 0 && win_proc_api.error() != 535 {
-    win_proc_api.close(client)
-    win_proc_api.close(server)
+    _ = win_proc_api.close(client)
+    _ = win_proc_api.close(server)
     return false
   }
   mode: u32 = 1
   if win_proc_api.pipe_mode(client, &mode, nil, nil) == 0 {
-    win_proc_api.close(client)
-    win_proc_api.close(server)
+    _ = win_proc_api.close(client)
+    _ = win_proc_api.close(server)
     return false
   }
   reader := win_proc_descriptor(server)
@@ -106,8 +107,8 @@ fn disk_windows_pipe(fds: *i32) bool {
     }
     return false
   }
-  fds[..2][0] = reader
-  fds[..2][1] = writer
+  #slice(fds, 2)[0] = reader
+  #slice(fds, 2)[1] = writer
   return true
 }
 fn disk_windows_emit(queue: *WindowsDiskQueue, descriptor: i32, event_mask: u32) {
@@ -228,13 +229,13 @@ fn disk_add(fd: i32, path: *const u8, requested_mask: u32) i32 {
   }
   current := InstallStat{}
   if install_lstat(path, &current) != 0 || current.device != info.device || current.inode != info.inode || (current.mode & 61440) != 16384 {
-    disk_windows_api.close(change)
+    _ = disk_windows_api.close(change)
     _ = rec_close(directory)
     return -1
   }
   node = #cast(*WindowsDiskNode, rec_alloc(1, #sizeof(WindowsDiskNode)))
   if node == nil {
-    disk_windows_api.close(change)
+    _ = disk_windows_api.close(change)
     _ = rec_close(directory)
     return -1
   }
@@ -260,7 +261,7 @@ fn disk_remove(fd: i32, descriptor: i32) i32 {
     node := link.*
     if node.fd == descriptor {
       link.* = node.next
-      disk_windows_api.close(node.change)
+      _ = disk_windows_api.close(node.change)
       _ = rec_close(node.fd)
       rec_free(#cast(rawptr, node))
       return 0
@@ -288,7 +289,7 @@ fn disk_changes_close(fd: i32) {
   node := queue.nodes
   for node != nil {
     next := node.next
-    disk_windows_api.close(node.change)
+    _ = disk_windows_api.close(node.change)
     _ = rec_close(node.fd)
     rec_free(#cast(rawptr, node))
     node = next

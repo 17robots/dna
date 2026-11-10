@@ -55,7 +55,7 @@ fn dock_case(side:u8) {
  motion.rectangle_seed(&pane,[0.0,0.0,1000.0,600.0],0.0)
  for frame in 10..40 {
   app.ui.frame=#cast(u64,frame)
-  step:=8.0
+  step:f32=8.0
   if frame>10 {step=16.0}
   app.view.animation.geometry_elapsed=step
   app.view.animation.now+=step

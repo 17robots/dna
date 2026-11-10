@@ -353,7 +353,7 @@ fn install(arena: *mem.Arena, root: []const u8, item: *const Language) {
   }
   temp := temp_storage[..c.string_length(&temp_storage[0], 4096)]
   defer cleanup(temp)
-  _ = io.println(io.stdout(), "Downloading and compiling {}", item.name)
+  io.println("Downloading and compiling {}", item.name)
   used = 0
   add(command[..], &used, installer_shell_tools())
   add(command[..], &used, "set -eu\ncd ")
@@ -399,15 +399,15 @@ fn install(arena: *mem.Arena, root: []const u8, item: *const Language) {
   }
   run(command[..used])
   output_storage: [4096]u8 = []
-  if !std_fs.write_all(append_path(output_storage[..], package, "extensions"), extension_storage[..extension_length]).ok || !std_fs.write_all(append_path(output_storage[..], package, "indent"), item.indent).ok {
+  if std_fs.write_all(append_path(output_storage[..], package, "extensions"), extension_storage[..extension_length]).failure.kind != io.Kind.Ok || std_fs.write_all(append_path(output_storage[..], package, "indent"), item.indent).failure.kind != io.Kind.Ok {
     #panic("cannot write package metadata")
   }
-  if names_length > 0 && !std_fs.write_all(append_path(output_storage[..], package, "filenames"), names_storage[..names_length]).ok {
+  if names_length > 0 && std_fs.write_all(append_path(output_storage[..], package, "filenames"), names_storage[..names_length]).failure.kind != io.Kind.Ok {
     #panic("cannot write package metadata")
   }
   named_storage: [4096]u8 = []
   named := append_path(named_storage[..], temp, item.name)
-  if !std_fs.rename(package, named).ok {
+  if std_fs.rename(package, named).failure.kind != io.Kind.Ok {
     #panic("cannot stage language package")
   }
   first: usize = 0
@@ -431,17 +431,17 @@ fn install(arena: *mem.Arena, root: []const u8, item: *const Language) {
   add(version_storage[..], &version_length, item.name)
   add(version_storage[..], &version_length, "-")
   add(version_storage[..], &version_length, temp[#len(temp) - 6..])
-  if !std_fs.rename(named, version_storage[..version_length]).ok {
+  if std_fs.rename(named, version_storage[..version_length]).failure.kind != io.Kind.Ok {
     #panic("cannot publish language version")
   }
   link_storage: [4096]u8 = []
   link := append_path(link_storage[..], temp, "active")
   destination_storage: [4096]u8 = []
   destination := append_path(destination_storage[..], root, item.name)
-  if !installer_symbolic_link(version_storage[..version_length], link).ok || !std_fs.rename(link, destination).ok {
+  if installer_symbolic_link(version_storage[..version_length], link).failure.kind != io.Kind.Ok || std_fs.rename(link, destination).failure.kind != io.Kind.Ok {
     #panic("cannot activate language version")
   }
-  _ = io.println(io.stdout(), "Installed {}. Use :language-reload in DNA.", item.name)
+  io.println("Installed {}. Use :language-reload in DNA.", item.name)
   _ = arena
 }
 fn main() {
@@ -449,7 +449,7 @@ fn main() {
   defer mem.arena_release(allocated)
   arena := allocated
   args := process.arguments(arena)
-  if !args.ok {
+  if args.failure.kind != io.Kind.Ok {
     #panic("arguments unavailable")
   }
   path: [4096]u8 = []
@@ -458,7 +458,7 @@ fn main() {
   }
   registry := Registry{}
   read := std_fs.read_all(arena, path[..c.string_length(&path[0], 4096)], 65536)
-  if !read.ok {
+  if read.failure.kind != io.Kind.Ok {
     #panic("cannot read bundled registry")
   }
   load_registry(&registry, read.value)
@@ -468,31 +468,31 @@ fn main() {
   config := process.environment(arena, "XDG_CONFIG_HOME")
   config_path: [4096]u8 = []
   config_length: usize = 0
-  if config.ok && config.found && #len(config.value) > 0 {
+  if config.failure.kind == io.Kind.Ok && config.found && #len(config.value) > 0 {
     add(config_path[..], &config_length, config.value)
-  } else if home.ok && home.found {
+  } else if home.failure.kind == io.Kind.Ok && home.found {
     add(config_path[..], &config_length, home.value)
     add(config_path[..], &config_length, "/.config")
   }
   add(config_path[..], &config_length, "/dna/languages.toml")
   custom := std_fs.read_all(arena, config_path[..config_length], 65536)
-  if custom.ok {
+  if custom.failure.kind == io.Kind.Ok {
     load_registry(&registry, custom.value)
   }
   root_storage: [4096]u8 = []
   root_length: usize = 0
   env_storage: [4096]u8 = []
   configured := process.environment(arena, "DNA_LANGUAGE_DIR")
-  if configured.ok && configured.found {
+  if configured.failure.kind == io.Kind.Ok && configured.found {
     add(root_storage[..], &root_length, configured.value)
   }
   else {
     data_storage: [4096]u8 = []
     data := process.environment(arena, "XDG_CONFIG_HOME")
-    if data.ok && data.found && #len(data.value) > 0 {
+    if data.failure.kind == io.Kind.Ok && data.found && #len(data.value) > 0 {
       add(root_storage[..], &root_length, data.value)
     } else {
-      if !home.ok || !home.found {
+      if home.failure.kind != io.Kind.Ok || !home.found {
         #panic("HOME unavailable")
       }
       add(root_storage[..], &root_length, home.value)
@@ -541,33 +541,33 @@ fn main() {
       installed[index] = grammar_installed(root_storage[..root_length], item.name)
       index += 1
     }
-    _ = io.println(io.stdout(), "Installed languages:")
+    io.println("Installed languages:")
     count: usize = 0
     index = 0
     for index < registry.count {
       if installed[index] {
-        _ = io.println(io.stdout(), "  {}: {}", registry.entries[index].name, registry.entries[index].extensions)
+        io.println("  {}: {}", registry.entries[index].name, registry.entries[index].extensions)
         count += 1
       }
       index += 1
     }
     if count == 0 {
-      _ = io.println(io.stdout(), "  (none)")
+      io.println("  (none)")
     }
-    _ = io.println(io.stdout(), "\nAvailable to install:")
+    io.println("\nAvailable to install:")
     count = 0
     index = 0
     for index < registry.count {
       if !installed[index] {
-        _ = io.println(io.stdout(), "  {}: {}", registry.entries[index].name, registry.entries[index].extensions)
+        io.println("  {}: {}", registry.entries[index].name, registry.entries[index].extensions)
         count += 1
       }
       index += 1
     }
     if count == 0 {
-      _ = io.println(io.stdout(), "  (none; all catalogue languages are installed)")
+      io.println("  (none; all catalogue languages are installed)")
     }
-    _ = io.println(io.stdout(), "\nInstall: :language-install NAME\nActivate: :language-reload\nThese are syntax-highlighting packages, not language servers.")
+    io.println("\nInstall: :language-install NAME\nActivate: :language-reload\nThese are syntax-highlighting packages, not language servers.")
     server_list(root_storage[..root_length])
     return
   }

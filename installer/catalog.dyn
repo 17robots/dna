@@ -1,3 +1,4 @@
+use "std/io"
 // Stable, bounded records for the editor's package manager, one per line and
 // tab-separated. Registry names cannot contain tabs/newlines; installation
 // state comes from actual files.
@@ -14,7 +15,7 @@ fn grammar_installed(root: []const u8, name: []const u8) bool {
   }
   for leaf in ["parser.so", "highlights.scm", "extensions"] {
     info := std_fs.metadata(append_path(file_storage[..], package, leaf))
-    if !info.ok || (info.mode & 61440) != 32768 || info.size == 0 {
+    if info.failure.kind != io.Kind.Ok || (info.mode & 61440) != 32768 || info.size == 0 {
       return false
     }
   }
@@ -48,17 +49,17 @@ fn catalog(registry: *Registry, root: []const u8) {
     if names_length > 0 {
       names_length -= 1
     }
-    _ = io.println(io.stdout(), "grammar\t{}\t{}\t{}\t{}\t{}", item.name, state, extension_storage[..extension_length], names_storage[..names_length], item.url)
+    io.println("grammar\t{}\t{}\t{}\t{}\t{}", item.name, state, extension_storage[..extension_length], names_storage[..names_length], item.url)
   }
   for index in 0..9 {
     item := server_package(index)
     storage: [4096]u8 = []
     info := std_fs.metadata(server_executable(root, item, storage[..]))
     state: []const u8 = "available"
-    if info.ok && installer_executable(server_executable(root, item, storage[..])) {
+    if info.failure.kind == io.Kind.Ok && installer_executable(server_executable(root, item, storage[..])) {
       state = "installed"
     }
-    _ = io.println(io.stdout(), "server\t{}\t{}\t{}\t{}", item.name, state, item.packages, item.executable)
+    io.println("server\t{}\t{}\t{}\t{}", item.name, state, item.packages, item.executable)
   }
 }
 fn uninstall(root: []const u8, name: []const u8) {
@@ -72,7 +73,7 @@ fn uninstall(root: []const u8, name: []const u8) {
   target_space := mem.arena_create(4096)
   defer mem.arena_release(target_space)
   target := installer_read_link(target_space, active)
-  if !target.ok {
+  if target.failure.kind != io.Kind.Ok {
     #panic("refusing to remove a package not managed by DNA")
   }
   used: usize = 0
@@ -88,12 +89,12 @@ fn uninstall(root: []const u8, name: []const u8) {
       #panic("invalid managed version")
     }
   }
-  if !std_fs.remove(active).ok {
+  if std_fs.remove(active).failure.kind != io.Kind.Ok {
     #panic("cannot deactivate package")
   }
   removed := installer_remove_tree(target.value)
-  if !removed.ok && removed.error != -2 {
+  if removed.failure.kind != io.Kind.Ok && removed.failure.native != -2 {
     #panic("package deactivated but cleanup failed; refresh the package list")
   }
-  _ = io.println(io.stdout(), "Uninstalled {}. Older retained versions are unchanged.", name)
+  io.println("Uninstalled {}. Older retained versions are unchanged.", name)
 }
