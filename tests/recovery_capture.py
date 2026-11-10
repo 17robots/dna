@@ -101,7 +101,7 @@ fn load_original(document:*buffer.Document,length:usize) {
  check(buffer.load_storage(document,&storage,length))
 }
 fn assert_retained(previous:[]const u8,count:usize,app:*App) {
- check(submissions==count && buffer.equal(record_storage[..record_length],previous))
+ check(submissions==count && buffer.equal(#slice(record_storage, record_length),previous))
  check(app.logs>0)
 }
 fn main() {
@@ -126,11 +126,11 @@ fn main() {
  check(submissions==1)
  clean:=workspace.State{}
  defer workspace.release(&clean)
- check(workspace.decode(record_storage[..record_length],&clean))
+ check(workspace.decode(#slice(record_storage, record_length),&clean))
  check(clean.buffers[0].reload && !clean.buffers[0].patched)
  // Capture an actual small replacement in a document larger than the old
  // recovery threshold, then decode and apply the production restore branch.
- slot.file.stamp=fs.Stamp{ok:true,inode:11,size:#cast(u64,original),modify_seconds:13,modify_nanos:14}
+ slot.file.stamp=fs.Stamp{valid:true,inode:11,size:#cast(u64,original),modify_seconds:13,modify_nanos:14}
  middle:=original/2
  document.anchor=middle
  document.cursor=middle+3
@@ -142,7 +142,7 @@ fn main() {
  _=buffer.copy_bytes(&previous[0],record_storage,record_length)
  decoded:=workspace.State{}
  defer workspace.release(&decoded)
- check(workspace.decode(record_storage[..record_length],&decoded))
+ check(workspace.decode(#slice(record_storage, record_length),&decoded))
  patch:=&decoded.buffers[0]
  check(patch.reload && patch.patched && patch.patch_low==middle && patch.patch_high==middle+3)
  check(buffer.equal(patch.patch,"XYZ") && patch.stamp[0]==11 && patch.stamp[1]==#cast(u64,original) && patch.stamp[2]==13 && patch.stamp[3]==14)
@@ -159,10 +159,10 @@ fn main() {
  check(!restore_patch(&app,restored,&invalid,slot.file.stamp))
  // Missing baseline identity fails before submission, preserving the exact
  // previously encoded recovery record.
- slot.file.stamp.ok=false
+ slot.file.stamp.valid=false
  capture(&app)
  assert_retained(previous[..previous_length],2,&app)
- slot.file.stamp.ok=true
+ slot.file.stamp.valid=true
  // Two distant one-byte edits span 40 MiB: capture records pieces of the
  // file plus only the new bytes, and restore rebuilds the same text.
  document.anchor=0
@@ -175,7 +175,7 @@ fn main() {
  check(submissions==3)
  pieced:=workspace.State{}
  defer workspace.release(&pieced)
- check(workspace.decode(record_storage[..record_length],&pieced))
+ check(workspace.decode(#slice(record_storage, record_length),&pieced))
  pieces:=&pieced.buffers[0]
  check(pieces.patched && #len(pieces.pieces)>0 && #len(pieces.patch)<=8 && record_length<4096)
  load_original(restored,original)
@@ -194,7 +194,7 @@ fn main() {
  check(submissions==4)
  large:=workspace.State{}
  defer workspace.release(&large)
- check(workspace.decode(record_storage[..record_length],&large))
+ check(workspace.decode(#slice(record_storage, record_length),&large))
  load_original(restored,original)
  check(restore_patch(&app,restored,&large.buffers[0],slot.file.stamp))
  check(restored.length==document.length && buffer.byte_at(restored,1000)=='b' && buffer.byte_at(restored,1000+280000000-1)=='b' && buffer.byte_at(restored,1000+280000000)=='a')
@@ -216,7 +216,7 @@ with tempfile.TemporaryDirectory(prefix="dna-recovery-capture-") as temporary:
     for module in ("buffer", "workspace", "owned_arena"):
         shutil.copytree(ROOT / "src" / module, stage / module)
     for name, contents in {
-        "fs": '''pub struct Stamp {inode:u64,size:u64,modify_seconds:u64,modify_nanos:u64,ok:bool}
+        "fs": '''pub struct Stamp {inode:u64,size:u64,modify_seconds:u64,modify_nanos:u64,valid: bool}
 ''',
         "files": '''use "../fs" fs
 pub struct State {length:usize,stamp:fs.Stamp}

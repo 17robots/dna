@@ -54,7 +54,7 @@ pub fn load_storage_lazy(document: *Document, storage: *TextStorage, length: usi
   if storage.block == nil || length < lazy_minimum || load_cpus() < 2 {
     return load_storage(document, storage, length)
   }
-  bytes := storage.block.bytes[..length]
+  bytes := #slice(storage.block.bytes, length)
   // The prefix ends after a newline, so the document never shows half a line
   // or half a character; a prefix without one loads at once instead.
   shown := lazy_prefix
@@ -78,7 +78,7 @@ pub fn load_storage_lazy(document: *Document, storage: *TextStorage, length: usi
     #panic("cannot allocate text tables")
   }
   for leaf in 0..load.leaves {
-    load.tables[..load.leaves][leaf] = nil
+    #slice(load.tables, load.leaves)[leaf] = nil
   }
   load.workers = load_cpus()
   if load.workers > ParallelWorkers {
@@ -105,7 +105,7 @@ fn lazy_launch(load: *LazyLoad, phase: u8) {
     load.jobs[index].fill = phase == 2
     load.started[index] = false
     spawned := thread.spawn_with_size(load.arena, ParallelStack, lazy_job_run, #cast(rawptr, &load.jobs[index]))
-    if spawned.ok {
+    if spawned.failure.kind == io.Kind.Ok {
       load.threads[index] = spawned.value
       load.started[index] = true
     } else {
@@ -116,7 +116,7 @@ fn lazy_launch(load: *LazyLoad, phase: u8) {
 fn lazy_join(load: *LazyLoad) {
   for index in 0..load.workers {
     if load.started[index] {
-      if !thread.join(load.threads[index]).ok {
+      if thread.join(load.threads[index]).failure.kind != io.Kind.Ok {
         #panic("cannot join text loader")
       }
       load.started[index] = false
@@ -128,7 +128,7 @@ fn lazy_free(load: *LazyLoad) {
   // Tables not yet adopted by leaves.
   if load.phase != 0 {
     for leaf in 0..load.leaves {
-      table := load.tables[..load.leaves][leaf]
+      table := #slice(load.tables, load.leaves)[leaf]
       if table != nil {
         rope_free(#cast(rawptr, table))
       }
@@ -158,7 +158,7 @@ pub fn load_tick(document: *Document) bool {
   lazy_join(load)
   if load.phase == 1 {
     for index in 0..load.workers {
-      if !load.jobs[index].ok {
+      if !load.jobs[index].valid {
         lazy_free(load)
         document.lazy = nil
         document.load_state = LoadFailed
@@ -166,10 +166,10 @@ pub fn load_tick(document: *Document) bool {
       }
     }
     for leaf in 0..load.leaves {
-      count := load.counts[..load.leaves][leaf]
+      count := #slice(load.counts, load.leaves)[leaf]
       if count > 0 {
-        load.tables[..load.leaves][leaf] = #cast(*u16, rope_malloc(count * #sizeof(u16)))
-        if load.tables[..load.leaves][leaf] == nil {
+        #slice(load.tables, load.leaves)[leaf] = #cast(*u16, rope_malloc(count * #sizeof(u16)))
+        if #slice(load.tables, load.leaves)[leaf] == nil {
           #panic("cannot allocate text node")
         }
       }
@@ -177,7 +177,7 @@ pub fn load_tick(document: *Document) bool {
     lazy_launch(load, 2)
     return false
   }
-  tail := rope_build_prepared(load.block, &load.block.bytes[..load.offset + load.total][load.offset], load.total, 0, load.leaves, load.counts, load.tables)
+  tail := rope_build_prepared(load.block, &#slice(load.block.bytes, load.offset + load.total)[load.offset], load.total, 0, load.leaves, load.counts, load.tables)
   // Leaves own the tables now.
   load.phase = 0
   lazy_free(load)

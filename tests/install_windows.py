@@ -22,7 +22,7 @@ extern fn test_read "_read"(fd:i32, bytes:*u8, length:u32) i32
 fn equal(left:*const u8, right:[]const u8) bool {
   length:=string_length(left)
   if length!=#len(right) { return false }
-  for at in 0..length { if left[..length][at]!=right[at] { return false } }
+  for at in 0..length { if #slice(left, length)[at]!=right[at] { return false } }
   return true
 }
 fn main() {
@@ -76,7 +76,7 @@ fn main() {
   if fd<0 || install_fdopendir(fd)!=nil || install_fstat(fd,&info)!=0 || rec_close(fd)!=0 { #panic("failed fdopendir ownership") }
   destination:[]const u8="renamed.txt\0"
   renamed:=install_rename(root_fd,&leaf[0],root_fd,&destination[0],1)
-  if renamed!=0 { _=io.println(io.stderr(), "relative rename failed: errno {}", rec_errno().*)
+  if renamed!=0 { io.eprintln("relative rename failed: errno {}", rec_errno().*)
     #panic("relative no-replace rename") }
   old:=install_openat(root_fd,&leaf[0],655360,0)
   if old>=0 { _=rec_close(old)

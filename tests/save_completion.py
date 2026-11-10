@@ -24,7 +24,8 @@ def function(source, name):
 
 
 source = (ROOT / "src/file_actions.dyn").read_text()
-fixture = '''use "./buffer" buffer
+fixture = '''use "std/io" io
+use "./buffer" buffer
 use "./files" files
 use "./owner" arena_owner
 use "./thread" thread
@@ -110,8 +111,9 @@ pub fn save_abort(job:*SaveJob) {aborted+=1}
     "owner": '''pub released:usize=0
 pub fn release(arena:rawptr) {released+=1}
 ''',
-    "thread": '''pub struct Result {ok:bool}
-pub fn join(worker:rawptr) Result {return Result{ok:true}}
+    "thread": '''use "std/io" io
+pub struct Result {failure:io.Failure}
+pub fn join(worker:rawptr) Result {return Result{}}
 ''',
 }
 with tempfile.TemporaryDirectory(prefix="dna-save-completion-") as temporary:

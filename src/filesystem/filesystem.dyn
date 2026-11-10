@@ -1,21 +1,21 @@
 // DNA's filesystem boundary supplements the pinned SDK's portable byte I/O.
 use "std/fs" std_fs
 use "std/mem"
-use "std/errors"
+use "std/io"
 
 pub type File = std_fs.File
 pub type FileResult = std_fs.FileResult
 pub type Result = std_fs.Result
 pub type ReadAllResult = std_fs.ReadAllResult
-pub struct Metadata { size, inode, device: u64, mode: u16, error: isize, kind: errors.Kind, ok: bool }
+pub type Metadata = std_fs.Metadata
 // Identity of an open file's current contents: equal stamps mean nothing
 // replaced or rewrote it in between.
-pub struct Stamp { inode, size, modify_seconds, modify_nanos, change_seconds, change_nanos: u64, ok: bool }
-pub struct PathResult { path: []u8, error: isize, kind: errors.Kind, ok: bool }
-pub struct DirectoryResult { directory: Directory, error: isize, kind: errors.Kind, ok: bool }
-pub struct DirectoryEntry { name: []const u8, kind: u8, ok: bool, error: isize, error_kind: errors.Kind }
+pub struct Stamp { inode, size, modify_seconds, modify_nanos, change_seconds, change_nanos: u64, valid: bool }
+pub struct PathResult { path: []u8, failure: io.Failure }
+pub struct DirectoryResult { directory: Directory, failure: io.Failure }
+pub type DirectoryEntry = std_fs.DirectoryEntry
 pub struct AtomicFile { file: File, destination, temporary: []const u8, active: bool }
-pub struct AtomicResult { transaction: AtomicFile, error: isize, kind: errors.Kind, ok: bool }
+pub struct AtomicResult { transaction: AtomicFile, failure: io.Failure }
 
 pub fn open(path: []const u8) FileResult {
   return std_fs.open(path)
@@ -35,8 +35,8 @@ pub fn adopt_handle(handle: isize) File {
 pub fn is_open(file: *const File) bool {
   return std_fs.is_open(file)
 }
-pub fn close(file: *File) Result {
-  return std_fs.close(file)
+pub fn close(file: *File) {
+  std_fs.close(file)
 }
 pub fn read(file: *File, destination: []u8) Result {
   return std_fs.read(file, destination)
@@ -47,10 +47,10 @@ pub fn write(file: *File, source: []const u8) Result {
 // Position only the private save output; source descriptors stay unchanged.
 pub fn seek(file: *File, offset: usize) Result {
   if offset > 9223372036854775807 {
-    return Result{kind: errors.Kind.InvalidInput}
+    return Result{ failure: io.Failure{ kind: io.Kind.InvalidInput } }
   }
   result := std_fs.seek(file, #cast(isize, offset), 0)
-  return Result{error: result.error, kind: result.kind, ok: result.ok}
+  return Result{ failure: result.failure }
 }
 pub fn sync(file: *File) Result {
   return std_fs.sync(file)
@@ -65,41 +65,38 @@ pub fn write_all(path: []const u8, source: []const u8) Result {
 // Borrow paths until commit/abort. The caller supplies a sibling temporary.
 pub fn atomic_begin(destination: []const u8, temporary: []const u8) AtomicResult {
   if #len(destination) == 0 || #len(temporary) == 0 {
-    return AtomicResult{error: -22, kind: errors.Kind.InvalidInput}
+    return AtomicResult{ failure: io.Failure{ kind: io.Kind.InvalidInput, native: -22 } }
   }
   created := atomic_create_exclusive(temporary)
-  if !created.ok {
-    return AtomicResult{error: created.error, kind: created.kind}
+  if created.failure.kind != io.Kind.Ok {
+    return AtomicResult{ failure: io.Failure{ kind: created.failure.kind, native: created.failure.native } }
   }
-  return AtomicResult{transaction: AtomicFile{file: created.value, destination: destination, temporary: temporary, active: true}, ok: true}
+  return AtomicResult{transaction: AtomicFile{file: created.value, destination: destination, temporary: temporary, active: true}}
 }
 pub fn atomic_commit(transaction: *AtomicFile) Result {
   if !transaction.active {
-    return Result{error: -22, kind: errors.Kind.InvalidState}
+    return Result{ failure: io.Failure{ kind: io.Kind.InvalidState, native: -22 } }
   }
   synced := sync(&transaction.file)
-  if !synced.ok {
+  if synced.failure.kind != io.Kind.Ok {
     return synced
   }
-  closed := close(&transaction.file)
-  if !closed.ok {
-    return closed
-  }
+  close(&transaction.file)
   renamed := rename(transaction.temporary, transaction.destination)
-  if renamed.ok {
+  if renamed.failure.kind == io.Kind.Ok {
     transaction.active = false
   }
   return renamed
 }
 pub fn atomic_abort(transaction: *AtomicFile) Result {
   if !transaction.active {
-    return Result{error: -22, kind: errors.Kind.InvalidState}
+    return Result{ failure: io.Failure{ kind: io.Kind.InvalidState, native: -22 } }
   }
   if is_open(&transaction.file) {
     _ = close(&transaction.file)
   }
   removed := remove(transaction.temporary)
-  if removed.ok {
+  if removed.failure.kind == io.Kind.Ok {
     transaction.active = false
   }
   return removed
@@ -109,11 +106,11 @@ pub fn atomic_abort(transaction: *AtomicFile) Result {
 // file created with a broader inherited/default access policy.
 pub fn atomic_begin_private(destination: []const u8, temporary: []const u8) AtomicResult {
   if #len(destination) == 0 || #len(temporary) == 0 {
-    return AtomicResult{error: -22, kind: errors.Kind.InvalidInput}
+    return AtomicResult{ failure: io.Failure{ kind: io.Kind.InvalidInput, native: -22 } }
   }
   created := create_private_exclusive(temporary)
-  if !created.ok {
-    return AtomicResult{error: created.error, kind: created.kind}
+  if created.failure.kind != io.Kind.Ok {
+    return AtomicResult{ failure: io.Failure{ kind: created.failure.kind, native: created.failure.native } }
   }
-  return AtomicResult{transaction: AtomicFile{file: created.value, destination: destination, temporary: temporary, active: true}, ok: true}
+  return AtomicResult{transaction: AtomicFile{file: created.value, destination: destination, temporary: temporary, active: true}}
 }

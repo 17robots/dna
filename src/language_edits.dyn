@@ -1,3 +1,4 @@
+use "std/parse" parse
 fn lsp_edit_file(app: *App, uri: []const u8, edits: *const json.Value, version: *const json.Value) bool {
   plan := &app.lsp.edits
   if plan.count == 16 {
@@ -27,7 +28,7 @@ fn lsp_edit_file(app: *App, uri: []const u8, edits: *const json.Value, version: 
         return false
       }
       expected := lsp.number(version)
-      if !json.is_missing(version) && !json.is_null(version) && (!expected.ok || expected.value != tracked.version) {
+      if !json.is_missing(version) && !json.is_null(version) && (!expected.valid || expected.value != tracked.version) {
         return false
       }
       item.slot = slot_index
@@ -44,18 +45,18 @@ fn lsp_edit_file(app: *App, uri: []const u8, edits: *const json.Value, version: 
       return false
     }
     info := files.metadata(decoded)
-    if !info.ok || (info.mode & 61440) != 32768 {
+    if info.failure.kind != io.Kind.Ok || (info.mode & 61440) != 32768 {
       return false
     }
     read := fs.read_all(plan.arena, decoded, buffer.Capacity)
-    if !read.ok || !buffer.valid(read.value) {
+    if read.failure.kind != io.Kind.Ok || !buffer.valid(read.value) {
       return false
     }
     item.before = read.value
   }
   output := mem.push_bytes_uninit(plan.arena, buffer.Capacity + 1)
   applied := lsp.edits(item.before, edits, output)
-  if !applied.ok {
+  if !applied.valid {
     return false
   }
   item.after = output[..applied.value]
@@ -146,7 +147,7 @@ fn lsp_apply(app: *App) {
       }
       info := files.metadata(item.path[..item.length])
       read := files.read_text(item.path[..item.length])
-      same := info.ok && (info.mode & 61440) == 32768 && read.ok && buffer.equal(read.data, item.before)
+      same := info.failure.kind == io.Kind.Ok && (info.mode & 61440) == 32768 && read.valid && buffer.equal(read.data, item.before)
       files.release_text(&read)
       if !same {
         notice(app, "File changed after preview. Nothing applied.")
@@ -186,7 +187,7 @@ fn lsp_apply(app: *App) {
     app.lsp.results.revision = app.documents.slots[app.lsp.results.slot].document.revision
     lsp_action_request(app, command, false)
   }
-  if plan.snippet.ok && app.documents.active == plan.snippet_slot {
+  if plan.snippet.valid && app.documents.active == plan.snippet_slot {
     snippet_begin(app, plan.snippet, plan.snippet_start)
   }
   lsp_edits_release(app)
@@ -229,7 +230,7 @@ fn lsp_completion(app: *App, item: *const json.Value) {
   if format.value == 2 {
     plain := mem.push_bytes_uninit(allocated, buffer.Capacity + 1)
     snippet = lsp.parse_snippet(content, plain)
-    if !snippet.ok {
+    if !snippet.valid {
       notice(app, "Completion uses unsupported snippet variables, choices, or transforms; buffer unchanged.")
       return
     }
@@ -242,7 +243,7 @@ fn lsp_completion(app: *App, item: *const json.Value) {
     }
     start := lsp.json_offset(buffer.all(slot.document), json.object_get(range, "start"))
     finish := lsp.json_offset(buffer.all(slot.document), json.object_get(range, "end"))
-    if !start.ok || !finish.ok || start.value > finish.value {
+    if !start.valid || !finish.valid || start.value > finish.value {
       notice(app, "Invalid completion range.")
       return
     }
@@ -294,19 +295,19 @@ fn lsp_completion(app: *App, item: *const json.Value) {
   }
   add_text(message, &used, "]}}")
   parsed := json.parse(allocated, message[..used])
-  if !parsed.ok {
+  if parsed.failure.kind != parse.Kind.Ok {
     notice(app, "Invalid completion edit.")
     return
   }
   lsp_prepare_edit(app, parsed.root)
-  if app.prompt_state.panel == Panel.LspEdit && snippet.ok {
+  if app.prompt_state.panel == Panel.LspEdit && snippet.valid {
     adjusted := insertion_start
     extra_edit := additional.first
     for extra_edit != nil {
       extra_range := json.object_get(extra_edit, "range")
       extra_start := lsp.json_offset(buffer.all(slot.document), json.object_get(extra_range, "start"))
       extra_end := lsp.json_offset(buffer.all(slot.document), json.object_get(extra_range, "end"))
-      if extra_start.ok && extra_end.ok && extra_end.value <= insertion_start {
+      if extra_start.valid && extra_end.valid && extra_end.value <= insertion_start {
         adjusted = adjusted - (extra_end.value - extra_start.value) + #len(json_text(extra_edit, "newText"))
       }
       extra_edit = extra_edit.next
@@ -391,7 +392,7 @@ fn lsp_accept(app: *App) {
   }
   low := lsp.json_offset(buffer.all(app.documents.current), json.object_get(range, "start"))
   high := lsp.json_offset(buffer.all(app.documents.current), json.object_get(range, "end"))
-  if !low.ok || !high.ok {
+  if !low.valid || !high.valid {
     notice(app, "Language location is outside the current document.")
     return
   }

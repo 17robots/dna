@@ -10,6 +10,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 DYN = str(Path(os.environ.get('DYN', ROOT.parent/'dyn/compiler/build/dyn-release')).resolve())
 SOURCE = r'''
+use "std/io" io
 use "std/bytes" byte_ops
 pub struct Substring { flags:u32, offset:i32, length:i32, line:i32, cluster:i32, x:i32, y:i32, width:i32, height:i32 }
 fn check(ok:bool) { if !ok { #panic("native text contract") } }
@@ -41,7 +42,8 @@ fn main() {
  large_font:=#cast(*NativeFont,large)
  if large_font.file.backing>#len(large_font.face.data)+131072 {#panic("font reader retained geometric growth copies")}
  replacement:=std_fs.create(large_name[..#len(large_name)-1])
- check(replacement.ok && std_fs.close(&replacement.value).ok)
+ check(replacement.failure.kind == io.Kind.Ok)
+ std_fs.close(&replacement.value)
  a_text_for_large:[1]u8=[97]
  large_width:i32=0
  check(ttf_measure(large,&a_text_for_large[0],1,&large_width,nil))

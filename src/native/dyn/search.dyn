@@ -1,3 +1,4 @@
+use "std/io"
 // One worker owns traversal/regex state
 // Generation changes cancel stale work.
 #link("pcre2-8")
@@ -51,7 +52,7 @@ fn search_cancelled(scan: *SearchScan) bool {
     return true
   }
   sample := time.monotonic_now()
-  if !sample.ok {
+  if sample.failure.kind != io.Kind.Ok {
     scan.partial = true
     return true
   }
@@ -84,7 +85,7 @@ fn search_plain_literal(query: *const u8, length: usize) bool {
   }
   syntax: []const u8 = "\\.^$|?*+()[]{}"
   for i in 0..length {
-    byte := query[..length][i]
+    byte := #slice(query, length)[i]
     if byte < 32 || byte > 126 {
       return false
     }
@@ -104,7 +105,7 @@ fn search_literal_match(scan: *SearchScan, bytes: *const u8, length: usize, star
     if chunk > limit {
       chunk = limit
     }
-    found := pred_find(&bytes[..length][at], chunk, scan.query, scan.query_length)
+    found := pred_find(&#slice(bytes, length)[at], chunk, scan.query, scan.query_length)
     if found != nil {
       return found
     }
@@ -150,7 +151,7 @@ fn search_file(scan: *SearchScan, parent: i32, leaf: *const u8, path: *const u8)
     if chunk > 65536 {
       chunk = 65536
     }
-    count := proc_read_raw(fd, &bytes[..room][length], chunk)
+    count := proc_read_raw(fd, &#slice(bytes, room)[length], chunk)
     if count < 0 {
       scan.partial = true
       _ = rec_close(fd)
@@ -175,7 +176,7 @@ fn search_file(scan: *SearchScan, parent: i32, leaf: *const u8, path: *const u8)
     if chunk > 65536 {
       chunk = 65536
     }
-    if search_byte(&bytes[..room][binary_at], 0, chunk) != nil {
+    if search_byte(&#slice(bytes, room)[binary_at], 0, chunk) != nil {
       return
     }
     binary_at += chunk
@@ -206,12 +207,12 @@ fn search_file(scan: *SearchScan, parent: i32, leaf: *const u8, path: *const u8)
       // The first successful checked match validates this immutable subject.
       // Plain ASCII literals can then use byte search without splitting UTF-8.
       match_options = 1073741824 // PCRE2_NO_UTF_CHECK
-      matched := search_range(scan.data)[..2]
+      matched := #slice(search_range(scan.data), 2)
       range[0] = matched[0]
       range[1] = matched[1]
     }
     for previous < range[0] {
-      if bytes[..room][previous] == 10 {
+      if #slice(bytes, room)[previous] == 10 {
         line += 1
         line_start = previous + 1
       }
@@ -220,13 +221,13 @@ fn search_file(scan: *SearchScan, parent: i32, leaf: *const u8, path: *const u8)
     row := SearchRow{start: range[0], end: range[1], line: line, column: range[0] - line_start + 1}
     search_copy_text(row.path[..], path)
     end := line_start
-    for end < length && bytes[..room][end] != 10 && end - line_start < 255 {
+    for end < length && #slice(bytes, room)[end] != 10 && end - line_start < 255 {
       end += 1
     }
-    for end < length && end > line_start && (bytes[..room][end] & 192) == 128 {
+    for end < length && end > line_start && (#slice(bytes, room)[end] & 192) == 128 {
       end -= 1
     }
-    _ = copy(&row.text[0], &bytes[..room][line_start], end - line_start)
+    _ = copy(&row.text[0], &#slice(bytes, room)[line_start], end - line_start)
     for i in 0..end - line_start {
       if row.text[i] < 32 {
         row.text[i] = 32
@@ -249,7 +250,7 @@ fn search_file(scan: *SearchScan, parent: i32, leaf: *const u8, path: *const u8)
         break
       }
       at += 1
-      for at < length && (bytes[..room][at] & 192) == 128 {
+      for at < length && (#slice(bytes, room)[at] & 192) == 128 {
         at += 1
       }
     }
@@ -259,7 +260,7 @@ fn search_valid_name(name: *const u8) bool {
   length := string_length(name)
   i: usize = 0
   for i < length {
-    first := name[..length][i]
+    first := #slice(name, length)[i]
     i += 1
     if first < 32 || first == 127 {
       return false
@@ -288,7 +289,7 @@ fn search_valid_name(name: *const u8) bool {
       return false
     }
     for n in 0..count {
-      byte := name[..length][i]
+      byte := #slice(name, length)[i]
       i += 1
       if (byte & 192) != 128 {
         return false
@@ -399,7 +400,7 @@ fn search_worker(opaque: rawptr) i32 {
     error: i32 = 0
     offset: usize = 0
     deadline := time.deadline_after(5 * time.Second)
-    if deadline.ok {
+    if deadline.failure.kind == io.Kind.Ok {
       scan.deadline = deadline.value.at
       scan.deadline_valid = true
     }

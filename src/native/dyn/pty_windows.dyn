@@ -1,4 +1,5 @@
 #target(kernel: windows)
+use "std/io"
 
 // ConPTY owns its two blocking endpoints. The UI owns nonblocking CRT tokens.
 // A joined worker serializes resize and close while the UI drains output, so
@@ -26,7 +27,7 @@ win_pty_api: WinPtyAPI
 win_pty_once: win_proc_sync.Once
 fn win_pty_symbol(library: rawptr, name: []const u8) rawptr {
   result := win_proc_loader.symbol(library, name)
-  if result.ok {
+  if result.failure.kind == io.Kind.Ok {
     return result.value
   }
   return nil
@@ -44,7 +45,7 @@ fn win_pty_bundle_file(path: []u16, directory: usize, name: []const u8) bool {
 }
 fn win_pty_configure() bool {
   kernel := win_proc_loader.open("kernel32.dll", 0)
-  if !kernel.ok {
+  if kernel.failure.kind != io.Kind.Ok {
     return false
   }
   win_pty_api.module = #cast(fn(u32, rawptr, *rawptr) i32, win_pty_symbol(kernel.value, "GetModuleHandleExW"))
@@ -239,7 +240,7 @@ fn win_pty_command(space: *WinProcSpace, shell, command: *const u8) bool {
   default_shell := shell == nil || shell.* == 0
   if !default_shell {
     size := string_length(shell)
-    default_shell = size == 7 && shell[..size][0] == 47 && shell[..size][1] == 98 && shell[..size][2] == 105 && shell[..size][3] == 110 && shell[..size][4] == 47 && shell[..size][5] == 115 && shell[..size][6] == 104
+    default_shell = size == 7 && #slice(shell, size)[0] == 47 && #slice(shell, size)[1] == 98 && #slice(shell, size)[2] == 105 && #slice(shell, size)[3] == 110 && #slice(shell, size)[4] == 47 && #slice(shell, size)[5] == 115 && #slice(shell, size)[6] == 104
   }
   if default_shell {
     size := win_proc_api.system(&space.executable[0], 32760)
@@ -332,7 +333,7 @@ fn terminal_start(t: *Terminal, cwd, shell, command: *const u8) bool {
   if owner == nil {
     return false
   }
-  owner.child = OwnedProcess{}
+  owner.child = proc_none()
   owner.input = -1
   owner.output = -1
   descriptors: [4]i32 = [-1, -1, -1, -1]
@@ -441,8 +442,8 @@ fn terminal_resize_host(t: *Terminal, size: *const TtySize) {
   if owner == nil || size.columns == 0 || size.rows == 0 || size.columns > 32767 || size.rows > 32767 {
     return
   }
-  packed := #cast(u32, size.columns) | (#cast(u32, size.rows) << 16)
-  win_proc_sync.store_u32(&owner.size, packed)
+  packed_value := #cast(u32, size.columns) | (#cast(u32, size.rows) << 16)
+  win_proc_sync.store_u32(&owner.size, packed_value)
   _ = win_pty_api.signal(owner.event)
 }
 fn terminal_stop(t: *Terminal) {

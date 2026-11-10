@@ -16,8 +16,8 @@ s=(ROOT/'src/animation.dyn').read_text()
 source='''use "./motion" motion
 use "./sdl" sdl
 use "./settings" settings
-struct Config {popup_animation_ms:f32=40.0,popup_transitions:bool=true,placement:settings.Placement}
-struct Animation {now:f32,active,surfaces_ready,resized,geometry_active:bool,geometry_elapsed:f32=8.0,surface_geometry:[8]motion.Rectangle,surface_seen:[8]u64}
+struct Config {popup_animation_ms:f32,popup_transitions:bool,placement:settings.Placement}
+struct Animation {now:f32,active,surfaces_ready,resized,geometry_active:bool,geometry_elapsed:f32,surface_geometry:[8]motion.Rectangle,surface_seen:[8]u64}
 struct View {animation:Animation,reduced_motion:bool}
 struct Pointer {dragging:bool}
 struct Ui {frame:u64}
@@ -35,7 +35,7 @@ fn place_of(app:*const App,surface:usize)settings.Placement{return app.config.pl
 '''+function(s,'surface_motion_enabled')+function(s,'animated_surface')+'''
 fn equal(a,b:sdl.Rect) bool {return a.x==b.x && a.y==b.y && a.width==b.width && a.height==b.height}
 fn dock_case(side:u8) {
- app:=App{config:Config{}}
+ app:=App{config:Config{popup_animation_ms:40.0,popup_transitions:true}}
  app.config.placement=settings.Placement{mode:settings.PlaceDock,side:side}
  app.view.animation.surfaces_ready=true
  app.ui.frame=10
@@ -55,7 +55,7 @@ fn dock_case(side:u8) {
  motion.rectangle_seed(&pane,[0.0,0.0,1000.0,600.0],0.0)
  for frame in 10..40 {
   app.ui.frame=#cast(u64,frame)
-  step:=8.0
+  step:f32=8.0
   if frame>10 {step=16.0}
   app.view.animation.geometry_elapsed=step
   app.view.animation.now+=step
@@ -70,7 +70,7 @@ fn dock_case(side:u8) {
 }
 fn main() {
  for side in 0..4 {dock_case(#cast(u8,side))}
- app:=App{config:Config{}}
+ app:=App{config:Config{popup_animation_ms:40.0,popup_transitions:true}}
  app.ui.frame=1
  target:=sdl.Rect{x:100.25,y:80.75,width:600.5,height:400.5}
  if !equal(animated_surface(&app,0,target,1.0),target) {#panic("startup surface must retain exact placement")}

@@ -29,26 +29,26 @@ with tempfile.TemporaryDirectory(prefix='dna-host-environment-') as directory:
     process = stage / 'process'
     process.mkdir()
     (process / 'process.dyn').write_text('''use "std/mem"
-use "std/errors"
+use "std/io"
 extern fn invoked "probe_invoked"() i32
-pub struct EnvironmentResult { value: []u8, found: bool, error: isize, kind: errors.Kind, ok: bool }
-pub struct ArgumentsResult { value: [][]const u8, error: isize, kind: errors.Kind, ok: bool }
+pub struct EnvironmentResult { value: []u8, found: bool, failure: io.Failure }
+pub struct ArgumentsResult { value: [][]const u8, failure: io.Failure }
 pub fn environment(arena: *mem.Arena, name: []const u8) EnvironmentResult {
   _ = name
   mode := invoked()
   if mode == 0 { #panic("rejected name reached allocating wrapper") }
-  if mode == 2 { return EnvironmentResult{error: -5, kind: errors.Kind.System} }
-  if mode == 3 { return EnvironmentResult{ok: true} }
-  if mode == 4 { return EnvironmentResult{found: true, ok: true} }
+  if mode == 2 { return EnvironmentResult{failure: io.Failure{kind: io.Kind.System, native: -5}} }
+  if mode == 3 { return EnvironmentResult{} }
+  if mode == 4 { return EnvironmentResult{found: true} }
   value := mem.push_bytes_uninit(arena, 3)
   value[0] = 97
   value[1] = 98
   value[2] = 99
-  return EnvironmentResult{value: value, found: true, ok: true}
+  return EnvironmentResult{value: value, found: true}
 }
 pub fn arguments(arena: *mem.Arena) ArgumentsResult {
   _ = arena
-  return ArgumentsResult{ok: true}
+  return ArgumentsResult{}
 }
 ''')
     (stage / 'probe.c').write_text('''#include <stdlib.h>
@@ -66,41 +66,41 @@ int probe_calls(void) { return calls; }
 ''')
     subprocess.run(['cc', '-c', str(stage / 'probe.c'), '-o', str(stage / 'probe.o')], check=True, timeout=30)
     source = ['''use "./host" host
-use "std/errors"
+use "std/io"
 extern fn set "probe_set"(mode: i32)
 extern fn calls "probe_calls"() i32
-fn rejected(name: []const u8, kind: errors.Kind, error: isize) {
+fn rejected(name: []const u8, kind: io.Kind, error: isize) {
   set(0)
   output: [4]u8 = [90,90,90,90]
   result := host.environment(name, output[..3])
-  if result.ok || result.found || result.kind != kind || result.error != error || #len(result.value) != 0 || calls() != 0 { #panic("rejection") }
+  if result.failure.kind == io.Kind.Ok || result.found || result.failure.kind != kind || result.failure.native != error || #len(result.value) != 0 || calls() != 0 { #panic("rejection") }
   for byte in output { if byte != 90 { #panic("rejected output changed") } }
 }
 fn accepted(name: []const u8) {
   set(1)
   output: [4]u8 = [90,90,90,90]
   result := host.environment(name, output[..3])
-  if !result.ok || !result.found || #len(result.value) != 3 || calls() != 1 { #panic("accepted boundary") }
+  if result.failure.kind != io.Kind.Ok || !result.found || #len(result.value) != 3 || calls() != 1 { #panic("accepted boundary") }
   if &result.value[0] != &output[0] || output[0] != 97 || output[2] != 99 || output[3] != 90 { #panic("destination ownership") }
 }
 fn main() {''']
     # Raw byte arrays cover malformed sequences without relying on source decoding.
     for value in (b'\x80', b'\xc0\xaf', b'\xe0\x80\x80', b'\xed\xa0\x80', b'\xf4\x90\x80\x80', b'\xf0\x9f\x98', b'a\xff'):
-        source += [f'  bad{len(source)}: [{len(value)}]u8 = [{",".join(map(str, value))}]', f'  rejected(bad{len(source)}[..], errors.Kind.Capacity, -28)']
-    source += ['''  rejected("", errors.Kind.InvalidInput, -22)
-  rejected("a=b", errors.Kind.InvalidInput, -22)
+        source += [f'  bad{len(source)}: [{len(value)}]u8 = [{",".join(map(str, value))}]', f'  rejected(bad{len(source)}[..], io.Kind.Capacity, -28)']
+    source += ['''  rejected("", io.Kind.InvalidInput, -22)
+  rejected("a=b", io.Kind.InvalidInput, -22)
   nul: [3]u8 = [97,0,98]
-  rejected(nul[..], errors.Kind.InvalidInput, -22)
+  rejected(nul[..], io.Kind.InvalidInput, -22)
   ascii: [32768]u8 = []
   for i in 0..32768 { ascii[i] = 97 }
   accepted(ascii[..32767])
-  rejected(ascii[..], errors.Kind.Capacity, -28)
+  rejected(ascii[..], io.Kind.Capacity, -28)
   bmp: [98304]u8 = []
   for i in 0..32768 { bmp[i*3] = 226
     bmp[i*3+1] = 130
     bmp[i*3+2] = 172 }
   accepted(bmp[..98301])
-  rejected(bmp[..], errors.Kind.Capacity, -28)
+  rejected(bmp[..], io.Kind.Capacity, -28)
   astral: [65537]u8 = []
   for i in 0..16384 { astral[i*4] = 240
     astral[i*4+1] = 159
@@ -110,23 +110,23 @@ fn main() {''']
   astral[65532] = 97
   accepted(astral[..65533])
   astral[65532] = 240
-  rejected(astral[..65536], errors.Kind.Capacity, -28)
+  rejected(astral[..65536], io.Kind.Capacity, -28)
   output: [4]u8 = [90,90,90,90]
   for capacity in 0..3 {
     set(1)
     short := host.environment("valid", output[..capacity])
-    if short.ok || short.error != -28 || short.kind != errors.Kind.Capacity || calls() != 1 { #panic("short output") }
+    if short.failure.kind == io.Kind.Ok || short.failure.native != -28 || short.failure.kind != io.Kind.Capacity || calls() != 1 { #panic("short output") }
     for byte in output { if byte != 90 { #panic("short output overwritten") } }
   }
   set(2)
   failure := host.environment("valid", output[..])
-  if failure.ok || failure.error != -5 || failure.kind != errors.Kind.System || failure.found || calls() != 1 { #panic("native diagnostic") }
+  if failure.failure.kind == io.Kind.Ok || failure.failure.native != -5 || failure.failure.kind != io.Kind.System || failure.found || calls() != 1 { #panic("native diagnostic") }
   set(3)
   missing := host.environment("valid", output[..0])
-  if !missing.ok || missing.found || #len(missing.value) != 0 || calls() != 1 { #panic("missing") }
+  if missing.failure.kind != io.Kind.Ok || missing.found || #len(missing.value) != 0 || calls() != 1 { #panic("missing") }
   set(4)
   empty := host.environment("valid", output[..0])
-  if !empty.ok || !empty.found || #len(empty.value) != 0 || calls() != 1 { #panic("empty") }
+  if empty.failure.kind != io.Kind.Ok || !empty.found || #len(empty.value) != 0 || calls() != 1 { #panic("empty") }
 }''']
     (stage / 'main.dyn').write_text('\n'.join(source))
     for mode in ('debug', 'release'):

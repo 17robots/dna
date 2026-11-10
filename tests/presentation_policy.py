@@ -20,7 +20,7 @@ scheduler = (ROOT/'src/scheduler.dyn').read_text()
 base = '''use "./sdl" sdl
 struct Animation {active:bool}
 struct View {vsync,vsync_supported:bool,refresh_ms:f32,animation:Animation}
-struct Config {frame_interval_ms:f32=4.0}
+struct Config {frame_interval_ms:f32}
 struct App {view:View,config:Config,render_pending:u64}
 const RenderKey:u64=1
 const RenderText:u64=2
@@ -30,7 +30,7 @@ const RenderWindow:u64=16
 fn answering_input(app:*const App)bool{return (app.render_pending&(RenderKey|RenderText|RenderMouse|RenderIme|RenderWindow))!=0}
 '''
 cases = '''fn main(){
- app:=App{config:Config{}}
+ app:=App{config:Config{frame_interval_ms:4.0}}
  display_refresh(&app,nil)
  if app.view.refresh_ms<16.0 || animation_interval(&app)<16 {#panic("unknown native refresh spins animation at 250 Hz")}
  app.view.refresh_ms=1000.0/144.0

@@ -1,3 +1,4 @@
+use "std/io" io
 #link("pcre2-8")
 use "../buffer"
 use "../owned_arena" arena_owner
@@ -25,7 +26,7 @@ struct CalloutBlock {
 
 // base: where the text of the last find_document call starts in the
 // document, for callouts that need document positions.
-pub struct Pattern { code, data, context: rawptr, ok: bool, error: i32, error_offset: usize, base: usize }
+pub struct Pattern { code, data, context: rawptr, valid: bool, error: i32, error_offset: usize, base: usize }
 pub struct Match { found, error: bool, start, end: usize }
 // partial: a match may start at or after offset but needs text past the end.
 pub struct Window { found, partial, error: bool, start, end: usize }
@@ -53,7 +54,7 @@ fn open_options(text: []const u8, options: u32) Pattern {
   if match_limit(result.context, 10000) != 0 || depth_limit(result.context, 128) != 0 || heap_limit(result.context, 4096) != 0 {
     return result
   }
-  result.ok = true
+  result.valid = true
   return result
 }
 pub fn close(pattern: *Pattern) {
@@ -69,7 +70,7 @@ pub fn close(pattern: *Pattern) {
   pattern.data = nil
   pattern.context = nil
   pattern.code = nil
-  pattern.ok = false
+  pattern.valid = false
 }
 pub fn find(pattern: *Pattern, text: []const u8, offset: usize) Match {
   return find_options(pattern, text, offset, 0)
@@ -78,7 +79,7 @@ pub fn find(pattern: *Pattern, text: []const u8, offset: usize) Match {
 // ends, so PCRE2 need not validate it again on every call.
 const Checked: u32 = 0x40000000
 fn find_options(pattern: *Pattern, text: []const u8, offset: usize, options: u32) Match {
-  if !pattern.ok || offset > #len(text) {
+  if !pattern.valid || offset > #len(text) {
     return Match{error: true}
   }
   empty: [1]u8 = [0]
@@ -93,21 +94,21 @@ fn find_options(pattern: *Pattern, text: []const u8, offset: usize, options: u32
   if result < 0 {
     return Match{error: true}
   }
-  vector := offsets(pattern.data)[..2]
+  vector := #slice(offsets(pattern.data), 2)
   return Match{found: true, start: vector[0], end: vector[1]}
 }
 // Capture group index of the last successful find on this pattern, relative
 // to the text passed to find. An unset group is not found. Read it before the
 // next find on the same pattern.
 pub fn group(pattern: *const Pattern, index: usize) Match {
-  if !pattern.ok {
+  if !pattern.valid {
     return Match{}
   }
   count := #cast(usize, offset_count(pattern.data))
   if index >= count {
     return Match{}
   }
-  vector := offsets(pattern.data)[..2 * count]
+  vector := #slice(offsets(pattern.data), 2 * count)
   // PCRE2_UNSET is the all-ones offset.
   if vector[2 * index] == 0xffffffffffffffff || vector[2 * index] > vector[2 * index + 1] {
     return Match{}
@@ -121,7 +122,7 @@ pub fn find_window(pattern: *Pattern, text: []const u8, offset: usize) Window {
   return find_window_options(pattern, text, offset, 0)
 }
 fn find_window_options(pattern: *Pattern, text: []const u8, offset: usize, options: u32) Window {
-  if !pattern.ok || offset > #len(text) {
+  if !pattern.valid || offset > #len(text) {
     return Window{error: true}
   }
   empty: [1]u8 = [0]
@@ -134,13 +135,13 @@ fn find_window_options(pattern: *Pattern, text: []const u8, offset: usize, optio
     return Window{}
   }
   if result == -2 {
-    vector := offsets(pattern.data)[..2]
+    vector := #slice(offsets(pattern.data), 2)
     return Window{partial: true, start: vector[0]}
   }
   if result < 0 {
     return Window{error: true}
   }
-  vector := offsets(pattern.data)[..2]
+  vector := #slice(offsets(pattern.data), 2)
   return Window{found: true, start: vector[0], end: vector[1]}
 }
 

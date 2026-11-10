@@ -1,3 +1,4 @@
+use "std/io" io
 // Native GUI backend. The public platform wrapper keeps terminal dispatch.
 use "vendor/window/events"
 use "std/ui"
@@ -8,7 +9,7 @@ use "host" renderer_host
 use "./native_present" native_present
 use "./backend" native_backend
 
-struct NativeTexture { next: *NativeTexture, gpu, framebuffer: u32, storage: *mem.Arena, premultiplied: bool, owner: *mem.Arena, pixels: []u8, width, height: i32, alpha: u8 = 255 }
+struct NativeTexture { next: *NativeTexture, gpu, framebuffer: u32, storage: *mem.Arena, premultiplied: bool, owner: *mem.Arena, pixels: []u8, width, height: i32, alpha: u8}
 struct NativeClipboard { owner: *mem.Arena, bytes: []u8, next: *NativeClipboard }
 struct NativeGui {
   window: window_api.Window,
@@ -20,17 +21,18 @@ struct NativeGui {
   target: *NativeTexture,
   textures: *NativeTexture,
   color: ui.Color,
-  draw_alpha: u8 = 255,
+  draw_alpha: u8,
   viewport: PixelRect,
   clip: PixelRect,
   clipped: bool,
-  sx: f32 = 1.0,
-  sy: f32 = 1.0,
+  sx: f32,
+  sy: f32,
   listening: bool,
   requested_width: i32,
   requested_height: i32,
   injected: [128]Event,
-  injected_text: [128][4097]u8,
+  injected_arena: *mem.Arena,
+  injected_text: []u8,
   injected_count: usize,
   deferred: [128]events.Event,
   deferred_count: usize,
@@ -46,6 +48,7 @@ struct NativeGui {
   click_valid: bool,
   character: u32,
   payload: [65537]u8,
+  closed: bool,
 }
 native_gui: NativeGui
 pub fn init(flags: u32) bool {
@@ -59,9 +62,13 @@ fn sdl_create_window(title: *const u8, width, height: i32, flags: u64) rawptr {
   if native_gui.presenter.program!=0 || native_gui.gpu.program!=0 {
     return nil
   }
-  native_gui=NativeGui{}
-  result := window_api.open(&native_gui.window, title[..c.string_length(title, 4096)], width, height)
-  if !result.ok {
+  // Static storage starts zero. Clearing it again would touch every page.
+  if native_gui.closed {
+    native_gui=NativeGui{}
+  }
+  native_gui.draw_alpha=255
+  result := window_api.open(&native_gui.window, #slice(title, c.string_length(title, 4096)), width, height)
+  if result.kind != io.Kind.Ok {
     return nil
   }
   window_api.listen_events(&native_gui.window, true)
@@ -86,7 +93,7 @@ fn native_software_requested() bool {
   storage: [32]u8 = []
   value := renderer_host.environment("DNA_RENDERER", storage[..])
   expected := "software"
-  if !value.ok || !value.found || #len(value.value) != #len(expected) {
+  if value.failure.kind != io.Kind.Ok || !value.found || #len(value.value) != #len(expected) {
     return false
   }
   for i in 0..#len(expected) {
@@ -106,7 +113,7 @@ fn sdl_create_renderer(window: rawptr, name: *const u8) rawptr {
       return nil
     }
   }
-  else if !native_present.open(&native_gui.presenter).ok {
+  else if native_present.open(&native_gui.presenter).failure.kind != io.Kind.Ok {
     return nil
   }
   if !native_resize() {
@@ -143,6 +150,11 @@ fn sdl_destroy_renderer(renderer: rawptr) {
   native_present.gpu_close(&native_gui.gpu)
   mem.arena_release(native_gui.pixels)
   native_gui.pixels = nil
+  if native_gui.injected_arena!=nil {
+    mem.arena_release(native_gui.injected_arena)
+    native_gui.injected_arena=nil
+  }
+  native_gui.closed=true
   native_gui.surface=software.Surface{}
   native_gui.viewport=PixelRect{}
   native_gui.target=nil
@@ -258,12 +270,12 @@ fn sdl_present(renderer: rawptr) bool {
     if !native_present.gpu_flush(&native_gui.gpu) {
       return false
     }
-    return window_api.swap(&native_gui.window).ok
+    return window_api.swap(&native_gui.window).kind == io.Kind.Ok
   }
-  if !native_present.draw(&native_gui.presenter, native_gui.surface).ok {
+  if native_present.draw(&native_gui.presenter, native_gui.surface).failure.kind != io.Kind.Ok {
     return false
   }
-  return window_api.swap(&native_gui.window).ok
+  return window_api.swap(&native_gui.window).kind == io.Kind.Ok
 }
 fn sdl_scale(renderer: rawptr, x, y: f32) bool {
   if !(x>0.0 && y>0.0) || x>16.0 || y>16.0 {
@@ -289,7 +301,7 @@ fn sdl_fill(renderer: rawptr, rect: *const Rect) bool {
     native_fill_span(&surface, bounds, color)
     return true
   }
-  return software.render(&surface, &command, software.Font{}).ok
+  return software.render(&surface, &command, software.Font{}).failure.kind == io.Kind.Ok
 }
 fn sdl_size(renderer: rawptr, width, height: *i32) bool {
   width.*=native_gui.surface.width
@@ -321,7 +333,7 @@ fn sdl_create_texture(renderer: rawptr, format: u32, access, width, height: i32)
   }
   owner := mem.arena_create(4096)
   t := mem.push(NativeTexture, owner)
-  t.*=NativeTexture{owner:owner, width:width, height:height, next:native_gui.textures}
+  t.*=NativeTexture{alpha:255, owner:owner, width:width, height:height, next:native_gui.textures}
   native_gui.textures=t
   if !native_gui.direct {
     native_texture_storage(t)
@@ -511,8 +523,8 @@ fn sdl_render_texture(renderer: rawptr, texture: rawptr, source, destination: *c
   // original sequential sampling and blending behavior.
   texture_begin:=#cast(usize, &t.pixels[0])
   target_begin:=#cast(usize, &surface.pixels[0])
-  distinct:=texture_begin+#len(t.pixels)<=target_begin || target_begin+#len(surface.pixels)<=texture_begin
-  copy_opaque:=unit_x && unit_y && draw_alpha==255 && distinct
+  disjoint:=texture_begin+#len(t.pixels)<=target_begin || target_begin+#len(surface.pixels)<=texture_begin
+  copy_opaque:=unit_x && unit_y && draw_alpha==255 && disjoint
   for row in 0..clip.height {
     y:=clip.y-top+row
     ty:=source_y+y
@@ -598,7 +610,7 @@ pub fn native_text_cached_bitmap(renderer:rawptr, key:u64, pixels:*const u8, wid
   if native_gui.direct {
     return native_present.gpu_glyph(&native_gui.gpu, key, pixels, width, height, bounds, pane_clip, ui.Color{r:r, g:g, b:b, a:a}, native_gui.sx, native_gui.sy)
   }
-  mask:=pixels[..#cast(usize, width)*#cast(usize, height)]
+  mask:=#slice(pixels, #cast(usize, width)*#cast(usize, height))
   unit_x:=native_gui.sx==1.0
   for row in 0..clip.height {
     source_row:=#cast(usize, #cast(f32, clip.y-top+row)/native_gui.sy)
@@ -754,7 +766,7 @@ fn native_event(source:*const events.Event, event:*Event) bool {
     if target.down {
       now:=time.monotonic_now()
       delta:=time.elapsed(native_gui.click_at, now.value)
-      same:=native_gui.click_valid && now.ok && delta.ok && delta.value>=0 && delta.value<=500*time.Millisecond && native_gui.click_button==source.button && source.x>=native_gui.click_x-4 && source.x<=native_gui.click_x+4 && source.y>=native_gui.click_y-4 && source.y<=native_gui.click_y+4
+      same:=native_gui.click_valid && now.failure.kind == io.Kind.Ok && delta.failure.kind == io.Kind.Ok && delta.value>=0 && delta.value<=500*time.Millisecond && native_gui.click_button==source.button && source.x>=native_gui.click_x-4 && source.x<=native_gui.click_x+4 && source.y>=native_gui.click_y-4 && source.y<=native_gui.click_y+4
       if same && native_gui.click_count<3 {
         native_gui.click_count+=1
       }
@@ -765,7 +777,7 @@ fn native_event(source:*const events.Event, event:*Event) bool {
       native_gui.click_x=source.x
       native_gui.click_y=source.y
       native_gui.click_at=now.value
-      native_gui.click_valid=now.ok
+      native_gui.click_valid=now.failure.kind == io.Kind.Ok
     }
     target.clicks=native_gui.click_count
     target.x=#cast(f32, source.x)
@@ -826,14 +838,17 @@ fn sdl_poll(event:*Event) bool {
     event.*=native_gui.injected[0]
     kind:=#cast(u32, event.words[0]&4294967295)
     if kind==770 || kind==771 {
-      n:=c.string_length(&native_gui.injected_text[0][0], 4097)
-      _=mem.copy(native_gui.payload[..n+1], native_gui.injected_text[0][..n+1])
+      slot:=injected_slot(0)
+      n:=c.string_length(&slot[0], 4097)
+      _=mem.copy(native_gui.payload[..n+1], slot[..n+1])
       #cast(*TextEvent, event).text=&native_gui.payload[0]
     }
     native_gui.injected_count-=1
     for i in 0..native_gui.injected_count {
       native_gui.injected[i]=native_gui.injected[i+1]
-      native_gui.injected_text[i]=native_gui.injected_text[i+1]
+      if native_gui.injected_arena!=nil {
+        _=mem.copy(injected_slot(i), injected_slot(i+1))
+      }
     }
     return true
   }
@@ -858,7 +873,7 @@ fn sdl_poll(event:*Event) bool {
       return true
     }
   }
-  if !window_api.poll(&native_gui.window).ok {
+  if window_api.poll(&native_gui.window).kind != io.Kind.Ok {
     return false
   }
   for window_api.next_event(&native_gui.window, &source) {
@@ -878,6 +893,14 @@ fn sdl_wait_timeout(event:*Event, milliseconds:i32) bool {
 fn sdl_wait(event:*Event) bool {
   return sdl_wait_timeout(event, -1)
 }
+// Injected text is rare, so its 525 KB table exists only after the first use.
+fn injected_slot(index:usize) []u8 {
+  if native_gui.injected_arena==nil {
+    native_gui.injected_arena=mem.arena_create(128*4097+65536)
+    native_gui.injected_text=#slice(mem.arena_push(native_gui.injected_arena, 128*4097, 1), 128*4097)
+  }
+  return native_gui.injected_text[index*4097..(index+1)*4097]
+}
 fn sdl_push(event:*Event) bool {
   if event==nil || native_gui.injected_count>=128 {
     return false
@@ -894,11 +917,12 @@ fn sdl_push(event:*Event) bool {
     if n>4096 {
       return false
     }
-    _=mem.copy(native_gui.injected_text[at][..n], text[..n])
-    native_gui.injected_text[at][n]=0
+    slot:=injected_slot(at)
+    _=mem.copy(slot[..n], #slice(text, n))
+    slot[n]=0
   }
   native_gui.injected_count+=1
-  return window_api.wake(&native_gui.window).ok
+  return window_api.wake(&native_gui.window).kind == io.Kind.Ok
 }
 fn sdl_start_text(window:rawptr) bool {
   window_api.set_text_input(&native_gui.window, true, 0, 0, 1, 1)
@@ -926,7 +950,7 @@ fn sdl_key_from_scancode(scancode:u32, modifiers:u16, key_event:bool) u32 {
 }
 
 fn sdl_render_vsync(renderer:rawptr, vsync:i32) bool {
-  return window_api.set_swap_interval(&native_gui.window, vsync).ok
+  return window_api.set_swap_interval(&native_gui.window, vsync).kind == io.Kind.Ok
 }
 fn sdl_window_display(window:rawptr) u32 {
   return 0
@@ -966,12 +990,12 @@ fn sdl_clipboard_set(text:*const u8) bool {
   if length>16777216 {
     return false
   }
-  return window_api.try_set_clipboard(&native_gui.window, text[..length]).ok
+  return window_api.try_set_clipboard(&native_gui.window, #slice(text, length)).kind == io.Kind.Ok
 }
 fn sdl_clipboard_get() *const u8 {
   window_api.request_paste_snapshot(&native_gui.window)
   started:=time.monotonic_now()
-  if !started.ok {
+  if started.failure.kind != io.Kind.Ok {
     return nil
   }
   // The SDK ends stalled transfers after five seconds without progress.
@@ -979,10 +1003,10 @@ fn sdl_clipboard_get() *const u8 {
   for {
     now:=time.monotonic_now()
     elapsed:=time.elapsed(started.value, now.value)
-    if !now.ok || !elapsed.ok || elapsed.value<0 || elapsed.value>=30*time.Second {
+    if now.failure.kind != io.Kind.Ok || elapsed.failure.kind != io.Kind.Ok || elapsed.value<0 || elapsed.value>=30*time.Second {
       return nil
     }
-    if !window_api.poll(&native_gui.window).ok {
+    if window_api.poll(&native_gui.window).kind != io.Kind.Ok {
       return nil
     }
     source:=events.Event{}
@@ -999,7 +1023,7 @@ fn sdl_clipboard_get() *const u8 {
       }
     }
     if !window_api.paste_pending(&native_gui.window) {
-      if !window_api.paste_status(&native_gui.window).ok {
+      if window_api.paste_status(&native_gui.window).kind != io.Kind.Ok {
         return nil
       }
       text:=window_api.clipboard(&native_gui.window)
@@ -1037,7 +1061,7 @@ fn sdl_free(pointer:rawptr) {
   }
 }
 fn sdl_title(window:rawptr, title:*const u8) bool {
-  return title!=nil && window_api.set_title(&native_gui.window, title[..c.string_length(title, 4096)]).ok
+  return title!=nil && window_api.set_title(&native_gui.window, #slice(title, c.string_length(title, 4096))).kind == io.Kind.Ok
 }
 fn sdl_clear_composition(window:rawptr) bool {
   window_api.set_text_input(&native_gui.window, false, 0, 0, 1, 1)
@@ -1047,11 +1071,11 @@ fn sdl_clear_composition(window:rawptr) bool {
 fn sdl_set_window_size(window:rawptr, width, height:i32) bool {
   native_gui.requested_width=width
   native_gui.requested_height=height
-  return window_api.set_size(&native_gui.window, width, height).ok
+  return window_api.set_size(&native_gui.window, width, height).kind == io.Kind.Ok
 }
 fn sdl_sync_window(window:rawptr) bool {
   for attempt in 0..100 {
-    if !window_api.poll(&native_gui.window).ok {
+    if window_api.poll(&native_gui.window).kind != io.Kind.Ok {
       return false
     }
     if native_gui.window.width==native_gui.requested_width && native_gui.window.height==native_gui.requested_height {
@@ -1072,15 +1096,15 @@ fn sdl_geometry(renderer, texture:rawptr, vertices:*const Vertex, count:i32, ind
   clip:=native_clip(surface)
   opacity:=#cast(f32, native_draw_alpha(255))/255.0
   for triangle in 0..index_count/3 {
-    ia:=indices[..#cast(usize, index_count)][#cast(usize, triangle*3)]
-    ib:=indices[..#cast(usize, index_count)][#cast(usize, triangle*3+1)]
-    ic:=indices[..#cast(usize, index_count)][#cast(usize, triangle*3+2)]
+    ia:=#slice(indices, #cast(usize, index_count))[#cast(usize, triangle*3)]
+    ib:=#slice(indices, #cast(usize, index_count))[#cast(usize, triangle*3+1)]
+    ic:=#slice(indices, #cast(usize, index_count))[#cast(usize, triangle*3+2)]
     if ia<0 || ib<0 || ic<0 || ia>=count || ib>=count || ic>=count {
       return false
     }
-    a:=vertices[..#cast(usize, count)][#cast(usize, ia)]
-    b:=vertices[..#cast(usize, count)][#cast(usize, ib)]
-    c:=vertices[..#cast(usize, count)][#cast(usize, ic)]
+    a:=#slice(vertices, #cast(usize, count))[#cast(usize, ia)]
+    b:=#slice(vertices, #cast(usize, count))[#cast(usize, ib)]
+    c:=#slice(vertices, #cast(usize, count))[#cast(usize, ic)]
     a.alpha=a.alpha*opacity
     b.alpha=b.alpha*opacity
     c.alpha=c.alpha*opacity

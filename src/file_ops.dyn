@@ -150,8 +150,8 @@ fn file_op_make_parents(path: []const u8, last: bool) bool {
     if at == #len(path) || path[at] == '/' {
       if at < #len(path) || last {
         info := fs.metadata(path[..at])
-        if !info.ok {
-          if !fs.make_directory(path[..at], 493).ok {
+        if info.failure.kind != io.Kind.Ok {
+          if fs.make_directory(path[..at], 493).failure.kind != io.Kind.Ok {
             return false
           }
         }
@@ -165,30 +165,30 @@ fn file_op_make_parents(path: []const u8, last: bool) bool {
   return true
 }
 fn file_op_exists(path: []const u8) bool {
-  return fs.metadata_nofollow(path).ok
+  return fs.metadata_nofollow(path).failure.kind == io.Kind.Ok
 }
 // Copies a file, or a folder and everything below it, refusing symlinks and
 // existing destinations. `depth` bounds recursion.
 fn file_op_copy(source: []const u8, destination: []const u8, depth: usize) bool {
   info := fs.metadata_nofollow(source)
-  if !info.ok || depth > 32 || file_op_exists(destination) {
+  if info.failure.kind != io.Kind.Ok || depth > 32 || file_op_exists(destination) {
     return false
   }
   kind := info.mode & 61440
   if kind == 16384 {
-    if !fs.make_directory(destination, 493).ok {
+    if fs.make_directory(destination, 493).failure.kind != io.Kind.Ok {
       return false
     }
     storage: [8192]u8 = []
     opened := fs.open_directory(source, storage[..])
-    if !opened.ok {
+    if opened.failure.kind != io.Kind.Ok {
       return false
     }
     ok := true
     for ok {
       entry := fs.directory_next(&opened.directory)
-      if !entry.ok {
-        ok = entry.error == 0
+      if !entry.found {
+        ok = entry.failure.native == 0
         break
       }
       from: [4096]u8 = []
@@ -205,38 +205,38 @@ fn file_op_copy(source: []const u8, destination: []const u8, depth: usize) bool 
       }
       ok = file_op_copy(from[..from_length], to[..to_length], depth + 1)
     }
-    _ = fs.close_directory(&opened.directory)
+    fs.close_directory(&opened.directory)
     return ok
   }
   if kind != 32768 {
     return false
   }
   input := fs.open_nofollow(source)
-  if !input.ok {
+  if input.failure.kind != io.Kind.Ok {
     return false
   }
-  defer _ = fs.close(&input.value)
+  defer fs.close(&input.value)
   output := fs.create_exclusive(destination)
-  if !output.ok {
+  if output.failure.kind != io.Kind.Ok {
     return false
   }
   chunk: [65536]u8 = []
   ok := true
   for ok {
     read := fs.read(&input.value, chunk[..])
-    if !read.ok {
+    if read.failure.kind != io.Kind.Ok {
       ok = false
       break
     }
     if read.transferred == 0 {
       break
     }
-    ok = fs.write(&output.value, chunk[..read.transferred]).ok
+    ok = fs.write(&output.value, chunk[..read.transferred]).failure.kind == io.Kind.Ok
   }
   if ok {
-    ok = fs.preserve_permissions(&output.value, source).ok
+    ok = fs.preserve_permissions(&output.value, source).failure.kind == io.Kind.Ok
   }
-  ok = fs.close(&output.value).ok && ok
+  fs.close(&output.value)
   return ok
 }
 // Enter in the prompt: apply the typed path.
@@ -275,10 +275,11 @@ fn file_op_submit(app: *App) {
     }
     if !folder {
       created := fs.create_exclusive(target)
-      if !created.ok || !fs.close(&created.value).ok {
+      if created.failure.kind != io.Kind.Ok {
         notice(app, "Cannot create that file.")
         return
       }
+      fs.close(&created.value)
     }
     file_op_finish(app, target)
     return
@@ -304,7 +305,7 @@ fn file_op_submit(app: *App) {
     file_op_finish(app, target)
     return
   }
-  if !fs.rename_noreplace(source, target).ok {
+  if fs.rename_noreplace(source, target).failure.kind != io.Kind.Ok {
     notice(app, "Move failed: the destination exists, is on another disk, or permissions deny it.")
     return
   }
@@ -326,12 +327,12 @@ fn file_op_trash(app: *App) {
   trash_length := copy_text(trash[..3800], folder)
   add_text(trash[..], &trash_length, ".dna-trash")
   link: [4096]u8 = []
-  if fs.read_link(trash[..trash_length], link[..]).ok {
+  if fs.read_link(trash[..trash_length], link[..]).failure.kind == io.Kind.Ok {
     notice(app, "Trash destination must not be a symlink.")
     file_op_finish(app, "")
     return
   }
-  if !file_op_exists(trash[..trash_length]) && !fs.make_directory(trash[..trash_length], 448).ok {
+  if !file_op_exists(trash[..trash_length]) && fs.make_directory(trash[..trash_length], 448).failure.kind != io.Kind.Ok {
     notice(app, "Cannot create the .dna-trash folder.")
     file_op_finish(app, "")
     return
@@ -348,7 +349,7 @@ fn file_op_trash(app: *App) {
     if file_op_exists(target[..used]) {
       continue
     }
-    if !fs.rename_noreplace(source, target[..used]).ok {
+    if fs.rename_noreplace(source, target[..used]).failure.kind != io.Kind.Ok {
       notice(app, "Moving to .dna-trash failed.")
       file_op_finish(app, "")
       return

@@ -26,13 +26,14 @@ with tempfile.TemporaryDirectory(prefix='dna-darwin-errno-') as directory:
     stage = Path(directory)
     shutil.copytree(ROOT/'src/cstring', stage/'cstring')
     (stage/'dynlib').mkdir()
-    (stage/'dynlib/dynlib.dyn').write_text('''pub struct SymbolResult {value:rawptr,ok:bool}
+    (stage/'dynlib/dynlib.dyn').write_text('''use "std/io"
+pub struct SymbolResult {value:rawptr,failure:io.Failure}
 extern fn resolve "probe_resolve"() rawptr
 pub fn symbol(handle:rawptr,name:[]const u8) SymbolResult {
  if #cast(isize,handle)!=-2 || #len(name)!=7 {#panic("wrong Darwin symbol lookup")}
  expected:[]const u8="__error"
  for i in 0..7 {if name[i]!=expected[i] {#panic("wrong errno symbol")}}
- return SymbolResult{value:resolve(),ok:true}
+ return SymbolResult{value:resolve()}
 }
 ''')
     source = (ROOT/'src/filesystem/macos.dyn').read_text()
@@ -40,6 +41,8 @@ pub fn symbol(handle:rawptr,name:[]const u8) SymbolResult {
     (stage/'main.dyn').write_text('''#link("c")
 #link("pthread")
 use "std/sync" sync
+use "std/io"
+use "std/parse"
 use "./dynlib" dynlib
 use "./cstring" cstring
 extern fn probe_fail "probe_fail"()

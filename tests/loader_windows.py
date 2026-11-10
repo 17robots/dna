@@ -32,8 +32,8 @@ pub fn test_readable(path:*const u8) i32 {
 pub fn test_helper(output:*u8,capacity:usize) usize {
   name:=syntax_helper_name()
   if capacity<=#len(name) { return 0 }
-  for index in 0..#len(name) { output[..capacity][index]=name[index] }
-  output[..capacity][#len(name)]=0
+  for index in 0..#len(name) { #slice(output, capacity)[index]=name[index] }
+  #slice(output, capacity)[#len(name)]=0
   return #len(name)
 }
 fn main() {}

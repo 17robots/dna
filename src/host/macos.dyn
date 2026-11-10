@@ -1,6 +1,8 @@
+use "std/parse" parse
 #target(kernel: darwin)
 #link("System")
 use "std/c"
+use "std/io"
 
 extern fn host_getcwd "getcwd"(output: *u8, capacity: usize) *u8
 extern fn host_chdir "chdir"(path: *const u8) i32
@@ -17,7 +19,7 @@ fn native_change_directory(path: []const u8) bool {
     return false
   }
   encoded := cstring.bounded(storage[..], path)
-  return encoded.ok && host_chdir(encoded.value) == 0
+  return encoded.failure.kind == parse.Kind.Ok && host_chdir(encoded.value) == 0
 }
 fn native_process_id() u32 {
   return #cast(u32, host_getpid())
@@ -35,58 +37,58 @@ extern fn host_argument_vector "dyn_arguments_vector"() ***const u8
 fn native_environment(name: []const u8, destination: []u8) EnvironmentResult {
   storage: [4096]u8 = []
   if #len(name) >= #len(storage) {
-    return EnvironmentResult{error: -28, kind: errors.Kind.Capacity}
+    return EnvironmentResult{ failure: io.Failure{ kind: io.Kind.Capacity, native: -28 } }
   }
   key := cstring.bounded(storage[..], name)
-  if !key.ok {
-    return EnvironmentResult{error: -28, kind: errors.Kind.Capacity}
+  if key.failure.kind != parse.Kind.Ok {
+    return EnvironmentResult{ failure: io.Failure{ kind: io.Kind.Capacity, native: -28 } }
   }
   value := host_environment(key.value)
   if value == nil {
-    return EnvironmentResult{value: destination[..0], ok: true}
+    return EnvironmentResult{ value: destination[..0] }
   }
   if #len(destination) == ~#cast(usize, 0) {
-    return EnvironmentResult{kind: errors.Kind.Overflow}
+    return EnvironmentResult{ failure: io.Failure{ kind: io.Kind.Overflow } }
   }
   parsed := c.bytes_from_string(value, #len(destination) + 1)
-  if !parsed.ok || #len(parsed.value) > #len(destination) {
-    return EnvironmentResult{error: -28, kind: errors.Kind.Capacity}
+  if parsed.failure.kind != parse.Kind.Ok || #len(parsed.value) > #len(destination) {
+    return EnvironmentResult{ failure: io.Failure{ kind: io.Kind.Capacity, native: -28 } }
   }
   _ = mem.copy(destination, parsed.value)
-  return EnvironmentResult{value: destination[..#len(parsed.value)], found: true, ok: true}
+  return EnvironmentResult{ value: destination[..#len(parsed.value)], found: true }
 }
 fn native_arguments(arena: *mem.Arena) ArgumentsResult {
   count_pointer := host_argument_count()
   if count_pointer == nil || count_pointer.* < 0 {
-    return ArgumentsResult{kind: errors.Kind.InvalidState}
+    return ArgumentsResult{ failure: io.Failure{ kind: io.Kind.InvalidState } }
   }
   count := #cast(usize, count_pointer.*)
   if count == 0 {
-    return ArgumentsResult{ok: true}
+    return ArgumentsResult{}
   }
   if count > (~#cast(usize, 0)) / #sizeof([]const u8) {
-    return ArgumentsResult{kind: errors.Kind.Overflow}
+    return ArgumentsResult{ failure: io.Failure{ kind: io.Kind.Overflow } }
   }
   vector_pointer := host_argument_vector()
   if vector_pointer == nil || vector_pointer.* == nil {
-    return ArgumentsResult{kind: errors.Kind.InvalidState}
+    return ArgumentsResult{ failure: io.Failure{ kind: io.Kind.InvalidState } }
   }
   slots := mem.arena_push_uninit(arena, count * #sizeof([]const u8), #alignof([]const u8))
-  values := (#cast(*[]const u8, slots))[..count]
-  vector := vector_pointer.*[..count]
+  values := #slice((#cast(*[]const u8, slots)), count)
+  vector := #slice(vector_pointer.*, count)
   for index in 0..count {
     source := vector[index]
     if source == nil {
-      return ArgumentsResult{kind: errors.Kind.InvalidState}
+      return ArgumentsResult{ failure: io.Failure{ kind: io.Kind.InvalidState } }
     }
     size := host_argument_length(source)
     allocation := mem.arena_push_uninit(arena, size, 1)
     destination := arena.data[..0]
     if size > 0 {
-      destination = allocation[..size]
+      destination = #slice(allocation, size)
     }
-    _ = mem.copy(destination, source[..size])
+    _ = mem.copy(destination, #slice(source, size))
     values[index] = destination
   }
-  return ArgumentsResult{values: values, ok: true}
+  return ArgumentsResult{ values: values }
 }

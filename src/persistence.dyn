@@ -58,14 +58,14 @@ fn recovery_pieces(saved: *workspace.SavedBuffer, state: *workspace.State, doc: 
     state.patches = mem.arena_create(RecoveryPatchLimit + 268435456)
   }
   list := buffer.saved_pieces(doc, state.patches, RecoveryPatchLimit)
-  if !list.ok {
+  if !list.valid {
     return false
   }
   records := mem.arena_try_push_uninit(state.patches, #len(list.pieces) * 24 + 1, 8)
   if !records.ok {
     return false
   }
-  encoded := (#cast(*u8, records.memory))[..#len(list.pieces) * 24]
+  encoded := #slice((#cast(*u8, records.memory)), #len(list.pieces) * 24)
   for index in 0..#len(list.pieces) {
     piece := list.pieces[index]
     kind: usize = 0
@@ -94,7 +94,7 @@ fn recovery_patch(saved: *workspace.SavedBuffer, state: *workspace.State, slot: 
     return true
   }
   stamp := files.saved_stamp(&slot.file)
-  if !stamp.ok {
+  if !stamp.valid {
     return false
   }
   low := doc.saved_prefix
@@ -123,7 +123,7 @@ fn recovery_apply_pieces(doc: *buffer.Document, saved: *const workspace.SavedBuf
   count := #len(saved.pieces) / 24
   arena := arena_owner.create(count * #sizeof(buffer.Piece) + 64)
   defer arena_owner.release(arena)
-  pieces := (#cast(*buffer.Piece, &mem.push_bytes_uninit(arena, count * #sizeof(buffer.Piece) + 16)[0]))[..count]
+  pieces := #slice((#cast(*buffer.Piece, &mem.push_bytes_uninit(arena, count * #sizeof(buffer.Piece) + 16)[0])), count)
   for index in 0..count {
     words: [3]usize = []
     for word in 0..3 {
@@ -233,7 +233,7 @@ fn session_save(app: *App, argument: []const u8) bool {
   used := copy_text(temporary[..], path)
   add_text(temporary[..], &used, ".tmp")
   tx := fs.atomic_begin_private(path, temporary[..used])
-  if !tx.ok {
+  if tx.failure.kind != io.Kind.Ok {
     notice(app, "Cannot create session snapshot. Ensure its parent directory exists and no .tmp file remains.")
     return false
   }
@@ -242,7 +242,7 @@ fn session_save(app: *App, argument: []const u8) bool {
       _ = fs.atomic_abort(&tx.transaction)
     }
   }
-  if !fs.set_permissions(&tx.transaction.file, 384).ok || !fs.write(&tx.transaction.file, bytes[..length]).ok || !fs.atomic_commit(&tx.transaction).ok {
+  if fs.set_permissions(&tx.transaction.file, 384).failure.kind != io.Kind.Ok || fs.write(&tx.transaction.file, bytes[..length]).failure.kind != io.Kind.Ok || fs.atomic_commit(&tx.transaction).failure.kind != io.Kind.Ok {
     notice(app, "Session write failed.")
     return false
   }
@@ -263,7 +263,7 @@ fn session_restore(app: *App, argument: []const u8) bool {
   path_storage: [4096]u8 = []
   path := session_path(app, argument, path_storage[..])
   info := files.metadata(path)
-  if !info.ok || (info.mode & 61440) != 32768 {
+  if info.failure.kind != io.Kind.Ok || (info.mode & 61440) != 32768 {
     notice(app, "Session must be a regular file.")
     return false
   }
@@ -280,7 +280,7 @@ fn session_restore(app: *App, argument: []const u8) bool {
   read := fs.read_all(allocated, path, session_limit)
   state := workspace.State{}
   defer workspace.release(&state)
-  if !read.ok || !workspace.decode(read.value, &state) {
+  if read.failure.kind != io.Kind.Ok || !workspace.decode(read.value, &state) {
     notice(app, "Invalid, truncated, or unsupported session. Workspace unchanged.")
     return false
   }
@@ -321,12 +321,12 @@ fn session_restore(app: *App, argument: []const u8) bool {
         notice(app, "Could not initialize a restored buffer. Workspace unchanged.")
         return false
       }
-      restored[index].colors = colors.memory[..buffer.Capacity + 1]
+      restored[index].colors = #slice(colors.memory, buffer.Capacity + 1)
       doc := restored[index].document
       if saved.reload {
         // Read (or map) the file straight into storage the document adopts.
         disk := files.read_document(saved.path)
-        loaded := disk.ok && buffer.load_storage(doc, &disk.storage, #len(disk.data))
+        loaded := disk.valid && buffer.load_storage(doc, &disk.storage, #len(disk.data))
         stamp := disk.stamp
         restored[index].stamp = stamp
         files.release_text(&disk)
@@ -336,7 +336,7 @@ fn session_restore(app: *App, argument: []const u8) bool {
         }
         if saved.patched {
           // Edits apply only to the exact file they were made against.
-          same := stamp.ok && stamp.inode == saved.stamp[0] && stamp.size == saved.stamp[1] && stamp.modify_seconds == saved.stamp[2] && stamp.modify_nanos == saved.stamp[3]
+          same := stamp.valid && stamp.inode == saved.stamp[0] && stamp.size == saved.stamp[1] && stamp.modify_seconds == saved.stamp[2] && stamp.modify_nanos == saved.stamp[3]
           if same && #len(saved.pieces) > 0 {
             if !recovery_apply_pieces(doc, saved) {
               notice(app, "Cannot apply recovered edits. Workspace and recovery record unchanged.")
@@ -588,7 +588,7 @@ fn recovery_allowed(app: *App) bool {
   if !app.recovery.checked {
     env: [32]u8 = []
     disabled := host.environment("DNA_RECOVERY", env[..])
-    app.recovery.disabled = disabled.ok && disabled.found && buffer.equal(disabled.value, "0")
+    app.recovery.disabled = disabled.failure.kind == io.Kind.Ok && disabled.found && buffer.equal(disabled.value, "0")
     smoke := host.environment("DYN_EDITOR_SMOKE", env[..])
     if smoke.found {
       app.recovery.disabled = true

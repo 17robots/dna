@@ -20,7 +20,7 @@ pub fn test_parent(path:*const u8,output:*u8) i32 {
   return 0
 }
 pub fn test_normalize(path:*const u8,length:usize,output:*u8,capacity:usize) usize {
-  return #len(file_normalize_path(path[..length],output[..capacity]))
+  return #len(file_normalize_path(#slice(path, length),#slice(output, capacity)))
 }
 fn main() {}
 '''

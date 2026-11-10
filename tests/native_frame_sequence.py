@@ -16,6 +16,7 @@ ROOT=Path(__file__).resolve().parents[1]
 FIXTURE=r'''use "vendor/window/wayland" window_api
 use "vendor/window/events"
 use "std/ui/software"
+use "std/io" io
 use "std/mem"
 use "./presenter" presenter
 #link("c")
@@ -36,12 +37,12 @@ fn verify(renderer:*presenter.Presenter,surface:software.Surface,readback:[]u8) 
 }
 fn main() {
  host:=window_api.Window{}
- check(window_api.open(&host,"DNA native frame sequence",320,160).ok,"sequence window")
+ check(window_api.open(&host,"DNA native frame sequence",320,160).kind == io.Kind.Ok,"sequence window")
  defer window_api.close(&host)
  window_api.listen_events(&host,true)
  _=window_api.set_swap_interval(&host,0)
  renderer:=presenter.Presenter{}
- check(presenter.open(&renderer).ok,"sequence presenter")
+ check(presenter.open(&renderer).failure.kind == io.Kind.Ok,"sequence presenter")
  defer presenter.close(&renderer)
  owner:=mem.arena_create(0)
  defer mem.arena_release(owner)
@@ -64,7 +65,7 @@ fn main() {
   }
  }
  for frame in 0..FRAME_COUNT {
-  check(window_api.poll(&host).ok,"sequence event poll")
+  check(window_api.poll(&host).kind == io.Kind.Ok,"sequence event poll")
   event:=events.Event{}
   for window_api.next_event(&host,&event) {}
   // Keep CPU memory allocated and reuse it immediately after prior swap.
@@ -83,12 +84,12 @@ fn main() {
    height=max_height/2}
   length:=#cast(usize,width)*#cast(usize,height)*4
   surface:=software.Surface{pixels:pixels[..length],width:width,height:height,stride:#cast(usize,width)*4}
-  check(presenter.draw(&renderer,surface).ok,"sequence upload")
+  check(presenter.draw(&renderer,surface).failure.kind == io.Kind.Ok,"sequence upload")
   verify(&renderer,surface,readback[..length])
-  check(window_api.swap(&host).ok,"sequence swap")
+  check(window_api.swap(&host).kind == io.Kind.Ok,"sequence swap")
   if frame%53==27 {
    presenter.close(&renderer)
-   check(presenter.open(&renderer).ok,"sequence recreate")
+   check(presenter.open(&renderer).failure.kind == io.Kind.Ok,"sequence recreate")
   }
  }
 }

@@ -39,7 +39,7 @@ fn project_config_find(app: *App) {
       return
     }
     info := files.metadata(candidate[..length])
-    if info.ok && (info.mode & 61440) == 32768 {
+    if info.failure.kind == io.Kind.Ok && (info.mode & 61440) == 32768 {
       state.path_length = copy_text(state.path[..], candidate[..length])
       return
     }
@@ -54,7 +54,7 @@ fn project_config_find(app: *App) {
     if directory == 0 && state.root[0] == '/' && length > 9 {
       root_file := "/dna.toml"
       root_info := files.metadata(root_file)
-      if root_info.ok && (root_info.mode & 61440) == 32768 {
+      if root_info.failure.kind == io.Kind.Ok && (root_info.mode & 61440) == 32768 {
         state.path_length = copy_text(state.path[..], root_file)
       }
       return
@@ -65,12 +65,12 @@ fn trust_store_path(output: []u8) []const u8 {
   storage: [4096]u8 = []
   used: usize = 0
   base := host.environment("XDG_STATE_HOME", storage[..])
-  if base.ok && base.found && #len(base.value) > 0 {
+  if base.failure.kind == io.Kind.Ok && base.found && #len(base.value) > 0 {
     used = copy_text(output, base.value)
   }
   else {
     home := host.environment("HOME", storage[..])
-    if !home.ok || !home.found {
+    if home.failure.kind != io.Kind.Ok || !home.found {
       return output[..0]
     }
     used = copy_text(output, home.value)
@@ -99,7 +99,7 @@ fn trust_check(app: *App, path: []const u8, text: []const u8) bool {
   mark := mem.arena_mark(app.scratch)
   defer mem.arena_rewind(app.scratch, mark)
   read := fs.read_all(app.scratch, store, 262144)
-  if !read.ok {
+  if read.failure.kind != io.Kind.Ok {
     return false
   }
   digest_storage: [64]u8 = []
@@ -129,7 +129,7 @@ fn trust_project(app: *App, typography: *Typography) {
   path := state.path[..state.path_length]
   read := files.read_text(path)
   defer files.release_text(&read)
-  if !read.ok {
+  if !read.valid {
     notice(app, "Cannot read dna.toml.")
     return
   }
@@ -157,13 +157,13 @@ fn trust_project(app: *App, typography: *Typography) {
   add_text(line[..], &used, path)
   add_text(line[..], &used, "\n")
   opened := fs.append(store)
-  if !opened.ok {
+  if opened.failure.kind != io.Kind.Ok {
     notice(app, "Cannot write the trust store.")
     return
   }
   written := fs.write(&opened.value, line[..used])
-  _ = fs.close(&opened.value)
-  if !written.ok {
+  fs.close(&opened.value)
+  if written.failure.kind != io.Kind.Ok {
     notice(app, "Cannot write the trust store.")
     return
   }
@@ -189,7 +189,7 @@ fn project_config_apply(app: *App, parsed: *settings.Settings, global: *const se
   }
   path := state.path[..state.path_length]
   read := fs.read_all(app.scratch, path, 16384)
-  if !read.ok {
+  if read.failure.kind != io.Kind.Ok {
     notice(app, "Cannot read dna.toml (maximum 16 KiB); project settings ignored.")
     return false
   }
@@ -243,12 +243,12 @@ fn project_sections_apply(app: *App, parsed: *settings.Settings, global: *const 
   if #len(source) == 0 || app.workspace.project_length == 0 {
     return
   }
-  output := mem.arena_push(app.scratch, #len(source), 1)[..#len(source)]
+  output := #slice(mem.arena_push(app.scratch, #len(source), 1), #len(source))
   trial := scratch_settings(app)
   home_storage: [4096]u8 = []
   home := host.environment("HOME", home_storage[..])
   home_text: []const u8 = ""
-  if home.ok && home.found {
+  if home.failure.kind == io.Kind.Ok && home.found {
     home_text = home.value
   }
   project := app.workspace.project[..app.workspace.project_length]

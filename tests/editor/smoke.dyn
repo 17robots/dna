@@ -1,8 +1,10 @@
+use "std/io" io
+use "std/parse" parse
 // Run only when the test runner supplies an isolated fixture directory.
 fn workflow_smoke(app: *App, typography: *Typography) {
   location: [4096]u8 = []
   configured := host.environment("DNA_WORKFLOW_TEST", location[..])
-  if !configured.ok || !configured.found {
+  if configured.failure.kind != io.Kind.Ok || !configured.found {
     return
   }
   app.directory_state.length = copy_text(app.directory_state.path[..], configured.value)
@@ -96,7 +98,7 @@ fn workflow_smoke(app: *App, typography: *Typography) {
   }
   trash_storage: [4096]u8 = []
   trashed := joined(app, ".dna-trash/renamed.txt", trash_storage[..])
-  if !files.metadata(trashed).ok {
+  if files.metadata(trashed).failure.kind != io.Kind.Ok {
     #panic("recoverable trash missing")
   }
   app.prompt_state.panel = Panel.None
@@ -226,7 +228,7 @@ fn session_smoke(app: *App, typography: *Typography) {
 fn completion_smoke(app: *App, typography: *Typography) {
   storage: [4096]u8 = []
   directory := host.environment("DNA_WORKFLOW_TEST", storage[..])
-  if !directory.ok || !directory.found {
+  if directory.failure.kind != io.Kind.Ok || !directory.found {
     return
   }
   old := app.documents.active
@@ -335,14 +337,14 @@ fn completion_smoke(app: *App, typography: *Typography) {
   home: [4096]u8 = []
   env := host.environment("HOME", home[..])
   result := expand_home("~/", expanded[..])
-  if env.ok && env.found && (#len(result) != #len(env.value) + 1 || !buffer.equal(result[..#len(env.value)], env.value)) {
+  if env.failure.kind == io.Kind.Ok && env.found && (#len(result) != #len(env.value) + 1 || !buffer.equal(result[..#len(env.value)], env.value)) {
     #panic("home expansion")
   }
 }
 fn explorer_smoke(app: *App, typography: *Typography) {
   configured_storage: [4096]u8 = []
   configured := host.environment("DNA_WORKFLOW_TEST", configured_storage[..])
-  if !configured.ok || !configured.found {
+  if configured.failure.kind != io.Kind.Ok || !configured.found {
     return
   }
   root: [4096]u8 = []
@@ -481,7 +483,7 @@ fn explorer_smoke(app: *App, typography: *Typography) {
   existing := joined(app, "alpha.txt", existing_storage[..])
   created_storage: [4096]u8 = []
   created := joined(app, "created.txt", created_storage[..])
-  if !files.metadata(existing).ok || files.metadata(created).ok {
+  if files.metadata(existing).failure.kind != io.Kind.Ok || files.metadata(created).failure.kind == io.Kind.Ok {
     #panic("preview mutated disk")
   }
   key_input(app, typography, 27, 0)
@@ -490,7 +492,7 @@ fn explorer_smoke(app: *App, typography: *Typography) {
   }
   explorer_preview(app)
   key_input(app, typography, 13, 0)
-  if app.prompt_state.panel != Panel.Directory || explorer_dirty(app) || files.metadata(existing).ok || !files.metadata(created).ok {
+  if app.prompt_state.panel != Panel.Directory || explorer_dirty(app) || files.metadata(existing).failure.kind == io.Kind.Ok || files.metadata(created).failure.kind != io.Kind.Ok {
     #panic("apply staged explorer edits")
   }
   if !buffer.equal(buffer.all(app.documents.current), "alpha contents") || !contains(files.name(app.documents.file), "/renamed.txt") {
@@ -517,16 +519,16 @@ fn explorer_smoke(app: *App, typography: *Typography) {
   }
   buffer.undo(app.documents.current)
   explorer_preview(app)
-  if app.prompt_state.panel != Panel.DirectoryApply || !files.metadata(child_path).ok {
+  if app.prompt_state.panel != Panel.DirectoryApply || files.metadata(child_path).failure.kind != io.Kind.Ok {
     #panic("directory trash preview")
   }
   key_input(app, typography, 27, 0)
-  if !files.metadata(child_path).ok || !explorer_dirty(app) {
+  if files.metadata(child_path).failure.kind != io.Kind.Ok || !explorer_dirty(app) {
     #panic("directory trash cancel")
   }
   explorer_preview(app)
   key_input(app, typography, 13, 0)
-  if app.prompt_state.panel != Panel.Directory || files.metadata(child_path).ok || !contains(files.name(app.documents.file), "/.dna-trash/keep/child.txt") {
+  if app.prompt_state.panel != Panel.Directory || files.metadata(child_path).failure.kind == io.Kind.Ok || !contains(files.name(app.documents.file), "/.dna-trash/keep/child.txt") {
     #panic("directory trash apply and child path")
   }
   close_clean(app)
@@ -553,17 +555,17 @@ fn explorer_smoke(app: *App, typography: *Typography) {
   }
   folder_storage: [4096]u8 = []
   folder_path := joined(app, "new-folder", folder_storage[..])
-  if files.metadata(folder_path).ok {
+  if files.metadata(folder_path).failure.kind == io.Kind.Ok {
     #panic("folder created before confirmation")
   }
   key_input(app, typography, 27, 0)
-  if !explorer_dirty(app) || files.metadata(folder_path).ok {
+  if !explorer_dirty(app) || files.metadata(folder_path).failure.kind == io.Kind.Ok {
     #panic("folder preview cancellation")
   }
   explorer_preview(app)
   explorer_apply(app)
   folder_info := files.metadata(folder_path)
-  if !folder_info.ok || (folder_info.mode & 61440) != 16384 || explorer_dirty(app) {
+  if folder_info.failure.kind != io.Kind.Ok || (folder_info.mode & 61440) != 16384 || explorer_dirty(app) {
     #panic("folder creation apply")
   }
   buffer.move_to(doc, doc.length, false)
@@ -587,7 +589,7 @@ fn explorer_smoke(app: *App, typography: *Typography) {
   }
   collision_storage: [4096]u8 = []
   collision := joined(app, "collision.txt", collision_storage[..])
-  if !fs.write_all(collision, "external").ok {
+  if fs.write_all(collision, "external").failure.kind != io.Kind.Ok {
     #panic("collision fixture write")
   }
   explorer_apply(app)
@@ -610,14 +612,14 @@ fn explorer_smoke(app: *App, typography: *Typography) {
   renamed := joined(app, "renamed.txt", renamed_storage[..])
   backup_storage: [4096]u8 = []
   backup := joined(app, "external-backup.txt", backup_storage[..])
-  if !fs.rename(renamed, backup).ok || !fs.write_all(renamed, "external replacement").ok {
+  if fs.rename(renamed, backup).failure.kind != io.Kind.Ok || fs.write_all(renamed, "external replacement").failure.kind != io.Kind.Ok {
     #panic("external replacement fixture")
   }
   explorer_apply(app)
   if app.prompt_state.panel != Panel.Message {
     #panic("changed source accepted")
   }
-  if !fs.remove(renamed).ok || !fs.rename(backup, renamed).ok {
+  if fs.remove(renamed).failure.kind != io.Kind.Ok || fs.rename(backup, renamed).failure.kind != io.Kind.Ok {
     #panic("restore external fixture")
   }
   app.explorer.quit_after_discard = false
@@ -1349,7 +1351,7 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
   font_identity_smoke(app, typography)
   location: [4096]u8 = []
   configured := host.environment("DNA_WORKFLOW_TEST", location[..])
-  if !configured.ok || !configured.found {
+  if configured.failure.kind != io.Kind.Ok || !configured.found {
     return
   }
   previous: [4096]u8 = []
@@ -1383,7 +1385,7 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
   saved_config: [4096]u8 = []
   saved_length := copy_text(saved_config[..], app.configuration.path[..app.configuration.path_length])
   app.configuration.path_length = copy_text(app.configuration.path[..], config_path)
-  if !fs.write_all(config_path, "font_size = 23\nline_height = 1.4\nindent_width = 2\n[keys.normal]\n\"f2\" = \"pwd\"\n").ok {
+  if fs.write_all(config_path, "font_size = 23\nline_height = 1.4\nindent_width = 2\n[keys.normal]\n\"f2\" = \"pwd\"\n").failure.kind != io.Kind.Ok {
     #panic("write config fixture")
   }
   config_reload(app, typography, false)
@@ -1397,14 +1399,14 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
   if app.prompt_state.panel != Panel.Message || !buffer.equal(app.prompt_state.message[..app.prompt_state.message_length], app.workspace.project[..app.workspace.project_length]) {
     #panic("configured binding")
   }
-  if !fs.write_all(config_path, "font_size = 999\n").ok {
+  if fs.write_all(config_path, "font_size = 999\n").failure.kind != io.Kind.Ok {
     #panic("invalid config fixture")
   }
   config_reload(app, typography, false)
   if typography.points != 23.0 || app.config.indent_width != 2 || active_file_config(app).indent_width != 2 || app.prompt_state.panel != Panel.Message {
     #panic("invalid reload mutated config")
   }
-  if !fs.write_all(config_path, "font_size = 20\n").ok {
+  if fs.write_all(config_path, "font_size = 20\n").failure.kind != io.Kind.Ok {
     #panic("restore config fixture")
   }
   app.configuration.watch_due = 0
@@ -1422,7 +1424,7 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
   app.prompt_state.panel = Panel.None
   theme_storage: [4096]u8 = []
   custom_theme := joined(app, "custom-theme.toml", theme_storage[..])
-  if !fs.write_all(custom_theme, "base = \"charcoal\"\nbackground = \"#102030\"\nsyntax_keyword = \"#123456\"\nterminal_red = \"#abcdef\"\n").ok {
+  if fs.write_all(custom_theme, "base = \"charcoal\"\nbackground = \"#102030\"\nsyntax_keyword = \"#123456\"\nterminal_red = \"#abcdef\"\n").failure.kind != io.Kind.Ok {
     #panic("theme fixture")
   }
   theme_switch(app, typography, custom_theme)
@@ -1437,7 +1439,7 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
   theme_config_length := copy_text(theme_config[..], "theme = \"")
   add_text(theme_config[..], &theme_config_length, custom_theme)
   add_text(theme_config[..], &theme_config_length, "\"\n")
-  if !fs.write_all(config_path, theme_config[..theme_config_length]).ok {
+  if fs.write_all(config_path, theme_config[..theme_config_length]).failure.kind != io.Kind.Ok {
     #panic("custom theme config fixture")
   }
   app.configuration.path_length = copy_text(app.configuration.path[..], config_path)
@@ -1447,7 +1449,7 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
   if !contains(app.prompt_state.message[..app.prompt_state.message_length], custom_theme) {
     #panic("config reload lost selected theme")
   }
-  if !fs.write_all(custom_theme, "background = \"broken\"\n").ok {
+  if fs.write_all(custom_theme, "background = \"broken\"\n").failure.kind != io.Kind.Ok {
     #panic("invalid theme fixture")
   }
   theme_switch(app, typography, custom_theme)
@@ -1847,7 +1849,7 @@ fn editor_commands_smoke(app: *App, typography: *Typography) {
   }
   installed_storage: [4096]u8 = []
   installed := host.environment("DNA_TEST_LANGUAGE_DIR", installed_storage[..4095])
-  if installed.ok && installed.found {
+  if installed.failure.kind == io.Kind.Ok && installed.found {
     saved_root: [4096]u8 = []
     saved_root_length := copy_text(saved_root[..], app.workspace.language_root[..app.workspace.language_root_length])
     app.workspace.language_root_length = copy_text(app.workspace.language_root[..], installed.value)
@@ -1865,7 +1867,7 @@ fn editor_commands_smoke(app: *App, typography: *Typography) {
     }
     fixture_storage: [4096]u8 = []
     fixture := host.environment("DNA_WORKFLOW_TEST", fixture_storage[..])
-    if !fixture.ok || !fixture.found {
+    if fixture.failure.kind != io.Kind.Ok || !fixture.found {
       #panic("filetype test requires isolated fixture directory")
     }
     save_storage: [4096]u8 = []
@@ -1969,7 +1971,7 @@ fn close_binding_smoke(app: *App, typography: *Typography) {
   }
   fixture_storage: [4096]u8 = []
   fixture := host.environment("DNA_WORKFLOW_TEST", fixture_storage[..])
-  if fixture.ok && fixture.found {
+  if fixture.failure.kind == io.Kind.Ok && fixture.found {
     if !new_buffer(app) {
       #panic("save-close buffer fixture")
     }
@@ -1981,7 +1983,7 @@ fn close_binding_smoke(app: *App, typography: *Typography) {
     add_text(path[..], &used, "/ctrl-x-save.txt")
     text_input(app, path[..used])
     key_input(app, typography, 13, 0)
-    if app.documents.count != before || app.documents.active != original || !files.metadata(path[..used]).ok {
+    if app.documents.count != before || app.documents.active != original || files.metadata(path[..used]).failure.kind != io.Kind.Ok {
       #panic("Ctrl-X save did not save and close")
     }
   }
@@ -2079,7 +2081,7 @@ fn picker_close_smoke(app: *App, typography: *Typography) {
   }
   fixture_storage: [4096]u8 = []
   fixture := host.environment("DNA_WORKFLOW_TEST", fixture_storage[..])
-  if fixture.ok && fixture.found {
+  if fixture.failure.kind == io.Kind.Ok && fixture.found {
     key_input(app, typography, 120, 64)
     key_input(app, typography, 115, 0)
     path: [4096]u8 = []
@@ -2087,7 +2089,7 @@ fn picker_close_smoke(app: *App, typography: *Typography) {
     add_text(path[..], &used, "/picker-save.txt")
     text_input(app, path[..used])
     key_input(app, typography, 13, 0)
-    if app.prompt_state.panel != Panel.Buffers || app.documents.slots[saving].document != nil || app.documents.active != original || !files.metadata(path[..used]).ok {
+    if app.prompt_state.panel != Panel.Buffers || app.documents.slots[saving].document != nil || app.documents.active != original || files.metadata(path[..used]).failure.kind != io.Kind.Ok {
       #panic("picker save-and-close")
     }
   } else {
@@ -2335,13 +2337,13 @@ fn project_tools_smoke(renderer: rawptr, window: rawptr, app: *App, typography: 
   original_active := app.documents.active
   environment: [4096]u8 = []
   fixture := host.environment("DNA_WORKFLOW_TEST", environment[..])
-  if !fixture.ok || !fixture.found {
+  if fixture.failure.kind != io.Kind.Ok || !fixture.found {
     return
   }
   path: [4096]u8 = []
   length := copy_text(path[..], fixture.value)
   add_text(path[..], &length, "/project-search.txt")
-  if !fs.write_all(path[..length], "needle α needle\n").ok {
+  if fs.write_all(path[..length], "needle α needle\n").failure.kind != io.Kind.Ok {
     #panic("search fixture")
   }
   old_project: [4096]u8 = []
@@ -2449,7 +2451,7 @@ fn project_tools_smoke(renderer: rawptr, window: rawptr, app: *App, typography: 
 fn persistence_smoke() {
   environment: [4096]u8 = []
   fixture := host.environment("DNA_WORKFLOW_TEST", environment[..])
-  if !fixture.ok || !fixture.found {
+  if fixture.failure.kind != io.Kind.Ok || !fixture.found {
     return
   }
   owner := arena_owner.create((#sizeof(App) + 128))
@@ -2458,7 +2460,7 @@ fn persistence_smoke() {
   defer arena_owner.release(temporary)
   test_app := #cast(*App, mem.arena_push(owner, #sizeof(App), #alignof(App)))
   test_app.scratch = temporary
-  test_app.config = settings.Settings{}
+  settings.defaults(&test_app.config)
   defer release_editor_state(test_app)
   test_app.workspace.project_length = copy_text(test_app.workspace.project[..], fixture.value)
   if !new_buffer(test_app) {
@@ -2475,7 +2477,7 @@ fn persistence_smoke() {
   length := copy_text(path[..], fixture.value)
   add_text(path[..], &length, "/test.session")
   _ = session_save(test_app, path[..length])
-  if !files.metadata(path[..length]).ok {
+  if files.metadata(path[..length]).failure.kind != io.Kind.Ok {
     #panic("session save")
   }
   buffer.mark_saved(test_app.documents.current)
@@ -2500,7 +2502,7 @@ fn persistence_smoke() {
   add_text(layout_path[..], &layout_length, "/saved-layout.toml")
   layout_save(test_app, layout_path[..layout_length])
   layout_read := fs.read_all(test_app.scratch, layout_path[..layout_length], 4096)
-  if !layout_read.ok || layout.parse(layout_read.value).node_count != 5 {
+  if layout_read.failure.kind != io.Kind.Ok || layout.parse(layout_read.value).node_count != 5 {
     #panic("layout save roundtrip")
   }
   buffer.mark_saved(test_app.documents.current)
@@ -2509,12 +2511,12 @@ fn persistence_smoke() {
 fn plugin_host_smoke(typography: *Typography) {
   manifest_storage: [4096]u8 = []
   manifest := host.environment("DNA_TEST_PLUGIN", manifest_storage[..])
-  if !manifest.ok || !manifest.found {
+  if manifest.failure.kind != io.Kind.Ok || !manifest.found {
     return
   }
   fixture_storage: [4096]u8 = []
   fixture := host.environment("DNA_WORKFLOW_TEST", fixture_storage[..])
-  if !fixture.ok || !fixture.found {
+  if fixture.failure.kind != io.Kind.Ok || !fixture.found {
     return
   }
   owner := arena_owner.create((#sizeof(App) + 128))
@@ -2523,7 +2525,7 @@ fn plugin_host_smoke(typography: *Typography) {
   defer arena_owner.release(temporary)
   test_app := #cast(*App, mem.arena_push(owner, #sizeof(App), #alignof(App)))
   test_app.scratch = temporary
-  test_app.config = settings.Settings{}
+  settings.defaults(&test_app.config)
   defer release_editor_state(test_app)
   defer plugin_release(test_app)
   test_app.configuration.path_length = copy_text(test_app.configuration.path[..], fixture.value)
@@ -2592,7 +2594,7 @@ fn plugin_host_smoke(typography: *Typography) {
   installed: [4096]u8 = []
   installed_length := copy_text(installed[..], fixture.value)
   add_text(installed[..], &installed_length, "/plugins/uppercase/plugin.json")
-  if !files.metadata(installed[..installed_length]).ok {
+  if files.metadata(installed[..installed_length]).failure.kind != io.Kind.Ok {
     #panic("plugin local install/update")
   }
   plugin_update(test_app, "uppercase")
@@ -2611,15 +2613,15 @@ fn plugin_host_smoke(typography: *Typography) {
   catalog_used := copy_text(catalog_json[..], "{\"uppercase\":")
   add_text(catalog_json[..], &catalog_used, lsp_json_string(quoted_path[..], manifest.value))
   add_text(catalog_json[..], &catalog_used, "}")
-  if !fs.write_all(catalog_path[..catalog_length], catalog_json[..catalog_used]).ok {
+  if fs.write_all(catalog_path[..catalog_length], catalog_json[..catalog_used]).failure.kind != io.Kind.Ok {
     #panic("plugin catalog fixture")
   }
   plugin_remove(test_app, "uppercase")
-  if files.metadata(installed[..installed_length]).ok {
+  if files.metadata(installed[..installed_length]).failure.kind == io.Kind.Ok {
     #panic("plugin removal")
   }
   plugin_install_named(test_app, "uppercase")
-  if !files.metadata(installed[..installed_length]).ok {
+  if files.metadata(installed[..installed_length]).failure.kind != io.Kind.Ok {
     #panic("plugin catalog install")
   }
 

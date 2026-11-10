@@ -73,7 +73,7 @@ with tempfile.TemporaryDirectory(prefix='dna-clone-save-') as directory:
     linux = linux_path.read_text().replace('WholeFileClones: bool = false', 'WholeFileClones: bool = true')
     linux = linux.replace(function(linux, 'clone_exclusive'), function(macos, 'clone_exclusive'))
     linux = linux.replace(function(linux, 'resize'), function(macos, 'resize'))
-    linux = linux.replace(function(linux, 'copy_range'), '''pub fn copy_range(source:*const File,offset:u64,target:*File,length:usize) Result {return Result{kind:errors.Kind.Unsupported}}''')
+    linux = linux.replace(function(linux, 'copy_range'), '''pub fn copy_range(source:*const File,offset:u64,target:*File,length:usize) Result {return Result{failure:io.Failure{kind:io.Kind.Unsupported}}}''')
     linux = linux.replace(function(linux, 'map_file'), 'pub fn map_file(fd:isize,length:u64) *u8 {return test_map(fd,length)}')
     linux = linux.replace(function(linux, 'unmap_file'), 'pub fn unmap_file(bytes:*u8,length:u64) {test_unmap(bytes,length)}')
     linux += '''
@@ -88,12 +88,12 @@ extern fn darwin_errno "probe_errno"() *i32
 fn darwin_error() isize {return 0-#cast(isize,darwin_errno().*)}
 fn darwin_path(path:[]const u8,storage:[]u8) *const u8 {
  result:=bounded_string(storage,path)
- if !result.ok || #len(path)==0 {return nil}
+ if result.failure.kind != parse.Kind.Ok || #len(path)==0 {return nil}
  return result.value
 }
 fn darwin_result(code:i32) Result {
- if code==0 {return Result{ok:true}}
- return Result{error:darwin_error(),kind:errors.Kind.System}
+ if code==0 {return Result{}}
+ return Result{failure:io.Failure{kind:io.Kind.System,native:darwin_error()}}
 }
 '''
     linux_path.write_text(linux)
@@ -104,7 +104,7 @@ extern fn probe_mode "probe_mode"() i32
 pub fn test_mode() i32 {return probe_mode()}
 extern fn probe_after_write "probe_after_write"()
 pub fn write(file: *File, source: []const u8) Result {
-  if probe_mode()==9 {return Result{error:-5,kind:errors.Kind.System}}
+  if probe_mode()==9 {return Result{failure:io.Failure{kind:io.Kind.System,native:-5}}}
   probe_after_write()
   test_written+=#len(source)''').replace('pub fn seek(file: *File, offset: usize) Result {', 'pub fn seek(file: *File, offset: usize) Result {\n test_seeks+=1')
     boundary.write_text(source)

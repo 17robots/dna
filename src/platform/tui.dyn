@@ -1,3 +1,4 @@
+use "std/io" io
 use "../host"
 #link("dna_native")
 // Terminal backend behind the platform and text APIs. DNA keeps laying out in
@@ -111,8 +112,8 @@ pub fn tui_start() bool {
     count := MaxColumns * MaxRows
     screen_storage = mem.arena_create(2 * count * #sizeof(Cell) + 1048576 + mem.ArenaBufferOverhead)
     host.small_pages(screen_storage.data)
-    grid = (#cast(*Cell, mem.arena_push_uninit(screen_storage, count * #sizeof(Cell), #alignof(Cell))))[..count]
-    shown = (#cast(*Cell, mem.arena_push_uninit(screen_storage, count * #sizeof(Cell), #alignof(Cell))))[..count]
+    grid = #slice((#cast(*Cell, mem.arena_push_uninit(screen_storage, count * #sizeof(Cell), #alignof(Cell)))), count)
+    shown = #slice((#cast(*Cell, mem.arena_push_uninit(screen_storage, count * #sizeof(Cell), #alignof(Cell)))), count)
     output = mem.push_bytes_uninit(screen_storage, 1048576)
   }
   state.active = true
@@ -127,12 +128,12 @@ pub fn tui_start() bool {
 fn environment_is(name: []const u8, wanted: []const u8) bool {
   storage: [4096]u8 = []
   value := host.environment(name[..#len(name) - 1], storage[..])
-  return value.ok && value.found && buffer_equal(value.value, wanted)
+  return value.failure.kind == io.Kind.Ok && value.found && buffer_equal(value.value, wanted)
 }
 fn environment_contains(name: []const u8, part: []const u8) bool {
   storage: [4096]u8 = []
   value := host.environment(name[..#len(name) - 1], storage[..])
-  return value.ok && value.found && find(value.value, part, 0) < #len(value.value)
+  return value.failure.kind == io.Kind.Ok && value.found && find(value.value, part, 0) < #len(value.value)
 }
 // 24-bit color when the terminal says so (COLORTERM, a -direct TERM) or is
 // known to; DNA_TRUECOLOR=1 or 0 overrides either way.
@@ -165,7 +166,7 @@ fn undercurl_supported() bool {
   }
   vte_storage: [4096]u8 = []
   vte := host.environment("VTE_VERSION", vte_storage[..])
-  if vte.ok && vte.found {
+  if vte.failure.kind == io.Kind.Ok && vte.found {
     return true
   }
   known: [5][]const u8 = ["kitty", "wezterm", "foot", "ghostty", "contour"]
@@ -233,29 +234,29 @@ pub fn tui_clear() {
 pub fn tui_cells(cells: *const u32, columns: i32, rows: i32, x: f32, y: f32, cursor_column: i32, cursor_row: i32) {
   origin_column := floor_cell(x + #cast(f32, state.origin_x) + CellWidth * 0.5, CellWidth)
   origin_row := floor_cell(y + #cast(f32, state.origin_y) + CellHeight * 0.5, CellHeight)
-  values := cells[..#cast(usize, (columns * rows * 3))]
+  values := #slice(cells, #cast(usize, (columns * rows * 3)))
   for row in 0..rows {
     for column in 0..columns {
       index := #cast(usize, ((row * columns + column) * 3))
       target_column := origin_column + column
       target_row := origin_row + row
       if cell_visible(target_column, target_row) {
-        packed := values[index]
+        packed_value := values[index]
         flags: u8 = 0
-        if (packed & 16777216) != 0 {
+        if (packed_value & 16777216) != 0 {
           flags = flags | Bold
         }
-        if (packed & 33554432) != 0 {
+        if (packed_value & 33554432) != 0 {
           flags = flags | Italic
         }
-        if (packed & 67108864) != 0 {
+        if (packed_value & 67108864) != 0 {
           flags = flags | Underline
-          if (packed & 134217728) != 0 && state.undercurl {
+          if (packed_value & 134217728) != 0 && state.undercurl {
             flags = flags | Curl
           }
         }
         foreground := values[index + 1]
-        cell_at(target_column, target_row).* = Cell{character: packed & 16777215, foreground: foreground, background: values[index + 2], underline: foreground, flags: flags}
+        cell_at(target_column, target_row).* = Cell{character: packed_value & 16777215, foreground: foreground, background: values[index + 2], underline: foreground, flags: flags}
       }
     }
   }
@@ -513,8 +514,8 @@ pub fn tui_text_set(handle: rawptr, bytes: *const u8, length: usize) bool {
     }
     text.capacity = capacity
   }
-  storage := (#cast(*u8, text.bytes))[..text.capacity]
-  source := bytes[..length]
+  storage := #slice((#cast(*u8, text.bytes)), text.capacity)
+  source := #slice(bytes, length)
   for index in 0..length {
     storage[index] = source[index]
   }
@@ -535,7 +536,7 @@ fn text_bytes(text: *const TuiText) []const u8 {
   if text.bytes == nil {
     return ""
   }
-  return (#cast(*const u8, text.bytes))[..text.length]
+  return #slice((#cast(*const u8, text.bytes)), text.length)
 }
 // Decode one UTF-8 codepoint; invalid bytes read as themselves.
 fn decode(bytes: []const u8, at: usize, width: *usize) u32 {
@@ -997,7 +998,7 @@ pub fn tui_present() {
 pub fn tui_title(title: *const u8, length: usize) {
   output_used = 0
   emit("\x1b]2;")
-  emit(title[..length])
+  emit(#slice(title, length))
   emit("\x1b\\")
   tty_write(&output[0], output_used)
   output_used = 0
@@ -1009,8 +1010,8 @@ pub fn tui_clipboard_set(text: *const u8, length: usize) {
   }
   state.clipboard = heap_alloc(length + 1)
   if state.clipboard != nil {
-    copy := (#cast(*u8, state.clipboard))[..length + 1]
-    source := text[..length]
+    copy := #slice((#cast(*u8, state.clipboard)), length + 1)
+    source := #slice(text, length)
     for index in 0..length {
       copy[index] = source[index]
     }
@@ -1019,7 +1020,7 @@ pub fn tui_clipboard_set(text: *const u8, length: usize) {
   alphabet: []const u8 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
   output_used = 0
   emit("\x1b]52;c;")
-  bytes := text[..length]
+  bytes := #slice(text, length)
   at: usize = 0
   for at < length {
     a := #cast(u32, bytes[at])
@@ -1050,7 +1051,7 @@ pub fn tui_clipboard_set(text: *const u8, length: usize) {
 pub fn tui_clipboard_get() *const u8 {
   length: usize = 0
   if state.clipboard != nil {
-    for (#cast(*const u8, state.clipboard))[..length + 1][length] != 0 {
+    for #slice((#cast(*const u8, state.clipboard)), length + 1)[length] != 0 {
       length += 1
     }
   }
@@ -1058,9 +1059,9 @@ pub fn tui_clipboard_get() *const u8 {
   if copy == nil {
     return nil
   }
-  target := (#cast(*u8, copy))[..length + 1]
+  target := #slice((#cast(*u8, copy)), length + 1)
   if length > 0 {
-    source := (#cast(*const u8, state.clipboard))[..length]
+    source := #slice((#cast(*const u8, state.clipboard)), length)
     for index in 0..length {
       target[index] = source[index]
     }
@@ -1273,8 +1274,8 @@ fn paste_append(bytes: []const u8) {
       return
     }
     if state.paste != nil {
-      old := (#cast(*u8, state.paste))[..state.paste_length]
-      target := (#cast(*u8, grown))[..state.paste_length]
+      old := #slice((#cast(*u8, state.paste)), state.paste_length)
+      target := #slice((#cast(*u8, grown)), state.paste_length)
       for index in 0..state.paste_length {
         target[index] = old[index]
       }
@@ -1283,7 +1284,7 @@ fn paste_append(bytes: []const u8) {
     state.paste = grown
     state.paste_capacity = capacity
   }
-  target := (#cast(*u8, state.paste))[state.paste_length..state.paste_length + #len(bytes)]
+  target := #slice(#offset((#cast(*u8, state.paste)), state.paste_length), (state.paste_length + #len(bytes)) - (state.paste_length))
   for index in 0..#len(bytes) {
     target[index] = bytes[index]
   }
@@ -1317,7 +1318,7 @@ pub fn tui_paste() []const u8 {
   if state.paste == nil {
     return ""
   }
-  return (#cast(*const u8, state.paste))[..state.paste_length]
+  return #slice((#cast(*const u8, state.paste)), state.paste_length)
 }
 pub fn tui_paste_clear() {
   state.paste_length = 0

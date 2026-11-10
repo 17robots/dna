@@ -19,7 +19,7 @@ struct LoadJob {
   counts: *usize,
   tables: **u16,
   fill: bool,
-  ok: bool,
+  valid: bool,
   // Set for background loads (lazy.dyn), which count finished jobs.
   owner: *LazyLoad,
 }
@@ -27,7 +27,7 @@ fn load_job_run(context: rawptr) isize {
   job := #cast(*LoadJob, context)
   if job.fill {
     for leaf in job.first..job.last {
-      table := job.tables[..job.last][leaf]
+      table := #slice(job.tables, job.last)[leaf]
       if table == nil {
         continue
       }
@@ -36,12 +36,12 @@ fn load_job_run(context: rawptr) isize {
       count: usize = 0
       at: usize = 0
       for at < length {
-        hit := find_byte(&job.data[..job.total][low + at], 10, length - at)
+        hit := find_byte(&#slice(job.data, job.total)[low + at], 10, length - at)
         if hit == nil {
           break
         }
-        position := #cast(usize, hit) - #cast(usize, &job.data[..job.total][low])
-        table[..count + 1][count] = #cast(u16, position)
+        position := #cast(usize, hit) - #cast(usize, &#slice(job.data, job.total)[low])
+        #slice(table, count + 1)[count] = #cast(u16, position)
         count += 1
         at = position + 1
       }
@@ -55,16 +55,16 @@ fn load_job_run(context: rawptr) isize {
   if high > job.total {
     high = job.total
   }
-  text := job.data[..job.total]
+  text := #slice(job.data, job.total)
   for low > 0 && low < high && (text[low] & 192) == 128 && low < job.first * LeafLimit + 3 {
     low += 1
   }
   for high < job.total && (text[high] & 192) == 128 {
     high += 1
   }
-  job.ok = valid(text[low..high])
+  job.valid = valid(text[low..high])
   for leaf in job.first..job.last {
-    job.counts[..job.last][leaf] = rope_newlines_in(&text[leaf * LeafLimit], leaf_length(job.total, leaf))
+    #slice(job.counts, job.last)[leaf] = rope_newlines_in(&text[leaf * LeafLimit], leaf_length(job.total, leaf))
   }
   return 0
 }
@@ -92,7 +92,7 @@ fn load_run(jobs: []LoadJob) {
   started: [16]bool = []
   for index in 1..#len(jobs) {
     spawned := thread.spawn_with_size(arena, ParallelStack, load_job_run, #cast(rawptr, &jobs[index]))
-    if spawned.ok {
+    if spawned.failure.kind == io.Kind.Ok {
       threads[index] = spawned.value
       started[index] = true
     }
@@ -100,7 +100,7 @@ fn load_run(jobs: []LoadJob) {
   _ = load_job_run(#cast(rawptr, &jobs[0]))
   for index in 1..#len(jobs) {
     if started[index] {
-      if !thread.join(threads[index]).ok {
+      if thread.join(threads[index]).failure.kind != io.Kind.Ok {
         #panic("cannot join text loader")
       }
     }
@@ -111,20 +111,20 @@ fn load_run(jobs: []LoadJob) {
 }
 // Validate a block's first total bytes and build its tree, using every CPU
 // for large blocks. Returns nil with ok false for text that is not UTF-8.
-struct LoadResult { root: *RopeNode, ok: bool }
+struct LoadResult { root: *RopeNode, valid: bool }
 fn rope_load_block(block: *RopeBlock, total: usize) LoadResult {
   if total == 0 {
-    return LoadResult{ok: true}
+    return LoadResult{valid: true}
   }
   workers := load_cpus()
   if workers > ParallelWorkers {
     workers = ParallelWorkers
   }
   if total < ParallelMinimum || workers < 2 {
-    if !valid(block.bytes[..total]) {
+    if !valid(#slice(block.bytes, total)) {
       return LoadResult{}
     }
-    return LoadResult{root: rope_from_block(block, total), ok: true}
+    return LoadResult{root: rope_from_block(block, total), valid: true}
   }
   leaves := (total + LeafLimit - 1) / LeafLimit
   counts := #cast(*usize, rope_malloc(leaves * #sizeof(usize)))
@@ -141,16 +141,16 @@ fn rope_load_block(block: *RopeBlock, total: usize) LoadResult {
   }
   load_run(jobs)
   for index in 0..workers {
-    if !jobs[index].ok {
+    if !jobs[index].valid {
       return LoadResult{}
     }
   }
   for leaf in 0..leaves {
-    count := counts[..leaves][leaf]
-    tables[..leaves][leaf] = nil
+    count := #slice(counts, leaves)[leaf]
+    #slice(tables, leaves)[leaf] = nil
     if count > 0 {
-      tables[..leaves][leaf] = #cast(*u16, rope_malloc(count * #sizeof(u16)))
-      if tables[..leaves][leaf] == nil {
+      #slice(tables, leaves)[leaf] = #cast(*u16, rope_malloc(count * #sizeof(u16)))
+      if #slice(tables, leaves)[leaf] == nil {
         #panic("cannot allocate text node")
       }
     }
@@ -159,7 +159,7 @@ fn rope_load_block(block: *RopeBlock, total: usize) LoadResult {
     jobs[index].fill = true
   }
   load_run(jobs)
-  return LoadResult{root: rope_build_prepared(block, block.bytes, total, 0, leaves, counts, tables), ok: true}
+  return LoadResult{root: rope_build_prepared(block, block.bytes, total, 0, leaves, counts, tables), valid: true}
 }
 // Leaves over data (inside block) of total bytes, LeafLimit each from data.
 fn rope_build_prepared(block: *RopeBlock, data: *const u8, total: usize, first: usize, count: usize, counts: *usize, tables: **u16) *RopeNode {
@@ -169,10 +169,10 @@ fn rope_build_prepared(block: *RopeBlock, data: *const u8, total: usize, first: 
     node.right = nil
     block.refs += 1
     node.block = block
-    node.data = &data[..total][first * LeafLimit]
+    node.data = &#slice(data, total)[first * LeafLimit]
     node.length = leaf_length(total, first)
-    node.lines = counts[..first + 1][first]
-    node.newlines = tables[..first + 1][first]
+    node.lines = #slice(counts, first + 1)[first]
+    node.newlines = #slice(tables, first + 1)[first]
     node.height = 1
     return node
   }

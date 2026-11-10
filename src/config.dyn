@@ -61,17 +61,17 @@ fn config_location(app: *App) {
   settings.defaults(&app.config)
   storage: [4096]u8 = []
   configured := host.environment("DNA_CONFIG", storage[..])
-  if configured.ok && configured.found {
+  if configured.failure.kind == io.Kind.Ok && configured.found {
     app.configuration.path_length = copy_text(app.configuration.path[..], configured.value)
     return
   }
   base := host.environment("XDG_CONFIG_HOME", storage[..])
-  if base.ok && base.found && #len(base.value) > 0 {
+  if base.failure.kind == io.Kind.Ok && base.found && #len(base.value) > 0 {
     app.configuration.path_length = copy_text(app.configuration.path[..], base.value)
   }
   else {
     home := host.environment("HOME", storage[..])
-    if !home.ok || !home.found {
+    if home.failure.kind != io.Kind.Ok || !home.found {
       return
     }
     app.configuration.path_length = copy_text(app.configuration.path[..], home.value)
@@ -81,7 +81,7 @@ fn config_location(app: *App) {
 }
 fn config_open_font(app: *const App, typography: *const Typography, path: *const u8, points: f32, startup: bool) rawptr {
   length:=c.string_length(path, 4096)
-  if startup && points==typography.points*typography.scale && buffer.equal(path[..length], app.fonts.original_font_path[..app.fonts.original_font_length]) {
+  if startup && points==typography.points*typography.scale && buffer.equal(#slice(path, length), app.fonts.original_font_path[..app.fonts.original_font_length]) {
     return typography.original_font
   }
   return ttf.open(path, points)
@@ -109,8 +109,8 @@ fn config_reload(app: *App, typography: *Typography, startup: bool) {
   mark := mem.arena_mark(app.scratch)
   defer mem.arena_rewind(app.scratch, mark)
   // Without a global file the defaults stand in, and a dna.toml still applies.
-  read := fs.ReadAllResult{ok: true}
-  if files.metadata(path).ok {
+  read := fs.ReadAllResult{}
+  if files.metadata(path).failure.kind == io.Kind.Ok {
     read = fs.read_all(app.scratch, path, 16384)
   }
   else if startup {
@@ -120,11 +120,12 @@ fn config_reload(app: *App, typography: *Typography, startup: bool) {
       return
     }
   }
-  if !read.ok {
+  if read.failure.kind != io.Kind.Ok {
     notice(app, "Cannot read config (maximum 16 KiB).")
     return
   }
   parsed := settings.Settings{}
+  settings.defaults(&parsed)
   global_layer := settings.Layer{}
   if !settings.parse_layer(read.value, &parsed, &global_layer) {
     message: [256]u8 = []
@@ -138,7 +139,7 @@ fn config_reload(app: *App, typography: *Typography, startup: bool) {
   project_config_find(app)
   if !project_config_apply(app, &parsed, &global_layer) {
     // An invalid dna.toml leaves the global settings alone.
-    parsed = settings.Settings{}
+    settings.defaults(&parsed)
     retry_layer := settings.Layer{}
     _ = settings.parse_layer(read.value, &parsed, &retry_layer)
   }
@@ -322,7 +323,7 @@ fn config_reload(app: *App, typography: *Typography, startup: bool) {
   app.view.revision += 1
   app.prompt_state.panel = Panel.None
   // A missing global file is a known state (zero stamps) until it appears.
-  app.configuration.stamp_ready = file_stamp(&app.configuration.path[0], &app.configuration.stamp[0]) != 0 || !files.metadata(path).ok
+  app.configuration.stamp_ready = file_stamp(&app.configuration.path[0], &app.configuration.stamp[0]) != 0 || files.metadata(path).failure.kind != io.Kind.Ok
 }
 fn font_refresh(app: *App) {
   app.completion.count = 0

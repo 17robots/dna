@@ -1,3 +1,4 @@
+use "std/parse" parse
 // Native GUI text backend.
 // HarfBuzz glyph shaping and FriBidi paragraph ordering preserve UTF-8 source
 // offsets. Fonts, native libraries and cached bitmaps stay on the GUI thread.
@@ -13,7 +14,7 @@ use "std/dynlib"
 use "std/unicode/utf8"
 use "std/c"
 use "std/math"
-use "std/errors"
+use "std/io"
 use "../platform" sdl
 
 struct NativeTextCallbacks {
@@ -74,7 +75,7 @@ struct NativeText {
   fallback_count: usize,
   fallback_revisions: [16]u64,
   wrap: i32,
-  red: u8 = 255, green: u8 = 255, blue: u8 = 255, alpha: u8 = 255,
+  red: u8, green: u8, blue: u8, alpha: u8,
 }
 struct NativeLibraries {
   harfbuzz: dynlib.Handle,
@@ -90,7 +91,7 @@ native_libraries: NativeLibraries
 fn native_library(names: []const []const u8) dynlib.Handle {
   for name in names {
     loaded:=dynlib.open(name, dynlib.Now|dynlib.Local)
-    if loaded.ok {
+    if loaded.failure.kind == io.Kind.Ok {
       return loaded.value
     }
   }
@@ -251,13 +252,13 @@ fn native_font_mappable(path:[]const u8) bool {
 }
 fn native_font_map(path:[]const u8) std_fs.Mapping {
   opened:=std_fs.open(path)
-  if !opened.ok {
-    return std_fs.Mapping{error:opened.error, kind:opened.kind}
+  if opened.failure.kind != io.Kind.Ok {
+    return std_fs.Mapping{ failure: opened.failure }
   }
-  mapping:=std_fs.Mapping{kind:errors.Kind.InvalidInput}
+  mapping:=std_fs.Mapping{ failure: io.Failure{ kind: io.Kind.InvalidInput } }
   info:=std_fs.file_metadata(&opened.value)
   // Regular, non-empty, bounded, and not writable by group or others.
-  if info.ok && (info.mode & 61440) == 32768 && (info.mode & 18) == 0 && info.size != 0 && info.size <= 67108864 {
+  if info.failure.kind == io.Kind.Ok && (info.mode & 61440) == 32768 && (info.mode & 18) == 0 && info.size != 0 && info.size <= 67108864 {
     mapping=std_fs.map(&opened.value)
   }
   _=std_fs.close(&opened.value)
@@ -278,15 +279,15 @@ fn ttf_open(path: *const u8, points: f32) rawptr {
     return nil
   }
   mapping := std_fs.Mapping{}
-  if native_font_mappable(path[..length]) {
-    mapping = native_font_map(path[..length])
+  if native_font_mappable(#slice(path, length)) {
+    mapping = native_font_map(#slice(path, length))
   }
   file: *mem.Arena = nil
   contents: []const u8 = mapping.value
   if #len(contents) == 0 {
     file = mem.arena_create(65536)
-    copied := std_fs.read_all(file, path[..length], 67108864)
-    if !copied.ok || #len(copied.value) == 0 {
+    copied := std_fs.read_all(file, #slice(path, length), 67108864)
+    if copied.failure.kind != io.Kind.Ok || #len(copied.value) == 0 {
       mem.arena_release(file)
       return nil
     }
@@ -301,7 +302,7 @@ fn ttf_open(path: *const u8, points: f32) rawptr {
   font.face = face.value
   font.points = points
   font.revision = 1
-  if face.ok {
+  if face.failure.kind == parse.Kind.Ok {
     font.metrics=ft.FaceMetrics{units_per_em:face.value.units_per_em, ascent:face.value.ascent, descent:face.value.descent}
     font.line_units=#cast(i32, face.value.ascent)-#cast(i32, face.value.descent)+#cast(i32, face.value.line_gap)
   } else {
@@ -404,7 +405,7 @@ fn native_covered(font:*NativeFont, grapheme:[]const u8) bool {
   at:usize=0
   for at<#len(grapheme) {
     scalar:=utf8.decode(grapheme, at)
-    if !scalar.ok {
+    if !scalar.valid {
       return false
     }
     cp:=scalar.codepoint
@@ -450,7 +451,7 @@ fn native_bitmap(font:*NativeFont, index:u16) *NativeGlyph {
   bitmap:=font_api.Bitmap{}
   if font.freetype.face==nil {
     raster:=font_api.raster(font.glyph_memory, &font.face, index, native_em(font))
-    if !raster.ok {
+    if raster.failure.kind != parse.Kind.Ok {
       mem.arena_rewind(font.glyph_memory, mark)
       return nil
     }
@@ -487,9 +488,9 @@ fn native_bitmap(font:*NativeFont, index:u16) *NativeGlyph {
 }
 fn native_build(arena:*mem.Arena, font:*NativeFont, text:[]const u8, wrap:i32) text_layout.Result {
   if !utf8.valid(text) || #len(text)>2147483647 {
-    return text_layout.Result{kind:errors.Kind.InvalidInput}
+    return text_layout.Result{kind:io.Kind.InvalidInput}
   }
-  return text_layout.build(arena, text, text_layout.Font{data:#cast(rawptr, font), select:native_select, line_height:native_line(font), space_advance:font.space}, &native_libraries.hb, &native_libraries.fb, text_layout.Options{width:wrap, wrap:wrap>0})
+  return text_layout.build(arena, text, text_layout.Font{data:#cast(rawptr, font), select:native_select, line_height:native_line(font), space_advance:font.space}, &native_libraries.hb, &native_libraries.fb, text_layout.Options{width:wrap, no_wrap:wrap<=0})
 }
 fn native_revisions_match(text: *const NativeText, font: *const NativeFont) bool {
   if text.font!=font || text.revision!=font.revision || text.fallback_count!=font.fallback_count {
@@ -560,14 +561,14 @@ fn ttf_measure(handle: rawptr, bytes: *const u8, length: usize, width: *i32, hei
       current=false
     }
   }
-  if !current || !byte_ops.equal(font.measure_text, bytes[..length]) {
+  if !current || !byte_ops.equal(font.measure_text, #slice(bytes, length)) {
     if font.measure==nil {
       font.measure=mem.arena_create(65536)
     }
     arena:=font.measure
     font.measure_valid=false
     mem.arena_reset(arena)
-    result:=native_build(arena, font, bytes[..length], 0)
+    result:=native_build(arena, font, #slice(bytes, length), 0)
     if !result.ok {
       mem.arena_reset(arena)
       return false
@@ -622,7 +623,7 @@ fn native_create(engine: rawptr, handle: rawptr, bytes: *const u8, length: usize
   text.green = 255
   text.blue = 255
   text.alpha = 255
-  if !native_update(text, #cast(*NativeFont, handle), bytes[..length], 0) {
+  if !native_update(text, #cast(*NativeFont, handle), #slice(bytes, length), 0) {
     mem.arena_release(owner)
     return nil
   }
@@ -643,7 +644,7 @@ fn ttf_set(handle: rawptr, bytes: *const u8, length: usize) bool {
     return false
   }
   text := #cast(*NativeText, handle)
-  return native_update(text, text.font, bytes[..length], text.wrap)
+  return native_update(text, text.font, #slice(bytes, length), text.wrap)
 }
 fn ttf_wrap(handle: rawptr, pixels: i32) bool {
   if handle == nil || pixels < 0 {

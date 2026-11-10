@@ -24,10 +24,10 @@ with tempfile.TemporaryDirectory(prefix='dna-static-sdk-') as directory:
     shutil.copytree(ROOT/'tests/native/static_lifecycle',stage)
     entry = stage/'main.dyn'
     # Import the same SDK modules the archive uses. Before symbol isolation,
-    # this consumer reproduced a duplicate std/errors.linux definition.
+    # this consumer reproduced a duplicate std/io.linux definition.
     text = entry.read_text()
-    text = 'use "std/errors"\nuse "std/sync"\n'+text
-    text = text.replace('fn main() {', 'fn main() {\n  sdk_lock:=sync.mutex()\n  sync.lock(&sdk_lock)\n  check(errors.linux(-22)==errors.Kind.InvalidInput,"SDK error classification")\n  sync.unlock(&sdk_lock)',1)
+    text = 'use "std/io"\nuse "std/sync"\n'+text
+    text = text.replace('fn main() {', 'fn main() {\n  sdk_lock:=sync.mutex()\n  sync.lock(&sdk_lock)\n  check(io.linux(-22)==io.Kind.InvalidInput,"SDK error classification")\n  sync.unlock(&sdk_lock)',1)
     entry.write_text(text)
     subprocess.run([
         'python3', str(ROOT / 'scripts/compile.py'), os.environ.get('DYN', 'dyn'),

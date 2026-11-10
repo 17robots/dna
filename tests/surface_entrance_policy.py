@@ -15,7 +15,7 @@ def function(source,name):
 s=(ROOT/'src/animation.dyn').read_text()
 base='''use "./motion" motion
 use "./sdl" sdl
-struct Config {popup_animation_ms:f32=40.0,popup_transitions:bool=true}
+struct Config {popup_animation_ms:f32,popup_transitions:bool}
 struct Animation {now,geometry_elapsed:f32,active,surfaces_ready,resized,geometry_active,geometry_retargeted:bool}
 struct View {animation:Animation,reduced_motion:bool}
 struct Pointer {dragging:bool}
@@ -36,7 +36,7 @@ fn frame(app:*App,now,elapsed:f32,cause:u32,changed:bool){
 }
 '''
 cases='''fn main() {
- app:=App{config:Config{}}
+ app:=App{config:Config{popup_animation_ms:40.0,popup_transitions:true}}
  left:=motion.Rectangle{}
  right:=motion.Rectangle{}
  full:=sdl.PixelRect{width:1000,height:600}

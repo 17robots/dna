@@ -1,3 +1,4 @@
+use "std/parse" parse
 use "../../src/filesystem" fs
 use "std/io"
 use "../../src/host" host
@@ -15,34 +16,34 @@ fn equal(a: []const u8, b: []const u8) bool {
 }
 fn content(path: []const u8, expected: []const u8) {
   opened := fs.open(path)
-  if !opened.ok {
+  if opened.failure.kind != io.Kind.Ok {
     #panic("open content")
   }
   defer _ = fs.close(&opened.value)
   storage: [128]u8 = []
   read := fs.read(&opened.value, storage[..])
-  if !read.ok || !equal(storage[..read.transferred], expected) {
+  if read.failure.kind != io.Kind.Ok || !equal(storage[..read.transferred], expected) {
     #panic("content changed unexpectedly")
   }
 }
 fn require(result: fs.Result, operation: []const u8) {
-  if !result.ok {
-    _ = io.println(io.stderr(), "{} failed: {}", operation, result.error)
+  if result.failure.kind != io.Kind.Ok {
+    io.eprintln("{} failed: {}", operation, result.failure.native)
     #panic(operation)
   }
 }
 fn clone_and_patch() {
   require(fs.write_all("clone-source.txt", "0123456789"), "clone fixture")
   source := fs.open("clone-source.txt")
-  if !source.ok {
+  if source.failure.kind != io.Kind.Ok {
     #panic("clone source open")
   }
   defer _ = fs.close(&source.value)
   cloned := fs.clone_exclusive(&source.value, "clone-output.txt")
-  if !cloned.ok {
+  if cloned.failure.kind != io.Kind.Ok {
     expected: [8]u8 = []
     required := host.environment("DNA_TEST_REQUIRE_APFS", expected[..])
-    if required.ok && equal(required.value, "1") {
+    if required.failure.kind == io.Kind.Ok && equal(required.value, "1") {
       #panic("APFS clone required on this test volume")
     }
     return
@@ -51,14 +52,14 @@ fn clone_and_patch() {
   require(fs.seek(&cloned.value, 5), "clone seek")
   require(fs.write(&cloned.value, "EDIT"), "clone patch")
   require(fs.resize(&cloned.value, 9), "clone resize")
-  require(fs.close(&cloned.value), "clone close")
+  fs.close(&cloned.value)
   content("clone-output.txt", "01234EDIT")
   content("clone-source.txt", "0123456789")
-  if fs.clone_exclusive(&source.value, "clone-output.txt").ok {
+  if fs.clone_exclusive(&source.value, "clone-output.txt").failure.kind == io.Kind.Ok {
     #panic("clone replaced existing file")
   }
   content("clone-output.txt", "01234EDIT")
-  _ = io.println(io.stdout(), "PASS native exclusive whole-file clone, patch, resize and unchanged origin")
+  io.println("PASS native exclusive whole-file clone, patch, resize and unchanged origin")
 }
 fn mapping_and_ranges() {
   bytes: [262144]u8 = []
@@ -67,37 +68,37 @@ fn mapping_and_ranges() {
   }
   require(fs.write_all("mapped.bin", bytes[..]), "mapping fixture")
   source := fs.open("mapped.bin")
-  if !source.ok {
+  if source.failure.kind != io.Kind.Ok {
     #panic("mapping open")
   }
   defer _ = fs.close(&source.value)
   mapped := fs.map_file(source.value.descriptor, #cast(u64, #len(bytes)))
   expected: [8]u8 = []
   native := host.environment("DNA_TEST_FILE_MAPPING", expected[..])
-  if mapped == nil && native.ok && equal(native.value, "1") {
+  if mapped == nil && native.failure.kind == io.Kind.Ok && equal(native.value, "1") {
     #panic("native mapping unavailable")
   }
   if mapped != nil {
-    if mapped[..#len(bytes)][0] != bytes[0] || mapped[..#len(bytes)][200000] != bytes[200000] {
+    if #slice(mapped, #len(bytes))[0] != bytes[0] || #slice(mapped, #len(bytes))[200000] != bytes[200000] {
       #panic("mapping contents")
     }
     // Darwin protects inaccessible backing pages, while already resident
     // private pages may retain old bytes. Windows refuses truncation while
     // views exist. Reads must remain safe and source metadata authoritative.
     truncated := fs.create("mapped.bin")
-    if truncated.ok {
-      require(fs.close(&truncated.value), "truncate close")
+    if truncated.failure.kind == io.Kind.Ok {
+      fs.close(&truncated.value)
       changed := fs.file_metadata(&source.value)
-      if !changed.ok || changed.size != 0 {
+      if changed.failure.kind != io.Kind.Ok || changed.size != 0 {
         #panic("source truncation not observed")
       }
       for position in [100000, 200000] {
-        observed := mapped[..#len(bytes)][position]
+        observed := #slice(mapped, #len(bytes))[position]
         if observed != 0 && observed != bytes[position] {
           #panic("unexpected truncated mapping contents")
         }
       }
-    } else if mapped[..#len(bytes)][200000] != bytes[200000] {
+    } else if #slice(mapped, #len(bytes))[200000] != bytes[200000] {
       #panic("mapping after refused truncation")
     }
     fs.unmap_file(mapped, #cast(u64, #len(bytes)))
@@ -105,32 +106,32 @@ fn mapping_and_ranges() {
   require(fs.write_all("range-source.bin", bytes[..]), "range fixture")
   origin := fs.open("range-source.bin")
   target := fs.create("range-target.bin")
-  if !origin.ok || !target.ok {
+  if origin.failure.kind != io.Kind.Ok || target.failure.kind != io.Kind.Ok {
     #panic("range files")
   }
   require(fs.write(&target.value, "Z"), "range prefix")
   copied := fs.copy_range(&origin.value, 1, &target.value, 200000)
-  if !copied.ok {
+  if copied.failure.kind != io.Kind.Ok {
     if copied.transferred != 0 {
       #panic("partial range copy")
     }
     require(fs.write(&target.value, bytes[1..200001]), "range fallback")
   }
   one: [1]u8 = []
-  if !fs.read(&origin.value, one[..]).ok || one[0] != bytes[0] {
+  if fs.read(&origin.value, one[..]).failure.kind != io.Kind.Ok || one[0] != bytes[0] {
     #panic("range changed source position")
   }
-  require(fs.close(&origin.value), "range source close")
-  require(fs.close(&target.value), "range target close")
+  fs.close(&origin.value)
+  fs.close(&target.value)
   result := fs.open("range-target.bin")
-  if !result.ok || fs.metadata("range-target.bin").size != 200001 {
+  if result.failure.kind != io.Kind.Ok || fs.metadata("range-target.bin").size != 200001 {
     #panic("range output size")
   }
   offset: usize = 0
   part: [16384]u8 = []
   for offset < 200001 {
     read := fs.read(&result.value, part[..])
-    if !read.ok || read.transferred == 0 {
+    if read.failure.kind != io.Kind.Ok || read.transferred == 0 {
       #panic("range output read")
     }
     for index in 0..read.transferred {
@@ -144,87 +145,88 @@ fn mapping_and_ranges() {
     }
     offset += read.transferred
   }
-  require(fs.close(&result.value), "range result close")
+  fs.close(&result.value)
 }
 fn main() {
   mapping_and_ranges()
   clone_and_patch()
   private := fs.create_private_exclusive("private.txt")
-  if !private.ok {
-    _ = io.println(io.stderr(), "create private failed: {}", private.error)
+  if private.failure.kind != io.Kind.Ok {
+    io.eprintln("create private failed: {}", private.failure.native)
     #panic("private create")
   }
   require(fs.write(&private.value, "private"), "private write")
   require(fs.set_permissions(&private.value, 384), "private chmod")
-  require(fs.close(&private.value), "private close")
-  if !fs.make_directory("private-directory", 448).ok {
+  fs.close(&private.value)
+  if fs.make_directory("private-directory", 448).failure.kind != io.Kind.Ok {
     #panic("private directory permissions")
   }
   copied := fs.create_private_exclusive("copied-permissions.txt")
-  if !copied.ok {
+  if copied.failure.kind != io.Kind.Ok {
     #panic("create permission copy")
   }
   require(fs.preserve_permissions(&copied.value, "private.txt"), "preserve permissions")
   require(fs.write(&copied.value, "copied"), "permission copy write")
-  require(fs.close(&copied.value), "permission copy close")
+  fs.close(&copied.value)
   private_transaction := fs.atomic_begin_private("session.txt", "session.tmp")
-  if !private_transaction.ok || !fs.write(&private_transaction.transaction.file, "session").ok || !fs.atomic_commit(&private_transaction.transaction).ok {
+  if private_transaction.failure.kind != io.Kind.Ok || fs.write(&private_transaction.transaction.file, "session").failure.kind != io.Kind.Ok || fs.atomic_commit(&private_transaction.transaction).failure.kind != io.Kind.Ok {
     #panic("private atomic save")
   }
-  if fs.metadata("absent").ok {
+  if fs.metadata("absent").failure.kind == io.Kind.Ok {
     #panic("missing metadata")
   }
-  if !fs.write_all("source café.txt", "source").ok || !fs.write_all("target 日本語.txt", "target").ok {
+  if fs.write_all("source café.txt", "source").failure.kind != io.Kind.Ok || fs.write_all("target 日本語.txt", "target").failure.kind != io.Kind.Ok {
     #panic("create fixtures")
   }
   safe := fs.open_nofollow("source café.txt")
-  if !safe.ok {
+  if safe.failure.kind != io.Kind.Ok {
     #panic("safe open regular file")
   }
   info := fs.file_metadata(&safe.value)
-  if !info.ok || info.size != 6 || !fs.close(&safe.value).ok {
+  if info.failure.kind != io.Kind.Ok || info.size != 6 {
     #panic("handle metadata")
   }
+  fs.close(&safe.value)
   source := fs.metadata("source café.txt")
-  if !source.ok || source.size != 6 || (source.mode & 61440) != 32768 {
+  if source.failure.kind != io.Kind.Ok || source.size != 6 || (source.mode & 61440) != 32768 {
     #panic("regular metadata")
   }
-  if fs.rename_noreplace("source café.txt", "target 日本語.txt").ok {
+  if fs.rename_noreplace("source café.txt", "target 日本語.txt").failure.kind == io.Kind.Ok {
     #panic("rename overwrote destination")
   }
   content("source café.txt", "source")
   content("target 日本語.txt", "target")
-  if !fs.rename_noreplace("source café.txt", "moved.txt").ok || fs.metadata("source café.txt").ok {
+  if fs.rename_noreplace("source café.txt", "moved.txt").failure.kind != io.Kind.Ok || fs.metadata("source café.txt").failure.kind == io.Kind.Ok {
     #panic("rename to new path")
   }
   content("moved.txt", "source")
   transaction := fs.atomic_begin("target 日本語.txt", "temporary.txt")
-  if !transaction.ok || !fs.write(&transaction.transaction.file, "replacement").ok {
+  if transaction.failure.kind != io.Kind.Ok || fs.write(&transaction.transaction.file, "replacement").failure.kind != io.Kind.Ok {
     #panic("atomic begin/write")
   }
   content("target 日本語.txt", "target")
-  if !fs.atomic_commit(&transaction.transaction).ok || transaction.transaction.active || fs.metadata("temporary.txt").ok {
+  if fs.atomic_commit(&transaction.transaction).failure.kind != io.Kind.Ok || transaction.transaction.active || fs.metadata("temporary.txt").failure.kind == io.Kind.Ok {
     #panic("atomic commit")
   }
   content("target 日本語.txt", "replacement")
   aborted := fs.atomic_begin("target 日本語.txt", "temporary.txt")
-  if !aborted.ok || !fs.write(&aborted.transaction.file, "discard").ok || !fs.atomic_abort(&aborted.transaction).ok {
+  if aborted.failure.kind != io.Kind.Ok || fs.write(&aborted.transaction.file, "discard").failure.kind != io.Kind.Ok || fs.atomic_abort(&aborted.transaction).failure.kind != io.Kind.Ok {
     #panic("atomic abort")
   }
   content("target 日本語.txt", "replacement")
-  if fs.metadata("temporary.txt").ok {
+  if fs.metadata("temporary.txt").failure.kind == io.Kind.Ok {
     #panic("abort left temporary")
   }
   // A directory cannot be overwritten with a regular file. Abort must still
   // clean the temporary after commit has closed its handle and rename fails.
   failed := fs.atomic_begin("protected-directory", "temporary.txt")
-  if !failed.ok || !fs.write(&failed.transaction.file, "discard").ok {
+  if failed.failure.kind != io.Kind.Ok || fs.write(&failed.transaction.file, "discard").failure.kind != io.Kind.Ok {
     #panic("failure fixture")
   }
-  if fs.atomic_commit(&failed.transaction).ok || !failed.transaction.active {
+  if fs.atomic_commit(&failed.transaction).failure.kind == io.Kind.Ok || !failed.transaction.active {
     #panic("invalid replacement succeeded")
   }
-  if !fs.atomic_abort(&failed.transaction).ok {
+  if fs.atomic_abort(&failed.transaction).failure.kind != io.Kind.Ok {
     #panic("abort after failed commit")
   }
   if (fs.metadata("protected-directory").mode & 61440) != 16384 {
@@ -232,14 +234,14 @@ fn main() {
   }
   storage: [8192]u8 = []
   opened := fs.open_directory(".", storage[..])
-  if !opened.ok {
+  if opened.failure.kind != io.Kind.Ok {
     #panic("open directory")
   }
   found: usize = 0
   for true {
     entry := fs.directory_next(&opened.directory)
-    if !entry.ok {
-      if entry.error != 0 {
+    if !entry.found {
+      if entry.failure.native != 0 {
         #panic("directory enumeration failed")
       }
       break
@@ -257,32 +259,32 @@ fn main() {
       found += 1
     }
   }
-  if found != 3 || !fs.close_directory(&opened.directory).ok {
+  if found != 3 {
     #panic("directory names or close")
   }
-  if fs.metadata("link-enabled").ok {
+  if fs.metadata("link-enabled").failure.kind == io.Kind.Ok {
     refused := fs.open_nofollow("link.txt")
-    if refused.ok {
+    if refused.failure.kind == io.Kind.Ok {
       _ = fs.close(&refused.value)
       #panic("safe open followed symlink")
     }
     link := fs.metadata_nofollow("link.txt")
     followed := fs.metadata("link.txt")
-    if !link.ok || (link.mode & 61440) != 40960 || !followed.ok || followed.size != 11 {
+    if link.failure.kind != io.Kind.Ok || (link.mode & 61440) != 40960 || followed.failure.kind != io.Kind.Ok || followed.size != 11 {
       #panic("symlink metadata")
     }
     target: [4096]u8 = []
     result := fs.read_link("link.txt", target[..])
-    if !result.ok || !equal(result.path, "target 日本語.txt") {
+    if result.failure.kind != io.Kind.Ok || !equal(result.path, "target 日本語.txt") {
       #panic("symlink target")
     }
-    if !fs.remove("link.txt").ok {
+    if fs.remove("link.txt").failure.kind != io.Kind.Ok {
       #panic("unlink symlink")
     }
     content("target 日本語.txt", "replacement")
   }
-  if !fs.remove("moved.txt").ok || fs.metadata("moved.txt").ok {
+  if fs.remove("moved.txt").failure.kind != io.Kind.Ok || fs.metadata("moved.txt").failure.kind == io.Kind.Ok {
     #panic("remove")
   }
-  _ = io.println(io.stdout(), "PASS filesystem Unicode, metadata, enumeration, no-overwrite, atomic commit/abort")
+  io.println("PASS filesystem Unicode, metadata, enumeration, no-overwrite, atomic commit/abort")
 }

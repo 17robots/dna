@@ -67,11 +67,11 @@ fn disk_hash(bytes: *const u8, length: usize) u64 {
   value: u64 = 1469598103934665603
   for i in 0..length {
     // Preserve the historical seed and modulo-2^64 FNV result exactly.
-    value = #wrap((value ^ #cast(u64, bytes[..length][i])) * 1099511628211)
+    value = ((value ^ #cast(u64, #slice(bytes, length)[i])) * 1099511628211)
   }
   return value
 }
-struct DiskStreamHash { hash: u64, ok: bool }
+struct DiskStreamHash { hash: u64, valid: bool }
 // FNV-1a over a file's first size bytes, read through a fixed buffer.
 fn disk_stream_hash(fd: i32, size: usize) DiskStreamHash {
   chunk: [65536]u8 = []
@@ -90,11 +90,11 @@ fn disk_stream_hash(fd: i32, size: usize) DiskStreamHash {
       return DiskStreamHash{}
     }
     for i in 0..#cast(usize, count) {
-      value = #wrap((value ^ #cast(u64, chunk[i])) * 1099511628211)
+      value = ((value ^ #cast(u64, chunk[i])) * 1099511628211)
     }
     done += #cast(usize, count)
   }
-  return DiskStreamHash{hash: value, ok: true}
+  return DiskStreamHash{hash: value, valid: true}
 }
 fn disk_same(a: *const InstallStat, b: *const InstallStat) bool {
   return a.device == b.device && a.inode == b.inode && a.size == b.size && a.mode == b.mode && a.modify_seconds == b.modify_seconds && a.modify_nanos == b.modify_nanos && a.change_seconds == b.change_seconds && a.change_nanos == b.change_nanos
@@ -104,19 +104,19 @@ fn disk_parent(path: *const u8, output: *u8) {
   _ = copy(output, path, length + 1)
   slash: isize = -1
   for i in 0..length {
-    if disk_path_separator(output[..4096][i]) {
+    if disk_path_separator(#slice(output, 4096)[i]) {
       slash = #cast(isize, i)
     }
   }
   if slash < 0 {
-    output[..4096][0] = 46
-    output[..4096][1] = 0
+    #slice(output, 4096)[0] = 46
+    #slice(output, 4096)[1] = 0
   }
-  else if slash == 0 || (slash == 2 && output[..4096][1] == 58 && disk_path_separator(92)) {
-    output[..4096][#cast(usize, slash) + 1] = 0
+  else if slash == 0 || (slash == 2 && #slice(output, 4096)[1] == 58 && disk_path_separator(92)) {
+    #slice(output, 4096)[#cast(usize, slash) + 1] = 0
   }
   else {
-    output[..4096][#cast(usize, slash)] = 0
+    #slice(output, 4096)[#cast(usize, slash)] = 0
   }
 }
 fn disk_wake(d: *DiskWorker) {
@@ -160,17 +160,17 @@ fn disk_directories(d: *DiskWorker) bool {
   for i in 0..count {
     used := false
     for j in 0..count {
-      if d.watches[j] == previous[..count][i] {
+      if d.watches[j] == #slice(previous, count)[i] {
         used = true
       }
     }
     for j in 0..i {
-      if previous[..count][j] == previous[..count][i] {
+      if #slice(previous, count)[j] == #slice(previous, count)[i] {
         used = true
       }
     }
-    if previous[..count][i] >= 0 && !used {
-      _ = disk_remove(d.changes, previous[..count][i])
+    if #slice(previous, count)[i] >= 0 && !used {
+      _ = disk_remove(d.changes, #slice(previous, count)[i])
     }
   }
   search_free(#cast(rawptr, previous))
@@ -250,7 +250,7 @@ fn disk_worker(context: rawptr) i32 {
           // Hash in a small buffer first; most checks find the file unchanged
           // and never hold its whole contents in memory.
           streamed := disk_stream_hash(fd, #cast(usize, stamp.size))
-          if !streamed.ok {
+          if !streamed.valid {
             status = 3
           } else if snapshot.trusted && disk_trusted(&snapshot, &stamp) {
             length = #cast(usize, stamp.size)
@@ -268,7 +268,7 @@ fn disk_worker(context: rawptr) i32 {
             }
           }
           for status == 0 && !unchanged_hash && length < #cast(usize, stamp.size) {
-            count := proc_read_raw(fd, &bytes[..#cast(usize, stamp.size) + 1][length], #cast(usize, stamp.size) - length)
+            count := proc_read_raw(fd, &#slice(bytes, #cast(usize, stamp.size) + 1)[length], #cast(usize, stamp.size) - length)
             if count < 0 && rec_errno().* == 4 {
               continue
             }
@@ -407,7 +407,7 @@ fn disk_reserve(d: *DiskWorker, index: usize) bool {
     return false
   }
   for i in 0..capacity {
-    watches[..capacity][i] = -1
+    #slice(watches, capacity)[i] = -1
   }
   if #len(d.files) > 0 {
     _ = copy(#cast(*u8, files), #cast(*u8, &d.files[0]), #len(d.files) * #sizeof(DiskWatched))
@@ -415,8 +415,8 @@ fn disk_reserve(d: *DiskWorker, index: usize) bool {
     search_free(#cast(rawptr, &d.files[0]))
     search_free(#cast(rawptr, &d.watches[0]))
   }
-  d.files = files[..capacity]
-  d.watches = watches[..capacity]
+  d.files = #slice(files, capacity)
+  d.watches = #slice(watches, capacity)
   return true
 }
 pub fn dna_disk_watch_checked(d: *DiskWorker, index: usize, identity: u64, path: *const u8, saved: *const u8, length: usize) i32 {
@@ -459,7 +459,7 @@ pub fn dna_disk_watch_stamped(d: *DiskWorker, index: usize, identity: u64, path:
   w := &d.files[index]
   w.trusted = true
   for i in 0..6 {
-    w.trust[i] = stamp[..6][i]
+    w.trust[i] = #slice(stamp, 6)[i]
   }
   rec_unlock(d.lock)
   return 1
@@ -539,7 +539,7 @@ pub fn dna_disk_take_at(d: *DiskWorker, index: usize, identity: u64, output: *u8
       result = 1
       if capacity > w.length {
         _ = copy(output, w.bytes, w.length)
-        output[..capacity][w.length] = 0
+        #slice(output, capacity)[w.length] = 0
       }
       else {
         result = 0
@@ -577,7 +577,7 @@ pub fn dna_file_stamp(path: *const u8, output: *u64) i32 {
   if disk_stat(path, &info) != 0 || (info.mode & 61440) != 32768 {
     return 0
   }
-  values := output[..6]
+  values := #slice(output, 6)
   values[0] = info.device
   values[1] = info.inode
   values[2] = #cast(u64, info.size)
@@ -635,7 +635,7 @@ pub fn dna_path_watch_poll(watch: *DiskPathWatch) i32 {
     changed = 1
     offset: usize = 0
     for offset < #cast(usize, count) {
-      event := #cast(*DiskEvent, &bytes[..8192][offset])
+      event := #cast(*DiskEvent, &#slice(bytes, 8192)[offset])
       if (event.mask & 44032) != 0 {
         invalid = true
       }
@@ -711,7 +711,7 @@ pub fn dna_directory_watch_poll(watch: *DiskDirectoryWatch) i32 {
     }
     offset: usize = 0
     for offset < #cast(usize, count) {
-      event := #cast(*DiskEvent, &bytes[..8192][offset])
+      event := #cast(*DiskEvent, &#slice(bytes, 8192)[offset])
       if (event.mask & 32768) == 0 {
         changed = 1
       }

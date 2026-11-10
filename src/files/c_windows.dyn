@@ -4,6 +4,7 @@
 use "std/sync" file_windows_sync
 use "std/dynlib" file_windows_loader
 use "std/c" file_windows_c
+use "std/io"
 
 struct FileWindowsAttributes { attributes, tag: u32 }
 struct FileWindowsPathAPI {
@@ -18,7 +19,7 @@ file_windows_path_api: FileWindowsPathAPI
 file_windows_path_once: file_windows_sync.Once
 fn file_windows_path_symbol(library: rawptr, name: []const u8) rawptr {
   found := file_windows_loader.symbol(library, name)
-  if !found.ok || found.value == nil {
+  if found.failure.kind != io.Kind.Ok || found.value == nil {
     #panic("missing Windows file path routine")
   }
   return found.value
@@ -26,7 +27,7 @@ fn file_windows_path_symbol(library: rawptr, name: []const u8) rawptr {
 fn file_windows_path_prepare() {
   if file_windows_sync.once_begin(&file_windows_path_once) {
     kernel := file_windows_loader.open("kernel32.dll", 0)
-    if !kernel.ok {
+    if kernel.failure.kind != io.Kind.Ok {
       #panic("missing Windows file path library")
     }
     file_windows_path_api.open = #cast(fn(*const u16, u32, u32, rawptr, u32, u32, rawptr) rawptr, file_windows_path_symbol(kernel.value, "CreateFileW"))
@@ -93,7 +94,7 @@ fn realpath(path: *const u8, output: *u8) *u8 {
   if directory == nil || #cast(isize, directory) == -1 {
     return nil
   }
-  defer _ = file_windows_path_api.close(directory)
+  defer { _ = file_windows_path_api.close(directory) }
   info := FileWindowsAttributes{}
   if file_windows_path_api.information(directory, 9, #cast(rawptr, &info), #cast(u32, #sizeof(FileWindowsAttributes))) == 0 || (info.attributes & 16) == 0 {
     return nil
@@ -124,7 +125,7 @@ fn realpath(path: *const u8, output: *u8) *u8 {
     output.* = 0
     return nil
   }
-  bytes := output[..4096]
+  bytes := #slice(output, 4096)
   for index in 0..#cast(usize, written) {
     if bytes[index] == 92 {
       bytes[index] = 47

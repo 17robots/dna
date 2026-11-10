@@ -17,7 +17,7 @@ const VimRxCursor: usize = 0xfffffffffffffffe
 
 struct VimRegexFilter { kind: u8, compare: u8, value: usize }
 struct VimRegex {
-  ok: bool,
+  valid: bool,
   message: []const u8,
   // The pattern can match a line break, so matching one line at a time is
   // not enough.
@@ -123,53 +123,53 @@ fn rx_ends_branch(source: []const u8, at: usize, mode: u8) bool {
   return (token.byte == '|' || token.byte == ')' || token.byte == '&') && rx_is_special(token, mode)
 }
 // Class body for a class letter; negated classes are written [^body].
-struct RxClass { body: []const u8, negated: bool, ok: bool }
+struct RxClass { body: []const u8, negated: bool, valid: bool }
 fn rx_class(letter: u8) RxClass {
   if letter == 's' || letter == 'S' {
-    return RxClass{body: " \\t", negated: letter == 'S', ok: true}
+    return RxClass{body: " \\t", negated: letter == 'S', valid: true}
   }
   if letter == 'd' || letter == 'D' {
-    return RxClass{body: "0-9", negated: letter == 'D', ok: true}
+    return RxClass{body: "0-9", negated: letter == 'D', valid: true}
   }
   if letter == 'w' || letter == 'W' {
-    return RxClass{body: "0-9A-Za-z_", negated: letter == 'W', ok: true}
+    return RxClass{body: "0-9A-Za-z_", negated: letter == 'W', valid: true}
   }
   if letter == 'a' || letter == 'A' {
-    return RxClass{body: "A-Za-z", negated: letter == 'A', ok: true}
+    return RxClass{body: "A-Za-z", negated: letter == 'A', valid: true}
   }
   if letter == 'l' || letter == 'L' {
-    return RxClass{body: "a-z", negated: letter == 'L', ok: true}
+    return RxClass{body: "a-z", negated: letter == 'L', valid: true}
   }
   if letter == 'u' || letter == 'U' {
-    return RxClass{body: "A-Z", negated: letter == 'U', ok: true}
+    return RxClass{body: "A-Z", negated: letter == 'U', valid: true}
   }
   if letter == 'x' || letter == 'X' {
-    return RxClass{body: "0-9A-Fa-f", negated: letter == 'X', ok: true}
+    return RxClass{body: "0-9A-Fa-f", negated: letter == 'X', valid: true}
   }
   if letter == 'o' || letter == 'O' {
-    return RxClass{body: "0-7", negated: letter == 'O', ok: true}
+    return RxClass{body: "0-7", negated: letter == 'O', valid: true}
   }
   if letter == 'h' || letter == 'H' {
-    return RxClass{body: "A-Za-z_", negated: letter == 'H', ok: true}
+    return RxClass{body: "A-Za-z_", negated: letter == 'H', valid: true}
   }
   // \k \i \f \p and their digit-free upper-case forms.
   if letter == 'k' || letter == 'i' {
-    return RxClass{body: "\\p{L}\\p{N}_", ok: true}
+    return RxClass{body: "\\p{L}\\p{N}_", valid: true}
   }
   if letter == 'K' || letter == 'I' {
-    return RxClass{body: "\\p{L}_", ok: true}
+    return RxClass{body: "\\p{L}_", valid: true}
   }
   if letter == 'f' {
-    return RxClass{body: "\\p{L}\\p{N}_/.\\-+,#$%~=", ok: true}
+    return RxClass{body: "\\p{L}\\p{N}_/.\\-+,#$%~=", valid: true}
   }
   if letter == 'F' {
-    return RxClass{body: "\\p{L}_/.\\-+,#$%~=", ok: true}
+    return RxClass{body: "\\p{L}_/.\\-+,#$%~=", valid: true}
   }
   if letter == 'p' {
-    return RxClass{body: "\\x20-\\x7e\\x{a0}-\\x{10ffff}", ok: true}
+    return RxClass{body: "\\x20-\\x7e\\x{a0}-\\x{10ffff}", valid: true}
   }
   if letter == 'P' {
-    return RxClass{body: "\\x20-\\x2f\\x3a-\\x7e\\x{a0}-\\x{10ffff}", ok: true}
+    return RxClass{body: "\\x20-\\x2f\\x3a-\\x7e\\x{a0}-\\x{10ffff}", valid: true}
   }
   return RxClass{}
 }
@@ -401,7 +401,7 @@ fn rx_close_ze(out: *RxOut, group: *RxGroup) {
   }
 }
 fn rx_fail(regex: *VimRegex, message: []const u8) usize {
-  regex.ok = false
+  regex.valid = false
   regex.message = message
   return 0
 }
@@ -626,7 +626,7 @@ fn rx_around(source: []const u8, at: usize, out: *RxOut, regex: *VimRegex, atom:
 // The caller adds (?m) and, for ignore case, (?i). previous is the last
 // substitute string, for ~.
 fn vim_regex(source: []const u8, magic: bool, previous: []const u8, output: []u8, regex: *VimRegex) usize {
-  regex.* = VimRegex{ok: true}
+  regex.* = VimRegex{valid: true}
   out := RxOut{bytes: output}
   mode: u8 = 2
   if !magic {
@@ -637,7 +637,7 @@ fn vim_regex(source: []const u8, magic: bool, previous: []const u8, output: []u8
   groups[0] = RxGroup{}
   atom := VimRxNone
   at: usize = 0
-  for at < #len(source) && !out.overflow && regex.ok {
+  for at < #len(source) && !out.overflow && regex.valid {
     token := rx_token(source, at)
     byte := token.byte
     fresh := out.used == groups[depth].branch
@@ -723,7 +723,7 @@ fn vim_regex(source: []const u8, magic: bool, previous: []const u8, output: []u8
           }
           at = after
         }
-        else if rx_class(next).ok {
+        else if rx_class(next).valid {
           atom = out.used
           rx_emit_class(&out, rx_class(next), true)
           regex.multiline = true
@@ -753,7 +753,7 @@ fn vim_regex(source: []const u8, magic: bool, previous: []const u8, output: []u8
         atom = out.used
         rx_add(&out, "\\x08")
       }
-      else if rx_class(byte).ok {
+      else if rx_class(byte).valid {
         atom = out.used
         rx_emit_class(&out, rx_class(byte), false)
       }
@@ -901,7 +901,7 @@ fn vim_regex(source: []const u8, magic: bool, previous: []const u8, output: []u8
       }
     }
   }
-  if !regex.ok {
+  if !regex.valid {
     return 0
   }
   if depth != 0 {
@@ -920,7 +920,7 @@ fn vim_regex_query(source: []const u8, magic: bool, ignore: bool, previous: []co
     return rx_fail(regex, "Pattern is too long.")
   }
   length := vim_regex(source, magic, previous, output[10..], regex)
-  if !regex.ok {
+  if !regex.valid {
     return 0
   }
   prefix: []const u8 = "(?m)"
