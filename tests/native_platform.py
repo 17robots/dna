@@ -48,7 +48,7 @@ fn main() {
  native_check(sdl_render_texture(renderer,texture,nil,&destination) && native_pixel(40,10,0,64,0,255),"modulated texture alpha")
  sdl_destroy_texture(texture)
  native_check(native_present.draw(&native_gui.presenter,native_gui.surface).failure.kind == io.Kind.Ok,"GPU upload")
- pixel: [4]u8=[]
+ pixel: [4]u8
  api:=&native_gui.presenter.api
  api.pixel_store_i(3333,1)
  api.read_pixels(20,native_gui.surface.height-1-10,1,1,6408,5121,#cast(rawptr,&pixel[0]))
@@ -60,7 +60,7 @@ fn main() {
  api.read_pixels(20,native_gui.surface.height-1-10,1,1,6408,5121,#cast(rawptr,&pixel[0]))
  native_check(pixel[0]==17 && pixel[1]==83 && pixel[2]==201,"same-size upload replaces GPU pixel")
  // Exercise resized texture storage without relying on compositor window sizing.
- resized_pixels:[3072]u8=[]
+ resized_pixels:[3072]u8
  for i in 0..768 {
    resized_pixels[i*4]=51
    resized_pixels[i*4+1]=129
@@ -171,7 +171,7 @@ fn main() {
  sdl_free(#cast(rawptr,first_clip))
  sdl_free(#cast(rawptr,second_clip))
  native_check(native_gui.clipboards==nil,"clipboard free balances owners")
- large_owner:=mem.arena_create(0)
+ large_owner:=mem.arena_alloc(0)
  large:=mem.push_bytes_uninit(large_owner,1200002)
  for i in 0..1200001 {large[i]=97}
  large[1200001]=0

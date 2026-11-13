@@ -15,7 +15,7 @@ use "std/bytes" byte_ops
 pub struct Substring { flags:u32, offset:i32, length:i32, line:i32, cluster:i32, x:i32, y:i32, width:i32, height:i32 }
 fn check(ok:bool) { if !ok { #panic("native text contract") } }
 fn main() {
- path: [4096]u8 = []
+ path: [4096]u8
  name := "FONT_PATH"
  _ = mem.copy(path[..#len(name)],name)
  font := ttf_open(&path[0],16.0)
@@ -42,7 +42,7 @@ fn main() {
  large_font:=#cast(*NativeFont,large)
  if large_font.file.backing>#len(large_font.face.data)+131072 {#panic("font reader retained geometric growth copies")}
  replacement:=std_fs.create(large_name[..#len(large_name)-1])
- check(replacement.failure.kind == io.Kind.Ok)
+ check(!io.failed(replacement.failure))
  std_fs.close(&replacement.value)
  a_text_for_large:[1]u8=[97]
  large_width:i32=0
@@ -259,7 +259,7 @@ fn native_build(arena:*mem.Arena,font:*NativeFont,text:[]const u8,wrap:i32)text_
     other=[]
     for path in formats:
         other.append('''if true {
- format_name:[4096]u8=[]
+ format_name:[4096]u8
  format_path:[]const u8="'''+str(path)+'''"
  _=mem.copy(format_name[..#len(format_path)],format_path)
  format_font:=ttf_open(&format_name[0],16.0)

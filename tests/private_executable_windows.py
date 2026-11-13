@@ -21,23 +21,23 @@ fn write_payload(executable:bool, path:[]const u8) {
   created:=fs.FileResult{}
   if executable { created=fs.create_private_executable_exclusive(path)
   } else { created=fs.create_private_exclusive(path) }
-  if created.failure.kind != io.Kind.Ok { #panic("private output creation") }
+  if io.failed(created.failure) { #panic("private output creation") }
   opened:=fs.open("payload.exe")
-  if opened.failure.kind != io.Kind.Ok { #panic("PE fixture open") }
-  buffer:[16384]u8=[]
+  if io.failed(opened.failure) { #panic("PE fixture open") }
+  buffer:[16384]u8
   for {
     read:=fs.read(&opened.value,buffer[..])
-    if read.failure.kind != io.Kind.Ok { #panic("PE fixture read") }
+    if io.failed(read.failure) { #panic("PE fixture read") }
     if read.transferred==0 { break }
     at:usize=0
     for at<read.transferred {
       written:=fs.write(&created.value,buffer[at..read.transferred])
-      if written.failure.kind != io.Kind.Ok || written.transferred==0 { #panic("private PE write") }
+      if io.failed(written.failure) || written.transferred==0 { #panic("private PE write") }
       at+=written.transferred
     }
   }
   fs.close(&opened.value)
-  if fs.sync(&created.value).failure.kind != io.Kind.Ok { #panic("private PE close") }
+  if io.failed(fs.sync(&created.value).failure) { #panic("private PE close") }
   fs.close(&created.value)
 }
 fn main() {
@@ -46,32 +46,32 @@ fn main() {
   write_payload(true,"private café 日本語.exe")
   write_payload(false,"data café 日本語.exe")
   if !fs.executable("private café 日本語.exe") || fs.executable("data café 日本語.exe") || fs.executable("missing.exe") || fs.executable(".") || fs.executable("reparse-payload.exe") { #panic("effective executable access must match private DACL and reject non-regular paths") }
-  if fs.create_private_executable_exclusive("private café 日本語.exe").failure.kind == io.Kind.Ok || fs.create_private_exclusive("data café 日本語.exe").failure.kind == io.Kind.Ok { #panic("private creation must not overwrite") }
+  if !io.failed(fs.create_private_executable_exclusive("private café 日本語.exe").failure) || !io.failed(fs.create_private_exclusive("data café 日本語.exe").failure) { #panic("private creation must not overwrite") }
   kernel:=loader.open("kernel32.dll",0)
   process_symbol:=loader.symbol(kernel.value,"GetCurrentProcess")
   count_symbol:=loader.symbol(kernel.value,"GetProcessHandleCount")
-  if kernel.failure.kind != io.Kind.Ok || process_symbol.failure.kind != io.Kind.Ok || count_symbol.failure.kind != io.Kind.Ok { #panic("handle API") }
+  if io.failed(kernel.failure) || io.failed(process_symbol.failure) || io.failed(count_symbol.failure) { #panic("handle API") }
   process:=#cast(fn()rawptr,process_symbol.value)
   handles:=#cast(fn(rawptr,*u32)i32,count_symbol.value)
   // Warm both creation paths before checking steady ownership.
   for attempt in 0..2 {
     file:=fs.create_private_executable_exclusive("temporary.exe")
-    if file.failure.kind != io.Kind.Ok { #panic("warmup") }
+    if io.failed(file.failure) { #panic("warmup") }
     fs.close(&file.value)
-    if fs.remove("temporary.exe").failure.kind != io.Kind.Ok { #panic("warmup") }
+    if io.failed(fs.remove("temporary.exe").failure) { #panic("warmup") }
   }
   before:u32=0
   after:u32=0
   if handles(process(),&before)==0 { #panic("initial handle count") }
   for attempt in 0..128 {
     file:=fs.create_private_executable_exclusive("temporary.exe")
-    if file.failure.kind != io.Kind.Ok { #panic("executable creation lifecycle") }
+    if io.failed(file.failure) { #panic("executable creation lifecycle") }
     fs.close(&file.value)
-    if fs.remove("temporary.exe").failure.kind != io.Kind.Ok { #panic("executable creation lifecycle") }
+    if io.failed(fs.remove("temporary.exe").failure) { #panic("executable creation lifecycle") }
     file=fs.create_private_exclusive("temporary.data")
-    if file.failure.kind != io.Kind.Ok { #panic("data creation lifecycle") }
+    if io.failed(file.failure) { #panic("data creation lifecycle") }
     fs.close(&file.value)
-    if fs.remove("temporary.data").failure.kind != io.Kind.Ok { #panic("data creation lifecycle") }
+    if io.failed(fs.remove("temporary.data").failure) { #panic("data creation lifecycle") }
     if !fs.executable("private café 日本語.exe") || fs.executable("data café 日本語.exe") || fs.executable("missing.exe") || fs.executable(".") || fs.executable("reparse-payload.exe") { #panic("effective executable access lifecycle") }
   }
   if handles(process(),&after)==0 || before!=after { #panic("private creation handle leak") }

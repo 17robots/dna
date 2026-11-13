@@ -29,7 +29,7 @@ fn project_config_find(app: *App) {
   state.root_length = copy_text(state.root[..], app.workspace.project[..app.workspace.project_length])
   directory := state.root_length
   for directory > 0 {
-    candidate: [4096]u8 = []
+    candidate: [4096]u8
     length := copy_text(candidate[..], state.root[..directory])
     if length > 0 && candidate[length - 1] != '/' {
       add_text(candidate[..], &length, "/")
@@ -39,7 +39,7 @@ fn project_config_find(app: *App) {
       return
     }
     info := files.metadata(candidate[..length])
-    if info.failure.kind == io.Kind.Ok && (info.mode & 61440) == 32768 {
+    if !io.failed(info.failure) && (info.mode & 61440) == 32768 {
       state.path_length = copy_text(state.path[..], candidate[..length])
       return
     }
@@ -54,7 +54,7 @@ fn project_config_find(app: *App) {
     if directory == 0 && state.root[0] == '/' && length > 9 {
       root_file := "/dna.toml"
       root_info := files.metadata(root_file)
-      if root_info.failure.kind == io.Kind.Ok && (root_info.mode & 61440) == 32768 {
+      if !io.failed(root_info.failure) && (root_info.mode & 61440) == 32768 {
         state.path_length = copy_text(state.path[..], root_file)
       }
       return
@@ -62,14 +62,14 @@ fn project_config_find(app: *App) {
   }
 }
 fn trust_store_path(output: []u8) []const u8 {
-  storage: [4096]u8 = []
+  storage: [4096]u8
   used: usize = 0
   base := host.environment("XDG_STATE_HOME", storage[..])
-  if base.failure.kind == io.Kind.Ok && base.found && #len(base.value) > 0 {
+  if !io.failed(base.failure) && base.found && #len(base.value) > 0 {
     used = copy_text(output, base.value)
   } else {
     home := host.environment("HOME", storage[..])
-    if home.failure.kind != io.Kind.Ok || !home.found {
+    if io.failed(home.failure) || !home.found {
       return output[..0]
     }
     used = copy_text(output, home.value)
@@ -79,7 +79,7 @@ fn trust_store_path(output: []u8) []const u8 {
   return output[..used]
 }
 fn trust_digest(text: []const u8, output: []u8) []const u8 {
-  digest: [32]u8 = []
+  digest: [32]u8
   _ = sha2.sum256(digest[..], text)
   digits: []const u8 = "0123456789abcdef"
   for index in 0..32 {
@@ -90,7 +90,7 @@ fn trust_digest(text: []const u8, output: []u8) []const u8 {
 }
 // Trust lines are "<sha256> <path>"; the newest line for a path wins.
 fn trust_check(app: *App, path: []const u8, text: []const u8) bool {
-  store_storage: [4096]u8 = []
+  store_storage: [4096]u8
   store := trust_store_path(store_storage[..])
   if #len(store) == 0 {
     return false
@@ -98,10 +98,10 @@ fn trust_check(app: *App, path: []const u8, text: []const u8) bool {
   mark := mem.arena_mark(app.scratch)
   defer mem.arena_rewind(app.scratch, mark)
   read := fs.read_all(app.scratch, store, 262144)
-  if read.failure.kind != io.Kind.Ok {
+  if io.failed(read.failure) {
     return false
   }
-  digest_storage: [64]u8 = []
+  digest_storage: [64]u8
   digest := trust_digest(text, digest_storage[..])
   trusted := false
   at: usize = 0
@@ -132,7 +132,7 @@ fn trust_project(app: *App, typography: *Typography) {
     notice(app, "Cannot read dna.toml.")
     return
   }
-  store_storage: [4096]u8 = []
+  store_storage: [4096]u8
   store := trust_store_path(store_storage[..])
   if #len(store) == 0 {
     notice(app, "No state directory for trust: set HOME or XDG_STATE_HOME.")
@@ -142,27 +142,27 @@ fn trust_project(app: *App, typography: *Typography) {
   for parent > 0 && store[parent - 1] != '/' {
     parent -= 1
   }
-  directories: [4096]u8 = []
+  directories: [4096]u8
   _ = copy_text(directories[..], store[..parent - 1])
   if config_directories(&directories[0]) == 0 {
     notice(app, "Cannot create the trust store directory.")
     return
   }
-  line: [4200]u8 = []
+  line: [4200]u8
   used: usize = 0
-  digest_storage: [64]u8 = []
+  digest_storage: [64]u8
   add_text(line[..], &used, trust_digest(read.data, digest_storage[..]))
   add_text(line[..], &used, " ")
   add_text(line[..], &used, path)
   add_text(line[..], &used, "\n")
   opened := fs.append(store)
-  if opened.failure.kind != io.Kind.Ok {
+  if io.failed(opened.failure) {
     notice(app, "Cannot write the trust store.")
     return
   }
   written := fs.write(&opened.value, line[..used])
   fs.close(&opened.value)
-  if written.failure.kind != io.Kind.Ok {
+  if io.failed(written.failure) {
     notice(app, "Cannot write the trust store.")
     return
   }
@@ -188,7 +188,7 @@ fn project_config_apply(app: *App, parsed: *settings.Settings, global: *const se
   }
   path := state.path[..state.path_length]
   read := fs.read_all(app.scratch, path, 16384)
-  if read.failure.kind != io.Kind.Ok {
+  if io.failed(read.failure) {
     notice(app, "Cannot read dna.toml (maximum 16 KiB); project settings ignored.")
     return false
   }
@@ -197,7 +197,7 @@ fn project_config_apply(app: *App, parsed: *settings.Settings, global: *const se
   layer.lock_count = global.lock_count
   state.trusted = layer.trusted
   if !settings.parse_layer(read.value, parsed, &layer) {
-    message: [256]u8 = []
+    message: [256]u8
     used: usize = 0
     add_text(message[..], &used, "Invalid dna.toml at line ")
     add_number(message[..], &used, parsed.error_line)
@@ -242,10 +242,10 @@ fn project_sections_apply(app: *App, parsed: *settings.Settings, global: *const 
   }
   output := #slice(mem.arena_push(app.scratch, #len(source), 1), #len(source))
   trial := scratch_settings(app)
-  home_storage: [4096]u8 = []
+  home_storage: [4096]u8
   home := host.environment("HOME", home_storage[..])
   home_text: []const u8 = ""
-  if home.failure.kind == io.Kind.Ok && home.found {
+  if !io.failed(home.failure) && home.found {
     home_text = home.value
   }
   project := app.workspace.project[..app.workspace.project_length]
@@ -256,7 +256,7 @@ fn project_sections_apply(app: *App, parsed: *settings.Settings, global: *const 
     layer.locks = global.locks
     layer.lock_count = global.lock_count
     if !settings.parse_layer(output, trial, &layer) {
-      message: [256]u8 = []
+      message: [256]u8
       used := copy_text(message[..], "Invalid [project] section in config at line ")
       add_number(message[..], &used, trial.error_line)
       add_text(message[..], &used, "; it was skipped.")
@@ -270,7 +270,7 @@ fn project_sections_apply(app: *App, parsed: *settings.Settings, global: *const 
 // :config-sources: where the effective settings come from.
 fn config_sources(app: *App) {
   state := &app.project_config
-  report: [8192]u8 = []
+  report: [8192]u8
   used: usize = 0
   add_text(report[..], &used, "Global: ")
   add_text(report[..], &used, app.configuration.path[..app.configuration.path_length])

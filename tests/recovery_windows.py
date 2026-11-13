@@ -43,7 +43,7 @@ pub fn test_roots()i32 {
   roots:[11]usize=[3,3,3,15,14,7,21,0,0,0,0]
   for index in 0..11 {
     path:=paths[index]
-    text:[128]u8=[]
+    text:[128]u8
     _=copy(&text[0],&path[0],#len(path))
     if rec_path_root(&text[0],#len(path))!=roots[index] || rec_absolute(&text[0])!=(roots[index]!=0) { return 0 }
   }

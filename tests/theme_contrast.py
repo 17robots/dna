@@ -16,7 +16,7 @@ fn main(){
   light=mode==1
   t:=default_theme()
   colors:=[t.background,t.surface,t.selection,t.text,t.muted,t.cursor]
-  bytes:[18]u8=[]
+  bytes:[18]u8
   for i in 0..6 {bytes[i*3]=colors[i].red
    bytes[i*3+1]=colors[i].green
    bytes[i*3+2]=colors[i].blue}

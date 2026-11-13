@@ -32,14 +32,14 @@ pub fn test_tools(output:*u8,capacity:usize) usize {
 pub fn test_temporary(path:*u8) i32 { if temporary(path)!=nil { return 1 }
   return 0 }
 pub fn test_pointer(target,path:*const u8) i32 {
-  if installer_symbolic_link(#slice(target, installer_windows_c.string_length(target,4096)),#slice(path, installer_windows_c.string_length(path,4096))).failure.kind == io.Kind.Ok { return 1 }
+  if !io.failed(installer_symbolic_link(#slice(target, installer_windows_c.string_length(target,4096)),#slice(path, installer_windows_c.string_length(path,4096))).failure) { return 1 }
   return 0
 }
 pub fn test_read(path:*const u8,output:*u8,capacity:usize) isize {
   arena:=installer_windows_mem.arena_create(16384)
   defer installer_windows_mem.arena_release(arena)
   read:=installer_read_link(arena,#slice(path, installer_windows_c.string_length(path,4096)))
-  if read.failure.kind != io.Kind.Ok { return read.failure.native }
+  if io.failed(read.failure) { return read.failure.native }
   if #len(read.value)>=capacity { return -28 }
   for index in 0..#len(read.value) { #slice(output, capacity)[index]=read.value[index] }
   #slice(output, capacity)[#len(read.value)]=0
@@ -49,7 +49,7 @@ pub fn test_resolve(path:*const u8,output:*u8,capacity:usize) usize {
   return #len(installer_package_path(#slice(path, installer_windows_c.string_length(path,4096)),#slice(output, capacity)))
 }
 pub fn test_remove(path:*const u8) i32 {
-  if installer_remove_tree(#slice(path, installer_windows_c.string_length(path,4096))).failure.kind == io.Kind.Ok { return 1 }
+  if !io.failed(installer_remove_tree(#slice(path, installer_windows_c.string_length(path,4096))).failure) { return 1 }
   return 0
 }
 pub fn test_executable(path:*const u8) i32 {

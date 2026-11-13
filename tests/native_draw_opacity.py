@@ -33,7 +33,7 @@ pub fn probe_draw(kind:i32,alpha:u8,texture:*u8) bool {
  rect:=Rect{width:8.0,height:8.0}
  if kind==0 {return sdl_fill(nil,&rect)}
  if kind==1 {
-  mask:[64]u8=[]
+  mask:[64]u8
   for i in 0..64 {mask[i]=#cast(u8,(i*41)%256)}
   return native_text_bitmap(nil,&mask[0],8,8,0.0,0.0,color.r,color.g,color.b,alpha)
  }

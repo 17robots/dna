@@ -24,7 +24,7 @@ with tempfile.TemporaryDirectory(prefix='dna-process-close-') as temporary:
   directory: []const u8 = "/tmp\\0"
   child := proc_open(&command[0], &directory[0], false)
   if child.pid <= 0 { #panic("child spawn") }
-  bytes: [5]u8 = []
+  bytes: [5]u8
   used: usize = 0
   deadline := proc_ticks() + 2000
   for used < 5 && proc_ticks() < deadline {

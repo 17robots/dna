@@ -24,19 +24,19 @@ use "./servers" server_discovery
 use "std/fs" frontend_test_fs
 struct ThreadTime { seconds, nanoseconds: i64 }
 fn command_tests() {
-  root_storage:[4096]u8=[]
-  helper_storage:[4096]u8=[]
-  script_storage:[8192]u8=[]
+  root_storage:[4096]u8
+  helper_storage:[4096]u8
+  script_storage:[8192]u8
   root:=host.environment("DNA_COMMAND_ROOT",root_storage[..])
   helper:=host.environment("DNA_COMMAND_HELPER",helper_storage[..])
   script:=host.environment("DNA_COMMAND_SCRIPT",script_storage[..])
   if root.failure.kind != io.Kind.Ok || !root.found || helper.failure.kind != io.Kind.Ok || !helper.found || script.failure.kind != io.Kind.Ok || !script.found { #panic("command fixture environment") }
-  command:[32768]u8=[]
+  command:[32768]u8
   used:usize=0
   if !platform_language_command(command[..],&used,root.value,helper.value,"-c",script.value) || used==0 || command[used]!=0 { #panic("language command builder") }
   for byte in command[..used] { if byte>=128 { #panic("command must contain only ASCII") } }
   if frontend_test_fs.write_all("language-command.txt",command[..used]).failure.kind != io.Kind.Ok { #panic("command fixture write") }
-  protocol_storage:[8192]u8=[]
+  protocol_storage:[8192]u8
   protocol:=host.environment("DNA_COMMAND_PROTOCOL",protocol_storage[..])
   if protocol.failure.kind != io.Kind.Ok || !protocol.found { #panic("protocol fixture environment") }
   used=0
@@ -45,7 +45,7 @@ fn command_tests() {
   if !platform_language_command(command[..],&used,root.value,helper.value,"--version","") || frontend_test_fs.write_all("language-version-command.txt",command[..used]).failure.kind != io.Kind.Ok { #panic("optional name omitted") }
   used=0
   if !platform_language_command(command[..],&used,root.value,helper.value,"-c","import sys;sys.exit(7)") || frontend_test_fs.write_all("language-failure-command.txt",command[..used]).failure.kind != io.Kind.Ok { #panic("failure command") }
-  rejected:[32]u8=[]
+  rejected:[32]u8
   for at in 0..32 { rejected[at]=90 }
   previous:usize=3
   if platform_language_command(rejected[..],&previous,root.value,helper.value,"-c",script.value) || previous!=3 { #panic("command capacity refusal") }
@@ -55,14 +55,14 @@ fn command_tests() {
   for bad in [nul[..],invalid[..]] {
     if platform_language_command(command[..],&previous,root.value,helper.value,"-c",bad) || previous!=3 { #panic("invalid command input") }
   }
-  huge:[10000]u8=[]
+  huge:[10000]u8
   for at in 0..10000 { huge[at]=97 }
   if platform_language_command(command[..],&previous,root.value,helper.value,"-c",huge[..]) || previous!=3 { #panic("cmd encoded length bound") }
-  directory:[32768]u8=[]
+  directory:[32768]u8
   size:=platform_job_directory(directory[..])
   if size<3 || directory[size]!=0 || directory[1]!=58 || directory[2]!=47 || frontend_test_fs.write_all("language-directory.txt",directory[..size]).failure.kind != io.Kind.Ok { #panic("trusted native job directory") }
   if platform_job_directory(rejected[..1])!=0 || rejected[0]!=90 { #panic("job directory capacity") }
-  parent:[64]u8=[]
+  parent:[64]u8
   value:=host.environment("DNA_LANGUAGE_DIR",parent[..])
   expected:[]const u8="parent unchanged"
   if value.failure.kind != io.Kind.Ok || !value.found || #len(value.value)!=#len(expected) { #panic("parent language environment") }
@@ -80,7 +80,7 @@ fn main() {
   first := "session café 日本語\0"
   second := "changed\0"
   if handoff_setenv(&key[0], &first[0], 1) != 0 { #panic("Unicode environment set") }
-  storage: [4096]u8 = []
+  storage: [4096]u8
   value := host.environment(key[..#len(key)-1], storage[..])
   if value.failure.kind != io.Kind.Ok || !value.found || #len(value.value) != #len(first)-1 { #panic("Unicode environment read") }
   for at in 0..#len(value.value) {

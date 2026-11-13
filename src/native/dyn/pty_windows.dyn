@@ -27,7 +27,7 @@ win_pty_api: WinPtyAPI
 win_pty_once: win_proc_sync.Once
 fn win_pty_symbol(library: rawptr, name: []const u8) rawptr {
   result := win_proc_loader.symbol(library, name)
-  if result.failure.kind == io.Kind.Ok {
+  if !io.failed(result.failure) {
     return result.value
   }
   return nil
@@ -45,7 +45,7 @@ fn win_pty_bundle_file(path: []u16, directory: usize, name: []const u8) bool {
 }
 fn win_pty_configure() bool {
   kernel := win_proc_loader.open("kernel32.dll", 0)
-  if kernel.failure.kind != io.Kind.Ok {
+  if io.failed(kernel.failure) {
     return false
   }
   win_pty_api.module = #cast(fn(u32, rawptr, *rawptr) i32, win_pty_symbol(kernel.value, "GetModuleHandleExW"))
@@ -63,7 +63,7 @@ fn win_pty_configure() bool {
   if win_pty_api.module(6, #cast(rawptr, terminal_start), &module) == 0 {
     return false
   }
-  path: [32768]u16 = []
+  path: [32768]u16
   length := win_pty_api.module_path(module, &path[0], 32768)
   if length == 0 || length >= 32768 {
     return false
@@ -130,7 +130,7 @@ fn win_pty_release(owner: *WinPtyOwner) {
   if owner.thread != nil {
     win_proc_sync.store_u32(&owner.stop, 1)
     _ = win_pty_api.signal(owner.event)
-    bytes: [8192]u8 = []
+    bytes: [8192]u8
     for win_proc_sync.load_u32(&owner.done) == 0 {
       // No UI retains these bytes once terminal_stop has taken ownership.
       if owner.output >= 0 {

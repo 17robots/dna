@@ -39,7 +39,7 @@ fn darwin_prepare_errno() {
   if sync.once_begin(&darwin_errno_once) {
     // Darwin RTLD_DEFAULT searches process-lifetime system libraries.
     symbol := dynlib.symbol(#cast(rawptr, #cast(isize, -2)), "__error")
-    if symbol.failure.kind != io.Kind.Ok || symbol.value == nil {
+    if io.failed(symbol.failure) || symbol.value == nil {
       #panic("libSystem errno accessor unavailable")
     }
     darwin_errno_get = #cast(fn() *i32, symbol.value)
@@ -59,7 +59,7 @@ fn darwin_path(path: []const u8, storage: []u8) *const u8 {
     return nil
   }
   encoded := cstring.bounded(storage, path)
-  if encoded.failure.kind != parse.Kind.Ok {
+  if parse.failed(encoded.failure) {
     return nil
   }
   return encoded.value
@@ -82,7 +82,7 @@ fn darwin_metadata(value: i32, info: *const DarwinStat) Metadata {
   return Metadata{ size: #cast(u64, info.size), inode: info.inode, device: #cast(u64, #cast(u32, info.device)), mode: info.mode }
 }
 pub fn metadata(path: []const u8) Metadata {
-  storage: [4096]u8 = []
+  storage: [4096]u8
   name := darwin_path(path, storage[..])
   if name == nil {
     return Metadata{ failure: io.Failure{ kind: io.Kind.InvalidInput, native: -22 } }
@@ -91,7 +91,7 @@ pub fn metadata(path: []const u8) Metadata {
   return darwin_metadata(darwin_stat(name, &info), &info)
 }
 pub fn metadata_nofollow(path: []const u8) Metadata {
-  storage: [4096]u8 = []
+  storage: [4096]u8
   name := darwin_path(path, storage[..])
   if name == nil {
     return Metadata{ failure: io.Failure{ kind: io.Kind.InvalidInput, native: -22 } }
@@ -111,7 +111,7 @@ pub fn open_directory(path: []const u8, storage: []u8) DirectoryResult {
   if #len(storage) < 1024 {
     return DirectoryResult{ failure: io.Failure{ kind: io.Kind.InvalidInput, native: -22 } }
   }
-  path_storage: [4096]u8 = []
+  path_storage: [4096]u8
   name := darwin_path(path, path_storage[..])
   if name == nil {
     return DirectoryResult{ failure: io.Failure{ kind: io.Kind.InvalidInput, native: -22 } }
@@ -163,8 +163,8 @@ pub fn close_directory(directory: *Directory) {
   _ = darwin_result(darwin_closedir(handle))
 }
 fn darwin_move(source: []const u8, destination: []const u8, exclusive: bool) Result {
-  source_storage: [4096]u8 = []
-  destination_storage: [4096]u8 = []
+  source_storage: [4096]u8
+  destination_storage: [4096]u8
   old_name := darwin_path(source, source_storage[..])
   new_name := darwin_path(destination, destination_storage[..])
   if old_name == nil || new_name == nil {
@@ -182,7 +182,7 @@ pub fn rename_noreplace(source: []const u8, destination: []const u8) Result {
   return darwin_move(source, destination, true)
 }
 pub fn remove(path: []const u8) Result {
-  storage: [4096]u8 = []
+  storage: [4096]u8
   name := darwin_path(path, storage[..])
   if name == nil {
     return Result{ failure: io.Failure{ kind: io.Kind.InvalidInput, native: -22 } }
@@ -190,7 +190,7 @@ pub fn remove(path: []const u8) Result {
   return darwin_result(darwin_unlink(name))
 }
 pub fn make_directory(path: []const u8, mode: usize) Result {
-  storage: [4096]u8 = []
+  storage: [4096]u8
   name := darwin_path(path, storage[..])
   if name == nil || mode > 65535 {
     return Result{ failure: io.Failure{ kind: io.Kind.InvalidInput, native: -22 } }
@@ -198,7 +198,7 @@ pub fn make_directory(path: []const u8, mode: usize) Result {
   return darwin_result(darwin_mkdir(name, #cast(u16, mode)))
 }
 pub fn remove_directory(path: []const u8) Result {
-  storage: [4096]u8 = []
+  storage: [4096]u8
   name := darwin_path(path, storage[..])
   if name == nil {
     return Result{ failure: io.Failure{ kind: io.Kind.InvalidInput, native: -22 } }
@@ -206,7 +206,7 @@ pub fn remove_directory(path: []const u8) Result {
   return darwin_result(darwin_rmdir(name))
 }
 pub fn read_link(path: []const u8, destination: []u8) PathResult {
-  storage: [4096]u8 = []
+  storage: [4096]u8
   name := darwin_path(path, storage[..])
   if name == nil || #len(destination) == 0 {
     return PathResult{ failure: io.Failure{ kind: io.Kind.InvalidInput, native: -22 } }
@@ -234,7 +234,7 @@ pub fn set_permissions(file: *File, mode: usize) Result {
 
 // No creation flag: open's variadic mode argument is intentionally absent.
 pub fn open_nofollow(path: []const u8) FileResult {
-  storage: [4096]u8 = []
+  storage: [4096]u8
   name := darwin_path(path, storage[..])
   if name == nil {
     return FileResult{ failure: io.Failure{ kind: io.Kind.InvalidInput, native: -22 } }
@@ -251,7 +251,7 @@ fn atomic_create_exclusive(path: []const u8) FileResult {
   return std_fs.create_exclusive(path)
 }
 pub fn create_private_exclusive(path: []const u8) FileResult {
-  storage: [4096]u8 = []
+  storage: [4096]u8
   name := darwin_path(path, storage[..])
   if name == nil {
     return FileResult{ failure: io.Failure{ kind: io.Kind.InvalidInput, native: -22 } }
@@ -265,7 +265,7 @@ pub fn create_private_exclusive(path: []const u8) FileResult {
 }
 pub fn preserve_permissions(file: *File, source: []const u8) Result {
   info := metadata(source)
-  if info.failure.kind != io.Kind.Ok {
+  if io.failed(info.failure) {
     return Result{ failure: io.Failure{ kind: info.failure.kind, native: info.failure.native } }
   }
   return set_permissions(file, #cast(usize, (info.mode & 511)))
@@ -317,10 +317,10 @@ pub fn clone_exclusive(source: *const File, path: []const u8) FileResult {
   info := file_metadata(source)
   // A read-only origin can still be saved through replacement. Do not change
   // its permissions merely to enable this optimization.
-  if info.failure.kind != io.Kind.Ok || (info.mode & 61440) != 32768 || (info.mode & 128) == 0 {
+  if io.failed(info.failure) || (info.mode & 61440) != 32768 || (info.mode & 128) == 0 {
     return FileResult{ failure: io.Failure{ kind: io.Kind.Unsupported } }
   }
-  storage: [4096]u8 = []
+  storage: [4096]u8
   name := darwin_path(path, storage[..])
   if name == nil {
     return FileResult{ failure: io.Failure{ kind: io.Kind.InvalidInput } }
@@ -340,7 +340,7 @@ pub fn clone_exclusive(source: *const File, path: []const u8) FileResult {
   }
   file := adopt_handle(#cast(isize, descriptor))
   cloned := file_metadata(&file)
-  if cloned.failure.kind != io.Kind.Ok || (cloned.mode & 61440) != 32768 || cloned.size != info.size {
+  if io.failed(cloned.failure) || (cloned.mode & 61440) != 32768 || cloned.size != info.size {
     _ = close(&file)
     _ = darwin_unlink(name)
     return FileResult{ failure: io.Failure{ kind: io.Kind.InvalidState } }
@@ -360,5 +360,5 @@ pub fn resize(file: *File, length: usize) Result {
 
 pub fn executable(path: []const u8) bool {
   info := metadata(path)
-  return info.failure.kind == io.Kind.Ok && (info.mode & 61440) == 32768 && (info.mode & 73) != 0
+  return !io.failed(info.failure) && (info.mode & 61440) == 32768 && (info.mode & 73) != 0
 }

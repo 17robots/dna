@@ -39,9 +39,8 @@ struct LazyLoad {
   phase: u8,
   done: sync.AtomicU32,
 }
-fn lazy_job_run(context: rawptr) isize {
-  job := #cast(*LoadJob, context)
-  _ = load_job_run(context)
+fn lazy_job_run(job: *LoadJob) isize {
+  _ = load_job_run(job)
   _ = sync.fetch_add_u32(&job.owner.done, 1)
   return 0
 }
@@ -73,7 +72,7 @@ pub fn load_storage_lazy(document: *Document, storage: *TextStorage, length: usi
   load.leaves = (load.total + LeafLimit - 1) / LeafLimit
   load.counts = #cast(*usize, rope_malloc(load.leaves * #sizeof(usize)))
   load.tables = #cast(**u16, rope_malloc(load.leaves * #sizeof(*u16)))
-  load.arena = mem.arena_create(4096)
+  load.arena = mem.arena_alloc(4096)
   if load.counts == nil || load.tables == nil {
     #panic("cannot allocate text tables")
   }
@@ -104,19 +103,19 @@ fn lazy_launch(load: *LazyLoad, phase: u8) {
   for index in 0..load.workers {
     load.jobs[index].fill = phase == 2
     load.started[index] = false
-    spawned := thread.spawn_with_size(load.arena, ParallelStack, lazy_job_run, #cast(rawptr, &load.jobs[index]))
-    if spawned.failure.kind == io.Kind.Ok {
+    spawned := thread.spawn_with_size(load.arena, ParallelStack, lazy_job_run, &load.jobs[index])
+    if !io.failed(spawned.failure) {
       load.threads[index] = spawned.value
       load.started[index] = true
     } else {
-      _ = lazy_job_run(#cast(rawptr, &load.jobs[index]))
+      _ = lazy_job_run(&load.jobs[index])
     }
   }
 }
 fn lazy_join(load: *LazyLoad) {
   for index in 0..load.workers {
     if load.started[index] {
-      if thread.join(load.threads[index]).failure.kind != io.Kind.Ok {
+      if io.failed(thread.join(load.threads[index]).failure) {
         #panic("cannot join text loader")
       }
       load.started[index] = false

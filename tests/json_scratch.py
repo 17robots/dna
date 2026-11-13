@@ -11,6 +11,11 @@ ROOT = Path(__file__).resolve().parents[1]
 DYN = os.environ.get('DYN', str(ROOT.parent / 'dyn/compiler/build/dyn-release'))
 
 
+def initializer(data):
+    # An empty array needs no initializer: a declaration is already zero.
+    return f' = {bytes_literal(data)}' if data else ''
+
+
 def bytes_literal(value):
     return '[' + ','.join(str(byte) for byte in value) + ']'
 
@@ -23,6 +28,7 @@ use "std/io"
 use "std/thread"
 use "std/sync"
 use "std/parse"
+use "std/math"
 use "./buffer" buffer
 ''' + helpers + '''
 fn same(a: []const u8, b: []const u8) bool {
@@ -45,10 +51,10 @@ fn check_string(input: []const u8, expected: []const u8) {
   unchanged(output[#len(expected)..])
 }
 fn check_value(input: []const u8, expected: []const u8) {
-  arena := mem.arena_create(4096)
+  arena := mem.arena_alloc(4096)
   defer mem.arena_release(arena)
   parsed := json.parse(arena, input)
-  if parsed.failure.kind != parse.Kind.Ok { #panic("invalid test input") }
+  if parse.failed(parsed.failure) { #panic("invalid test input") }
   output: [1024]u8
   for index in 0..#len(output) { output[index] = 165 }
   if #len(lsp_json_encode(output[..#len(expected) - 1], parsed.root)) != 0 { #panic("short nested output accepted") }
@@ -72,7 +78,7 @@ fn aliased(input: []const u8) {
   if #len(lsp_json_encode(output[..64], &value)) != 0 || !same(output[..], saved[..]) { #panic("key alias") }
 }
 fn main() {
-  arena := mem.arena_create(#sizeof(buffer.Document) + 4096)
+  arena := mem.arena_alloc(#sizeof(buffer.Document) + 4096)
   defer mem.arena_release(arena)
   document := buffer.allocate(arena)
   defer buffer.release(document)
@@ -84,7 +90,7 @@ fn main() {
   if #len(lsp_json_document(encoded[..0], document, 0, document.length)) != 0 { #panic("document JSON empty output") }
   // Past LspParallelEscape the encoder splits across threads; slices meet at
   // arbitrary bytes, so the result must still match the serial encoding.
-  large_arena := mem.arena_create(160000000)
+  large_arena := mem.arena_alloc(160000000)
   defer mem.arena_release(large_arena)
   large := mem.push_bytes_uninit(large_arena, 20000003)
   pattern: [10]u8 = [97, 98, 34, 92, 10, 9, 1, 195, 169, 122]
@@ -106,12 +112,12 @@ strings = ['', 'plain', 'a"b\\c\n\r\t\b\f', ''.join(chr(i) for i in range(32)), 
 for index, value in enumerate(strings):
     raw = value.encode()
     expected = json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode()
-    fixture += f'  string{index}: [{len(raw)}]u8 = {bytes_literal(raw)}\n  expected{index}: [{len(expected)}]u8 = {bytes_literal(expected)}\n  check_string(string{index}[..], expected{index}[..])\n'
+    fixture += f'  string{index}: [{len(raw)}]u8{initializer(raw)}\n  expected{index}: [{len(expected)}]u8{initializer(expected)}\n  check_string(string{index}[..], expected{index}[..])\n'
 for index, value in enumerate(({'outer': [None, True, False, 12, 'a\nb', {'x': 'é'}]}, [[], {}, [0, -12]], {})):
     encoded = json.dumps(value, ensure_ascii=False, separators=(',', ':')).encode()
-    fixture += f'  json{index}: [{len(encoded)}]u8 = {bytes_literal(encoded)}\n  check_value(json{index}[..], json{index}[..])\n'
+    fixture += f'  json{index}: [{len(encoded)}]u8{initializer(encoded)}\n  check_value(json{index}[..], json{index}[..])\n'
 for index, value in enumerate((b'raw', b'\n\t', bytes([1, 2, 3]), b'"\\')):
-    fixture += f'  alias{index}: [{len(value)}]u8 = {bytes_literal(value)}\n  aliased(alias{index}[..])\n'
+    fixture += f'  alias{index}: [{len(value)}]u8{initializer(value)}\n  aliased(alias{index}[..])\n'
 fixture += '''  output: [16]u8
   for index in 0..#len(output) { output[index] = 165 }
   invalid: [1]u8 = [255]
@@ -122,13 +128,13 @@ fixture += '''  output: [16]u8
   unchanged(output[..])
   state := LspJsonOutput{ bytes: output[..2], writing: true }
   rejected := lsp_json_write(#cast(rawptr, &state), "long")
-  if rejected.status != io.Status.Error || rejected.transferred != 0 || state.used != 0 { #panic("callback partial failure") }
+  if !io.failed(rejected.failure) || rejected.transferred != 0 || state.used != 0 { #panic("callback partial failure") }
   unchanged(output[..])
   state.writing = false
   rejected = lsp_json_write(#cast(rawptr, &state), "long")
-  if rejected.status != io.Status.Error || state.used != 0 { #panic("count callback failure") }
+  if !io.failed(rejected.failure) || state.used != 0 { #panic("count callback failure") }
   unchanged(output[..])
-  node_storage: [16]u64 = []
+  node_storage: [16]u64
   node := #cast(*json.Value, &node_storage[0])
   node.* = json.Value{ kind: json.KindNull }
   before := node_storage

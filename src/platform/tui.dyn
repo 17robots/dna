@@ -110,7 +110,7 @@ pub fn tui_start() bool {
     // loader can touch a huge BSS page before we can apply a residency hint.
     // Fresh owning mappings supply zero cells without touching unused rows.
     count := MaxColumns * MaxRows
-    screen_storage = mem.arena_create(2 * count * #sizeof(Cell) + 1048576 + mem.ArenaBufferOverhead)
+    screen_storage = mem.arena_alloc(2 * count * #sizeof(Cell) + 1048576 + mem.ArenaBufferOverhead)
     host.small_pages(screen_storage.data)
     grid = #slice((#cast(*Cell, mem.arena_push_uninit(screen_storage, count * #sizeof(Cell), #alignof(Cell)))), count)
     shown = #slice((#cast(*Cell, mem.arena_push_uninit(screen_storage, count * #sizeof(Cell), #alignof(Cell)))), count)
@@ -126,14 +126,14 @@ pub fn tui_start() bool {
   return true
 }
 fn environment_is(name: []const u8, wanted: []const u8) bool {
-  storage: [4096]u8 = []
+  storage: [4096]u8
   value := host.environment(name[..#len(name) - 1], storage[..])
-  return value.failure.kind == io.Kind.Ok && value.found && buffer_equal(value.value, wanted)
+  return !io.failed(value.failure) && value.found && buffer_equal(value.value, wanted)
 }
 fn environment_contains(name: []const u8, part: []const u8) bool {
-  storage: [4096]u8 = []
+  storage: [4096]u8
   value := host.environment(name[..#len(name) - 1], storage[..])
-  return value.failure.kind == io.Kind.Ok && value.found && find(value.value, part, 0) < #len(value.value)
+  return !io.failed(value.failure) && value.found && find(value.value, part, 0) < #len(value.value)
 }
 // 24-bit color when the terminal says so (COLORTERM, a -direct TERM) or is
 // known to; DNA_TRUECOLOR=1 or 0 overrides either way.
@@ -164,9 +164,9 @@ fn undercurl_supported() bool {
   if environment_is("DNA_UNDERCURL\0", "0") {
     return false
   }
-  vte_storage: [4096]u8 = []
+  vte_storage: [4096]u8
   vte := host.environment("VTE_VERSION", vte_storage[..])
-  if vte.failure.kind == io.Kind.Ok && vte.found {
+  if !io.failed(vte.failure) && vte.found {
     return true
   }
   known: [5][]const u8 = ["kitty", "wezterm", "foot", "ghostty", "contour"]
@@ -480,7 +480,7 @@ fn put_character(column: i32, row: i32, character: u32, foreground: u32, italic:
 // Text objects: UTF-8 laid out in whole cells (monospace terminals).
 
 pub struct TuiText { bytes: rawptr, length: usize, capacity: usize, color: u32, wrap: i32, alive: bool, italic: bool }
-texts: [4096]TuiText = []
+texts: [4096]TuiText
 
 pub fn tui_text_create() rawptr {
   for index in 0..4096 {
@@ -724,7 +724,7 @@ fn emit(bytes: []const u8) {
   }
 }
 fn emit_number(value: u32) {
-  digits: [12]u8 = []
+  digits: [12]u8
   count: usize = 0
   remaining := value
   for {
@@ -738,7 +738,7 @@ fn emit_number(value: u32) {
   emit(digits[12 - count..])
 }
 fn emit_character(character: u32) {
-  encoded: [4]u8 = []
+  encoded: [4]u8
   if character < 128 {
     encoded[0] = #cast(u8, character)
     emit(encoded[..1])
@@ -1012,14 +1012,14 @@ pub fn tui_clipboard_set(text: *const u8, length: usize) {
   for at < length {
     a := #cast(u32, bytes[at])
     b: u32 = 0
-    c: u32 = 0
+    ch: u32 = 0
     if at + 1 < length {
       b = #cast(u32, bytes[at + 1])
     }
     if at + 2 < length {
-      c = #cast(u32, bytes[at + 2])
+      ch = #cast(u32, bytes[at + 2])
     }
-    group := (a << 16) | (b << 8) | c
+    group := (a << 16) | (b << 8) | ch
     quad: [4]u8 = [alphabet[#cast(usize, ((group >> 18) & 63))], alphabet[#cast(usize, ((group >> 12) & 63))], alphabet[#cast(usize, ((group >> 6) & 63))], alphabet[#cast(usize, (group & 63))]]
     if at + 1 >= length {
       quad[2] = '='
@@ -1422,7 +1422,7 @@ fn parse_one(force_escape: bool) usize {
   }
   // SGR mouse: ESC [ < b ; x ; y M|m
   if #len(parameters) > 0 && parameters[0] == '<' && (final == 'M' || final == 'm') {
-    values: [3]u32 = []
+    values: [3]u32
     count := numbers(parameters[1..], values[..])
     if count == 3 {
       button := values[0]
@@ -1485,7 +1485,7 @@ fn parse_one(force_escape: bool) usize {
       }
       queue_key(code, modifiers, character)
       if (modifiers & (ModCtrl | ModAlt)) == 0 && code >= 32 {
-        encoded: [4]u8 = []
+        encoded: [4]u8
         queue_text(encoded[..encode(character, encoded[..])])
       }
     }

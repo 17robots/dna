@@ -64,15 +64,15 @@ pub fn resolve(path: []const u8, output: []u8) []const u8 {
       return output[..0]
     }
   }
-  normalized: [4096]u8 = []
+  normalized: [4096]u8
   path = file_normalize_path(path, normalized[..])
   if #len(path) == 0 {
     return output[..0]
   }
-  parent_storage: [4096]u8 = []
-  absolute: [4096]u8 = []
+  parent_storage: [4096]u8
+  absolute: [4096]u8
   parent := bounded_string(parent_storage[..], paths.dirname(path))
-  if parent.failure.kind != parse.Kind.Ok || realpath(parent.value, &absolute[0]) == nil {
+  if parse.failed(parent.failure) || realpath(parent.value, &absolute[0]) == nil {
     return output[..0]
   }
   length := c.string_length(&absolute[0], 4096)
@@ -169,7 +169,7 @@ fn save_seed(destination: []const u8, temporary: []const u8, snapshot: *const bu
       before := fs.file_stamp(&origin)
       if before.valid && same_values(stamp_values(before), source.stamp) {
         cloned := fs.clone_exclusive(&origin, temporary)
-        if cloned.failure.kind == io.Kind.Ok {
+        if !io.failed(cloned.failure) {
           transaction := fs.AtomicFile{file: cloned.value, destination: destination, temporary: temporary, active: true}
           after := fs.file_stamp(&origin)
           if after.valid && same_stamp(before, after) {
@@ -191,7 +191,7 @@ fn save_seed(destination: []const u8, temporary: []const u8, snapshot: *const bu
 // writing and immediately before publication, not only before reading a run.
 fn mapped_sources_current(snapshot: *const buffer.TextSnapshot) bool {
   checked: isize = -1
-  checked_stamp: [6]u64 = []
+  checked_stamp: [6]u64
   at: usize = 0
   for at < snapshot.length {
     source := buffer.snapshot_source_at(snapshot, at)
@@ -214,7 +214,7 @@ fn mapped_sources_current(snapshot: *const buffer.TextSnapshot) bool {
 // that was opened, so it is never written: mapped_changed reports that.
 fn write_document(file: *fs.File, snapshot: *const buffer.TextSnapshot, seed: *const CloneSeed, mapped_changed: *bool) bool {
   checked: isize = -1
-  checked_stamp: [6]u64 = []
+  checked_stamp: [6]u64
   usable := false
   current := false
   at: usize = 0
@@ -241,14 +241,14 @@ fn write_document(file: *fs.File, snapshot: *const buffer.TextSnapshot, seed: *c
           next += #len(following.bytes)
         }
         if seed.descriptor == source.descriptor && source.offset == #cast(u64, at) && same_values(seed.stamp, source.stamp) {
-          if fs.seek(file, next).failure.kind != io.Kind.Ok {
+          if io.failed(fs.seek(file, next).failure) {
             return false
           }
           at = next
           continue
         }
         copied := fs.copy_range(&origin, source.offset, file, next - at)
-        if copied.failure.kind == io.Kind.Ok {
+        if !io.failed(copied.failure) {
           at = next
           continue
         }
@@ -262,7 +262,7 @@ fn write_document(file: *fs.File, snapshot: *const buffer.TextSnapshot, seed: *c
         return false
       }
     }
-    if fs.write(file, source.bytes).failure.kind != io.Kind.Ok {
+    if io.failed(fs.write(file, source.bytes).failure) {
       return false
     }
     at += length
@@ -285,7 +285,7 @@ pub fn set_mapper(map: fn(isize, u64) *u8, unmap: fn(*u8, u64)) {
 // unchanged parts cost no private memory and open time does not copy it.
 fn read_mapped(path: []const u8) FileText {
   opened := fs.open(path)
-  if opened.failure.kind != io.Kind.Ok {
+  if io.failed(opened.failure) {
     return FileText{}
   }
   stamp := fs.file_stamp(&opened.value)
@@ -316,7 +316,7 @@ fn read_bounded(path: []const u8, limit: usize) FileText {
   room := limit
   if limit > buffer.Capacity {
     info := fs.metadata(path)
-    if info.failure.kind == io.Kind.Ok && #cast(usize, info.size) < limit - 16777216 {
+    if !io.failed(info.failure) && #cast(usize, info.size) < limit - 16777216 {
       room = #cast(usize, info.size) + 16777216
     }
   }
@@ -335,7 +335,7 @@ fn read_bounded(path: []const u8, limit: usize) FileText {
     storage = mem.push_bytes_uninit(result.arena, room + 1)
   }
   opened := fs.open(path)
-  if opened.failure.kind != io.Kind.Ok {
+  if io.failed(opened.failure) {
     release_text(&result)
     return FileText{}
   }
@@ -353,7 +353,7 @@ fn read_bounded(path: []const u8, limit: usize) FileText {
       free = 1048576
     }
     part := fs.read(&opened.value, storage[total..total + free])
-    if part.failure.kind != io.Kind.Ok {
+    if io.failed(part.failure) {
       failed = true
       break
     }
@@ -389,7 +389,7 @@ fn read_bounded(path: []const u8, limit: usize) FileText {
 // to the last complete line when the file continues past them.
 pub fn read_prefix(arena: *mem.Arena, path: []const u8, maximum: usize) []const u8 {
   opened := fs.open(path)
-  if opened.failure.kind != io.Kind.Ok {
+  if io.failed(opened.failure) {
     return ""
   }
   defer fs.close(&opened.value)
@@ -400,7 +400,7 @@ pub fn read_prefix(arena: *mem.Arena, path: []const u8, maximum: usize) []const 
   total: usize = 0
   for total < maximum {
     part := fs.read(&opened.value, storage[total..])
-    if part.failure.kind != io.Kind.Ok {
+    if io.failed(part.failure) {
       return ""
     }
     if part.transferred == 0 {
@@ -429,12 +429,12 @@ pub fn open(state: *State, document: *buffer.Document, path: []const u8, scratch
   if #len(path) == 0 || #len(path) >= 4000 {
     return "Invalid or too-long file path."
   }
-  link_storage: [4096]u8 = []
-  if fs.read_link(path, link_storage[..]).failure.kind == io.Kind.Ok {
+  link_storage: [4096]u8
+  if !io.failed(fs.read_link(path, link_storage[..]).failure) {
     return "Open the symlink target explicitly; symlink editing is not supported yet."
   }
   info := metadata(path)
-  if info.failure.kind != io.Kind.Ok || (info.mode & 61440) != 32768 {
+  if io.failed(info.failure) || (info.mode & 61440) != 32768 {
     return "Cannot open: expected a readable regular file."
   }
   read := read_document(path)
@@ -462,7 +462,7 @@ pub fn open(state: *State, document: *buffer.Document, path: []const u8, scratch
 }
 fn path_stamp(path: []const u8) fs.Stamp {
   opened := fs.open(path)
-  if opened.failure.kind != io.Kind.Ok {
+  if io.failed(opened.failure) {
     return fs.Stamp{}
   }
   stamp := fs.file_stamp(&opened.value)
@@ -518,20 +518,20 @@ pub fn save_start(job: *SaveJob, state: *State, document: *const buffer.Document
   }
   job.same = buffer.equal(path, name(state))
   info := metadata(path)
-  link_storage: [4096]u8 = []
-  if fs.read_link(path, link_storage[..]).failure.kind == io.Kind.Ok {
+  link_storage: [4096]u8
+  if !io.failed(fs.read_link(path, link_storage[..]).failure) {
     job.error = "Refusing to replace a symlink."
     return false
   }
-  if info.failure.kind == io.Kind.Ok && (!job.same || !unchanged(state, document, path, scratch)) {
+  if !io.failed(info.failure) && (!job.same || !unchanged(state, document, path, scratch)) {
     job.error = "File exists or changed externally. Save As a different path."
     return false
   }
-  if job.same && info.failure.kind != io.Kind.Ok {
+  if job.same && io.failed(info.failure) {
     job.error = "Original file disappeared; use Save As."
     return false
   }
-  if info.failure.kind == io.Kind.Ok && (info.mode & 61440) != 32768 {
+  if !io.failed(info.failure) && (info.mode & 61440) != 32768 {
     job.error = "Destination is not a regular file."
     return false
   }
@@ -545,13 +545,13 @@ pub fn save_start(job: *SaveJob, state: *State, document: *const buffer.Document
   } else {
     transaction = fs.atomic_begin(job.path[..job.path_length], temporary)
   }
-  if transaction.failure.kind != io.Kind.Ok {
+  if io.failed(transaction.failure) {
     buffer.snapshot_release(&job.snapshot)
     job.error = "Cannot create save temporary file; check permissions or a leftover .dna-write file."
     return false
   }
   job.transaction = transaction.transaction
-  if info.failure.kind == io.Kind.Ok && fs.preserve_permissions(&job.transaction.file, path).failure.kind != io.Kind.Ok {
+  if !io.failed(info.failure) && io.failed(fs.preserve_permissions(&job.transaction.file, path).failure) {
     save_abort(job)
     job.error = "Cannot preserve file permissions."
     return false
@@ -560,7 +560,7 @@ pub fn save_start(job: *SaveJob, state: *State, document: *const buffer.Document
 }
 // Stream the snapshot's storage chunks (no flattened copy) and flush them.
 pub fn save_write(job: *SaveJob) {
-  job.written = write_document(&job.transaction.file, &job.snapshot, &job.seed, &job.mapped_changed) && (job.seed.descriptor < 0 || fs.resize(&job.transaction.file, job.snapshot.length).failure.kind == io.Kind.Ok) && fs.sync(&job.transaction.file).failure.kind == io.Kind.Ok
+  job.written = write_document(&job.transaction.file, &job.snapshot, &job.seed, &job.mapped_changed) && (job.seed.descriptor < 0 || !io.failed(fs.resize(&job.transaction.file, job.snapshot.length).failure)) && !io.failed(fs.sync(&job.transaction.file).failure)
 }
 // Drop a started save without touching the destination.
 pub fn save_abort(job: *SaveJob) {
@@ -586,7 +586,7 @@ pub fn save_finish(job: *SaveJob, state: *State, document: *buffer.Document, scr
     if !unchanged(state, document, path, scratch) {
       return "File changed during save; original was not replaced."
     }
-    if fs.atomic_commit(&job.transaction).failure.kind != io.Kind.Ok {
+    if io.failed(fs.atomic_commit(&job.transaction).failure) {
       return "Atomic save failed."
     }
     // Replacing the pathname changes the old inode's ctime even though the
@@ -609,16 +609,16 @@ pub fn save_finish(job: *SaveJob, state: *State, document: *buffer.Document, scr
   } else {
     synced := fs.sync(&job.transaction.file)
     fs.close(&job.transaction.file)
-    if synced.failure.kind != io.Kind.Ok {
+    if io.failed(synced.failure) {
       return "Cannot flush new file."
     }
     // RENAME_NOREPLACE prevents a racing creator from being overwritten.
-    if fs.rename_noreplace(job.transaction.temporary, path).failure.kind != io.Kind.Ok {
+    if io.failed(fs.rename_noreplace(job.transaction.temporary, path).failure) {
       return "Cannot create new file without replacing an existing destination."
     }
     job.transaction.active = false
   }
-  old_recovery: [4096]u8 = []
+  old_recovery: [4096]u8
   old_path := suffix(name(state), ".dna-recovery", old_recovery[..])
   if state.recovery_owned {
     _ = fs.remove(old_path)
@@ -644,12 +644,12 @@ pub fn recover(state: *State, document: *buffer.Document, scratch: *mem.Arena) [
   if buffer.dirty(document) {
     return "Save or discard current edits before restoring recovery."
   }
-  storage: [4096]u8 = []
+  storage: [4096]u8
   path := suffix(name(state), ".dna-recovery", storage[..])
   mark := mem.arena_mark(scratch)
   defer mem.arena_rewind(scratch, mark)
   info := metadata(path)
-  if info.failure.kind != io.Kind.Ok || (info.mode & 61440) != 32768 {
+  if io.failed(info.failure) || (info.mode & 61440) != 32768 {
     return "Recovery snapshot must be a regular file."
   }
   result := read_text(path)
@@ -666,7 +666,7 @@ pub fn recover(state: *State, document: *buffer.Document, scratch: *mem.Arena) [
 }
 pub fn discard_recovery(state: *State) {
   if state.recovery_owned {
-    storage: [4096]u8 = []
+    storage: [4096]u8
     path := suffix(name(state), ".dna-recovery", storage[..])
     _ = fs.remove(path)
     state.recovery_owned = false
@@ -674,9 +674,9 @@ pub fn discard_recovery(state: *State) {
 }
 
 pub fn directory_path(path: []const u8, output: []u8) usize {
-  encoded: [4096]u8 = []
+  encoded: [4096]u8
   name := bounded_string(encoded[..], path)
-  if #len(output) < 4096 || name.failure.kind != parse.Kind.Ok || realpath(name.value, &output[0]) == nil {
+  if #len(output) < 4096 || parse.failed(name.failure) || realpath(name.value, &output[0]) == nil {
     return 0
   }
   return c.string_length(&output[0], 4096)

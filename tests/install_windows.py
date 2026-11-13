@@ -42,7 +42,7 @@ fn main() {
   // must still address that same object, without reopening its stale pathname.
   if install_rename(-100,&root[0],-100,&moved[0],1)!=0 { #panic("parent rename") }
   fd:=install_openat(root_fd,&leaf[0],655360|2048,0)
-  text:[5]u8=[]
+  text:[5]u8
   if fd<0 || test_read(fd,&text[0],5)!=5 || text[0]!=72 || text[4]!=79 || install_fstat(fd,&info)!=0 || info.size!=5 || rec_close(fd)!=0 { #panic("relative file after parent rename") }
   if install_fstatat(root_fd,&leaf[0],&info,256)!=0 || (info.mode&61440)!=32768 || info.inode==0 { #panic("relative metadata") }
   original:=info
@@ -104,7 +104,7 @@ fn main() {
   }
   if handles(install_win_api.process(),&after)==0 || before!=after { #panic("relative IO handle leak") }
   if rec_close(root_fd)!=0 { #panic("root ownership") }
-  temporary:[32]u8=[]
+  temporary:[32]u8
   pattern:[]const u8="private-XXXXXX"
   for at in 0..#len(pattern) { temporary[at]=pattern[at] }
   if install_mkdtemp(&temporary[0])==nil || install_lstat(&temporary[0],&info)!=0 || (info.mode&61440)!=16384 || install_rmdir(&temporary[0])!=0 { #panic("private temporary directory") }

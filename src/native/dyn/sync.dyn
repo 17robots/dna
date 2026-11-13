@@ -74,9 +74,9 @@ pub fn dna_condition_signal(condition: rawptr) {
   _ = sync_condition_signal(condition)
 }
 fn sync_run(pointer: rawptr) rawptr {
-  thread := #cast(*NativeThread, pointer)
-  thread.result = thread.entry(thread.state)
-  sync.store_u32(&thread.finished, 1)
+  thread_value := #cast(*NativeThread, pointer)
+  thread_value.result = thread_value.entry(thread_value.state)
+  sync.store_u32(&thread_value.finished, 1)
   return nil
 }
 // Only successfully joined records may be freed. On a persistent join
@@ -88,12 +88,12 @@ fn sync_collect_threads() {
   _ = sync_mutex_lock(#cast(rawptr, &sync_retired_lock))
   link := &sync_retired_threads
   for link.* != nil {
-    thread := link.*
-    if sync_thread_join(thread.handle, nil) == 0 {
-      link.* = thread.retired_next
-      rec_free(#cast(rawptr, thread))
+    thread_value := link.*
+    if sync_thread_join(thread_value.handle, nil) == 0 {
+      link.* = thread_value.retired_next
+      rec_free(#cast(rawptr, thread_value))
     } else {
-      link = &thread.retired_next
+      link = &thread_value.retired_next
     }
   }
   _ = sync_mutex_unlock(#cast(rawptr, &sync_retired_lock))
@@ -103,43 +103,43 @@ pub fn dna_thread_create(entry: fn(rawptr) i32, state: rawptr) rawptr {
     return nil
   }
   sync_collect_threads()
-  thread := #cast(*NativeThread, rec_malloc(#sizeof(NativeThread)))
-  if thread == nil {
+  thread_value := #cast(*NativeThread, rec_malloc(#sizeof(NativeThread)))
+  if thread_value == nil {
     return nil
   }
-  thread.* = NativeThread{entry: entry, state: state}
-  if sync_thread_create(&thread.handle, nil, sync_run, #cast(rawptr, thread)) != 0 {
-    rec_free(#cast(rawptr, thread))
+  thread_value.* = NativeThread{entry: entry, state: state}
+  if sync_thread_create(&thread_value.handle, nil, sync_run, #cast(rawptr, thread_value)) != 0 {
+    rec_free(#cast(rawptr, thread_value))
     return nil
   }
-  return #cast(rawptr, thread)
+  return #cast(rawptr, thread_value)
 }
 pub fn dna_thread_join(pointer: rawptr, status: *i32) {
-  thread := #cast(*NativeThread, pointer)
-  if thread == nil {
+  thread_value := #cast(*NativeThread, pointer)
+  if thread_value == nil {
     return
   }
-  if sync_thread_is_self(thread.handle) {
+  if sync_thread_is_self(thread_value.handle) {
     // Returning would let the caller release the state this entry still uses.
     #panic("cannot join the current native thread")
   }
-  joined := sync_thread_join(thread.handle, nil) == 0
+  joined := sync_thread_join(thread_value.handle, nil) == 0
   if !joined {
-    for sync.load_u32(&thread.finished) == 0 {
+    for sync.load_u32(&thread_value.finished) == 0 {
       _ = time.sleep(time.Millisecond)
     }
-    joined = sync_thread_join(thread.handle, nil) == 0
+    joined = sync_thread_join(thread_value.handle, nil) == 0
   }
   if status != nil {
-    status.* = thread.result
+    status.* = thread_value.result
   }
   if joined {
-    rec_free(#cast(rawptr, thread))
+    rec_free(#cast(rawptr, thread_value))
     sync_collect_threads()
   } else {
     _ = sync_mutex_lock(#cast(rawptr, &sync_retired_lock))
-    thread.retired_next = sync_retired_threads
-    sync_retired_threads = thread
+    thread_value.retired_next = sync_retired_threads
+    sync_retired_threads = thread_value
     _ = sync_mutex_unlock(#cast(rawptr, &sync_retired_lock))
   }
 }

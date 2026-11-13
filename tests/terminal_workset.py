@@ -53,8 +53,8 @@ fn terminal_needs_poll(handle: rawptr) i32 { if handle != nil { return 1 }; retu
 model += '''
 fn main() {
   app := App{}
-  slots: [80]Slot = []
-  pointers: [80]*Slot = []
+  slots: [80]Slot
+  pointers: [80]*Slot
   for index in 0..80 { pointers[index] = &slots[index] }
   app.documents.slots = pointers[..]
   if terminals_running(&app) || terminals_waiting_for_exit(&app) || terminal_escape_due(&app) != 0 { #panic("empty terminal state") }

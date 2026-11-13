@@ -59,18 +59,18 @@ extern fn system_font_families "dna_font_families"(output: *u8, capacity: usize)
 
 fn config_location(app: *App) {
   settings.defaults(&app.config)
-  storage: [4096]u8 = []
+  storage: [4096]u8
   configured := host.environment("DNA_CONFIG", storage[..])
-  if configured.failure.kind == io.Kind.Ok && configured.found {
+  if !io.failed(configured.failure) && configured.found {
     app.configuration.path_length = copy_text(app.configuration.path[..], configured.value)
     return
   }
   base := host.environment("XDG_CONFIG_HOME", storage[..])
-  if base.failure.kind == io.Kind.Ok && base.found && #len(base.value) > 0 {
+  if !io.failed(base.failure) && base.found && #len(base.value) > 0 {
     app.configuration.path_length = copy_text(app.configuration.path[..], base.value)
   } else {
     home := host.environment("HOME", storage[..])
-    if home.failure.kind != io.Kind.Ok || !home.found {
+    if io.failed(home.failure) || !home.found {
       return
     }
     app.configuration.path_length = copy_text(app.configuration.path[..], home.value)
@@ -109,7 +109,7 @@ fn config_reload(app: *App, typography: *Typography, startup: bool) {
   defer mem.arena_rewind(app.scratch, mark)
   // Without a global file the defaults stand in, and a dna.toml still applies.
   read := fs.ReadAllResult{}
-  if files.metadata(path).failure.kind == io.Kind.Ok {
+  if !io.failed(files.metadata(path).failure) {
     read = fs.read_all(app.scratch, path, 16384)
   } else if startup {
     project_config_find(app)
@@ -118,7 +118,7 @@ fn config_reload(app: *App, typography: *Typography, startup: bool) {
       return
     }
   }
-  if read.failure.kind != io.Kind.Ok {
+  if io.failed(read.failure) {
     notice(app, "Cannot read config (maximum 16 KiB).")
     return
   }
@@ -126,7 +126,7 @@ fn config_reload(app: *App, typography: *Typography, startup: bool) {
   settings.defaults(&parsed)
   global_layer := settings.Layer{}
   if !settings.parse_layer(read.value, &parsed, &global_layer) {
-    message: [256]u8 = []
+    message: [256]u8
     used: usize = 0
     add_text(message[..], &used, "Invalid config at line ")
     add_number(message[..], &used, parsed.error_line)
@@ -174,12 +174,12 @@ fn config_reload(app: *App, typography: *Typography, startup: bool) {
   }
   parsed.theme_path = ""
   replacement: rawptr = nil
-  resolved_font: [4096]u8 = []
+  resolved_font: [4096]u8
   resolved_font_length: usize = 0
-  resolved_fallback: [4096]u8 = []
+  resolved_fallback: [4096]u8
   resolved_fallback_length: usize = 0
   if parsed.font_length > 0 {
-    font_storage: [4096]u8 = []
+    font_storage: [4096]u8
     font_path := expand_home(parsed.font[..parsed.font_length], font_storage[..])
     if #len(font_path) == 0 {
       notice(app, "Invalid font path; settings unchanged.")
@@ -193,8 +193,8 @@ fn config_reload(app: *App, typography: *Typography, startup: bool) {
     }
   }
   if parsed.font_length == 0 && #len(parsed.font_family) > 0 {
-    family: [257]u8 = []
-    resolved_family: [4096]u8 = []
+    family: [257]u8
+    resolved_family: [4096]u8
     _ = copy_text(family[..], parsed.font_family)
     if match_system_font(&family[0], &resolved_family[0], 4096) == 0 {
       notice(app, "Cannot resolve configured font family. Settings unchanged.")
@@ -209,7 +209,7 @@ fn config_reload(app: *App, typography: *Typography, startup: bool) {
   }
   fallback: rawptr = nil
   if #len(parsed.fallback) > 0 {
-    fallback_storage: [4096]u8 = []
+    fallback_storage: [4096]u8
     fallback_path := expand_home(parsed.fallback, fallback_storage[..])
     resolved_fallback_length = copy_text(resolved_fallback[..], fallback_path)
     if #len(fallback_path) > 0 {
@@ -320,7 +320,7 @@ fn config_reload(app: *App, typography: *Typography, startup: bool) {
   app.view.revision += 1
   app.prompt_state.panel = Panel.None
   // A missing global file is a known state (zero stamps) until it appears.
-  app.configuration.stamp_ready = file_stamp(&app.configuration.path[0], &app.configuration.stamp[0]) != 0 || files.metadata(path).failure.kind != io.Kind.Ok
+  app.configuration.stamp_ready = file_stamp(&app.configuration.path[0], &app.configuration.stamp[0]) != 0 || io.failed(files.metadata(path).failure)
 }
 fn font_refresh(app: *App) {
   app.completion.count = 0
@@ -357,7 +357,7 @@ fn font_select(app: *App, typography: *Typography, path: []const u8) {
     notice(app, "TUI fonts and size are set in your terminal emulator. Choose a Nerd Font there for icons.")
     return
   }
-  storage: [4096]u8 = []
+  storage: [4096]u8
   expanded := expand_home(path, storage[..])
   if #len(expanded) == 0 {
     notice(app, "Invalid font path.")
@@ -576,7 +576,7 @@ fn configured_key(app: *App, typography: *Typography, key: u32, modifiers: u16) 
     return false
   }
   typed := binding_stroke(app, key, modifiers)
-  keys: [5]settings.Stroke = []
+  keys: [5]settings.Stroke
   for index in 0..state.count {
     keys[index] = state.pending[index]
   }
@@ -643,7 +643,7 @@ fn binding_flush(app: *App, typography: *Typography) {
     key_input(app, typography, keys[index], mods[index])
     app.input_state.character = 0
     if strokes[index].character >= 32 && wants_text_input(app) {
-      encoded: [4]u8 = []
+      encoded: [4]u8
       app.binding_state.swallow = 0
       text_input(app, encoded[..vim_encode(strokes[index].character, encoded[..])])
     }
@@ -746,7 +746,7 @@ fn config_watch(app: *App, typography: *Typography) bool {
     interval = 30000
   }
   app.configuration.watch_due = now + interval
-  current: [6]u64 = []
+  current: [6]u64
   _ = file_stamp(&app.configuration.path[0], &current[0])
   // A new project directory, or an edited dna.toml, reloads as well.
   project := &app.project_config
@@ -757,7 +757,7 @@ fn config_watch(app: *App, typography: *Typography) bool {
     changed = true
     project.stamp_ready = false
   } else if project.path_length > 0 {
-    project_now: [6]u64 = []
+    project_now: [6]u64
     if file_stamp(&project.path[0], &project_now[0]) == 0 || !project.stamp_ready {
       changed = true
     }
@@ -768,10 +768,10 @@ fn config_watch(app: *App, typography: *Typography) bool {
     }
   } else if project.root_length > 0 {
     // A dna.toml created in the project directory after startup.
-    created: [4200]u8 = []
+    created: [4200]u8
     created_length := copy_text(created[..], project.root[..project.root_length])
     add_text(created[..], &created_length, "/dna.toml")
-    created_stamp: [6]u64 = []
+    created_stamp: [6]u64
     if file_stamp(&created[0], &created_stamp[0]) != 0 {
       changed = true
     }

@@ -32,7 +32,7 @@ fn main() {
   if rec_write(fd,&bytes[0],4)!=4 || rec_sync(fd)!=0 || rec_close(fd)!=0 { #panic("binary write and flush") }
   if rec_open(&path[0],524481,384)>=0 || rec_errno().*!=17 { #panic("exclusive create must preserve existing file") }
   fd=rec_open(&path[0],657408,0)
-  read:[4]u8=[]
+  read:[4]u8
   if fd<0 || test_read(fd,&read[0],4)!=4 || read[0]!=65 || read[1]!=0 || read[2]!=13 || read[3]!=10 || rec_close(fd)!=0 { #panic("binary read") }
   fd=rec_open(&replacement[0],524481,448)
   changed:[]const u8="NEW"
@@ -53,7 +53,7 @@ fn main() {
   if rec_open(&path[0],720896,0)>=0 || rec_errno().*!=20 { #panic("directory validation") }
   junction:[]const u8="reparse-link\0"
   if rec_open(&junction[0],720896,0)>=0 || rec_errno().*!=95 { #panic("nofollow must refuse a junction") }
-  template:[32]u8=[]
+  template:[32]u8
   pattern:[]const u8="private-XXXXXX"
   for at in 0..#len(pattern) { template[at]=pattern[at] }
   fd=rec_temp(&template[0])

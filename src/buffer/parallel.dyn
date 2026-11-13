@@ -23,8 +23,7 @@ struct LoadJob {
   // Set for background loads (lazy.dyn), which count finished jobs.
   owner: *LazyLoad,
 }
-fn load_job_run(context: rawptr) isize {
-  job := #cast(*LoadJob, context)
+fn load_job_run(job: *LoadJob) isize {
   if job.fill {
     for leaf in job.first..job.last {
       table := #slice(job.tables, job.last)[leaf]
@@ -86,25 +85,25 @@ pub fn parallel_workers() usize {
 // Run each job's pass, all but the first on new threads. Jobs whose thread
 // cannot start run on this thread instead.
 fn load_run(jobs: []LoadJob) {
-  arena := mem.arena_create(4096)
+  arena := mem.arena_alloc(4096)
   defer mem.arena_release(arena)
-  threads: [16]*thread.Thread = []
-  started: [16]bool = []
+  threads: [16]*thread.Thread
+  started: [16]bool
   for index in 1..#len(jobs) {
-    spawned := thread.spawn_with_size(arena, ParallelStack, load_job_run, #cast(rawptr, &jobs[index]))
-    if spawned.failure.kind == io.Kind.Ok {
+    spawned := thread.spawn_with_size(arena, ParallelStack, load_job_run, &jobs[index])
+    if !io.failed(spawned.failure) {
       threads[index] = spawned.value
       started[index] = true
     }
   }
-  _ = load_job_run(#cast(rawptr, &jobs[0]))
+  _ = load_job_run(&jobs[0])
   for index in 1..#len(jobs) {
     if started[index] {
-      if thread.join(threads[index]).failure.kind != io.Kind.Ok {
+      if io.failed(thread.join(threads[index]).failure) {
         #panic("cannot join text loader")
       }
     } else {
-      _ = load_job_run(#cast(rawptr, &jobs[index]))
+      _ = load_job_run(&jobs[index])
     }
   }
 }
@@ -133,7 +132,7 @@ fn rope_load_block(block: *RopeBlock, total: usize) LoadResult {
   }
   defer rope_free(#cast(rawptr, counts))
   defer rope_free(#cast(rawptr, tables))
-  storage: [16]LoadJob = []
+  storage: [16]LoadJob
   jobs := storage[..workers]
   for index in 0..workers {
     jobs[index] = LoadJob{data: block.bytes, total: total, first: leaves * index / workers, last: leaves * (index + 1) / workers, counts: counts, tables: tables}

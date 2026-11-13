@@ -38,9 +38,9 @@ fn main() {
   _ = mem.push_bytes_uninit(lazy, 32)
   owner.release(lazy)
   storage: [5]u8 = [7,7,7,7,7]
-  check(cstring.bounded(storage[..], "large").failure.kind != parse.Kind.Ok && storage[0] == 7)
-  check(cstring.bounded(storage[..], "a\0b").failure.kind != parse.Kind.Ok && storage[0] == 7)
-  check(cstring.bounded(storage[..], "text").failure.kind == parse.Kind.Ok && storage[4] == 0)
+  check(parse.failed(cstring.bounded(storage[..], "large").failure) && storage[0] == 7)
+  check(parse.failed(cstring.bounded(storage[..], "a\0b").failure) && storage[0] == 7)
+  check(!parse.failed(cstring.bounded(storage[..], "text").failure) && storage[4] == 0)
 }
 '''
 with tempfile.TemporaryDirectory(prefix='dna-arena-') as directory:
