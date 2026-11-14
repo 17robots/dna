@@ -1,20 +1,27 @@
-# DNA 0.1.0-preview.16
+# DNA 0.1.0-preview.17
 
 Experimental Linux x86-64 preview built with the published Dyn
-0.1.0-preview.35 compiler, SDK and runtime.
+0.1.0-preview.36 compiler, SDK and runtime.
 
 ## Changes
 
-- Updated the compiler, SDK and runtime to Dyn 0.1.0-preview.35, which adds
-  faster decimal formatting, quotient/remainder reuse for runtime divisors and
-  propagation of uniform arguments into private functions. No source changes
-  were needed.
+- Updated the compiler, SDK and runtime to Dyn 0.1.0-preview.36, the
+  standardization release: `Type{}` literals only, no shadowing, `for x, i`
+  index loops, text `case`, `{value, failure}` results with `io.Failure`,
+  sticky void writers and debug overflow checks on by default.
+- Ported production sources, examples, the installer and host tests to the
+  new language and std names.
+- Hashes (FNV, git gutter baselines, disk fingerprints) and the LSP escape
+  scan now wrap explicitly with `math.wrapping_*`, so debug builds keep
+  overflow checks on everywhere else.
 - Updated verified SDK pins for Linux, macOS and Windows and the Linux CI
   compiler download.
 
 ## Compatibility
 
-Configuration, document and session formats are unchanged from preview.15.
+Configuration, document and session formats are unchanged from preview.16.
+Plugins written in Dyn must be ported to Dyn preview 36; see the Dyn
+`docs/migrations/standard-20261113.md` guide and `tools/migrate-standard.py`.
 The application package remains Linux x86-64 and requires compatible host
 glibc, a monospace font, and desktop libraries/graphics drivers for GUI use.
 See the archive's `build-info.json` for its minimum glibc version. Both GUI
