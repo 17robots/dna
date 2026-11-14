@@ -81,7 +81,7 @@ fn windows_path(path: []const u8, output: []u16) Result {
   if used <= 0 {
     return windows_failure(fs_error())
   }
-  output[#cast(usize, used)] = 0
+  output[used] = 0
   return Result{ transferred: #cast(usize, used) }
 }
 fn windows_mode(attributes: u32, nofollow: bool) u16 {
@@ -103,7 +103,7 @@ fn windows_metadata(handle: rawptr, nofollow: bool) Metadata {
     failure := windows_failure(fs_error())
     return Metadata{ failure: io.Failure{ kind: failure.failure.kind, native: failure.failure.native } }
   }
-  return Metadata{ size: (#cast(u64, information.size_high) << 32) | #cast(u64, information.size_low), inode: (#cast(u64, information.index_high) << 32) | #cast(u64, information.index_low), device: #cast(u64, information.volume), mode: windows_mode(information.attributes, nofollow) }
+  return Metadata{ size: (#cast(u64, information.size_high) << 32) | #cast(u64, information.size_low), inode: (#cast(u64, information.index_high) << 32) | #cast(u64, information.index_low), device: information.volume, mode: windows_mode(information.attributes, nofollow) }
 }
 fn windows_path_metadata(path: []const u8, nofollow: bool) Metadata {
   wide: [32768]u16
@@ -253,7 +253,7 @@ pub fn directory_next(directory: *Directory) DirectoryEntry {
     if (directory.data.attributes & 1024) != 0 {
       kind = 10
     }
-    return DirectoryEntry{ name: directory.storage[..#cast(usize, used)], kind: kind, found: true }
+    return DirectoryEntry{ name: directory.storage[..used], kind: kind, found: true }
   }
   return DirectoryEntry{}
 }
@@ -384,12 +384,12 @@ pub fn read_link(path: []const u8, destination: []u8) PathResult {
   } else {
     return PathResult{ failure: io.Failure{ kind: io.Kind.Unsupported, native: -50 } }
   }
-  if #cast(usize, data.length) < prefix {
+  if data.length < prefix {
     return PathResult{ failure: io.Failure{ kind: io.Kind.InvalidInput, native: -87 } }
   }
   offset := #cast(usize, data.payload[0])
   length := #cast(usize, data.payload[1])
-  if (offset & 1) != 0 || (length & 1) != 0 || length == 0 || prefix + offset + length > #cast(usize, data.length) {
+  if (offset & 1) != 0 || (length & 1) != 0 || length == 0 || prefix + offset + length > data.length {
     return PathResult{ failure: io.Failure{ kind: io.Kind.InvalidInput, native: -87 } }
   }
   start := (prefix + offset) / 2
@@ -411,7 +411,7 @@ pub fn read_link(path: []const u8, destination: []u8) PathResult {
     failure := windows_failure(fs_error())
     return PathResult{ failure: io.Failure{ kind: failure.failure.kind, native: failure.failure.native } }
   }
-  return PathResult{ path: destination[..#cast(usize, used)] }
+  return PathResult{ path: destination[..used] }
 }
 // Restrict at creation, before any other process can acquire a permissive
 // handle. A later chmod alone cannot revoke access from already-open handles.
@@ -608,7 +608,7 @@ pub fn file_stamp(file: *const File) Stamp {
   }
   // FILETIME counts 100 ns intervals.
   written := (#cast(u64, information.times[5]) << 32) | #cast(u64, information.times[4])
-  return Stamp{inode: (#cast(u64, information.index_high) << 32) | #cast(u64, information.index_low), size: (#cast(u64, information.size_high) << 32) | #cast(u64, information.size_low), modify_seconds: written / 10000000, modify_nanos: (written % 10000000) * 100, change_seconds: #cast(u64, information.volume), valid: true}
+  return Stamp{inode: (#cast(u64, information.index_high) << 32) | #cast(u64, information.index_low), size: (#cast(u64, information.size_high) << 32) | #cast(u64, information.size_low), modify_seconds: written / 10000000, modify_nanos: (written % 10000000) * 100, change_seconds: information.volume, valid: true}
 }
 // ReFS block cloning accelerates aligned interiors. Unaligned edges use an
 // independently reopened source handle, leaving the origin's position alone.
@@ -654,10 +654,10 @@ pub fn copy_range(source: *const File, offset: u64, destination: *File, length: 
   if length > 9223372036854775807 {
     return Result{ failure: io.Failure{ kind: io.Kind.Unsupported } }
   }
-  if #cast(usize, offset % #cast(u64, alignment)) != position.value % alignment || offset > 9223372036854775807 - #cast(u64, length) || position.value > 9223372036854775807 - length {
+  if #cast(usize, offset % alignment) != position.value % alignment || offset > 9223372036854775807 - #cast(u64, length) || position.value > 9223372036854775807 - length {
     return Result{ failure: io.Failure{ kind: io.Kind.Unsupported } }
   }
-  head := (alignment - #cast(usize, offset % #cast(u64, alignment))) % alignment
+  head := (alignment - #cast(usize, offset % alignment)) % alignment
   if head > length {
     head = length
   }
@@ -687,7 +687,7 @@ pub fn copy_range(source: *const File, offset: u64, destination: *File, length: 
   if existing.size < #cast(u64, end) && fs_set_basic(#cast(rawptr, destination.descriptor), 6, #cast(rawptr, &end), 8) == 0 {
     return windows_failure(fs_error())
   }
-  range := WinCloneRange{source: #cast(rawptr, source.descriptor), source_offset: #cast(i64, offset + #cast(u64, head)), destination_offset: #cast(i64, position.value + head), length: #cast(i64, middle)}
+  range := WinCloneRange{source: #cast(rawptr, source.descriptor), source_offset: #cast(i64, offset + head), destination_offset: #cast(i64, position.value + head), length: #cast(i64, middle)}
   returned: u32 = 0
   if fs_ioctl(#cast(rawptr, destination.descriptor), 623428, #cast(rawptr, &range), #cast(u32, #sizeof(WinCloneRange)), nil, 0, &returned, nil) == 0 {
     // The transaction is private. The caller overwrites the entire requested
@@ -703,7 +703,7 @@ pub fn copy_range(source: *const File, offset: u64, destination: *File, length: 
   if io.failed(skipped.failure) {
     return Result{ transferred: head + middle, failure: io.Failure{ kind: skipped.failure.kind, native: skipped.failure.native } }
   }
-  last := windows_copy_edge(&reopened, offset + #cast(u64, head + middle), destination, tail)
+  last := windows_copy_edge(&reopened, offset + (head + middle), destination, tail)
   last.transferred += head + middle
   return last
 }
