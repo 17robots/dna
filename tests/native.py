@@ -80,7 +80,7 @@ if (root/'dyn').exists():
         # The installed parser and bundled query must agree on builtin and type parameter syntax.
         builtins = ('sizeof', 'alignof')
         source = 'fn layout(T: type) usize {\n'
-        source += '  fixed: [4 * 1024]u8 = []\n'
+        source += '  fixed: [4 * 1024]u8\n'
         source += '  return #sizeof(T) + #alignof(T)\n}\n'
         text = source.encode()
         output = (c.c_ubyte * len(text))()

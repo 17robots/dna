@@ -49,8 +49,8 @@ fn save_cancel(app:*App) {app.canceled+=1
  app.documents.saving.waiting=false}
 fn check(value:bool) {if !value {#panic("unsafe async save completion")}}
 fn run_case(changed:bool,moved:bool,missing:bool,close:bool) {
- slots:[8]Slot=[]
- pointers:[8]*Slot=[]
+ slots:[8]Slot
+ pointers:[8]*Slot
  for index in 0..8 {pointers[index]=&slots[index]}
  document:=buffer.Document{dirty:changed}
  slots[7].document=&document

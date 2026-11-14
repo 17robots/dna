@@ -50,7 +50,7 @@ extern fn probe_race "probe_race"(callback:fn()i32) i32
 extern fn probe_expected "probe_expected"() i32
 '''+helpers+'''
 fn check_error() i32 {
- storage:[32]u8=[]
+ storage:[32]u8
  if darwin_path("missing",storage[..])==nil {#panic("missing path")}
  probe_fail()
  if darwin_error()!=0-#cast(isize,probe_expected()) {#panic("loader clobbered I/O errno")}

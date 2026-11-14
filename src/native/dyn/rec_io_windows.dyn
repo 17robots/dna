@@ -36,7 +36,7 @@ win_io_api: WinIOAPI
 win_io_once: win_io_sync.Once
 fn win_io_symbol(library: rawptr, name: []const u8) rawptr {
   result := win_io_loader.symbol(library, name)
-  if result.failure.kind != io.Kind.Ok || result.value == nil {
+  if io.failed(result.failure) || result.value == nil {
     #panic("missing Windows IO routine")
   }
   return result.value
@@ -47,7 +47,7 @@ fn win_io_prepare() {
     // paths below use LoadLibraryW instead of the SDK's narrow loader wrapper.
     kernel := win_io_loader.open("kernel32.dll", 0)
     security := win_io_loader.open("advapi32.dll", 0)
-    if kernel.failure.kind != io.Kind.Ok || security.failure.kind != io.Kind.Ok {
+    if io.failed(kernel.failure) || io.failed(security.failure) {
       #panic("missing Windows IO system library")
     }
     win_io_api.create = #cast(fn(*const u16, u32, u32, rawptr, u32, u32, rawptr) rawptr, win_io_symbol(kernel.value, "CreateFileW"))
@@ -141,7 +141,7 @@ fn rec_open(path: *const u8, flags: i32, mode: u32) i32 {
   if (flags & 1024) != 0 || (flags & 3) == 3 {
     return win_io_fail(50)
   }
-  wide: [32768]u16 = []
+  wide: [32768]u16
   if !win_io_path(path, wide[..]) {
     return -1
   }
@@ -158,7 +158,7 @@ fn rec_open(path: *const u8, flags: i32, mode: u32) i32 {
     } else {
       created = win_io_files.create_private_exclusive(win_io_text(path))
     }
-    if created.failure.kind != io.Kind.Ok {
+    if io.failed(created.failure) {
       return win_io_fail(#cast(u32, 0 - created.failure.native))
     }
     handle = #cast(rawptr, created.value.descriptor)
@@ -257,7 +257,7 @@ struct WinIORename { flags:u32, root:rawptr, length:u32, name:[32768]u16 }
 fn rec_rename_report(from:*const u8, to:*const u8, native_error:*u32)i32 {
   native_error.*=0
   win_io_prepare()
-  source:[32768]u16=[]
+  source:[32768]u16
   target:=WinIORename{flags:3}
   if !win_io_path(from, source[..]) || !win_io_path(to, target.name[..]) {
     return -1
@@ -304,7 +304,7 @@ fn rec_rename_report(from:*const u8, to:*const u8, native_error:*u32)i32 {
 
 fn rec_unlink(path: *const u8) i32 {
   win_io_prepare()
-  wide: [32768]u16 = []
+  wide: [32768]u16
   if !win_io_path(path, wide[..]) {
     return -1
   }
@@ -319,7 +319,7 @@ fn rec_mkdir(path: *const u8, mode: u32) i32 {
     return win_io_fail(87)
   }
   result := win_io_files.make_directory(win_io_text(path), #cast(usize, mode))
-  if result.failure.kind != io.Kind.Ok {
+  if io.failed(result.failure) {
     return win_io_fail(#cast(u32, 0 - result.failure.native))
   }
   return 0
@@ -340,7 +340,7 @@ fn rec_temp(path: *u8) i32 {
   }
   alphabet := "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_-"
   for attempt in 0..128 {
-    random: [6]u8 = []
+    random: [6]u8
     if win_io_api.random(&random[0], 6) == 0 {
       return win_io_fail(5)
     }
@@ -363,7 +363,7 @@ fn memory_environment(name: *const u8) *u8 {
 fn syntax_dlopen(path: *const u8, flags: i32) rawptr {
   win_io_prepare()
   _ = flags
-  wide: [32768]u16 = []
+  wide: [32768]u16
   if !win_io_path(path, wide[..]) {
     return nil
   }
@@ -374,7 +374,7 @@ fn syntax_dlopen(path: *const u8, flags: i32) rawptr {
   return library
 }
 fn syntax_dlclose(library: rawptr) i32 {
-  if win_io_loader.close(&library).failure.kind == io.Kind.Ok {
+  if !io.failed(win_io_loader.close(&library).failure) {
     return 0
   }
   return -1

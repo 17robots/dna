@@ -37,9 +37,9 @@ fn dna_tty_enter() i32 { if !tty_enter_host() { return 0 }
   return 1 }
 read_result:i32=100
 read_started:sync.AtomicU32
-fn read_worker(context:rawptr)isize {
+fn read_worker(context:*u8)isize {
   _=context
-  bytes:[64]u8=[]
+  bytes:[64]u8
   sync.store_u32(&read_started,1)
   for {
     read_result=tty_read_host(&bytes[0],64,-1)
@@ -54,8 +54,8 @@ fn expect_bytes(actual:[]const u8,expected:[]const u8) {
 fixture_input:rawptr
 fixture_peek:fn(rawptr,*WinTtyRecord,u32,*u32)i32
 fn fixture_read_exact(expected:[]const u8, chunk_limit:i32) {
-  bytes:[64]u8=[]
-  records:[16]WinTtyRecord=[]
+  bytes:[64]u8
+  records:[16]WinTtyRecord
   record_count:u32=0
   _=fixture_peek(fixture_input,&records[0],16,&record_count)
   used:usize=0
@@ -97,9 +97,9 @@ fn main() {
       if tty_command_line[at+#len(argument)]!=0 { #panic("handoff argv terminator") }
       at+=#len(argument)+1
     }
-    value:[128]u8=[]
+    value:[128]u8
     result:=win_io_host.environment("DNA_HANDOFF",value[..])
-    if result.failure.kind != io.Kind.Ok || !result.found { #panic("handoff environment") }
+    if io.failed(result.failure) || !result.found { #panic("handoff environment") }
     expect_bytes(result.value,"session café 日本語")
     file:[]const u8="handoff-ok.txt\0"
     fd:=rec_open(&file[0],524481,384)
@@ -125,7 +125,7 @@ fn main() {
   _=standard(4294967284,original_error)
   input_name:[]const u8="CONIN$\0"
   output_name:[]const u8="CONOUT$\0"
-  wide:[32]u16=[]
+  wide:[32]u16
   if !win_io_path(&input_name[0],wide[..]) { #panic("console path") }
   input:=win_io_api.create(&wide[0],3221225472,3,nil,3,0,nil)
   if !win_io_path(&output_name[0],wide[..]) { #panic("console output path") }
@@ -149,7 +149,7 @@ fn main() {
   // mouse records below still exercise the production SGR translation.
   if win_tty_api.set_mode(input,mode & ~#cast(u32,16))==0 { #panic("isolate injected console input") }
   _=flush_input(input)
-  bytes:[64]u8=[]
+  bytes:[64]u8
   record:=WinTtyRecord{kind:1}
   key:=#cast(*WinTtyKey,&record.data[0])
   key.*=WinTtyKey{down:1,repeat:1,key:65,character:233}
@@ -190,9 +190,9 @@ fn main() {
   _=write_input(input,&record,1,&written)
   if tty_read_host(&bytes[0],64,100)!=-2 || sync.exchange_u32(&tty_resize_pending,0)!=1 { #panic("resize-only read") }
   _=flush_input(input)
-  owner:=mem.arena_create(8192)
+  owner:=mem.arena_alloc(8192)
   worker:=thread.spawn_with_size(owner,1048576,read_worker,nil)
-  if worker.failure.kind != io.Kind.Ok { #panic("pending reader thread") }
+  if io.failed(worker.failure) { #panic("pending reader thread") }
   for sync.load_u32(&read_started)==0 { sleep(1) }
   deadline:=win_tty_api.ticks()+1000
   for {
@@ -204,7 +204,7 @@ fn main() {
     sleep(1)
   }
   tty_leave_host()
-  if thread.join(worker.value).failure.kind != io.Kind.Ok || (read_result!=-1 && read_result!=-2) { #panic("leave must release pending reader") }
+  if io.failed(thread.join(worker.value).failure) || (read_result!=-1 && read_result!=-2) { #panic("leave must release pending reader") }
   mem.arena_release(owner)
   if win_tty_api.mode(input,&mode)==0 || mode!=before_input || win_tty_api.input_page()!=before_input_page || win_tty_api.output_page()!=before_output_page { #panic("input mode and page restoration") }
   if win_tty_api.mode(output,&mode)==0 || mode!=before_output { #panic("output mode restoration") }
@@ -231,9 +231,9 @@ fn main() {
   arguments:[7]*const u8=[executable,&child[0],&empty[0],&spaced[0],&quoted[0],&unicode[0],nil]
   session:[]const u8="session café 日本語\0"
   if !tty_handoff_host(executable,&arguments[0],&session[0]) { #panic("frontend handoff") }
-  parent_value:[128]u8=[]
+  parent_value:[128]u8
   parent_environment:=win_io_host.environment("DNA_HANDOFF",parent_value[..])
-  if parent_environment.failure.kind != io.Kind.Ok || !parent_environment.found { #panic("parent handoff environment") }
+  if io.failed(parent_environment.failure) || !parent_environment.found { #panic("parent handoff environment") }
   expect_bytes(parent_environment.value,"parent value")
   _=standard(4294967286,original_input)
   _=standard(4294967285,original_output)

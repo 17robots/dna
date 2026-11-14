@@ -35,7 +35,7 @@ pub fn test_stage(root,name,manifest,executable,leaf:*const u8)i32 {
   container:=plugin_win_container(parent,name,false)
   if container<0 { return 0 }
   defer _=rec_close(container)
-  version:[10]u8=[]
+  version:[10]u8
   if plugin_win_build_version(container,manifest,executable,name,leaf,version[..]) { return 1 }
   return 0
 }

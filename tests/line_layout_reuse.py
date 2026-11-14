@@ -40,13 +40,13 @@ pub fn probe()u64 {
  arena:=arena_owner.create(0)
  defer arena_owner.release(arena)
  doc:=buffer.allocate(arena)
- source:[12000]u8=[]
+ source:[12000]u8
  used:usize=0
  for i in 0..600 {for byte in "office אבג é AV\\n" {source[used]=byte
    used+=1}}
  if !buffer.load(doc,source[..used]) {#panic("line layout probe document")}
  typography:=Typography{font:#cast(rawptr,1),engine:#cast(rawptr,1),line:16.0}
- layouts:[4]LineLayout=[]
+ layouts:[4]LineLayout
  first:[4]usize=[0,50,100,450]
  for i in 0..4 {_=line_layout_update(&typography,&layouts[i],doc,1,TextViewport{start:buffer.row_start(doc,first[i]),end:buffer.row_start(doc,first[i]+20)})}
  before:u64=0

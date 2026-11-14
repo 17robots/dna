@@ -158,7 +158,7 @@ fn main() {
  native_probe_software=true
  renderer:=sdl_create_renderer(window,nil)
  check(renderer!=nil && !native_gui.direct,"software reference")
- owner:=mem.arena_create(65536)
+ owner:=mem.arena_alloc(65536)
  defer mem.arena_release(owner)
  size:=#cast(usize,native_gui.surface.width*native_gui.surface.height)*4
  reference:=mem.push_bytes_uninit(owner,size)

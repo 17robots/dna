@@ -90,10 +90,10 @@ fn sdl_destroy_window(window: rawptr) {
   native_gui.listening = false
 }
 fn native_software_requested() bool {
-  storage: [32]u8 = []
+  storage: [32]u8
   value := renderer_host.environment("DNA_RENDERER", storage[..])
   expected := "software"
-  if value.failure.kind != io.Kind.Ok || !value.found || #len(value.value) != #len(expected) {
+  if io.failed(value.failure) || !value.found || #len(value.value) != #len(expected) {
     return false
   }
   for i in 0..#len(expected) {
@@ -112,7 +112,7 @@ fn sdl_create_renderer(window: rawptr, name: *const u8) rawptr {
     if !native_present.gpu_open(&native_gui.gpu) {
       return nil
     }
-  } else if native_present.open(&native_gui.presenter).failure.kind != io.Kind.Ok {
+  } else if io.failed(native_present.open(&native_gui.presenter).failure) {
     return nil
   }
   if !native_resize() {
@@ -179,7 +179,7 @@ fn native_resize() bool {
     return true
   }
   if native_gui.pixels == nil {
-    native_gui.pixels = mem.arena_create(65536)
+    native_gui.pixels = mem.arena_alloc(65536)
   } else {
     mem.arena_reset(native_gui.pixels)
   }
@@ -202,8 +202,8 @@ fn native_clip(surface: software.Surface) ui.Rect {
   viewport := ui.Rect{x:native_gui.viewport.x, y:native_gui.viewport.y, width:native_gui.viewport.width, height:native_gui.viewport.height}
   result := ui.intersect(viewport, ui.Rect{width:surface.width, height:surface.height})
   if native_gui.clipped {
-    c := native_gui.clip
-    result = ui.intersect(result, ui.Rect{x:viewport.x+c.x, y:viewport.y+c.y, width:c.width, height:c.height})
+    ch := native_gui.clip
+    result = ui.intersect(result, ui.Rect{x:viewport.x+ch.x, y:viewport.y+ch.y, width:ch.width, height:ch.height})
   }
   return result
 }
@@ -270,7 +270,7 @@ fn sdl_present(renderer: rawptr) bool {
     }
     return window_api.swap(&native_gui.window).kind == io.Kind.Ok
   }
-  if native_present.draw(&native_gui.presenter, native_gui.surface).failure.kind != io.Kind.Ok {
+  if io.failed(native_present.draw(&native_gui.presenter, native_gui.surface).failure) {
     return false
   }
   return window_api.swap(&native_gui.window).kind == io.Kind.Ok
@@ -299,7 +299,7 @@ fn sdl_fill(renderer: rawptr, rect: *const Rect) bool {
     native_fill_span(&surface, bounds, color)
     return true
   }
-  return software.render(&surface, &command, software.Font{}).failure.kind == io.Kind.Ok
+  return !io.failed(software.render(&surface, &command, software.Font{}).failure)
 }
 fn sdl_size(renderer: rawptr, width, height: *i32) bool {
   width.*=native_gui.surface.width
@@ -329,7 +329,7 @@ fn sdl_create_texture(renderer: rawptr, format: u32, access, width, height: i32)
   if width<=0 || height<=0 || width>16384 || height>16384 {
     return nil
   }
-  owner := mem.arena_create(4096)
+  owner := mem.arena_alloc(4096)
   t := mem.push(NativeTexture, owner)
   t.*=NativeTexture{alpha:255, owner:owner, width:width, height:height, next:native_gui.textures}
   native_gui.textures=t
@@ -761,7 +761,7 @@ fn native_event(source:*const events.Event, event:*Event) bool {
     if target.down {
       now:=time.monotonic_now()
       delta:=time.elapsed(native_gui.click_at, now.value)
-      same:=native_gui.click_valid && now.failure.kind == io.Kind.Ok && delta.failure.kind == io.Kind.Ok && delta.value>=0 && delta.value<=500*time.Millisecond && native_gui.click_button==source.button && source.x>=native_gui.click_x-4 && source.x<=native_gui.click_x+4 && source.y>=native_gui.click_y-4 && source.y<=native_gui.click_y+4
+      same:=native_gui.click_valid && !io.failed(now.failure) && !io.failed(delta.failure) && delta.value>=0 && delta.value<=500*time.Millisecond && native_gui.click_button==source.button && source.x>=native_gui.click_x-4 && source.x<=native_gui.click_x+4 && source.y>=native_gui.click_y-4 && source.y<=native_gui.click_y+4
       if same && native_gui.click_count<3 {
         native_gui.click_count+=1
       } else {
@@ -771,7 +771,7 @@ fn native_event(source:*const events.Event, event:*Event) bool {
       native_gui.click_x=source.x
       native_gui.click_y=source.y
       native_gui.click_at=now.value
-      native_gui.click_valid=now.failure.kind == io.Kind.Ok
+      native_gui.click_valid=!io.failed(now.failure)
     }
     target.clicks=native_gui.click_count
     target.x=#cast(f32, source.x)
@@ -890,7 +890,7 @@ fn sdl_wait(event:*Event) bool {
 // Injected text is rare, so its 525 KB table exists only after the first use.
 fn injected_slot(index:usize) []u8 {
   if native_gui.injected_arena==nil {
-    native_gui.injected_arena=mem.arena_create(128*4097+65536)
+    native_gui.injected_arena=mem.arena_alloc(128*4097+65536)
     native_gui.injected_text=#slice(mem.arena_push(native_gui.injected_arena, 128*4097, 1), 128*4097)
   }
   return native_gui.injected_text[index*4097..(index+1)*4097]
@@ -989,7 +989,7 @@ fn sdl_clipboard_set(text:*const u8) bool {
 fn sdl_clipboard_get() *const u8 {
   window_api.request_paste_snapshot(&native_gui.window)
   started:=time.monotonic_now()
-  if started.failure.kind != io.Kind.Ok {
+  if io.failed(started.failure) {
     return nil
   }
   // The SDK ends stalled transfers after five seconds without progress.
@@ -997,7 +997,7 @@ fn sdl_clipboard_get() *const u8 {
   for {
     now:=time.monotonic_now()
     elapsed:=time.elapsed(started.value, now.value)
-    if now.failure.kind != io.Kind.Ok || elapsed.failure.kind != io.Kind.Ok || elapsed.value<0 || elapsed.value>=30*time.Second {
+    if io.failed(now.failure) || io.failed(elapsed.failure) || elapsed.value<0 || elapsed.value>=30*time.Second {
       return nil
     }
     if window_api.poll(&native_gui.window).kind != io.Kind.Ok {
@@ -1021,7 +1021,7 @@ fn sdl_clipboard_get() *const u8 {
         return nil
       }
       text:=window_api.clipboard(&native_gui.window)
-      owner:=mem.arena_create(4096)
+      owner:=mem.arena_alloc(4096)
       copied:=mem.push(NativeClipboard, owner)
       copied.*=NativeClipboard{owner:owner, next:native_gui.clipboards}
       copied.bytes=mem.push_bytes_uninit(copied.owner, #len(text)+1)
@@ -1097,30 +1097,30 @@ fn sdl_geometry(renderer, texture:rawptr, vertices:*const Vertex, count:i32, ind
     }
     a:=#slice(vertices, #cast(usize, count))[#cast(usize, ia)]
     b:=#slice(vertices, #cast(usize, count))[#cast(usize, ib)]
-    c:=#slice(vertices, #cast(usize, count))[#cast(usize, ic)]
+    ch:=#slice(vertices, #cast(usize, count))[#cast(usize, ic)]
     a.alpha=a.alpha*opacity
     b.alpha=b.alpha*opacity
-    c.alpha=c.alpha*opacity
+    ch.alpha=ch.alpha*opacity
     a.x=a.x*native_gui.sx+#cast(f32, native_gui.viewport.x)
     a.y=a.y*native_gui.sy+#cast(f32, native_gui.viewport.y)
     b.x=b.x*native_gui.sx+#cast(f32, native_gui.viewport.x)
     b.y=b.y*native_gui.sy+#cast(f32, native_gui.viewport.y)
-    c.x=c.x*native_gui.sx+#cast(f32, native_gui.viewport.x)
-    c.y=c.y*native_gui.sy+#cast(f32, native_gui.viewport.y)
+    ch.x=ch.x*native_gui.sx+#cast(f32, native_gui.viewport.x)
+    ch.y=ch.y*native_gui.sy+#cast(f32, native_gui.viewport.y)
     if native_gui.direct {
       ga:=native_present.GpuVertex{x:a.x, y:a.y, r:a.red, g:a.green, b:a.blue, a:a.alpha}
       gb:=native_present.GpuVertex{x:b.x, y:b.y, r:b.red, g:b.green, b:b.blue, a:b.alpha}
-      gc:=native_present.GpuVertex{x:c.x, y:c.y, r:c.red, g:c.green, b:c.blue, a:c.alpha}
+      gc:=native_present.GpuVertex{x:ch.x, y:ch.y, r:ch.red, g:ch.green, b:ch.blue, a:ch.alpha}
       if !native_present.gpu_triangle(&native_gui.gpu, ga, gb, gc, clip) {
         return false
       }
       continue
     }
-    area:=native_edge(a, b, c.x, c.y)
+    area:=native_edge(a, b, ch.x, ch.y)
     if area<0.0 {
       temporary:=b
-      b=c
-      c=temporary
+      b=ch
+      ch=temporary
       area=0.0-area
     }
     if area==0.0 || area!=area || clip.width<=0 || clip.height<=0 {
@@ -1135,26 +1135,26 @@ fn sdl_geometry(renderer, texture:rawptr, vertices:*const Vertex, count:i32, ind
     if b.x < low_x {
       low_x = b.x
     }
-    if c.x < low_x {
-      low_x = c.x
+    if ch.x < low_x {
+      low_x = ch.x
     }
     if b.y < low_y {
       low_y = b.y
     }
-    if c.y < low_y {
-      low_y = c.y
+    if ch.y < low_y {
+      low_y = ch.y
     }
     if b.x > high_x {
       high_x = b.x
     }
-    if c.x > high_x {
-      high_x = c.x
+    if ch.x > high_x {
+      high_x = ch.x
     }
     if b.y > high_y {
       high_y = b.y
     }
-    if c.y > high_y {
-      high_y = c.y
+    if ch.y > high_y {
+      high_y = ch.y
     }
     clip_right := clip.x + clip.width
     clip_bottom := clip.y + clip.height
@@ -1187,11 +1187,11 @@ fn sdl_geometry(renderer, texture:rawptr, vertices:*const Vertex, count:i32, ind
     }
     for y in top..bottom {
       for x in left..right {
-        wa:=native_edge(b, c, #cast(f32, x)+0.5, #cast(f32, y)+0.5)/area
-        wb:=native_edge(c, a, #cast(f32, x)+0.5, #cast(f32, y)+0.5)/area
+        wa:=native_edge(b, ch, #cast(f32, x)+0.5, #cast(f32, y)+0.5)/area
+        wb:=native_edge(ch, a, #cast(f32, x)+0.5, #cast(f32, y)+0.5)/area
         wc:=1.0-wa-wb
-        if (wa>0.0 || (wa==0.0 && native_top_left(b, c))) && (wb>0.0 || (wb==0.0 && native_top_left(c, a))) && (wc>0.0 || (wc==0.0 && native_top_left(a, b))) {
-          native_blend(&surface, x, y, #cast(u8, (a.red*wa+b.red*wb+c.red*wc)*255.0), #cast(u8, (a.green*wa+b.green*wb+c.green*wc)*255.0), #cast(u8, (a.blue*wa+b.blue*wb+c.blue*wc)*255.0), #cast(u8, (a.alpha*wa+b.alpha*wb+c.alpha*wc)*255.0))
+        if (wa>0.0 || (wa==0.0 && native_top_left(b, ch))) && (wb>0.0 || (wb==0.0 && native_top_left(ch, a))) && (wc>0.0 || (wc==0.0 && native_top_left(a, b))) {
+          native_blend(&surface, x, y, #cast(u8, (a.red*wa+b.red*wb+ch.red*wc)*255.0), #cast(u8, (a.green*wa+b.green*wb+ch.green*wc)*255.0), #cast(u8, (a.blue*wa+b.blue*wb+ch.blue*wc)*255.0), #cast(u8, (a.alpha*wa+b.alpha*wb+ch.alpha*wc)*255.0))
         }
       }
     }
@@ -1218,7 +1218,7 @@ fn native_top_left(a, b:Vertex) bool {
 
 fn native_texture_storage(texture:*NativeTexture) {
   if texture.storage==nil {
-    texture.storage=mem.arena_create(65536)
+    texture.storage=mem.arena_alloc(65536)
     texture.pixels=mem.push_bytes_uninit(texture.storage, #cast(usize, texture.width)*#cast(usize, texture.height)*4)
   }
 }

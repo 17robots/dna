@@ -134,7 +134,7 @@ fn file_op_follow(app: *App, source: []const u8, destination: []const u8) {
     if slot.document == nil || !file_op_within(name, source) {
       continue
     }
-    moved: [4096]u8 = []
+    moved: [4096]u8
     used := copy_text(moved[..4000], destination)
     add_text(moved[..], &used, name[#len(source)..])
     files.discard_recovery(&slot.file)
@@ -150,8 +150,8 @@ fn file_op_make_parents(path: []const u8, last: bool) bool {
     if at == #len(path) || path[at] == '/' {
       if at < #len(path) || last {
         info := fs.metadata(path[..at])
-        if info.failure.kind != io.Kind.Ok {
-          if fs.make_directory(path[..at], 493).failure.kind != io.Kind.Ok {
+        if io.failed(info.failure) {
+          if io.failed(fs.make_directory(path[..at], 493).failure) {
             return false
           }
         } else if (info.mode & 61440) != 16384 {
@@ -164,23 +164,23 @@ fn file_op_make_parents(path: []const u8, last: bool) bool {
   return true
 }
 fn file_op_exists(path: []const u8) bool {
-  return fs.metadata_nofollow(path).failure.kind == io.Kind.Ok
+  return !io.failed(fs.metadata_nofollow(path).failure)
 }
 // Copies a file, or a folder and everything below it, refusing symlinks and
 // existing destinations. `depth` bounds recursion.
 fn file_op_copy(source: []const u8, destination: []const u8, depth: usize) bool {
   info := fs.metadata_nofollow(source)
-  if info.failure.kind != io.Kind.Ok || depth > 32 || file_op_exists(destination) {
+  if io.failed(info.failure) || depth > 32 || file_op_exists(destination) {
     return false
   }
   kind := info.mode & 61440
   if kind == 16384 {
-    if fs.make_directory(destination, 493).failure.kind != io.Kind.Ok {
+    if io.failed(fs.make_directory(destination, 493).failure) {
       return false
     }
-    storage: [8192]u8 = []
+    storage: [8192]u8
     opened := fs.open_directory(source, storage[..])
-    if opened.failure.kind != io.Kind.Ok {
+    if io.failed(opened.failure) {
       return false
     }
     ok := true
@@ -190,8 +190,8 @@ fn file_op_copy(source: []const u8, destination: []const u8, depth: usize) bool 
         ok = entry.failure.native == 0
         break
       }
-      from: [4096]u8 = []
-      to: [4096]u8 = []
+      from: [4096]u8
+      to: [4096]u8
       from_length := copy_text(from[..3800], source)
       add_text(from[..], &from_length, "/")
       add_text(from[..], &from_length, entry.name)
@@ -211,29 +211,29 @@ fn file_op_copy(source: []const u8, destination: []const u8, depth: usize) bool 
     return false
   }
   input := fs.open_nofollow(source)
-  if input.failure.kind != io.Kind.Ok {
+  if io.failed(input.failure) {
     return false
   }
   defer fs.close(&input.value)
   output := fs.create_exclusive(destination)
-  if output.failure.kind != io.Kind.Ok {
+  if io.failed(output.failure) {
     return false
   }
-  chunk: [65536]u8 = []
+  chunk: [65536]u8
   ok := true
   for ok {
     read := fs.read(&input.value, chunk[..])
-    if read.failure.kind != io.Kind.Ok {
+    if io.failed(read.failure) {
       ok = false
       break
     }
     if read.transferred == 0 {
       break
     }
-    ok = fs.write(&output.value, chunk[..read.transferred]).failure.kind == io.Kind.Ok
+    ok = !io.failed(fs.write(&output.value, chunk[..read.transferred]).failure)
   }
   if ok {
-    ok = fs.preserve_permissions(&output.value, source).failure.kind == io.Kind.Ok
+    ok = !io.failed(fs.preserve_permissions(&output.value, source).failure)
   }
   fs.close(&output.value)
   return ok
@@ -253,7 +253,7 @@ fn file_op_submit(app: *App) {
       relative_to = relative_to[..#len(relative_to) - 1]
     }
   }
-  target_storage: [4096]u8 = []
+  target_storage: [4096]u8
   target := file_op_target(relative_to, typed, target_storage[..])
   if #len(target) == 0 {
     notice(app, "Enter a name or relative path.")
@@ -274,7 +274,7 @@ fn file_op_submit(app: *App) {
     }
     if !folder {
       created := fs.create_exclusive(target)
-      if created.failure.kind != io.Kind.Ok {
+      if io.failed(created.failure) {
         notice(app, "Cannot create that file.")
         return
       }
@@ -304,7 +304,7 @@ fn file_op_submit(app: *App) {
     file_op_finish(app, target)
     return
   }
-  if fs.rename_noreplace(source, target).failure.kind != io.Kind.Ok {
+  if io.failed(fs.rename_noreplace(source, target).failure) {
     notice(app, "Move failed: the destination exists, is on another disk, or permissions deny it.")
     return
   }
@@ -322,22 +322,22 @@ fn file_op_trash(app: *App) {
   }
   leaf := file_op_leaf(source)
   folder := source[..#len(source) - #len(leaf)]
-  trash: [4096]u8 = []
+  trash: [4096]u8
   trash_length := copy_text(trash[..3800], folder)
   add_text(trash[..], &trash_length, ".dna-trash")
-  link: [4096]u8 = []
-  if fs.read_link(trash[..trash_length], link[..]).failure.kind == io.Kind.Ok {
+  link: [4096]u8
+  if !io.failed(fs.read_link(trash[..trash_length], link[..]).failure) {
     notice(app, "Trash destination must not be a symlink.")
     file_op_finish(app, "")
     return
   }
-  if !file_op_exists(trash[..trash_length]) && fs.make_directory(trash[..trash_length], 448).failure.kind != io.Kind.Ok {
+  if !file_op_exists(trash[..trash_length]) && io.failed(fs.make_directory(trash[..trash_length], 448).failure) {
     notice(app, "Cannot create the .dna-trash folder.")
     file_op_finish(app, "")
     return
   }
   for suffix in 0..1000 {
-    target: [4096]u8 = []
+    target: [4096]u8
     used := copy_text(target[..3900], trash[..trash_length])
     add_text(target[..], &used, "/")
     add_text(target[..], &used, leaf)
@@ -348,7 +348,7 @@ fn file_op_trash(app: *App) {
     if file_op_exists(target[..used]) {
       continue
     }
-    if fs.rename_noreplace(source, target[..used]).failure.kind != io.Kind.Ok {
+    if io.failed(fs.rename_noreplace(source, target[..used]).failure) {
       notice(app, "Moving to .dna-trash failed.")
       file_op_finish(app, "")
       return
@@ -367,7 +367,7 @@ fn directory_file_op(app: *App, kind: u8) {
     app.directory_state.length = copy_text(app.directory_state.path[..], app.explorer.path[..app.explorer.path_length])
   }
   base := app.directory_state.path[..app.directory_state.length]
-  source: [4096]u8 = []
+  source: [4096]u8
   source_length: usize = 0
   if app.directory_state.selected < app.directory_state.count {
     entry := &app.directory_state.entries[app.directory_state.selected]

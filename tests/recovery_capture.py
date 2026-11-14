@@ -61,7 +61,7 @@ fn recovery_error(worker:rawptr) i32 {return 0}
 fn recovery_open(path:*const u8) rawptr {return #cast(rawptr,1)}
 fn recovery_submit(worker:rawptr,bytes:*const u8,length:usize) i32 {
  if record_storage==nil {
-  record_arena:=mem.arena_create(300000000)
+  record_arena:=mem.arena_alloc(300000000)
   record_storage=&mem.push_bytes_uninit(record_arena,290000000)[0]
   record_capacity=290000000
  }
@@ -80,7 +80,7 @@ fn add_text(output:[]u8,used:*usize,input:[]const u8) {
  used.*+=copy_text(output[used.*..],input)
 }
 fn work_acquire(app:*App,work:*Work,capacity:usize,label:[]const u8) bool {
- work.arena=mem.arena_create(capacity+4096)
+ work.arena=mem.arena_alloc(capacity+4096)
  return work.arena!=nil
 }
 fn work_finish(app:*App,work:*Work,label:[]const u8) {
@@ -105,7 +105,7 @@ fn assert_retained(previous:[]const u8,count:usize,app:*App) {
  check(app.logs>0)
 }
 fn main() {
- arena:=mem.arena_create(2*#sizeof(buffer.Document)+4096)
+ arena:=mem.arena_alloc(2*#sizeof(buffer.Document)+4096)
  defer mem.arena_release(arena)
  document:=buffer.allocate(arena)
  restored:=buffer.allocate(arena)
@@ -137,7 +137,7 @@ fn main() {
  check(buffer.replace(document,"XYZ"))
  capture(&app)
  check(submissions==2)
- previous:[8192]u8=[]
+ previous:[8192]u8
  previous_length:=record_length
  _=buffer.copy_bytes(&previous[0],record_storage,record_length)
  decoded:=workspace.State{}
@@ -183,7 +183,7 @@ fn main() {
  check(restored.length==document.length && buffer.byte_at(restored,0)=='B' && buffer.byte_at(restored,restored.length-1)=='C')
  check(buffer.equal(buffer.range(restored,middle,middle+3),"XYZ"))
  // New text past the former 256 MiB patch bound still fits one record.
- inserted_arena:=mem.arena_create(290000000)
+ inserted_arena:=mem.arena_alloc(290000000)
  defer mem.arena_release(inserted_arena)
  inserted:=mem.push_bytes_uninit(inserted_arena,280000000)
  _=fill(&inserted[0],98,#len(inserted),#len(inserted))

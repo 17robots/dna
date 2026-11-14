@@ -19,7 +19,7 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 PROBE = r'''fn startup_probe(app:*App, typography:*Typography, renderer:rawptr, window:rawptr, input_storage:[]u8) {
- sample:[64000]u8=[]
+ sample:[64000]u8
  used:usize=0
  for row in 0..400 {
   text:="fn example() { sample := 1234; value := sample + 17 }\n"
@@ -44,7 +44,7 @@ PROBE = r'''fn startup_probe(app:*App, typography:*Typography, renderer:rawptr, 
    elapsed:=(render_clock()-started)/1000
    cpu_elapsed:=(frame_probe_cpu()-cpu_started)/1000
    if frame>=5 {
-    output:[128]u8=[]
+    output:[128]u8
     at:usize=0
     add_number(output[..],&at,#cast(usize,width))
     add_text(output[..],&at," ")
@@ -115,7 +115,7 @@ def main():
             probe=stage/'startup_probe.dyn'
             probe.write_text(probe.read_text()+r'''
 fn frame_probe_components(begin,paint,composite:u64) {
- output:[128]u8=[]
+ output:[128]u8
  at:usize=0
  add_text(output[..],&at,"P ")
  add_number(output[..],&at,#cast(usize,begin/1000))

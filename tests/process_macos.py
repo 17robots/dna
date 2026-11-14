@@ -29,7 +29,7 @@ fn main() {
   command: []const u8 = "printf hello\0"
   directory: []const u8 = "/tmp\0"
   child := proc_open(&command[0], &directory[0], true)
-  bytes: [32]u8 = []
+  bytes: [32]u8
   _ = proc_write(child.input, &bytes[0], 1)
   _ = proc_read(child.output, &bytes[0], 32)
   _ = proc_peek(&child)

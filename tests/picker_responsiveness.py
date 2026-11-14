@@ -35,8 +35,8 @@ fn copy_text(output:[]u8,text:[]const u8)usize{for at in 0..#len(text){output[at
 fn expand_home(path:[]const u8,output:[]u8)[]const u8{return path}
 '''
 CHECK='''fn main(){
- names:[65536]u8=[]
- offsets:[2048]usize=[]
+ names:[65536]u8
+ offsets:[2048]usize
  index:=PickerIndex{names:names[..],offsets:offsets[..]}
  app:=App{}
  app.prompt_state.panel=Panel.Open

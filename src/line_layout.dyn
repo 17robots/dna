@@ -78,39 +78,39 @@ fn line_draw_end(doc: *const buffer.Document, low: usize, high: usize) usize {
   return end
 }
 // Bring the visible rows up to date. Returns the number of lines shaped.
-fn line_layout_update(typography: *Typography, layout: *LineLayout, doc: *const buffer.Document, identity: u64, viewport: TextViewport) usize {
-  if layout.document == doc && layout.identity == identity && layout.start == viewport.start && layout.end == viewport.end && layout.line == typography.line && layout.window == line_window_key(doc) {
-    if layout.revision == doc.revision {
+fn line_layout_update(typography: *Typography, arranged: *LineLayout, doc: *const buffer.Document, identity: u64, viewport: TextViewport) usize {
+  if arranged.document == doc && arranged.identity == identity && arranged.start == viewport.start && arranged.end == viewport.end && arranged.line == typography.line && arranged.window == line_window_key(doc) {
+    if arranged.revision == doc.revision {
       return 0
     }
-    changed:=buffer.changes_since(doc, layout.revision)
+    changed:=buffer.changes_since(doc, arranged.revision)
     // The journal's common prefix proves every edit was strictly after these
     // complete visible lines. Boundary edits and missing history rebuild.
-    if changed.found && changed.low>layout.end {
-      layout.revision=doc.revision
+    if changed.found && changed.low>arranged.end {
+      arranged.revision=doc.revision
       return 0
     }
   }
-  layout.builds+=1
+  arranged.builds+=1
   first := buffer.row_at(doc, viewport.start)
   count: usize = 0
   for count < LineSlots && first + count < doc.line_count && (count == 0 || buffer.row_start(doc, first + count) < viewport.end) {
     count += 1
   }
   for slot in 0..LineSlots {
-    layout.lines[slot].used = false
+    arranged.lines[slot].used = false
   }
-  hashes: [256]u64 = []
+  hashes: [256]u64
   // Lines already shaped keep their text objects wherever they moved.
   for index in 0..count {
     bytes := line_bytes(doc, first + index)
     hashes[index] = line_hash(bytes)
-    layout.rows[index] = LineSlots
+    arranged.rows[index] = LineSlots
     for slot in 0..LineSlots {
-      candidate := &layout.lines[slot]
+      candidate := &arranged.lines[slot]
       if candidate.text != nil && !candidate.used && candidate.hash == hashes[index] && candidate.length == #len(bytes) {
         candidate.used = true
-        layout.rows[index] = slot
+        arranged.rows[index] = slot
         break
       }
     }
@@ -118,15 +118,15 @@ fn line_layout_update(typography: *Typography, layout: *LineLayout, doc: *const 
   shaped: usize = 0
   free_slot: usize = 0
   for index in 0..count {
-    if layout.rows[index] != LineSlots {
+    if arranged.rows[index] != LineSlots {
       continue
     }
-    for free_slot < LineSlots && layout.lines[free_slot].used {
+    for free_slot < LineSlots && arranged.lines[free_slot].used {
       free_slot += 1
     }
-    entry := &layout.lines[free_slot]
+    entry := &arranged.lines[free_slot]
     entry.used = true
-    layout.rows[index] = free_slot
+    arranged.rows[index] = free_slot
     if entry.text == nil {
       blank: [1]u8 = [0]
       entry.text = ttf.create(typography.engine, typography.font, &blank[0], 0)
@@ -151,60 +151,60 @@ fn line_layout_update(typography: *Typography, layout: *LineLayout, doc: *const 
   for index in 0..count {
     low := buffer.row_start(doc, first + index)
     high := buffer.line_end(doc, low)
-    layout.origins[index] = line_draw_start(doc, low, high)
+    arranged.origins[index] = line_draw_start(doc, low, high)
   }
-  layout.window = line_window_key(doc)
-  layout.first_row = first
-  layout.count = count
-  layout.line = typography.line
-  layout.document = doc
-  layout.identity = identity
-  layout.revision = doc.revision
-  layout.start = viewport.start
-  layout.end = viewport.end
+  arranged.window = line_window_key(doc)
+  arranged.first_row = first
+  arranged.count = count
+  arranged.line = typography.line
+  arranged.document = doc
+  arranged.identity = identity
+  arranged.revision = doc.revision
+  arranged.start = viewport.start
+  arranged.end = viewport.end
   return shaped
 }
-fn line_layout_draw(layout: *LineLayout, color: Rgb, x: f32, y: f32) {
-  for index in 0..layout.count {
-    text := layout.lines[layout.rows[index]].text
-    if !tint(text, color) || !ttf.draw(text, x, y + #cast(f32, index) * layout.line) {
+fn line_layout_draw(arranged: *LineLayout, color: Rgb, x: f32, y: f32) {
+  for index in 0..arranged.count {
+    text := arranged.lines[arranged.rows[index]].text
+    if !tint(text, color) || !ttf.draw(text, x, y + #cast(f32, index) * arranged.line) {
       #panic("text draw failed")
     }
   }
 }
 // Geometry of a document position, relative to the first visible row, like
 // the old whole-viewport substring query.
-fn layout_substring(layout: *const LineLayout, doc: *const buffer.Document, position: usize, output: *ttf.Substring) bool {
+fn layout_substring(arranged: *const LineLayout, doc: *const buffer.Document, position: usize, output: *ttf.Substring) bool {
   row := buffer.row_at(doc, position)
-  if row < layout.first_row || row >= layout.first_row + layout.count {
+  if row < arranged.first_row || row >= arranged.first_row + arranged.count {
     return false
   }
-  index := row - layout.first_row
-  origin := layout.origins[index]
-  if position < origin || position - origin > layout.lines[layout.rows[index]].length {
+  index := row - arranged.first_row
+  origin := arranged.origins[index]
+  if position < origin || position - origin > arranged.lines[arranged.rows[index]].length {
     return false
   }
-  if !ttf.substring(layout.lines[layout.rows[index]].text, #cast(i32, (position - origin)), output) {
+  if !ttf.substring(arranged.lines[arranged.rows[index]].text, #cast(i32, (position - origin)), output) {
     return false
   }
-  output.y += #cast(i32, (#cast(f32, index) * layout.line))
+  output.y += #cast(i32, (#cast(f32, index) * arranged.line))
   return true
 }
-fn line_layout_font(layout: *LineLayout, font: rawptr) {
+fn line_layout_font(arranged: *LineLayout, font: rawptr) {
   for slot in 0..LineSlots {
-    if layout.lines[slot].text != nil {
-      _ = ttf.set_font(layout.lines[slot].text, font)
-      layout.lines[slot].hash = 0
-      layout.lines[slot].length = 0
+    if arranged.lines[slot].text != nil {
+      _ = ttf.set_font(arranged.lines[slot].text, font)
+      arranged.lines[slot].hash = 0
+      arranged.lines[slot].length = 0
     }
   }
-  layout.document = nil
+  arranged.document = nil
 }
-fn line_layout_release(layout: *LineLayout) {
+fn line_layout_release(arranged: *LineLayout) {
   for slot in 0..LineSlots {
-    if layout.lines[slot].text != nil {
-      ttf.destroy(layout.lines[slot].text)
+    if arranged.lines[slot].text != nil {
+      ttf.destroy(arranged.lines[slot].text)
     }
   }
-  layout.* = LineLayout{}
+  arranged.* = LineLayout{}
 }

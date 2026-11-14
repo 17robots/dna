@@ -190,7 +190,7 @@ with tempfile.TemporaryDirectory(prefix='dna-worksets-') as temporary:
     source += '\n' + functions(args.source_root/'persistence.dyn', ['recovery_needed'])
     source += '''
 fn probe_number(value:usize) {
-  bytes:[32]u8=[]
+  bytes:[32]u8
   at:usize=30
   current:=value
   bytes[31]=10
@@ -209,7 +209,7 @@ fn main() {
   slots:=mem.push_array(Slot,owner,80)
   docs:=mem.push_array(buffer.Document,owner,80)
   pointers:=mem.push_array(*Slot,owner,80)
-  colors: [32]u8=[]
+  colors: [32]u8
   app.recovery.ready=true
   app.config.syntax_enabled=true
   app.disk.worker=#cast(rawptr,1)

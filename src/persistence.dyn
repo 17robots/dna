@@ -55,7 +55,7 @@ const RecoveryPatchLimit: usize = 4026531840
 const RecoveryPiecesMinimum: usize = 1048576
 fn recovery_pieces(saved: *workspace.SavedBuffer, state: *workspace.State, doc: *const buffer.Document) bool {
   if state.patches == nil {
-    state.patches = mem.arena_create(RecoveryPatchLimit + 268435456)
+    state.patches = mem.arena_alloc(RecoveryPatchLimit + 268435456)
   }
   list := buffer.saved_pieces(doc, state.patches, RecoveryPatchLimit)
   if !list.valid {
@@ -125,7 +125,7 @@ fn recovery_apply_pieces(doc: *buffer.Document, saved: *const workspace.SavedBuf
   defer arena_owner.release(arena)
   pieces := #slice((#cast(*buffer.Piece, &mem.push_bytes_uninit(arena, count * #sizeof(buffer.Piece) + 16)[0])), count)
   for index in 0..count {
-    words: [3]usize = []
+    words: [3]usize
     for word in 0..3 {
       for byte in 0..8 {
         words[word] |= #cast(usize, saved.pieces[index * 24 + word * 8 + byte]) << (byte * 8)
@@ -203,7 +203,7 @@ fn session_capture(app: *App, state: *workspace.State, recovery: bool) bool {
   return true
 }
 fn session_save(app: *App, argument: []const u8) bool {
-  path_storage: [4096]u8 = []
+  path_storage: [4096]u8
   path := session_path(app, argument, path_storage[..])
   if #len(path) == 0 || #len(path) > 3980 {
     notice(app, "Invalid session path.")
@@ -227,11 +227,11 @@ fn session_save(app: *App, argument: []const u8) bool {
     notice(app, "Session exceeds snapshot capacity.")
     return false
   }
-  temporary: [4096]u8 = []
+  temporary: [4096]u8
   used := copy_text(temporary[..], path)
   add_text(temporary[..], &used, ".tmp")
   tx := fs.atomic_begin_private(path, temporary[..used])
-  if tx.failure.kind != io.Kind.Ok {
+  if io.failed(tx.failure) {
     notice(app, "Cannot create session snapshot. Ensure its parent directory exists and no .tmp file remains.")
     return false
   }
@@ -240,7 +240,7 @@ fn session_save(app: *App, argument: []const u8) bool {
       _ = fs.atomic_abort(&tx.transaction)
     }
   }
-  if fs.set_permissions(&tx.transaction.file, 384).failure.kind != io.Kind.Ok || fs.write(&tx.transaction.file, bytes[..length]).failure.kind != io.Kind.Ok || fs.atomic_commit(&tx.transaction).failure.kind != io.Kind.Ok {
+  if io.failed(fs.set_permissions(&tx.transaction.file, 384).failure) || io.failed(fs.write(&tx.transaction.file, bytes[..length]).failure) || io.failed(fs.atomic_commit(&tx.transaction).failure) {
     notice(app, "Session write failed.")
     return false
   }
@@ -258,10 +258,10 @@ fn session_restore(app: *App, argument: []const u8) bool {
       return false
     }
   }
-  path_storage: [4096]u8 = []
+  path_storage: [4096]u8
   path := session_path(app, argument, path_storage[..])
   info := files.metadata(path)
-  if info.failure.kind != io.Kind.Ok || (info.mode & 61440) != 32768 {
+  if io.failed(info.failure) || (info.mode & 61440) != 32768 {
     notice(app, "Session must be a regular file.")
     return false
   }
@@ -278,7 +278,7 @@ fn session_restore(app: *App, argument: []const u8) bool {
   read := fs.read_all(allocated, path, session_limit)
   state := workspace.State{}
   defer workspace.release(&state)
-  if read.failure.kind != io.Kind.Ok || !workspace.decode(read.value, &state) {
+  if io.failed(read.failure) || !workspace.decode(read.value, &state) {
     notice(app, "Invalid, truncated, or unsupported session. Workspace unchanged.")
     return false
   }
@@ -527,7 +527,7 @@ fn recovery_tick(app: *App) {
     return
   }
   if app.recovery.worker == nil {
-    path: [4096]u8 = []
+    path: [4096]u8
     parent := app.configuration.path_length
     for parent > 0 && app.configuration.path[parent - 1] != '/' {
       parent -= 1
@@ -583,9 +583,9 @@ fn recovery_allowed(app: *App) bool {
     return false
   }
   if !app.recovery.checked {
-    env: [32]u8 = []
+    env: [32]u8
     disabled := host.environment("DNA_RECOVERY", env[..])
-    app.recovery.disabled = disabled.failure.kind == io.Kind.Ok && disabled.found && buffer.equal(disabled.value, "0")
+    app.recovery.disabled = !io.failed(disabled.failure) && disabled.found && buffer.equal(disabled.value, "0")
     smoke := host.environment("DYN_EDITOR_SMOKE", env[..])
     if smoke.found {
       app.recovery.disabled = true

@@ -46,7 +46,7 @@ fn lsp_json_sources(out: []u8, value: *const json.Value, depth: usize) bool {
 fn lsp_json_write(data: rawptr, source: []const u8) io.Transfer {
   output := #cast(*LspJsonOutput, data)
   if #len(source) > #len(output.bytes) - output.used || (!output.writing && lsp_json_overlap(output.bytes, source)) {
-    return io.Transfer{ error: -28, status: io.Status.Error }
+    return io.Transfer{ failure: io.Failure{ kind: io.Kind.System, native: -28 } }
   }
   if output.writing {
     _ = mem.move(output.bytes[output.used..], source)
@@ -61,13 +61,13 @@ fn lsp_json_encode(out: []u8, value: *const json.Value) []u8 {
   output := LspJsonOutput{ bytes: out }
   writer := io.Writer{ data: #cast(rawptr, &output), write: lsp_json_write }
   measured := json.write(writer, value)
-  if measured.status == io.Status.Error {
+  if io.failed(measured.failure) {
     return out[..0]
   }
   output.used = 0
   output.writing = true
   encoded := json.write(writer, value)
-  if encoded.status == io.Status.Error {
+  if io.failed(encoded.failure) {
     return out[..0]
   }
   return out[..output.used]
@@ -97,7 +97,9 @@ fn lsp_escape(out: *u8, bytes: []const u8) usize {
       word := #cast(*const u64, &bytes[plain]).*
       quote := word ^ 0x2222222222222222
       slash := word ^ 0x5c5c5c5c5c5c5c5c
-      special := ((word - 0x2020202020202020) & ~word) | ((quote - 0x0101010101010101) & ~quote) | ((slash - 0x0101010101010101) & ~slash)
+      // The subtractions borrow across bytes on purpose (SWAR); they wrap.
+      special := (math.wrapping_sub(word, 0x2020202020202020) & ~word) |
+        (math.wrapping_sub(quote, 0x0101010101010101) & ~quote) | (math.wrapping_sub(slash, 0x0101010101010101) & ~slash)
       if (special & 0x8080808080808080) != 0 {
         break
       }
@@ -152,8 +154,7 @@ fn lsp_escape(out: *u8, bytes: []const u8) usize {
 const LspParallelEscape: usize = 16777216
 const LspEscapeStack: usize = 65536
 struct LspEscapeJob { snapshot: *const buffer.TextSnapshot, low, high: usize, out: *u8, size: usize, done: *sync.AtomicU32 }
-fn lsp_escape_job(context: rawptr) isize {
-  job := #cast(*LspEscapeJob, context)
+fn lsp_escape_job(job: *LspEscapeJob) isize {
   size: usize = 0
   at := job.low
   for at < job.high {
@@ -177,25 +178,25 @@ fn lsp_escape_job(context: rawptr) isize {
 // Run every job, all but the first on new threads (or here when one cannot
 // start).
 fn lsp_escape_run(jobs: []LspEscapeJob) {
-  arena := mem.arena_create(4096)
+  arena := mem.arena_alloc(4096)
   defer mem.arena_release(arena)
-  threads: [16]*thread.Thread = []
-  started: [16]bool = []
+  threads: [16]*thread.Thread
+  started: [16]bool
   for index in 1..#len(jobs) {
-    spawned := thread.spawn_with_size(arena, LspEscapeStack, lsp_escape_job, #cast(rawptr, &jobs[index]))
-    if spawned.failure.kind == io.Kind.Ok {
+    spawned := thread.spawn_with_size(arena, LspEscapeStack, lsp_escape_job, &jobs[index])
+    if !io.failed(spawned.failure) {
       threads[index] = spawned.value
       started[index] = true
     }
   }
-  _ = lsp_escape_job(#cast(rawptr, &jobs[0]))
+  _ = lsp_escape_job(&jobs[0])
   for index in 1..#len(jobs) {
     if started[index] {
-      if thread.join(threads[index]).failure.kind != io.Kind.Ok {
+      if io.failed(thread.join(threads[index]).failure) {
         #panic("cannot join language-server encoder")
       }
     } else {
-      _ = lsp_escape_job(#cast(rawptr, &jobs[index]))
+      _ = lsp_escape_job(&jobs[index])
     }
   }
 }
@@ -212,7 +213,7 @@ fn lsp_json_document(out: []u8, doc: *const buffer.Document, low: usize, high: u
   if high - low >= LspParallelEscape && workers > 1 {
     snapshot := buffer.snapshot_take(doc)
     defer buffer.snapshot_release(&snapshot)
-    storage: [16]LspEscapeJob = []
+    storage: [16]LspEscapeJob
     jobs := storage[..workers]
     for index in 0..workers {
       jobs[index] = LspEscapeJob{snapshot: &snapshot, low: low + (high - low) * index / workers, high: low + (high - low) * (index + 1) / workers}
@@ -308,19 +309,19 @@ fn lsp_encode_launch(encode: *LspEncode) {
   sync.store_u32(&encode.done, 0)
   for index in 0..encode.workers {
     encode.started[index] = false
-    spawned := thread.spawn_with_size(encode.arena, LspEscapeStack, lsp_escape_job, #cast(rawptr, &encode.jobs[index]))
-    if spawned.failure.kind == io.Kind.Ok {
+    spawned := thread.spawn_with_size(encode.arena, LspEscapeStack, lsp_escape_job, &encode.jobs[index])
+    if !io.failed(spawned.failure) {
       encode.threads[index] = spawned.value
       encode.started[index] = true
     } else {
-      _ = lsp_escape_job(#cast(rawptr, &encode.jobs[index]))
+      _ = lsp_escape_job(&encode.jobs[index])
     }
   }
 }
 fn lsp_encode_join(encode: *LspEncode) {
   for index in 0..encode.workers {
     if encode.started[index] {
-      if thread.join(encode.threads[index]).failure.kind != io.Kind.Ok {
+      if io.failed(thread.join(encode.threads[index]).failure) {
         #panic("cannot join language-server encoder")
       }
       encode.started[index] = false
@@ -630,7 +631,7 @@ fn lsp_server_failure(app: *App, index: usize, reason: []const u8) {
       break
     }
   }
-  text: [512]u8 = []
+  text: [512]u8
   used: usize = 0
   add_text(text[..], &used, program)
   add_text(text[..], &used, " stopped: ")
@@ -892,9 +893,9 @@ fn lsp_start(app: *App, language: []const u8, command: []const u8) {
     return
   }
   server.deadline = sdl.ticks() + #cast(u64, app.config.lsp_timeout_ms)
-  uri: [12288]u8 = []
-  encoded: [32768]u8 = []
-  message: [65536]u8 = []
+  uri: [12288]u8
+  encoded: [32768]u8
+  message: [65536]u8
   used: usize = 0
   lsp_header(message[..], &used, "initialize", 1)
   add_text(message[..], &used, "{\"processId\":null,\"rootUri\":")
@@ -917,8 +918,8 @@ fn lsp_for(app: *App) usize {
   return 8
 }
 fn lsp_document_uri(out: []u8, used: *usize, path: []const u8) {
-  uri: [12288]u8 = []
-  encoded: [32768]u8 = []
+  uri: [12288]u8
+  encoded: [32768]u8
   add_text(out, used, lsp_json_string(encoded[..], lsp.uri(path, uri[..])))
 }
 // The line index skips unchanged preceding lines; only this line needs UTF-16 counting.
@@ -945,7 +946,7 @@ fn lsp_sync_slot(app:*App, index:usize, slot_index:usize, force:bool) bool {
     matches = buffer.equal(filetype_name(slot), server.language[..server.length])
   }
   if tracked.identity != 0 && (!matches || tracked.identity != slot.identity || !buffer.equal(tracked.path[..tracked.length], files.name(&slot.file))) {
-    close_message: [32768]u8 = []
+    close_message: [32768]u8
     close_used: usize = 0
     lsp_header(close_message[..], &close_used, "textDocument/didClose", 0)
     add_text(close_message[..], &close_used, "{\"textDocument\":{\"uri\":")
@@ -1273,8 +1274,8 @@ fn lsp_request(app: *App, kind: usize, argument: []const u8) {
   app.lsp.position = position
   app.lsp.insert = app.view.insert
   app.lsp.deadline = sdl.ticks() + #cast(u64, app.config.lsp_timeout_ms)
-  message: [65536]u8 = []
-  escaped: [32768]u8 = []
+  message: [65536]u8
+  escaped: [32768]u8
   used: usize = 0
   lsp_header(message[..], &used, method, app.lsp.pending)
   if kind == 14 {
@@ -1344,7 +1345,7 @@ fn lsp_request(app: *App, kind: usize, argument: []const u8) {
   lsp_note(app, "Language request pending…")
 }
 fn lsp_diagnostics(app: *App, index: usize, params: *const json.Value) {
-  storage: [4096]u8 = []
+  storage: [4096]u8
   path := lsp.path(json_text(params, "uri"), storage[..])
   count:=#len(app.documents.slots)
   if count>#len(app.lsp.servers[index].documents) {
@@ -1434,7 +1435,7 @@ fn lsp_markup(out: []u8, used: *usize, value: *const json.Value) {
 }
 fn lsp_handle(app: *App, index: usize, source: []const u8, arena: *mem.Arena) bool {
   parsed := json.parse(arena, source)
-  if parsed.failure.kind != parse.Kind.Ok || !json.is_object(parsed.root) {
+  if parse.failed(parsed.failure) || !json.is_object(parsed.root) {
     lsp_note(app, "Malformed JSON from language server; stopped.")
     lsp_stop(app, index)
     return false
@@ -1455,7 +1456,7 @@ fn lsp_handle(app: *App, index: usize, source: []const u8, arena: *mem.Arena) bo
         render_request(app, RenderLsp)
       }
       if app.prompt_state.panel == Panel.LspEdit {
-        reply: [512]u8 = []
+        reply: [512]u8
         encoded_reply := lsp_json_encode(reply[..], json.object_get(root, "id"))
         if #len(encoded_reply) > 0 {
           app.lsp.edits.reply_length = copy_text(app.lsp.edits.reply[..], encoded_reply)
@@ -1466,8 +1467,8 @@ fn lsp_handle(app: *App, index: usize, source: []const u8, arena: *mem.Arena) bo
       }
     }
     if !json.is_missing(json.object_get(root, "id")) {
-      response: [65536]u8 = []
-      encoded: [16384]u8 = []
+      response: [65536]u8
+      encoded: [16384]u8
       used := copy_text(response[..], "{\"jsonrpc\":\"2.0\",\"id\":")
       encoded_id := lsp_json_encode(encoded[..], json.object_get(root, "id"))
       if #len(encoded_id) == 0 {
@@ -1518,12 +1519,12 @@ fn lsp_handle(app: *App, index: usize, source: []const u8, arena: *mem.Arena) bo
       lsp_stop(app, index)
       return false
     }
-    sync := json.object_get(caps, "textDocumentSync")
-    change := lsp.number(sync)
-    if json.is_object(sync) {
-      change = lsp.number(json.object_get(sync, "change"))
+    synced := json.object_get(caps, "textDocumentSync")
+    change := lsp.number(synced)
+    if json.is_object(synced) {
+      change = lsp.number(json.object_get(synced, "change"))
     }
-    save := json.object_get(sync, "save")
+    save := json.object_get(synced, "save")
     server.save = json.is_object(save) || (json.is_bool(save) && save.boolean)
     include := json.object_get(save, "includeText")
     server.save_text = json.is_bool(include) && include.boolean
@@ -1575,7 +1576,7 @@ fn lsp_handle(app: *App, index: usize, source: []const u8, arena: *mem.Arena) bo
     stale = "another panel is open"
   }
   if #len(stale) > 0 {
-    stale_status: [256]u8 = []
+    stale_status: [256]u8
     stale_length: usize = 0
     if app.lsp.automatic && app.lsp.kind == 1 {
       // Never apply stale edits. Let the scheduler request the current position.
@@ -1596,7 +1597,7 @@ fn lsp_handle(app: *App, index: usize, source: []const u8, arena: *mem.Arena) bo
     return false
   }
   if app.lsp.kind == 2 {
-    text: [8192]u8 = []
+    text: [8192]u8
     length: usize = 0
     lsp_markup(text[..], &length, json.object_get(result, "contents"))
     if length == 0 {
@@ -1680,7 +1681,7 @@ fn lsp_handle(app: *App, index: usize, source: []const u8, arena: *mem.Arena) bo
     app.prompt_state.panel = Panel.LspResults
   }
   if state.kind == 1 {
-    status: [256]u8 = []
+    status: [256]u8
     status_length: usize = 0
     if app.lsp.automatic {
       add_text(status[..], &status_length, "Automatic completion: ")
@@ -1856,7 +1857,7 @@ fn lsp_symbol_label(app: *App, item: *const json.Value, output: []u8) usize {
   add_text(output, &used, "  ")
   kind := lsp.number(json.object_get(item, "kind"))
   add_text(output, &used, lsp_symbol_kind(kind.value))
-  path: [4096]u8 = []
+  path: [4096]u8
   range: *const json.Value = nil
   file := lsp_symbol_location(app, item, path[..], &range)
   add_text(output, &used, "  ")
@@ -1913,7 +1914,7 @@ fn lsp_result_label(app: *App, item: *const json.Value, output: []u8) usize {
   if #len(uri) == 0 {
     uri = json_text(item, "targetUri")
   }
-  path: [4096]u8 = []
+  path: [4096]u8
   used := copy_text(output, lsp.path(uri, path[..]))
   range := json.object_get(item, "range")
   if json.is_missing(range) {
@@ -1951,7 +1952,7 @@ fn lsp_popup(app: *App, output: []u8) usize {
     } else {
       add_text(output, &used, "  ")
     }
-    label: [4096]u8 = []
+    label: [4096]u8
     length := lsp_result_label(app, state.items[index], label[..])
     add_text(output, &used, label[..length])
     add_text(output, &used, "\n")
@@ -1970,7 +1971,7 @@ fn lsp_config(app: *App) {
     }
     configured_index += 1
   }
-  path: [4096]u8 = []
+  path: [4096]u8
   parent := app.configuration.path_length
   for parent > 0 && app.configuration.path[parent - 1] != 47 {
     parent -= 1
@@ -1980,15 +1981,15 @@ fn lsp_config(app: *App) {
   allocated := arena_owner.create((262144))
   defer arena_owner.release(allocated)
   read := fs.read_all(allocated, path[..length], 32768)
-  if read.failure.kind != io.Kind.Ok && configured_count > 0 {
+  if io.failed(read.failure) && configured_count > 0 {
     return
   }
-  if read.failure.kind != io.Kind.Ok {
+  if io.failed(read.failure) {
     notice(app, "Create lsp.json beside config.toml, e.g. {\"dyn\":\"dyn lsp\",\"python\":\"pyright-langserver --stdio\"}. Commands run only when you use :lsp-config.")
     return
   }
   parsed := json.parse(allocated, read.value)
-  if parsed.failure.kind != parse.Kind.Ok || !json.is_object(parsed.root) {
+  if parse.failed(parsed.failure) || !json.is_object(parsed.root) {
     notice(app, "lsp.json must map filetypes to trusted server command strings.")
     return
   }
@@ -2037,8 +2038,8 @@ fn lsp_command(app: *App, verb: []const u8, argument: []const u8) bool {
       index += 1
     }
     if index < 8 {
-      language: [65]u8 = []
-      command: [4096]u8 = []
+      language: [65]u8
+      command: [4096]u8
       server := &app.lsp.servers[index]
       name_length := copy_text(language[..], server.language[..server.length])
       command_length := copy_text(command[..], server.command[..c.string_length(&server.command[0], 4096)])
@@ -2260,9 +2261,9 @@ fn lsp_auto_start(app: *App) {
     if (app.lsp.auto_started & 65536) == 0 {
       app.lsp.auto_started = app.lsp.auto_started | 65536
       if lsp_for(app) == 8 {
-        command_storage: [4096]u8 = []
+        command_storage: [4096]u8
         override := host.environment("DNA_DYN_LSP", command_storage[..])
-        if override.failure.kind == io.Kind.Ok && override.found && #len(override.value) > 0 {
+        if !io.failed(override.failure) && override.found && #len(override.value) > 0 {
           lsp_start(app, "dyn", override.value)
         } else {
           lsp_start(app, "dyn", "dyn lsp")
@@ -2309,7 +2310,7 @@ fn lsp_receive_finish(app: *App, work: *WorkArena, retained: bool) {
 }
 
 fn lsp_status(app: *App) {
-  text: [8192]u8 = []
+  text: [8192]u8
   used: usize = 0
   index := lsp_for(app)
   add_text(text[..], &used, "Server: ")
@@ -2347,7 +2348,7 @@ fn lsp_cancel_request(app: *App) {
   if app.lsp.pending == 0 {
     return
   }
-  cancel: [256]u8 = []
+  cancel: [256]u8
   used: usize = 0
   lsp_header(cancel[..], &used, "$/cancelRequest", 0)
   add_text(cancel[..], &used, "{\"id\":")

@@ -109,7 +109,7 @@ def main():
         complete.mkdir()
         for module in ('files', 'buffer', 'filesystem', 'host', 'cstring', 'owned_arena'):
             shutil.copytree(ROOT / 'src' / module, complete / module)
-        (complete / 'main.dyn').write_text('use "./files"\nfn main() {\n output:[4096]u8=[]\n _=files.resolve("C:/parent/file.txt",output[..])\n}\n', encoding='utf-8')
+        (complete / 'main.dyn').write_text('use "./files"\nfn main() {\n output:[4096]u8\n _=files.resolve("C:/parent/file.txt",output[..])\n}\n', encoding='utf-8')
         for target in ('x86_64-windows', 'aarch64-windows'):
             for mode in ('debug', 'release'):
                 for name, source in (('helpers', stage), ('complete', complete)):

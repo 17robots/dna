@@ -15,7 +15,7 @@ frontend_windows_api: WindowsFrontendAPI
 frontend_windows_once: frontend_sync.Once
 fn frontend_symbol(library: rawptr, name: []const u8) rawptr {
   result := frontend_loader.symbol(library, name)
-  if result.failure.kind != io.Kind.Ok || result.value == nil {
+  if io.failed(result.failure) || result.value == nil {
     #panic("missing Windows frontend routine")
   }
   return result.value
@@ -24,7 +24,7 @@ fn frontend_prepare() {
   if frontend_sync.once_begin(&frontend_windows_once) {
     kernel := frontend_loader.open("kernel32.dll", 0)
     user := frontend_loader.open("user32.dll", 0)
-    if kernel.failure.kind != io.Kind.Ok || user.failure.kind != io.Kind.Ok {
+    if io.failed(kernel.failure) || io.failed(user.failure) {
       #panic("missing Windows frontend library")
     }
     frontend_windows_api.set_environment = #cast(fn(*const u16, *const u16) i32, frontend_symbol(kernel.value, "SetEnvironmentVariableW"))
@@ -63,14 +63,14 @@ fn handoff_setenv(name, value: *const u8, overwrite: i32) i32 {
     return -1
   }
   if overwrite == 0 {
-    storage: [4096]u8 = []
+    storage: [4096]u8
     present := host.environment(#slice(name, c.string_length(name, 65536)), storage[..])
     if present.found {
       return 0
     }
   }
-  key: [32768]u16 = []
-  text: [32768]u16 = []
+  key: [32768]u16
+  text: [32768]u16
   if !frontend_wide(name, key[..]) || !frontend_wide(value, text[..]) {
     return -1
   }
@@ -81,7 +81,7 @@ fn handoff_setenv(name, value: *const u8, overwrite: i32) i32 {
 }
 fn handoff_unsetenv(name: *const u8) i32 {
   frontend_prepare()
-  key: [32768]u16 = []
+  key: [32768]u16
   if name == nil || !frontend_wide(name, key[..]) {
     return -1
   }
@@ -90,7 +90,7 @@ fn handoff_unsetenv(name: *const u8) i32 {
   }
   return 0
 }
-fn thread_clock(kind: i32, time: *ThreadTime) i32 {
+fn thread_clock(kind: i32, moment: *ThreadTime) i32 {
   frontend_prepare()
   created: u64 = 0
   ended: u64 = 0
@@ -106,8 +106,8 @@ fn thread_clock(kind: i32, time: *ThreadTime) i32 {
     return -1
   }
   ticks := kernel + user
-  time.seconds = #cast(i64, ticks / 10000000)
-  time.nanoseconds = #cast(i64, (ticks % 10000000) * 100)
+  moment.seconds = #cast(i64, ticks / 10000000)
+  moment.nanoseconds = #cast(i64, (ticks % 10000000) * 100)
   return 0
 }
 
@@ -144,7 +144,7 @@ fn frontend_system_directory(space: *WindowsLanguageCommand) usize {
   return length
 }
 fn platform_job_directory(output: []u8) usize {
-  arena := frontend_mem.arena_try_create(196608)
+  arena := frontend_mem.arena_try_alloc(196608)
   if !arena.ok {
     return 0
   }
@@ -276,7 +276,7 @@ fn platform_language_command(output: []u8, used: *usize, root, helper, verb, nam
   if used.* >= #len(output) || #len(root) == 0 || #len(helper) == 0 || #len(verb) == 0 {
     return false
   }
-  arena := frontend_mem.arena_try_create(196608)
+  arena := frontend_mem.arena_try_alloc(196608)
   if !arena.ok {
     return false
   }

@@ -42,9 +42,9 @@ fn main() {
  window_api.listen_events(&host,true)
  _=window_api.set_swap_interval(&host,0)
  renderer:=presenter.Presenter{}
- check(presenter.open(&renderer).failure.kind == io.Kind.Ok,"sequence presenter")
+ check(!io.failed(presenter.open(&renderer).failure),"sequence presenter")
  defer presenter.close(&renderer)
- owner:=mem.arena_create(0)
+ owner:=mem.arena_alloc(0)
  defer mem.arena_release(owner)
  max_width:=host.width
  max_height:=host.height
@@ -84,12 +84,12 @@ fn main() {
    height=max_height/2}
   length:=#cast(usize,width)*#cast(usize,height)*4
   surface:=software.Surface{pixels:pixels[..length],width:width,height:height,stride:#cast(usize,width)*4}
-  check(presenter.draw(&renderer,surface).failure.kind == io.Kind.Ok,"sequence upload")
+  check(!io.failed(presenter.draw(&renderer,surface).failure),"sequence upload")
   verify(&renderer,surface,readback[..length])
   check(window_api.swap(&host).kind == io.Kind.Ok,"sequence swap")
   if frame%53==27 {
    presenter.close(&renderer)
-   check(presenter.open(&renderer).failure.kind == io.Kind.Ok,"sequence recreate")
+   check(!io.failed(presenter.open(&renderer).failure),"sequence recreate")
   }
  }
 }

@@ -33,7 +33,7 @@ fn close_enough(a,b:f64)bool{return a-b<0.0001 && b-a<0.0001}
 fn main(){
  check(init())
  defer quit()
- name: [4096]u8=[]
+ name: [4096]u8
  path: []const u8="FONT_PATH"
  _=mem.copy(name[..#len(path)],path)
  font:=ttf_open(&name[0],16.0)

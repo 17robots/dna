@@ -26,7 +26,7 @@ struct Typography {original_font:rawptr,points,scale:f32}
 '''+source[start:end]+'''
 fn main(){
  app:=App{}
- path:[32]u8=[]
+ path:[32]u8
  name:[]const u8="same.ttf"
  _=mem.copy(path[..#len(name)],name)
  _=mem.copy(app.fonts.original_font_path[..#len(name)],name)

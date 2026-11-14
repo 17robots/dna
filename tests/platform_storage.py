@@ -110,7 +110,7 @@ fn main() {
   offset:u64=1
   if mode==2 {offset=2}
   result:=copy_range(&origin,offset,&target,200000)
-  if probe_check(result.transferred,result.failure.kind == io.Kind.Ok)!=1 {#panic("range result")}
+  if probe_check(result.transferred,!io.failed(result.failure))!=1 {#panic("range result")}
  }
  for mode in 0..3 {
   probe_reset(#cast(i32,mode))

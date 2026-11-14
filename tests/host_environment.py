@@ -73,14 +73,14 @@ fn rejected(name: []const u8, kind: io.Kind, error: isize) {
   set(0)
   output: [4]u8 = [90,90,90,90]
   result := host.environment(name, output[..3])
-  if result.failure.kind == io.Kind.Ok || result.found || result.failure.kind != kind || result.failure.native != error || #len(result.value) != 0 || calls() != 0 { #panic("rejection") }
+  if !io.failed(result.failure) || result.found || result.failure.kind != kind || result.failure.native != error || #len(result.value) != 0 || calls() != 0 { #panic("rejection") }
   for byte in output { if byte != 90 { #panic("rejected output changed") } }
 }
 fn accepted(name: []const u8) {
   set(1)
   output: [4]u8 = [90,90,90,90]
   result := host.environment(name, output[..3])
-  if result.failure.kind != io.Kind.Ok || !result.found || #len(result.value) != 3 || calls() != 1 { #panic("accepted boundary") }
+  if io.failed(result.failure) || !result.found || #len(result.value) != 3 || calls() != 1 { #panic("accepted boundary") }
   if &result.value[0] != &output[0] || output[0] != 97 || output[2] != 99 || output[3] != 90 { #panic("destination ownership") }
 }
 fn main() {''']
@@ -91,17 +91,17 @@ fn main() {''']
   rejected("a=b", io.Kind.InvalidInput, -22)
   nul: [3]u8 = [97,0,98]
   rejected(nul[..], io.Kind.InvalidInput, -22)
-  ascii: [32768]u8 = []
+  ascii: [32768]u8
   for i in 0..32768 { ascii[i] = 97 }
   accepted(ascii[..32767])
   rejected(ascii[..], io.Kind.Capacity, -28)
-  bmp: [98304]u8 = []
+  bmp: [98304]u8
   for i in 0..32768 { bmp[i*3] = 226
     bmp[i*3+1] = 130
     bmp[i*3+2] = 172 }
   accepted(bmp[..98301])
   rejected(bmp[..], io.Kind.Capacity, -28)
-  astral: [65537]u8 = []
+  astral: [65537]u8
   for i in 0..16384 { astral[i*4] = 240
     astral[i*4+1] = 159
     astral[i*4+2] = 152
@@ -115,18 +115,18 @@ fn main() {''']
   for capacity in 0..3 {
     set(1)
     short := host.environment("valid", output[..capacity])
-    if short.failure.kind == io.Kind.Ok || short.failure.native != -28 || short.failure.kind != io.Kind.Capacity || calls() != 1 { #panic("short output") }
+    if !io.failed(short.failure) || short.failure.native != -28 || short.failure.kind != io.Kind.Capacity || calls() != 1 { #panic("short output") }
     for byte in output { if byte != 90 { #panic("short output overwritten") } }
   }
   set(2)
   failure := host.environment("valid", output[..])
-  if failure.failure.kind == io.Kind.Ok || failure.failure.native != -5 || failure.failure.kind != io.Kind.System || failure.found || calls() != 1 { #panic("native diagnostic") }
+  if !io.failed(failure.failure) || failure.failure.native != -5 || failure.failure.kind != io.Kind.System || failure.found || calls() != 1 { #panic("native diagnostic") }
   set(3)
   missing := host.environment("valid", output[..0])
-  if missing.failure.kind != io.Kind.Ok || missing.found || #len(missing.value) != 0 || calls() != 1 { #panic("missing") }
+  if io.failed(missing.failure) || missing.found || #len(missing.value) != 0 || calls() != 1 { #panic("missing") }
   set(4)
   empty := host.environment("valid", output[..0])
-  if empty.failure.kind != io.Kind.Ok || !empty.found || #len(empty.value) != 0 || calls() != 1 { #panic("empty") }
+  if io.failed(empty.failure) || !empty.found || #len(empty.value) != 0 || calls() != 1 { #panic("empty") }
 }''']
     (stage / 'main.dyn').write_text('\n'.join(source))
     for mode in ('debug', 'release'):
@@ -138,7 +138,7 @@ with tempfile.TemporaryDirectory(prefix='dna-host-targets-') as directory:
     stage = Path(directory)
     for module in ('host', 'owned_arena', 'cstring'):
         shutil.copytree(ROOT / 'src' / module, stage / module)
-    (stage / 'main.dyn').write_text('use "./host" host\nfn main() { storage: [32]u8 = []\n _ = host.environment("PATH", storage[..]) }\n')
+    (stage / 'main.dyn').write_text('use "./host" host\nfn main() { storage: [32]u8\n _ = host.environment("PATH", storage[..]) }\n')
     for target in ('x86_64-macos', 'aarch64-macos', 'x86_64-windows', 'aarch64-windows'):
         subprocess.run([DYN, 'check', str(stage), '--target', target], check=True, timeout=120)
 print('PASS Windows environment preflight, UTF-16 boundaries, diagnostics and bounded borrowed output (mock wrapper; no native Windows runtime)')

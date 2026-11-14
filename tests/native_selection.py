@@ -55,7 +55,7 @@ fn capture(data:rawptr,region:*const Substring)bool {
 fn main(){
  check(init())
  defer quit()
- path: [4096]u8=[]
+ path: [4096]u8
  name:="FONT_PATH"
  _=mem.copy(path[..#len(name)],name)
  font:=ttf_open(&path[0],32.0)
@@ -142,7 +142,7 @@ fn main(){
  result.stop=true
  check(!text.selection(handle,0,#len(source),capture,&result) && result.count==1)
  // A long selected line walks cells once rather than querying each prefix.
- owner:=mem.arena_create(0)
+ owner:=mem.arena_alloc(0)
  defer mem.arena_release(owner)
  bytes:=mem.push_bytes_uninit(owner,20000)
  for i in 0..#len(bytes) {bytes[i]=97}

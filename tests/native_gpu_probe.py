@@ -47,7 +47,7 @@ fn native_probe_pixels()[]const u8 {
  if !native_probe_resize() || !native_present.gpu_flush(&native_gui.gpu) {#panic("GPU probe flush")}
  size:=#cast(usize,native_gui.surface.width)*#cast(usize,native_gui.surface.height)*4
  if #len(native_probe_buffer)!=size {
-  if native_probe_owner==nil {native_probe_owner=mem.arena_create(65536)}
+  if native_probe_owner==nil {native_probe_owner=mem.arena_alloc(65536)}
   else {mem.arena_reset(native_probe_owner)}
   native_probe_buffer=mem.push_bytes_uninit(native_probe_owner,size)
  }
