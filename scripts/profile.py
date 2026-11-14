@@ -99,7 +99,8 @@ def main():
                 if source in STUBS:
                     shutil.copyfile(ROOT / STUBS[source], stage / source)
     if 'gui' not in chosen['frontends']:
-        for source in [*(stage / 'platform').glob('window_*.dyn'), *(stage / 'platform').glob('memory_*.dyn')]:
+        # memory_*.dyn stays: the terminal frontend copies spans with it too.
+        for source in (stage / 'platform').glob('window_*.dyn'):
             source.unlink()
         for folder in ('platform/native_present', 'platform/backend'):
             shutil.rmtree(stage / folder, ignore_errors=True)
