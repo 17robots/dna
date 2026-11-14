@@ -104,9 +104,10 @@ Passed checks:
   allocation accounting and worker shutdown checks passed.
 - Extracted archive startup, presentation, and shutdown with an isolated HOME
   and no development library paths, on the host with dummy and Wayland backends.
-- Clean Arch container startup: extracted package and one host font only, no
-  SDK, repository mount, network, or writable root filesystem. This is a
-  headless startup check, not a cross-machine desktop interaction test.
+- Clean Arch container: extracted package and one host font only, no SDK,
+  repository mount, network, display or writable root filesystem. It checks
+  `--version` and a TUI smoke under a pseudo-terminal; it is not a
+  cross-machine desktop interaction test.
 - Repeated packaging produced identical archives; extracted checksums passed.
 
 Reproduction commands (from the repository, with the pinned SDK):
@@ -119,7 +120,9 @@ mise exec -- python3 tests/fuzz_tui.py 301 3 300
 mise exec -- env DNA_PACKAGE_IMAGE=docker.io/library/archlinux:base python3 tests/package.py
 ```
 
-The container check requires the image already present locally. Logs from this
+The container check requires the image already present locally (`podman pull
+docker.io/library/archlinux:base`). On btrfs, where podman's overlay storage
+is unavailable, set `DNA_PODMAN='podman --storage-driver vfs'`. Logs from this
 run are under `build/prerelease-*.log`; the exact container image ID and archive
 hash are in `build/packages/container-check.json`.
 

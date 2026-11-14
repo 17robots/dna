@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -80,3 +81,30 @@ with tempfile.TemporaryDirectory(prefix='dna-clean-package-') as temporary:
         print('UNAVAILABLE mount isolation; extracted startup and dependency checks still required')
     print('PASS package contains no SDL dependency')
     assert not any('SDL' in p.name for p in (package/'lib').iterdir())
+    image = os.environ.get('DNA_PACKAGE_IMAGE')
+    if image:
+        # A clean image with only the extracted package and one font: no SDK,
+        # checkout, network or writable root. No display, so the GUI cannot
+        # start there; --version and a TUI smoke under a pseudo-terminal can.
+        # DNA_PODMAN overrides the command, e.g. 'podman --storage-driver vfs'.
+        podman = shlex.split(os.environ.get('DNA_PODMAN', 'podman'))
+        identity = subprocess.check_output([*podman, 'image', 'inspect', '--format', '{{.Id}}', image], text=True).strip()
+        font = subprocess.check_output(['fc-match', '-f', '%{file}', 'monospace'], text=True).strip()
+        container = [*podman, 'run', '--rm', '--pull=never', '--network=none', '--read-only', '--tmpfs', '/tmp',
+                     '-v', f'{package}:/preview:ro', '-v', f'{font}:/font.ttf:ro',
+                     '-e', 'HOME=/tmp', '-e', 'DNA_FONT=/font.ttf', '-e', 'TERM=xterm-256color',
+                     '-e', 'DYN_EDITOR_SMOKE=1', '-e', 'DNA_RECOVERY=0', '-e', 'DNA_CONFIG=/tmp/config.toml',
+                     '-e', 'DNA_LANGUAGE_DIR=/tmp/languages']
+        version = subprocess.run([*container, identity, '/preview/dna', '--version'],
+                                 capture_output=True, text=True, timeout=60)
+        assert version.returncode == 0 and version.stdout.startswith('dna '), (version.stdout, version.stderr)
+        tui = subprocess.run(['script', '-qec', shlex.join([*container, '-t', identity, 'timeout', '30',
+                                                            '/preview/dna', '--tui']) + '; echo "exit=$?"',
+                              '/dev/null'], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+        assert tui.stdout.rstrip().endswith('exit=0'), (tui.stdout[-400:], tui.stderr)
+        report = {'image': identity, 'archive_sha256': first,
+                  'mode': 'clean image: --version and a TUI smoke under a pseudo-terminal; no SDK, repository, network or display'}
+        (ROOT / 'build/packages/container-check.json').write_text(json.dumps(report, indent=2) + '\n')
+        print('PASS clean-image version and TUI startup:', identity)
+    else:
+        print('Container check not requested; set DNA_PACKAGE_IMAGE to a local image')
