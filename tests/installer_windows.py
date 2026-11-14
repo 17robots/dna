@@ -36,7 +36,7 @@ pub fn test_pointer(target,path:*const u8) i32 {
   return 0
 }
 pub fn test_read(path:*const u8,output:*u8,capacity:usize) isize {
-  arena:=installer_windows_mem.arena_create(16384)
+  arena:=installer_windows_mem.arena_alloc(16384)
   defer installer_windows_mem.arena_release(arena)
   read:=installer_read_link(arena,#slice(path, installer_windows_c.string_length(path,4096)))
   if io.failed(read.failure) { return read.failure.native }

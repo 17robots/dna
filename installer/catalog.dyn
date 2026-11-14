@@ -5,17 +5,17 @@ use "std/io"
 //   grammar NAME STATE EXTENSIONS FILENAMES URL   (comma lists)
 //   server  NAME STATE NPM-PACKAGES EXECUTABLE
 fn grammar_installed(root: []const u8, name: []const u8) bool {
-  package_storage: [4096]u8 = []
-  file_storage: [4096]u8 = []
+  package_storage: [4096]u8
+  file_storage: [4096]u8
   active := append_path(package_storage[..], root, name)
-  version_storage: [4096]u8 = []
+  version_storage: [4096]u8
   package := installer_package_path(active, version_storage[..])
   if #len(package) == 0 {
     return false
   }
   for leaf in ["parser.so", "highlights.scm", "extensions"] {
     info := std_fs.metadata(append_path(file_storage[..], package, leaf))
-    if info.failure.kind != io.Kind.Ok || (info.mode & 61440) != 32768 || info.size == 0 {
+    if io.failed(info.failure) || (info.mode & 61440) != 32768 || info.size == 0 {
       return false
     }
   }
@@ -29,9 +29,9 @@ fn catalog(registry: *Registry, root: []const u8) {
     }
     item := &registry.entries[index]
     // Extensions and file names one per line become comma lists.
-    extension_storage: [4096]u8 = []
+    extension_storage: [4096]u8
     extension_length := extensions(item, extension_storage[..])
-    names_storage: [4096]u8 = []
+    names_storage: [4096]u8
     names_length := filenames(item, names_storage[..])
     for at in 0..extension_length {
       if extension_storage[at] == 10 {
@@ -53,10 +53,10 @@ fn catalog(registry: *Registry, root: []const u8) {
   }
   for index in 0..9 {
     item := server_package(index)
-    storage: [4096]u8 = []
+    storage: [4096]u8
     info := std_fs.metadata(server_executable(root, item, storage[..]))
     state: []const u8 = "available"
-    if info.failure.kind == io.Kind.Ok && installer_executable(server_executable(root, item, storage[..])) {
+    if !io.failed(info.failure) && installer_executable(server_executable(root, item, storage[..])) {
       state = "installed"
     }
     io.println("server\t{}\t{}\t{}\t{}", item.name, state, item.packages, item.executable)
@@ -66,14 +66,14 @@ fn uninstall(root: []const u8, name: []const u8) {
   if !identifier(name) {
     #panic("invalid package name")
   }
-  active_storage: [4096]u8 = []
-  target_storage: [4096]u8 = []
-  prefix_storage: [4096]u8 = []
+  active_storage: [4096]u8
+  target_storage: [4096]u8
+  prefix_storage: [4096]u8
   active := append_path(active_storage[..], root, name)
-  target_space := mem.arena_create(4096)
+  target_space := mem.arena_alloc(4096)
   defer mem.arena_release(target_space)
   target := installer_read_link(target_space, active)
-  if target.failure.kind != io.Kind.Ok {
+  if io.failed(target.failure) {
     #panic("refusing to remove a package not managed by DNA")
   }
   used: usize = 0
@@ -89,11 +89,11 @@ fn uninstall(root: []const u8, name: []const u8) {
       #panic("invalid managed version")
     }
   }
-  if std_fs.remove(active).failure.kind != io.Kind.Ok {
+  if io.failed(std_fs.remove(active).failure) {
     #panic("cannot deactivate package")
   }
   removed := installer_remove_tree(target.value)
-  if removed.failure.kind != io.Kind.Ok && removed.failure.native != -2 {
+  if io.failed(removed.failure) && removed.failure.native != -2 {
     #panic("package deactivated but cleanup failed; refresh the package list")
   }
   io.println("Uninstalled {}. Older retained versions are unchanged.", name)

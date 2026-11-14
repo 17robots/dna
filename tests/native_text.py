@@ -146,7 +146,7 @@ fn main() {
  check(ttf_set(text,&spaced[0],3))
  check(ttf_substring(text,2,&hit) && hit.y==50 && hit.height==50)
  // A large one-off layout/measurement must not remain as reusable scratch.
- large_memory:=mem.arena_create(65536)
+ large_memory:=mem.arena_alloc(65536)
  large_bytes:=mem.push_bytes_uninit(large_memory,20000)
  for index in 0..#len(large_bytes) {large_bytes[index]=120}
  check(ttf_set(text,&large_bytes[0],#len(large_bytes)))
@@ -234,10 +234,10 @@ with tempfile.TemporaryDirectory(prefix='dna-native-text-') as directory:
     bridge=bridge[bridge.index('native_text_callbacks:'):]
     (module/'bridge.dyn').write_text(bridge+'\ntracked_texts:usize\nfn memory_active() bool { return true }\nfn memory_record(category:u32,size:usize,lifetime:u64,release:bool) { if release { tracked_texts-=1 } else { tracked_texts+=1 } }\n')
     backend=backend.replace('fn native_build(', 'fn native_build_actual(',1)
-    backend=backend.replace('mem.arena_create(', 'native_probe_arena_create(')
+    backend=backend.replace('mem.arena_alloc(', 'native_probe_arena_create(')
     backend+='''\nnative_arena_count:usize
 fn native_probe_arena_create(capacity:usize)*mem.Arena {native_arena_count+=1
- return mem.arena_create(capacity)}
+ return mem.arena_alloc(capacity)}
 native_build_count:usize
 fn native_build(arena:*mem.Arena,font:*NativeFont,text:[]const u8,wrap:i32)text_layout.Result {
  native_build_count+=1

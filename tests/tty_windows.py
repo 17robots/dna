@@ -37,7 +37,7 @@ fn dna_tty_enter() i32 { if !tty_enter_host() { return 0 }
   return 1 }
 read_result:i32=100
 read_started:sync.AtomicU32
-fn read_worker(context:rawptr)isize {
+fn read_worker(context:*u8)isize {
   _=context
   bytes:[64]u8
   sync.store_u32(&read_started,1)
