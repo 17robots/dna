@@ -129,6 +129,7 @@ _smoke: deps test
     python3 tests/syntax_consistency.py
     python3 tests/syntax_stream.py
     python3 tests/syntax_dyn_fullfile.py
+    python3 tests/syntax_dyn_strings.py
     python3 tests/thread_join.py
     python3 tests/picker_index.py
     python3 tests/picker_responsiveness.py
