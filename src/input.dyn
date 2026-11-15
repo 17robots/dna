@@ -129,6 +129,9 @@ fn text_input(app: *App, text: []const u8) {
   }
   macro_text(app, text)
   vim_record_text(app, text)
+  if app.view.insert && app.prompt_state.panel == Panel.None {
+    insert_repeat_text(app, text)
+  }
   app.composition.length = 0
   if app.prompt_state.panel == Panel.Hover {
     app.prompt_state.panel = Panel.None
@@ -208,6 +211,8 @@ fn text_input(app: *App, text: []const u8) {
     if !buffer.replace_all(app.explorer.document, text) {
       notice(app, "Explorer edit exceeds text capacity.")
     }
+  } else if (app.prompt_state.panel == Panel.None || completion_visible(app)) && app.view.insert && app.config.vim_keys && app.vim.replacing {
+    vim_replace_text(app, text)
   } else if (app.prompt_state.panel == Panel.None || completion_visible(app)) && app.view.insert {
     changed(app, text)
     app.lsp.completion_typed = true
@@ -400,6 +405,11 @@ fn key_input(app: *App, typography: *Typography, key: u32, modifiers: u16) {
   status_message_clear(app)
   explorer_borrow:=explorer_vim_begin(app)
   defer explorer_vim_end(app, &explorer_borrow)
+  // Helix `.` repeats the last insert.
+  if !app.config.vim_keys && !app.view.insert && app.prompt_state.panel == Panel.None && key == KeyPeriod && modifiers == 0 && app.input_state.pending == 0 && insert_repeat_run(app, typography) {
+    return
+  }
+  defer insert_repeat_after_key(app, key, modifiers, app.view.insert)
   recorded_panel:=app.prompt_state.panel
   if app.explorer.vim_borrowed {
     app.prompt_state.panel=Panel.None
@@ -866,6 +876,9 @@ fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
   if app.config.vim_keys && vim_key(app, typography, key, modifiers) {
     return
   }
+  if app.view.insert && !app.config.vim_keys && (control || (modifiers & ModAlt) != 0) && insert_edit_key(app, key, modifiers) {
+    return
+  }
   if control {
     if !app.view.insert && (key == KeyB || key == KeyF || key == KeyD || key == KeyU) {
       page_motion(app, typography, key == KeyF || key == KeyD, key == KeyD || key == KeyU)
@@ -879,7 +892,7 @@ fn key_dispatch(app: *App, typography: *Typography, key: u32, modifiers: u16) {
       jump_forward(app)
     } else if key == KeyS && !app.view.insert {
       jump_push(app)
-      notice(app, "Saved the selection to the jump list.")
+      status_note(app, "Saved the selection to the jump list")
     } else if key == KeyP {
       panel(app, Panel.Commands)
     } else if key == KeyF {

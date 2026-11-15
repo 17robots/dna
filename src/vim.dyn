@@ -1,3 +1,4 @@
+use "std/mem"
 // Vim profile ([editor] vim_keys = true, or :keymap vim): Vim's normal,
 // visual and operator-pending modes on top of DNA's editing core. Insert mode
 // keeps DNA's insert keys; Escape returns to normal mode with the cursor one
@@ -68,7 +69,18 @@ struct VimState {
   last_macro: usize,
   // Ex command state: last :s pattern, string and flags, :s///c progress.
   ex: VimExState,
+  // Replace mode (R): typed characters overwrite; Backspace puts back what
+  // each one replaced.
+  replacing: bool,
+  replaced: [512]VimReplaced,
+  replaced_count: usize,
+  // File marks A-Z: a file and a line and column in it.
+  file_marks: [26]VimFileMark,
 }
+struct VimFileMark { path: [4096]u8, path_length: usize, row, column: usize, set: bool }
+// One character typed in Replace mode: its length and the bytes it covered
+// (none past the end of a line, where Replace mode appends).
+struct VimReplaced { inserted: u8, original: [4]u8, original_length: u8 }
 
 fn vim_reset(app: *App) {
   app.vim = VimState{}
@@ -915,6 +927,10 @@ fn vim_operate(app: *App, operator: u32, low: usize, end: usize, linewise: bool,
     vim_place(app, buffer.line_nonblank(doc, buffer.line_start(doc, first)))
     return
   }
+  if operator == 'Q' {
+    vim_format_lines(app, first, last)
+    return
+  }
   // Case operators: ~ toggles, u lowers, U raises.
   mode: u8 = 0
   if operator == 'u' {
@@ -927,6 +943,141 @@ fn vim_operate(app: *App, operator: u32, low: usize, end: usize, linewise: bool,
   vim_place(app, range_low)
 }
 
+// gq: rewrap the lines first..last (positions) to VimFormatWidth columns.
+// Blank lines separate paragraphs. Each paragraph keeps its first line's
+// indentation and comment leader ("// ", "# ", ...) on every line.
+const VimFormatWidth: usize = 79
+fn vim_format_lines(app: *App, first: usize, last: usize) {
+  doc := vim_doc(app)
+  low := buffer.line_start(doc, first)
+  high := vim_text_end(doc, last)
+  if high <= low {
+    return
+  }
+  mark := mem.arena_mark(app.scratch)
+  defer mem.arena_rewind(app.scratch, mark)
+  source := mem.push_bytes_uninit(app.scratch, high - low)
+  buffer.copy_range(doc, low, high, source)
+  output := mem.push_bytes_uninit(app.scratch, (high - low) * 2 + 4096)
+  used: usize = 0
+  leader := comment_token(app)
+  at: usize = 0
+  for at < #len(source) {
+    // One paragraph: consecutive non-blank lines with the first line's prefix.
+    line_end := at
+    for line_end < #len(source) && source[line_end] != 10 {
+      line_end += 1
+    }
+    if vim_format_blank(source[at..line_end]) {
+      add_text(output, &used, source[at..line_end])
+      if line_end < #len(source) {
+        add_text(output, &used, "\n")
+      }
+      at = line_end + 1
+      continue
+    }
+    prefix_length := vim_format_prefix(source[at..line_end], leader)
+    prefix: [256]u8
+    if prefix_length > 255 {
+      prefix_length = 255
+    }
+    _ = copy_text(prefix[..], source[at..at + prefix_length])
+    column: usize = 0
+    for at < #len(source) {
+      line_end = at
+      for line_end < #len(source) && source[line_end] != 10 {
+        line_end += 1
+      }
+      line := source[at..line_end]
+      if vim_format_blank(line) {
+        break
+      }
+      // A different indentation or comment leader starts a new paragraph,
+      // so code is never folded into a comment or the reverse.
+      if !buffer.equal(vim_format_kind(line, leader), vim_format_kind(prefix[..prefix_length], leader)) {
+        break
+      }
+      word := vim_format_prefix(line, leader)
+      for word < #len(line) {
+        for word < #len(line) && (line[word] == ' ' || line[word] == 9) {
+          word += 1
+        }
+        word_end := word
+        for word_end < #len(line) && line[word_end] != ' ' && line[word_end] != 9 {
+          word_end += 1
+        }
+        if word_end == word {
+          break
+        }
+        if column > 0 && column + 1 + (word_end - word) > VimFormatWidth {
+          add_text(output, &used, "\n")
+          column = 0
+        }
+        if column == 0 {
+          add_text(output, &used, prefix[..prefix_length])
+          column = prefix_length
+        } else {
+          add_text(output, &used, " ")
+          column += 1
+        }
+        add_text(output, &used, line[word..word_end])
+        column += word_end - word
+        word = word_end
+      }
+      at = line_end + 1
+    }
+    if at <= #len(source) {
+      add_text(output, &used, "\n")
+    }
+  }
+  // The text ends where the range did: drop a newline added after the last line.
+  if used > 0 && output[used - 1] == 10 && source[#len(source) - 1] != 10 {
+    used -= 1
+  }
+  buffer.checkpoint(doc)
+  vim_set_range(doc, low, high)
+  if !buffer.replace(doc, output[..used]) {
+    status_error(app, "Formatting exceeds document capacity.")
+    return
+  }
+  buffer.checkpoint(doc)
+  app.vim.changed = true
+  last_line := low + used
+  vim_place(app, buffer.line_nonblank(doc, buffer.line_start(doc, last_line)))
+}
+// Indentation plus the comment leader, without the spaces after it.
+fn vim_format_kind(line: []const u8, leader: []const u8) []const u8 {
+  at: usize = 0
+  for at < #len(line) && (line[at] == ' ' || line[at] == 9) {
+    at += 1
+  }
+  if #len(leader) > 0 && at + #len(leader) <= #len(line) && buffer.equal(line[at..at + #len(leader)], leader) {
+    at += #len(leader)
+  }
+  return line[..at]
+}
+fn vim_format_blank(line: []const u8) bool {
+  for byte in line {
+    if byte != ' ' && byte != 9 && byte != 13 {
+      return false
+    }
+  }
+  return true
+}
+// Indentation plus a comment leader and the spaces after it.
+fn vim_format_prefix(line: []const u8, leader: []const u8) usize {
+  at: usize = 0
+  for at < #len(line) && (line[at] == ' ' || line[at] == 9) {
+    at += 1
+  }
+  if #len(leader) > 0 && at + #len(leader) <= #len(line) && buffer.equal(line[at..at + #len(leader)], leader) {
+    at += #len(leader)
+    for at < #len(line) && line[at] == ' ' {
+      at += 1
+    }
+  }
+  return at
+}
 // p / P. Lines go below or above the cursor line; characters after or at
 // the cursor. The cursor ends on the last pasted character, or the first
 // non-blank of the first pasted line.
@@ -1173,7 +1324,67 @@ fn vim_open_line(app: *App, above: bool, count: usize) {
   vim_start_insert(app, position, count, true)
 }
 // Escape from insert: repeat the inserted text for 3ihi or 3o.
+// Replace mode typing: overwrite the character under the cursor, or append
+// at a line end, remembering what was replaced.
+fn vim_replace_text(app: *App, text: []const u8) {
+  doc := vim_doc(app)
+  if doc.secondary.count != 0 || doc.anchor != doc.cursor {
+    changed(app, text)
+    return
+  }
+  at := doc.cursor
+  ending := vim_text_end(doc, at)
+  record := VimReplaced{inserted: #cast(u8, #len(text))}
+  high := at
+  if at < ending {
+    high = buffer.next(doc, at)
+    if high - at > 4 || #len(text) > 255 {
+      high = at
+    } else {
+      buffer.copy_range(doc, at, high, record.original[..])
+      record.original_length = #cast(u8, high - at)
+    }
+  }
+  vim_set_range(doc, at, high)
+  if !buffer.replace(doc, text) {
+    return
+  }
+  doc.anchor = at + #len(text)
+  doc.cursor = doc.anchor
+  if app.vim.replaced_count < #len(app.vim.replaced) {
+    app.vim.replaced[app.vim.replaced_count] = record
+    app.vim.replaced_count += 1
+  }
+}
+// Backspace in Replace mode restores the last replaced character; before
+// any typing it only moves left, as in Vim.
+fn vim_replace_backspace(app: *App) {
+  doc := vim_doc(app)
+  if app.vim.replaced_count == 0 || doc.anchor != doc.cursor {
+    if doc.cursor > buffer.line_start(doc, doc.cursor) {
+      position := buffer.previous(doc, doc.cursor)
+      doc.anchor = position
+      doc.cursor = position
+    }
+    return
+  }
+  app.vim.replaced_count -= 1
+  record := app.vim.replaced[app.vim.replaced_count]
+  at := doc.cursor
+  inserted := #cast(usize, record.inserted)
+  if inserted > at {
+    return
+  }
+  vim_set_range(doc, at - inserted, at)
+  if !buffer.replace(doc, record.original[..record.original_length]) {
+    return
+  }
+  doc.anchor = at - inserted
+  doc.cursor = doc.anchor
+}
 fn vim_insert_finish(app: *App) {
+  app.vim.replacing = false
+  app.vim.replaced_count = 0
   doc := vim_doc(app)
   count := app.vim.insert_count
   app.vim.insert_count = 0
@@ -1523,6 +1734,10 @@ fn vim_take_count(app: *App) usize {
 // Insert mode: Ctrl-w and Ctrl-u delete backward like Vim; other keys are
 // DNA's insert keys.
 fn vim_insert_key(app: *App, key: u32, modifiers: u16) bool {
+  if app.vim.replacing && key == KeyBackspace && (modifiers & ModCtrlAlt) == 0 {
+    vim_replace_backspace(app)
+    return true
+  }
   if (modifiers & ModCtrl) == 0 || (key != KeyW && key != KeyU) {
     return false
   }
@@ -1665,6 +1880,8 @@ fn vim_pending(app: *App, typography: *Typography, character: u32, key: u32) {
       index := #cast(usize, (character - 'a'))
       doc.marks[buffer.NamedMarkBase + index] = vim_head(app)
       doc.named_marks |= #cast(u32, 1) << #cast(u32, index)
+    } else if character >= 'A' && character <= 'Z' {
+      vim_file_mark_set(app, #cast(usize, (character - 'A')))
     }
     app.vim.count = 0
     return
@@ -1679,9 +1896,18 @@ fn vim_pending(app: *App, typography: *Typography, character: u32, key: u32) {
       if (doc.named_marks & (#cast(u32, 1) << #cast(u32, index))) != 0 {
         movement.target = buffer.boundary(doc, doc.marks[buffer.NamedMarkBase + index])
         movement.valid = true
+      } else {
+        status_error(app, "E20: Mark not set")
       }
     } else if character == '`' || character == 39 {
       movement.valid = vim_last_jump(app, &movement.target)
+    } else if character >= 'A' && character <= 'Z' {
+      if !vim_file_mark_target(app, #cast(usize, (character - 'A')), &movement.target) {
+        app.vim.operator = 0
+        return
+      }
+      doc = vim_doc(app)
+      movement.valid = true
     }
     if movement.valid && pending == 39 {
       movement.target = buffer.line_nonblank(doc, movement.target)
@@ -1779,6 +2005,21 @@ fn vim_g_key(app: *App, typography: *Typography, character: u32, key: u32) {
     _ = vim_ex_command(app, typography, "%s//~/&")
     return
   }
+  if character == 'q' {
+    if app.vim.operator == 'Q' {
+      vim_line_operator(app, 'Q')
+      return
+    }
+    if app.vim.operator == 0 && vim_visual(app) {
+      vim_visual_operator(app, typography, 'Q')
+      return
+    }
+    app.vim.operator = 'Q'
+    app.vim.operator_g = true
+    app.vim.operator_count = vim_take_count(app)
+    buffer.checkpoint(vim_doc(app))
+    return
+  }
   if character == '~' || character == 'u' || character == 'U' {
     if app.vim.operator == character && app.vim.operator_g {
       // g~~ / guu / gUU: the whole line.
@@ -1838,6 +2079,104 @@ fn vim_g_key(app: *App, typography: *Typography, character: u32, key: u32) {
 }
 // Move the cursor (normal) or the visual head to a motion's target.
 // Where the newest jump-list entry in this document points (for `` and '').
+// :marks lists the marks of this buffer (a-z) and the file marks (A-Z).
+fn vim_marks_show(app: *App) {
+  doc := vim_doc(app)
+  output := app.prompt_state.message[..]
+  used := copy_text(output, "mark  line  col  file/text")
+  for index in 0..26 {
+    if (doc.named_marks & (#cast(u32, 1) << #cast(u32, index))) == 0 {
+      continue
+    }
+    position := buffer.boundary(doc, doc.marks[buffer.NamedMarkBase + index])
+    letter: [1]u8 = [#cast(u8, 'a' + index)]
+    vim_marks_row(output, &used, letter[..], buffer.row_at(doc, position), position - buffer.line_start(doc, position))
+    low := buffer.line_start(doc, position)
+    high := vim_text_end(doc, position)
+    if high > low + 60 {
+      high = low + 60
+    }
+    line: [64]u8
+    buffer.copy_range(doc, low, high, line[..])
+    add_text(output, &used, line[..high - low])
+  }
+  for index in 0..26 {
+    mark := &app.vim.file_marks[index]
+    if !mark.set {
+      continue
+    }
+    letter: [1]u8 = [#cast(u8, 'A' + index)]
+    vim_marks_row(output, &used, letter[..], mark.row, mark.column)
+    shown: [4096]u8
+    add_text(output, &used, display_path(app, mark.path[..mark.path_length], shown[..]))
+  }
+  app.prompt_state.message_length = used
+  app.prompt_state.panel = Panel.Message
+  app.prompt_state.selected = 0
+}
+fn vim_marks_row(output: []u8, used: *usize, letter: []const u8, row, column: usize) {
+  add_text(output, used, "\n ")
+  add_text(output, used, letter)
+  add_text(output, used, "    ")
+  start := used.*
+  add_number(output, used, row + 1)
+  for used.* < start + 9 {
+    add_text(output, used, " ")
+  }
+  start = used.*
+  add_number(output, used, column)
+  for used.* < start + 5 {
+    add_text(output, used, " ")
+  }
+}
+fn vim_file_mark_set(app: *App, index: usize) {
+  name := files.name(app.documents.file)
+  if #len(name) == 0 {
+    status_error(app, "File marks need a file; save the buffer first.")
+    return
+  }
+  doc := vim_doc(app)
+  head := vim_head(app)
+  mark := &app.vim.file_marks[index]
+  mark.path_length = copy_text(mark.path[..], name)
+  mark.row = buffer.row_at(doc, head)
+  mark.column = head - buffer.line_start(doc, head)
+  mark.set = mark.path_length > 0
+}
+// The position of file mark index, opening its file first when it is not
+// the current one. False (with a message) when there is nowhere to go.
+fn vim_file_mark_target(app: *App, index: usize, target: *usize) bool {
+  mark := &app.vim.file_marks[index]
+  if !mark.set {
+    status_error(app, "E20: Mark not set")
+    return false
+  }
+  path := mark.path[..mark.path_length]
+  if !buffer.equal(files.name(app.documents.file), path) {
+    if app.vim.operator != 0 {
+      status_error(app, "E20: Mark not set")
+      return false
+    }
+    jump_push(app)
+    open_file(app, path)
+    if !buffer.equal(files.name(app.documents.file), path) {
+      return false
+    }
+  }
+  doc := vim_doc(app)
+  row := mark.row
+  if row > vim_last_row(doc) {
+    row = vim_last_row(doc)
+  }
+  start := buffer.line_position(doc, row + 1)
+  position := start + mark.column
+  ending := vim_text_end(doc, start)
+  if position > ending {
+    position = ending
+  }
+  target.* = buffer.boundary(doc, position)
+  return true
+}
 fn vim_last_jump(app: *App, target: *usize) bool {
   jumps := &app.jumps
   if jumps.count == 0 {
@@ -2006,8 +2345,12 @@ fn vim_is_operator(character: u32) bool {
 }
 // A key while an operator waits for its motion.
 fn vim_operator_key(app: *App, typography: *Typography, character: u32, key: u32) {
-  // dd, yy, >>; for case operators both guu and gugu.
-  if character == app.vim.operator {
+  // dd, yy, >>; for case operators both guu and gugu; gqq.
+  if character == app.vim.operator || (app.vim.operator == 'Q' && character == 'q') {
+    if app.vim.operator == 'Q' {
+      vim_line_operator(app, 'Q')
+      return
+    }
     vim_line_operator(app, character)
     return
   }
@@ -2082,6 +2425,14 @@ fn vim_normal_key(app: *App, typography: *Typography, character: u32, key: u32, 
       position = vim_text_end(doc, head)
     }
     vim_start_insert(app, position, count, false)
+    return
+  }
+  if character == 'R' {
+    count := vim_take_count(app)
+    buffer.checkpoint(doc)
+    vim_start_insert(app, head, count, false)
+    app.vim.replacing = true
+    app.vim.replaced_count = 0
     return
   }
   if character == 'o' || character == 'O' {

@@ -48,6 +48,7 @@ closest match. Settings live in `~/.config/dna/config.toml`; start from
 ## Documentation
 
 - [Keys](docs/keys.md): the Helix-style and Vim keymaps, menus, text objects
+- [Helix compatibility](docs/helix-compatibility.md): every Helix default binding, measured
 - [Configuration](docs/configuration.md): settings, fonts and layout files
 - [Themes](docs/themes.md): built-in themes and writing your own
 - [Languages](docs/languages.md): grammars, highlighting and language servers

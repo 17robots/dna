@@ -143,6 +143,7 @@ _smoke: deps test
     python3 tests/tui_usability.py
     python3 tests/tui_frames.py dna-debug dna-release
     python3 tests/command_feedback.py dna-debug dna-release
+    python3 tests/keymap_features.py dna-debug dna-release
     python3 tests/large_file.py
     python3 tests/syntax_window.py
     python3 tests/syntax_objects.py

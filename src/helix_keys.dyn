@@ -180,7 +180,108 @@ fn bracket_key(app: *App, key: u32, modifiers: u16) {
     buffer.select_to(doc, paragraph_edge(doc, buffer.head(doc), forward), app.view.extend)
   } else if key == KeySpace {
     blank_line(app, forward)
+  } else if key == KeyG {
+    git_change_jump(app, forward, shift)
+  } else if key == KeyF || key == KeyT || key == KeyA || key == KeyC {
+    kind: u32 = 1
+    if key == KeyT {
+      kind = 3
+    } else if key == KeyA {
+      kind = 5
+    } else if key == KeyC {
+      kind = 7
+    }
+    syntax_object_jump(app, kind, forward)
   }
+}
+// ]g / [g: next or previous changed hunk against git; ]G / [G: last or first.
+fn git_change_jump(app: *App, forward: bool, edge: bool) {
+  slot := app.documents.slots[app.documents.active]
+  doc := app.documents.current
+  diff := slot.git
+  if !git_current(diff, doc) || diff.hunk_count == 0 {
+    status_error(app, "No changes against git in this buffer")
+    return
+  }
+  row := buffer.row_at(doc, buffer.head(doc))
+  chosen := diff.hunk_count
+  if edge {
+    chosen = 0
+    if forward {
+      chosen = diff.hunk_count - 1
+    }
+  } else if forward {
+    for index in 0..diff.hunk_count {
+      if diff.hunks[index].first > row {
+        chosen = index
+        break
+      }
+    }
+  } else {
+    for index in 0..diff.hunk_count {
+      if git_hunk_end(diff.hunks[index]) <= row {
+        chosen = index
+      }
+    }
+  }
+  if chosen == diff.hunk_count {
+    status_error(app, "No more changes")
+    return
+  }
+  target := diff.hunks[chosen].first
+  if target > doc.line_count - 1 {
+    target = doc.line_count - 1
+  }
+  jump_push(app)
+  goto_row(app, target)
+}
+// ]f [f, ]t [t, ]a [a, ]c [c: the start of the next or previous function,
+// type, parameter or comment (tree-sitter text objects). Scans line starts
+// for the enclosing object, so it needs the language's textobjects query.
+fn syntax_object_jump(app: *App, kind: u32, forward: bool) {
+  slot := app.documents.slots[app.documents.active]
+  doc := app.documents.current
+  if slot.syntax == nil {
+    status_error(app, "Install a grammar for syntax motions (:languages)")
+    return
+  }
+  head := buffer.head(doc)
+  row := buffer.row_at(doc, head)
+  revision := syntax_tree_revision(slot)
+  best: usize = doc.length + 1
+  scanned: usize = 0
+  for scanned < 20000 {
+    scanned += 1
+    if forward {
+      row += 1
+      if row >= doc.line_count {
+        break
+      }
+    } else {
+      if row == 0 {
+        break
+      }
+      row -= 1
+    }
+    point := #cast(u32, buffer.line_nonblank(doc, buffer.row_start(doc, row)))
+    start: u32 = 0
+    end: u32 = 0
+    if syntax_object(slot.syntax, revision, point, point, kind, 1, &start, &end) == 0 {
+      continue
+    }
+    position := #cast(usize, start)
+    if (forward && position > head) || (!forward && position < head) {
+      best = position
+      break
+    }
+  }
+  if best > doc.length {
+    status_error(app, "No more syntax objects in that direction")
+    return
+  }
+  jump_push(app)
+  buffer.checkpoint(doc)
+  buffer.select_to(doc, best, app.view.extend)
 }
 // ]D / [D: last or first diagnostic in the buffer.
 fn diagnostic_edge(app: *App, last: bool) {

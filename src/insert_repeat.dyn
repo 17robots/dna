@@ -1,0 +1,94 @@
+// Helix's `.`: repeat the last insert. The key that entered insert mode and
+// everything typed until Escape are recorded, then replayed at the cursor.
+// (The Vim keymap has its own `.`, which repeats any change.)
+struct InsertRepeatEvent { key: u32, modifiers: u16, text_at, text_length: usize }
+struct InsertRepeat {
+  recording, replaying, valid: bool,
+  entry_key: u32,
+  entry_modifiers: u16,
+  events: [256]InsertRepeatEvent,
+  event_count: usize,
+  text: [4096]u8,
+  text_length: usize,
+  // The finished recording `.` replays.
+  last_entry_key: u32,
+  last_entry_modifiers: u16,
+  last_events: [256]InsertRepeatEvent,
+  last_event_count: usize,
+  last_text: [4096]u8,
+  last_text_length: usize,
+}
+
+// After each key: start recording when it entered insert mode, record it while
+// inserting, and keep the recording when it left insert mode.
+fn insert_repeat_after_key(app: *App, key: u32, modifiers: u16, was_insert: bool) {
+  state := &app.insert_repeat
+  if app.config.vim_keys || state.replaying {
+    return
+  }
+  inserting := app.view.insert && app.prompt_state.panel == Panel.None
+  if !was_insert && inserting {
+    state.recording = true
+    state.entry_key = key
+    state.entry_modifiers = modifiers
+    state.event_count = 0
+    state.text_length = 0
+    return
+  }
+  if !state.recording {
+    return
+  }
+  if was_insert && !app.view.insert {
+    state.recording = false
+    state.last_entry_key = state.entry_key
+    state.last_entry_modifiers = state.entry_modifiers
+    state.last_event_count = state.event_count
+    for index in 0..state.event_count {
+      state.last_events[index] = state.events[index]
+    }
+    state.last_text_length = copy_text(state.last_text[..], state.text[..state.text_length])
+    state.valid = true
+    return
+  }
+  // Printable keys arrive again as text; record the text, not the key.
+  printable := key >= 32 && key < 127 && (modifiers & (ModCtrl | ModAlt)) == 0
+  if was_insert && inserting && !printable && state.event_count < #len(state.events) {
+    state.events[state.event_count] = InsertRepeatEvent{key: key, modifiers: modifiers}
+    state.event_count += 1
+  }
+}
+fn insert_repeat_text(app: *App, text: []const u8) {
+  state := &app.insert_repeat
+  if !state.recording || state.replaying || state.event_count >= #len(state.events) || state.text_length + #len(text) >= #len(state.text) {
+    return
+  }
+  at := state.text_length
+  add_text(state.text[..], &state.text_length, text)
+  state.events[state.event_count] = InsertRepeatEvent{text_at: at, text_length: #len(text)}
+  state.event_count += 1
+}
+// True when `.` replayed the last insert.
+fn insert_repeat_run(app: *App, typography: *Typography) bool {
+  state := &app.insert_repeat
+  if app.config.vim_keys || !state.valid || app.view.insert {
+    return false
+  }
+  state.replaying = true
+  defer {
+    state.replaying = false
+  }
+  key_input(app, typography, state.last_entry_key, state.last_entry_modifiers)
+  if !app.view.insert {
+    return true
+  }
+  for index in 0..state.last_event_count {
+    event := state.last_events[index]
+    if event.text_length > 0 {
+      text_input(app, state.last_text[event.text_at..event.text_at + event.text_length])
+    } else {
+      key_input(app, typography, event.key, event.modifiers)
+    }
+  }
+  key_input(app, typography, KeyEscape, 0)
+  return true
+}
