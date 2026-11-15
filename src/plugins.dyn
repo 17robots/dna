@@ -199,15 +199,20 @@ fn plugin_prepare(app: *App, manifest: []const u8) {
       notice(app, "Invalid plugin permission.")
       return
     }
-    if buffer.equal(item.text, "document.read") {
-      pending.read = true
-    } else if buffer.equal(item.text, "document.write") {
-      pending.write = true
-    } else if buffer.equal(item.text, "buffer.create") {
-      pending.create = true
-    } else {
-      notice(app, "Unknown plugin permission; plugin was not started.")
-      return
+    case item.text {
+      "document.read" => {
+        pending.read = true
+      }
+      "document.write" => {
+        pending.write = true
+      }
+      "buffer.create" => {
+        pending.create = true
+      }
+      _ => {
+        notice(app, "Unknown plugin permission; plugin was not started.")
+        return
+      }
     }
     item = item.next
   }
@@ -298,14 +303,14 @@ fn plugin_run_command(app: *App, command_index: usize) {
 }
 fn json_unsigned(value: *const json.Value) usize {
   if !json.is_number(value) || #len(value.text) == 0 || #len(value.text) > 15 {
-    return 18446744073709551615
+    return #max(usize)
   }
   result: usize = 0
   for byte in value.text {
     if byte < 48 || byte > 57 {
-      return 18446744073709551615
+      return #max(usize)
     }
-    result = result * 10 + #cast(usize, (byte - 48))
+    result = result * 10 + (byte - 48)
   }
   return result
 }
@@ -400,7 +405,7 @@ fn plugin_message(app: *App, index: usize, source: []const u8) {
     target := json_unsigned(json.object_get(parsed.root, "buffer"))
     revision := json_unsigned(json.object_get(parsed.root, "revision"))
     replacement := json_text(parsed.root, "text")
-    if target >= #len(app.documents.slots) || target != plugin.command_slot || plugin.command_identity != app.documents.slots[target].identity || plugin.command_revision != #cast(u64, revision) || app.documents.slots[target].document == nil || app.documents.slots[target].terminal.handle != nil || app.documents.slots[target].document.revision != #cast(u64, revision) || !json.is_string(json.object_get(parsed.root, "text")) || #len(replacement) > 65535 || !buffer.valid(replacement) {
+    if target >= #len(app.documents.slots) || target != plugin.command_slot || plugin.command_identity != app.documents.slots[target].identity || plugin.command_revision != revision || app.documents.slots[target].document == nil || app.documents.slots[target].terminal.handle != nil || app.documents.slots[target].document.revision != revision || !json.is_string(json.object_get(parsed.root, "text")) || #len(replacement) > 65535 || !buffer.valid(replacement) {
       plugin_log(app, "Plugin edit rejected: stale buffer/revision or invalid text.")
       return
     }
@@ -410,7 +415,7 @@ fn plugin_message(app: *App, index: usize, source: []const u8) {
     }
     app.plugin_state.edit_length = copy_text(app.plugin_state.edit[..], replacement)
     app.plugin_state.edit_target = target
-    app.plugin_state.edit_revision = #cast(u64, revision)
+    app.plugin_state.edit_revision = revision
     app.plugin_state.edit_identity = app.documents.slots[target].identity
     app.plugin_state.edit_document = app.documents.slots[target].document
     app.prompt_state.panel = Panel.PluginEdit

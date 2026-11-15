@@ -132,8 +132,8 @@ fn lsp_escape(out: *u8, bytes: []const u8) usize {
         target[used + 1] = 'u'
         target[used + 2] = '0'
         target[used + 3] = '0'
-        target[used + 4] = hex[#cast(usize, byte >> 4)]
-        target[used + 5] = hex[#cast(usize, byte & 15)]
+        target[used + 4] = hex[byte >> 4]
+        target[used + 5] = hex[byte & 15]
       } else {
         target[used] = 92
         target[used + 1] = byte
@@ -767,9 +767,7 @@ fn lsp_documents_ensure(server:*LanguageServer, count:usize)bool {
     return false
   }
   records:=#slice((#cast(*LspDocument, allocated.memory)), count)
-  for i in 0..#len(server.documents) {
-    records[i]=server.documents[i]
-  }
+  _ = mem.copy(records, server.documents)
   previous:=server.documents_arena
   server.documents=records
   server.documents_arena=arena
@@ -1475,25 +1473,30 @@ fn lsp_handle(app: *App, index: usize, source: []const u8, arena: *mem.Arena) bo
         return false
       }
       add_text(response[..], &used, encoded_id)
-      if buffer.equal(method, "workspace/configuration") {
-        add_text(response[..], &used, ",\"result\":[")
-        count := json.array_length(json.object_get(params, "items"))
-        if count > 128 {
-          count = 128
-        }
-        for item_index in 0..count {
-          if item_index > 0 {
-            add_text(response[..], &used, ",")
+      case method {
+        "workspace/configuration" => {
+          add_text(response[..], &used, ",\"result\":[")
+          count := json.array_length(json.object_get(params, "items"))
+          if count > 128 {
+            count = 128
           }
-          add_text(response[..], &used, "null")
+          for item_index in 0..count {
+            if item_index > 0 {
+              add_text(response[..], &used, ",")
+            }
+            add_text(response[..], &used, "null")
+          }
+          add_text(response[..], &used, "]}")
         }
-        add_text(response[..], &used, "]}")
-      } else if buffer.equal(method, "window/workDoneProgress/create") {
-        add_text(response[..], &used, ",\"result\":null}")
-      } else if buffer.equal(method, "workspace/applyEdit") {
-        add_text(response[..], &used, ",\"result\":{\"applied\":false,\"failureReason\":\"Use an explicit previewed code action\"}}")
-      } else {
-        add_text(response[..], &used, ",\"error\":{\"code\":-32601,\"message\":\"Client method not supported\"}}")
+        "window/workDoneProgress/create" => {
+          add_text(response[..], &used, ",\"result\":null}")
+        }
+        "workspace/applyEdit" => {
+          add_text(response[..], &used, ",\"result\":{\"applied\":false,\"failureReason\":\"Use an explicit previewed code action\"}}")
+        }
+        _ => {
+          add_text(response[..], &used, ",\"error\":{\"code\":-32601,\"message\":\"Client method not supported\"}}")
+        }
       }
       _ = lsp_send(app, index, response[..used])
     }

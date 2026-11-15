@@ -134,7 +134,7 @@ fn pred_compile_regex(item: *Predicate, pattern: *const u8, length: u32, lua: bo
   source := pattern
   size := length
   if lua {
-    converted_length := pred_lua(#slice(pattern, #cast(usize, length)), converted[..])
+    converted_length := pred_lua(#slice(pattern, length), converted[..])
     if converted_length == 0 && length != 0 {
       return false
     }
@@ -143,7 +143,7 @@ fn pred_compile_regex(item: *Predicate, pattern: *const u8, length: u32, lua: bo
   }
   error: i32 = 0
   offset: usize = 0
-  item.code = search_compile(source, #cast(usize, size), 524288, &error, &offset, nil)
+  item.code = search_compile(source, size, 524288, &error, &offset, nil)
   if item.code == nil {
     return false
   }
@@ -158,7 +158,7 @@ fn pred_parse(query: rawptr, steps: []const TsPredicateStep, item: *Predicate, d
   }
   length: u32 = 0
   raw := pred_string(query, steps[0].id, &length)
-  name := #slice(raw, #cast(usize, length))
+  name := #slice(raw, length)
   if #len(name) > 0 && name[#len(name) - 1] == 33 {
     directive.* = true
     return true
@@ -236,11 +236,11 @@ pub fn predicates_compile(query: rawptr) *Predicates {
   for pattern in 0..#cast(usize, result.patterns) {
     length: u32 = 0
     raw_steps := pred_steps(query, #cast(u32, pattern), &length)
-    #slice(result.first, #cast(usize, result.patterns))[pattern] = result.total
+    #slice(result.first, result.patterns)[pattern] = result.total
     if length == 0 {
       continue
     }
-    steps := #slice(raw_steps, #cast(usize, length))
+    steps := #slice(raw_steps, length)
     begin: usize = 0
     for i in 0..#len(steps) {
       if steps[i].kind != 0 {
@@ -255,12 +255,12 @@ pub fn predicates_compile(query: rawptr) *Predicates {
         }
         pred_disable(query, #cast(u32, pattern))
       } else if !directive {
-        #slice(result.items, #cast(usize, capacity) + 1)[#cast(usize, result.total)] = item
+        #slice(result.items, #cast(usize, capacity) + 1)[result.total] = item
         result.total += 1
       }
       begin = i + 1
     }
-    #slice(result.count, #cast(usize, result.patterns))[pattern] = result.total - #slice(result.first, #cast(usize, result.patterns))[pattern]
+    #slice(result.count, result.patterns)[pattern] = result.total - #slice(result.first, result.patterns)[pattern]
   }
   return result
 }
@@ -273,7 +273,7 @@ fn pred_contiguous(context: rawptr, start: u32, end: u32, slot: u32) *const u8 {
 }
 fn pred_capture_source(match: *const TsMatch, capture: u32, source: *const PredicateSource, slot: u32, output: **const u8, output_length: *u32) bool {
   for i in 0..#cast(usize, match.capture_count) {
-    entry := &#slice(match.captures, #cast(usize, match.capture_count))[i]
+    entry := &#slice(match.captures, match.capture_count)[i]
     if entry.index == capture {
       start := pred_start(entry.node)
       end := pred_end(entry.node)
@@ -304,13 +304,13 @@ pub fn predicates_pass(predicates: *Predicates, match: *const TsMatch, text: *co
   return predicates_pass_source(predicates, match, &source)
 }
 fn predicates_pass_source(predicates: *Predicates, match: *const TsMatch, source: *const PredicateSource) bool {
-  if predicates == nil || #cast(u32, match.pattern_index) >= predicates.patterns {
+  if predicates == nil || match.pattern_index >= predicates.patterns {
     return true
   }
-  first := #slice(predicates.first, #cast(usize, predicates.patterns))[#cast(usize, match.pattern_index)]
-  count := #slice(predicates.count, #cast(usize, predicates.patterns))[#cast(usize, match.pattern_index)]
+  first := #slice(predicates.first, predicates.patterns)[match.pattern_index]
+  count := #slice(predicates.count, predicates.patterns)[match.pattern_index]
   for i in #cast(usize, first)..#cast(usize, (first + count)) {
-    item := &#slice(predicates.items, #cast(usize, predicates.total))[i]
+    item := &#slice(predicates.items, predicates.total)[i]
     value: *const u8 = nil
     value_length: u32 = 0
     if !pred_capture_source(match, item.capture, source, 0, &value, &value_length) {
@@ -318,22 +318,22 @@ fn predicates_pass_source(predicates: *Predicates, match: *const TsMatch, source
     }
     result := false
     if item.kind == 1 {
-      result = search_match(item.code, value, #cast(usize, value_length), 0, 0, item.data, nil) >= 0
+      result = search_match(item.code, value, value_length, 0, 0, item.data, nil) >= 0
     } else if item.kind == 0 && item.other_capture {
       other: *const u8 = nil
       other_length: u32 = 0
-      result = pred_capture_source(match, item.other, source, 1, &other, &other_length) && pred_equal(#slice(other, #cast(usize, other_length)), #slice(value, #cast(usize, value_length)))
+      result = pred_capture_source(match, item.other, source, 1, &other, &other_length) && pred_equal(#slice(other, other_length), #slice(value, value_length))
     } else {
       for a in 0..#cast(usize, item.argument_count) {
         if result {
           break
         }
         argument_length: u32 = 0
-        argument := pred_string(predicates.query, #slice(item.arguments, #cast(usize, item.argument_count))[a].id, &argument_length)
+        argument := pred_string(predicates.query, #slice(item.arguments, item.argument_count)[a].id, &argument_length)
         if item.kind == 3 {
-          result = pred_contains(#slice(value, #cast(usize, value_length)), #slice(argument, #cast(usize, argument_length)))
+          result = pred_contains(#slice(value, value_length), #slice(argument, argument_length))
         } else {
-          result = pred_equal(#slice(argument, #cast(usize, argument_length)), #slice(value, #cast(usize, value_length)))
+          result = pred_equal(#slice(argument, argument_length), #slice(value, value_length))
         }
       }
     }
@@ -348,7 +348,7 @@ pub fn predicates_free(predicates: *Predicates) {
     return
   }
   for i in 0..#cast(usize, predicates.total) {
-    item := &#slice(predicates.items, #cast(usize, predicates.total))[i]
+    item := &#slice(predicates.items, predicates.total)[i]
     if item.code != nil {
       search_data_free(item.data)
       search_code_free(item.code)

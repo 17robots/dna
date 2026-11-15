@@ -31,9 +31,7 @@ pub fn set_name(state: *State, path: []const u8) bool {
       return false
     }
   }
-  for index in 0..#len(path) {
-    state.path[index] = path[index]
-  }
+  _ = mem.copy(state.path[..], path)
   state.length = #len(path)
   state.path[state.length] = 0
   return true
@@ -91,9 +89,7 @@ pub fn resolve(path: []const u8, output: []u8) []const u8 {
   if joined_length >= 4000 || joined_length >= #len(output) {
     return output[..0]
   }
-  for index in 0..length {
-    output[index] = absolute[index]
-  }
+  _ = mem.copy(output, absolute[..length])
   at := length
   if separator {
     output[at] = '/'
@@ -164,7 +160,7 @@ fn save_seed(destination: []const u8, temporary: []const u8, snapshot: *const bu
   at: usize = 0
   for at < snapshot.length {
     source := buffer.snapshot_source_at(snapshot, at)
-    if source.descriptor >= 0 && source.offset == #cast(u64, at) {
+    if source.descriptor >= 0 && source.offset == at {
       origin := fs.File{descriptor: source.descriptor, active: true, owned: false}
       before := fs.file_stamp(&origin)
       if before.valid && same_values(stamp_values(before), source.stamp) {
@@ -235,12 +231,12 @@ fn write_document(file: *fs.File, snapshot: *const buffer.TextSnapshot, seed: *c
         next := at + length
         for next < snapshot.length {
           following := buffer.snapshot_source_at(snapshot, next)
-          if following.descriptor != source.descriptor || following.offset != source.offset + #cast(u64, next - at) || !same_values(following.stamp, source.stamp) {
+          if following.descriptor != source.descriptor || following.offset != source.offset + (next - at) || !same_values(following.stamp, source.stamp) {
             break
           }
           next += #len(following.bytes)
         }
-        if seed.descriptor == source.descriptor && source.offset == #cast(u64, at) && same_values(seed.stamp, source.stamp) {
+        if seed.descriptor == source.descriptor && source.offset == at && same_values(seed.stamp, source.stamp) {
           if io.failed(fs.seek(file, next).failure) {
             return false
           }
@@ -289,7 +285,7 @@ fn read_mapped(path: []const u8) FileText {
     return FileText{}
   }
   stamp := fs.file_stamp(&opened.value)
-  if stamp.valid && stamp.size >= #cast(u64, OriginMinimum) && #cast(usize, stamp.size) < DocumentLimit {
+  if stamp.valid && stamp.size >= OriginMinimum && #cast(usize, stamp.size) < DocumentLimit {
     bytes := mapper.map(opened.value.descriptor, stamp.size)
     if bytes != nil {
       result := FileText{storage: buffer.storage_mapped(bytes, #cast(usize, stamp.size), mapper.unmap)}
@@ -365,14 +361,14 @@ fn read_bounded(path: []const u8, limit: usize) FileText {
   // A large document keeps its file open: while the file's stamp is
   // unchanged, saving copies untouched ranges from it in-kernel.
   after := fs.file_stamp(&opened.value)
-  if !failed && !result.too_large && result.storage.block != nil && total >= OriginMinimum && before.valid && after.valid && same_stamp(before, after) && after.size == #cast(u64, total) {
+  if !failed && !result.too_large && result.storage.block != nil && total >= OriginMinimum && before.valid && after.valid && same_stamp(before, after) && after.size == total {
     buffer.storage_set_origin(&result.storage, opened.value.descriptor, stamp_values(after), close_origin)
     result.stamp = after
     result.data = storage[..total]
     result.valid = true
     return result
   }
-  if before.valid && after.valid && same_stamp(before, after) && after.size == #cast(u64, total) {
+  if before.valid && after.valid && same_stamp(before, after) && after.size == total {
     result.stamp = after
   }
   fs.close(&opened.value)

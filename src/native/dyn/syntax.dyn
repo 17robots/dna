@@ -244,7 +244,7 @@ fn syntax_worker(context: rawptr) i32 {
     }
     syntax_tree_delete(stream_cache.tree)
     stream_cache = SyntaxStreamCache{}
-    if !syntax_reserve(&input.text, #cast(usize, worker.length)) || !syntax_reserve(&previous.text, #cast(usize, worker.length)) || !syntax_reserve(&scratch_colors, #cast(usize, worker.length)) {
+    if !syntax_reserve(&input.text, worker.length) || !syntax_reserve(&previous.text, worker.length) || !syntax_reserve(&scratch_colors, worker.length) {
       worker.pending = false
       // The UI resubmits unfinished revisions; transient OOM must not suppress
       // that retry merely because this revision was already accepted.
@@ -263,7 +263,7 @@ fn syntax_worker(context: rawptr) i32 {
     worker.pending = false
     sync.store_u32(&worker.cancel, 0)
     rec_unlock(worker.mutex)
-    _ = syntax_fill(&scratch_colors[0], 0, #cast(usize, input.length))
+    _ = syntax_fill(&scratch_colors[0], 0, input.length)
     if retained != nil {
       prefix: u32 = 0
       old_end := previous.length
@@ -337,7 +337,7 @@ fn syntax_worker(context: rawptr) i32 {
             end = input.length
           }
           if color != 0 && start < end {
-            _ = syntax_fill(&scratch_colors[start], color, #cast(usize, (end - start)))
+            _ = syntax_fill(&scratch_colors[start], color, end - start)
           }
         }
         complete = !syntax_cursor_exceeded(cursor) && sync.load_u32(&worker.cancel) == 0
@@ -407,14 +407,14 @@ fn syntax_worker(context: rawptr) i32 {
       worker.tree_length = input.length
       // Parsing and queries have finished; no reader retains these byte slices.
       // The mutex also protects published colors and the UI's pending text.
-      if syntax_oversized(input.text, #cast(usize, input.length)) || syntax_oversized(previous.text, #cast(usize, previous.length)) || syntax_oversized(scratch_colors, #cast(usize, input.length)) || syntax_oversized(worker.text, #cast(usize, worker.length)) || syntax_oversized(worker.colors, #cast(usize, input.length)) {
+      if syntax_oversized(input.text, input.length) || syntax_oversized(previous.text, previous.length) || syntax_oversized(scratch_colors, input.length) || syntax_oversized(worker.text, worker.length) || syntax_oversized(worker.colors, input.length) {
         worker.small_revisions += 1
         if worker.small_revisions >= 8 {
-          syntax_trim(&worker.text, #cast(usize, worker.length))
-          syntax_trim(&worker.colors, #cast(usize, input.length))
-          syntax_trim(&input.text, #cast(usize, input.length))
-          syntax_trim(&previous.text, #cast(usize, previous.length))
-          syntax_trim(&scratch_colors, #cast(usize, input.length))
+          syntax_trim(&worker.text, worker.length)
+          syntax_trim(&worker.colors, input.length)
+          syntax_trim(&input.text, input.length)
+          syntax_trim(&previous.text, previous.length)
+          syntax_trim(&scratch_colors, input.length)
           worker.small_revisions = 0
         }
       } else {
@@ -565,13 +565,13 @@ fn syntax_open(root: *const u8, filename: *const u8, selected: *const u8) *Synta
       if syntax_path(path[..], &version_directory[0], "filenames") {
         length := syntax_readfile(&path[0], &extensions[0], 1024)
         if length >= 0 {
-          matches = syntax_list_matches(extensions[..#cast(usize, length)], file[base..])
+          matches = syntax_list_matches(extensions[..length], file[base..])
         }
       }
       if !matches && extension <= #len(file) && syntax_path(path[..], &version_directory[0], "extensions") {
         length := syntax_readfile(&path[0], &extensions[0], 1024)
         if length >= 0 {
-          matches = syntax_list_matches(extensions[..#cast(usize, length)], file[extension..])
+          matches = syntax_list_matches(extensions[..length], file[extension..])
         }
       }
       if !matches {
@@ -696,12 +696,12 @@ pub fn dna_syntax_update_changed(worker: *SyntaxWorker, text: *const u8, length:
     if #cast(usize, length) + 1 > #len(worker.text) / 4 {
       worker.small_revisions = 0
     }
-    if !syntax_reserve(&worker.text, #cast(usize, length)) || !syntax_reserve(&worker.colors, #cast(usize, length)) {
+    if !syntax_reserve(&worker.text, length) || !syntax_reserve(&worker.colors, length) {
       rec_unlock(worker.mutex)
       return
     }
     syntax_stream_drop(worker)
-    _ = copy(&worker.text[0], text, #cast(usize, length))
+    _ = copy(&worker.text[0], text, length)
     worker.has_change = change != nil
     if change != nil {
       worker.change = change.*
@@ -729,7 +729,7 @@ pub fn dna_syntax_update_begin(worker: *SyntaxWorker, length: u32, revision: u64
     if #cast(usize, length) + 1 > #len(worker.text) / 4 {
       worker.small_revisions = 0
     }
-    if syntax_reserve(&worker.text, #cast(usize, length)) && syntax_reserve(&worker.colors, #cast(usize, length)) {
+    if syntax_reserve(&worker.text, length) && syntax_reserve(&worker.colors, length) {
       return &worker.text[0]
     }
   }
@@ -757,7 +757,7 @@ pub fn dna_syntax_colors(worker: *SyntaxWorker, output: *u8, length: u32, revisi
   }
   ready := worker.ready && worker.finished == revision && length <= worker.length
   if ready {
-    _ = copy(output, &worker.colors[0], #cast(usize, length))
+    _ = copy(output, &worker.colors[0], length)
   }
   rec_unlock(worker.mutex)
   if ready {
@@ -904,7 +904,7 @@ pub fn dna_syntax_object(worker: *SyntaxWorker, revision: u64, low: u32, high: u
   none: [0]SyntaxRange
   ranges: []SyntaxRange = none[..]
   if worker.object_count > 0 {
-    ranges = #slice(#cast(*SyntaxRange, &worker.ranges[0]), #cast(usize, worker.object_count))
+    ranges = #slice(#cast(*SyntaxRange, &worker.ranges[0]), worker.object_count)
   }
   for step in 0..count {
     if !ok {
@@ -912,8 +912,7 @@ pub fn dna_syntax_object(worker: *SyntaxWorker, revision: u64, low: u32, high: u
     }
     found: i32 = -1
     width: u32 = 4294967295
-    for i in 0..#len(ranges) {
-      range := ranges[i]
+    for range, i in ranges {
       if range.kind != kind || range.start > current_low || range.end < current_high || (step > 0 && range.start == previous_start && range.end == previous_end) {
         continue
       }
@@ -926,9 +925,9 @@ pub fn dna_syntax_object(worker: *SyntaxWorker, revision: u64, low: u32, high: u
       ok = false
       break
     }
-    current_low = ranges[#cast(usize, found)].start
+    current_low = ranges[found].start
     previous_start = current_low
-    current_high = ranges[#cast(usize, found)].end
+    current_high = ranges[found].end
     previous_end = current_high
   }
   if ok {

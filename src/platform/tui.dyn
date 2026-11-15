@@ -128,7 +128,7 @@ pub fn tui_start() bool {
 fn environment_is(name: []const u8, wanted: []const u8) bool {
   storage: [4096]u8
   value := host.environment(name[..#len(name) - 1], storage[..])
-  return !io.failed(value.failure) && value.found && buffer_equal(value.value, wanted)
+  return !io.failed(value.failure) && value.found && mem.equal(value.value, wanted)
 }
 fn environment_contains(name: []const u8, part: []const u8) bool {
   storage: [4096]u8
@@ -234,7 +234,7 @@ pub fn tui_clear() {
 pub fn tui_cells(cells: *const u32, columns: i32, rows: i32, x: f32, y: f32, cursor_column: i32, cursor_row: i32) {
   origin_column := floor_cell(x + #cast(f32, state.origin_x) + CellWidth * 0.5, CellWidth)
   origin_row := floor_cell(y + #cast(f32, state.origin_y) + CellHeight * 0.5, CellHeight)
-  values := #slice(cells, #cast(usize, (columns * rows * 3)))
+  values := #slice(cells, columns * rows * 3)
   for row in 0..rows {
     for column in 0..columns {
       index := #cast(usize, ((row * columns + column) * 3))
@@ -513,10 +513,8 @@ pub fn tui_text_set(handle: rawptr, bytes: *const u8, length: usize) bool {
     }
     text.capacity = capacity
   }
-  storage := #slice((#cast(*u8, text.bytes)), text.capacity)
-  source := #slice(bytes, length)
-  for index in 0..length {
-    storage[index] = source[index]
+  if length > 0 {
+    _ = native_span_copy(#cast(*u8, text.bytes), bytes, length, length + 1)
   }
   text.length = length
   return true
@@ -542,7 +540,7 @@ fn decode(bytes: []const u8, at: usize, width: *usize) u32 {
   first := bytes[at]
   if first < 128 || at + 1 >= #len(bytes) {
     width.* = 1
-    return #cast(u32, first)
+    return first
   }
   if first >= 240 && at + 3 < #len(bytes) {
     width.* = 4
@@ -557,7 +555,7 @@ fn decode(bytes: []const u8, at: usize, width: *usize) u32 {
     return ((#cast(u32, first) & 31) << 6) | (#cast(u32, bytes[at + 1]) & 63)
   }
   width.* = 1
-  return #cast(u32, first)
+  return first
 }
 // Terminal columns a codepoint takes: wide CJK and emoji 2, combining 0.
 fn display_width(character: u32) i32 {
@@ -877,10 +875,10 @@ pub fn tui_present() {
   if state.full_redraw {
     emit("\x1b[2J")
   }
-  current_foreground: u32 = 4294967295
-  current_background: u32 = 4294967295
+  current_foreground: u32 = #max(u32)
+  current_background: u32 = #max(u32)
   current_underline: u8 = 0
-  current_underline_color: u32 = 4294967295
+  current_underline_color: u32 = #max(u32)
   current_italic := false
   current_bold := false
   cursor_column: i32 = -1
@@ -997,10 +995,9 @@ pub fn tui_clipboard_set(text: *const u8, length: usize) {
   }
   state.clipboard = heap_alloc(length + 1)
   if state.clipboard != nil {
-    copy := #slice((#cast(*u8, state.clipboard)), length + 1)
-    source := #slice(text, length)
-    for index in 0..length {
-      copy[index] = source[index]
+    copy := #slice(#cast(*u8, state.clipboard), length + 1)
+    if length > 0 {
+      _ = native_span_copy(&copy[0], text, length, length + 1)
     }
     copy[length] = 0
   }
@@ -1014,13 +1011,13 @@ pub fn tui_clipboard_set(text: *const u8, length: usize) {
     b: u32 = 0
     ch: u32 = 0
     if at + 1 < length {
-      b = #cast(u32, bytes[at + 1])
+      b = bytes[at + 1]
     }
     if at + 2 < length {
-      ch = #cast(u32, bytes[at + 2])
+      ch = bytes[at + 2]
     }
     group := (a << 16) | (b << 8) | ch
-    quad: [4]u8 = [alphabet[#cast(usize, ((group >> 18) & 63))], alphabet[#cast(usize, ((group >> 12) & 63))], alphabet[#cast(usize, ((group >> 6) & 63))], alphabet[#cast(usize, (group & 63))]]
+    quad: [4]u8 = [alphabet[(group >> 18) & 63], alphabet[(group >> 12) & 63], alphabet[(group >> 6) & 63], alphabet[group & 63]]
     if at + 1 >= length {
       quad[2] = '='
     }
@@ -1048,10 +1045,7 @@ pub fn tui_clipboard_get() *const u8 {
   }
   target := #slice((#cast(*u8, copy)), length + 1)
   if length > 0 {
-    source := #slice((#cast(*const u8, state.clipboard)), length)
-    for index in 0..length {
-      target[index] = source[index]
-    }
+    _ = native_span_copy(&target[0], #cast(*const u8, state.clipboard), length, length + 1)
   }
   target[length] = 0
   return #cast(*const u8, copy)
@@ -1100,9 +1094,7 @@ fn queue_text(bytes: []const u8) {
   }
   slot_index := state.text_next
   state.text_next = (state.text_next + 1) % 64
-  for index in 0..#len(bytes) {
-    state.texts[slot_index][index] = bytes[index]
-  }
+  _ = mem.copy(state.texts[slot_index][..], bytes)
   state.texts[slot_index][#len(bytes)] = 0
   event := Event{}
   text := #cast(*TextEvent, &event)
@@ -1258,20 +1250,15 @@ fn paste_append(bytes: []const u8) {
       return
     }
     if state.paste != nil {
-      old := #slice((#cast(*u8, state.paste)), state.paste_length)
-      target := #slice((#cast(*u8, grown)), state.paste_length)
-      for index in 0..state.paste_length {
-        target[index] = old[index]
+      if state.paste_length > 0 {
+        _ = native_span_copy(#cast(*u8, grown), #cast(*const u8, state.paste), state.paste_length, state.paste_length + 1)
       }
       heap_free(state.paste)
     }
     state.paste = grown
     state.paste_capacity = capacity
   }
-  target := #slice(#offset((#cast(*u8, state.paste)), state.paste_length), (state.paste_length + #len(bytes)) - (state.paste_length))
-  for index in 0..#len(bytes) {
-    target[index] = bytes[index]
-  }
+  _ = native_span_copy(#offset(#cast(*u8, state.paste), state.paste_length), &bytes[0], #len(bytes), #len(bytes) + 1)
   state.paste_length += #len(bytes)
 }
 // Inside a paste: everything up to ESC [201~ is text, never keys, however
@@ -1279,7 +1266,7 @@ fn paste_append(bytes: []const u8) {
 fn paste_finish() {
   state.pasting = false
   event := Event{}
-  event.words[0] = #cast(u64, PasteEvent)
+  event.words[0] = PasteEvent
   queue(event)
 }
 fn paste_continue() usize {
@@ -1393,7 +1380,7 @@ fn parse_one(force_escape: bool) usize {
         character += 32
         modifiers = modifiers | ModShift
       }
-      queue_key(character, modifiers, #cast(u32, second))
+      queue_key(character, modifiers, second)
       return 2
     }
     queue_key(27, 0, 0)
@@ -1414,7 +1401,7 @@ fn parse_one(force_escape: bool) usize {
   final := bytes[end]
   parameters := bytes[2..end]
   // Bracketed paste: gathered by paste_continue until ESC [201~.
-  if final == '~' && buffer_equal(parameters, "200") {
+  if final == '~' && mem.equal(parameters, "200") {
     state.pasting = true
     state.paste_length = 0
     state.paste_since = ticks()
@@ -1523,21 +1510,10 @@ fn encode(character: u32, encoded: []u8) usize {
   encoded[3] = #cast(u8, ((character & 63) | 128))
   return 4
 }
-fn buffer_equal(a: []const u8, b: []const u8) bool {
-  if #len(a) != #len(b) {
-    return false
-  }
-  for index in 0..#len(a) {
-    if a[index] != b[index] {
-      return false
-    }
-  }
-  return true
-}
 fn find(bytes: []const u8, pattern: []const u8, from: usize) usize {
   at := from
   for at + #len(pattern) <= #len(bytes) {
-    if buffer_equal(bytes[at..at + #len(pattern)], pattern) {
+    if mem.equal(bytes[at..at + #len(pattern)], pattern) {
       return at
     }
     at += 1
@@ -1551,7 +1527,7 @@ fn numbers(text: []const u8, values: []u32) usize {
   for byte in text {
     if byte >= '0' && byte <= '9' {
       if value < 100000000 {
-        value = value * 10 + #cast(u32, (byte - '0'))
+        value = value * 10 + (byte - '0')
       }
       digits = true
     } else if byte == ';' || byte == ':' {
@@ -1578,9 +1554,7 @@ fn parse_input(force_escape: bool) {
       return
     }
     remaining := state.input_used - used
-    for index in 0..remaining {
-      state.input[index] = state.input[used + index]
-    }
+    _ = mem.move(state.input[..], state.input[used..used + remaining])
     state.input_used = remaining
   }
 }
@@ -1680,7 +1654,7 @@ pub fn tui_wait(event: *Event, milliseconds: i32) bool {
       return true
     }
     wake := Event{}
-    wake.words[0] = #cast(u64, WorkerWakeEvent)
+    wake.words[0] = WorkerWakeEvent
     event.* = wake
     return true
   }
