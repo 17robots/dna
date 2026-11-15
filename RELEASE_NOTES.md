@@ -1,46 +1,38 @@
-# DNA 0.1.0-preview.19
+# DNA 0.1.0-preview.20
 
 Experimental Linux x86-64 preview built with the published Dyn
-0.1.0-preview.39 compiler, SDK and runtime. It fixes the window frontend on
-hosts whose graphics driver needs a newer Wayland client library than the one
-preview 18 bundled. The package still needs only **glibc 2.38**.
+0.1.0-preview.39 compiler, SDK and runtime. It fixes Dyn highlighting of
+strings that contain comment markers after an escape, and takes the Dyn
+grammar and highlights from dyn-editors. The package still needs only
+**glibc 2.38**.
 
 ## Changes
 
-- Updated the compiler, SDK and runtime to Dyn 0.1.0-preview.39, which removes
-  union types. DNA declared none, so its sources are unchanged. Verified SDK
-  pins for Linux, macOS and Windows and the Linux CI compiler download are
-  updated.
+- The Dyn grammar is pinned to tree-sitter-dyn `b0a012f`, the revision
+  dyn-editors 0.1.9 ships for Dyn preview 39 (previously `6fca64d`), and DNA's
+  Dyn highlights are dyn-editors' Helix highlights. `#instance`, `#max`,
+  `#min`, `#offset` and `#slice` are highlighted as builtins, and generic
+  struct type parameters as types. `#wrap` and `is`, which Dyn no longer has,
+  are gone.
 
 ## Fixes
 
-- Preview 18 bundled Ubuntu 24.04's libwayland-client 1.22 and loaded it ahead
-  of the system copy. NVIDIA's EGL driver (620 series, with egl-wayland2)
-  loads the same library, failed with the older one, and DNA exited with
-  `window creation failed (no usable display or GPU driver; try dna --tui)`.
-- The Wayland, X11/xcb and GL dispatch libraries (`libwayland-*`, `libX11`,
-  `libxcb`, `libEGL`, `libGL`, `libGLX`, `libGLdispatch` and what only they
-  need) now come from the host, so they match its graphics driver. The package
-  keeps copies under `lib/host/<soname>/`; the launcher adds one to the search
-  path only when the host's `ldconfig` cache lacks that library, for example
-  for `dna --tui` on a machine without a desktop.
+- A `//` or `/*` inside a Dyn string after an escape was highlighted as a
+  comment: `"q \" /* r"` greyed the rest of the line and every line up to the
+  next `*/`, and `"q \n // r"` greyed the rest of the line. Strings now stay
+  string text.
 
 ## Compatibility
 
-Configuration, document and session formats are unchanged from preview 18.
-Plugins written in Dyn must build with Dyn preview 39; replace any `union`
-with `#bitcast` or a payload enum as described in Dyn's
-`docs/migrations/0.1.0-preview.39.md`.
-The archive layout gains `lib/host/`. Start DNA through the `dna` launcher;
-running `bin/dna-wayland` or `bin/dna-x11` directly uses only the host's
-display libraries.
+Configuration, document and session formats are unchanged from preview 19.
+An installed Dyn grammar is not replaced automatically: update it once with
+`u` on Dyn in `:languages` (or `:language-install dyn`) to get the fix.
 
 ## Qualification
 
-Formatting, the complete Linux smoke suite, deterministic archive
-verification, the package in clean Ubuntu 24.04, Debian 13 and Fedora 40
-containers, extracted GUI startup, and launcher library selection with and
-without host display libraries. The Wayland frontend was checked on Arch with
-NVIDIA 620.70 and egl-wayland2 1.0.2.
+Formatting, the complete Linux smoke suite (including a new check that
+comment markers after each escape stay string text), deterministic archive
+verification, and the package in clean Ubuntu 24.04, Debian 13 and Fedora 40
+containers. Highlighting was checked in the installed package on Arch.
 
 See `PRERELEASE.md` for the remaining limitations.
