@@ -223,7 +223,9 @@ with tempfile.TemporaryDirectory(prefix='dna-native-platform-') as directory:
             if types[end]=='}':depth-=1
             end+=1
         declarations.append(types[match.start():end])
-    (stage/'types.dyn').write_text('use "std/mem"\n#link("dna_native")\npub const WorkerWakeEvent:u32=32768\npub const InputOverflowEvent:u32=32770\n'+'\n'.join(declarations))
+    # Every event constant the native GUI uses lives with these records.
+    constants=re.findall(r'^pub const [A-Za-z_]+\s*:\s*u32\s*=\s*[0-9]+$',types,re.M)
+    (stage/'types.dyn').write_text('use "std/mem"\n#link("dna_native")\n'+'\n'.join(constants)+'\n'+'\n'.join(declarations))
     shutil.copyfile(ROOT/'src/platform/gui.dyn',stage/'sdl.dyn')
     for module in ('host','owned_arena','cstring'):
         shutil.copytree(ROOT/'src'/module,stage/module)

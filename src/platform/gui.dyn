@@ -1,6 +1,7 @@
 use "std/io" io
 // Native GUI backend. The public platform wrapper keeps terminal dispatch.
 use "vendor/window/events"
+use "std/text/edit" surrounding_edit
 use "std/ui"
 use "std/ui/software"
 use "std/c"
@@ -49,6 +50,14 @@ struct NativeGui {
   character: u32,
   payload: [65537]u8,
   closed: bool,
+  // Input-method context around the caret (see sdl_surrounding) and the
+  // replacement it last sent back, assembled from Edit chunks.
+  surrounding: surrounding_edit.Tracker,
+  published: u64,
+  from_input_method: bool,
+  edit_chunks: events.EditBuffer,
+  edit: ImeEdit,
+  edit_text: [4096]u8,
 }
 native_gui: NativeGui
 pub fn init(flags: u32) bool {
@@ -671,6 +680,18 @@ fn native_key(key:u32) u32 {
   return 0
 }
 fn native_event(source:*const events.Event, event:*Event) bool {
+  if source.kind==events.Kind.Edit || native_gui.edit_chunks.active {
+    collected:=events.collect_edit(&native_gui.edit_chunks, source)
+    if collected.ready {
+      length:=mem.copy(native_gui.edit_text[..], collected.value.text)
+      native_gui.edit=ImeEdit{text:native_gui.edit_text[..length], start:collected.value.start, end:collected.value.end, token:collected.value.token}
+      event.words[0]=ImeEditEvent
+      return true
+    }
+    if source.kind==events.Kind.Edit {
+      return false
+    }
+  }
   event.*=Event{}
   mods:u16=0
   if (source.modifiers&events.Shift)!=0 {
@@ -916,6 +937,35 @@ fn sdl_start_text(window:rawptr) bool {
 fn sdl_stop_text(window:rawptr) bool {
   window_api.set_text_input(&native_gui.window, false, 0, 0, 1, 1)
   return true
+}
+// Publish the text around the caret to the input method; returns the
+// context's token (0 when unavailable). Unchanged context is not resent.
+fn sdl_surrounding(window:rawptr, text:[]const u8, cursor, anchor:usize) u64 {
+  cause:=surrounding_edit.Cause.Other
+  if native_gui.from_input_method {
+    cause=surrounding_edit.Cause.InputMethod
+  }
+  snapshot:=surrounding_edit.snapshot(&native_gui.surrounding, 1, text, cursor, anchor, cause)
+  if snapshot.failure.kind != io.Kind.Ok {
+    return 0
+  }
+  if snapshot.value.token == native_gui.published {
+    return native_gui.published
+  }
+  if window_api.set_surrounding_text(&native_gui.window, snapshot.value).kind != io.Kind.Ok {
+    native_gui.published=0
+    return 0
+  }
+  native_gui.published=snapshot.value.token
+  native_gui.from_input_method=false
+  return native_gui.published
+}
+fn sdl_ime_edit() ImeEdit {
+  return native_gui.edit
+}
+fn sdl_ime_edit_applied() {
+  native_gui.from_input_method=true
+  native_gui.edit=ImeEdit{}
 }
 fn sdl_text_area(window:rawptr, area:*const PixelRect, cursor:i32) bool {
   if area==nil {
