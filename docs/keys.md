@@ -33,6 +33,10 @@ character, so `x` never highlights the first character of the following line. Wo
 | Search for the selection (then `n` / `N`) | `*` |
 | View: center / top / bottom / scroll a line | `z` then `z`/`c`, `t`, `b`, `k`/`j`; `Z` keeps the menu open |
 | Next / previous diagnostic, first/last diagnostic, paragraph, add blank line | `]` / `[` then `d`, `D`, `p`, Space |
+| Next / previous git change, last / first git change | `]` / `[` then `g`, `G` |
+| Next / previous function, type, parameter, comment (needs the language's text objects) | `]` / `[` then `f`, `t`, `a`, `c` |
+| Repeat the last insert | `.` |
+| Insert mode: delete word before / after, to line start / end, next character | Ctrl-W or Alt-Backspace / Alt-D, Ctrl-U / Ctrl-K, Ctrl-D |
 | Toggle line comments | `:comment` (Helix's `Ctrl C` / `Space c` keep DNA's copy / close buffer) |
 | Keymap profile | `:keymap helix` or `:keymap vim`; `[modules] keymap` sets the default |
 | Character find / till (reverse with Shift) | `f` / `t`, then a character; Escape cancels |
@@ -210,7 +214,8 @@ keys and clickable guide entries follow the same Vim dispatch.
 | Visual | `v V` Ctrl-v; motions and text objects extend; `d x c s y > < ~ u U J r p P o`, `D X Y C S R` for lines, block `I A`, `gv` |
 | Registers | `"a`–`"z`, `"_` (black hole); the unnamed register is the system clipboard |
 | Macros | `q{a-z}` records, `q` stops, `@{a-z}` and `@@` replay |
-| Marks | `m{a-z}`; `` `{a-z} `` and `'{a-z}`, also after operators; `` `` `` and `''` |
+| Marks | `m{a-z}`; `` `{a-z} `` and `'{a-z}`, also after operators; `` `` `` and `''`; file marks `m{A-Z}`, `:marks` |
+| Replace, format | `R` (Replace mode), `gq{motion}`, `gqq`, `gqap` |
 | Search | `/` and `?` (PCRE), `n N`, `* #` |
 | View | Ctrl-d Ctrl-u Ctrl-f Ctrl-b, Ctrl-e Ctrl-y, `zz zt zb` |
 | Language server | `K` hover, `gd gy gr gi` (definition, type, references, implementation) |
@@ -222,10 +227,23 @@ LSP goto). `m{a-z}` sets a mark in the current file; `` `{a-z} `` goes to it and
 `'{a-z}` to its line, as motions too (`d'a`, `` y`a ``); `` `` `` and `''`
 return to the last jump. Marks move with edits and last until the file is
 reloaded. `.` after a visual change repeats it on a region of the same size at
-the cursor (not after block mode). Not yet: uppercase (file) marks, Replace
-mode (`R`), `gq`, `=`, sentence and tag objects, `gJ` (joins with spaces like
-`J`), and capture groups in `:s` (patterns are PCRE, so write `a|b`, not
-`a\|b`). Ctrl-x closes the buffer only in the Helix keymap.
+the cursor (not after block mode).
+
+`R` enters Replace mode: typed characters overwrite, Backspace puts back what
+each one replaced, and typing past the line end appends. `gq{motion}`, `gqq`,
+`gqap` and visual `gq` rewrap lines to 79 columns; blank lines separate
+paragraphs, and each paragraph keeps its indentation and comment leader, so
+code next to a comment is never folded into it. `m{A-Z}` sets a file mark;
+`'{A-Z}` and `` `{A-Z} `` open its file and jump there. `:marks` lists the
+buffer's marks and the file marks. An unset mark reports `E20: Mark not set`.
+
+Not yet: `=`, sentence and tag objects, `gJ` (joins with spaces like `J`),
+`:earlier`/`:later`, and capture groups in `:s` (patterns are PCRE, so write
+`a|b`, not `a\|b`). Ctrl-x closes the buffer only in the Helix keymap.
+
+`:[range]sort[!] [i] [n] [u]` sorts whole lines in either keymap; without a
+range it sorts the file. `!` reverses, `i` ignores case, `n` compares the first
+number in each line, and `u` keeps one of each run of equal lines.
 
 ## Go-to menu
 

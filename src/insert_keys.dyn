@@ -1,0 +1,103 @@
+// Helix's insert-mode editing keys (the Vim keymap has its own): delete a
+// word or to a line end without leaving insert mode. Word and line deletions
+// act on the primary cursor; character deletions on every cursor.
+
+// Word classes for deleting by word: 0 space, 1 word characters, 2 the rest.
+fn insert_word_class(byte: u8) u8 {
+  if byte == ' ' || byte == 9 {
+    return 0
+  }
+  if (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || (byte >= '0' && byte <= '9') || byte == '_' || byte >= 128 {
+    return 1
+  }
+  return 2
+}
+
+// True when the key was an insert-mode editing key and has been handled.
+fn insert_edit_key(app: *App, key: u32, modifiers: u16) bool {
+  control := (modifiers & ModCtrl) != 0
+  alt := (modifiers & ModAlt) != 0
+  doc := app.documents.current
+  if control && !alt && key == KeyD {
+    buffer.erase_all(doc, false)
+    return true
+  }
+  if control && !alt && key == KeyH {
+    buffer.erase_all(doc, true)
+    return true
+  }
+  if control && !alt && key == KeyJ {
+    changed(app, "\n")
+    return true
+  }
+  if control && !alt && key == KeyS {
+    buffer.checkpoint(doc)
+    return true
+  }
+  word_back := (control && !alt && key == KeyW) || (alt && !control && key == KeyBackspace)
+  word_forward := alt && !control && (key == KeyD || key == KeyDelete)
+  to_start := control && !alt && key == KeyU
+  to_end := control && !alt && key == KeyK
+  if !(word_back || word_forward || to_start || to_end) {
+    return false
+  }
+  if doc.secondary.count != 0 || doc.anchor != doc.cursor {
+    return true
+  }
+  at := doc.cursor
+  low := at
+  high := at
+  if to_start {
+    low = buffer.line_start(doc, at)
+  } else if to_end {
+    high = buffer.line_end(doc, at)
+    if high > at && buffer.byte_at(doc, high - 1) == 13 {
+      high -= 1
+    }
+  } else if word_back {
+    beginning := buffer.line_start(doc, at)
+    for low > beginning && insert_word_class(buffer.byte_at(doc, low - 1)) == 0 {
+      low -= 1
+    }
+    if low > beginning {
+      kind := insert_word_class(buffer.byte_at(doc, low - 1))
+      for low > beginning && insert_word_class(buffer.byte_at(doc, low - 1)) == kind {
+        low -= 1
+      }
+    }
+    if low == at && at > 0 {
+      // At a line start, join with the previous line like Backspace.
+      low = buffer.previous(doc, at)
+    }
+  } else {
+    ending := buffer.line_end(doc, at)
+    for high < ending && insert_word_class(buffer.byte_at(doc, high)) == 0 {
+      high += 1
+    }
+    if high < ending {
+      kind := insert_word_class(buffer.byte_at(doc, high))
+      for high < ending && insert_word_class(buffer.byte_at(doc, high)) == kind {
+        high += 1
+      }
+    }
+    if high == at && at < doc.length {
+      high = buffer.next(doc, at)
+    }
+  }
+  if high <= low {
+    return true
+  }
+  // Keep partial UTF-8 out of the range.
+  for low > 0 && low < at && (buffer.byte_at(doc, low) & 192) == 128 {
+    low -= 1
+  }
+  for high < doc.length && (buffer.byte_at(doc, high) & 192) == 128 {
+    high += 1
+  }
+  doc.anchor = low
+  doc.cursor = high
+  _ = buffer.replace(doc, "")
+  doc.anchor = low
+  doc.cursor = low
+  return true
+}
