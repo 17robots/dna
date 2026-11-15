@@ -72,12 +72,20 @@ fn matches(app: *App) {
         continue
       }
       name := command_name(app, index)
-      if #len(name) == 0 {
+      if #len(name) == 0 || (index < BuiltinCommands && !command_available(app, index) && !command_alias(index, query)) {
         continue
       }
       score := fuzzy_score(command_title(name), query)
+      // Rows whose words start with the typed words come first: they are
+      // the rows Enter runs.
+      if score >= 0 && word_prefix_match(command_title(name), query) {
+        score += 100000
+      }
       if command_alias(index, query) {
         score = 1000000
+      }
+      if #len(query) == 0 {
+        score += palette_recent_rank(app, index)
       }
       if score >= 0 {
         menu_insert(app, scores[..], index, score)
@@ -195,6 +203,9 @@ fn draw_command_palette(renderer: rawptr, app: *App, typography: *Typography, wi
     motion.snap(&ui.boxes[list].scroll, ui.boxes[list].scroll_target)
   }
   window := ui_list_window(ui, list, count, line * #cast(f32, shown))
+  // An empty query lists commands to browse; a typed one highlights a row only
+  // when Enter would run it.
+  highlight := app.prompt_state.length == 0 || app.command_menu.arguments || palette_row_runs(app, selected)
   ui_push(ui, list)
   ui_spacer(ui, "above", #cast(f32, window.first) * line)
   for row in window.first..window.last {
@@ -215,7 +226,7 @@ fn draw_command_palette(renderer: rawptr, app: *App, typography: *Typography, wi
       _ = ui_label(ui, "shortcut", shortcut, UiMuted)
     }
     ui_pop(ui)
-    ui_animate(app, ui, item, row == selected)
+    ui_animate(app, ui, item, row == selected && highlight)
   }
   ui_spacer(ui, "below", #cast(f32, (count - window.last)) * line)
   if count == 0 {
@@ -265,7 +276,41 @@ fn command_palette_mouse(app: *App, typography: *Typography, x: f32, y: f32, pre
   return true
 }
 
+fn palette_recent_rank(app: *const App, id: usize) i32 {
+  menu := &app.command_menu
+  for index in 0..menu.recent_count {
+    if menu.recent[index] == id {
+      return #cast(i32, (8 - index) * 10)
+    }
+  }
+  return 0
+}
+fn palette_recent_push(app: *App, id: usize) {
+  menu := &app.command_menu
+  found := menu.recent_count
+  for index in 0..menu.recent_count {
+    if menu.recent[index] == id {
+      found = index
+    }
+  }
+  if found == menu.recent_count && menu.recent_count < 8 {
+    menu.recent_count += 1
+  }
+  if found == 8 {
+    found = 7
+  }
+  at := found
+  for at > 0 {
+    menu.recent[at] = menu.recent[at - 1]
+    at -= 1
+  }
+  menu.recent[0] = id
+  menu.cached = false
+}
 fn action(app: *App, typography: *Typography, id: usize) {
+  if id < PaletteRowBase {
+    palette_recent_push(app, id)
+  }
   if id >= PaletteRowBase {
     palette_row_choose(app, typography, id - PaletteRowBase, false)
     return
@@ -586,6 +631,18 @@ fn explorer_command(app: *App, typography: *Typography, chosen: usize) bool {
   return false
 }
 // Runs a palette row directly, as when it is clicked.
+// Enter runs the highlighted row only when it was picked, or when the typed
+// words start words of its title. Otherwise Enter reports an unknown command.
+fn palette_row_runs(app: *App, row: usize) bool {
+  if row >= app.prompt_state.match_count {
+    return false
+  }
+  if palette_picked(app) {
+    return true
+  }
+  query := app.prompt_state.text[..app.prompt_state.length]
+  return word_prefix_match(command_title(command_name(app, app.prompt_state.matches[row])), query)
+}
 fn command_run(app: *App, typography: *Typography, id: usize) {
   app.terminal_state.commands = false
   if app.explorer.commands {

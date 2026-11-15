@@ -10,14 +10,27 @@ extern fn handoff_run "dna_handoff_run"()
 
 // The editor returns after all its cleanup; a pending :frontend handoff then
 // replaces this process with the other frontend.
-fn main() {
-  if cli_version() {
-    return
+fn main() i32 {
+  early := cli_early()
+  if early >= 0 {
+    return early
   }
-  editor_main()
+  status := editor_main()
+  if status != 0 {
+    return status
+  }
   handoff_run()
+  return 0
 }
-fn editor_main() {
+// Startup problems the user can fix end with a message and exit status 1;
+// panics remain for internal invariants.
+fn startup_failure(text: []const u8) i32 {
+  host.write_error("dna: ")
+  host.write_error(text)
+  host.write_error("\n")
+  return 1
+}
+fn editor_main() i32 {
   // Large documents map their file; the native guard survives truncation.
   files.set_mapper(map_file, unmap_file)
   owned := arena_owner.create((#sizeof(App) + 128))
@@ -88,7 +101,7 @@ fn editor_main() {
   }
   terminal := frontend_choose(app, flag_frontend)
   if terminal && !sdl.tui_start() {
-    #panic("--tui needs a terminal on stdin and stdout")
+    return startup_failure("--tui needs a terminal on stdin and stdout")
   }
   defer sdl.tui_stop()
   // Native notifications wake either frontend through its event queue.
@@ -97,7 +110,10 @@ fn editor_main() {
     sdl_flags = 16384
   }
   if !sdl.init(sdl_flags) {
-    #panic("native platform init failed")
+    if terminal {
+      return startup_failure("terminal frontend could not start")
+    }
+    return startup_failure("no usable display (set WAYLAND_DISPLAY or DISPLAY, or run dna --tui)")
   }
   defer sdl.quit()
 
@@ -117,13 +133,13 @@ fn editor_main() {
     egl_vendor_clear()
   }
   if window == nil {
-    #panic("window creation failed")
+    return startup_failure("window creation failed (no usable display or GPU driver; try dna --tui)")
   }
   defer sdl.destroy_window(window)
 
   renderer := sdl.create_renderer(window, nil)
   if renderer == nil {
-    #panic("renderer creation failed")
+    return startup_failure("renderer creation failed (OpenGL 3.3 unavailable; try DNA_RENDERER=software or dna --tui)")
   }
   defer sdl.destroy_renderer(renderer)
   // Frames land on the display's refresh, evenly spaced and without tearing.
@@ -168,7 +184,7 @@ fn editor_main() {
     font = ttf.open(&font_path[0], 16.0)
   }
   if font == nil {
-    #panic("font unavailable: set DNA_FONT to a font file")
+    return startup_failure("no monospace font found: install one, or set font in config.toml or DNA_FONT")
   }
   app.fonts.original_font_length = copy_text(app.fonts.original_font_path[..], font_path[..c.string_length(&font_path[0], 4096)])
   app.fonts.active_font_length = copy_text(app.fonts.active_font_path[..], app.fonts.original_font_path[..app.fonts.original_font_length])
@@ -497,4 +513,5 @@ fn editor_main() {
   if !io.failed(smoke.failure) && smoke.found {
     finish_probe(app)
   }
+  return 0
 }

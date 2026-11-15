@@ -13,6 +13,11 @@ struct PromptState {
   history_count, history_next, history_depth: usize,
   history_draft: [4096]u8,
   history_draft_length: usize,
+  // The palette row was chosen with arrows or Ctrl-N/P for the current query
+  // (picked_runs is CommandMenuState.filter_runs then). Only a picked row, or
+  // one whose words start with what was typed, runs on Enter.
+  picked: bool,
+  picked_runs: u64,
 }
 
 fn command_history_remember(app: *App) {
@@ -86,6 +91,14 @@ fn command_palette_move(app: *App, older: bool) {
   } else if app.prompt_state.selected + 1 < app.prompt_state.match_count {
     app.prompt_state.selected += 1
   }
+  palette_mark_picked(app)
+}
+fn palette_mark_picked(app: *App) {
+  app.prompt_state.picked = true
+  app.prompt_state.picked_runs = app.command_menu.filter_runs
+}
+fn palette_picked(app: *const App) bool {
+  return app.prompt_state.picked && app.prompt_state.picked_runs == app.command_menu.filter_runs
 }
 // Prompt/picker input never falls through to editing commands.
 fn prompt_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
@@ -125,7 +138,7 @@ fn prompt_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
   if prompting(app) && control && key == KeyV {
     pasted := sdl.clipboard_get()
     if pasted == nil {
-      notice(app, "Clipboard unavailable.")
+      status_error(app, "Clipboard unavailable.")
       return
     }
     defer sdl.free(#cast(rawptr, pasted))
@@ -236,6 +249,9 @@ fn prompt_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
     }
     if key == KeyUp && app.prompt_state.selected > 0 {
       app.prompt_state.selected -= 1
+    }
+    if app.prompt_state.panel == Panel.Commands && (key == KeyDown || key == KeyUp) {
+      palette_mark_picked(app)
     }
   }
   if prompting(app) && key == KeyBackspace && app.prompt_state.length > 0 {

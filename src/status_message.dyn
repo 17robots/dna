@@ -1,0 +1,123 @@
+use "std/io"
+use "host"
+
+// One-line feedback shown in the status line, like Vim's message area: a
+// search that found nothing, an unknown command, a completed write. It stays
+// until the next key, so it never blocks input the way a dialog does. Use
+// notice() only when the text is long or the user must read it before going on.
+struct StatusMessage {
+  text: [512]u8,
+  length: usize,
+  error: bool,
+  // :messages shows the most recent ones, oldest first.
+  history: [20][512]u8,
+  history_lengths: [20]usize,
+  history_next, history_count: usize,
+}
+
+fn status_note(app: *App, text: []const u8) {
+  status_message_set(app, text, false)
+}
+fn status_error(app: *App, text: []const u8) {
+  status_message_set(app, text, true)
+}
+fn status_message_set(app: *App, text: []const u8, error: bool) {
+  message := &app.status_message
+  message.length = copy_text(message.text[..], text)
+  message.error = error
+  status_message_shown(app)
+}
+// A message ends the command that produced it, as notice() did; other panels
+// (search, dialogs) stay as their callers left them.
+fn status_message_shown(app: *App) {
+  message := &app.status_message
+  // With the status line hidden there is nowhere to show it; errors fall
+  // back to a dialog so they are never silent.
+  if !app.view.status_line && message.error {
+    notice(app, message.text[..message.length])
+  }
+  at := message.history_next
+  message.history_lengths[at] = copy_text(message.history[at][..], message.text[..message.length])
+  message.history_next = (at + 1) % 20
+  if message.history_count < 20 {
+    message.history_count += 1
+  }
+  if app.prompt_state.panel == Panel.Commands {
+    app.prompt_state.panel = Panel.None
+  }
+  app.render_pending = app.render_pending | RenderKey
+}
+// Two-part messages such as "Pattern not found: " + pattern.
+fn status_error_with(app: *App, prefix: []const u8, detail: []const u8) {
+  message := &app.status_message
+  used := copy_text(message.text[..], prefix)
+  add_text(message.text[..], &used, detail)
+  message.length = used
+  message.error = true
+  status_message_shown(app)
+}
+fn status_message_clear(app: *App) {
+  app.status_message.length = 0
+}
+fn status_message_text(app: *const App) []const u8 {
+  return app.status_message.text[..app.status_message.length]
+}
+
+// A path as the user thinks of it: relative to the project, else under ~,
+// else absolute. Used wherever a message names a file.
+fn display_path(app: *App, path: []const u8, output: []u8) []const u8 {
+  project := app.workspace.project[..app.workspace.project_length]
+  if #len(project) > 0 && #len(path) > #len(project) + 1 && buffer.equal(path[..#len(project)], project) && path[#len(project)] == '/' {
+    return output[..copy_text(output, path[#len(project) + 1..])]
+  }
+  home_storage: [4096]u8
+  home := host.environment("HOME", home_storage[..])
+  if !io.failed(home.failure) && home.found && #len(home.value) > 1 && #len(path) > #len(home.value) && buffer.equal(path[..#len(home.value)], home.value) && path[#len(home.value)] == '/' {
+    used := copy_text(output, "~")
+    add_text(output, &used, path[#len(home.value)..])
+    return output[..used]
+  }
+  return output[..copy_text(output, path)]
+}
+// Vim's write report: "notes.txt" 2L, 24B written
+fn status_written(app: *App, index: usize) {
+  slot := app.documents.slots[index]
+  shown: [4096]u8
+  name := display_path(app, files.name(&slot.file), shown[..])
+  doc := slot.document
+  lines := buffer.row_at(doc, doc.length)
+  if doc.length > 0 && buffer.byte_at(doc, doc.length - 1) != 10 {
+    lines += 1
+  }
+  message := &app.status_message
+  used := copy_text(message.text[..], "\"")
+  add_text(message.text[..], &used, name)
+  add_text(message.text[..], &used, "\" ")
+  add_number(message.text[..], &used, lines)
+  add_text(message.text[..], &used, "L, ")
+  add_number(message.text[..], &used, doc.length)
+  add_text(message.text[..], &used, "B written")
+  message.length = used
+  message.error = false
+  status_message_shown(app)
+}
+// :messages: recent status messages in a dialog, oldest first.
+fn status_messages_show(app: *App) {
+  message := &app.status_message
+  if message.history_count == 0 {
+    status_note(app, "No messages")
+    return
+  }
+  output := app.prompt_state.message[..]
+  used: usize = 0
+  for index in 0..message.history_count {
+    at := (message.history_next + 20 - message.history_count + index) % 20
+    if used > 0 {
+      add_text(output, &used, "\n")
+    }
+    add_text(output, &used, message.history[at][..message.history_lengths[at]])
+  }
+  app.prompt_state.message_length = used
+  app.prompt_state.panel = Panel.Message
+  app.prompt_state.selected = 0
+}

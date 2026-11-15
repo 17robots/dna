@@ -30,7 +30,7 @@ DNA now builds persistent `std/ui/box` identities and delegates lookup,
 recycling, frame text, clipping, hit-testing and geometry to the shared layer.
 Indexed application metadata, configurable animation, custom drawing and the
 SDL/SDL_ttf backend remain. This does not remove the native window or text
-backend. See [the migration and friction log](UI-MIGRATION-20261027.md) for the
+backend. See [the migration and friction log](ui-migration-20261027.md) for the
 precise scope, checks and remaining work.
 
 The preview.28 candidate preserves preview.27's pointer-handle, chained-arena

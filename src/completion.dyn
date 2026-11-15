@@ -224,12 +224,64 @@ fn command_execute(app: *App, typography: *Typography) {
     app.explorer.commands = true
     matches(app)
     app.explorer.commands = false
-    if app.prompt_state.match_count > 0 {
+    if app.prompt_state.match_count > 0 && palette_row_runs(app, app.prompt_state.selected) {
       if explorer_command(app, typography, app.prompt_state.matches[app.prompt_state.selected]) {
         return
       }
     }
     notice(app, "Explorer commands: write, undo, redo, refresh, discard, quit. Explorer :write takes no path.")
+    return
+  }
+  // Forced forms: ! discards unsaved changes instead of asking.
+  if buffer.equal(text, "q!") || buffer.equal(text, "quit!") || buffer.equal(text, "bd!") {
+    app.prompt_state.panel = Panel.None
+    close_clean(app)
+    return
+  }
+  if buffer.equal(text, "qa!") || buffer.equal(text, "qall!") || buffer.equal(text, "quit-all!") {
+    app.prompt_state.panel = Panel.None
+    app.running = false
+    return
+  }
+  if buffer.equal(text, "e!") || buffer.equal(text, "reload!") {
+    app.prompt_state.panel = Panel.None
+    disk_reload(app, true)
+    return
+  }
+  if buffer.equal(text, "w!") {
+    action(app, typography, 1)
+    return
+  }
+  if buffer.equal(text, "messages") || buffer.equal(text, "mes") {
+    status_messages_show(app)
+    return
+  }
+  if buffer.equal(text, "ls") || buffer.equal(text, "buffers!") {
+    action(app, typography, 21)
+    return
+  }
+  // Search highlights end with the search; nothing stays highlighted to clear.
+  if buffer.equal(text, "noh") || buffer.equal(text, "nohlsearch") {
+    app.prompt_state.panel = Panel.None
+    return
+  }
+  // Vim spellings that DNA runs under another name.
+  if (#len(text) > 4 && buffer.equal(text[..4], "sav ")) || (#len(text) > 7 && buffer.equal(text[..7], "saveas ")) || (#len(text) > 1 && text[0] == '!') {
+    rewritten: [4096]u8
+    used: usize = 0
+    if text[0] == '!' {
+      used = copy_text(rewritten[..], "run ")
+      add_text(rewritten[..], &used, text[1..])
+    } else {
+      space: usize = 0
+      for text[space] != ' ' {
+        space += 1
+      }
+      used = copy_text(rewritten[..], "write")
+      add_text(rewritten[..], &used, text[space..])
+    }
+    app.prompt_state.length = copy_text(app.prompt_state.text[..], rewritten[..used])
+    command_execute(app, typography)
     return
   }
   if vim_ex_command(app, typography, text) {
@@ -254,6 +306,14 @@ fn command_execute(app: *App, typography: *Typography) {
   }
   if buffer.equal(text, "theme") {
     theme_current(app)
+    return
+  }
+  if buffer.equal(text, "help") || buffer.equal(text, "h") {
+    help_open(app, false)
+    return
+  }
+  if buffer.equal(text, "keys") || buffer.equal(text, "keymaps") || buffer.equal(text, "map") {
+    help_open(app, true)
     return
   }
   if (buffer.equal(verb, "set") || buffer.equal(verb, "se")) && argument < #len(text) {
@@ -429,7 +489,13 @@ fn command_execute(app: *App, typography: *Typography) {
     return
   }
   matches(app)
-  if app.prompt_state.match_count > 0 {
+  if app.prompt_state.match_count > 0 && (app.command_menu.arguments || palette_row_runs(app, app.prompt_state.selected)) {
     action(app, typography, app.prompt_state.matches[app.prompt_state.selected])
+    return
+  }
+  // Like Vim's E492: a typo never runs the nearest fuzzy match.
+  app.prompt_state.panel = Panel.None
+  if #len(text) > 0 {
+    status_error_with(app, "Not an editor command: ", text)
   }
 }

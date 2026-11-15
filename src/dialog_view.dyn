@@ -115,6 +115,13 @@ fn draw_dialog(renderer: rawptr, app: *App, typography: *Typography, width: i32,
   if compact {
     padding = app.config.popup_padding * scale
   }
+  // The terminal frontend has no document padding; keep body text off the
+  // frame's border column.
+  terminal := sdl.tui_active()
+  side := padding
+  if terminal && side < typography.cell * 2.0 {
+    side = typography.cell * 2.0
+  }
   box_width := #cast(f32, width) * app.view.popup_width
   minimum := 520.0 * scale
   if box_width < minimum {
@@ -127,7 +134,7 @@ fn draw_dialog(renderer: rawptr, app: *App, typography: *Typography, width: i32,
   box_width = place_rect(app, SurfaceDialog, width, height, status, scale, sdl.Rect{width: box_width, height: #cast(f32, height) * 0.5}).width
   labels: [16384]u8
   count := popup_text(app, labels[..])
-  wrap := #cast(i32, (box_width - padding * 2.0))
+  wrap := #cast(i32, (box_width - side * 2.0))
   if wrap < 1 {
     wrap = 1
   }
@@ -153,6 +160,10 @@ fn draw_dialog(renderer: rawptr, app: *App, typography: *Typography, width: i32,
   button_row: f32 = 0.0
   if buttons > 0 {
     button_row = line + 14.0 * scale
+    // Terminal buttons are one bracketed row: "[ Save ]".
+    if terminal {
+      button_row = line * 2.0
+    }
   }
   // Fit the content; long bodies stop at popup_height of the window and scroll.
   limit := app.view.popup_height
@@ -186,7 +197,7 @@ fn draw_dialog(renderer: rawptr, app: *App, typography: *Typography, width: i32,
   ui.boxes[frame].floating[0] = x
   ui.boxes[frame].floating[1] = y + shift
   ui.boxes[frame].fill = theme().surface
-  ui.boxes[frame].padding[0] = padding
+  ui.boxes[frame].padding[0] = side
   ui.boxes[frame].padding[1] = padding
   ui_size(ui, frame, UiAxisX, UiSizeKind.Pixels, box_width / scale, 1.0)
   ui_size(ui, frame, UiAxisY, UiSizeKind.Pixels, box_height / scale, 1.0)
@@ -209,12 +220,30 @@ fn draw_dialog(renderer: rawptr, app: *App, typography: *Typography, width: i32,
         space := ui_make(ui, ui_hash_number(ui.boxes[row].key, 100 + index), 0)
         ui_size(ui, space, UiAxisX, UiSizeKind.Pixels, 8.0, 1.0)
       }
-      button := ui_make(ui, ui_hash(ui.boxes[row].key, choice.label), UiClickable | UiHover | UiBorder | UiBackground | UiText)
-      ui_text_set(ui, button, choice.label)
+      // A bordered button is three terminal rows and its frame would spill
+      // past the dialog; the terminal draws a bracketed label instead.
+      button_flags := UiClickable | UiHover | UiBorder | UiBackground | UiText
+      if terminal {
+        button_flags = UiClickable | UiHover | UiBackground | UiText
+      }
+      button := ui_make(ui, ui_hash(ui.boxes[row].key, choice.label), button_flags)
+      if terminal {
+        bracketed: [64]u8
+        bracketed_length := copy_text(bracketed[..], "[ ")
+        add_text(bracketed[..], &bracketed_length, choice.label)
+        add_text(bracketed[..], &bracketed_length, " ]")
+        ui_text_set(ui, button, bracketed[..bracketed_length])
+      } else {
+        ui_text_set(ui, button, choice.label)
+      }
       ui.boxes[button].fill = theme().line
       ui.boxes[button].value = index
       ui.boxes[button].padding[0] = typography.cell * 1.5
       ui.boxes[button].padding[1] = 3.0 * scale
+      if terminal {
+        ui.boxes[button].padding[0] = 0.0
+        ui.boxes[button].padding[1] = 0.0
+      }
       ui_size(ui, button, UiAxisX, UiSizeKind.Text, 0.0, 1.0)
       ui_size(ui, button, UiAxisY, UiSizeKind.Text, 0.0, 1.0)
       ui_animate(app, ui, button, index == dialog_focused(app))

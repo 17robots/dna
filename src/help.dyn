@@ -1,0 +1,266 @@
+use "std/mem"
+
+// :help and :keys open a reference in a new buffer. The menus, commands and
+// your [keys] bindings come from the same tables the editor dispatches with,
+// so they cannot drift; only the short core-key summary below is written by
+// hand. Close the buffer with :q like any other.
+
+const HelpCapacity: usize = 131072
+
+fn help_open(app: *App, keys_only: bool) {
+  mark := mem.arena_mark(app.scratch)
+  defer mem.arena_rewind(app.scratch, mark)
+  output := mem.push_bytes_uninit(app.scratch, HelpCapacity)
+  used: usize = 0
+  if keys_only {
+    help_keys(app, output, &used)
+  } else {
+    help_guide(app, output, &used)
+    add_text(output, &used, "\n")
+    help_keys(app, output, &used)
+    add_text(output, &used, "\n")
+    help_commands(app, output, &used)
+  }
+  app.prompt_state.panel = Panel.None
+  if !new_buffer(app) {
+    return
+  }
+  if !buffer.load(app.documents.current, output[..used]) {
+    status_error(app, "Help text exceeds buffer capacity.")
+    return
+  }
+  buffer.checkpoint(app.documents.current)
+  app.documents.current.anchor = 0
+  app.documents.current.cursor = 0
+  filetype_command(app, "markdown")
+  app.prompt_state.panel = Panel.None
+  status_note(app, "Help: search with /, close with :q")
+}
+
+fn help_guide(app: *App, output: []u8, used: *usize) {
+  add_text(output, used, "# DNA help\n\n")
+  add_text(output, used, "This buffer is generated. Search it with /, close it with :q.\n")
+  add_text(output, used, ":keys shows only the key reference. Keymap: ")
+  add_text(output, used, keymap_name(app))
+  add_text(output, used, " (change with :keymap vim or :keymap helix).\n\n")
+  add_text(output, used, "## Getting started\n\n")
+  add_text(output, used, "- Open a file: Space f (file picker), or :e path\n")
+  add_text(output, used, "- Edit: i inserts, Escape returns to normal mode\n")
+  add_text(output, used, "- Save: :w   Save as: :w path   Save and close: :x or :wq\n")
+  add_text(output, used, "- Close the buffer: :q (asks when unsaved), :q! discards\n")
+  add_text(output, used, "- Quit DNA: :qa (asks when unsaved), :qa! discards everything\n")
+  add_text(output, used, "- Commands: press : and type; arrows pick a row, Enter runs it\n")
+  add_text(output, used, "- Key menus: Space shows the leader menu; g, z, [ and ] show theirs\n")
+  add_text(output, used, "- Settings: :settings, or :set name value for this session\n")
+  add_text(output, used, "- Config file: ~/.config/dna/config.toml (:config opens it)\n")
+  add_text(output, used, "- Messages shown in the status line: :messages lists recent ones\n")
+}
+
+fn help_keys(app: *App, output: []u8, used: *usize) {
+  add_text(output, used, "# Key reference (")
+  add_text(output, used, keymap_name(app))
+  add_text(output, used, " keymap)\n\n")
+  add_text(output, used, "## Core keys\n\n")
+  if app.config.vim_keys {
+    add_text(output, used, "Motions        h j k l, w W b B e E ge gE, 0 ^ $, gg G, H M L, { }, %, f F t T ; ,\n")
+    add_text(output, used, "Operators      d c y > <, g~ gu gU; doubled for lines (dd cc yy)\n")
+    add_text(output, used, "Text objects   iw aw iW aW ip ap, i( a( i[ a[ i{ a{ i< a<, i\" a\" i' a'\n")
+    add_text(output, used, "Editing        x X D C s S Y, p P, r{c}, J, ~, i a I A o O, Ctrl-a Ctrl-x\n")
+    add_text(output, used, "Undo, repeat   u, Ctrl-r, .\n")
+    add_text(output, used, "Visual         v V Ctrl-v, gv\n")
+    add_text(output, used, "Registers      \"a-\"z, \"_; the unnamed register is the system clipboard\n")
+    add_text(output, used, "Macros, marks  q{a-z} @{a-z} @@, m{a-z} `{a-z} '{a-z}\n")
+    add_text(output, used, "Search         / ? n N * #\n")
+    add_text(output, used, "View           Ctrl-d Ctrl-u Ctrl-f Ctrl-b Ctrl-e Ctrl-y, zz zt zb\n")
+    add_text(output, used, "Language       K hover, gd gy gr gi\n")
+    add_text(output, used, "Jumps          Ctrl-o Ctrl-i\n")
+  } else {
+    add_text(output, used, "Insert         i a o O I A; Escape returns to normal mode\n")
+    add_text(output, used, "Move           h j k l, arrows; w b e (W B E include punctuation)\n")
+    add_text(output, used, "Select         v then movement; x selects lines; % selects all\n")
+    add_text(output, used, "Cursors        C / Alt-C add below / above; , keeps the primary\n")
+    add_text(output, used, "Edit           d delete, c change, y copy, p P paste, r replace, J join\n")
+    add_text(output, used, "Indent, case   > <, ~ toggles case\n")
+    add_text(output, used, "Undo / redo    u / U\n")
+    add_text(output, used, "Search         / ? then n N; * searches for the selection\n")
+    add_text(output, used, "Pages          Ctrl-b Ctrl-f, Ctrl-u Ctrl-d\n")
+    add_text(output, used, "Palette        : or Ctrl-P; Space opens the leader menu\n")
+    add_text(output, used, "Close buffer   Ctrl-x; quit Ctrl-q\n")
+  }
+  add_text(output, used, "\n## Space (leader) menu\n\n")
+  for index in 0..LeaderCommands {
+    help_hint(output, used, "Space ", key_hint(false, index))
+  }
+  count := leader_custom_count(app)
+  for index in 0..count {
+    help_hint(output, used, "Space ", leader_custom_hint(app, index))
+  }
+  add_text(output, used, "\n## Go-to menu (g)\n\n")
+  for index in 0..16 {
+    help_hint(output, used, "g ", goto_hint(index))
+  }
+  add_text(output, used, "\n## Window menu (Space w, Ctrl-w)\n\n")
+  for index in 0..10 {
+    help_hint(output, used, "Ctrl-w ", window_hint(index))
+  }
+  add_text(output, used, "\n## View menu (z)\n\n")
+  for index in 0..5 {
+    help_hint(output, used, "z ", view_hint(index))
+  }
+  add_text(output, used, "\n## Brackets ([ and ])\n\n")
+  for index in 0..4 {
+    hint := bracket_hint(index)
+    if buffer.equal(hint.key, " ") {
+      hint.key = "Space"
+    }
+    help_hint(output, used, "] ", hint)
+  }
+  add_text(output, used, "\n## Match menu (m)\n\n")
+  for index in 0..6 {
+    help_hint(output, used, "m ", match_hint(0, index))
+  }
+  help_bindings(app, output, used)
+}
+
+fn help_hint(output: []u8, used: *usize, prefix: []const u8, hint: KeyHint) {
+  if #len(hint.key) == 0 || #len(hint.label) == 0 {
+    return
+  }
+  start := used.*
+  add_text(output, used, prefix)
+  add_text(output, used, hint.key)
+  help_pad(output, used, start, 15)
+  add_text(output, used, hint.label)
+  add_text(output, used, "\n")
+}
+
+fn help_pad(output: []u8, used: *usize, start: usize, width: usize) {
+  add_text(output, used, " ")
+  for used.* < start + width {
+    add_text(output, used, " ")
+  }
+}
+
+// Bindings from config.toml and dna.toml that apply to this keymap.
+fn help_bindings(app: *App, output: []u8, used: *usize) {
+  shown := false
+  for index in 0..app.config.binding_count {
+    binding := &app.config.bindings[index]
+    if binding.keymap == 1 && app.config.vim_keys {
+      continue
+    }
+    if binding.keymap == 2 && !app.config.vim_keys {
+      continue
+    }
+    if !shown {
+      add_text(output, used, "\n## Your bindings ([keys] in config.toml or dna.toml)\n\n")
+      shown = true
+    }
+    start := used.*
+    add_text(output, used, help_scope_name(binding.scope))
+    add_text(output, used, " ")
+    for step_index in 0..binding_length(binding) {
+      if step_index > 0 {
+        add_text(output, used, " ")
+      }
+      help_stroke(output, used, binding_step(binding, step_index))
+    }
+    help_pad(output, used, start, 24)
+    add_text(output, used, binding.command)
+    if binding.from_project {
+      add_text(output, used, "  (project)")
+    }
+    add_text(output, used, "\n")
+  }
+}
+
+fn help_scope_name(scope: u8) []const u8 {
+  if scope == settings.ScopeSpace {
+    return "space"
+  }
+  if scope == settings.ScopeInsert {
+    return "insert"
+  }
+  if scope == settings.ScopeSelect {
+    return "select"
+  }
+  return "normal"
+}
+
+fn help_stroke(output: []u8, used: *usize, stroke: settings.Stroke) {
+  if (stroke.modifiers & ModCtrl) != 0 {
+    add_text(output, used, "Ctrl-")
+  }
+  if (stroke.modifiers & ModAlt) != 0 {
+    add_text(output, used, "Alt-")
+  }
+  if (stroke.modifiers & ModShift) != 0 && stroke.character == 0 {
+    add_text(output, used, "Shift-")
+  }
+  code := stroke.character
+  if code == 0 {
+    code = stroke.key
+  }
+  if code == 32 {
+    add_text(output, used, "Space")
+  } else if code == 27 {
+    add_text(output, used, "Esc")
+  } else if code == 13 {
+    add_text(output, used, "Enter")
+  } else if code == 9 {
+    add_text(output, used, "Tab")
+  } else if code == 8 {
+    add_text(output, used, "Backspace")
+  } else if code > 32 && code < 127 {
+    at := #cast(usize, code - 33)
+    add_text(output, used, PrintableKeys[at..at + 1])
+  } else if code >= 1073741882 && code <= 1073741893 {
+    add_text(output, used, "F")
+    add_number(output, used, #cast(usize, code - 1073741881))
+  } else {
+    add_text(output, used, "key ")
+    add_number(output, used, #cast(usize, code))
+  }
+}
+
+// Every built-in and plugin command, with its : names and key.
+fn help_commands(app: *App, output: []u8, used: *usize) {
+  add_text(output, used, "# Commands\n\n")
+  add_text(output, used, "Run any of these from the : palette by name or by a : alias.\n\n")
+  for id in 0..BuiltinCommands {
+    info := command_info(id)
+    if #len(info.label) == 0 || !command_available(app, id) {
+      continue
+    }
+    start := used.*
+    add_text(output, used, command_title(info.label))
+    help_pad(output, used, start, 36)
+    aliases_start := used.*
+    at: usize = 0
+    for at < #len(info.aliases) {
+      end := at
+      for end < #len(info.aliases) && info.aliases[end] != '|' {
+        end += 1
+      }
+      if used.* > aliases_start {
+        add_text(output, used, " ")
+      }
+      add_text(output, used, ":")
+      add_text(output, used, info.aliases[at..end])
+      at = end + 1
+    }
+    shortcut := command_shortcut(info.label)
+    if #len(shortcut) > 0 && shortcut[0] != ':' {
+      help_pad(output, used, start, 66)
+      add_text(output, used, shortcut)
+    }
+    add_text(output, used, "\n")
+  }
+  for index in 0..app.plugin_state.command_count {
+    name := command_name(app, PluginCommandBase + index)
+    if #len(name) > 0 {
+      add_text(output, used, name)
+      add_text(output, used, "  (plugin)\n")
+    }
+  }
+}

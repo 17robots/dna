@@ -56,7 +56,7 @@ fn draw_chrome(renderer: rawptr, app: *App, typography: *Typography, width: i32,
     if app.view.status_line {
       bottom -= typography.line
     }
-    draw_gutter(doc, typography, margin + gutter, margin, bottom, scroll_y, app.view.relative_numbers, position, app.documents.slots[app.documents.active].git)
+    draw_gutter(doc, typography, margin + gutter, margin, bottom, scroll_y, app.view.relative_numbers, position, app.documents.slots[app.documents.active].git, gutter_phantom(app))
   }
   if app.view.status_line {
     draw_status(renderer, app, typography, width, height, margin, current, position)
@@ -77,8 +77,17 @@ fn draw_git_sign(typography: *Typography, kind: u8, x: f32, y: f32) {
     #panic("git sign draw failed")
   }
 }
-fn draw_gutter(doc: *const buffer.Document, typography: *Typography, right: f32, top: f32, bottom: f32, scroll_y: f32, relative: bool, position: usize, diff: *const GitDiff) {
+fn gutter_phantom(app: *const App) u8 {
+  if app.config.vim_keys {
+    return 1
+  }
+  return 0
+}
+fn draw_gutter(doc: *const buffer.Document, typography: *Typography, right: f32, top: f32, bottom: f32, scroll_y: f32, relative: bool, position: usize, diff: *const GitDiff, phantom_mode: u8) {
   current := line_at(doc, position)
+  // The row after a final newline is not a line in Vim: phantom_mode 1 shows
+  // it as ~ (past the end), 2 leaves it unnumbered (explorer listings).
+  phantom := phantom_mode != 0 && doc.length > 0 && doc.line_count > 1 && buffer.byte_at(doc, doc.length - 1) == 10
   first := #cast(usize, (scroll_y / typography.line))
   row := first + 1
   // Hunks are in row order; each covers its rows, a deletion the one row
@@ -101,9 +110,17 @@ fn draw_gutter(doc: *const buffer.Document, typography: *Typography, right: f32,
       }
       label: [32]u8
       length: usize = 0
-      add_number(label[..], &length, number)
+      if phantom && row == doc.line_count && row != current {
+        if phantom_mode == 1 {
+          length = copy_text(label[..], "~")
+        }
+      } else {
+        add_number(label[..], &length, number)
+      }
       x := right - (#cast(f32, length) + 2.0) * typography.cell
-      chrome_text(typography, label[..length], x, y, row == current)
+      if length > 0 {
+        chrome_text(typography, label[..length], x, y, row == current)
+      }
       if hunks {
         index := row - 1
         for hunk < diff.hunk_count && git_hunk_end(diff.hunks[hunk]) <= index {
@@ -315,7 +332,10 @@ fn draw_status(renderer: rawptr, app: *App, typography: *Typography, width: i32,
     add_number(cursors[..], &cursors_length, doc.secondary.count + 1)
     status_segment(app, ui, pane, "cursors", cursors[..cursors_length], 0, 0)
   }
-  if doc.anchor != doc.cursor {
+  // Vim normal mode keeps a one-character Helix-style selection internally;
+  // only visual modes select anything the user can see.
+  vim_selecting := !app.config.vim_keys || app.vim.mode == VimMode.Visual || app.vim.mode == VimMode.VisualLine || app.vim.mode == VimMode.VisualBlock || app.view.extend
+  if doc.anchor != doc.cursor && vim_selecting {
     chosen: [32]u8
     chosen_length := copy_text(chosen[..], "selected ")
     add_number(chosen[..], &chosen_length, counts.selected)
@@ -323,6 +343,12 @@ fn draw_status(renderer: rawptr, app: *App, typography: *Typography, width: i32,
   }
   if app.input_state.pending != 0 {
     status_segment(app, ui, pane, "pending", "awaiting character (Esc cancels)", 0, 0)
+  } else if app.status_message.length > 0 && pane == app.view.focused {
+    note_flags: u32 = UiClip
+    if app.status_message.error {
+      note_flags = note_flags | UiError
+    }
+    status_segment(app, ui, pane, "note", status_message_text(app), 0, note_flags)
   } else {
     status_segment(app, ui, pane, "commands", ": commands", 91, 0)
   }

@@ -45,8 +45,8 @@ for name, result, args in (
     fn=getattr(V,'vterm_'+name);fn.restype=result;fn.argtypes=args
 
 class Session:
-    def __init__(self, command, env, cwd):
-        self.rows,self.columns=32,120
+    def __init__(self, command, env, cwd, rows=32, columns=120):
+        self.rows,self.columns=rows,columns
         self.vt=V.vterm_new(self.rows,self.columns)
         V.vterm_set_utf8(self.vt,1)
         self.screen=V.vterm_obtain_screen(self.vt)
@@ -79,6 +79,14 @@ class Session:
         out=c.create_string_buffer(self.rows*self.columns*4+64)
         size=V.vterm_screen_get_text(self.screen,out,len(out),Rect(0,self.rows,0,self.columns))
         return out.raw[:size].decode('utf-8','replace')
+    def grid(self):
+        """Screen rows padded to the full width, one string per row."""
+        out=c.create_string_buffer(self.columns*4+64);rows=[]
+        for row in range(self.rows):
+            size=V.vterm_screen_get_text(self.screen,out,len(out),Rect(row,row+1,0,self.columns))
+            text=out.raw[:size].decode('utf-8','replace').rstrip('\n')
+            rows.append(text.ljust(self.columns)[:self.columns])
+        return rows
     def cursor(self):
         pos=Pos();V.vterm_state_get_cursorpos(self.state,c.byref(pos));return pos.row,pos.col
     def wait(self, predicate, started=None, timeout=8):

@@ -19,6 +19,9 @@ run file="": (build "debug")
     env -u DNA_DEFAULT_SERVERS ./build/dna-debug {{quote(file)}}
 run-release file="": (build "release")
     env -u DNA_DEFAULT_SERVERS ./build/dna-release {{quote(file)}}
+# List one-off probe and investigation output in build/; --delete removes it.
+clean-scratch *flags:
+    python3 scripts/clean_scratch.py {{flags}}
 # dyn fmt skips nested module directories, so visit each one.
 fmt:
     find src tests examples -name '*.dyn' -printf '%h\n' | sort -u | xargs -n1 "$DYN" fmt
@@ -138,6 +141,8 @@ _smoke: deps test
     just build debug
     just build release
     python3 tests/tui_usability.py
+    python3 tests/tui_frames.py dna-debug dna-release
+    python3 tests/command_feedback.py dna-debug dna-release
     python3 tests/large_file.py
     python3 tests/syntax_window.py
     python3 tests/syntax_objects.py
@@ -160,6 +165,7 @@ _smoke: deps test
     python3 tests/native_only.py --binary build/dna-debug --binary build/dna-release --binary build/dna-minimal --binary build/dna-terminal
     python3 tests/version.py --binary build/dna-minimal --binary build/dna-terminal
     python3 tests/tui_render.py terminal
+    python3 tests/tui_frames.py dna-terminal
 
 # Compile the same native production sources used by direct dyn run/build.
 smoke-direct: deps

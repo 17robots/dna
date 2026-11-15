@@ -31,7 +31,7 @@ with tempfile.TemporaryDirectory(prefix='dna-lsp-workset-') as directory:
     work=Path(directory);stage=work/'editor'
     shutil.copytree(ROOT/'src',stage)
     main=stage/'main.dyn'
-    main.write_text(main.read_text().replace('fn main() {','fn unused_editor_entry() {',1)+'\n'+(ROOT/'tests/lsp_workset/main.dyn').read_text())
+    main.write_text(main.read_text().replace('fn main() i32 {','fn unused_editor_entry() i32 {',1)+'\n'+(ROOT/'tests/lsp_workset/main.dyn').read_text())
     lsp=stage/'language_server.dyn';source=lsp.read_text()
     if args.baseline:
         baseline=args.baseline.read_text()
