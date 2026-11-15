@@ -19,7 +19,7 @@
 ; function
 (fn name: (identifier) @function)
 (extern_fn name: (identifier) @function)
-[ "#alignof" "#assert" "#bitcast" "#cast" "#len" "#load" "#offsetof" "#panic" "#reverse" "#sizeof" "#syscall" "#typeof" "#wrap" ] @function.builtin
+[ "#alignof" "#assert" "#bitcast" "#cast" "#instance" "#len" "#load" "#max" "#min" "#offset" "#offsetof" "#panic" "#reverse" "#sizeof" "#slice" "#syscall" "#typeof" ] @function.builtin
 (call (primary (identifier) @function))
 (call (primary (field_access (identifier) @function)))
 
@@ -27,7 +27,6 @@
 [ "const" "defer" "distinct" "enum" "extern" "fn" "packed" "pub" "struct" "type" "use" ] @keyword
 
 [ "case" "else" "if" ] @keyword.control.conditional
-"is" @keyword.operator
 "#target" @keyword.directive
 [ "break" "continue" ] @keyword.control
 [ "for" "in" ] @keyword.control.repeat
@@ -35,6 +34,7 @@
 
 (primitive) @type.builtin
 (type_parameter) @type
+(struct_type_parameter (identifier) @type)
 
 ; label
 (break_ (identifier) @label)
