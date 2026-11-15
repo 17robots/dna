@@ -39,6 +39,7 @@ struct App {documents:Documents,scratch:rawptr,prompt_state:Prompt,closed:usize,
 fn document_lifecycle_changed(app:*App,index:usize) {}
 fn slot_syntax_release(slot:*Slot) {}
 fn plugin_event(app:*App,event:[]const u8) {}
+fn status_written(app:*App,index:usize) {}
 fn file_config_invalidate(app:*App) {}
 fn notice(app:*App,text:[]const u8) {}
 fn request_quit(app:*App) {}

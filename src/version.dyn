@@ -2,30 +2,41 @@ use "std/io"
 
 const DnaVersion: []const u8 = "0.1.0-preview.17"
 
-// Handle informational commands before allocating editor state or opening files.
-fn cli_version() bool {
+// Printed by --help; keep in step with README "Run".
+const DnaUsage: []const u8 = "Usage: dna [--gui | --tui] [--] [FILE | DIRECTORY]\n\nOpen FILE, or open DIRECTORY as the project and show its explorer.\nWith no target, DNA opens an empty buffer in the current directory.\n\nOptions:\n  --gui          Use the window frontend.\n  --tui          Use the terminal frontend.\n  --             Treat every later argument as a path.\n  -h, --help     Show this help and exit.\n  --version      Show the version and exit.\n\nConfiguration: ~/.config/dna/config.toml (or DNA_CONFIG).\nIn the editor, :help lists commands and :keys lists key bindings.\n"
+
+// Handle informational commands before allocating editor state or opening
+// files. Returns the exit code, or -1 when the editor should start.
+fn cli_early() i32 {
   owner := arena_owner.create(65536)
   defer arena_owner.release(owner)
   arguments := host.arguments(owner)
   if io.failed(arguments.failure) {
-    return false
+    return -1
   }
-  requested := false
   for index in 1..#len(arguments.values) {
     argument := arguments.values[index]
     if buffer.equal(argument, "--") {
       break
     }
     if buffer.equal(argument, "--version") || (#len(arguments.values) == 2 && buffer.equal(argument, "version")) {
-      requested = true
-      break
+      _ = io.write(io.stdout(), "dna ")
+      _ = io.write(io.stdout(), DnaVersion)
+      _ = io.write(io.stdout(), "\n")
+      return 0
+    }
+    if buffer.equal(argument, "--help") || buffer.equal(argument, "-h") || (#len(arguments.values) == 2 && buffer.equal(argument, "help")) {
+      _ = io.write(io.stdout(), DnaUsage)
+      return 0
+    }
+    if #len(argument) > 1 && argument[0] == '-' && !buffer.equal(argument, "--tui") && !buffer.equal(argument, "--gui") {
+      host.write_error("dna: unknown option '")
+      host.write_error(argument)
+      host.write_error("'\nTry 'dna --help'. Use 'dna -- ")
+      host.write_error(argument)
+      host.write_error("' to open a file with that name.\n")
+      return 2
     }
   }
-  if !requested {
-    return false
-  }
-  _ = io.write(io.stdout(), "dna ")
-  _ = io.write(io.stdout(), DnaVersion)
-  _ = io.write(io.stdout(), "\n")
-  return true
+  return -1
 }

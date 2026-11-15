@@ -286,6 +286,9 @@ pub fn tui_clip(rectangle: *const PixelRect) {
 pub fn tui_target(texture: bool) {
   state.texture_target = texture
 }
+fn cell_on_screen(column: i32, row: i32) bool {
+  return column >= 0 && row >= 0 && column < state.columns && row < state.rows
+}
 // Whether the cell's centre is inside the clip and on screen.
 fn cell_visible(column: i32, row: i32) bool {
   if column < 0 || row < 0 || column >= state.columns || row >= state.rows {
@@ -417,6 +420,40 @@ pub fn tui_fill(rectangle: *const Rect) {
       if cell_visible(column, row) {
         cell_at(column, row).* = Cell{character: 32, foreground: cell_at(column, row).foreground, background: state.color}
       }
+    }
+  }
+}
+// A scrollbar thumb. A thin fill would become a box line indistinguishable
+// from a border and would sit on the view's last text column. When a frame
+// border runs just right of the view, the thumb thickens that border (┃);
+// otherwise it is a half block (▐) in the view's last column.
+pub fn tui_scroll_thumb(view: *const Rect, thumb: *const Rect) {
+  right := to_column(view.x + #cast(f32, state.origin_x) + view.width)
+  first_row := to_row(thumb.y + #cast(f32, state.origin_y))
+  last_row := to_row(thumb.y + #cast(f32, state.origin_y) + thumb.height) - 1
+  if last_row < first_row {
+    last_row = first_row
+  }
+  middle := (first_row + last_row) / 2
+  border := -1
+  // The enclosing panel's clip excludes its own border, so look at the
+  // screen cells directly.
+  for column in right..right + 3 {
+    if cell_on_screen(column, middle) && (cell_at(column, middle).flags & (LineUp | LineDown)) != 0 {
+      border = column
+      break
+    }
+  }
+  for row in first_row..=last_row {
+    if border >= 0 {
+      if cell_on_screen(border, row) && (cell_at(border, row).flags & (LineUp | LineDown)) != 0 {
+        cell := cell_at(border, row)
+        cell.flags = cell.flags & ~(LineLeft | LineRight | LineUp | LineDown)
+        cell.character = 9475
+        cell.foreground = state.color
+      }
+    } else {
+      put_character(right - 1, row, 9616, state.color, false)
     }
   }
 }
