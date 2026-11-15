@@ -3,6 +3,7 @@
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import sys
@@ -47,8 +48,14 @@ with tempfile.TemporaryDirectory(prefix='dna-clean-package-') as temporary:
         assert str(package/'dna') in content and str(ROOT) not in content, content
         assert mode+' %f' in content and 'Terminal='+terminal in content, content
     print('PASS packaged desktop registration: relocated GUI/TUI entries')
-    library_env = dict(host_env, LD_LIBRARY_PATH=str(package / 'lib'))
-    for binary in [*(package / 'bin').iterdir(), *(package / 'lib').iterdir()]:
+    # Resolve everything from the package alone, as on a host with no display
+    # libraries: lib/ plus every lib/host/<soname> fallback.
+    fallbacks = sorted((package/'lib/host').iterdir())
+    assert any(p.name.startswith('libwayland-client.') for p in fallbacks), fallbacks
+    assert not any(p.name.startswith(('libwayland-', 'libEGL.', 'libGL', 'libX11.', 'libxcb.'))
+                   for p in (package/'lib').iterdir() if p.is_file()), 'display library outside lib/host'
+    library_env = dict(host_env, LD_LIBRARY_PATH=os.pathsep.join(map(str, [package/'lib', *fallbacks])))
+    for binary in [*(package / 'bin').iterdir(), *(p for p in (package / 'lib').rglob('*') if p.is_file())]:
         paths = subprocess.check_output(['ldd', str(binary)], env=library_env, text=True)
         assert 'not found' not in paths, paths
         assert str(ROOT) not in paths, paths
@@ -57,9 +64,34 @@ with tempfile.TemporaryDirectory(prefix='dna-clean-package-') as temporary:
     subprocess.run([str(package/'dna')], cwd=directory, env=host_env, check=True, timeout=30)
     for backend, display in (('wayland', 'WAYLAND_DISPLAY'), ('x11', 'DISPLAY')):
         if host_env.get(display):
-            subprocess.run([str(package / 'bin' / ('dna-' + backend))], cwd=directory,
-                           env=library_env, check=True, timeout=30)
+            backend_env = dict(host_env)
+            if backend == 'x11':
+                backend_env.pop('WAYLAND_DISPLAY', None)
+            subprocess.run([str(package / 'dna')], cwd=directory,
+                           env=backend_env, check=True, timeout=30)
             print('PASS extracted ' + backend + ' startup/presentation/shutdown')
+    # The launcher prefers the host's display libraries (a bundled
+    # libwayland-client 1.22 broke NVIDIA's EGL on newer hosts) and falls back
+    # to lib/host only for sonames the ldconfig cache does not list.
+    def loaded_wayland_client(env):
+        trace = subprocess.run([str(package/'dna'), '--version'], cwd=directory, capture_output=True, text=True,
+                               env=dict(env, WAYLAND_DISPLAY='dna-package-probe', LD_DEBUG='libs'), timeout=30)
+        assert trace.returncode == 0, trace.stderr[-2000:]
+        paths = re.findall(r'calling init: (\S*/libwayland-client\.so\.0)', trace.stderr)
+        assert len(paths) == 1, trace.stderr[-2000:]
+        return paths[0]
+    host_cache = subprocess.run(['ldconfig', '-p'], capture_output=True, text=True).stdout
+    if '\tlibwayland-client.so.0 (libc6,x86-64' in host_cache:
+        used = loaded_wayland_client(host_env)
+        assert str(package) not in used, used
+        print('PASS launcher uses the host libwayland-client:', used)
+    fake = directory/'no-ldconfig'
+    fake.mkdir()
+    (fake/'ldconfig').write_text('#!/bin/sh\nexit 0\n')
+    (fake/'ldconfig').chmod(0o755)
+    used = loaded_wayland_client(dict(host_env, PATH=f'{fake}:{host_env["PATH"]}'))
+    assert used.startswith(str(package/'lib/host')), used
+    print('PASS launcher falls back to lib/host without host display libraries')
     subprocess.run(['python3', str(ROOT/'tests/version.py'), '--binary', str(package/'dna'),
                     '--binary', str(package/'bin/dna-wayland'), '--binary', str(package/'bin/dna-x11')],
                    env=host_env, check=True, timeout=30)
@@ -80,7 +112,7 @@ with tempfile.TemporaryDirectory(prefix='dna-clean-package-') as temporary:
     else:
         print('UNAVAILABLE mount isolation; extracted startup and dependency checks still required')
     print('PASS package contains no SDL dependency')
-    assert not any('SDL' in p.name for p in (package/'lib').iterdir())
+    assert not any('SDL' in p.name for p in (package/'lib').rglob('*'))
     image = os.environ.get('DNA_PACKAGE_IMAGE')
     if image:
         # A clean image with only the extracted package and one font: no SDK,
