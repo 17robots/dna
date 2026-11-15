@@ -23,7 +23,24 @@ ENV = dict(os.environ, LD_LIBRARY_PATH=os.pathsep.join(str(path) for path in
 NAME = 'dna-preview-linux-x86_64'
 VERSION = re.search(r'const DnaVersion: \[\]const u8 = "([^"]+)"', (ROOT/'src/version.dyn').read_text())[1]
 GLIBC = re.compile(r'^(libc|libm|libpthread|librt|libdl|libresolv|libutil)\.so\.')
+# Display-server and GL dispatch libraries must match the host's graphics
+# driver: NVIDIA's EGL/GLX vendor libraries load them too, and an older bundled
+# copy (Ubuntu 24.04's libwayland-client 1.22) breaks them on newer hosts. These
+# are shipped only as fallbacks under lib/host/<soname>/, which the launcher
+# adds to the search path only for sonames the host's ldconfig cache lacks.
+HOST = re.compile(r'^lib(EGL|GL|GLX|GLdispatch|OpenGL|GLESv2|gbm|drm|wayland-[a-z]+|X11|X11-xcb|xcb(-[a-z0-9]+)?|Xau|Xdmcp|Xext|Xrender|Xfixes|Xi|Xrandr|Xcursor|Xss|Xtst)\.so\.')
 def sha(path): return hashlib.sha256(path.read_bytes()).hexdigest()
+def needed(path): return re.findall(r'\(NEEDED\).*?\[(.*?)\]', subprocess.check_output(['readelf', '-d', str(path)], text=True))
+def host_fallbacks(roots, loaded, libraries):
+    # Bundled libraries reachable from the editor without passing through a
+    # host display/GL library stay in lib/; the rest (HOST and anything only
+    # they need, such as libXdmcp's libbsd) become host fallbacks.
+    core=set(); pending=[*loaded, *(name for root in roots for name in needed(root))]
+    while pending:
+        name=pending.pop()
+        if name in core or name not in libraries or HOST.match(name): continue
+        core.add(name); pending.extend(needed(libraries[name]))
+    return set(libraries)-core
 def dependencies(binary):
     dynamic = subprocess.check_output(['readelf', '-d', str(binary)], text=True)
     for needed in re.findall(r'\(NEEDED\).*?\[(.*?)\]', dynamic):
@@ -55,7 +72,9 @@ Run `./dna [file-or-directory]` from this directory, or add this directory to PA
 Use `./dna --version` or `./dna version` to print the application version.
 Keep `bin`, `lib`, and `share` beside the launcher. No Dyn SDK or Python is
 required to run the editor. A system monospace font, compatible glibc, and
-Linux display/graphics-driver libraries are required. The launcher selects Wayland
+Linux display/graphics-driver libraries are required. The launcher uses the host's
+Wayland, X11 and GL libraries; copies under lib/host are used only where the host
+has none (for example `--tui` on a headless machine). The launcher selects Wayland
 when WAYLAND_DISPLAY is set, otherwise X11. Both binaries also support --tui.
 
 Run `./dna-install-desktop` to register DNA and DNA (Terminal) in your app
@@ -105,14 +124,14 @@ system-wide by extracting or running this archive.
     libraries = {}
     # Text providers are loaded dynamically by the native shaper. Bundle them
     # and their dependencies as well as the ELF-linked window/runtime libraries.
-    providers=[]
+    providers=[]; provider_names=[]
     for library in ('harfbuzz', 'fribidi', 'freetype'):
         path=Path(subprocess.check_output(['cc', '-print-file-name=lib'+library+'.so'], text=True).strip()).resolve()
         if not path.is_file(): raise SystemExit('Missing native text provider: '+library)
         soname=re.search(r'\(SONAME\).*?\[(.*?)\]', subprocess.check_output(['readelf','-d',str(path)], text=True))
         if not soname: raise SystemExit('Missing text provider SONAME: '+str(path))
         libraries[soname[1]]=path
-        providers.append(path)
+        providers.append(path); provider_names.append(soname[1])
 
     for binary in (tree/'bin/dna-wayland', tree/'bin/dna-x11', tree/'bin/dna-language', PREFIX/'lib/libdna_native.so', *providers):
         for name, source in dependencies(binary):
@@ -120,10 +139,18 @@ system-wide by extracting or running this archive.
             libraries[name] = source.resolve()
     if any('SDL' in name for name in libraries): raise SystemExit('Package contains an SDL dependency')
     libraries['libdna_native.so'] = (PREFIX/'lib/libdna_native.so').resolve()
+    # Text providers are dlopened, so they are roots themselves.
+    fallbacks=host_fallbacks([tree/'bin/dna-wayland', tree/'bin/dna-x11', tree/'bin/dna-language'], provider_names, libraries)
+    if not any(name.startswith('libwayland-client.') for name in fallbacks): raise SystemExit('libwayland-client must be a host fallback')
     inventory=[]
     for name, source in sorted(libraries.items()):
-        shutil.copyfile(source, tree/'lib'/name)
         record={'name':name, 'sha256':sha(source)}
+        if name in fallbacks:
+            (tree/'lib/host'/name).mkdir(parents=True)
+            shutil.copyfile(source, tree/'lib/host'/name/name)
+            record['host_fallback']=True
+        else:
+            shutil.copyfile(source, tree/'lib'/name)
         if shutil.which('pacman'):
             package=subprocess.run(['pacman','-Qqo',str(source)],capture_output=True,text=True)
             if package.returncode == 0:
@@ -165,14 +192,32 @@ system-wide by extracting or running this archive.
     launcher='''#!/bin/sh
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-export LD_LIBRARY_PATH="$root/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+# Display and GL libraries come from the host so they match its graphics
+# driver; lib/host/<soname> is used only for sonames the host does not have.
+cache=
+for ldconfig in "$(command -v ldconfig || true)" /sbin/ldconfig /usr/sbin/ldconfig; do
+    if [ -n "$ldconfig" ] && [ -x "$ldconfig" ] && cache=$("$ldconfig" -p); then
+        break
+    fi
+    cache=
+done
+tab=$(printf '\\t')
+path="$root/lib"
+for fallback in "$root"/lib/host/*; do
+    [ -d "$fallback" ] || continue
+    case "$cache" in
+        *"$tab${fallback##*/} (libc6,x86-64"*) ;;
+        *) path="$path:$fallback" ;;
+    esac
+done
+export LD_LIBRARY_PATH="$path${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 if [ -n "${WAYLAND_DISPLAY:-}" ]; then
     exec "$root/bin/dna-wayland" "$@"
 fi
 exec "$root/bin/dna-x11" "$@"
 '''
     (tree/'dna').write_text(launcher);(tree/'dna').chmod(0o755)
-    symbols=''.join(subprocess.check_output(['readelf','--version-info',str(binary)],text=True) for binary in [tree/'bin/dna-wayland',tree/'bin/dna-x11',tree/'bin/dna-language',*sorted((tree/'lib').iterdir())])
+    symbols=''.join(subprocess.check_output(['readelf','--version-info',str(binary)],text=True) for binary in [tree/'bin/dna-wayland',tree/'bin/dna-x11',tree/'bin/dna-language',*sorted(path for path in (tree/'lib').rglob('*') if path.is_file())])
     glibc=max(set(re.findall(r'GLIBC_([0-9]+(?:\.[0-9]+)+)',symbols)),key=lambda v:tuple(map(int,v.split('.'))))
     metadata={'dna':VERSION,'minimum_glibc':glibc,'format':1,'target':'linux-x86_64','dyn':subprocess.check_output([os.environ.get('DYN','dyn'),'--version'],text=True).strip(),'libraries':inventory,'runtime_requirements':['glibc compatible with this build','installed monospace font','Linux desktop display/backend and graphics-driver libraries'],'scope':'Local preview; no publication performed.'}
     (tree/'build-info.json').write_text(json.dumps(metadata,indent=2,sort_keys=True)+'\n')
