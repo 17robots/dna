@@ -11,12 +11,12 @@ the known limitations before relying on it.
 
 ## Install
 
-The preview package is for Linux x86-64 and needs **glibc 2.43 or newer**, a
-monospace font, and desktop graphics libraries for the window frontend. It does
-not run on Ubuntu 24.04 (glibc 2.39).
+The preview package is for Linux x86-64 and needs **glibc 2.38 or newer**
+(Ubuntu 24.04, Debian 13, Fedora 39 and later), a monospace font, and desktop
+graphics libraries for the window frontend.
 
 ```sh
-mise use -g 'github:17robots/dna[prerelease=true,strip_components=1,bin_path=.]@0.1.0-preview.17'
+mise use -g 'github:17robots/dna[prerelease=true,strip_components=1,bin_path=.]@0.1.0-preview.18'
 dna path/to/file.dyn
 dna path/to/project
 ```

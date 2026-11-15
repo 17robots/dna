@@ -2,18 +2,19 @@
 
 ## Install the prerelease with mise
 
-The Linux x86-64 preview requires **glibc 2.43 or newer**, a system monospace
-font, and desktop display libraries for GUI mode. It does not run on Ubuntu
-24.04's glibc 2.39. See [PRERELEASE.md](../PRERELEASE.md) before installing.
-Preview.17 changes are recorded in [RELEASE_NOTES.md](../RELEASE_NOTES.md).
+The Linux x86-64 preview requires **glibc 2.38 or newer** (Ubuntu 24.04, Debian
+13, Fedora 39 and later), a system monospace font, and desktop display
+libraries for GUI mode. See [PRERELEASE.md](../PRERELEASE.md) before
+installing. Preview.18 changes are recorded in
+[RELEASE_NOTES.md](../RELEASE_NOTES.md).
 
 ```sh
-mise use -g 'github:17robots/dna[prerelease=true,strip_components=1,bin_path=.]@0.1.0-preview.17'
+mise use -g 'github:17robots/dna[prerelease=true,strip_components=1,bin_path=.]@0.1.0-preview.18'
 dna path/to/file.dyn
 dna path/to/project
 ```
 
-Use `mise exec github:17robots/dna@0.1.0-preview.17 -- dna path/to/project`
+Use `mise exec github:17robots/dna@0.1.0-preview.18 -- dna path/to/project`
 if mise is not activated in your shell. The explicit `bin_path=.` selects the
 archive's launcher, which loads its bundled libraries. The Dyn SDK is needed to
 build DNA, but is not required to run this package. Language servers are
