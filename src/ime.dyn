@@ -1,4 +1,82 @@
-struct Composition { bytes: [4096]u8, length: usize, start, selected: i32 }
+struct Composition {
+  bytes: [4096]u8,
+  length: usize,
+  start, selected: i32,
+  // The surrounding text last published to the input method: its token,
+  // where it starts in the document, and the document revision it describes.
+  surrounding_token: u64,
+  surrounding_base: usize,
+  surrounding_revision: u64,
+  surrounding_document: *buffer.Document,
+}
+
+// Bytes of context published on each side of the caret, within its line.
+const SurroundingSide: usize = 1800
+
+// Publish the caret's line (bounded) so input methods can see what they edit:
+// reconversion, deleting before the caret, autocorrection.
+fn surrounding_publish(window: rawptr, app: *App) {
+  composition := &app.composition
+  if !app.view.insert || app.prompt_state.panel != Panel.None || app.documents.slots[app.documents.active].terminal.handle != nil {
+    composition.surrounding_token = 0
+    return
+  }
+  doc := app.documents.current
+  cursor := doc.cursor
+  anchor := doc.anchor
+  low := buffer.line_start(doc, cursor)
+  high := buffer.line_end(doc, cursor)
+  if cursor > low + SurroundingSide {
+    low = cursor - SurroundingSide
+  }
+  if high > cursor + SurroundingSide {
+    high = cursor + SurroundingSide
+  }
+  // Keep both ends on UTF-8 boundaries.
+  for low < cursor && (buffer.byte_at(doc, low) & 192) == 128 {
+    low += 1
+  }
+  for high > cursor && high < doc.length && (buffer.byte_at(doc, high) & 192) == 128 {
+    high -= 1
+  }
+  if anchor < low || anchor > high {
+    anchor = cursor
+  }
+  text: [4096]u8
+  buffer.copy_range(doc, low, high, text[..])
+  token := sdl.surrounding(window, text[..high - low], cursor - low, anchor - low)
+  composition.surrounding_token = token
+  composition.surrounding_base = low
+  composition.surrounding_revision = doc.revision
+  composition.surrounding_document = doc
+}
+
+// The input method replaced bytes of the published context. Apply it only
+// when the document is still exactly what was published.
+fn surrounding_edit_apply(app: *App) {
+  edit := sdl.ime_edit()
+  composition := &app.composition
+  doc := app.documents.current
+  if edit.token == 0 || edit.token != composition.surrounding_token || doc != composition.surrounding_document || doc.revision != composition.surrounding_revision || !app.view.insert {
+    return
+  }
+  low := composition.surrounding_base + edit.start
+  high := composition.surrounding_base + edit.end
+  if high < low || high > doc.length || !buffer.valid(edit.text) {
+    return
+  }
+  doc.anchor = low
+  doc.cursor = high
+  if !buffer.replace(doc, edit.text) {
+    status_error(app, "Input method edit exceeds document capacity.")
+    return
+  }
+  doc.anchor = low + #len(edit.text)
+  doc.cursor = doc.anchor
+  composition.surrounding_token = 0
+  sdl.ime_edit_applied()
+}
+
 
 fn composition_update(app: *App, event: *const sdl.EditingEvent) {
   app.composition.length = 0
@@ -45,6 +123,7 @@ fn composition_draw(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
     area := sdl.PixelRect{x: #cast(i32, (x * sx)), y: #cast(i32, (y * sy)), width: #cast(i32, (typography.cell * sx)), height: #cast(i32, (typography.line * sy))}
     _ = sdl.text_area(window, &area, 0)
   }
+  surrounding_publish(window, app)
   composition := &app.composition
   if composition.length == 0 {
     return

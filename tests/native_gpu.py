@@ -315,7 +315,7 @@ with tempfile.TemporaryDirectory(prefix='dna-native-gpu-') as directory:
             if types[end]=='}':depth-=1
             end+=1
         declarations.append(types[match.start():end])
-    (stage/'types.dyn').write_text('use "std/mem"\n#link("dna_native")\npub const WorkerWakeEvent:u32=32768\npub const InputOverflowEvent:u32=32770\n'+'\n'.join(declarations))
+    (stage/'types.dyn').write_text('use "std/mem"\n#link("dna_native")\n'+'\n'.join(re.findall(r'^pub const [A-Za-z_]+\s*:\s*u32\s*=\s*[0-9]+$',types,re.M))+'\n'+'\n'.join(declarations))
     gui=(ROOT/'src/platform/gui.dyn').read_text().replace('native_gui.direct=!native_software_requested()','native_gui.direct=!native_probe_software')
     gui=install_gpu_probe(gui)
     gui+='\nnative_probe_software:bool\n'

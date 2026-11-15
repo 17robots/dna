@@ -139,6 +139,25 @@ system-wide by extracting or running this archive.
                         target=tree/'licenses/system'/license_file.relative_to('/usr/share/licenses')
                         target.parent.mkdir(parents=True,exist_ok=True)
                         shutil.copyfile(license_file,target)
+        elif shutil.which('dpkg'):
+            # Debian/Ubuntu builds: the owning package and its copyright file.
+            package=subprocess.run(['dpkg','-S',str(source)],capture_output=True,text=True)
+            if package.returncode == 0:
+                owner=package.stdout.split(':',1)[0].strip()
+                version=subprocess.run(['dpkg-query','-W','-f=${Version}',owner],capture_output=True,text=True).stdout.strip()
+                record['package']=f'{owner} {version}'.strip()
+                copyright_file=Path('/usr/share/doc')/owner/'copyright'
+                if copyright_file.is_file():
+                    target=tree/'licenses'/owner/'copyright'
+                    target.parent.mkdir(parents=True,exist_ok=True)
+                    shutil.copyfile(copyright_file,target)
+            else:
+                # Built from source into /usr/local (tree-sitter on Ubuntu).
+                stem=name.split('.so')[0].removeprefix('lib')
+                local=Path('/usr/local/share/licenses')/stem
+                if local.is_dir():
+                    record['package']=stem+' (source build)'
+                    shutil.copytree(local,tree/'licenses'/stem,dirs_exist_ok=True)
         inventory.append(record)
     common=Path('/usr/share/licenses/common')
     if common.is_dir():shutil.copytree(common,tree/'licenses/common',dirs_exist_ok=True)
