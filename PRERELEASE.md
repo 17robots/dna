@@ -6,8 +6,9 @@ reliability or compatibility with every Linux distribution.
 ## Known limitations
 
 - The packaged target is Linux x86-64. Check `build-info.json` for the required
-  glibc version. The October 5 audit build requires glibc 2.43; it is not
-  compatible with Ubuntu 24.04's glibc 2.39. Display/graphics-driver libraries and a monospace font are
+  glibc version. Since preview 18 the package is built on Ubuntu 24.04 and
+  needs glibc 2.38; it is checked in clean Ubuntu 24.04, Debian 13 and Fedora
+  40 containers (`tests/package_distros.py`). Display/graphics-driver libraries and a monospace font are
   supplied by the host. Other operating systems are not covered by this build.
 - Language servers are separate installations. Dyn semantic completion can take
   hundreds of milliseconds in large projects. DNA shows matching file words
@@ -129,8 +130,8 @@ hash are in `build/packages/container-check.json`.
 ## Release assessment
 
 Suitable for an explicitly experimental preview on compatible Linux systems.
-A general Linux release needs a build against an older supported glibc baseline
-and testing on those target distributions. Broader desktop/IME testing and
+The package now targets glibc 2.38 and runs on current Ubuntu LTS, Debian and
+Fedora; distributions older than that are not covered. Broader desktop/IME testing and
 sustained use on different projects remain outstanding. The local checks do not
 establish that every edit is crash-safe or that memory cannot grow in other
 workloads. The first release is `v0.1.0-preview.1`; it is explicitly marked as a prerelease.
