@@ -15,7 +15,7 @@ fn saved_leaf_less(a: *const SavedLeaf, b: *const SavedLeaf) bool {
 // In-place heapsort by address; the saved tree's leaves need not be in
 // address order once text has moved.
 fn saved_leaves_sort(leaves: []SavedLeaf) {
-  count := #len(leaves)
+  count := leaves.len
   start := count / 2
   for start > 0 {
     start -= 1
@@ -37,9 +37,7 @@ fn saved_leaves_sift(leaves: []SavedLeaf, first: usize, end: usize) {
     if child + 1 < end && saved_leaf_less(&leaves[child], &leaves[child + 1]) {
       child += 1
     }
-    if !saved_leaf_less(&leaves[root], &leaves[child]) {
-      return
-    }
+    if !saved_leaf_less(&leaves[root], &leaves[child]) { return }
     swapped := leaves[root]
     leaves[root] = leaves[child]
     leaves[child] = swapped
@@ -49,7 +47,7 @@ fn saved_leaves_sift(leaves: []SavedLeaf, first: usize, end: usize) {
 // The saved leaf holding address, or none.
 fn saved_leaf_find(leaves: []const SavedLeaf, address: usize) *const SavedLeaf {
   low: usize = 0
-  high := #len(leaves)
+  high := leaves.len
   for low < high {
     middle := (low + high) / 2
     if leaves[middle].address <= address {
@@ -58,13 +56,9 @@ fn saved_leaf_find(leaves: []const SavedLeaf, address: usize) *const SavedLeaf {
       high = middle
     }
   }
-  if low == 0 {
-    return nil
-  }
+  if low == 0 { return nil }
   found := &leaves[low - 1]
-  if address >= found.address + found.length {
-    return nil
-  }
+  if address >= found.address + found.length { return nil }
   return found
 }
 // Describe the document against its saved text, in arena. Fails (ok false)
@@ -84,13 +78,10 @@ pub fn saved_pieces(document: *const Document, arena: *mem.Arena, limit: usize) 
     current_count += 1
     at = run.high
   }
-  leaves_memory := mem.arena_try_push_uninit(arena, (saved_count + 1) * #sizeof(SavedLeaf), 8)
-  pieces_memory := mem.arena_try_push_uninit(arena, (current_count + 1) * #sizeof(Piece), 8)
-  if !leaves_memory.ok || !pieces_memory.ok {
-    return PieceList{}
-  }
-  leaves := #slice((#cast(*SavedLeaf, leaves_memory.memory)), saved_count)
-  pieces := #slice((#cast(*Piece, pieces_memory.memory)), current_count + 1)
+  needed := (saved_count + 1) * #sizeof(SavedLeaf) + (current_count + 1) * #sizeof(Piece) + 16
+  if mem.arena_room(arena) < needed { return PieceList{} }
+  leaves := mem.push_array<SavedLeaf>(arena, saved_count + 1)[..saved_count]
+  pieces := mem.push_array<Piece>(arena, current_count + 1)
   at = 0
   for index in 0..saved_count {
     run := rope_run(document.saved_root, at)
@@ -122,14 +113,8 @@ pub fn saved_pieces(document: *const Document, arena: *mem.Arena, limit: usize) 
     }
     at = run.high
   }
-  if literal_total > limit {
-    return PieceList{}
-  }
-  literal_memory := mem.arena_try_push_uninit(arena, literal_total + 1, 1)
-  if !literal_memory.ok {
-    return PieceList{}
-  }
-  literals := #slice((#cast(*u8, literal_memory.memory)), literal_total)
+  if literal_total > limit || mem.arena_room(arena) < literal_total + 1 { return PieceList{} }
+  literals := mem.push_bytes(arena, literal_total + 1)[..literal_total]
   // Second pass: copy the literal bytes, in document order.
   written: usize = 0
   at = 0
@@ -152,16 +137,12 @@ pub fn saved_pieces(document: *const Document, arena: *mem.Arena, limit: usize) 
 pub fn apply_pieces(document: *Document, pieces: []const Piece, literals: []const u8) bool {
   for piece in pieces {
     if piece.literal {
-      if piece.offset > #len(literals) || piece.length > #len(literals) - piece.offset {
-        return false
-      }
+      if piece.offset > literals.len || piece.length > literals.len - piece.offset { return false }
     } else if piece.offset > document.length || piece.length > document.length - piece.offset {
       return false
     }
   }
-  if !valid(literals) {
-    return false
-  }
+  if !valid(literals) { return false }
   root: *RopeNode = nil
   for piece in pieces {
     part: *RopeNode = nil
@@ -201,9 +182,7 @@ fn rope_valid(root: *const RopeNode) bool {
       high -= 1
     }
     rope_copy(root, at, high, &window[0])
-    if !valid(window[..high - at]) {
-      return false
-    }
+    if !valid(window[..high - at]) { return false }
     at = high
   }
   return true

@@ -56,38 +56,21 @@ pub struct State {
 }
 // Preserve the inline legacy representation while growing snapshots as needed.
 pub fn buffer_count(state: *const State) usize {
-  return 16 + #len(state.additional)
+  return 16 + state.additional.len
 }
 pub fn buffer_at(state: *const State, index: usize) *const SavedBuffer {
-  if index < 16 {
-    return &state.buffers[index]
-  }
+  if index < 16 { return &state.buffers[index] }
   return &state.additional[index - 16]
 }
 pub fn buffer_mut(state: *State, index: usize) *SavedBuffer {
-  if index < 16 {
-    return &state.buffers[index]
-  }
+  if index < 16 { return &state.buffers[index] }
   return &state.additional[index - 16]
 }
 pub fn prepare(state: *State, count: usize) bool {
-  if count <= buffer_count(state) {
-    return true
-  }
-  if count - 16 > (#cast(usize, -1) - mem.ArenaHeader) / #sizeof(SavedBuffer) {
-    return false
-  }
-  created := mem.arena_try_alloc((count - 16) * #sizeof(SavedBuffer) + mem.ArenaHeader)
-  if !created.ok {
-    return false
-  }
-  storage := created.arena
-  allocated := mem.arena_try_push(storage, (count - 16) * #sizeof(SavedBuffer), #alignof(SavedBuffer))
-  if !allocated.ok {
-    mem.arena_release(storage)
-    return false
-  }
-  additional := #slice((#cast(*SavedBuffer, allocated.memory)), count - 16)
+  if count <= buffer_count(state) { return true }
+  if count - 16 > (#cast(usize, -1) - mem.ArenaHeader) / #sizeof(SavedBuffer) { return false }
+  storage := mem.arena_alloc((count - 16) * #sizeof(SavedBuffer) + mem.ArenaHeader)
+  additional := mem.push_array<SavedBuffer>(storage, count - 16)
   _ = mem.copy(additional, state.additional)
   mem.arena_release(state.storage)
   state.storage = storage
@@ -107,13 +90,11 @@ struct Reader { bytes: []const u8, at: usize, valid: bool}
 struct Writer { bytes: []u8, at: usize, valid: bool}
 
 fn flag(value: bool) usize {
-  if value {
-    return 1
-  }
+  if value { return 1 }
   return 0
 }
 fn number(out: *Writer, value: usize) {
-  if #len(out.bytes) - out.at < 8 {
+  if out.bytes.len - out.at < 8 {
     out.valid = false
     return
   }
@@ -123,18 +104,18 @@ fn number(out: *Writer, value: usize) {
   out.at += 8
 }
 fn text(out: *Writer, value: []const u8) {
-  number(out, #len(value))
-  if #len(value) > #len(out.bytes) - out.at {
+  number(out, value.len)
+  if value.len > out.bytes.len - out.at {
     out.valid = false
     return
   }
-  if #len(value) > 0 {
-    _ = buffer.copy_bytes(&out.bytes[out.at], &value[0], #len(value))
-    out.at += #len(value)
+  if value.len > 0 {
+    _ = buffer.copy_bytes(&out.bytes[out.at], &value[0], value.len)
+    out.at += value.len
   }
 }
 fn get_number(input: *Reader) usize {
-  if #len(input.bytes) - input.at < 8 {
+  if input.bytes.len - input.at < 8 {
     input.valid = false
     return 0
   }
@@ -148,7 +129,7 @@ fn get_number(input: *Reader) usize {
 // Length-prefixed binary bytes, without the UTF-8 check get_text applies.
 fn get_bytes(input: *Reader, limit: usize) []const u8 {
   length := get_number(input)
-  if length > limit || length > #len(input.bytes) - input.at {
+  if length > limit || length > input.bytes.len - input.at {
     input.valid = false
     return ""
   }
@@ -158,7 +139,7 @@ fn get_bytes(input: *Reader, limit: usize) []const u8 {
 }
 fn get_text(input: *Reader, limit: usize) []const u8 {
   length := get_number(input)
-  if length > limit || length > #len(input.bytes) - input.at {
+  if length > limit || length > input.bytes.len - input.at {
     input.valid = false
     return ""
   }
@@ -176,7 +157,7 @@ fn get_text(input: *Reader, limit: usize) []const u8 {
 }
 pub fn encode(state: *const State, output: []u8) usize {
   writer := Writer{bytes: output, valid: true}
-  if #len(state.additional) > 0 {
+  if state.additional.len > 0 {
     text(&writer, "DNA session 3")
   } else {
     text(&writer, "DNA session 2")
@@ -184,14 +165,14 @@ pub fn encode(state: *const State, output: []u8) usize {
   text(&writer, state.project)
   number(&writer, state.active)
   number(&writer, state.focused)
-  if #len(state.additional) > 0 {
+  if state.additional.len > 0 {
     number(&writer, buffer_count(state))
   }
   for index in 0..buffer_count(state) {
     item := buffer_at(state, index)
     if item.used && item.reload {
       // Flag 2: the path and position only; flag 3 adds the edit patch.
-      if item.patched && #len(item.pieces) > 0 {
+      if item.patched && item.pieces.len > 0 {
         number(&writer, 4)
       } else if item.patched {
         number(&writer, 3)
@@ -206,7 +187,7 @@ pub fn encode(state: *const State, output: []u8) usize {
         for value in item.stamp {
           number(&writer, #cast(usize, value))
         }
-        if #len(item.pieces) > 0 {
+        if item.pieces.len > 0 {
           text(&writer, item.pieces)
         } else {
           number(&writer, item.patch_low)
@@ -223,16 +204,16 @@ pub fn encode(state: *const State, output: []u8) usize {
       if item.split_saved {
         length: usize = 0
         for part in item.saved_parts {
-          length += #len(part)
+          length += part.len
         }
         number(&writer, length)
-        if length > #len(writer.bytes) - writer.at {
+        if length > writer.bytes.len - writer.at {
           writer.valid = false
         } else {
           for part in item.saved_parts {
-            if #len(part) > 0 {
-              _ = buffer.copy_bytes(&writer.bytes[writer.at], &part[0], #len(part))
-              writer.at += #len(part)
+            if part.len > 0 {
+              _ = buffer.copy_bytes(&writer.bytes[writer.at], &part[0], part.len)
+              writer.at += part.len
             }
           }
         }
@@ -263,38 +244,26 @@ pub fn encode(state: *const State, output: []u8) usize {
       selections(&writer, &pane.secondary)
     }
   }
-  if !writer.valid {
-    return 0
-  }
+  if !writer.valid { return 0 }
   return writer.at
 }
 fn tree(state: *const State, index: usize, parent: usize, seen: *u32) bool {
-  if index >= 15 || (seen.* & (#cast(u32, 1) << #cast(u32, index))) != 0 {
-    return false
-  }
+  if index >= 15 || (seen.* & (#cast(u32, 1) << #cast(u32, index))) != 0 { return false }
   seen.* = seen.* | (#cast(u32, 1) << #cast(u32, index))
   pane := &state.panes[index]
-  if !pane.used || pane.parent != parent || pane.percent < 10 || pane.percent > 90 {
-    return false
-  }
+  if !pane.used || pane.parent != parent || pane.percent < 10 || pane.percent > 90 { return false }
   if pane.branch {
     return tree(state, pane.first, index, seen) && tree(state, pane.second, index, seen)
   }
-  if pane.slot >= buffer_count(state) || !buffer_at(state, pane.slot).used {
-    return false
-  }
+  if pane.slot >= buffer_count(state) || !buffer_at(state, pane.slot).used { return false }
   item := buffer_at(state, pane.slot)
   // Reloaded text is unknown here; positions are clamped after the reload.
-  if item.reload {
-    return pane.scroll_x <= 100000000 && pane.scroll_y <= 100000000
-  }
+  if item.reload { return pane.scroll_x <= 100000000 && pane.scroll_y <= 100000000 }
   for selected in 0..pane.secondary.count {
     selection := pane.secondary.ranges[selected]
-    if selection.cursor > #len(item.text) || selection.anchor > #len(item.text) {
-      return false
-    }
+    if selection.cursor > item.text.len || selection.anchor > item.text.len { return false }
   }
-  return pane.cursor <= #len(item.text) && pane.anchor <= #len(item.text) && pane.scroll_x <= 100000000 && pane.scroll_y <= 100000000
+  return pane.cursor <= item.text.len && pane.anchor <= item.text.len && pane.scroll_x <= 100000000 && pane.scroll_y <= 100000000
 }
 // Replaces owned metadata; source text remains borrowed until the next decode.
 pub fn decode(source: []const u8, state: *State) bool {
@@ -310,24 +279,20 @@ pub fn decode(source: []const u8, state: *State) bool {
   version := get_text(&reader, 32)
   dynamic := buffer.equal(version, "DNA session 3")
   newer := dynamic || buffer.equal(version, "DNA session 2")
-  if !newer && !buffer.equal(version, "DNA session 1") {
-    return false
-  }
+  if !newer && !buffer.equal(version, "DNA session 1") { return false }
   state.project = get_text(&reader, 4095)
   state.active = get_number(&reader)
   state.focused = get_number(&reader)
   if dynamic {
     count := get_number(&reader)
-    if !reader.valid || count <= 16 || count > (#len(source) - reader.at) / 8 || !prepare(state, count) {
+    if !reader.valid || count <= 16 || count > (source.len - reader.at) / 8 || !prepare(state, count) {
       return false
     }
   }
   for index in 0..buffer_count(state) {
     item := buffer_mut(state, index)
     used := get_number(&reader)
-    if used > 4 || (used >= 2 && !newer) {
-      return false
-    }
+    if used > 4 || (used >= 2 && !newer) { return false }
     if used >= 2 {
       item.used = true
       item.reload = true
@@ -341,10 +306,8 @@ pub fn decode(source: []const u8, state: *State) bool {
           item.stamp[index_stamp] = get_number(&reader)
         }
         if used == 4 {
-          item.pieces = get_bytes(&reader, #len(source))
-          if #len(item.pieces) == 0 || #len(item.pieces) % 24 != 0 {
-            return false
-          }
+          item.pieces = get_bytes(&reader, source.len)
+          if item.pieces.len == 0 || item.pieces.len % 24 != 0 { return false }
         } else {
           item.patch_low = get_number(&reader)
           item.patch_high = get_number(&reader)
@@ -353,20 +316,14 @@ pub fn decode(source: []const u8, state: *State) bool {
         // contiguous insertion bounded by buffer.Capacity.
         limit := buffer.Capacity
         if used == 4 {
-          limit = #len(source)
+          limit = source.len
         }
         item.patch = get_bytes(&reader, limit)
-        if item.patch_low > item.patch_high || !utf8.valid(item.patch) {
-          return false
-        }
+        if item.patch_low > item.patch_high || !utf8.valid(item.patch) { return false }
       }
-      if #len(item.path) == 0 || item.path[0] != '/' {
-        return false
-      }
+      if item.path.len == 0 || item.path[0] != '/' { return false }
       for byte in item.path {
-        if byte == 10 || byte == 13 {
-          return false
-        }
+        if byte == 10 || byte == 13 { return false }
       }
       continue
     }
@@ -378,22 +335,14 @@ pub fn decode(source: []const u8, state: *State) bool {
       item.filetype = get_text(&reader, 64)
       item.cursor = get_number(&reader)
       item.anchor = get_number(&reader)
-      if newer && !get_selections(&reader, &item.secondary, #len(item.text)) {
-        return false
-      }
-      if item.cursor > #len(item.text) || item.anchor > #len(item.text) {
-        return false
-      }
-      if #len(item.path) > 0 && item.path[0] != '/' {
-        return false
-      }
+      if newer && !get_selections(&reader, &item.secondary, item.text.len) { return false }
+      if item.cursor > item.text.len || item.anchor > item.text.len { return false }
+      if item.path.len > 0 && item.path[0] != '/' { return false }
       for byte in item.path {
-        if byte == 10 || byte == 13 {
-          return false
-        }
+        if byte == 10 || byte == 13 { return false }
       }
       for previous in 0..index {
-        if #len(item.path) > 0 && buffer_at(state, previous).used && buffer.equal(buffer_at(state, previous).path, item.path) {
+        if item.path.len > 0 && buffer_at(state, previous).used && buffer.equal(buffer_at(state, previous).path, item.path) {
           return false
         }
       }
@@ -402,16 +351,12 @@ pub fn decode(source: []const u8, state: *State) bool {
   for index in 0..15 {
     pane := &state.panes[index]
     present := get_number(&reader)
-    if present > 1 {
-      return false
-    }
+    if present > 1 { return false }
     pane.used = present == 1
     if pane.used {
       branch := get_number(&reader)
       vertical := get_number(&reader)
-      if branch > 1 || vertical > 1 {
-        return false
-      }
+      if branch > 1 || vertical > 1 { return false }
       pane.branch = branch == 1
       pane.vertical = vertical == 1
       pane.parent = get_number(&reader)
@@ -423,53 +368,49 @@ pub fn decode(source: []const u8, state: *State) bool {
       pane.percent = get_number(&reader)
       pane.scroll_x = get_number(&reader)
       pane.scroll_y = get_number(&reader)
-      if newer && !get_selections(&reader, &pane.secondary, buffer.Capacity) {
-        return false
-      }
+      if newer && !get_selections(&reader, &pane.secondary, buffer.Capacity) { return false }
     }
   }
-  if !reader.valid || reader.at != #len(source) || state.active >= buffer_count(state) || state.focused >= 15 || !buffer_at(state, state.active).used || !state.panes[state.focused].used || state.panes[state.focused].branch || state.panes[state.focused].slot != state.active {
+  if !reader.valid || reader.at != source.len || state.active >= buffer_count(state) || state.focused >= 15 || !buffer_at(state, state.active).used || !state.panes[state.focused].used || state.panes[state.focused].branch || state.panes[state.focused].slot != state.active {
     return false
   }
   seen: u32 = 0
-  if !tree(state, 0, 0, &seen) {
-    return false
-  }
+  if !tree(state, 0, 0, &seen) { return false }
   for index in 0..15 {
     if state.panes[index].used && (seen & (#cast(u32, 1) << #cast(u32, index))) == 0 {
       return false
     }
   }
-  success = #len(state.project) > 0 && state.project[0] == '/'
+  success = state.project.len > 0 && state.project[0] == '/'
   return success
 }
 
 pub fn encoded_size(state: *const State) usize {
-  size: usize = 8 + 13 + 8 + #len(state.project) + 16 + buffer_count(state) * 8 + 15 * 8
-  if #len(state.additional) > 0 {
+  size: usize = 8 + 13 + 8 + state.project.len + 16 + buffer_count(state) * 8 + 15 * 8
+  if state.additional.len > 0 {
     size += 8
   }
   for index in 0..buffer_count(state) {
     item := buffer_at(state, index)
     if item.used && item.reload {
-      size += 32 + #len(item.path) + #len(item.filetype)
+      size += 32 + item.path.len + item.filetype.len
       if item.patched {
         // Four stamp words, the range, and the patch with its length.
-        size += 56 + #len(item.patch)
-        if #len(item.pieces) > 0 {
+        size += 56 + item.patch.len
+        if item.pieces.len > 0 {
           // The piece records with their length replace the two range words.
-          size += #len(item.pieces) - 8
+          size += item.pieces.len - 8
         }
       }
     } else if item.used {
       if item.split_saved {
         for part in item.saved_parts {
-          size += #len(part)
+          size += part.len
         }
       }
-      size += 56 + item.secondary.count * 16 + #len(item.path) + #len(item.text) + #len(item.filetype)
+      size += 56 + item.secondary.count * 16 + item.path.len + item.text.len + item.filetype.len
       if !item.split_saved {
-        size += #len(item.saved)
+        size += item.saved.len
       }
     }
   }
@@ -493,16 +434,12 @@ fn selections(out: *Writer, set: *const buffer.SelectionSet) {
 }
 fn get_selections(input: *Reader, set: *buffer.SelectionSet, limit: usize) bool {
   set.count = get_number(input)
-  if set.count > 31 {
-    return false
-  }
+  if set.count > 31 { return false }
   index: usize = 0
   for index < set.count {
     cursor := get_number(input)
     anchor := get_number(input)
-    if cursor > limit || anchor > limit {
-      return false
-    }
+    if cursor > limit || anchor > limit { return false }
     set.ranges[index] = buffer.Selection{cursor: cursor, anchor: anchor}
     index += 1
   }

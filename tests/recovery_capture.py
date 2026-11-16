@@ -26,12 +26,12 @@ def block(source, marker):
 
 source = (ROOT / "src/persistence.dyn").read_text()
 fixture = '''use "std/mem"
-use "./owned_arena" arena_owner
-use "./buffer" buffer
-use "./workspace" workspace
-use "./files" files
-use "./fs" fs
-use "./sdl" sdl
+use arena_owner "./owned_arena"
+use buffer "./buffer"
+use workspace "./workspace"
+use files "./files"
+use fs "./fs"
+use sdl "./sdl"
 extern fn fill "__memset_chk"(target:*u8,byte:i32,length:usize,room:usize) rawptr
 struct Terminal {handle:rawptr}
 struct Slot {document:*buffer.Document,file:files.State,filetype:[65]u8,filetype_length:usize,inferred_filetype:bool,terminal:Terminal}
@@ -62,7 +62,7 @@ fn recovery_open(path:*const u8) rawptr {return #cast(rawptr,1)}
 fn recovery_submit(worker:rawptr,bytes:*const u8,length:usize) i32 {
  if record_storage==nil {
   record_arena:=mem.arena_alloc(300000000)
-  record_storage=&mem.push_bytes_uninit(record_arena,290000000)[0]
+  record_storage=&mem.push_bytes(record_arena,290000000)[0]
   record_capacity=290000000
  }
  check(length<=record_capacity)
@@ -72,9 +72,9 @@ fn recovery_submit(worker:rawptr,bytes:*const u8,length:usize) i32 {
  return 1
 }
 fn copy_text(output:[]u8,input:[]const u8) usize {
- check(#len(output)>=#len(input))
- if #len(input)>0 {_=buffer.copy_bytes(&output[0],&input[0],#len(input))}
- return #len(input)
+ check(output.len>=input.len)
+ if input.len>0 {_=buffer.copy_bytes(&output[0],&input[0],input.len)}
+ return input.len
 }
 fn add_text(output:[]u8,used:*usize,input:[]const u8) {
  used.*+=copy_text(output[used.*..],input)
@@ -177,7 +177,7 @@ fn main() {
  defer workspace.release(&pieced)
  check(workspace.decode(#slice(record_storage, record_length),&pieced))
  pieces:=&pieced.buffers[0]
- check(pieces.patched && #len(pieces.pieces)>0 && #len(pieces.patch)<=8 && record_length<4096)
+ check(pieces.patched && pieces.pieces.len>0 && pieces.patch.len<=8 && record_length<4096)
  load_original(restored,original)
  check(restore_patch(&app,restored,pieces,slot.file.stamp))
  check(restored.length==document.length && buffer.byte_at(restored,0)=='B' && buffer.byte_at(restored,restored.length-1)=='C')
@@ -185,8 +185,8 @@ fn main() {
  // New text past the former 256 MiB patch bound still fits one record.
  inserted_arena:=mem.arena_alloc(290000000)
  defer mem.arena_release(inserted_arena)
- inserted:=mem.push_bytes_uninit(inserted_arena,280000000)
- _=fill(&inserted[0],98,#len(inserted),#len(inserted))
+ inserted:=mem.push_bytes(inserted_arena,280000000)
+ _=fill(&inserted[0],98,inserted.len,inserted.len)
  document.anchor=1000
  document.cursor=1000
  check(buffer.replace(document,inserted))
@@ -218,7 +218,7 @@ with tempfile.TemporaryDirectory(prefix="dna-recovery-capture-") as temporary:
     for name, contents in {
         "fs": '''pub struct Stamp {inode:u64,size:u64,modify_seconds:u64,modify_nanos:u64,valid: bool}
 ''',
-        "files": '''use "../fs" fs
+        "files": '''use fs "../fs"
 pub struct State {length:usize,stamp:fs.Stamp}
 pub fn saved_stamp(state:*const State) fs.Stamp {return state.stamp}
 pub fn name(state:*const State) []const u8 {return "/tmp/big.log"}

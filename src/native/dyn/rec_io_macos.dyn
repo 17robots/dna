@@ -1,6 +1,6 @@
 #target(kernel: darwin)
 #link("System")
-use "std/dynlib" native_loader
+use native_loader "std/dynlib"
 use "std/io"
 
 struct DarwinIO {
@@ -12,11 +12,13 @@ struct DarwinIO {
 darwin_io: DarwinIO
 darwin_io_once: sync.Once
 fn darwin_io_symbol(name: []const u8) rawptr {
-  result := native_loader.symbol(#cast(rawptr, #cast(isize, -2)), name)
-  if io.failed(result.failure) || result.value == nil {
+  result := native_loader.symbol(#cast(rawptr, #cast(isize, -2)), name) catch {
     #panic("missing libSystem IO routine")
   }
-  return result.value
+  if result == nil {
+    #panic("missing libSystem IO routine")
+  }
+  return result
 }
 fn darwin_io_prepare() {
   if sync.once_begin(&darwin_io_once) {
@@ -105,22 +107,20 @@ fn memory_environment(name:*const u8) *u8 {
 }
 
 fn syntax_dlopen(path:*const u8, flags:i32) rawptr {
-  return native_loader.open(#slice(path, string_length(path)), flags).value
+  return native_loader.open(#slice(path, string_length(path)), flags) catch nil
 }
 fn syntax_dlclose(library:rawptr) i32 {
-  if !io.failed(native_loader.close(&library).failure) {
-    return 0
+  native_loader.close(&library) catch {
+    return -1
   }
-  return -1
+  return 0
 }
 
 fn rec_path_separator(byte: u8) bool {
   return byte == 47
 }
 fn rec_path_root(path: *const u8, length: usize) usize {
-  if length > 0 && path.* == 47 {
-    return 1
-  }
+  if length > 0 && path.* == 47 { return 1 }
   return 0
 }
 fn rec_absolute(path: *const u8) bool {

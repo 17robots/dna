@@ -83,9 +83,7 @@ struct Slot {
 fn document_changed(context: rawptr) {
   slot := #cast(*Slot, context)
   app := slot.owner
-  if app == nil || slot.document == nil {
-    return
-  }
+  if app == nil || slot.document == nil { return }
   app.documents.generation += 1
   lsp_document_dirty(app, slot.index)
   if slot.observed_saved_epoch != slot.document.saved_epoch {
@@ -108,51 +106,37 @@ fn document_lifecycle_changed(app: *App, index: usize) {
 fn documents_append_slot(app: *App) *Slot {
   documents := &app.documents
   if documents.storage == nil {
-    documents.storage = mem.arena_try_alloc(65536).arena
-    if documents.storage == nil {
-      return nil
-    }
+    documents.storage = mem.arena_alloc(65536)
   }
   maximum := #cast(usize, -1)
-  if #len(documents.slots) == maximum {
-    return nil
-  }
-  needed := #len(documents.slots) + 1
-  if needed > #len(documents.index_storage) {
-    if #len(documents.index_storage) > maximum / 2 {
-      return nil
-    }
-    capacity := #len(documents.index_storage) * 2
+  if documents.slots.len == maximum { return nil }
+  needed := documents.slots.len + 1
+  if needed > documents.index_storage.len {
+    if documents.index_storage.len > maximum / 2 { return nil }
+    capacity := documents.index_storage.len * 2
     if capacity < 8 {
       capacity = 8
     }
-    if capacity < needed || capacity > maximum / (#sizeof(*Slot) + #sizeof(usize)) {
-      return nil
-    }
+    if capacity < needed || capacity > maximum / (#sizeof(*Slot) + #sizeof(usize)) { return nil }
+    directory_bytes := capacity * (#sizeof(*Slot) + #sizeof(usize))
+    if directory_bytes > maximum - (#alignof(*Slot) + #alignof(usize)) || mem.arena_room(documents.storage) < directory_bytes + #alignof(*Slot) + #alignof(usize) { return nil }
     // One allocation publishes pointer and picker directories atomically.
-    pointers := mem.arena_try_push(documents.storage, capacity * (#sizeof(*Slot) + #sizeof(usize)), #alignof(*Slot))
-    if !pointers.ok {
-      return nil
-    }
-    next := #slice((#cast(**Slot, pointers.memory)), capacity)
-    indices := #slice((#cast(*usize, #cast(usize, pointers.memory) + capacity * #sizeof(*Slot))), capacity)
-    for index in 0..#len(documents.slots) {
+    next := mem.push_array<*Slot>(documents.storage, capacity)
+    indices := mem.push_array<usize>(documents.storage, capacity)
+    for index in 0..documents.slots.len {
       next[index] = documents.slots[index]
       indices[index] = documents.buffer_results[index]
     }
     documents.index_storage = next
     documents.buffer_results = indices
-    documents.slots = next[..#len(documents.slots)]
+    documents.slots = next[..documents.slots.len]
   }
   // A cancelled restore can retain unpublished empty records for reuse.
-  slot := documents.index_storage[#len(documents.slots)]
+  slot := documents.index_storage[documents.slots.len]
   if slot == nil {
-    allocated := mem.arena_try_push(documents.storage, #sizeof(Slot), #alignof(Slot))
-    if !allocated.ok {
-      return nil
-    }
-    slot = #cast(*Slot, allocated.memory)
-    documents.index_storage[#len(documents.slots)] = slot
+    if mem.arena_room(documents.storage) < #sizeof(Slot) + #alignof(Slot) { return nil }
+    slot = mem.push<Slot>(documents.storage)
+    documents.index_storage[documents.slots.len] = slot
   }
   slot.index = needed - 1
   documents.slots = documents.index_storage[..needed]
@@ -167,7 +151,7 @@ fn new_buffer(app: *App) bool {
     return false
   }
   index: usize = 0
-  for index < #len(app.documents.slots) && app.documents.slots[index].document != nil {
+  for index < app.documents.slots.len && app.documents.slots[index].document != nil {
     index += 1
   }
   allocated := arena_owner.try_create(#sizeof(buffer.Document) + buffer.Capacity + 129)
@@ -176,8 +160,7 @@ fn new_buffer(app: *App) bool {
     return false
   }
   document := buffer.try_allocate(allocated)
-  colors := mem.arena_try_push_uninit(allocated, buffer.Capacity + 1, 1)
-  if document == nil || !colors.ok {
+  if document == nil || mem.arena_room(allocated) < buffer.Capacity + 1 {
     if document != nil {
       buffer.release(document)
     }
@@ -185,8 +168,9 @@ fn new_buffer(app: *App) bool {
     notice(app, "Could not initialize a new buffer. Existing buffers are unchanged.")
     return false
   }
+  colors := mem.push_bytes(allocated, buffer.Capacity + 1)
   slot: *Slot = nil
-  if index == #len(app.documents.slots) {
+  if index == app.documents.slots.len {
     slot = documents_append_slot(app)
   } else {
     slot = app.documents.slots[index]
@@ -210,7 +194,7 @@ fn new_buffer(app: *App) bool {
   mem.clear(&slot.diagnostics)
   slot.disk_changed = false
   slot.document = document
-  slot.colors = #slice(colors.memory, buffer.Capacity + 1)
+  slot.colors = colors
   _ = buffer.load(slot.document, "")
   document_observe(app, slot)
   app.documents.count += 1
@@ -218,7 +202,7 @@ fn new_buffer(app: *App) bool {
   return true
 }
 fn documents_release(app: *App) {
-  for index in 0..#len(app.documents.slots) {
+  for index in 0..app.documents.slots.len {
     slot := app.documents.slots[index]
     if slot.document != nil {
       if !buffer.dirty_cached(slot.document) {
@@ -238,9 +222,7 @@ fn documents_release(app: *App) {
 
 // One owner handles document arena accounting and invalidates borrowed pointers.
 fn document_release(app: *App, slot: *Slot) {
-  if slot.document == nil {
-    return
-  }
+  if slot.document == nil { return }
   buffer.clear_observer(slot.document)
   git_release(slot)
   slot.owner = nil
@@ -259,7 +241,7 @@ fn documents_rollback_new(app: *App, indices: []const usize, original: usize) {
   // Restore the original view before discarding temporary owners: rollback
   // must not close the split whose temporary buffer failed to open.
   activate(app, original)
-  remaining := #len(indices)
+  remaining := indices.len
   for remaining > 0 {
     remaining -= 1
     close_slot(app, indices[remaining])
@@ -268,7 +250,7 @@ fn documents_rollback_new(app: *App, indices: []const usize, original: usize) {
 // Advance files loading in the background. Returns true when one finished.
 fn documents_load_tick(app: *App) bool {
   changed := false
-  for index in 0..#len(app.documents.slots) {
+  for index in 0..app.documents.slots.len {
     doc := app.documents.slots[index].document
     if doc != nil && buffer.load_state(doc) == buffer.LoadRunning && buffer.load_tick(doc) {
       changed = true
@@ -280,11 +262,9 @@ fn documents_load_tick(app: *App) bool {
   return changed
 }
 fn documents_loading(app: *const App) bool {
-  for index in 0..#len(app.documents.slots) {
+  for index in 0..app.documents.slots.len {
     doc := app.documents.slots[index].document
-    if doc != nil && buffer.load_state(doc) == buffer.LoadRunning {
-      return true
-    }
+    if doc != nil && buffer.load_state(doc) == buffer.LoadRunning { return true }
   }
   return false
 }

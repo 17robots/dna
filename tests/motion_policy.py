@@ -16,8 +16,8 @@ def function(source,name):
         elif source[end]=='}':depth-=1
         end+=1
     return source[start:end]+'\n'
-BASE='''use "./motion" motion
-use "./sdl" sdl
+BASE='''use motion "./motion"
+use sdl "./sdl"
 struct Animation { now:f32, line:f32, active:bool, reset:bool, panel:Panel }
 enum Panel { None }
 struct View { reduced_motion:bool, insert:bool, animation:Animation, scroll_x,scroll_y:f32 }
@@ -286,7 +286,7 @@ CASES['cursor_continuation']='''fn main() {
  if !cursor_step_snaps(&x,&y,0.0,120.0,8.0,20.0) {#panic("newline steps must remain immediate")}
 }
 '''
-CASES['existing_contracts']=(ROOT/'tests/motion/main.dyn').read_text().replace('use "../../src/motion" motion','')
+CASES['existing_contracts']=(ROOT/'tests/motion/main.dyn').read_text().replace('use motion "../../src/motion"','')
 CASES['settings']='''fn main() {
  fast:=motion.Tween{}
  slow:=motion.Tween{}

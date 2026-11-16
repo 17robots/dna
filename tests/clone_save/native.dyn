@@ -1,7 +1,7 @@
-use "../../src/owned_arena" arena_owner
-use "../../src/buffer" buffer
-use "../../src/files" files
-use "../../src/filesystem" fs
+use arena_owner "../../src/owned_arena"
+use buffer "../../src/buffer"
+use files "../../src/files"
+use fs "../../src/filesystem"
 use "std/mem"
 use "std/io"
 
@@ -13,17 +13,17 @@ fn main() {
   size: usize = 17825792
   arena := arena_owner.create(#sizeof(buffer.Document) + size + 2097152)
   defer arena_owner.release(arena)
-  text := mem.push_bytes_uninit(arena, size)
+  text := mem.push_bytes(arena, size)
   for index in 0..size {
     text[index] = 97
   }
-  if fs.write_all("original.txt", text).failure.kind != io.Kind.Ok {
+  fs.write_all("original.txt", text) catch {
     #panic("native clone fixture")
   }
   doc := buffer.allocate(arena)
   defer buffer.release(doc)
   state := files.State{}
-  if #len(files.open(&state, doc, "original.txt", arena)) != 0 {
+  if files.open(&state, doc, "original.txt", arena).len != 0 {
     #panic("native mapped open")
   }
   buffer.move_to(doc, doc.length, false)
@@ -35,7 +35,7 @@ fn main() {
     #panic("APFS save was not seeded")
   }
   files.save_write(&job)
-  if #len(files.save_finish(&job, &state, doc, arena)) != 0 {
+  if files.save_finish(&job, &state, doc, arena).len != 0 {
     #panic("native cloned save")
   }
   // The retained origin is now unlinked. A second save must still be exact.
@@ -47,16 +47,17 @@ fn main() {
     #panic("native second start")
   }
   files.save_write(&job)
-  if #len(files.save_finish(&job, &state, doc, arena)) != 0 {
+  if files.save_finish(&job, &state, doc, arena).len != 0 {
     #panic("native second save")
   }
   disk := files.read_document("original.txt")
-  if !disk.valid || #len(disk.data) != size + 12 || !buffer.equal(disk.data[..size], text) || !buffer.equal(disk.data[size..], "APPENDSECOND") {
+  if !disk.valid || disk.data.len != size + 12 || !buffer.equal(disk.data[..size], text) || !buffer.equal(disk.data[size..], "APPENDSECOND") {
     #panic("native clone bytes")
   }
   files.release_text(&disk)
-  if fs.metadata("original.txt.dna-write").failure.kind == io.Kind.Ok {
-    #panic("native clone temporary leaked")
+  _ = fs.metadata("original.txt.dna-write") catch {
+    io.println("PASS clone native APFS mapped document, seeded append, repeated save and exact bytes")
+    return
   }
-  io.println("PASS clone native APFS mapped document, seeded append, repeated save and exact bytes")
+  #panic("native clone temporary leaked")
 }

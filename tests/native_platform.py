@@ -47,7 +47,7 @@ fn main() {
  destination.x=40.0
  native_check(sdl_render_texture(renderer,texture,nil,&destination) && native_pixel(40,10,0,64,0,255),"modulated texture alpha")
  sdl_destroy_texture(texture)
- native_check(native_present.draw(&native_gui.presenter,native_gui.surface).failure.kind == io.Kind.Ok,"GPU upload")
+ native_present.draw(&native_gui.presenter,native_gui.surface) catch { #panic("GPU upload") }
  pixel: [4]u8
  api:=&native_gui.presenter.api
  api.pixel_store_i(3333,1)
@@ -56,7 +56,7 @@ fn main() {
  // Reuse existing texture storage but replace its content on the next frame.
  changed:=Rect{x:20.0,y:10.0,width:1.0,height:1.0}
  native_check(sdl_color(renderer,17,83,201,255) && sdl_fill(renderer,&changed),"changed second frame")
- native_check(native_present.draw(&native_gui.presenter,native_gui.surface).failure.kind == io.Kind.Ok,"same-size GPU update")
+ native_present.draw(&native_gui.presenter,native_gui.surface) catch { #panic("same-size GPU update") }
  api.read_pixels(20,native_gui.surface.height-1-10,1,1,6408,5121,#cast(rawptr,&pixel[0]))
  native_check(pixel[0]==17 && pixel[1]==83 && pixel[2]==201,"same-size upload replaces GPU pixel")
  // Exercise resized texture storage without relying on compositor window sizing.
@@ -71,12 +71,12 @@ fn main() {
  resized_pixels[3069]=31
  resized_pixels[3070]=19
  resized:=software.Surface{pixels:resized_pixels[..],width:32,height:24,stride:128}
- native_check(native_present.draw(&native_gui.presenter,resized).failure.kind == io.Kind.Ok,"resized GPU upload")
+ native_present.draw(&native_gui.presenter,resized) catch { #panic("resized GPU upload") }
  api.read_pixels(0,23,1,1,6408,5121,#cast(rawptr,&pixel[0]))
  native_check(pixel[0]==51 && pixel[1]==129 && pixel[2]==207,"resized top-left GPU pixel")
  api.read_pixels(31,0,1,1,6408,5121,#cast(rawptr,&pixel[0]))
  native_check(pixel[0]==201 && pixel[1]==31 && pixel[2]==19,"resized bottom-right GPU pixel")
- native_check(native_present.draw(&native_gui.presenter,native_gui.surface).failure.kind == io.Kind.Ok,"restore full-size GPU upload")
+ native_present.draw(&native_gui.presenter,native_gui.surface) catch { #panic("restore full-size GPU upload") }
  api.read_pixels(20,native_gui.surface.height-1-10,1,1,6408,5121,#cast(rawptr,&pixel[0]))
  native_check(pixel[0]==17 && pixel[1]==83 && pixel[2]==201,"restored full-size GPU pixel")
  // One A8 source texel must cover the scaled 2 by 3 destination rectangle.
@@ -117,22 +117,22 @@ fn main() {
  source.kind=events.Kind.PointerUp
  native_check(native_event(&source,&event) && native_gui.mouse_buttons==0,"release clears left button")
  source.kind=events.Kind.PointerDown
- native_gui.click_at=time.monotonic_now().value
+ native_gui.click_at=time.monotonic_now()
  native_check(native_event(&source,&event) && #cast(*MouseButton,&event).clicks==2,"double click")
  source.kind=events.Kind.PointerUp
  native_check(native_event(&source,&event),"second release")
  source.kind=events.Kind.PointerDown
- native_gui.click_at=time.monotonic_now().value
+ native_gui.click_at=time.monotonic_now()
  native_check(native_event(&source,&event) && #cast(*MouseButton,&event).clicks==3,"triple click")
  source.kind=events.Kind.PointerUp
  native_check(native_event(&source,&event),"third release")
  source.kind=events.Kind.PointerDown
- native_gui.click_at=time.monotonic_now().value
+ native_gui.click_at=time.monotonic_now()
  native_check(native_event(&source,&event) && #cast(*MouseButton,&event).clicks==1,"click sequence restarts after triple")
  source.x=30
- native_gui.click_at=time.monotonic_now().value
+ native_gui.click_at=time.monotonic_now()
  native_check(native_event(&source,&event) && #cast(*MouseButton,&event).clicks==1,"distant click starts new sequence")
- native_gui.click_at=time.monotonic_now().value
+ native_gui.click_at=time.monotonic_now()
  native_gui.click_at.seconds-=1
  native_check(native_event(&source,&event) && #cast(*MouseButton,&event).clicks==1,"click timeout starts new sequence")
  source.button=3
@@ -172,7 +172,7 @@ fn main() {
  sdl_free(#cast(rawptr,second_clip))
  native_check(native_gui.clipboards==nil,"clipboard free balances owners")
  large_owner:=mem.arena_alloc(0)
- large:=mem.push_bytes_uninit(large_owner,1200002)
+ large:=mem.push_bytes(large_owner,1200002)
  for i in 0..1200001 {large[i]=97}
  large[1200001]=0
  native_check(sdl_clipboard_set(&large[0]),"large clipboard offer without truncation")
@@ -183,7 +183,7 @@ fn main() {
  source=events.Event{kind:events.Kind.Overflow,dropped:2}
  native_check(native_event(&source,&event) && event.words[0]==32770 && sdl_modifiers()==0 && native_gui.mouse_buttons==0,"overflow reports dropped input without stale state")
  sdl_destroy_renderer(renderer)
- native_check(native_gui.surface.width==0 && #len(native_gui.surface.pixels)==0,"destroy invalidates framebuffer")
+ native_check(native_gui.surface.width==0 && native_gui.surface.pixels.len==0,"destroy invalidates framebuffer")
  renderer=sdl_create_renderer(window,nil)
  native_check(renderer!=nil && sdl_color(renderer,1,2,3,255) && sdl_clear(renderer),"same-size renderer recreation")
  native_check(native_pixel(0,0,1,2,3,255),"recreated framebuffer writable")

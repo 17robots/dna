@@ -13,8 +13,8 @@ def function(source,name):
         end+=1
     return source[start:end]+'\n'
 s=(ROOT/'src/animation.dyn').read_text()
-base='''use "./motion" motion
-use "./sdl" sdl
+base='''use motion "./motion"
+use sdl "./sdl"
 struct Config {popup_animation_ms:f32,popup_transitions:bool}
 struct Animation {now,geometry_elapsed:f32,active,surfaces_ready,resized,geometry_active,geometry_retargeted:bool}
 struct View {animation:Animation,reduced_motion:bool}

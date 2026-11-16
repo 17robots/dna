@@ -32,7 +32,7 @@ struct RxGroup { open: usize, branch: usize, ze: bool }
 struct RxToken { byte: u8, escaped: bool, size: usize }
 
 fn rx_add(out: *RxOut, text: []const u8) {
-  if out.used + #len(text) >= #len(out.bytes) {
+  if out.used + text.len >= out.bytes.len {
     out.overflow = true
     return
   }
@@ -46,23 +46,21 @@ fn rx_byte(out: *RxOut, byte: u8) {
   rx_add(out, single[..])
 }
 fn rx_insert(out: *RxOut, at: usize, text: []const u8) {
-  if out.used + #len(text) >= #len(out.bytes) {
+  if out.used + text.len >= out.bytes.len {
     out.overflow = true
     return
   }
   index := out.used
   for index > at {
     index -= 1
-    out.bytes[index + #len(text)] = out.bytes[index]
+    out.bytes[index + text.len] = out.bytes[index]
   }
   buffer.copy(out.bytes[at..], text)
-  out.used += #len(text)
+  out.used += text.len
 }
 fn rx_one_of(byte: u8, set: []const u8) bool {
   for candidate in set {
-    if candidate == byte {
-      return true
-    }
+    if candidate == byte { return true }
   }
   return false
 }
@@ -74,19 +72,13 @@ fn rx_literal(out: *RxOut, byte: u8) {
   rx_byte(out, byte)
 }
 fn rx_char_size(byte: u8) usize {
-  if byte < 0xc0 {
-    return 1
-  }
-  if byte < 0xe0 {
-    return 2
-  }
-  if byte < 0xf0 {
-    return 3
-  }
+  if byte < 0xc0 { return 1 }
+  if byte < 0xe0 { return 2 }
+  if byte < 0xf0 { return 3 }
   return 4
 }
 fn rx_token(source: []const u8, at: usize) RxToken {
-  if source[at] == '\\' && at + 1 < #len(source) {
+  if source[at] == '\\' && at + 1 < source.len {
     return RxToken{byte: source[at + 1], escaped: true, size: 2}
   }
   return RxToken{byte: source[at], escaped: false, size: 1}
@@ -98,12 +90,8 @@ fn rx_special_set(byte: u8) bool {
 }
 // Whether the character has its meaning without a backslash at this level.
 fn rx_plain_special(byte: u8, mode: u8) bool {
-  if mode == 3 {
-    return rx_special_set(byte)
-  }
-  if mode == 2 {
-    return rx_one_of(byte, ".*[~")
-  }
+  if mode == 3 { return rx_special_set(byte) }
+  if mode == 2 { return rx_one_of(byte, ".*[~") }
   return false
 }
 fn rx_is_special(token: RxToken, mode: u8) bool {
@@ -111,13 +99,9 @@ fn rx_is_special(token: RxToken, mode: u8) bool {
 }
 // $ means end-of-line only before the end of a branch.
 fn rx_ends_branch(source: []const u8, at: usize, mode: u8) bool {
-  if at >= #len(source) {
-    return true
-  }
+  if at >= source.len { return true }
   token := rx_token(source, at)
-  if token.escaped && token.byte == 'n' {
-    return true
-  }
+  if token.escaped && token.byte == 'n' { return true }
   return (token.byte == '|' || token.byte == ')' || token.byte == '&') && rx_is_special(token, mode)
 }
 // Class body for a class letter; negated classes are written [^body].
@@ -151,21 +135,11 @@ fn rx_class(letter: u8) RxClass {
     return RxClass{body: "A-Za-z_", negated: letter == 'H', valid: true}
   }
   // \k \i \f \p and their digit-free upper-case forms.
-  if letter == 'k' || letter == 'i' {
-    return RxClass{body: "\\p{L}\\p{N}_", valid: true}
-  }
-  if letter == 'K' || letter == 'I' {
-    return RxClass{body: "\\p{L}_", valid: true}
-  }
-  if letter == 'f' {
-    return RxClass{body: "\\p{L}\\p{N}_/.\\-+,#$%~=", valid: true}
-  }
-  if letter == 'F' {
-    return RxClass{body: "\\p{L}_/.\\-+,#$%~=", valid: true}
-  }
-  if letter == 'p' {
-    return RxClass{body: "\\x20-\\x7e\\x{a0}-\\x{10ffff}", valid: true}
-  }
+  if letter == 'k' || letter == 'i' { return RxClass{body: "\\p{L}\\p{N}_", valid: true} }
+  if letter == 'K' || letter == 'I' { return RxClass{body: "\\p{L}_", valid: true} }
+  if letter == 'f' { return RxClass{body: "\\p{L}\\p{N}_/.\\-+,#$%~=", valid: true} }
+  if letter == 'F' { return RxClass{body: "\\p{L}_/.\\-+,#$%~=", valid: true} }
+  if letter == 'p' { return RxClass{body: "\\x20-\\x7e\\x{a0}-\\x{10ffff}", valid: true} }
   if letter == 'P' {
     return RxClass{body: "\\x20-\\x2f\\x3a-\\x7e\\x{a0}-\\x{10ffff}", valid: true}
   }
@@ -212,9 +186,7 @@ fn rx_digit(byte: u8, base: usize) usize {
   } else if byte >= 'A' && byte <= 'F' {
     value = #cast(usize, byte - 'A') + 10
   }
-  if value >= base {
-    return 99
-  }
+  if value >= base { return 99 }
   return value
 }
 // A numbered character after \%d \%x \%u \%U \%o, or \d \o \x \u \U in [].
@@ -235,7 +207,7 @@ fn rx_code(source: []const u8, at: usize, kind: u8, value: *usize) usize {
   }
   index := at
   value.* = 0
-  for index < #len(source) && index - at < limit && rx_digit(source[index], base) != 99 {
+  for index < source.len && index - at < limit && rx_digit(source[index], base) != 99 {
     value.* = value.* * base + rx_digit(source[index], base)
     index += 1
   }
@@ -248,32 +220,30 @@ fn rx_code(source: []const u8, at: usize, kind: u8, value: *usize) usize {
 // when there is no closing ] (the [ is then a literal).
 fn rx_collection(source: []const u8, at: usize, out: *RxOut, newline: bool, regex: *VimRegex) usize {
   index := at
-  if index < #len(source) && source[index] == '^' {
+  if index < source.len && source[index] == '^' {
     index += 1
   }
-  if index < #len(source) && source[index] == ']' {
+  if index < source.len && source[index] == ']' {
     index += 1
   }
-  for index < #len(source) && source[index] != ']' {
-    if source[index] == '[' && index + 1 < #len(source) && (source[index + 1] == ':' || source[index + 1] == '=' || source[index + 1] == '.') {
+  for index < source.len && source[index] != ']' {
+    if source[index] == '[' && index + 1 < source.len && (source[index + 1] == ':' || source[index + 1] == '=' || source[index + 1] == '.') {
       close := index + 2
-      for close + 1 < #len(source) && !(source[close] == source[index + 1] && source[close + 1] == ']') {
+      for close + 1 < source.len && !(source[close] == source[index + 1] && source[close + 1] == ']') {
         close += 1
       }
-      if close + 1 < #len(source) {
+      if close + 1 < source.len {
         index = close + 2
         continue
       }
     }
-    if source[index] == '\\' && index + 1 < #len(source) {
+    if source[index] == '\\' && index + 1 < source.len {
       index += 2
       continue
     }
     index += 1
   }
-  if index >= #len(source) {
-    return 0
-  }
+  if index >= source.len { return 0 }
   end := index
   index = at
   negated := false
@@ -292,10 +262,10 @@ fn rx_collection(source: []const u8, at: usize, out: *RxOut, newline: bool, rege
     if byte == '[' && index + 1 < end && (source[index + 1] == ':' || source[index + 1] == '=' || source[index + 1] == '.') {
       kind := source[index + 1]
       close := index + 2
-      for close + 1 < #len(source) && !(source[close] == kind && source[close + 1] == ']') {
+      for close + 1 < source.len && !(source[close] == kind && source[close + 1] == ']') {
         close += 1
       }
-      if close + 1 < #len(source) && close + 1 <= end {
+      if close + 1 < source.len && close + 1 <= end {
         name := source[index + 2..close]
         index = close + 2
         if kind != ':' {
@@ -385,9 +355,7 @@ fn rx_fail(regex: *VimRegex, message: []const u8) usize {
 // A \% position item: recorded, and a callout (?Cn) placed where it stands,
 // so the matcher checks it at that point of the match.
 fn rx_filter(regex: *VimRegex, out: *RxOut, kind: u8, compare: u8, value: usize) bool {
-  if regex.filter_count == #len(regex.filters) {
-    return false
-  }
+  if regex.filter_count == regex.filters.len { return false }
   regex.filters[regex.filter_count] = VimRegexFilter{kind: kind, compare: compare, value: value}
   regex.filter_count += 1
   number: [1]u8 = ['0' + #cast(u8, regex.filter_count)]
@@ -398,9 +366,7 @@ fn rx_filter(regex: *VimRegex, out: *RxOut, kind: u8, compare: u8, value: usize)
 }
 // \% items after the %. Returns the index after the item, or 0 on error.
 fn rx_percent(source: []const u8, at: usize, out: *RxOut, regex: *VimRegex, atom: *usize) usize {
-  if at >= #len(source) {
-    return rx_fail(regex, "E71: Invalid character after \\%")
-  }
+  if at >= source.len { return rx_fail(regex, "E71: Invalid character after \\%") }
   byte := source[at]
   if byte == '^' {
     rx_add(out, "\\A")
@@ -421,15 +387,11 @@ fn rx_percent(source: []const u8, at: usize, out: *RxOut, regex: *VimRegex, atom
     atom.* = VimRxNone
     return at + 1
   }
-  if byte == 'C' {
-    return at + 1
-  }
+  if byte == 'C' { return at + 1 }
   if byte == 'd' || byte == 'x' || byte == 'u' || byte == 'U' || byte == 'o' {
     value: usize = 0
     after := rx_code(source, at + 1, byte, &value)
-    if after == at + 1 {
-      return rx_fail(regex, "E678: Invalid character after \\%[dxouU]")
-    }
+    if after == at + 1 { return rx_fail(regex, "E678: Invalid character after \\%[dxouU]") }
     atom.* = out.used
     rx_hex(out, value)
     return after
@@ -439,9 +401,9 @@ fn rx_percent(source: []const u8, at: usize, out: *RxOut, regex: *VimRegex, atom
     index := at + 1
     count: usize = 0
     atom.* = out.used
-    for index < #len(source) && source[index] != ']' {
+    for index < source.len && source[index] != ']' {
       rx_add(out, "(?:")
-      if source[index] == '\\' && index + 1 < #len(source) {
+      if source[index] == '\\' && index + 1 < source.len {
         rx_literal(out, source[index + 1])
         index += 2
       } else {
@@ -450,7 +412,7 @@ fn rx_percent(source: []const u8, at: usize, out: *RxOut, regex: *VimRegex, atom
           rx_literal(out, source[index])
         } else {
           for offset in 0..size {
-            if index + offset < #len(source) {
+            if index + offset < source.len {
               rx_byte(out, source[index + offset])
             }
           }
@@ -459,9 +421,7 @@ fn rx_percent(source: []const u8, at: usize, out: *RxOut, regex: *VimRegex, atom
       }
       count += 1
     }
-    if index >= #len(source) || count == 0 {
-      return rx_fail(regex, "E69: Missing ] after \\%[")
-    }
+    if index >= source.len || count == 0 { return rx_fail(regex, "E69: Missing ] after \\%[") }
     for step in 0..count {
       rx_add(out, ")?")
     }
@@ -474,10 +434,8 @@ fn rx_percent(source: []const u8, at: usize, out: *RxOut, regex: *VimRegex, atom
     compare = source[index]
     index += 1
   }
-  if index < #len(source) && source[index] == 39 {
-    if index + 1 >= #len(source) {
-      return rx_fail(regex, "E71: Invalid character after \\%")
-    }
+  if index < source.len && source[index] == 39 {
+    if index + 1 >= source.len { return rx_fail(regex, "E71: Invalid character after \\%") }
     if !rx_filter(regex, out, 'm', compare, source[index + 1]) {
       return rx_fail(regex, "Too many \\% position items.")
     }
@@ -486,16 +444,16 @@ fn rx_percent(source: []const u8, at: usize, out: *RxOut, regex: *VimRegex, atom
   }
   value: usize = 0
   digits := index
-  if index < #len(source) && source[index] == '.' {
+  if index < source.len && source[index] == '.' {
     value = VimRxCursor
     index += 1
   } else {
-    for index < #len(source) && source[index] >= '0' && source[index] <= '9' && value < 100000000 {
+    for index < source.len && source[index] >= '0' && source[index] <= '9' && value < 100000000 {
       value = value * 10 + (source[index] - '0')
       index += 1
     }
   }
-  if index == digits || index >= #len(source) || (source[index] != 'l' && source[index] != 'c' && source[index] != 'v') {
+  if index == digits || index >= source.len || (source[index] != 'l' && source[index] != 'c' && source[index] != 'v') {
     return rx_fail(regex, "E71: Invalid character after \\%")
   }
   if !rx_filter(regex, out, source[index], compare, value) {
@@ -508,33 +466,33 @@ fn rx_percent(source: []const u8, at: usize, out: *RxOut, regex: *VimRegex, atom
 fn rx_brace(source: []const u8, at: usize, out: *RxOut, regex: *VimRegex) usize {
   index := at
   lazy := false
-  if index < #len(source) && source[index] == '-' {
+  if index < source.len && source[index] == '-' {
     lazy = true
     index += 1
   }
   low_start := index
-  for index < #len(source) && source[index] >= '0' && source[index] <= '9' {
+  for index < source.len && source[index] >= '0' && source[index] <= '9' {
     index += 1
   }
   low := source[low_start..index]
   comma := false
   high: []const u8 = ""
-  if index < #len(source) && source[index] == ',' {
+  if index < source.len && source[index] == ',' {
     comma = true
     index += 1
     high_start := index
-    for index < #len(source) && source[index] >= '0' && source[index] <= '9' {
+    for index < source.len && source[index] >= '0' && source[index] <= '9' {
       index += 1
     }
     high = source[high_start..index]
   }
-  if index < #len(source) && source[index] == '\\' {
+  if index < source.len && source[index] == '\\' {
     index += 1
   }
-  if index >= #len(source) || source[index] != '}' {
+  if index >= source.len || source[index] != '}' {
     return rx_fail(regex, "E554: Syntax error in \\{...}")
   }
-  if #len(low) == 0 && #len(high) == 0 {
+  if low.len == 0 && high.len == 0 {
     rx_add(out, "*")
   } else if !comma {
     rx_add(out, "{")
@@ -543,7 +501,7 @@ fn rx_brace(source: []const u8, at: usize, out: *RxOut, regex: *VimRegex) usize 
     lazy = false
   } else {
     rx_add(out, "{")
-    if #len(low) == 0 {
+    if low.len == 0 {
       rx_add(out, "0")
     } else {
       rx_add(out, low)
@@ -561,12 +519,10 @@ fn rx_brace(source: []const u8, at: usize, out: *RxOut, regex: *VimRegex) usize 
 // previous atom. Returns the index after the item, or 0 on error.
 fn rx_around(source: []const u8, at: usize, out: *RxOut, regex: *VimRegex, atom: usize) usize {
   index := at
-  for index < #len(source) && source[index] >= '0' && source[index] <= '9' {
+  for index < source.len && source[index] >= '0' && source[index] <= '9' {
     index += 1
   }
-  if index >= #len(source) {
-    return rx_fail(regex, "E64: @ follows nothing")
-  }
+  if index >= source.len { return rx_fail(regex, "E64: @ follows nothing") }
   prefix: []const u8 = ""
   if source[index] == '=' {
     prefix = "(?="
@@ -574,10 +530,10 @@ fn rx_around(source: []const u8, at: usize, out: *RxOut, regex: *VimRegex, atom:
     prefix = "(?!"
   } else if source[index] == '>' {
     prefix = "(?>"
-  } else if source[index] == '<' && index + 1 < #len(source) && source[index + 1] == '=' {
+  } else if source[index] == '<' && index + 1 < source.len && source[index + 1] == '=' {
     prefix = "(?<="
     index += 1
-  } else if source[index] == '<' && index + 1 < #len(source) && source[index + 1] == '!' {
+  } else if source[index] == '<' && index + 1 < source.len && source[index + 1] == '!' {
     prefix = "(?<!"
     index += 1
   } else {
@@ -603,7 +559,7 @@ fn vim_regex(source: []const u8, magic: bool, previous: []const u8, output: []u8
   groups[0] = RxGroup{}
   atom := VimRxNone
   at: usize = 0
-  for at < #len(source) && !out.overflow && regex.valid {
+  for at < source.len && !out.overflow && regex.valid {
     token := rx_token(source, at)
     byte := token.byte
     fresh := out.used == groups[depth].branch
@@ -640,9 +596,9 @@ fn vim_regex(source: []const u8, magic: bool, previous: []const u8, output: []u8
         rx_byte(&out, '\\')
         rx_byte(&out, byte)
       } else if byte == 'z' {
-        if at < #len(source) && source[at] == 's' {
+        if at < source.len && source[at] == 's' {
           rx_add(&out, "\\K")
-        } else if at < #len(source) && source[at] == 'e' {
+        } else if at < source.len && source[at] == 'e' {
           if !groups[depth].ze {
             rx_add(&out, "(?=")
             groups[depth].ze = true
@@ -653,9 +609,7 @@ fn vim_regex(source: []const u8, magic: bool, previous: []const u8, output: []u8
         at += 1
         atom = VimRxNone
       } else if byte == '_' {
-        if at >= #len(source) {
-          return rx_fail(regex, "E63: Invalid use of \\_")
-        }
+        if at >= source.len { return rx_fail(regex, "E63: Invalid use of \\_") }
         next := source[at]
         at += 1
         if next == '^' {
@@ -671,9 +625,7 @@ fn vim_regex(source: []const u8, magic: bool, previous: []const u8, output: []u8
         } else if next == '[' {
           atom = out.used
           after := rx_collection(source, at, &out, true, regex)
-          if after == 0 {
-            return rx_fail(regex, "E769: Missing ] after \\_[")
-          }
+          if after == 0 { return rx_fail(regex, "E769: Missing ] after \\_[") }
           at = after
         } else if rx_class(next).valid {
           atom = out.used
@@ -717,7 +669,7 @@ fn vim_regex(source: []const u8, magic: bool, previous: []const u8, output: []u8
       }
       size := rx_char_size(byte)
       for offset in 0..size {
-        if at + offset < #len(source) {
+        if at + offset < source.len {
           rx_byte(&out, source[at + offset])
         }
       }
@@ -741,36 +693,24 @@ fn vim_regex(source: []const u8, magic: bool, previous: []const u8, output: []u8
         rx_add(&out, "?")
       }
     } else if byte == '{' {
-      if atom == VimRxNone {
-        return rx_fail(regex, "E64: { follows nothing")
-      }
+      if atom == VimRxNone { return rx_fail(regex, "E64: { follows nothing") }
       after := rx_brace(source, at, &out, regex)
-      if after == 0 {
-        return 0
-      }
+      if after == 0 { return 0 }
       at = after
     } else if byte == '@' {
-      if atom == VimRxNone {
-        return rx_fail(regex, "E64: @ follows nothing")
-      }
+      if atom == VimRxNone { return rx_fail(regex, "E64: @ follows nothing") }
       after := rx_around(source, at, &out, regex, atom)
-      if after == 0 {
-        return 0
-      }
+      if after == 0 { return 0 }
       at = after
     } else if byte == '(' {
-      if depth + 1 == #len(groups) {
-        return rx_fail(regex, "E51: Too many \\(")
-      }
+      if depth + 1 == groups.len { return rx_fail(regex, "E51: Too many \\(") }
       open := out.used
       rx_add(&out, "(")
       depth += 1
       groups[depth] = RxGroup{open: open, branch: out.used}
       atom = VimRxNone
     } else if byte == ')' {
-      if depth == 0 {
-        return rx_fail(regex, "E55: Unmatched \\)")
-      }
+      if depth == 0 { return rx_fail(regex, "E55: Unmatched \\)") }
       rx_close_ze(&out, &groups[depth])
       rx_add(&out, ")")
       atom = groups[depth].open
@@ -809,10 +749,8 @@ fn vim_regex(source: []const u8, magic: bool, previous: []const u8, output: []u8
         at = after
       }
     } else if byte == '%' {
-      if at < #len(source) && source[at] == '(' {
-        if depth + 1 == #len(groups) {
-          return rx_fail(regex, "E51: Too many \\(")
-        }
+      if at < source.len && source[at] == '(' {
+        if depth + 1 == groups.len { return rx_fail(regex, "E51: Too many \\(") }
         open := out.used
         rx_add(&out, "(?:")
         depth += 1
@@ -821,35 +759,23 @@ fn vim_regex(source: []const u8, magic: bool, previous: []const u8, output: []u8
         at += 1
       } else {
         after := rx_percent(source, at, &out, regex, &atom)
-        if after == 0 {
-          return 0
-        }
+        if after == 0 { return 0 }
         at = after
       }
     }
   }
-  if !regex.valid {
-    return 0
-  }
-  if depth != 0 {
-    return rx_fail(regex, "E54: Unmatched \\(")
-  }
+  if !regex.valid { return 0 }
+  if depth != 0 { return rx_fail(regex, "E54: Unmatched \\(") }
   rx_close_ze(&out, &groups[0])
-  if out.overflow {
-    return rx_fail(regex, "Pattern is too long.")
-  }
+  if out.overflow { return rx_fail(regex, "Pattern is too long.") }
   return out.used
 }
 // A whole PCRE2 pattern for source: (?m), case, then the body. ignore is the
 // case rule when the pattern has no \c or \C.
 fn vim_regex_query(source: []const u8, magic: bool, ignore: bool, previous: []const u8, output: []u8, regex: *VimRegex) usize {
-  if #len(output) < 16 {
-    return rx_fail(regex, "Pattern is too long.")
-  }
+  if output.len < 16 { return rx_fail(regex, "Pattern is too long.") }
   length := vim_regex(source, magic, previous, output[10..], regex)
-  if !regex.valid {
-    return 0
-  }
+  if !regex.valid { return 0 }
   prefix: []const u8 = "(?m)"
   if regex.case == 'c' || (regex.case == 0 && ignore) {
     prefix = "(?m)(?i)"
@@ -857,7 +783,7 @@ fn vim_regex_query(source: []const u8, magic: bool, ignore: bool, previous: []co
   // The body was written after room for the prefix; move it into place.
   buffer.copy(output, prefix)
   for index in 0..length {
-    output[#len(prefix) + index] = output[10 + index]
+    output[prefix.len + index] = output[10 + index]
   }
-  return #len(prefix) + length
+  return prefix.len + length
 }

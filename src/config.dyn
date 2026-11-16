@@ -60,20 +60,19 @@ extern fn system_font_families "dna_font_families"(output: *u8, capacity: usize)
 fn config_location(app: *App) {
   settings.defaults(&app.config)
   storage: [4096]u8
-  configured := host.environment("DNA_CONFIG", storage[..])
-  if !io.failed(configured.failure) && configured.found {
-    app.configuration.path_length = copy_text(app.configuration.path[..], configured.value)
+  configured := host.environment("DNA_CONFIG", storage[..]) catch storage[..0]
+  if configured.len > 0 {
+    app.configuration.path_length = copy_text(app.configuration.path[..], configured)
     return
   }
-  base := host.environment("XDG_CONFIG_HOME", storage[..])
-  if !io.failed(base.failure) && base.found && #len(base.value) > 0 {
-    app.configuration.path_length = copy_text(app.configuration.path[..], base.value)
+  base := host.environment("XDG_CONFIG_HOME", storage[..]) catch storage[..0]
+  if base.len > 0 {
+    app.configuration.path_length = copy_text(app.configuration.path[..], base)
   } else {
-    home := host.environment("HOME", storage[..])
-    if io.failed(home.failure) || !home.found {
+    home := host.environment("HOME", storage[..]) catch {
       return
     }
-    app.configuration.path_length = copy_text(app.configuration.path[..], home.value)
+    app.configuration.path_length = copy_text(app.configuration.path[..], home)
     add_text(app.configuration.path[..], &app.configuration.path_length, "/.config")
   }
   add_text(app.configuration.path[..], &app.configuration.path_length, "/dna/config.toml")
@@ -108,9 +107,13 @@ fn config_reload(app: *App, typography: *Typography, startup: bool) {
   mark := mem.arena_mark(app.scratch)
   defer mem.arena_rewind(app.scratch, mark)
   // Without a global file the defaults stand in, and a dna.toml still applies.
-  read := fs.ReadAllResult{}
-  if !io.failed(files.metadata(path).failure) {
-    read = fs.read_all(app.scratch, path, 16384)
+  read: []u8
+  meta := files.metadata(path) catch fs.Metadata{}
+  if meta.mode != 0 {
+    read = fs.read_all(app.scratch, path, 16384) catch {
+      notice(app, "Cannot read config (maximum 16 KiB).")
+      return
+    }
   } else if startup {
     project_config_find(app)
     if app.project_config.path_length == 0 {
@@ -118,14 +121,10 @@ fn config_reload(app: *App, typography: *Typography, startup: bool) {
       return
     }
   }
-  if io.failed(read.failure) {
-    notice(app, "Cannot read config (maximum 16 KiB).")
-    return
-  }
   parsed := settings.Settings{}
   settings.defaults(&parsed)
   global_layer := settings.Layer{}
-  if !settings.parse_layer(read.value, &parsed, &global_layer) {
+  if !settings.parse_layer(read, &parsed, &global_layer) {
     message: [256]u8
     used: usize = 0
     add_text(message[..], &used, "Invalid config at line ")
@@ -139,15 +138,15 @@ fn config_reload(app: *App, typography: *Typography, startup: bool) {
     // An invalid dna.toml leaves the global settings alone.
     settings.defaults(&parsed)
     retry_layer := settings.Layer{}
-    _ = settings.parse_layer(read.value, &parsed, &retry_layer)
+    _ = settings.parse_layer(read, &parsed, &retry_layer)
   }
   if app.project_config.path_length > 0 {
     app.project_config.stamp_ready = file_stamp(&app.project_config.path[0], &app.project_config.stamp[0]) != 0
   }
-  project_sections_apply(app, &parsed, &global_layer, read.value)
+  project_sections_apply(app, &parsed, &global_layer, read)
   // :set values for this session apply last; locks still hold.
   if app.configuration.overrides_length > 0 || app.configuration.module_overrides_length > 0 || app.configuration.place_overrides_length > 0 {
-    overrides := mem.push_bytes_uninit(app.scratch, 8192)
+    overrides := mem.push_bytes(app.scratch, 8192)
     session_layer := settings.Layer{project: true, trusted: true, session: true}
     session_layer.locks = global_layer.locks
     session_layer.lock_count = global_layer.lock_count
@@ -162,14 +161,12 @@ fn config_reload(app: *App, typography: *Typography, startup: bool) {
     }
   }
   colors := settings.Palette{light: parsed.light_theme}
-  if #len(parsed.theme_path) > 0 && !theme_prepare(app, parsed.theme_path, &colors) {
-    return
-  }
+  if parsed.theme_path.len > 0 && !theme_prepare(app, parsed.theme_path, &colors) { return }
   chosen_theme: []const u8 = "charcoal"
   if parsed.light_theme {
     chosen_theme = "light"
   }
-  if #len(parsed.theme_path) > 0 {
+  if parsed.theme_path.len > 0 {
     chosen_theme = parsed.theme_path
   }
   parsed.theme_path = ""
@@ -181,7 +178,7 @@ fn config_reload(app: *App, typography: *Typography, startup: bool) {
   if parsed.font_length > 0 {
     font_storage: [4096]u8
     font_path := expand_home(parsed.font[..parsed.font_length], font_storage[..])
-    if #len(font_path) == 0 {
+    if font_path.len == 0 {
       notice(app, "Invalid font path; settings unchanged.")
       return
     }
@@ -192,7 +189,7 @@ fn config_reload(app: *App, typography: *Typography, startup: bool) {
       return
     }
   }
-  if parsed.font_length == 0 && #len(parsed.font_family) > 0 {
+  if parsed.font_length == 0 && parsed.font_family.len > 0 {
     family: [257]u8
     resolved_family: [4096]u8
     _ = copy_text(family[..], parsed.font_family)
@@ -208,11 +205,11 @@ fn config_reload(app: *App, typography: *Typography, startup: bool) {
     }
   }
   fallback: rawptr = nil
-  if #len(parsed.fallback) > 0 {
+  if parsed.fallback.len > 0 {
     fallback_storage: [4096]u8
     fallback_path := expand_home(parsed.fallback, fallback_storage[..])
     resolved_fallback_length = copy_text(resolved_fallback[..], fallback_path)
-    if #len(fallback_path) > 0 {
+    if fallback_path.len > 0 {
       fallback = ttf.open(&fallback_storage[0], parsed.font_size * typography.scale)
     }
     if fallback == nil {
@@ -267,7 +264,7 @@ fn config_reload(app: *App, typography: *Typography, startup: bool) {
   parsed.font_family = app.configuration.font_family[..family_length]
   app.lsp.auto_started = 0
   app.lsp.default_started = 0
-  for configured_slot in 0..#len(app.documents.slots) {
+  for configured_slot in 0..app.documents.slots.len {
     reset_slot := app.documents.slots[configured_slot]
     filetype_dirty_slot(app, configured_slot)
     if reset_slot.inferred_filetype {
@@ -281,7 +278,7 @@ fn config_reload(app: *App, typography: *Typography, startup: bool) {
     parsed.document_padding = 0.0
   }
   // Copy settings, then rebind borrowed strings to App-owned storage.
-  app.configuration.global_source_length = copy_text(app.configuration.global_source[..], read.value)
+  app.configuration.global_source_length = copy_text(app.configuration.global_source[..], read)
   app.configuration.global_source_ready = true
   app.config = parsed
   modules_validate(app)
@@ -299,11 +296,11 @@ fn config_reload(app: *App, typography: *Typography, startup: bool) {
     binding_index += 1
   }
   _ = copy_text(app.configuration.task_commands[..1024], parsed.build_command)
-  app.config.build_command = app.configuration.task_commands[..#len(parsed.build_command)]
+  app.config.build_command = app.configuration.task_commands[..parsed.build_command.len]
   _ = copy_text(app.configuration.task_commands[1024..2048], parsed.test_command)
-  app.config.test_command = app.configuration.task_commands[1024..1024 + #len(parsed.test_command)]
+  app.config.test_command = app.configuration.task_commands[1024..1024 + parsed.test_command.len]
   _ = copy_text(app.configuration.task_commands[2048..3072], parsed.run_command)
-  app.config.run_command = app.configuration.task_commands[2048..2048 + #len(parsed.run_command)]
+  app.config.run_command = app.configuration.task_commands[2048..2048 + parsed.run_command.len]
   _ = tint(typography.primary_document, theme().text)
   _ = tint(typography.directory_text, theme().text)
   _ = tint(typography.palette, theme().text)
@@ -320,7 +317,8 @@ fn config_reload(app: *App, typography: *Typography, startup: bool) {
   app.view.revision += 1
   app.prompt_state.panel = Panel.None
   // A missing global file is a known state (zero stamps) until it appears.
-  app.configuration.stamp_ready = file_stamp(&app.configuration.path[0], &app.configuration.stamp[0]) != 0 || io.failed(files.metadata(path).failure)
+  meta_after := files.metadata(path) catch fs.Metadata{}
+  app.configuration.stamp_ready = file_stamp(&app.configuration.path[0], &app.configuration.stamp[0]) != 0 || meta_after.mode == 0
 }
 fn font_refresh(app: *App) {
   app.completion.count = 0
@@ -335,7 +333,7 @@ fn font_refresh(app: *App) {
     }
     path := app.resource_state.font_list[at..end]
     at = end + 1
-    if #len(path) < 512 && contains(path, app.prompt_state.text[..app.prompt_state.length]) {
+    if path.len < 512 && contains(path, app.prompt_state.text[..app.prompt_state.length]) {
       entry := &app.completion.entries[app.completion.count]
       entry.length = copy_text(entry.name[..], path)
       app.completion.count += 1
@@ -359,7 +357,7 @@ fn font_select(app: *App, typography: *Typography, path: []const u8) {
   }
   storage: [4096]u8
   expanded := expand_home(path, storage[..])
-  if #len(expanded) == 0 {
+  if expanded.len == 0 {
     notice(app, "Invalid font path.")
     return
   }
@@ -386,24 +384,12 @@ fn font_select(app: *App, typography: *Typography, path: []const u8) {
 // Logical navigation actions share configured bindings across documents and
 // the tree; command-valued bindings still use the normal palette dispatcher.
 fn configured_navigation(command:[]const u8)u32 {
-  if buffer.equal(command, "move-up") {
-    return KeyUp
-  }
-  if buffer.equal(command, "move-down") {
-    return KeyDown
-  }
-  if buffer.equal(command, "move-left") {
-    return KeyLeft
-  }
-  if buffer.equal(command, "move-right") {
-    return KeyRight
-  }
-  if buffer.equal(command, "page-up") {
-    return KeyPageUp
-  }
-  if buffer.equal(command, "page-down") {
-    return KeyPageDown
-  }
+  if buffer.equal(command, "move-up") { return KeyUp }
+  if buffer.equal(command, "move-down") { return KeyDown }
+  if buffer.equal(command, "move-left") { return KeyLeft }
+  if buffer.equal(command, "move-right") { return KeyRight }
+  if buffer.equal(command, "page-up") { return KeyPageUp }
+  if buffer.equal(command, "page-down") { return KeyPageDown }
   return 0
 }
 // A key sequence in progress ("g" of "g x"): its keys wait here until the
@@ -453,33 +439,21 @@ fn binding_stroke(app: *const App, key: u32, modifiers: u16) settings.Stroke {
   return settings.Stroke{key: key, modifiers: normalized, character: character}
 }
 fn binding_step(binding: *const settings.Binding, index: usize) settings.Stroke {
-  if binding.count == 0 {
-    return settings.Stroke{key: binding.key, modifiers: binding.modifiers}
-  }
+  if binding.count == 0 { return settings.Stroke{key: binding.key, modifiers: binding.modifiers} }
   return binding.steps[index]
 }
 fn binding_length(binding: *const settings.Binding) usize {
-  if binding.count == 0 {
-    return 1
-  }
+  if binding.count == 0 { return 1 }
   return binding.count
 }
 fn stroke_matches(want: settings.Stroke, typed: settings.Stroke) bool {
-  if want.character != 0 {
-    return typed.character == want.character
-  }
+  if want.character != 0 { return typed.character == want.character }
   return want.key == typed.key && want.modifiers == typed.modifiers
 }
 fn binding_applies(app: *const App, binding: *const settings.Binding, scope: u8) bool {
-  if binding.scope != scope {
-    return false
-  }
-  if binding.keymap == 1 {
-    return !app.config.vim_keys
-  }
-  if binding.keymap == 2 {
-    return app.config.vim_keys
-  }
+  if binding.scope != scope { return false }
+  if binding.keymap == 1 { return !app.config.vim_keys }
+  if binding.keymap == 2 { return app.config.vim_keys }
   return true
 }
 struct BindingMatch { exact: usize, has_exact: bool, longer: bool }
@@ -489,24 +463,18 @@ fn binding_search(app: *const App, keys: []const settings.Stroke, scope: u8) Bin
   exact_specific := false
   for index in 0..app.config.binding_count {
     binding := &app.config.bindings[index]
-    if !binding_applies(app, binding, scope) {
-      continue
-    }
+    if !binding_applies(app, binding, scope) { continue }
     length := binding_length(binding)
-    if length < #len(keys) {
-      continue
-    }
+    if length < keys.len { continue }
     matched := true
-    for step in 0..#len(keys) {
+    for step in 0..keys.len {
       if !stroke_matches(binding_step(binding, step), keys[step]) {
         matched = false
         break
       }
     }
-    if !matched {
-      continue
-    }
-    if length > #len(keys) {
+    if !matched { continue }
+    if length > keys.len {
       result.longer = true
     } else if !result.has_exact || (!exact_specific && binding.keymap != 0) {
       result.exact = index
@@ -519,9 +487,7 @@ fn binding_search(app: *const App, keys: []const settings.Stroke, scope: u8) Bin
 fn configured_binding(app:*const App, key:u32, modifiers:u16, scope:u8)*const settings.Binding {
   keys: [1]settings.Stroke = [binding_stroke(app, key, modifiers)]
   found := binding_search(app, keys[..], scope)
-  if !found.has_exact {
-    return nil
-  }
+  if !found.has_exact { return nil }
   return &app.config.bindings[found.exact]
 }
 fn binding_scope(app: *App) u8 {
@@ -537,22 +503,14 @@ fn binding_scope(app: *App) u8 {
   if app.prompt_state.panel != Panel.None || app.documents.slots[app.documents.active].terminal.handle != nil || app.input_state.pending != 0 || app.register_state.pending {
     return 0
   }
-  if app.view.insert {
-    return settings.ScopeInsert
-  }
+  if app.view.insert { return settings.ScopeInsert }
   if app.config.vim_keys {
     // A count may come first: 3Y with Y = "keys:y$" yanks three lines.
-    if vim_binding_blocked(app) {
-      return 0
-    }
-    if vim_visual(app) {
-      return settings.ScopeSelect
-    }
+    if vim_binding_blocked(app) { return 0 }
+    if vim_visual(app) { return settings.ScopeSelect }
     return settings.ScopeNormal
   }
-  if app.view.extend {
-    return settings.ScopeSelect
-  }
+  if app.view.extend { return settings.ScopeSelect }
   return settings.ScopeNormal
 }
 // Keys typed by a "keys:" binding are never remapped (like Vim's noremap).
@@ -572,9 +530,7 @@ fn configured_key(app: *App, typography: *Typography, key: u32, modifiers: u16) 
     binding_flush(app, typography)
     scope = binding_scope(app)
   }
-  if scope == 0 {
-    return false
-  }
+  if scope == 0 { return false }
   typed := binding_stroke(app, key, modifiers)
   keys: [5]settings.Stroke
   for index in 0..state.count {
@@ -602,9 +558,7 @@ fn configured_key(app: *App, typography: *Typography, key: u32, modifiers: u16) 
     binding_run(app, typography, found.exact)
     return true
   }
-  if state.count == 0 {
-    return false
-  }
+  if state.count == 0 { return false }
   // The new key breaks the sequence: the waiting keys run first, then this
   // key is looked at afresh.
   binding_flush(app, typography)
@@ -621,9 +575,7 @@ fn binding_unrecord(app: *App) {
 fn binding_flush(app: *App, typography: *Typography) {
   state := &app.binding_state
   count := state.count
-  if count == 0 {
-    return
-  }
+  if count == 0 { return }
   state.count = 0
   if state.has_exact {
     state.has_exact = false
@@ -653,9 +605,7 @@ fn binding_flush(app: *App, typography: *Typography) {
   app.input_state.character = saved_character
 }
 fn binding_tick(app: *App, typography: *Typography) bool {
-  if app.binding_state.count == 0 || sdl.ticks() < app.binding_state.deadline {
-    return false
-  }
+  if app.binding_state.count == 0 || sdl.ticks() < app.binding_state.deadline { return false }
   binding_flush(app, typography)
   return true
 }
@@ -668,7 +618,7 @@ fn binding_run(app: *App, typography: *Typography, index: usize) {
     }
     return
   }
-  if #len(command) > 5 && buffer.equal(command[..5], "keys:") {
+  if command.len > 5 && buffer.equal(command[..5], "keys:") {
     if app.prompt_state.panel == Panel.Leader {
       app.prompt_state.panel = Panel.None
       app.input_state.leader_explorer = false
@@ -738,9 +688,7 @@ fn config_watch(app: *App, typography: *Typography) bool {
   if changed_path < 0 {
     configuration_release(app)
   }
-  if changed_path == 0 && now < app.configuration.watch_due {
-    return false
-  }
+  if changed_path == 0 && now < app.configuration.watch_due { return false }
   interval: u64 = 1000
   if app.configuration.watcher != nil && app.configuration.notifications {
     interval = 30000
@@ -781,9 +729,7 @@ fn config_watch(app: *App, typography: *Typography) bool {
       changed = true
     }
   }
-  if !changed && app.configuration.stamp_ready {
-    return false
-  }
+  if !changed && app.configuration.stamp_ready { return false }
   app.configuration.stamp = current
   app.configuration.stamp_ready = true
   previous_panel := app.prompt_state.panel

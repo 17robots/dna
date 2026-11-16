@@ -1,14 +1,18 @@
-use "std/io" io
-use "../../src/owned_arena" arena_owner
-use "../../src/files" files
-use "../../src/buffer" buffer
-use "std/fs" std_fs
+use io "std/io"
+use arena_owner "../../src/owned_arena"
+use files "../../src/files"
+use buffer "../../src/buffer"
+use std_fs "std/fs"
 use "std/mem"
-use "std/process" process
+use process "std/process"
 fn require_empty(error: []const u8) {
-  if #len(error) != 0 {
+  if error.len != 0 {
     #panic(error)
   }
+}
+fn exists(path: []const u8) bool {
+  _ = std_fs.metadata(path) catch { return false }
+  return true
 }
 fn main() {
   arena := arena_owner.create(#sizeof(buffer.Document) + 2097152)
@@ -17,7 +21,7 @@ fn main() {
   _ = buffer.load(doc, "first\n")
   state := files.State{}
   require_empty(files.save(&state, doc, "sample.txt", arena))
-  if buffer.dirty(doc) || std_fs.metadata("sample.txt").failure.kind != io.Kind.Ok {
+  if buffer.dirty(doc) || !exists("sample.txt") {
     #panic("new save")
   }
   if #syscall(90, &state.path[0], 448) != 0 {
@@ -27,35 +31,36 @@ fn main() {
   _ = buffer.replace(doc, "second\n")
   _ = buffer.replace(doc, "third\n")
   require_empty(files.save(&state, doc, "sample.txt", arena))
-  if (std_fs.metadata("sample.txt").mode & 511) != 448 || std_fs.metadata("sample.txt.dna-recovery").failure.kind == io.Kind.Ok {
+  saved_meta := std_fs.metadata("sample.txt") catch { #panic("saved metadata") }
+  if (saved_meta.mode & 511) != 448 || exists("sample.txt.dna-recovery") {
     #panic("permissions or recovery cleanup")
   }
-  _ = std_fs.write_all("sample.txt", "external\n")
+  std_fs.write_all("sample.txt", "external\n") catch { #panic("external write") }
   _ = buffer.replace(doc, "local\n")
-  if #len(files.save(&state, doc, "sample.txt", arena)) == 0 {
+  if files.save(&state, doc, "sample.txt", arena).len == 0 {
     #panic("external conflict accepted")
   }
-  check := std_fs.read_all(arena, "sample.txt", 100)
-  if check.failure.kind != io.Kind.Ok || !buffer.equal(check.value, "external\n") {
+  check := std_fs.read_all(arena, "sample.txt", 100) catch { #panic("external content lost") }
+  if !buffer.equal(check, "external\n") {
     #panic("external content lost")
   }
-  if #len(files.open(&state, doc, "sample.txt", arena)) == 0 {
+  if files.open(&state, doc, "sample.txt", arena).len == 0 {
     #panic("dirty open accepted")
   }
   require_empty(files.save(&state, doc, "new.txt", arena))
-  if #len(files.save(&state, doc, "sample.txt", arena)) == 0 {
+  if files.save(&state, doc, "sample.txt", arena).len == 0 {
     #panic("save-as overwrite accepted")
   }
   buffer.move_to(doc, doc.length, false)
   _ = buffer.replace(doc, "recover me\n")
-  if std_fs.write_all("new.txt.dna-recovery", buffer.all(doc)).failure.kind != io.Kind.Ok {
+  std_fs.write_all("new.txt.dna-recovery", buffer.all(doc)) catch {
     #panic("legacy recovery fixture")
   }
   // Simulate a fresh editor after a crash: sidecar exists, original still saved.
   state.recovery_owned = false
   _ = buffer.load(doc, "")
   require_empty(files.open(&state, doc, "new.txt", arena))
-  if std_fs.metadata("new.txt.dna-recovery").failure.kind != io.Kind.Ok {
+  if !exists("new.txt.dna-recovery") {
     #panic("unclaimed legacy recovery lost")
   }
   require_empty(files.recover(&state, doc, arena))
@@ -64,40 +69,39 @@ fn main() {
   }
   files.discard_recovery(&state)
   _ = buffer.load(doc, "")
-  if #len(files.open(&state, doc, "link.txt", arena)) == 0 {
+  if files.open(&state, doc, "link.txt", arena).len == 0 {
     #panic("symlink opened")
   }
   _ = buffer.replace(doc, "safe")
-  if #len(files.save(&state, doc, "link.txt", arena)) == 0 {
+  if files.save(&state, doc, "link.txt", arena).len == 0 {
     #panic("symlink replaced")
   }
   _ = buffer.load(doc, "unchanged")
-  if #len(files.open(&state, doc, "binary.txt", arena)) == 0 || !buffer.equal(buffer.all(doc), "unchanged") {
+  if files.open(&state, doc, "binary.txt", arena).len == 0 || !buffer.equal(buffer.all(doc), "unchanged") {
     #panic("invalid read mutated document")
   }
   before := state
   revision := doc.revision
   invalid: [5]u8 = [110, 101, 119, 255, 10]
-  if std_fs.write_all("invalid-utf8.txt", invalid[..]).failure.kind != io.Kind.Ok || std_fs.write_all("new.txt.dna-recovery", "owned recovery").failure.kind != io.Kind.Ok {
-    #panic("invalid-open fixture")
-  }
+  std_fs.write_all("invalid-utf8.txt", invalid[..]) catch { #panic("invalid-open fixture") }
+  std_fs.write_all("new.txt.dna-recovery", "owned recovery") catch { #panic("invalid-open fixture") }
   state.recovery_owned = true
-  if #len(files.open(&state, doc, "invalid-utf8.txt", arena)) == 0 || doc.revision != revision || !buffer.equal(buffer.all(doc), "unchanged") || !buffer.equal(files.name(&state), files.name(&before)) || !state.recovery_owned || std_fs.metadata("new.txt.dna-recovery").failure.kind != io.Kind.Ok {
+  if files.open(&state, doc, "invalid-utf8.txt", arena).len == 0 || doc.revision != revision || !buffer.equal(buffer.all(doc), "unchanged") || !buffer.equal(files.name(&state), files.name(&before)) || !state.recovery_owned || !exists("new.txt.dna-recovery") {
     #panic("failed open changed buffer, filename or recovery ownership")
   }
   files.discard_recovery(&state)
   // Size alone no longer rejects a file; this sparse fixture is all NUL bytes.
-  if #len(files.open(&state, doc, "large.txt", arena)) == 0 || !buffer.equal(buffer.all(doc), "unchanged") {
+  if files.open(&state, doc, "large.txt", arena).len == 0 || !buffer.equal(buffer.all(doc), "unchanged") {
     #panic("NUL-filled large file accepted")
   }
-  if #len(files.open(&state, doc, "pipe.txt", arena)) == 0 {
+  if files.open(&state, doc, "pipe.txt", arena).len == 0 {
     #panic("FIFO accepted")
   }
   resolved: [4096]u8
   alternate: [4096]u8
   a := files.resolve("../../src/sample.txt", resolved[..])
   b := files.resolve("sample.txt", alternate[..])
-  if #len(a) == 0 || !buffer.equal(a, b) {
+  if a.len == 0 || !buffer.equal(a, b) {
     #panic("path aliases")
   }
 }

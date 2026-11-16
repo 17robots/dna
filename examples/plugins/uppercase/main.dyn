@@ -1,11 +1,10 @@
-use "std/parse" parse
 use "std/io"
 use "std/mem"
 use "std/encoding/json"
 use "std/bytes"
 
 fn send(text: []const u8) {
-  _ = io.write_all(io.stdout(), text)
+  io.write(io.stdout(), text) catch {}
 }
 fn main() {
   memory := mem.arena_alloc(2097152)
@@ -14,47 +13,38 @@ fn main() {
   length: usize = 0
   byte: [1]u8
   for true {
-    received := io.read(io.stdin(), byte[..])
-    if received.transferred == 0 {
+    received := io.read(io.stdin(), byte[..]) catch {
       return
     }
+    if received == 0 { return }
     if byte[0] != 10 {
-      if length == 524287 {
-        return
-      }
+      if length == 524287 { return }
       line[length] = byte[0]
       length += 1
       continue
     }
     mem.arena_reset(memory)
-    parsed := json.parse(memory, line[..length])
+    root := json.parse(memory, line[..length]) catch {
+      return
+    }
     length = 0
-    if parsed.failure.kind != parse.Kind.Ok {
-      return
-    }
-    kind := json.object_get(parsed.root, "type")
-    if !json.is_string(kind) {
-      return
-    }
+    kind := json.object_get(root, "type")
+    if !json.is_string(kind) { return }
     if bytes.equal(kind.text, "initialize") {
       send("{\"type\":\"command\",\"name\":\"Uppercase buffer\"}\n{\"type\":\"ready\"}\n")
     } else if bytes.equal(kind.text, "command") {
-      text := json.object_get(parsed.root, "text")
-      revision := json.object_get(parsed.root, "revision")
-      target := json.object_get(parsed.root, "buffer")
-      if !json.is_string(text) || !json.is_number(revision) || !json.is_number(target) {
-        return
-      }
+      text := json.object_get(root, "text")
+      revision := json.object_get(root, "revision")
+      target := json.object_get(root, "buffer")
+      if !json.is_string(text) || !json.is_number(revision) || !json.is_number(target) { return }
       result := json.push_object(memory)
       _ = json.add_member(result, "type", json.push_string(memory, "replace"))
       _ = json.add_member(result, "revision", json.push_number(memory, revision.text))
       _ = json.add_member(result, "buffer", json.push_number(memory, target.text))
       output: [65536]u8
-      if #len(text.text) > 65535 {
-        return
-      }
+      if text.text.len > 65535 { return }
       index: usize = 0
-      for index < #len(text.text) {
+      for index < text.text.len {
         character := text.text[index]
         if character >= 97 && character <= 122 {
           character -= 32
@@ -62,8 +52,8 @@ fn main() {
         output[index] = character
         index += 1
       }
-      _ = json.add_member(result, "text", json.push_string(memory, output[..#len(text.text)]))
-      _ = json.write(io.stdout(), result)
+      _ = json.add_member(result, "text", json.push_string(memory, output[..text.text.len]))
+      json.write(io.stdout(), result) catch {}
       send("\n{\"type\":\"done\"}\n")
     }
   }

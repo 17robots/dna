@@ -57,7 +57,7 @@ fn main(){
  defer quit()
  path: [4096]u8
  name:="FONT_PATH"
- _=mem.copy(path[..#len(name)],name)
+ _=mem.copy(path[..name.len],name)
  font:=ttf_open(&path[0],32.0)
  check(font!=nil)
  defer ttf_close(font)
@@ -66,7 +66,7 @@ fn main(){
  CASES
  if true {
   source:="aéz"
-  text:=ttf_create(renderer,font,&source[0],#len(source))
+  text:=ttf_create(renderer,font,&source[0],source.len)
   check(text!=nil)
   recorded:=Captured{}
   check(!ttf_selection(text,2,3,capture,&recorded) && recorded.count==0)
@@ -83,10 +83,10 @@ fn main(){
  }
  if true {
   source:="ab\n\nאב"
-  text:=ttf_create(renderer,font,&source[0],#len(source))
+  text:=ttf_create(renderer,font,&source[0],source.len)
   check(text!=nil)
   recorded:=Captured{}
-  check(ttf_selection(text,0,#len(source),capture,&recorded) && recorded.count==2)
+  check(ttf_selection(text,0,source.len,capture,&recorded) && recorded.count==2)
   check(recorded.regions[0].line==0 && recorded.regions[1].line==2 && recorded.regions[1].y>recorded.regions[0].y)
   recorded=Captured{}
   check(ttf_selection(text,2,4,capture,&recorded) && recorded.count==0)
@@ -97,7 +97,7 @@ fn main(){
   handle:=ttf_create(renderer,font,&source[0],2)
   check(handle!=nil)
   text:=#cast(*NativeText,handle)
-  check(#len(text.layout.glyphs)==2)
+  check(text.layout.glyphs.len==2)
   text.layout.glyphs[0].x= -2147483647.0
   text.layout.glyphs[0].advance=2147483647.0
   text.layout.glyphs[1].x=0.0
@@ -108,8 +108,8 @@ fn main(){
  }
 }
 '''
-TUI=r'''use "./text" text
-use "./platform" sdl
+TUI=r'''use text "./text"
+use sdl "./platform"
 fn check(ok:bool){if !ok{#panic("TUI selection geometry")}}
 struct Captured {count:usize,width:i32,first:i32,last:i32,stop:bool}
 fn capture(data:rawptr,region:*const text.Substring)bool {
@@ -127,7 +127,7 @@ fn main(){
  check(handle!=nil)
  defer text.destroy(handle)
  source:="a\xcc\x81\t中z"
- check(text.set(handle,&source[0],#len(source)))
+ check(text.set(handle,&source[0],source.len))
  result:=Captured{}
  check(text.selection(handle,1,3,capture,&result) && result.count==1 && result.width==8 && result.first==0)
  result=Captured{}
@@ -140,15 +140,15 @@ fn main(){
  check(!text.selection(handle,0,99,capture,&result) && result.count==0)
  check(text.selection(handle,7,7,capture,&result) && result.count==0)
  result.stop=true
- check(!text.selection(handle,0,#len(source),capture,&result) && result.count==1)
+ check(!text.selection(handle,0,source.len,capture,&result) && result.count==1)
  // A long selected line walks cells once rather than querying each prefix.
  owner:=mem.arena_alloc(0)
  defer mem.arena_release(owner)
- bytes:=mem.push_bytes_uninit(owner,20000)
- for i in 0..#len(bytes) {bytes[i]=97}
- check(text.set(handle,&bytes[0],#len(bytes)))
+ bytes:=mem.push_bytes(owner,20000)
+ for i in 0..bytes.len {bytes[i]=97}
+ check(text.set(handle,&bytes[0],bytes.len))
  result=Captured{}
- check(text.selection(handle,0,#len(bytes),capture,&result) && result.count==20000 && result.width==160000)
+ check(text.selection(handle,0,bytes.len,capture,&result) && result.count==20000 && result.width==160000)
 }
 '''
 def literal(data): return '"'+''.join(f'\\x{x:02x}' for x in data)+'"'
@@ -196,7 +196,7 @@ with tempfile.TemporaryDirectory(prefix='dna-selection-') as directory:
     flags=shlex.split(subprocess.check_output(['pkg-config','--cflags','--libs','harfbuzz','fribidi'],text=True))
     subprocess.run(['cc','-std=c11','-O2',str(work/'oracle.c'),*flags,'-o',str(work/'oracle')],check=True)
     stage=work/'native';stage.mkdir();(stage/'platform').mkdir();(stage/'platform/platform.dyn').write_text(PLATFORM)
-    backend=(ROOT/'src/text/native.dyn').read_text().replace('use "../platform" sdl','use "./platform" sdl')
+    backend=(ROOT/'src/text/native.dyn').read_text().replace('use sdl "../platform"','use sdl "./platform"')
     backend=re.sub(r'extern fn native_text_attach[^\n]+','fn native_text_attach(callbacks:*const NativeTextCallbacks)bool{return dna_native_text_attach(callbacks)}',backend)
     backend=re.sub(r'extern fn native_tracked_create[^\n]+','fn native_tracked_create(engine:rawptr,font:rawptr,text:*const u8,length:usize)rawptr{return dna_text_create(engine,font,text,length)}',backend)
     backend=re.sub(r'extern fn native_tracked_destroy[^\n]+','fn native_tracked_destroy(text:rawptr){dna_text_destroy(text)}',backend)
@@ -210,7 +210,7 @@ with tempfile.TemporaryDirectory(prefix='dna-selection-') as directory:
         records=output.read_bytes();records=[struct.unpack('<8i',records[i:i+32]) for i in range(4,len(records),32)]
         data=source.encode();offsets=[0]
         for char in source:offsets.append(offsets[-1]+len(char.encode()))
-        lines=[f'if true {{ source:[]const u8={literal(data)}','handle:=ttf_create(renderer,font,&source[0],#len(source))','check(handle!=nil)']
+        lines=[f'if true {{ source:[]const u8={literal(data)}','handle:=ttf_create(renderer,font,&source[0],source.len)','check(handle!=nil)']
         for start in offsets:
             for end in offsets:
                 if end<start:continue

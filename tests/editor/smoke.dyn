@@ -1,13 +1,16 @@
-use "std/io" io
-use "std/parse" parse
+use io "std/io"
+use parse "std/parse"
+fn smoke_exists(path: []const u8) bool {
+  _ = files.metadata(path) catch { return false }
+  return true
+}
 // Run only when the test runner supplies an isolated fixture directory.
 fn workflow_smoke(app: *App, typography: *Typography) {
   location: [4096]u8
-  configured := host.environment("DNA_WORKFLOW_TEST", location[..])
-  if configured.failure.kind != io.Kind.Ok || !configured.found {
+  configured := host.environment("DNA_WORKFLOW_TEST", location[..]) catch {
     return
   }
-  app.directory_state.length = copy_text(app.directory_state.path[..], configured.value)
+  app.directory_state.length = copy_text(app.directory_state.path[..], configured)
   path: [4096]u8
   initial := joined(app, "input.txt", path[..])
   action(app, typography, 0)
@@ -98,7 +101,7 @@ fn workflow_smoke(app: *App, typography: *Typography) {
   }
   trash_storage: [4096]u8
   trashed := joined(app, ".dna-trash/renamed.txt", trash_storage[..])
-  if files.metadata(trashed).failure.kind != io.Kind.Ok {
+  if !smoke_exists(trashed) {
     #panic("recoverable trash missing")
   }
   app.prompt_state.panel = Panel.None
@@ -227,8 +230,7 @@ fn session_smoke(app: *App, typography: *Typography) {
 }
 fn completion_smoke(app: *App, typography: *Typography) {
   storage: [4096]u8
-  directory := host.environment("DNA_WORKFLOW_TEST", storage[..])
-  if directory.failure.kind != io.Kind.Ok || !directory.found {
+  directory := host.environment("DNA_WORKFLOW_TEST", storage[..]) catch {
     return
   }
   old := app.documents.active
@@ -238,7 +240,7 @@ fn completion_smoke(app: *App, typography: *Typography) {
   if app.prompt_state.panel != Panel.Open {
     #panic("leader open")
   }
-  text_input(app, directory.value)
+  text_input(app, directory)
   text_input(app, "/sub")
   picker_wait_smoke(app)
   if app.completion.count != 1 || app.completion.entries[0].directory || !buffer.equal(app.completion.entries[0].name[..app.completion.entries[0].length], "subdir/other.txt") {
@@ -315,7 +317,7 @@ fn completion_smoke(app: *App, typography: *Typography) {
   if app.prompt_state.panel != Panel.Open {
     #panic("space file picker")
   }
-  text_input(app, directory.value)
+  text_input(app, directory)
   text_input(app, "/oth")
   picker_wait_smoke(app)
   if app.completion.count != 1 || app.completion.entries[0].directory {
@@ -335,20 +337,19 @@ fn completion_smoke(app: *App, typography: *Typography) {
   key_input(app, typography, 27, 0)
   expanded: [4096]u8
   home: [4096]u8
-  env := host.environment("HOME", home[..])
+  env := host.environment("HOME", home[..]) catch home[..0]
   result := expand_home("~/", expanded[..])
-  if env.failure.kind == io.Kind.Ok && env.found && (#len(result) != #len(env.value) + 1 || !buffer.equal(result[..#len(env.value)], env.value)) {
+  if env.len > 0 && (result.len != env.len + 1 || !buffer.equal(result[..env.len], env)) {
     #panic("home expansion")
   }
 }
 fn explorer_smoke(app: *App, typography: *Typography) {
   configured_storage: [4096]u8
-  configured := host.environment("DNA_WORKFLOW_TEST", configured_storage[..])
-  if configured.failure.kind != io.Kind.Ok || !configured.found {
+  configured := host.environment("DNA_WORKFLOW_TEST", configured_storage[..]) catch {
     return
   }
   root: [4096]u8
-  root_length := copy_text(root[..], configured.value)
+  root_length := copy_text(root[..], configured)
   add_text(root[..], &root_length, "/explorer")
   app.directory_state.length = copy_text(app.directory_state.path[..], root[..root_length])
   app.prompt_state.panel = Panel.Directory
@@ -483,7 +484,7 @@ fn explorer_smoke(app: *App, typography: *Typography) {
   existing := joined(app, "alpha.txt", existing_storage[..])
   created_storage: [4096]u8
   created := joined(app, "created.txt", created_storage[..])
-  if files.metadata(existing).failure.kind != io.Kind.Ok || files.metadata(created).failure.kind == io.Kind.Ok {
+  if !smoke_exists(existing) || smoke_exists(created) {
     #panic("preview mutated disk")
   }
   key_input(app, typography, 27, 0)
@@ -492,7 +493,7 @@ fn explorer_smoke(app: *App, typography: *Typography) {
   }
   explorer_preview(app)
   key_input(app, typography, 13, 0)
-  if app.prompt_state.panel != Panel.Directory || explorer_dirty(app) || files.metadata(existing).failure.kind == io.Kind.Ok || files.metadata(created).failure.kind != io.Kind.Ok {
+  if app.prompt_state.panel != Panel.Directory || explorer_dirty(app) || smoke_exists(existing) || !smoke_exists(created) {
     #panic("apply staged explorer edits")
   }
   if !buffer.equal(buffer.all(app.documents.current), "alpha contents") || !contains(files.name(app.documents.file), "/renamed.txt") {
@@ -519,16 +520,16 @@ fn explorer_smoke(app: *App, typography: *Typography) {
   }
   buffer.undo(app.documents.current)
   explorer_preview(app)
-  if app.prompt_state.panel != Panel.DirectoryApply || files.metadata(child_path).failure.kind != io.Kind.Ok {
+  if app.prompt_state.panel != Panel.DirectoryApply || !smoke_exists(child_path) {
     #panic("directory trash preview")
   }
   key_input(app, typography, 27, 0)
-  if files.metadata(child_path).failure.kind != io.Kind.Ok || !explorer_dirty(app) {
+  if !smoke_exists(child_path) || !explorer_dirty(app) {
     #panic("directory trash cancel")
   }
   explorer_preview(app)
   key_input(app, typography, 13, 0)
-  if app.prompt_state.panel != Panel.Directory || files.metadata(child_path).failure.kind == io.Kind.Ok || !contains(files.name(app.documents.file), "/.dna-trash/keep/child.txt") {
+  if app.prompt_state.panel != Panel.Directory || smoke_exists(child_path) || !contains(files.name(app.documents.file), "/.dna-trash/keep/child.txt") {
     #panic("directory trash apply and child path")
   }
   close_clean(app)
@@ -536,13 +537,13 @@ fn explorer_smoke(app: *App, typography: *Typography) {
   // Duplicate destinations fail; bracket-prefixed names are ordinary filenames.
   buffer.move_to(doc, doc.length, false)
   _ = buffer.replace(doc, "created.txt\n")
-  if #len(explorer_plan(app)) == 0 {
+  if explorer_plan(app).len == 0 {
     #panic("duplicate destination accepted")
   }
   explorer_load(app)
   buffer.move_to(doc, doc.length, false)
   _ = buffer.replace(doc, "[1] extra.txt\n")
-  if #len(explorer_plan(app)) != 0 || app.explorer.edit_count != 1 {
+  if explorer_plan(app).len != 0 || app.explorer.edit_count != 1 {
     #panic("literal bracket filename rejected")
   }
   explorer_load(app)
@@ -555,28 +556,30 @@ fn explorer_smoke(app: *App, typography: *Typography) {
   }
   folder_storage: [4096]u8
   folder_path := joined(app, "new-folder", folder_storage[..])
-  if files.metadata(folder_path).failure.kind == io.Kind.Ok {
+  if smoke_exists(folder_path) {
     #panic("folder created before confirmation")
   }
   key_input(app, typography, 27, 0)
-  if !explorer_dirty(app) || files.metadata(folder_path).failure.kind == io.Kind.Ok {
+  if !explorer_dirty(app) || smoke_exists(folder_path) {
     #panic("folder preview cancellation")
   }
   explorer_preview(app)
   explorer_apply(app)
-  folder_info := files.metadata(folder_path)
-  if folder_info.failure.kind != io.Kind.Ok || (folder_info.mode & 61440) != 16384 || explorer_dirty(app) {
+  folder_info := files.metadata(folder_path) catch {
+    #panic("folder creation apply")
+  }
+  if (folder_info.mode & 61440) != 16384 || explorer_dirty(app) {
     #panic("folder creation apply")
   }
   buffer.move_to(doc, doc.length, false)
   _ = buffer.replace(doc, "new-folder\n")
-  if #len(explorer_plan(app)) == 0 {
+  if explorer_plan(app).len == 0 {
     #panic("file folder duplicate accepted")
   }
   explorer_load(app)
   buffer.move_to(doc, doc.length, false)
   _ = buffer.replace(doc, "nested/child/\n")
-  if #len(explorer_plan(app)) == 0 {
+  if explorer_plan(app).len == 0 {
     #panic("nested folder path accepted")
   }
   explorer_load(app)
@@ -589,7 +592,7 @@ fn explorer_smoke(app: *App, typography: *Typography) {
   }
   collision_storage: [4096]u8
   collision := joined(app, "collision.txt", collision_storage[..])
-  if fs.write_all(collision, "external").failure.kind != io.Kind.Ok {
+  fs.write_all(collision, "external") catch {
     #panic("collision fixture write")
   }
   explorer_apply(app)
@@ -612,14 +615,20 @@ fn explorer_smoke(app: *App, typography: *Typography) {
   renamed := joined(app, "renamed.txt", renamed_storage[..])
   backup_storage: [4096]u8
   backup := joined(app, "external-backup.txt", backup_storage[..])
-  if fs.rename(renamed, backup).failure.kind != io.Kind.Ok || fs.write_all(renamed, "external replacement").failure.kind != io.Kind.Ok {
+  fs.rename(renamed, backup) catch {
+    #panic("external replacement fixture")
+  }
+  fs.write_all(renamed, "external replacement") catch {
     #panic("external replacement fixture")
   }
   explorer_apply(app)
   if app.prompt_state.panel != Panel.Message {
     #panic("changed source accepted")
   }
-  if fs.remove(renamed).failure.kind != io.Kind.Ok || fs.rename(backup, renamed).failure.kind != io.Kind.Ok {
+  fs.remove(renamed) catch {
+    #panic("restore external fixture")
+  }
+  fs.rename(backup, renamed) catch {
     #panic("restore external fixture")
   }
   app.explorer.quit_after_discard = false
@@ -653,7 +662,7 @@ fn explorer_smoke(app: *App, typography: *Typography) {
   _ = buffer.replace(doc, "another.txt")
   key_input(app, typography, 58, 0)
   text_input(app, "w ")
-  text_input(app, configured.value)
+  text_input(app, configured)
   text_input(app, "/accidental.txt")
   key_input(app, typography, 13, 0)
   if app.prompt_state.panel != Panel.Message {
@@ -1350,16 +1359,15 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
   picker_mouse_smoke(renderer, typography)
   font_identity_smoke(app, typography)
   location: [4096]u8
-  configured := host.environment("DNA_WORKFLOW_TEST", location[..])
-  if configured.failure.kind != io.Kind.Ok || !configured.found {
+  configured := host.environment("DNA_WORKFLOW_TEST", location[..]) catch {
     return
   }
   previous: [4096]u8
   previous_length := copy_text(previous[..], app.workspace.project[..app.workspace.project_length])
   active := app.documents.active
   doc := app.documents.current
-  project_cd(app, configured.value)
-  if !buffer.equal(app.workspace.project[..app.workspace.project_length], configured.value) || app.documents.active != active || app.documents.current != doc {
+  project_cd(app, configured)
+  if !buffer.equal(app.workspace.project[..app.workspace.project_length], configured) || app.documents.active != active || app.documents.current != doc {
     #panic("cd preserves active document")
   }
   project_cd(app, "subdir")
@@ -1367,7 +1375,7 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
     #panic("relative cd")
   }
   project_cd(app, "-")
-  if !buffer.equal(app.workspace.project[..app.workspace.project_length], configured.value) {
+  if !buffer.equal(app.workspace.project[..app.workspace.project_length], configured) {
     #panic("cd previous")
   }
   panel(app, Panel.Commands)
@@ -1377,7 +1385,7 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
     #panic("cd completion")
   }
   project_cd(app, "missing-directory")
-  if app.prompt_state.panel != Panel.Message || !buffer.equal(app.workspace.project[..app.workspace.project_length], configured.value) {
+  if app.prompt_state.panel != Panel.Message || !buffer.equal(app.workspace.project[..app.workspace.project_length], configured) {
     #panic("failed cd changed root")
   }
   config_storage: [4096]u8
@@ -1385,7 +1393,7 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
   saved_config: [4096]u8
   saved_length := copy_text(saved_config[..], app.configuration.path[..app.configuration.path_length])
   app.configuration.path_length = copy_text(app.configuration.path[..], config_path)
-  if fs.write_all(config_path, "font_size = 23\nline_height = 1.4\nindent_width = 2\n[keys.normal]\n\"f2\" = \"pwd\"\n").failure.kind != io.Kind.Ok {
+  fs.write_all(config_path, "font_size = 23\nline_height = 1.4\nindent_width = 2\n[keys.normal]\n\"f2\" = \"pwd\"\n") catch {
     #panic("write config fixture")
   }
   config_reload(app, typography, false)
@@ -1399,14 +1407,14 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
   if app.prompt_state.panel != Panel.Message || !buffer.equal(app.prompt_state.message[..app.prompt_state.message_length], app.workspace.project[..app.workspace.project_length]) {
     #panic("configured binding")
   }
-  if fs.write_all(config_path, "font_size = 999\n").failure.kind != io.Kind.Ok {
+  fs.write_all(config_path, "font_size = 999\n") catch {
     #panic("invalid config fixture")
   }
   config_reload(app, typography, false)
   if typography.points != 23.0 || app.config.indent_width != 2 || active_file_config(app).indent_width != 2 || app.prompt_state.panel != Panel.Message {
     #panic("invalid reload mutated config")
   }
-  if fs.write_all(config_path, "font_size = 20\n").failure.kind != io.Kind.Ok {
+  fs.write_all(config_path, "font_size = 20\n") catch {
     #panic("restore config fixture")
   }
   app.configuration.watch_due = 0
@@ -1424,7 +1432,7 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
   app.prompt_state.panel = Panel.None
   theme_storage: [4096]u8
   custom_theme := joined(app, "custom-theme.toml", theme_storage[..])
-  if fs.write_all(custom_theme, "base = \"charcoal\"\nbackground = \"#102030\"\nsyntax_keyword = \"#123456\"\nterminal_red = \"#abcdef\"\n").failure.kind != io.Kind.Ok {
+  fs.write_all(custom_theme, "base = \"charcoal\"\nbackground = \"#102030\"\nsyntax_keyword = \"#123456\"\nterminal_red = \"#abcdef\"\n") catch {
     #panic("theme fixture")
   }
   theme_switch(app, typography, custom_theme)
@@ -1439,7 +1447,7 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
   theme_config_length := copy_text(theme_config[..], "theme = \"")
   add_text(theme_config[..], &theme_config_length, custom_theme)
   add_text(theme_config[..], &theme_config_length, "\"\n")
-  if fs.write_all(config_path, theme_config[..theme_config_length]).failure.kind != io.Kind.Ok {
+  fs.write_all(config_path, theme_config[..theme_config_length]) catch {
     #panic("custom theme config fixture")
   }
   app.configuration.path_length = copy_text(app.configuration.path[..], config_path)
@@ -1449,7 +1457,7 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
   if !contains(app.prompt_state.message[..app.prompt_state.message_length], custom_theme) {
     #panic("config reload lost selected theme")
   }
-  if fs.write_all(custom_theme, "background = \"broken\"\n").failure.kind != io.Kind.Ok {
+  fs.write_all(custom_theme, "background = \"broken\"\n") catch {
     #panic("invalid theme fixture")
   }
   theme_switch(app, typography, custom_theme)
@@ -1477,7 +1485,7 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
   _ = terminal_poll(target)
   output: [32768]u8
   length := terminal_snapshot(target, &output[0], 32768)
-  if !contains(output[..length], "DNA-terminal-test") || !contains(output[..length], configured.value) {
+  if !contains(output[..length], "DNA-terminal-test") || !contains(output[..length], configured) {
     #panic("terminal command and project cwd")
   }
   task_next_error(app)
@@ -1538,6 +1546,13 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
     #panic("terminal must open below file")
   }
   draw(renderer, window, app, typography)
+  // One resize per frame, to the pane's target size. Resizing again to the
+  // still-animating size flipped the PTY between two sizes on every frame
+  // of the split, and the shell's prompt drifted down the pane.
+  terminal_pane := &app.view.panes[app.view.focused]
+  if terminal_resize(exited, #cast(f32, terminal_pane.target_rect.width) - 16.0, #cast(f32, terminal_pane.target_rect.height) - 16.0 - typography.line, typography.cell, typography.line) != 0 {
+    #panic("terminal drawn at an animated size")
+  }
   terminal_parent := app.view.panes[app.view.focused].parent
   if app.view.panes[terminal_parent].split_fraction != 0.75 || app.view.panes[app.view.focused].rect.height > app.view.panes[terminal_parent].rect.height / 4 + 1 {
     #panic("terminal default exceeds quarter height")
@@ -1550,7 +1565,7 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
   }
   // Give review motions a deterministic first line, independent of shell prompts.
   review_command := "PS1='DNA-terminal-ready> '; PROMPT_COMMAND=; printf '\\033[2J\\033[HDNA-review-ready\\n'\n"
-  terminal_text(exited, &review_command[0], #len(review_command))
+  terminal_text(exited, &review_command[0], review_command.len)
   review_deadline := sdl.ticks() + 2000
   review_ready: bool = false
   for !review_ready && sdl.ticks() < review_deadline {
@@ -1583,7 +1598,7 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
     #panic("terminal extend selection")
   }
   terminal_session := workspace.State{}
-  if !session_capture(app, &terminal_session, false) || #len(terminal_session.buffers[exited_slot].text) != 0 || terminal_session.panes[app.view.focused].cursor != 0 {
+  if !session_capture(app, &terminal_session, false) || terminal_session.buffers[exited_slot].text.len != 0 || terminal_session.panes[app.view.focused].cursor != 0 {
     #panic("terminal review leaked into session text")
   }
   review_revision := review_doc.revision
@@ -1646,7 +1661,7 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
   // first key typed after returning into Alt+key (cat -v shows it as ^[).
   terminal_mode(app).escape_pending = false
   cat_command := "clear; cat -v\n"
-  terminal_text(exited, &cat_command[0], #len(cat_command))
+  terminal_text(exited, &cat_command[0], cat_command.len)
   cat_deadline := sdl.ticks() + 300
   for sdl.ticks() < cat_deadline {
     _ = terminal_poll(exited)
@@ -1695,7 +1710,7 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
     for shell_length > 0 && (shell_screen[shell_length - 1] == 32 || shell_screen[shell_length - 1] == 10 || shell_screen[shell_length - 1] == 13) {
       shell_length -= 1
     }
-    shell_ready = shell_length >= #len(shell_prompt) && buffer.equal(shell_screen[shell_length - #len(shell_prompt)..shell_length], shell_prompt)
+    shell_ready = shell_length >= shell_prompt.len && buffer.equal(shell_screen[shell_length - shell_prompt.len..shell_length], shell_prompt)
   }
   if !shell_ready {
     #panic("cat interrupt must return to shell prompt")
@@ -1717,7 +1732,7 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
     #panic("cancel must retain running terminal")
   }
   exit_command: []const u8 = "exit\n"
-  terminal_text(exited, &exit_command[0], #len(exit_command))
+  terminal_text(exited, &exit_command[0], exit_command.len)
   exit_deadline := sdl.ticks() + 3000
   for app.documents.slots[exited_slot].terminal.handle != nil && sdl.ticks() < exit_deadline {
     _ = terminal_tick(app)
@@ -1737,7 +1752,7 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
   hidden := terminal_target(app)
   pane_close(app)
   app.prompt_state.panel = Panel.Buffers
-  terminal_text(hidden, &exit_command[0], #len(exit_command))
+  terminal_text(hidden, &exit_command[0], exit_command.len)
   hidden_deadline := sdl.ticks() + 3000
   for app.documents.slots[hidden_slot].terminal.handle != nil && sdl.ticks() < hidden_deadline {
     _ = terminal_tick(app)
@@ -1751,7 +1766,7 @@ fn foundation_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Ty
   split_slot := app.terminal_state.slot
   split_shell := terminal_target(app)
   terminal_promote(app)
-  terminal_text(split_shell, &exit_command[0], #len(exit_command))
+  terminal_text(split_shell, &exit_command[0], exit_command.len)
   split_deadline := sdl.ticks() + 3000
   for app.documents.slots[split_slot].terminal.handle != nil && sdl.ticks() < split_deadline {
     _ = terminal_tick(app)
@@ -1848,11 +1863,11 @@ fn editor_commands_smoke(app: *App, typography: *Typography) {
     #panic("automatic filetype reset")
   }
   installed_storage: [4096]u8
-  installed := host.environment("DNA_TEST_LANGUAGE_DIR", installed_storage[..4095])
-  if installed.failure.kind == io.Kind.Ok && installed.found {
+  installed := host.environment("DNA_TEST_LANGUAGE_DIR", installed_storage[..4095]) catch installed_storage[..0]
+  if installed.len > 0 {
     saved_root: [4096]u8
     saved_root_length := copy_text(saved_root[..], app.workspace.language_root[..app.workspace.language_root_length])
-    app.workspace.language_root_length = copy_text(app.workspace.language_root[..], installed.value)
+    app.workspace.language_root_length = copy_text(app.workspace.language_root[..], installed)
     _ = buffer.load(app.documents.current, "{\"n\":42}")
     smoke_command(app, typography, "filetype json")
     if app.documents.slots[app.documents.active].syntax == nil || !buffer.equal(filetype_name(app.documents.slots[app.documents.active]), "json") {
@@ -1866,12 +1881,11 @@ fn editor_commands_smoke(app: *App, typography: *Typography) {
       #panic("explicit filetype did not highlight unnamed buffer")
     }
     fixture_storage: [4096]u8
-    fixture := host.environment("DNA_WORKFLOW_TEST", fixture_storage[..])
-    if fixture.failure.kind != io.Kind.Ok || !fixture.found {
+    fixture := host.environment("DNA_WORKFLOW_TEST", fixture_storage[..]) catch {
       #panic("filetype test requires isolated fixture directory")
     }
     save_storage: [4096]u8
-    save_length := copy_text(save_storage[..], fixture.value)
+    save_length := copy_text(save_storage[..], fixture)
     add_text(save_storage[..], &save_length, "/filetype-test.py")
     save_file(app, save_storage[..save_length])
     _ = syntax_tick(app)
@@ -1970,8 +1984,8 @@ fn close_binding_smoke(app: *App, typography: *Typography) {
     #panic("Ctrl-X clean buffer close")
   }
   fixture_storage: [4096]u8
-  fixture := host.environment("DNA_WORKFLOW_TEST", fixture_storage[..])
-  if fixture.failure.kind == io.Kind.Ok && fixture.found {
+  fixture := host.environment("DNA_WORKFLOW_TEST", fixture_storage[..]) catch fixture_storage[..0]
+  if fixture.len > 0 {
     if !new_buffer(app) {
       #panic("save-close buffer fixture")
     }
@@ -1979,11 +1993,11 @@ fn close_binding_smoke(app: *App, typography: *Typography) {
     key_input(app, typography, 120, 64)
     key_input(app, typography, 115, 0)
     path: [4096]u8
-    used := copy_text(path[..], fixture.value)
+    used := copy_text(path[..], fixture)
     add_text(path[..], &used, "/ctrl-x-save.txt")
     text_input(app, path[..used])
     key_input(app, typography, 13, 0)
-    if app.documents.count != before || app.documents.active != original || files.metadata(path[..used]).failure.kind != io.Kind.Ok {
+    if app.documents.count != before || app.documents.active != original || !smoke_exists(path[..used]) {
       #panic("Ctrl-X save did not save and close")
     }
   }
@@ -2080,16 +2094,16 @@ fn picker_close_smoke(app: *App, typography: *Typography) {
     #panic("picker Save As cancellation")
   }
   fixture_storage: [4096]u8
-  fixture := host.environment("DNA_WORKFLOW_TEST", fixture_storage[..])
-  if fixture.failure.kind == io.Kind.Ok && fixture.found {
+  fixture := host.environment("DNA_WORKFLOW_TEST", fixture_storage[..]) catch fixture_storage[..0]
+  if fixture.len > 0 {
     key_input(app, typography, 120, 64)
     key_input(app, typography, 115, 0)
     path: [4096]u8
-    used := copy_text(path[..], fixture.value)
+    used := copy_text(path[..], fixture)
     add_text(path[..], &used, "/picker-save.txt")
     text_input(app, path[..used])
     key_input(app, typography, 13, 0)
-    if app.prompt_state.panel != Panel.Buffers || app.documents.slots[saving].document != nil || app.documents.active != original || files.metadata(path[..used]).failure.kind != io.Kind.Ok {
+    if app.prompt_state.panel != Panel.Buffers || app.documents.slots[saving].document != nil || app.documents.active != original || !smoke_exists(path[..used]) {
       #panic("picker save-and-close")
     }
   } else {
@@ -2130,7 +2144,7 @@ fn picker_close_smoke(app: *App, typography: *Typography) {
     key_input(app, typography, 120, 64)
     if phase == 0 {
       exit_text: []const u8 = "exit\n"
-      terminal_text(terminal, &exit_text[0], #len(exit_text))
+      terminal_text(terminal, &exit_text[0], exit_text.len)
       deadline := sdl.ticks() + 3000
       for app.documents.slots[terminal_slot].terminal.handle != nil && sdl.ticks() < deadline {
         _ = terminal_tick(app)
@@ -2336,19 +2350,18 @@ fn newline_smoke(app: *App, typography: *Typography) {
 fn project_tools_smoke(renderer: rawptr, window: rawptr, app: *App, typography: *Typography) {
   original_active := app.documents.active
   environment: [4096]u8
-  fixture := host.environment("DNA_WORKFLOW_TEST", environment[..])
-  if fixture.failure.kind != io.Kind.Ok || !fixture.found {
+  fixture := host.environment("DNA_WORKFLOW_TEST", environment[..]) catch {
     return
   }
   path: [4096]u8
-  length := copy_text(path[..], fixture.value)
+  length := copy_text(path[..], fixture)
   add_text(path[..], &length, "/project-search.txt")
-  if fs.write_all(path[..length], "needle α needle\n").failure.kind != io.Kind.Ok {
+  fs.write_all(path[..length], "needle α needle\n") catch {
     #panic("search fixture")
   }
   old_project: [4096]u8
   old_length := copy_text(old_project[..], app.workspace.project[..app.workspace.project_length])
-  app.workspace.project_length = copy_text(app.workspace.project[..], fixture.value)
+  app.workspace.project_length = copy_text(app.workspace.project[..], fixture)
   project_search_open(app)
   text_input(app, "needle")
   deadline := sdl.ticks() + 5000
@@ -2450,19 +2463,18 @@ fn project_tools_smoke(renderer: rawptr, window: rawptr, app: *App, typography: 
 
 fn persistence_smoke() {
   environment: [4096]u8
-  fixture := host.environment("DNA_WORKFLOW_TEST", environment[..])
-  if fixture.failure.kind != io.Kind.Ok || !fixture.found {
+  fixture := host.environment("DNA_WORKFLOW_TEST", environment[..]) catch {
     return
   }
   owner := arena_owner.create((#sizeof(App) + 128))
   temporary := arena_owner.create((2097152))
   defer arena_owner.release(owner)
   defer arena_owner.release(temporary)
-  test_app := #cast(*App, mem.arena_push(owner, #sizeof(App), #alignof(App)))
+  test_app := mem.push<App>(owner)
   test_app.scratch = temporary
   settings.defaults(&test_app.config)
   defer release_editor_state(test_app)
-  test_app.workspace.project_length = copy_text(test_app.workspace.project[..], fixture.value)
+  test_app.workspace.project_length = copy_text(test_app.workspace.project[..], fixture)
   if !new_buffer(test_app) {
     #panic("session new buffer")
   }
@@ -2474,10 +2486,10 @@ fn persistence_smoke() {
   pane_split(test_app, true)
   pane_resize(test_app, 30.0)
   path: [4096]u8
-  length := copy_text(path[..], fixture.value)
+  length := copy_text(path[..], fixture)
   add_text(path[..], &length, "/test.session")
   _ = session_save(test_app, path[..length])
-  if files.metadata(path[..length]).failure.kind != io.Kind.Ok {
+  if !smoke_exists(path[..length]) {
     #panic("session save")
   }
   buffer.mark_saved(test_app.documents.current)
@@ -2498,11 +2510,13 @@ fn persistence_smoke() {
     #panic("layout keeps spatial buffer order")
   }
   layout_path: [4096]u8
-  layout_length := copy_text(layout_path[..], fixture.value)
+  layout_length := copy_text(layout_path[..], fixture)
   add_text(layout_path[..], &layout_length, "/saved-layout.toml")
   layout_save(test_app, layout_path[..layout_length])
-  layout_read := fs.read_all(test_app.scratch, layout_path[..layout_length], 4096)
-  if layout_read.failure.kind != io.Kind.Ok || layout.parse(layout_read.value).node_count != 5 {
+  layout_read := fs.read_all(test_app.scratch, layout_path[..layout_length], 4096) catch {
+    #panic("layout save roundtrip")
+  }
+  if layout.parse(layout_read).node_count != 5 {
     #panic("layout save roundtrip")
   }
   buffer.mark_saved(test_app.documents.current)
@@ -2510,31 +2524,29 @@ fn persistence_smoke() {
 
 fn plugin_host_smoke(typography: *Typography) {
   manifest_storage: [4096]u8
-  manifest := host.environment("DNA_TEST_PLUGIN", manifest_storage[..])
-  if manifest.failure.kind != io.Kind.Ok || !manifest.found {
+  manifest := host.environment("DNA_TEST_PLUGIN", manifest_storage[..]) catch {
     return
   }
   fixture_storage: [4096]u8
-  fixture := host.environment("DNA_WORKFLOW_TEST", fixture_storage[..])
-  if fixture.failure.kind != io.Kind.Ok || !fixture.found {
+  fixture := host.environment("DNA_WORKFLOW_TEST", fixture_storage[..]) catch {
     return
   }
   owner := arena_owner.create((#sizeof(App) + 128))
   temporary := arena_owner.create((2097152))
   defer arena_owner.release(owner)
   defer arena_owner.release(temporary)
-  test_app := #cast(*App, mem.arena_push(owner, #sizeof(App), #alignof(App)))
+  test_app := mem.push<App>(owner)
   test_app.scratch = temporary
   settings.defaults(&test_app.config)
   defer release_editor_state(test_app)
   defer plugin_release(test_app)
-  test_app.configuration.path_length = copy_text(test_app.configuration.path[..], fixture.value)
+  test_app.configuration.path_length = copy_text(test_app.configuration.path[..], fixture)
   add_text(test_app.configuration.path[..], &test_app.configuration.path_length, "/config.toml")
   if !new_buffer(test_app) {
     #panic("plugin test buffer")
   }
   _ = buffer.load(test_app.documents.current, "hello α\n")
-  plugin_prepare(test_app, manifest.value)
+  plugin_prepare(test_app, manifest)
   if test_app.prompt_state.panel != Panel.PluginGrant || !test_app.plugin_state.pending.read || !test_app.plugin_state.pending.write {
     #panic("plugin grants")
   }
@@ -2589,12 +2601,12 @@ fn plugin_host_smoke(typography: *Typography) {
   if test_app.plugin_state.slots[0].process != nil || test_app.plugin_state.commands[0].length != 0 {
     #panic("plugin permission denial")
   }
-  _ = plugin_install(test_app, manifest.value)
-  _ = plugin_install(test_app, manifest.value)
+  _ = plugin_install(test_app, manifest)
+  _ = plugin_install(test_app, manifest)
   installed: [4096]u8
-  installed_length := copy_text(installed[..], fixture.value)
+  installed_length := copy_text(installed[..], fixture)
   add_text(installed[..], &installed_length, "/plugins/uppercase/plugin.json")
-  if files.metadata(installed[..installed_length]).failure.kind != io.Kind.Ok {
+  if !smoke_exists(installed[..installed_length]) {
     #panic("plugin local install/update")
   }
   plugin_update(test_app, "uppercase")
@@ -2606,22 +2618,22 @@ fn plugin_host_smoke(typography: *Typography) {
     #panic("plugin update cancel")
   }
   catalog_path: [4096]u8
-  catalog_length := copy_text(catalog_path[..], fixture.value)
+  catalog_length := copy_text(catalog_path[..], fixture)
   add_text(catalog_path[..], &catalog_length, "/plugin-catalog.json")
   catalog_json: [16384]u8
   quoted_path: [12288]u8
   catalog_used := copy_text(catalog_json[..], "{\"uppercase\":")
-  add_text(catalog_json[..], &catalog_used, lsp_json_string(quoted_path[..], manifest.value))
+  add_text(catalog_json[..], &catalog_used, lsp_json_string(quoted_path[..], manifest))
   add_text(catalog_json[..], &catalog_used, "}")
-  if fs.write_all(catalog_path[..catalog_length], catalog_json[..catalog_used]).failure.kind != io.Kind.Ok {
+  fs.write_all(catalog_path[..catalog_length], catalog_json[..catalog_used]) catch {
     #panic("plugin catalog fixture")
   }
   plugin_remove(test_app, "uppercase")
-  if files.metadata(installed[..installed_length]).failure.kind == io.Kind.Ok {
+  if smoke_exists(installed[..installed_length]) {
     #panic("plugin removal")
   }
   plugin_install_named(test_app, "uppercase")
-  if files.metadata(installed[..installed_length]).failure.kind != io.Kind.Ok {
+  if !smoke_exists(installed[..installed_length]) {
     #panic("plugin catalog install")
   }
 
@@ -2734,7 +2746,7 @@ fn batch_bindings_smoke(app: *App, typography: *Typography) {
   // Registers are sized to the selections, so a yank beyond the old 1 MiB
   // clipboard bound succeeds and the delete proceeds.
   key_input(app, typography, 100, 0)
-  if doc.length != 0 || app.register_state.clipboard.count != 2 || #len(app.register_state.clipboard.text) != 1200001 {
+  if doc.length != 0 || app.register_state.clipboard.count != 2 || app.register_state.clipboard.text.len != 1200001 {
     #panic("large multi-selection yank and delete")
   }
   app.prompt_state.panel = Panel.None

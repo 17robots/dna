@@ -43,13 +43,13 @@ fn native_probe_resize()bool {
 }
 fn native_probe_pixels()[]const u8 {
  if !native_gui.direct {return native_gui.surface.pixels}
- if !native_probe_dirty && #len(native_probe_buffer)>0 {return native_probe_buffer}
+ if !native_probe_dirty && native_probe_buffer.len>0 {return native_probe_buffer}
  if !native_probe_resize() || !native_present.gpu_flush(&native_gui.gpu) {#panic("GPU probe flush")}
  size:=#cast(usize,native_gui.surface.width)*#cast(usize,native_gui.surface.height)*4
- if #len(native_probe_buffer)!=size {
+ if native_probe_buffer.len!=size {
   if native_probe_owner==nil {native_probe_owner=mem.arena_alloc(65536)}
   else {mem.arena_reset(native_probe_owner)}
-  native_probe_buffer=mem.push_bytes_uninit(native_probe_owner,size)
+  native_probe_buffer=mem.push_bytes(native_probe_owner,size)
  }
  api:=&native_gui.gpu.api
  api.pixel_store_i(3333,1)
@@ -68,7 +68,7 @@ fn native_probe_blank() {
  if native_gui.direct {
   if !native_present.gpu_clear(&native_gui.gpu,native_gui.surface.width,native_gui.surface.height,ui.Color{}) {#panic("GPU blank probe")}
  } else {
-  for i in 0..#len(native_gui.surface.pixels) {native_gui.surface.pixels[i]=0}
+  for i in 0..native_gui.surface.pixels.len {native_gui.surface.pixels[i]=0}
  }
 }
 fn native_probe_destroy() {

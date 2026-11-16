@@ -1,5 +1,5 @@
-use "std/io" io
-use "std/parse" parse
+use io "std/io"
+use parse "std/parse"
 fn save_command(app: *App, text: []const u8) {
   // These fixtures edit app.config directly instead of calling config_reload.
   file_config_invalidate(app)
@@ -20,28 +20,30 @@ fn finish_saves(app: *App) {
 }
 fn save_sequence_smoke() {
   directory: [4096]u8
-  root := host.environment("DNA_WORKFLOW_TEST", directory[..4095])
-  if !root.found {
+  root := host.environment("DNA_WORKFLOW_TEST", directory[..4095]) catch {
     return
   }
   owned := arena_owner.create((#sizeof(App) + 128))
   scratch := arena_owner.create((2097152))
   defer arena_owner.release(owned)
   defer arena_owner.release(scratch)
-  app := #cast(*App, mem.arena_push(owned, #sizeof(App), #alignof(App)))
+  app := mem.push<App>(owned)
   app.scratch = scratch
   app.running = true
   settings.defaults(&app.config)
   defer release_editor_state(app)
   defer format_release(app)
-  app.directory_state.length = copy_text(app.directory_state.path[..], root.value)
+  app.directory_state.length = copy_text(app.directory_state.path[..], root)
   first: [4096]u8
-  first_length := copy_text(first[..], root.value)
+  first_length := copy_text(first[..], root)
   add_text(first[..], &first_length, "/save-first.txt")
   second: [4096]u8
-  second_length := copy_text(second[..], root.value)
+  second_length := copy_text(second[..], root)
   add_text(second[..], &second_length, "/save-second.txt")
-  if fs.write_all(first[..first_length], "first").failure.kind != io.Kind.Ok || fs.write_all(second[..second_length], "second").failure.kind != io.Kind.Ok {
+  fs.write_all(first[..first_length], "first") catch {
+    #panic("save fixture files")
+  }
+  fs.write_all(second[..second_length], "second") catch {
     #panic("save fixture files")
   }
   if !new_buffer(app) {
@@ -92,7 +94,7 @@ fn save_sequence_smoke() {
     #panic("cancel xa preserves buffer")
   }
   save_command(app, "xa")
-  app.prompt_state.length = copy_text(app.prompt_state.text[..], root.value)
+  app.prompt_state.length = copy_text(app.prompt_state.text[..], root)
   add_text(app.prompt_state.text[..], &app.prompt_state.length, "/missing-parent/output.txt")
   submit(app, nil)
   save_sequence_tick(app)
@@ -100,7 +102,7 @@ fn save_sequence_smoke() {
     #panic("failed xa preserves unsaved buffer")
   }
   save_command(app, "xa")
-  app.prompt_state.length = copy_text(app.prompt_state.text[..], root.value)
+  app.prompt_state.length = copy_text(app.prompt_state.text[..], root)
   add_text(app.prompt_state.text[..], &app.prompt_state.length, "/save-unnamed.txt")
   submit(app, nil)
   finish_saves(app)
@@ -121,12 +123,11 @@ fn language_popup_smoke(app: *App, typography: *Typography, renderer: rawptr, wi
   app.view.panes[app.view.focused].rect = pane
   motion.snap(&app.view.animation.file.cursor_x, 30.0)
   motion.snap(&app.view.animation.file.cursor_y, 140.0)
-  fixture := json.parse(app.scratch, "{\"label\":\"candidate\"}")
-  if fixture.failure.kind != parse.Kind.Ok {
+  fixture := json.parse(app.scratch, "{\"label\":\"candidate\"}") catch {
     #panic("completion geometry fixture")
   }
   for index in 0..16 {
-    app.lsp.results.items[index] = fixture.root
+    app.lsp.results.items[index] = fixture
   }
   app.lsp.results.count = 1
   app.prompt_state.selected = 0

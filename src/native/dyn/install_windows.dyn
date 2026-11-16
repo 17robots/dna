@@ -45,18 +45,19 @@ install_win_once: win_io_sync.Once
 fn install_win_prepare() {
   win_io_prepare()
   if win_io_sync.once_begin(&install_win_once) {
-    kernel := win_io_loader.open("kernel32.dll", 0)
-    native := win_io_loader.open("ntdll.dll", 0)
-    if io.failed(kernel.failure) || io.failed(native.failure) {
+    kernel := win_io_loader.open("kernel32.dll", 0) catch {
       #panic("missing Windows directory IO library")
     }
-    install_win_api.open = #cast(fn(*rawptr, u32, *InstallWinAttributes, *InstallWinStatus, *i64, u32, u32, u32, u32, rawptr, u32) i32, win_io_symbol(native.value, "NtCreateFile"))
-    install_win_api.status_error = #cast(fn(i32) u32, win_io_symbol(native.value, "RtlNtStatusToDosError"))
-    install_win_api.information = #cast(fn(rawptr, u32, rawptr, u32) i32, win_io_symbol(kernel.value, "GetFileInformationByHandleEx"))
-    install_win_api.rename = #cast(fn(rawptr, *InstallWinStatus, rawptr, u32, u32) i32, win_io_symbol(native.value, "NtSetInformationFile"))
-    install_win_api.duplicate = #cast(fn(rawptr, rawptr, rawptr, *rawptr, u32, i32, u32) i32, win_io_symbol(kernel.value, "DuplicateHandle"))
-    install_win_api.process = #cast(fn() rawptr, win_io_symbol(kernel.value, "GetCurrentProcess"))
-    install_win_api.remove_directory = #cast(fn(*const u16) i32, win_io_symbol(kernel.value, "RemoveDirectoryW"))
+    native := win_io_loader.open("ntdll.dll", 0) catch {
+      #panic("missing Windows directory IO library")
+    }
+    install_win_api.open = #cast(fn(*rawptr, u32, *InstallWinAttributes, *InstallWinStatus, *i64, u32, u32, u32, u32, rawptr, u32) i32, win_io_symbol(native, "NtCreateFile"))
+    install_win_api.status_error = #cast(fn(i32) u32, win_io_symbol(native, "RtlNtStatusToDosError"))
+    install_win_api.information = #cast(fn(rawptr, u32, rawptr, u32) i32, win_io_symbol(kernel, "GetFileInformationByHandleEx"))
+    install_win_api.rename = #cast(fn(rawptr, *InstallWinStatus, rawptr, u32, u32) i32, win_io_symbol(native, "NtSetInformationFile"))
+    install_win_api.duplicate = #cast(fn(rawptr, rawptr, rawptr, *rawptr, u32, i32, u32) i32, win_io_symbol(kernel, "DuplicateHandle"))
+    install_win_api.process = #cast(fn() rawptr, win_io_symbol(kernel, "GetCurrentProcess"))
+    install_win_api.remove_directory = #cast(fn(*const u16) i32, win_io_symbol(kernel, "RemoveDirectoryW"))
     win_io_sync.once_complete(&install_win_once)
   }
 }
@@ -84,9 +85,7 @@ fn install_win_name(path: *const u8) bool {
 }
 fn install_win_metadata(handle: rawptr, output: *InstallStat) i32 {
   info := WinIOInformation{}
-  if win_io_api.info(handle, &info) == 0 {
-    return win_io_fail(win_io_api.error())
-  }
+  if win_io_api.info(handle, &info) == 0 { return win_io_fail(win_io_api.error()) }
   mode: u32 = 0o100666
   if (info.attributes & 16) != 0 {
     mode = 0o040777
@@ -123,17 +122,13 @@ fn install_fstat(fd: i32, info: *InstallStat) i32 {
 fn install_win_path_stat(path: *const u8, info: *InstallStat, nofollow: bool) i32 {
   install_win_prepare()
   wide: [32768]u16
-  if !win_io_path(path, wide[..]) {
-    return -1
-  }
+  if !win_io_path(path, wide[..]) { return -1 }
   flags: u32 = 33554432
   if nofollow {
     flags |= 2097152
   }
   handle := win_io_api.create(&wide[0], 0, 7, nil, 3, flags, nil)
-  if #cast(isize, handle) == -1 {
-    return win_io_fail(win_io_api.error())
-  }
+  if #cast(isize, handle) == -1 { return win_io_fail(win_io_api.error()) }
   result := install_win_metadata(handle, info)
   saved := rec_errno().*
   _ = win_io_api.close(handle)
@@ -151,9 +146,7 @@ fn disk_stat(path: *const u8, info: *InstallStat) i32 {
 // Metadata may open a reparse object itself; transport never follows it.
 fn install_win_relative(fd: i32, path: *const u8, access: u32, options: u32, no_reparse: bool) rawptr {
   install_win_prepare()
-  if !install_win_name(path) {
-    return nil
-  }
+  if !install_win_name(path) { return nil }
   parent := win_io_handle(fd)
   parent_info := WinIOInformation{}
   if win_io_api.info(parent, &parent_info) == 0 {
@@ -165,9 +158,7 @@ fn install_win_relative(fd: i32, path: *const u8, access: u32, options: u32, no_
     return nil
   }
   wide: [1024]u16
-  if !win_io_path(path, wide[..]) {
-    return nil
-  }
+  if !win_io_path(path, wide[..]) { return nil }
   units: usize = 0
   for wide[units] != 0 {
     units += 1
@@ -207,39 +198,27 @@ fn install_win_relative(fd: i32, path: *const u8, access: u32, options: u32, no_
 }
 fn install_openat(fd: i32, path: *const u8, flags: i32, mode: u32) i32 {
   install_win_prepare()
-  if fd == -100 {
-    return rec_open(path, flags, mode)
-  }
+  if fd == -100 { return rec_open(path, flags, mode) }
   // Shared callers use this path for reads only. Private creates are performed
   // by rec_open, which establishes their protected DACL at creation time.
-  if (flags & (64 | 128 | 512 | 1024)) != 0 || (flags & 3) != 0 {
-    return win_io_fail(50)
-  }
+  if (flags & (64 | 128 | 512 | 1024)) != 0 || (flags & 3) != 0 { return win_io_fail(50) }
   options: u32 = 64
   if (flags & 65536) != 0 {
     options = 1
   }
   handle := install_win_relative(fd, path, 2147483776, options, true)
-  if handle == nil {
-    return -1
-  }
+  if handle == nil { return -1 }
   return win_io_adopt(handle, 0)
 }
 fn install_fstatat(fd: i32, path: *const u8, info: *InstallStat, flags: i32) i32 {
   install_win_prepare()
-  if (flags & ~#cast(i32, 256)) != 0 {
-    return win_io_fail(50)
-  }
-  if fd == -100 {
-    return install_win_path_stat(path, info, (flags & 256) != 0)
-  }
+  if (flags & ~#cast(i32, 256)) != 0 { return win_io_fail(50) }
+  if fd == -100 { return install_win_path_stat(path, info, (flags & 256) != 0) }
   // Even callers requesting follow metadata cannot escape a held parent via
   // a junction. Returning link metadata lets their regular/directory checks
   // reject it while picker enumeration remains complete.
   handle := install_win_relative(fd, path, 128, 0, false)
-  if handle == nil {
-    return -1
-  }
+  if handle == nil { return -1 }
   result := install_win_metadata(handle, info)
   saved := rec_errno().*
   _ = win_io_api.close(handle)
@@ -348,12 +327,8 @@ fn search_dirfd(opaque: rawptr) i32 {
 fn install_rmdir(path: *const u8) i32 {
   install_win_prepare()
   wide: [32768]u16
-  if !win_io_path(path, wide[..]) {
-    return -1
-  }
-  if install_win_api.remove_directory(&wide[0]) == 0 {
-    return win_io_fail(win_io_api.error())
-  }
+  if !win_io_path(path, wide[..]) { return -1 }
+  if install_win_api.remove_directory(&wide[0]) == 0 { return win_io_fail(win_io_api.error()) }
   return 0
 }
 fn install_mkdtemp(path: *u8) *u8 {
@@ -383,12 +358,8 @@ fn install_mkdtemp(path: *u8) *u8 {
     for at in 0..6 {
       #slice(path, length)[length - 6 + at] = alphabet[#cast(usize, random[at] & 63)]
     }
-    if rec_mkdir(path, 448) == 0 {
-      return path
-    }
-    if rec_errno().* != 17 {
-      return nil
-    }
+    if rec_mkdir(path, 448) == 0 { return path }
+    if rec_errno().* != 17 { return nil }
   }
   rec_errno().* = 17
   return nil
@@ -397,45 +368,27 @@ fn install_rename(source_fd: i32, source: *const u8, target_fd: i32, target: *co
   install_win_prepare()
   // Windows has no atomic directory exchange. Never emulate it with a sequence
   // that could publish a missing or partial active version after a crash.
-  if flags != 1 {
-    return win_io_fail(50)
-  }
+  if flags != 1 { return win_io_fail(50) }
   if source_fd == -100 || target_fd == -100 {
-    if source_fd != -100 || target_fd != -100 {
-      return win_io_fail(50)
-    }
+    if source_fd != -100 || target_fd != -100 { return win_io_fail(50) }
     from: [32768]u16
     to: [32768]u16
-    if !win_io_path(source, from[..]) || !win_io_path(target, to[..]) {
-      return -1
-    }
-    if win_io_api.move(&from[0], &to[0], 8) == 0 {
-      return win_io_fail(win_io_api.error())
-    }
+    if !win_io_path(source, from[..]) || !win_io_path(target, to[..]) { return -1 }
+    if win_io_api.move(&from[0], &to[0], 8) == 0 { return win_io_fail(win_io_api.error()) }
     return 0
   }
-  if !install_win_name(target) {
-    return -1
-  }
+  if !install_win_name(target) { return -1 }
   // DELETE access belongs to the source handle; target resolution remains
   // relative to the independently retained destination directory handle.
   handle := install_win_relative(source_fd, source, 65664, 0, true)
-  if handle == nil {
-    return -1
-  }
+  if handle == nil { return -1 }
   defer _ = win_io_api.close(handle)
   root := win_io_handle(target_fd)
   info := WinIOInformation{}
-  if win_io_api.info(root, &info) == 0 {
-    return win_io_fail(win_io_api.error())
-  }
-  if (info.attributes & 16) == 0 || (info.attributes & 1024) != 0 {
-    return win_io_fail(50)
-  }
+  if win_io_api.info(root, &info) == 0 { return win_io_fail(win_io_api.error()) }
+  if (info.attributes & 16) == 0 || (info.attributes & 1024) != 0 { return win_io_fail(50) }
   rename := InstallWinRename{root: root}
-  if !win_io_path(target, rename.name[..]) {
-    return -1
-  }
+  if !win_io_path(target, rename.name[..]) { return -1 }
   units: usize = 0
   for rename.name[units] != 0 {
     units += 1
@@ -446,9 +399,7 @@ fn install_rename(source_fd: i32, source: *const u8, target_fd: i32, target: *co
   status := InstallWinStatus{}
   bytes := #cast(usize, &rename.name[0]) - #cast(usize, &rename) + #cast(usize, rename.length)
   result := install_win_api.rename(handle, &status, #cast(rawptr, &rename), #cast(u32, bytes), 10)
-  if result < 0 {
-    return win_io_fail(install_win_api.status_error(result))
-  }
+  if result < 0 { return win_io_fail(install_win_api.status_error(result)) }
   return 0
 }
 
@@ -462,38 +413,31 @@ install_win_private_once: win_io_sync.Once
 fn install_win_private_prepare() {
   install_win_prepare()
   if win_io_sync.once_begin(&install_win_private_once) {
-    security:=win_io_loader.open("advapi32.dll", 0)
-    kernel:=win_io_loader.open("kernel32.dll", 0)
-    if io.failed(security.failure) || io.failed(kernel.failure) {
+    security:=win_io_loader.open("advapi32.dll", 0) catch {
       #panic("missing Windows plugin security library")
     }
-    install_win_private_api.descriptor=#cast(fn(*const u16, u32, *rawptr, *u32)i32, win_io_symbol(security.value, "ConvertStringSecurityDescriptorToSecurityDescriptorW"))
-    install_win_private_api.free=#cast(fn(rawptr)rawptr, win_io_symbol(kernel.value, "LocalFree"))
-    install_win_private_api.volume=#cast(fn(rawptr, rawptr, u32, rawptr, rawptr, *u32, rawptr, u32)i32, win_io_symbol(kernel.value, "GetVolumeInformationByHandleW"))
+    kernel:=win_io_loader.open("kernel32.dll", 0) catch {
+      #panic("missing Windows plugin security library")
+    }
+    install_win_private_api.descriptor=#cast(fn(*const u16, u32, *rawptr, *u32)i32, win_io_symbol(security, "ConvertStringSecurityDescriptorToSecurityDescriptorW"))
+    install_win_private_api.free=#cast(fn(rawptr)rawptr, win_io_symbol(kernel, "LocalFree"))
+    install_win_private_api.volume=#cast(fn(rawptr, rawptr, u32, rawptr, rawptr, *u32, rawptr, u32)i32, win_io_symbol(kernel, "GetVolumeInformationByHandleW"))
     win_io_sync.once_complete(&install_win_private_once)
   }
 }
 
 fn install_win_create_private(parent:i32, name:*const u8, directory, executable:bool)i32 {
   install_win_private_prepare()
-  if !install_win_name(name) {
-    return -1
-  }
+  if !install_win_name(name) { return -1 }
   root:=win_io_handle(parent)
   info:=WinIOInformation{}
-  if win_io_api.info(root, &info)==0 {
-    return win_io_fail(win_io_api.error())
-  }
-  if (info.attributes&16)==0 || (info.attributes&1024)!=0 {
-    return win_io_fail(50)
-  }
+  if win_io_api.info(root, &info)==0 { return win_io_fail(win_io_api.error()) }
+  if (info.attributes&16)==0 || (info.attributes&1024)!=0 { return win_io_fail(50) }
   flags:u32=0
   if install_win_private_api.volume(root, nil, 0, nil, nil, &flags, nil, 0)==0 {
     return win_io_fail(win_io_api.error())
   }
-  if (flags&8)==0 {
-    return win_io_fail(50)
-  }
+  if (flags&8)==0 { return win_io_fail(50) }
   policy:[]const u8="D:P(A;;FRFWSDWDWO;;;OW)"
   if directory {
     policy="D:P(A;OICI;FA;;;OW)"
@@ -501,7 +445,7 @@ fn install_win_create_private(parent:i32, name:*const u8, directory, executable:
     policy="D:P(A;;FRFWFXSDWDWO;;;OW)"
   }
   security_text:[64]u16
-  for at in 0..#len(policy) {
+  for at in 0..policy.len {
     security_text[at]=#cast(u16, policy[at])
   }
   security:rawptr=nil
@@ -511,9 +455,7 @@ fn install_win_create_private(parent:i32, name:*const u8, directory, executable:
   }
   defer _=install_win_private_api.free(security)
   wide:[1024]u16
-  if !win_io_path(name, wide[..]) {
-    return -1
-  }
+  if !win_io_path(name, wide[..]) { return -1 }
   units:usize=0
   for wide[units]!=0 {
     units+=1
@@ -533,9 +475,7 @@ fn install_win_create_private(parent:i32, name:*const u8, directory, executable:
   status:=InstallWinStatus{}
   handle:rawptr=nil
   result:=install_win_api.open(&handle, access, &attributes, &status, nil, file_attributes, 7, 2, options, nil, 0)
-  if result<0 {
-    return win_io_fail(install_win_api.status_error(result))
-  }
+  if result<0 { return win_io_fail(install_win_api.status_error(result)) }
   mode:i32=1
   if directory {
     mode=0

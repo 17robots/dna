@@ -1,8 +1,8 @@
 #target(kernel: windows)
 #link("ucrt")
 
-use "std/dynlib" frontend_loader
-use "std/sync" frontend_sync
+use frontend_loader "std/dynlib"
+use frontend_sync "std/sync"
 extern fn frontend_isatty "_isatty"(descriptor: i32) i32
 struct WindowsFrontendAPI {
   set_environment: fn(*const u16, *const u16) i32,
@@ -14,26 +14,29 @@ struct WindowsFrontendAPI {
 frontend_windows_api: WindowsFrontendAPI
 frontend_windows_once: frontend_sync.Once
 fn frontend_symbol(library: rawptr, name: []const u8) rawptr {
-  result := frontend_loader.symbol(library, name)
-  if io.failed(result.failure) || result.value == nil {
+  result := frontend_loader.symbol(library, name) catch {
     #panic("missing Windows frontend routine")
   }
-  return result.value
+  if result == nil {
+    #panic("missing Windows frontend routine")
+  }
+  return result
 }
 fn frontend_prepare() {
   if frontend_sync.once_begin(&frontend_windows_once) {
-    kernel := frontend_loader.open("kernel32.dll", 0)
-    user := frontend_loader.open("user32.dll", 0)
-    if io.failed(kernel.failure) || io.failed(user.failure) {
+    kernel := frontend_loader.open("kernel32.dll", 0) catch {
       #panic("missing Windows frontend library")
     }
-    frontend_windows_api.set_environment = #cast(fn(*const u16, *const u16) i32, frontend_symbol(kernel.value, "SetEnvironmentVariableW"))
-    frontend_windows_api.thread_times = #cast(fn(rawptr, *u64, *u64, *u64, *u64) i32, frontend_symbol(kernel.value, "GetThreadTimes"))
-    frontend_windows_api.process_times = #cast(fn(rawptr, *u64, *u64, *u64, *u64) i32, frontend_symbol(kernel.value, "GetProcessTimes"))
-    frontend_windows_api.current_thread = #cast(fn() rawptr, frontend_symbol(kernel.value, "GetCurrentThread"))
-    frontend_windows_api.current_process = #cast(fn() rawptr, frontend_symbol(kernel.value, "GetCurrentProcess"))
-    frontend_windows_api.screen = #cast(fn(i32) i32, frontend_symbol(user.value, "GetSystemMetrics"))
-    frontend_windows_api.system_directory = #cast(fn(*u16, u32) u32, frontend_symbol(kernel.value, "GetSystemDirectoryW"))
+    user := frontend_loader.open("user32.dll", 0) catch {
+      #panic("missing Windows frontend library")
+    }
+    frontend_windows_api.set_environment = #cast(fn(*const u16, *const u16) i32, frontend_symbol(kernel, "SetEnvironmentVariableW"))
+    frontend_windows_api.thread_times = #cast(fn(rawptr, *u64, *u64, *u64, *u64) i32, frontend_symbol(kernel, "GetThreadTimes"))
+    frontend_windows_api.process_times = #cast(fn(rawptr, *u64, *u64, *u64, *u64) i32, frontend_symbol(kernel, "GetProcessTimes"))
+    frontend_windows_api.current_thread = #cast(fn() rawptr, frontend_symbol(kernel, "GetCurrentThread"))
+    frontend_windows_api.current_process = #cast(fn() rawptr, frontend_symbol(kernel, "GetCurrentProcess"))
+    frontend_windows_api.screen = #cast(fn(i32) i32, frontend_symbol(user, "GetSystemMetrics"))
+    frontend_windows_api.system_directory = #cast(fn(*u16, u32) u32, frontend_symbol(kernel, "GetSystemDirectoryW"))
     frontend_sync.once_complete(&frontend_windows_once)
   }
 }
@@ -43,51 +46,38 @@ fn frontend_display_available() bool {
 }
 fn frontend_wide(text: *const u8, output: []u16) bool {
   length := c.string_length(text, 65536)
-  if length >= 65536 {
-    return false
-  }
+  if length >= 65536 { return false }
   if length == 0 {
     output[0] = 0
     return true
   }
-  used := host.utf16(65001, 8, text, #cast(i32, length), &output[0], #cast(i32, #len(output)) - 1)
-  if used <= 0 {
-    return false
-  }
+  used := host.utf16(65001, 8, text, #cast(i32, length), &output[0], #cast(i32, output.len) - 1)
+  if used <= 0 { return false }
   output[used] = 0
+  return true
+}
+fn frontend_has_environment(name: []const u8, storage: []u8) bool {
+  _ = host.environment(name, storage) catch { return false }
   return true
 }
 fn handoff_setenv(name, value: *const u8, overwrite: i32) i32 {
   frontend_prepare()
-  if name == nil || value == nil {
-    return -1
-  }
+  if name == nil || value == nil { return -1 }
   if overwrite == 0 {
     storage: [4096]u8
-    present := host.environment(#slice(name, c.string_length(name, 65536)), storage[..])
-    if present.found {
-      return 0
-    }
+    if frontend_has_environment(#slice(name, c.string_length(name, 65536)), storage[..]) { return 0 }
   }
   key: [32768]u16
   text: [32768]u16
-  if !frontend_wide(name, key[..]) || !frontend_wide(value, text[..]) {
-    return -1
-  }
-  if frontend_windows_api.set_environment(&key[0], &text[0]) == 0 {
-    return -1
-  }
+  if !frontend_wide(name, key[..]) || !frontend_wide(value, text[..]) { return -1 }
+  if frontend_windows_api.set_environment(&key[0], &text[0]) == 0 { return -1 }
   return 0
 }
 fn handoff_unsetenv(name: *const u8) i32 {
   frontend_prepare()
   key: [32768]u16
-  if name == nil || !frontend_wide(name, key[..]) {
-    return -1
-  }
-  if frontend_windows_api.set_environment(&key[0], nil) == 0 {
-    return -1
-  }
+  if name == nil || !frontend_wide(name, key[..]) { return -1 }
+  if frontend_windows_api.set_environment(&key[0], nil) == 0 { return -1 }
   return 0
 }
 fn thread_clock(kind: i32, moment: *ThreadTime) i32 {
@@ -102,9 +92,7 @@ fn thread_clock(kind: i32, moment: *ThreadTime) i32 {
   } else if kind == 2 {
     status = frontend_windows_api.process_times(frontend_windows_api.current_process(), &created, &ended, &kernel, &user)
   }
-  if status == 0 {
-    return -1
-  }
+  if status == 0 { return -1 }
   ticks := kernel + user
   moment.seconds = #cast(i64, ticks / 10000000)
   moment.nanoseconds = #cast(i64, (ticks % 10000000) * 100)
@@ -112,8 +100,8 @@ fn thread_clock(kind: i32, moment: *ThreadTime) i32 {
 }
 
 
-use "std/mem" frontend_mem
-use "std/encoding/base64" frontend_base64
+use frontend_mem "std/mem"
+use frontend_base64 "std/encoding/base64"
 use "std/io"
 struct WindowsLanguageCommand {
   script: [16384]u16,
@@ -128,9 +116,7 @@ fn frontend_system_directory(space: *WindowsLanguageCommand) usize {
     return 0
   }
   used := host.utf8(65001, 128, &space.scratch[0], #cast(i32, units), &space.system[0], 32767, nil, nil)
-  if used <= 0 {
-    return 0
-  }
+  if used <= 0 { return 0 }
   length := #cast(usize, used)
   for at in 0..length {
     if space.system[at] == 92 {
@@ -144,20 +130,11 @@ fn frontend_system_directory(space: *WindowsLanguageCommand) usize {
   return length
 }
 fn platform_job_directory(output: []u8) usize {
-  arena := frontend_mem.arena_try_alloc(196608)
-  if !arena.ok {
-    return 0
-  }
-  defer frontend_mem.arena_release(arena.arena)
-  allocation := frontend_mem.arena_try_push_uninit(arena.arena, #sizeof(WindowsLanguageCommand), #alignof(WindowsLanguageCommand))
-  if !allocation.ok {
-    return 0
-  }
-  space := #cast(*WindowsLanguageCommand, allocation.memory)
+  arena := frontend_mem.arena_alloc(196608)
+  defer frontend_mem.arena_release(arena)
+  space := frontend_mem.push<WindowsLanguageCommand>(arena)
   size := frontend_system_directory(space)
-  if size == 0 || size >= #len(output) {
-    return 0
-  }
+  if size == 0 || size >= output.len { return 0 }
   for at in 0..size {
     output[at] = space.system[at]
   }
@@ -165,9 +142,7 @@ fn platform_job_directory(output: []u8) usize {
   return size
 }
 fn frontend_language_text(space: *WindowsLanguageCommand, used: *usize, text: []const u8) bool {
-  if #len(text) > #len(space.script) - used.* {
-    return false
-  }
+  if text.len > space.script.len - used.* { return false }
   for byte in text {
     space.script[used.*] = byte
     used.* += 1
@@ -175,9 +150,7 @@ fn frontend_language_text(space: *WindowsLanguageCommand, used: *usize, text: []
   return true
 }
 fn frontend_language_units(space: *WindowsLanguageCommand, used: *usize, text: []const u16) bool {
-  if #len(space.script) - used.* < 2 {
-    return false
-  }
+  if space.script.len - used.* < 2 { return false }
   space.script[used.*] = 39
   used.* += 1
   for unit in text {
@@ -188,9 +161,7 @@ fn frontend_language_units(space: *WindowsLanguageCommand, used: *usize, text: [
     if quoted {
       required = 2
     }
-    if required >= #len(space.script) - used.* {
-      return false
-    }
+    if required >= space.script.len - used.* { return false }
     space.script[used.*] = unit
     used.* += 1
     if quoted {
@@ -203,37 +174,25 @@ fn frontend_language_units(space: *WindowsLanguageCommand, used: *usize, text: [
   return true
 }
 fn frontend_language_convert(space: *WindowsLanguageCommand, text: []const u8) isize {
-  if #len(text) > 32767 {
-    return -1
-  }
+  if text.len > 32767 { return -1 }
   for byte in text {
-    if byte == 0 {
-      return -1
-    }
+    if byte == 0 { return -1 }
   }
-  if #len(text) == 0 {
-    return 0
-  }
-  units := host.utf16(65001, 8, &text[0], #cast(i32, #len(text)), &space.scratch[0], 32768)
-  if units <= 0 {
-    return -1
-  }
+  if text.len == 0 { return 0 }
+  units := host.utf16(65001, 8, &text[0], #cast(i32, text.len), &space.scratch[0], 32768)
+  if units <= 0 { return -1 }
   return units
 }
 fn frontend_language_literal(space: *WindowsLanguageCommand, used: *usize, text: []const u8) bool {
   units := frontend_language_convert(space, text)
-  if units < 0 {
-    return false
-  }
+  if units < 0 { return false }
   return frontend_language_units(space, used, space.scratch[..#cast(usize, units)])
 }
 // ProcessStartInfo.Arguments uses the Windows CRT command-line contract.
 // Double backslashes before quotes and the closing delimiter; quote every arg.
 fn frontend_language_argument(space: *WindowsLanguageCommand, used: *usize, text: []const u8) bool {
   units := frontend_language_convert(space, text)
-  if units < 0 || #len(space.arguments) - used.* < 3 {
-    return false
-  }
+  if units < 0 || space.arguments.len - used.* < 3 { return false }
   if used.* != 0 {
     space.arguments[used.*] = 32
     used.* += 1
@@ -250,9 +209,7 @@ fn frontend_language_argument(space: *WindowsLanguageCommand, used: *usize, text
     if unit == 34 {
       count = slashes * 2 + 1
     }
-    if count + 1 >= #len(space.arguments) - used.* {
-      return false
-    }
+    if count + 1 >= space.arguments.len - used.* { return false }
     for index in 0..count {
       space.arguments[used.*] = 92
       used.* += 1
@@ -261,9 +218,7 @@ fn frontend_language_argument(space: *WindowsLanguageCommand, used: *usize, text
     used.* += 1
     slashes = 0
   }
-  if slashes * 2 + 1 > #len(space.arguments) - used.* {
-    return false
-  }
+  if slashes * 2 + 1 > space.arguments.len - used.* { return false }
   for index in 0..slashes * 2 {
     space.arguments[used.*] = 92
     used.* += 1
@@ -273,32 +228,19 @@ fn frontend_language_argument(space: *WindowsLanguageCommand, used: *usize, text
   return true
 }
 fn platform_language_command(output: []u8, used: *usize, root, helper, verb, name: []const u8) bool {
-  if used.* >= #len(output) || #len(root) == 0 || #len(helper) == 0 || #len(verb) == 0 {
-    return false
-  }
-  arena := frontend_mem.arena_try_alloc(196608)
-  if !arena.ok {
-    return false
-  }
-  defer frontend_mem.arena_release(arena.arena)
-  allocation := frontend_mem.arena_try_push_uninit(arena.arena, #sizeof(WindowsLanguageCommand), #alignof(WindowsLanguageCommand))
-  if !allocation.ok {
-    return false
-  }
-  space := #cast(*WindowsLanguageCommand, allocation.memory)
+  if used.* >= output.len || root.len == 0 || helper.len == 0 || verb.len == 0 { return false }
+  arena := frontend_mem.arena_alloc(196608)
+  defer frontend_mem.arena_release(arena)
+  space := frontend_mem.push<WindowsLanguageCommand>(arena)
   directory := frontend_system_directory(space)
-  if directory == 0 {
-    return false
-  }
+  if directory == 0 { return false }
   // Only this trusted, canonical OS path remains outside EncodedCommand.
   // Refuse expansion characters instead of accepting a different launcher path.
   for byte in space.system[..directory] {
-    if byte < 32 || byte >= 128 || byte == 34 || byte == 37 || byte == 33 {
-      return false
-    }
+    if byte < 32 || byte >= 128 || byte == 34 || byte == 37 || byte == 33 { return false }
   }
   arguments: usize = 0
-  if !frontend_language_argument(space, &arguments, verb) || (#len(name) > 0 && !frontend_language_argument(space, &arguments, name)) {
+  if !frontend_language_argument(space, &arguments, verb) || (name.len > 0 && !frontend_language_argument(space, &arguments, name)) {
     return false
   }
   script: usize = 0
@@ -314,15 +256,15 @@ fn platform_language_command(output: []u8, used: *usize, root, helper, verb, nam
   }
   suffix := "/WindowsPowerShell/v1.0/powershell.exe\" -NoLogo -NoProfile -NonInteractive -EncodedCommand "
   encoded_size := ((script * 2 + 2) / 3) * 4
-  required := 1 + directory + #len(suffix) + encoded_size
+  required := 1 + directory + suffix.len + encoded_size
   // cmd.exe's own limit is lower than CreateProcessW's 32768-unit buffer.
   // Leave output and its existing prefix untouched unless the whole command fits.
-  if required > 8190 || used.* > 8190 - required || required >= #len(output) - used.* || used.* + required >= 32768 {
+  if required > 8190 || used.* > 8190 - required || required >= output.len - used.* || used.* + required >= 32768 {
     return false
   }
   bytes := #slice((#cast(*const u8, &space.script[0])), script * 2)
   // Windows x64 and arm64 both store UTF-16 units little-endian.
-  encoded := frontend_base64.encode(arena.arena, bytes)
+  encoded := frontend_base64.encode(arena, bytes)
   at := used.*
   output[at] = 34
   at += 1

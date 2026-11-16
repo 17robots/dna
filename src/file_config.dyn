@@ -61,11 +61,9 @@ fn file_config_invalidate(app: *App) {
 // The file's absolute path; an unnamed buffer stands in the project directory.
 fn file_config_location(app: *App, slot: *Slot, output: []u8) []const u8 {
   name := files.name(&slot.file)
-  if #len(name) > 0 && slot.terminal.handle == nil {
+  if name.len > 0 && slot.terminal.handle == nil {
     resolved := files.resolve(name, output)
-    if #len(resolved) > 0 {
-      return resolved
-    }
+    if resolved.len > 0 { return resolved }
   }
   used := copy_text(output[..4000], app.workspace.project[..app.workspace.project_length])
   if used == 0 {
@@ -99,10 +97,12 @@ fn file_config_resolve(app: *App, config: *FileConfig, absolute: []const u8, fil
   global_text: []const u8 = ""
   if app.configuration.global_source_ready {
     global_text = app.configuration.global_source[..app.configuration.global_source_length]
-  } else if app.configuration.path_length > 0 && !io.failed(files.metadata(app.configuration.path[..app.configuration.path_length]).failure) {
-    read := fs.read_all(app.scratch, app.configuration.path[..app.configuration.path_length], 16384)
-    if !io.failed(read.failure) {
-      global_text = read.value
+  } else if app.configuration.path_length > 0 {
+    gmeta := files.metadata(app.configuration.path[..app.configuration.path_length]) catch fs.Metadata{}
+    if gmeta.mode != 0 {
+      empty: []u8
+      read := fs.read_all(app.scratch, app.configuration.path[..app.configuration.path_length], 16384) catch empty
+      global_text = read
     }
   }
   if !settings.parse_layer(global_text, global, &global_layer) {
@@ -136,18 +136,17 @@ fn file_config_resolve(app: *App, config: *FileConfig, absolute: []const u8, fil
   directory := file_config_directory(absolute)
   project: [4096]u8
   project_path := file_config_find_upward(directory, "dna.toml", project[..])
-  if #len(project_path) > 0 && !buffer.equal(project_path, app.configuration.path[..app.configuration.path_length]) {
-    read := fs.read_all(app.scratch, project_path, 16384)
-    if !io.failed(read.failure) {
+  if project_path.len > 0 && !buffer.equal(project_path, app.configuration.path[..app.configuration.path_length]) {
+    empty_proj: []u8
+    read := fs.read_all(app.scratch, project_path, 16384) catch empty_proj
+    if read.len > 0 {
       layered := scratch_settings(app)
-      if layered == nil {
-        return
-      }
+      if layered == nil { return }
       settings.defaults(layered)
-      layer := settings.Layer{project: true, trusted: trust_check(app, project_path, read.value)}
+      layer := settings.Layer{project: true, trusted: trust_check(app, project_path, read)}
       layer.locks = global_layer.locks
       layer.lock_count = global_layer.lock_count
-      if settings.parse_layer(read.value, layered, &layer) {
+      if settings.parse_layer(read, layered, &layer) {
         file_config_layer(config, layered, filetype, SourceProject)
         config.project_length = copy_text(config.project[..], project_path)
       }
@@ -155,14 +154,10 @@ fn file_config_resolve(app: *App, config: *FileConfig, absolute: []const u8, fil
   }
 
   // [project."PATH"] sections of the global file.
-  if #len(global_text) > 0 {
+  if global_text.len > 0 {
     home_storage: [4096]u8
-    home := host.environment("HOME", home_storage[..])
-    home_text: []const u8 = ""
-    if !io.failed(home.failure) && home.found {
-      home_text = home.value
-    }
-    output := #slice(mem.arena_push(app.scratch, #len(global_text), 1), #len(global_text))
+    home_text := host.environment("HOME", home_storage[..]) catch home_storage[..0]
+    output := mem.push_bytes(app.scratch, global_text.len)
     // Every section is copied into FileConfig before the next is parsed.
     // Reuse one Settings value regardless of the number of matching sections.
     layered := scratch_settings(app)
@@ -180,7 +175,7 @@ fn file_config_resolve(app: *App, config: *FileConfig, absolute: []const u8, fil
 
   // :set values for this session.
   if app.configuration.overrides_length > 0 || app.configuration.module_overrides_length > 0 {
-    text := #slice(mem.arena_push(app.scratch, 8192, 1), 8192)
+    text := mem.push_bytes(app.scratch, 8192)
     layered := scratch_settings(app)
     settings.defaults(layered)
     layer := settings.Layer{project: true, trusted: true, session: true}
@@ -193,7 +188,7 @@ fn file_config_resolve(app: *App, config: *FileConfig, absolute: []const u8, fil
   config.ready = true
 }
 fn scratch_settings(app: *App) *settings.Settings {
-  return mem.push(settings.Settings, app.scratch)
+  return mem.push<settings.Settings>(app.scratch)
 }
 // Applies the keys one layer set explicitly: top-level ones, then its
 // section for this filetype.
@@ -216,9 +211,7 @@ fn file_config_layer(config: *FileConfig, layered: *const settings.Settings, fil
     config.sources[3] = source
   }
   language := settings.language(layered, filetype)
-  if language == nil || language.seen == 0 {
-    return
-  }
+  if language == nil || language.seen == 0 { return }
   if !config.has_language {
     config.language = settings.Language{}
     config.language.name_length = copy_text(config.language.name[..64], filetype)
@@ -250,26 +243,23 @@ fn file_config_editorconfig(app: *App, config: *FileConfig, absolute: []const u8
   lengths: [32]usize
   count: usize = 0
   directory := file_config_directory(absolute)
-  length := #len(directory)
+  length := directory.len
   for count < 32 {
     candidate: [4096]u8
     used := copy_text(candidate[..4000], absolute[..length])
     add_text(candidate[..], &used, "/.editorconfig")
-    info := files.metadata(candidate[..used])
-    if !io.failed(info.failure) && (info.mode & 61440) == 32768 {
-      read := fs.read_all(app.scratch, candidate[..used], 65536)
-      if !io.failed(read.failure) {
-        texts[count] = read.value
+    info := files.metadata(candidate[..used]) catch fs.Metadata{}
+    if (info.mode & 61440) == 32768 {
+      empty_ec: []u8
+      read := fs.read_all(app.scratch, candidate[..used], 65536) catch empty_ec
+      if read.len > 0 {
+        texts[count] = read
         lengths[count] = length
         count += 1
-        if settings.editorconfig_root(read.value) {
-          break
-        }
+        if settings.editorconfig_root(read) { break }
       }
     }
-    if length == 0 {
-      break
-    }
+    if length == 0 { break }
     // Up one directory; "/" itself is length 0.
     length -= 1
     for length > 0 && absolute[length] != '/' {
@@ -281,14 +271,12 @@ fn file_config_editorconfig(app: *App, config: *FileConfig, absolute: []const u8
   for index > 0 {
     index -= 1
     start := lengths[index] + 1
-    if start <= #len(absolute) {
+    if start <= absolute.len {
       settings.editorconfig_apply(texts[index], absolute[start..], &result)
     }
   }
   config.editorconfig_count = count
-  if !result.matched {
-    return
-  }
+  if !result.matched { return }
   if result.indent_style != 0 && !file_config_locked(global, "insert_tabs") {
     config.insert_tabs = result.indent_style == settings.EditorTab
     config.sources[1] = SourceEditorConfig
@@ -313,7 +301,7 @@ fn file_config_editorconfig(app: *App, config: *FileConfig, absolute: []const u8
 }
 // "/a/b/c.txt" -> "/a/b"; "/a/b/" -> "/a/b"; "/c.txt" -> "".
 fn file_config_directory(absolute: []const u8) []const u8 {
-  end := #len(absolute)
+  end := absolute.len
   for end > 0 && absolute[end - 1] != '/' {
     end -= 1
   }
@@ -323,18 +311,14 @@ fn file_config_directory(absolute: []const u8) []const u8 {
   return absolute[..end]
 }
 fn file_config_find_upward(directory: []const u8, name: []const u8, output: []u8) []const u8 {
-  length := #len(directory)
+  length := directory.len
   for {
     used := copy_text(output[..4000], directory[..length])
     add_text(output, &used, "/")
     add_text(output, &used, name)
-    info := files.metadata(output[..used])
-    if !io.failed(info.failure) && (info.mode & 61440) == 32768 {
-      return output[..used]
-    }
-    if length == 0 {
-      return output[..0]
-    }
+    info := files.metadata(output[..used]) catch fs.Metadata{}
+    if (info.mode & 61440) == 32768 { return output[..used] }
+    if length == 0 { return output[..0] }
     length -= 1
     for length > 0 && directory[length] != '/' {
       length -= 1
@@ -343,26 +327,16 @@ fn file_config_find_upward(directory: []const u8, name: []const u8, output: []u8
   return output[..0]
 }
 fn file_config_source_name(source: u8) []const u8 {
-  if source == SourceEditorConfig {
-    return ".editorconfig"
-  }
-  if source == SourceProject {
-    return "dna.toml"
-  }
-  if source == SourceSection {
-    return "[project] section"
-  }
-  if source == SourceSession {
-    return ":set"
-  }
+  if source == SourceEditorConfig { return ".editorconfig" }
+  if source == SourceProject { return "dna.toml" }
+  if source == SourceSection { return "[project] section" }
+  if source == SourceSession { return ":set" }
   return "global"
 }
 // :config-sources lines for the active document.
 fn file_config_report(app: *App, report: []u8, used: *usize) {
   slot := app.documents.slots[app.documents.active]
-  if slot.document == nil || slot.terminal.handle != nil {
-    return
-  }
+  if slot.document == nil || slot.terminal.handle != nil { return }
   config := file_config(app, slot)
   add_text(report, used, "\nThis file: ")
   add_text(report, used, config.path[..config.path_length])
@@ -412,9 +386,7 @@ fn file_config_report(app: *App, report: []u8, used: *usize) {
 // EditorConfig obeys the same global editor locks as dna.toml and :set.
 fn file_config_locked(layer: *const settings.Layer, key: []const u8) bool {
   for index in 0..layer.lock_count {
-    if settings.lock_matches(layer.locks[index], "editor", key, key) {
-      return true
-    }
+    if settings.lock_matches(layer.locks[index], "editor", key, key) { return true }
   }
   return false
 }
@@ -424,7 +396,7 @@ fn save_file_config(app: *App, path: []const u8, output: *FileConfig) *FileConfi
   storage: [4096]u8
   absolute := files.resolve(path, storage[..])
   current := active_file_config(app)
-  if #len(absolute) == 0 || buffer.equal(absolute, current.path[..current.path_length]) {
+  if absolute.len == 0 || buffer.equal(absolute, current.path[..current.path_length]) {
     return current
   }
   slot := app.documents.slots[app.documents.active]

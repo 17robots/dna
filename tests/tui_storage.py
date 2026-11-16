@@ -13,36 +13,36 @@ ROOT=Path(__file__).resolve().parents[1]
 CHECK='''fn storage_check(ok:bool) { if !ok { #panic("TUI screen storage lifecycle") } }
 fn main() {
   if !tui_start() {
-    storage_check(!state.active && #len(grid)==0 && #len(shown)==0 && #len(output)==0)
+    storage_check(!state.active && grid.len==0 && shown.len==0 && output.len==0)
     storage_check(screen_storage==nil)
     return
   }
   for cycle in 0..2 {
     if cycle!=0 { storage_check(tui_start()) }
-    storage_check(#len(grid)==MaxColumns*MaxRows && #len(shown)==#len(grid) && #len(output)==1048576)
-    storage_check(grid[#len(grid)-1].character==0 && shown[#len(shown)-1].character==0)
+    storage_check(grid.len==MaxColumns*MaxRows && shown.len==grid.len && output.len==1048576)
+    storage_check(grid[grid.len-1].character==0 && shown[shown.len-1].character==0)
     address:=#cast(usize,&grid[0])
     storage_check(tui_start() && #cast(usize,&grid[0])==address)
     storage_check(floor_cell(-1.0,CellWidth)== -1 && floor_cell(-8.0,CellWidth)== -1 && floor_cell(-9.0,CellWidth)== -2 && floor_cell(-80.0,CellWidth)== -10)
     text:=tui_text_create()
     storage_check(text!=nil)
     ascii:[]const u8="0123456789TAIL"
-    storage_check(tui_text_set(text,&ascii[0],#len(ascii)))
+    storage_check(tui_text_set(text,&ascii[0],ascii.len))
     tui_clear()
     tui_text_draw(text,-80.0,0.0)
     storage_check(grid[0].character=='T' && grid[1].character=='A')
     unicode:[]const u8="é中é🙂TAIL"
-    storage_check(tui_text_set(text,&unicode[0],#len(unicode)))
+    storage_check(tui_text_set(text,&unicode[0],unicode.len))
     tui_clear()
     tui_text_draw(text,-48.0,0.0)
     storage_check(grid[0].character=='T' && grid[1].character=='A')
     tui_text_destroy(text)
     tui_clear()
     tui_present()
-    grid[#len(grid)-1].character=88
-    shown[#len(shown)-1].character=89
+    grid[grid.len-1].character=88
+    shown[shown.len-1].character=89
     tui_stop()
-    storage_check(!state.active && #len(grid)==0 && #len(shown)==0 && #len(output)==0)
+    storage_check(!state.active && grid.len==0 && shown.len==0 && output.len==0)
     storage_check(screen_storage==nil && output_used==0)
     tui_stop()
   }

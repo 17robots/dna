@@ -14,31 +14,33 @@ from windows_target import SDK_ARCH, link_arguments
 from dyn_path import real_dyn
 from sdk_compat import environment as sdk_environment
 
-SOURCE = r'''use "std/io" io
-use "./filesystem" fs
-use "std/dynlib" loader
+SOURCE = r'''use io "std/io"
+use fs "./filesystem"
+use loader "std/dynlib"
 fn write_payload(executable:bool, path:[]const u8) {
-  created:=fs.FileResult{}
-  if executable { created=fs.create_private_executable_exclusive(path)
-  } else { created=fs.create_private_exclusive(path) }
-  if io.failed(created.failure) { #panic("private output creation") }
-  opened:=fs.open("payload.exe")
-  if io.failed(opened.failure) { #panic("PE fixture open") }
+  created:=fs.File{}
+  if executable { created=fs.create_private_executable_exclusive(path) catch { #panic("private output creation") }
+  } else { created=fs.create_private_exclusive(path) catch { #panic("private output creation") } }
+  opened:=fs.open("payload.exe") catch { #panic("PE fixture open") }
   buffer:[16384]u8
   for {
-    read:=fs.read(&opened.value,buffer[..])
-    if io.failed(read.failure) { #panic("PE fixture read") }
-    if read.transferred==0 { break }
-    at:usize=0
-    for at<read.transferred {
-      written:=fs.write(&created.value,buffer[at..read.transferred])
-      if io.failed(written.failure) || written.transferred==0 { #panic("private PE write") }
-      at+=written.transferred
-    }
+    read:=fs.read(&opened,buffer[..]) catch { #panic("PE fixture read") }
+    if read==0 { break }
+    fs.write(&created,buffer[..read]) catch { #panic("private PE write") }
   }
-  fs.close(&opened.value)
-  if io.failed(fs.sync(&created.value).failure) { #panic("private PE close") }
-  fs.close(&created.value)
+  fs.close(&opened)
+  fs.sync(&created) catch { #panic("private PE close") }
+  fs.close(&created)
+}
+fn create_exec_fails(path:[]const u8) bool {
+  file:=fs.create_private_executable_exclusive(path) catch { return true }
+  fs.close(&file)
+  return false
+}
+fn create_data_fails(path:[]const u8) bool {
+  file:=fs.create_private_exclusive(path) catch { return true }
+  fs.close(&file)
+  return false
 }
 fn main() {
   // Both files contain the same valid PE. Their only intended difference is
@@ -46,32 +48,28 @@ fn main() {
   write_payload(true,"private café 日本語.exe")
   write_payload(false,"data café 日本語.exe")
   if !fs.executable("private café 日本語.exe") || fs.executable("data café 日本語.exe") || fs.executable("missing.exe") || fs.executable(".") || fs.executable("reparse-payload.exe") { #panic("effective executable access must match private DACL and reject non-regular paths") }
-  if !io.failed(fs.create_private_executable_exclusive("private café 日本語.exe").failure) || !io.failed(fs.create_private_exclusive("data café 日本語.exe").failure) { #panic("private creation must not overwrite") }
-  kernel:=loader.open("kernel32.dll",0)
-  process_symbol:=loader.symbol(kernel.value,"GetCurrentProcess")
-  count_symbol:=loader.symbol(kernel.value,"GetProcessHandleCount")
-  if io.failed(kernel.failure) || io.failed(process_symbol.failure) || io.failed(count_symbol.failure) { #panic("handle API") }
-  process:=#cast(fn()rawptr,process_symbol.value)
-  handles:=#cast(fn(rawptr,*u32)i32,count_symbol.value)
+  if !create_exec_fails("private café 日本語.exe") || !create_data_fails("data café 日本語.exe") { #panic("private creation must not overwrite") }
+  kernel:=loader.open("kernel32.dll",0) catch { #panic("handle API") }
+  process_symbol:=loader.symbol(kernel,"GetCurrentProcess") catch { #panic("handle API") }
+  count_symbol:=loader.symbol(kernel,"GetProcessHandleCount") catch { #panic("handle API") }
+  process:=#cast(fn()rawptr,process_symbol)
+  handles:=#cast(fn(rawptr,*u32)i32,count_symbol)
   // Warm both creation paths before checking steady ownership.
   for attempt in 0..2 {
-    file:=fs.create_private_executable_exclusive("temporary.exe")
-    if io.failed(file.failure) { #panic("warmup") }
-    fs.close(&file.value)
-    if io.failed(fs.remove("temporary.exe").failure) { #panic("warmup") }
+    file:=fs.create_private_executable_exclusive("temporary.exe") catch { #panic("warmup") }
+    fs.close(&file)
+    fs.remove("temporary.exe") catch { #panic("warmup") }
   }
   before:u32=0
   after:u32=0
   if handles(process(),&before)==0 { #panic("initial handle count") }
   for attempt in 0..128 {
-    file:=fs.create_private_executable_exclusive("temporary.exe")
-    if io.failed(file.failure) { #panic("executable creation lifecycle") }
-    fs.close(&file.value)
-    if io.failed(fs.remove("temporary.exe").failure) { #panic("executable creation lifecycle") }
-    file=fs.create_private_exclusive("temporary.data")
-    if io.failed(file.failure) { #panic("data creation lifecycle") }
-    fs.close(&file.value)
-    if io.failed(fs.remove("temporary.data").failure) { #panic("data creation lifecycle") }
+    file:=fs.create_private_executable_exclusive("temporary.exe") catch { #panic("executable creation lifecycle") }
+    fs.close(&file)
+    fs.remove("temporary.exe") catch { #panic("executable creation lifecycle") }
+    file=fs.create_private_exclusive("temporary.data") catch { #panic("data creation lifecycle") }
+    fs.close(&file)
+    fs.remove("temporary.data") catch { #panic("data creation lifecycle") }
     if !fs.executable("private café 日本語.exe") || fs.executable("data café 日本語.exe") || fs.executable("missing.exe") || fs.executable(".") || fs.executable("reparse-payload.exe") { #panic("effective executable access lifecycle") }
   }
   if handles(process(),&after)==0 || before!=after { #panic("private creation handle leak") }

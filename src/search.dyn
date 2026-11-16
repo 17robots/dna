@@ -6,9 +6,7 @@ struct SearchHistory { text: [4096]u8, length: usize }
 // The PCRE2 pattern for a search. The Vim keymap searches with Vim's
 // pattern syntax, shared with :s and :g; other keymaps use PCRE2 directly.
 fn search_query(app: *App, text: []const u8, output: []u8, regex: *VimRegex) []const u8 {
-  if !app.config.vim_keys || #len(text) == 0 {
-    return text
-  }
+  if !app.config.vim_keys || text.len == 0 { return text }
   length := vim_regex_query(text, true, vim_ignore(app, text), app.vim.ex.replacement[..app.vim.ex.replacement_length], output, regex)
   if !regex.valid {
     // Not a valid PCRE2 pattern either, so the search reports it invalid.
@@ -22,9 +20,7 @@ struct SearchCallout { app: *App, doc: *buffer.Document, regex: VimRegex, cursor
 fn search_callout(block: rawptr, data: rawptr) i32 {
   context := #cast(*SearchCallout, data)
   number := #cast(usize, pattern.callout_number(block))
-  if number == 0 || number > context.regex.filter_count {
-    return 0
-  }
+  if number == 0 || number > context.regex.filter_count { return 0 }
   position := context.compiled.base + pattern.callout_position(block)
   if vim_filter_check(context.app, context.doc, context.regex.filters[number - 1], position, context.cursor) {
     return 0
@@ -68,9 +64,7 @@ fn search_open(app: *App, kind: Panel, explorer: bool) {
 fn search_restore(app: *App) {
   state := &app.search_state
   doc := state.document
-  if doc == nil {
-    return
-  }
+  if doc == nil { return }
   doc.cursor = state.primary.cursor
   doc.anchor = state.primary.anchor
   doc.secondary = state.secondary
@@ -110,9 +104,7 @@ fn search_step(doc: *const buffer.Document, compiled: *pattern.Pattern, selectio
   if !backwards {
     // Skip a zero-width match at the current cursor when repeating.
     result := pattern.find_document(compiled, doc, base)
-    if result.found || result.error {
-      return result
-    }
+    if result.found || result.error { return result }
     return pattern.find_document(compiled, doc, 0)
   }
   // Scan forward to the last match before the cursor. Positions strictly
@@ -122,15 +114,9 @@ fn search_step(doc: *const buffer.Document, compiled: *pattern.Pattern, selectio
   at: usize = 0
   for at <= doc.length {
     candidate := pattern.find_document(compiled, doc, at)
-    if candidate.error {
-      return candidate
-    }
-    if !candidate.found {
-      break
-    }
-    if candidate.start >= base && previous.found {
-      return previous
-    }
+    if candidate.error { return candidate }
+    if !candidate.found { break }
+    if candidate.start >= base && previous.found { return previous }
     wrapped = candidate
     if candidate.start < base {
       previous = candidate
@@ -138,21 +124,15 @@ fn search_step(doc: *const buffer.Document, compiled: *pattern.Pattern, selectio
     if candidate.end > at {
       at = candidate.end
     } else {
-      if candidate.end == doc.length {
-        break
-      }
+      if candidate.end == doc.length { break }
       at = buffer.next(doc, candidate.end)
     }
   }
-  if previous.found {
-    return previous
-  }
+  if previous.found { return previous }
   return wrapped
 }
 fn search_range(doc: *const buffer.Document, original: buffer.Selection, match: pattern.Match, extending: bool, backwards: bool) buffer.Selection {
-  if !extending {
-    return buffer.Selection{anchor: match.start, cursor: match.end}
-  }
+  if !extending { return buffer.Selection{anchor: match.start, cursor: match.end} }
   fixed := original.anchor
   if original.cursor < original.anchor {
     fixed = buffer.previous(doc, fixed)
@@ -172,27 +152,19 @@ fn search_apply(doc: *buffer.Document, compiled: *pattern.Pattern, extending: bo
   for index in 0..selections.count {
     original := selections.items[index]
     result := search_step(doc, compiled, original, backwards)
-    if result.error {
-      return 3
-    }
+    if result.error { return 3 }
     if result.found {
       selections.items[index] = search_range(doc, original, result, extending, backwards)
-    } else if index == 0 {
-      return 1
-    }
+    } else if index == 0 { return 1 }
   }
   buffer.store(doc, &selections)
   return 0
 }
 fn selection_add(output: *buffer.Selections, low: usize, high: usize) bool {
   for index in 0..output.count {
-    if output.items[index].anchor == low && output.items[index].cursor == high {
-      return true
-    }
+    if output.items[index].anchor == low && output.items[index].cursor == high { return true }
   }
-  if output.count == buffer.SelectionCapacity {
-    return false
-  }
+  if output.count == buffer.SelectionCapacity { return false }
   output.items[output.count] = buffer.Selection{anchor: low, cursor: high}
   output.count += 1
   return true
@@ -208,42 +180,28 @@ fn select_matches(doc: *buffer.Document, compiled: *pattern.Pattern, split: bool
     at: usize = 0
     segment: usize = 0
     attempts: usize = 0
-    for at <= #len(text) {
-      if attempts == 4096 {
-        return 3
-      }
+    for at <= text.len {
+      if attempts == 4096 { return 3 }
       attempts += 1
       found := pattern.find(compiled, text, at)
-      if found.error {
-        return 3
-      }
-      if !found.found {
-        break
-      }
+      if found.error { return 3 }
+      if !found.found { break }
       if split {
         if found.start > segment && !selection_add(&output, low + segment, low + found.start) {
           return 4
         }
         segment = found.end
-      } else if !selection_add(&output, low + found.start, low + found.end) {
-        return 4
-      }
+      } else if !selection_add(&output, low + found.start, low + found.end) { return 4 }
       if found.end > at {
         at = found.end
       } else {
-        if found.end == #len(text) {
-          break
-        }
+        if found.end == text.len { break }
         at = buffer.next(doc, low + found.end) - low
       }
     }
-    if split && segment < #len(text) && !selection_add(&output, low + segment, high) {
-      return 4
-    }
+    if split && segment < text.len && !selection_add(&output, low + segment, high) { return 4 }
   }
-  if output.count == 0 {
-    return 1
-  }
+  if output.count == 0 { return 1 }
   buffer.store(doc, &output)
   return 0
 }
@@ -253,9 +211,7 @@ fn search_preview(app: *App) {
   state.status = 0
   pattern.task_finish(state.task)
   state.task = nil
-  if app.prompt_state.length == 0 {
-    return
-  }
+  if app.prompt_state.length == 0 { return }
   doc := state.document
   if app.prompt_state.panel != Panel.Search && doc.length >= pattern.BackgroundMinimum {
     mode: u8 = 1
@@ -311,9 +267,7 @@ fn search_preview(app: *App) {
 // Apply a finished worker search. Returns true when the view changed.
 fn search_tick(app: *App) bool {
   state := &app.search_state
-  if state.task == nil || !pattern.task_done(state.task) {
-    return false
-  }
+  if state.task == nil || !pattern.task_done(state.task) { return false }
   result := pattern.task_result(state.task)
   ranges_status := pattern.task_status(state.task)
   ranges_output := pattern.task_output(state.task).*
@@ -389,9 +343,7 @@ fn search_submit(app: *App) {
   vim_after_search(app)
 }
 fn search_repeat(app: *App, backwards: bool, explorer: bool) {
-  if app.search_history.length == 0 {
-    return
-  }
+  if app.search_history.length == 0 { return }
   doc := app.documents.current
   extending := app.view.extend
   if !explorer {
@@ -430,9 +382,7 @@ fn search_repeat_windowed(app: *App, doc: *buffer.Document, extending: bool, bac
   query: [4400]u8
   regex := VimRegex{}
   task := pattern.task_start(search_query(app, app.search_history.text[..app.search_history.length], query[..], &regex), doc, search_base(doc, original, backwards), backwards)
-  if task == nil {
-    return false
-  }
+  if task == nil { return false }
   for !pattern.task_done(task) {
     search_pause()
   }
@@ -449,12 +399,8 @@ fn search_repeat_windowed(app: *App, doc: *buffer.Document, extending: bool, bac
   return true
 }
 fn search_label(app: *const App) []const u8 {
-  if app.prompt_state.length == 0 {
-    return "Type a regular expression. Escape cancels."
-  }
-  if app.search_state.status == 1 {
-    return "No matches. Enter or Escape closes."
-  }
+  if app.prompt_state.length == 0 { return "Type a regular expression. Escape cancels." }
+  if app.search_state.status == 1 { return "No matches. Enter or Escape closes." }
   if app.search_state.status == 2 {
     return "Invalid regular expression. Edit pattern or Escape to cancel."
   }
@@ -464,9 +410,7 @@ fn search_label(app: *const App) []const u8 {
   if app.search_state.status == 4 {
     return "More than 32 selections. Narrow the pattern; selection unchanged."
   }
-  if app.search_state.status == 5 {
-    return "Searching..."
-  }
+  if app.search_state.status == 5 { return "Searching..." }
   return "Enter accepts. Escape restores the original selection."
 }
 
@@ -476,17 +420,13 @@ fn filter_selections(doc: *buffer.Document, compiled: *pattern.Pattern, remove: 
   for index in 0..originals.count {
     range := buffer.ordered(originals.items[index])
     found := pattern.find(compiled, buffer.range(doc, range.anchor, range.cursor), 0)
-    if found.error {
-      return 3
-    }
+    if found.error { return 3 }
     if found.found != remove {
       output.items[output.count] = originals.items[index]
       output.count += 1
     }
   }
-  if output.count == 0 {
-    return 1
-  }
+  if output.count == 0 { return 1 }
   buffer.store(doc, &output)
   return 0
 }

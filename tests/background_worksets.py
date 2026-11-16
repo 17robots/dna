@@ -35,13 +35,13 @@ def functions(path, names):
             end += 1
         body = source[start:end]
         if name == 'syntax_tick':
-            body = body.replace('for index < #len(app.documents.slots) {', 'for index < #len(app.documents.slots) {\n    probe_visits += 1')
+            body = body.replace('for index < app.documents.slots.len {', 'for index < app.documents.slots.len {\n    probe_visits += 1')
         if name == 'configured_filetypes':
             body = body.replace('slot := app.documents.slots[slot_index]', 'probe_filetypes += 1\n    slot := app.documents.slots[slot_index]')
         if name == 'configured_filetype_slot':
             body = body[:body.index('{')+1] + '\n  probe_filetypes += 1' + body[body.index('{')+1:]
         if name == 'recovery_needed':
-            body = body.replace('for index in 0..#len(app.documents.slots) {', 'for index in 0..#len(app.documents.slots) {\n    probe_recovery += 1')
+            body = body.replace('for index in 0..app.documents.slots.len {', 'for index in 0..app.documents.slots.len {\n    probe_recovery += 1')
         if name == 'syntax_slot_tick':
             body = body[:body.index('{')+1] + '\n  probe_visits += 1' + body[body.index('{')+1:]
         if name == 'syntax_waiting':
@@ -73,7 +73,7 @@ pub fn load_state(doc:*const Document) u8 { return 0 }
 pub fn chunk_at(doc:*const Document, offset:usize) []const u8 { return doc.bytes[offset..doc.length] }
 pub fn dirty_cached(doc:*Document) bool { return false }
 pub fn valid(bytes:[]const u8) bool { return true }
-pub fn equal(a:[]const u8,b:[]const u8) bool { if #len(a)!=#len(b) {return false} for i in 0..#len(a) { if a[i]!=b[i] {return false} } return true }
+pub fn equal(a:[]const u8,b:[]const u8) bool { if a.len!=b.len {return false} for i in 0..a.len { if a[i]!=b[i] {return false} } return true }
 '''
 FILES = '''pub struct State { path:[4096]u8, length:usize }
 pub fn name(file:*const State) []const u8 { return file.path[..file.length] }
@@ -85,7 +85,7 @@ pub fn forget_stamp(file:*State) { _ = file }
 BASE = '''use "std/mem"
 use "./buffer"
 use "./files"
-use "./owned_arena" arena_owner
+use arena_owner "./owned_arena"
 #link("c")
 extern fn puts "puts"(message:*const u8) i32
 probe_filetypes:usize=0
@@ -150,7 +150,7 @@ fn disk_next(worker:rawptr,ready:*DiskReady) i32 {
 }
 fn disk_take(worker:rawptr,index:usize,identity:u64,bytes:*u8,capacity:usize) i32 {return 0}
 fn disk_replace(doc:*buffer.Document,bytes:[]const u8) {}
-fn copy_text(out:[]u8,source:[]const u8) usize { for i in 0..#len(source) {out[i]=source[i]} return #len(source) }
+fn copy_text(out:[]u8,source:[]const u8) usize { for i in 0..source.len {out[i]=source[i]} return source.len }
 fn explorer_suffix(name:[]const u8,extension:[]const u8) bool {return false}
 fn lsp_document_dirty(app:*App,index:usize) {}
 fn slot_visible(app:*App,index:usize) bool {probe_visible+=1 return index==app.documents.active}
@@ -205,10 +205,10 @@ fn probe_number(value:usize) {
 fn main() {
   owner:=arena_owner.create(8388608)
   defer arena_owner.release(owner)
-  app:=mem.push(App,owner)
-  slots:=mem.push_array(Slot,owner,80)
-  docs:=mem.push_array(buffer.Document,owner,80)
-  pointers:=mem.push_array(*Slot,owner,80)
+  app:=mem.push<App>(owner)
+  slots:=mem.push_array<Slot>(owner,80)
+  docs:=mem.push_array<buffer.Document>(owner,80)
+  pointers:=mem.push_array<*Slot>(owner,80)
   colors: [32]u8
   app.recovery.ready=true
   app.config.syntax_enabled=true

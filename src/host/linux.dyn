@@ -1,22 +1,17 @@
-use "std/parse" parse
 #target(kernel: linux)
-use "std/process" process
+use process "std/process"
 use "std/c"
 
 fn native_current_directory(destination: []u8) usize {
-  result := #syscall(79, &destination[0], #len(destination))
-  if result <= 0 {
-    return 0
-  }
+  result := #syscall(79, &destination[0], destination.len)
+  if result <= 0 { return 0 }
   return #cast(usize, result) - 1
 }
 fn native_change_directory(path: []const u8) bool {
   storage: [4096]u8
-  if #len(path) >= #len(storage) {
-    return false
-  }
-  encoded := cstring.bounded(storage[..], path)
-  return !parse.failed(encoded.failure) && #syscall(80, encoded.value) == 0
+  if path.len >= storage.len { return false }
+  encoded := cstring.bounded(storage[..], path) catch { return false }
+  return #syscall(80, encoded) == 0
 }
 fn native_process_id() u32 {
   return #cast(u32, #syscall(39))
@@ -26,27 +21,19 @@ fn native_small_pages(memory: []u8) {
   // containing this valid span; both endpoint pages already belong to it.
   address := #cast(usize, &memory[0])
   prefix := address % 4096
-  if #len(memory) > #cast(usize, -1) - prefix - 4095 {
-    return
-  }
-  length := (#len(memory) + prefix + 4095) / 4096 * 4096
+  if memory.len > #cast(usize, -1) - prefix - 4095 { return }
+  length := (memory.len + prefix + 4095) / 4096 * 4096
   _ = #syscall(28, address - prefix, length, 15)
 }
 
-fn native_environment(name: []const u8, destination: []u8) EnvironmentResult {
+fn native_environment(name: []const u8, destination: []u8) []u8!io.IoErr {
   temporary := arena_owner.create(0)
   defer arena_owner.release(temporary)
-  result := process.environment(temporary, name)
-  if !io.failed(result.failure) && #len(result.value) > #len(destination) {
-    return EnvironmentResult{ failure: io.Failure{ kind: io.Kind.Capacity, native: -28 } }
-  }
-  if !io.failed(result.failure) {
-    _ = mem.move(destination, result.value)
-    return EnvironmentResult{ value: destination[..#len(result.value)], found: result.found }
-  }
-  return EnvironmentResult{ value: result.value, found: result.found, failure: result.failure }
+  value := try process.environment(temporary, name)
+  if value.len > destination.len { fail .Capacity }
+  _ = mem.move(destination, value)
+  return destination[..value.len]
 }
-fn native_arguments(arena: *mem.Arena) ArgumentsResult {
-  result := process.arguments(arena)
-  return ArgumentsResult{ values: result.value, failure: result.failure }
+fn native_arguments(arena: *mem.Arena) [][]const u8!io.IoErr {
+  return try process.arguments(arena)
 }

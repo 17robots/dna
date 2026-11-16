@@ -26,55 +26,42 @@ struct WinPtyAPI {
 win_pty_api: WinPtyAPI
 win_pty_once: win_proc_sync.Once
 fn win_pty_symbol(library: rawptr, name: []const u8) rawptr {
-  result := win_proc_loader.symbol(library, name)
-  if !io.failed(result.failure) {
-    return result.value
-  }
-  return nil
+  return win_proc_loader.symbol(library, name) catch nil
 }
 fn win_pty_bundle_file(path: []u16, directory: usize, name: []const u8) bool {
-  if directory + #len(name) >= #len(path) {
-    return false
-  }
-  for index in 0..#len(name) {
+  if directory + name.len >= path.len { return false }
+  for index in 0..name.len {
     path[directory + index] = #cast(u16, name[index])
   }
-  path[directory + #len(name)] = 0
+  path[directory + name.len] = 0
   attributes := win_pty_api.attributes(&path[0])
   return attributes != 4294967295 && (attributes & 1040) == 0
 }
 fn win_pty_configure() bool {
-  kernel := win_proc_loader.open("kernel32.dll", 0)
-  if io.failed(kernel.failure) {
+  kernel := win_proc_loader.open("kernel32.dll", 0) catch {
     return false
   }
-  win_pty_api.module = #cast(fn(u32, rawptr, *rawptr) i32, win_pty_symbol(kernel.value, "GetModuleHandleExW"))
-  win_pty_api.module_path = #cast(fn(rawptr, *u16, u32) u32, win_pty_symbol(kernel.value, "GetModuleFileNameW"))
-  win_pty_api.load = #cast(fn(*const u16, rawptr, u32) rawptr, win_pty_symbol(kernel.value, "LoadLibraryExW"))
-  win_pty_api.attributes = #cast(fn(*const u16) u32, win_pty_symbol(kernel.value, "GetFileAttributesW"))
-  win_pty_api.event = #cast(fn(rawptr, i32, i32, rawptr) rawptr, win_pty_symbol(kernel.value, "CreateEventW"))
-  win_pty_api.signal = #cast(fn(rawptr) i32, win_pty_symbol(kernel.value, "SetEvent"))
+  win_pty_api.module = #cast(fn(u32, rawptr, *rawptr) i32, win_pty_symbol(kernel, "GetModuleHandleExW"))
+  win_pty_api.module_path = #cast(fn(rawptr, *u16, u32) u32, win_pty_symbol(kernel, "GetModuleFileNameW"))
+  win_pty_api.load = #cast(fn(*const u16, rawptr, u32) rawptr, win_pty_symbol(kernel, "LoadLibraryExW"))
+  win_pty_api.attributes = #cast(fn(*const u16) u32, win_pty_symbol(kernel, "GetFileAttributesW"))
+  win_pty_api.event = #cast(fn(rawptr, i32, i32, rawptr) rawptr, win_pty_symbol(kernel, "CreateEventW"))
+  win_pty_api.signal = #cast(fn(rawptr) i32, win_pty_symbol(kernel, "SetEvent"))
   if win_pty_api.module == nil || win_pty_api.module_path == nil || win_pty_api.load == nil || win_pty_api.attributes == nil || win_pty_api.event == nil || win_pty_api.signal == nil {
     return false
   }
   module: rawptr = nil
   // FROM_ADDRESS | UNCHANGED_REFCOUNT. Resolve from this adapter's containing
   // DLL/executable, never the working directory or the ambient PATH.
-  if win_pty_api.module(6, #cast(rawptr, terminal_start), &module) == 0 {
-    return false
-  }
+  if win_pty_api.module(6, #cast(rawptr, terminal_start), &module) == 0 { return false }
   path: [32768]u16
   length := win_pty_api.module_path(module, &path[0], 32768)
-  if length == 0 || length >= 32768 {
-    return false
-  }
+  if length == 0 || length >= 32768 { return false }
   directory := #cast(usize, length)
   for directory > 0 && path[directory - 1] != 92 && path[directory - 1] != 47 {
     directory -= 1
   }
-  if directory == 0 {
-    return false
-  }
+  if directory == 0 { return false }
   // The official DLL otherwise falls back to the inbox host when its bundled
   // console host is missing. Require both verified deployment members.
   if !win_pty_bundle_file(path[..], directory, "OpenConsole.exe") || !win_pty_bundle_file(path[..], directory, "conpty.dll") {
@@ -82,15 +69,13 @@ fn win_pty_configure() bool {
   }
   // DLL_LOAD_DIR | DEFAULT_DIRS excludes current-directory and PATH lookup.
   library := win_pty_api.load(&path[0], nil, 4352)
-  if library == nil {
-    return false
-  }
+  if library == nil { return false }
   // All pseudoconsole operations come from this same pinned implementation.
   win_pty_api.create = #cast(fn(u32, rawptr, rawptr, u32, *rawptr) i32, win_pty_symbol(library, "ConptyCreatePseudoConsole"))
   win_pty_api.resize = #cast(fn(rawptr, u32) i32, win_pty_symbol(library, "ConptyResizePseudoConsole"))
   win_pty_api.close = #cast(fn(rawptr), win_pty_symbol(library, "ConptyClosePseudoConsole"))
   if win_pty_api.create == nil || win_pty_api.resize == nil || win_pty_api.close == nil {
-    _ = win_proc_loader.close(&library)
+    win_proc_loader.close(&library) catch {}
     return false
   }
   win_pty_api.library = library
@@ -108,9 +93,7 @@ fn win_pty_worker(context: rawptr) i32 {
   owner := #cast(*WinPtyOwner, context)
   for {
     _ = win_proc_api.wait(owner.event, 4294967295)
-    if win_proc_sync.load_u32(&owner.stop) != 0 {
-      break
-    }
+    if win_proc_sync.load_u32(&owner.stop) != 0 { break }
     size := win_proc_sync.load_u32(&owner.size)
     _ = win_pty_api.resize(owner.console, size)
   }
@@ -119,9 +102,7 @@ fn win_pty_worker(context: rawptr) i32 {
   return 0
 }
 fn win_pty_release(owner: *WinPtyOwner) {
-  if owner == nil {
-    return
-  }
+  if owner == nil { return }
   proc_close(&owner.child)
   if owner.input >= 0 {
     _ = rec_close(owner.input)
@@ -134,7 +115,7 @@ fn win_pty_release(owner: *WinPtyOwner) {
     for win_proc_sync.load_u32(&owner.done) == 0 {
       // No UI retains these bytes once terminal_stop has taken ownership.
       if owner.output >= 0 {
-        _ = proc_read_raw(owner.output, &bytes[0], #len(bytes))
+        _ = proc_read_raw(owner.output, &bytes[0], bytes.len)
       }
       win_proc_sleep(1)
     }
@@ -157,9 +138,7 @@ fn win_pty_release(owner: *WinPtyOwner) {
   rec_free(#cast(rawptr, owner))
 }
 fn win_pty_ascii(text: []u16, used: *usize, value: []const u8) bool {
-  if #len(value) > #len(text) - used.* - 1 {
-    return false
-  }
+  if value.len > text.len - used.* - 1 { return false }
   for byte in value {
     text[used.*] = #cast(u16, byte)
     used.* += 1
@@ -168,9 +147,7 @@ fn win_pty_ascii(text: []u16, used: *usize, value: []const u8) bool {
   return true
 }
 fn win_pty_unit(text: []u16, used: *usize, value: u16) bool {
-  if used.* >= #len(text) - 1 {
-    return false
-  }
+  if used.* >= text.len - 1 { return false }
   text[used.*] = value
   used.* += 1
   text[used.*] = 0
@@ -179,9 +156,7 @@ fn win_pty_unit(text: []u16, used: *usize, value: u16) bool {
 // Microsoft CRT argv quoting: double backslashes only before quotes or the
 // terminating quote. This preserves Unicode and embedded quotes in -c input.
 fn win_pty_quote(text: []u16, used: *usize, value: []const u16) bool {
-  if !win_pty_unit(text, used, 34) {
-    return false
-  }
+  if !win_pty_unit(text, used, 34) { return false }
   slashes: usize = 0
   for unit in value {
     if unit == 92 {
@@ -193,43 +168,33 @@ fn win_pty_quote(text: []u16, used: *usize, value: []const u16) bool {
       copies = slashes * 2 + 1
     }
     for copies > 0 {
-      if !win_pty_unit(text, used, 92) {
-        return false
-      }
+      if !win_pty_unit(text, used, 92) { return false }
       copies -= 1
     }
     slashes = 0
-    if !win_pty_unit(text, used, unit) {
-      return false
-    }
+    if !win_pty_unit(text, used, unit) { return false }
   }
   slashes *= 2
   for slashes > 0 {
-    if !win_pty_unit(text, used, 92) {
-      return false
-    }
+    if !win_pty_unit(text, used, 92) { return false }
     slashes -= 1
   }
   return win_pty_unit(text, used, 34)
 }
 fn win_pty_name_is(executable: []const u16, expected: []const u8) bool {
   first: usize = 0
-  for index in 0..#len(executable) {
+  for index in 0..executable.len {
     if executable[index] == 92 || executable[index] == 47 {
       first = index + 1
     }
   }
-  if #len(executable) - first != #len(expected) {
-    return false
-  }
-  for index in 0..#len(expected) {
+  if executable.len - first != expected.len { return false }
+  for index in 0..expected.len {
     unit := executable[first + index]
     if unit >= 65 && unit <= 90 {
       unit += 32
     }
-    if unit != #cast(u16, expected[index]) {
-      return false
-    }
+    if unit != #cast(u16, expected[index]) { return false }
   }
   return true
 }
@@ -244,52 +209,32 @@ fn win_pty_command(space: *WinProcSpace, shell, command: *const u8) bool {
   }
   if default_shell {
     size := win_proc_api.system(&space.executable[0], 32760)
-    if size == 0 || size >= 32760 {
-      return false
-    }
+    if size == 0 || size >= 32760 { return false }
     used := #cast(usize, size)
-    if !win_pty_ascii(space.executable[..], &used, "\\cmd.exe") {
-      return false
-    }
+    if !win_pty_ascii(space.executable[..], &used, "\\cmd.exe") { return false }
     length = #cast(i32, used)
   } else {
-    if !win_proc_absolute(shell) {
-      return false
-    }
+    if !win_proc_absolute(shell) { return false }
     length = win_proc_utf16(shell, &space.executable[0], 32768)
-    if length <= 0 {
-      return false
-    }
+    if length <= 0 { return false }
   }
   executable := space.executable[..#cast(usize, length)]
   for unit in executable {
-    if unit == 34 {
-      return false
-    }
+    if unit == 34 { return false }
   }
   used: usize = 0
-  if !win_pty_quote(space.command[..], &used, executable) {
-    return false
-  }
+  if !win_pty_quote(space.command[..], &used, executable) { return false }
   cmd := win_pty_name_is(executable, "cmd.exe")
   powershell := win_pty_name_is(executable, "powershell.exe") || win_pty_name_is(executable, "pwsh.exe")
   has_command := command != nil && command.* != 0
   if cmd {
-    if !win_pty_ascii(space.command[..], &used, " /D") {
-      return false
-    }
+    if !win_pty_ascii(space.command[..], &used, " /D") { return false }
     if has_command {
-      if !win_pty_ascii(space.command[..], &used, " /S /C \"") {
-        return false
-      }
+      if !win_pty_ascii(space.command[..], &used, " /S /C \"") { return false }
       command_length := win_proc_utf16(command, &space.command[used], #cast(i32, 32767 - used))
-      if command_length <= 0 {
-        return false
-      }
+      if command_length <= 0 { return false }
       used += #cast(usize, command_length)
-      if !win_pty_unit(space.command[..], &used, 34) {
-        return false
-      }
+      if !win_pty_unit(space.command[..], &used, 34) { return false }
     }
   } else {
     if powershell && !win_pty_ascii(space.command[..], &used, " -NoLogo -NoProfile") {
@@ -297,42 +242,28 @@ fn win_pty_command(space: *WinProcSpace, shell, command: *const u8) bool {
     }
     if has_command {
       if powershell {
-        if !win_pty_ascii(space.command[..], &used, " -Command ") {
-          return false
-        }
-      } else if !win_pty_ascii(space.command[..], &used, " -c ") {
-        return false
-      }
+        if !win_pty_ascii(space.command[..], &used, " -Command ") { return false }
+      } else if !win_pty_ascii(space.command[..], &used, " -c ") { return false }
       // The directory buffer is scratch until terminal_start converts cwd.
       command_length := win_proc_utf16(command, &space.directory[0], 32768)
       if command_length <= 0 || !win_pty_quote(space.command[..], &used, space.directory[..#cast(usize, command_length)]) {
         return false
       }
-    } else if !powershell && !win_pty_ascii(space.command[..], &used, " -i") {
-      return false
-    }
+    } else if !powershell && !win_pty_ascii(space.command[..], &used, " -i") { return false }
   }
   return true
 }
 fn terminal_start(t: *Terminal, cwd, shell, command: *const u8) bool {
-  if !win_pty_prepare() {
-    return false
-  }
-  if cwd == nil || !win_proc_absolute(cwd) {
-    return false
-  }
+  if !win_pty_prepare() { return false }
+  if cwd == nil || !win_proc_absolute(cwd) { return false }
   space := #cast(*WinProcSpace, rec_alloc(1, #sizeof(WinProcSpace)))
-  if space == nil {
-    return false
-  }
+  if space == nil { return false }
   defer rec_free(#cast(rawptr, space))
   if !win_pty_command(space, shell, command) || win_proc_utf16(cwd, &space.directory[0], 32768) <= 0 {
     return false
   }
   owner := #cast(*WinPtyOwner, rec_alloc(1, #sizeof(WinPtyOwner)))
-  if owner == nil {
-    return false
-  }
+  if owner == nil { return false }
   owner.child = proc_none()
   owner.input = -1
   owner.output = -1
@@ -418,9 +349,7 @@ fn terminal_start(t: *Terminal, cwd, shell, command: *const u8) bool {
 }
 fn terminal_exit_native(t: *Terminal) bool {
   owner := #cast(*WinPtyOwner, t.platform)
-  if owner == nil || proc_peek(&owner.child) == 0 {
-    return false
-  }
+  if owner == nil || proc_peek(&owner.child) == 0 { return false }
   code: u32 = 0
   t.status = -1
   if win_proc_api.exit(owner.child.process, &code) != 0 && code <= 2147483647 {

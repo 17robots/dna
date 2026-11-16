@@ -1,5 +1,5 @@
 #target(kernel: windows)
-use "std/dynlib" disk_windows_loader
+use disk_windows_loader "std/dynlib"
 use "std/io"
 
 // Windows change handles cover child names and in-place writes. The queue
@@ -32,15 +32,16 @@ disk_windows_queues: *WindowsDiskQueue
 fn disk_windows_prepare() {
   win_proc_prepare()
   if sync.once_begin(&disk_windows_once) {
-    kernel := disk_windows_loader.open("kernel32.dll", 0)
-    runtime := disk_windows_loader.open("ucrtbase.dll", 0)
-    if io.failed(kernel.failure) || io.failed(runtime.failure) {
+    kernel := disk_windows_loader.open("kernel32.dll", 0) catch {
       #panic("missing Windows disk APIs")
     }
-    disk_windows_api.first = #cast(fn(*const u16, i32, u32) rawptr, win_io_symbol(kernel.value, "FindFirstChangeNotificationW"))
-    disk_windows_api.next = #cast(fn(rawptr) i32, win_io_symbol(kernel.value, "FindNextChangeNotification"))
-    disk_windows_api.close = #cast(fn(rawptr) i32, win_io_symbol(kernel.value, "FindCloseChangeNotification"))
-    disk_windows_api.seek = #cast(fn(i32, i64, i32) i64, win_io_symbol(runtime.value, "_lseeki64"))
+    runtime := disk_windows_loader.open("ucrtbase.dll", 0) catch {
+      #panic("missing Windows disk APIs")
+    }
+    disk_windows_api.first = #cast(fn(*const u16, i32, u32) rawptr, win_io_symbol(kernel, "FindFirstChangeNotificationW"))
+    disk_windows_api.next = #cast(fn(rawptr) i32, win_io_symbol(kernel, "FindNextChangeNotification"))
+    disk_windows_api.close = #cast(fn(rawptr) i32, win_io_symbol(kernel, "FindCloseChangeNotification"))
+    disk_windows_api.seek = #cast(fn(i32, i64, i32) i64, win_io_symbol(runtime, "_lseeki64"))
     sync.once_complete(&disk_windows_once)
   }
 }
@@ -51,9 +52,7 @@ fn disk_lseek(fd: i32, offset: i64, whence: i32) i64 {
 fn disk_windows_find(fd: i32) *WindowsDiskQueue {
   queue := disk_windows_queues
   for queue != nil {
-    if queue.events[0] == fd {
-      return queue
-    }
+    if queue.events[0] == fd { return queue }
     queue = queue.next
   }
   return nil
@@ -77,9 +76,7 @@ fn disk_windows_pipe(fds: *i32) bool {
   win_proc_append_decimal(name[..], &used, sequence)
   // DUPLEX | FIRST_INSTANCE; MESSAGE | MESSAGE_READ | NOWAIT | REJECT_REMOTE.
   server := win_proc_api.named_pipe(&name[0], 524291, 15, 1, 65536, 65536, 0, nil)
-  if !win_proc_valid(server) {
-    return false
-  }
+  if !win_proc_valid(server) { return false }
   client := win_proc_api.open_pipe(&name[0], 3221225472, 0, nil, 3, 0, nil)
   if !win_proc_valid(client) {
     _ = win_proc_api.close(server)
@@ -112,14 +109,10 @@ fn disk_windows_pipe(fds: *i32) bool {
   return true
 }
 fn disk_windows_emit(queue: *WindowsDiskQueue, descriptor: i32, event_mask: u32) {
-  if queue.failed {
-    return
-  }
+  if queue.failed { return }
   record := DiskEvent{descriptor: descriptor, mask: event_mask}
   written := proc_write(queue.events[1], #cast(*const u8, &record), #sizeof(DiskEvent))
-  if written == -11 {
-    return
-  } // A full queue already requests a rescan.
+  if written == -11 { return } // A full queue already requests a rescan.
   if written != #cast(isize, #sizeof(DiskEvent)) {
     queue.failed = true
     // Wake readers through EOF and make registration explicitly fall back.
@@ -169,9 +162,7 @@ fn disk_inotify(flags: i32) i32 {
   _ = flags
   disk_windows_prepare()
   queue := #cast(*WindowsDiskQueue, rec_alloc(1, #sizeof(WindowsDiskQueue)))
-  if queue == nil {
-    return -1
-  }
+  if queue == nil { return -1 }
   queue.events = [-1, -1]
   if !disk_windows_pipe(&queue.events[0]) {
     rec_free(#cast(rawptr, queue))
@@ -191,19 +182,13 @@ fn disk_inotify(flags: i32) i32 {
 }
 fn disk_add(fd: i32, path: *const u8, requested_mask: u32) i32 {
   _ = requested_mask
-  if path == nil || string_length(path) >= 4096 {
-    return -1
-  }
+  if path == nil || string_length(path) >= 4096 { return -1 }
   rec_lock(#cast(rawptr, &disk_windows_lock))
   defer rec_unlock(#cast(rawptr, &disk_windows_lock))
   queue := disk_windows_find(fd)
-  if queue == nil || queue.failed {
-    return -1
-  }
+  if queue == nil || queue.failed { return -1 }
   directory := rec_open(path, 720896, 0) // DIRECTORY | NOFOLLOW | CLOEXEC
-  if directory < 0 {
-    return -1
-  }
+  if directory < 0 { return -1 }
   info := InstallStat{}
   if install_fstat(directory, &info) != 0 || (info.mode & 61440) != 16384 {
     _ = rec_close(directory)
@@ -253,9 +238,7 @@ fn disk_remove(fd: i32, descriptor: i32) i32 {
   rec_lock(#cast(rawptr, &disk_windows_lock))
   defer rec_unlock(#cast(rawptr, &disk_windows_lock))
   queue := disk_windows_find(fd)
-  if queue == nil {
-    return -1
-  }
+  if queue == nil { return -1 }
   link := &queue.nodes
   for link.* != nil {
     node := link.*
@@ -282,9 +265,7 @@ fn disk_changes_close(fd: i32) {
     sync.store_u32(&queue.stopping, 1)
   }
   rec_unlock(#cast(rawptr, &disk_windows_lock))
-  if queue == nil {
-    return
-  }
+  if queue == nil { return }
   dna_thread_join(queue.thread, nil)
   node := queue.nodes
   for node != nil {
@@ -308,14 +289,10 @@ fn disk_target_watch(fd: i32, path: *const u8, parent: i32) bool {
   rec_lock(#cast(rawptr, &disk_windows_lock))
   defer rec_unlock(#cast(rawptr, &disk_windows_lock))
   queue := disk_windows_find(fd)
-  if queue == nil || queue.failed {
-    return false
-  }
+  if queue == nil || queue.failed { return false }
   node := queue.nodes
   for node != nil {
-    if node.fd == parent {
-      return node.live
-    }
+    if node.fd == parent { return node.live }
     node = node.next
   }
   return false

@@ -9,42 +9,41 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 DYN = os.environ.get('DYN', 'dyn')
 FAKE = '''use "std/io"
-pub struct File {descriptor:isize,active,owned:bool}
-pub struct Result { transferred:usize,failure:io.Failure }
-pub struct OffsetResult { value:usize,failure:io.Failure }
+pub struct File {descriptor:isize,active:bool}
 extern fn probe_seek "probe_seek"(file:isize,offset:isize,origin:usize) isize
 extern fn probe_read "probe_read"(file:isize,bytes:*u8,length:usize) isize
 extern fn probe_write "probe_write"(file:isize,bytes:*const u8,length:usize) isize
 extern fn probe_close "probe_close"(file:isize) i32
-pub fn seek(file:*File,offset:isize,origin:usize) OffsetResult {
+pub fn seek(file:*File,offset:isize,origin:usize) usize!io.IoErr {
  n:=probe_seek(file.descriptor,offset,origin)
- if n<0 {return OffsetResult{failure:io.Failure{kind:io.Kind.System,native:n}}}
- return OffsetResult{value:#cast(usize,n)}
+ if n<0 {fail io.IoErr.System(n)}
+ return #cast(usize,n)
 }
-pub fn read(file:*File,bytes:[]u8) Result {
- n:=probe_read(file.descriptor,&bytes[0],#len(bytes))
- if n<0 {return Result{failure:io.Failure{kind:io.Kind.System,native:n}}}
- return Result{transferred:#cast(usize,n)}
+pub fn read(file:*File,bytes:[]u8) usize!io.IoErr {
+ n:=probe_read(file.descriptor,&bytes[0],bytes.len)
+ if n<0 {fail io.IoErr.System(n)}
+ return #cast(usize,n)
 }
-pub fn write(file:*File,bytes:[]const u8) Result {
- n:=probe_write(file.descriptor,&bytes[0],#len(bytes))
- if n<0 {return Result{failure:io.Failure{kind:io.Kind.System,native:n}}}
- return Result{transferred:#cast(usize,n)}
+pub fn write(file:*File,bytes:[]const u8) !io.IoErr {
+ n:=probe_write(file.descriptor,&bytes[0],bytes.len)
+ if n<0 {fail io.IoErr.System(n)}
 }
-pub fn close(file:*File) Result { _=probe_close(file.descriptor) file.active=false return Result{} }
-'''.replace(') file.active', ')\n file.active').replace('false return', 'false\n return')
+pub fn close(file:*File) {
+ _=probe_close(file.descriptor)
+ file.active=false
+}
+'''
 BASE = '''#link("c")
-use "./fake" std_fs
+use std_fs "./fake"
 use "std/io"
 type File=std_fs.File
-type Result=std_fs.Result
-struct Metadata { size:u64,failure:io.Failure }
+struct Metadata { size:u64 }
 fn is_open(file:*const File) bool {return file.active}
-fn adopt_handle(value:isize) File {return File{descriptor:value,active:true,owned:true}}
-fn close(file:*File) Result {return std_fs.close(file)}
+fn adopt_handle(value:isize) File {return File{descriptor:value,active:true}}
+fn close(file:*File) {std_fs.close(file)}
 extern fn probe_size "probe_size"() u64
-fn file_metadata(file:*const File) Metadata {return Metadata{size:probe_size()}}
-fn windows_failure(code:u32) Result {return Result{failure:io.Failure{kind:io.Kind.System,native:0-#cast(isize,code)}}}
+fn file_metadata(file:*const File) Metadata!io.IoErr {return Metadata{size:probe_size()}}
+fn windows_err(code:u32) io.IoErr {return io.IoErr.System(0-#cast(isize,code))}
 extern fn fs_reopen "ReOpenFile"(file:rawptr,access:u32,share:u32,flags:u32) rawptr
 extern fn fs_set_basic "SetFileInformationByHandle"(file:rawptr,kind:u32,data:rawptr,size:u32) i32
 extern fn fs_ioctl "DeviceIoControl"(file:rawptr,code:u32,input:rawptr,input_length:u32,output:rawptr,output_length:u32,returned:*u32,overlapped:rawptr) i32
@@ -109,8 +108,10 @@ fn main() {
   target:=adopt_handle(1099511627778)
   offset:u64=1
   if mode==2 {offset=2}
-  result:=copy_range(&origin,offset,&target,200000)
-  if probe_check(result.transferred,!io.failed(result.failure))!=1 {#panic("range result")}
+  transferred:usize=0
+  ok:=true
+  copy_range(&origin,offset,&target,200000,&transferred) catch { ok=false }
+  if probe_check(transferred,ok)!=1 {#panic("range result")}
  }
  for mode in 0..3 {
   probe_reset(#cast(i32,mode))
@@ -144,7 +145,7 @@ fn main() {
         subprocess.run([str(binary)],check=True,timeout=10)
     for module in ('filesystem','host','cstring','owned_arena'):
         shutil.copytree(ROOT/'src'/module,stage/module)
-    (stage/'main.dyn').write_text('use "./filesystem" fs\nfn main() { file:=fs.File{}\n _=fs.map_file(file.descriptor,1)\n _=fs.copy_range(&file,0,&file,1)\n _=fs.clone_exclusive(&file,"unused")\n _=fs.resize(&file,1) }\n')
+    (stage/'main.dyn').write_text('use fs "./filesystem"\nfn main() { file:=fs.File{}\n transferred:usize=0\n _=fs.map_file(file.descriptor,1)\n fs.copy_range(&file,0,&file,1,&transferred) catch {}\n _=fs.clone_exclusive(&file,"unused") catch fs.File{}\n fs.resize(&file,1) catch {} }\n')
     for target in ('x86_64-macos','aarch64-macos','x86_64-windows','aarch64-windows'):
         subprocess.run([DYN,'check',str(stage),'--target',target],check=True)
 print('PASS platform storage seams: 64-bit mappings, resilient flags, range cloning/edges, failures, source handles; four target checks (not native OS execution)')

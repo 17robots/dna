@@ -11,7 +11,7 @@ from native_software_source import function as software_function
 def function(name):
     return software_function(SOURCE,name)
 
-HEADER='''use "std/io" io
+HEADER='''use io "std/io"
 use "std/ui"
 use "std/ui/software"
 struct PixelRect {x,y,width,height:i32}

@@ -10,12 +10,14 @@ fn grammar_installed(root: []const u8, name: []const u8) bool {
   active := append_path(package_storage[..], root, name)
   version_storage: [4096]u8
   package := installer_package_path(active, version_storage[..])
-  if #len(package) == 0 {
+  if package.len == 0 {
     return false
   }
   for leaf in ["parser.so", "highlights.scm", "extensions"] {
-    info := std_fs.metadata(append_path(file_storage[..], package, leaf))
-    if io.failed(info.failure) || (info.mode & 61440) != 32768 || info.size == 0 {
+    info := std_fs.metadata(append_path(file_storage[..], package, leaf)) catch {
+      return false
+    }
+    if (info.mode & 61440) != 32768 || info.size == 0 {
       return false
     }
   }
@@ -54,9 +56,9 @@ fn catalog(registry: *Registry, root: []const u8) {
   for index in 0..9 {
     item := server_package(index)
     storage: [4096]u8
-    info := std_fs.metadata(server_executable(root, item, storage[..]))
+    executable_path := server_executable(root, item, storage[..])
     state: []const u8 = "available"
-    if !io.failed(info.failure) && installer_executable(server_executable(root, item, storage[..])) {
+    if installer_executable(executable_path) {
       state = "installed"
     }
     io.println("server\t{}\t{}\t{}\t{}", item.name, state, item.packages, item.executable)
@@ -71,8 +73,7 @@ fn uninstall(root: []const u8, name: []const u8) {
   active := append_path(active_storage[..], root, name)
   target_space := mem.arena_alloc(4096)
   defer mem.arena_release(target_space)
-  target := installer_read_link(target_space, active)
-  if io.failed(target.failure) {
+  target := installer_read_link(target_space, active) catch {
     #panic("refusing to remove a package not managed by DNA")
   }
   used: usize = 0
@@ -80,20 +81,22 @@ fn uninstall(root: []const u8, name: []const u8) {
   add(prefix_storage[..], &used, "/.")
   add(prefix_storage[..], &used, name)
   add(prefix_storage[..], &used, "-")
-  if #len(target.value) != used + 6 || !equal(target.value[..used], prefix_storage[..used]) {
+  if target.len != used + 6 || !equal(target[..used], prefix_storage[..used]) {
     #panic("package points outside its managed directory")
   }
-  for byte in target.value[used..] {
+  for byte in target[used..] {
     if !((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || (byte >= '0' && byte <= '9')) {
       #panic("invalid managed version")
     }
   }
-  if io.failed(std_fs.remove(active).failure) {
+  std_fs.remove(active) catch {
     #panic("cannot deactivate package")
   }
-  removed := installer_remove_tree(target.value)
-  if io.failed(removed.failure) && removed.failure.native != -2 {
-    #panic("package deactivated but cleanup failed; refresh the package list")
+  installer_remove_tree(target) catch err {
+    case err {
+      .NotFound => {}
+      _ => { #panic("package deactivated but cleanup failed; refresh the package list") }
+    }
   }
   io.println("Uninstalled {}. Older retained versions are unchanged.", name)
 }

@@ -14,7 +14,7 @@ fn vim_ex_sort(app: *App, doc: *buffer.Document, range_in: VimRange, text: []con
   }
   options := SortOptions{reverse: bang}
   at := start
-  for at < #len(text) && text[at] != '|' && text[at] != '"' {
+  for at < text.len && text[at] != '|' && text[at] != '"' {
     byte := text[at]
     if byte == 'i' {
       options.ignore_case = true
@@ -22,28 +22,22 @@ fn vim_ex_sort(app: *App, doc: *buffer.Document, range_in: VimRange, text: []con
       options.numeric = true
     } else if byte == 'u' {
       options.unique = true
-    } else if byte != ' ' && byte != 9 {
-      return vim_ex_fail(app, "E474: Invalid argument")
-    }
+    } else if byte != ' ' && byte != 9 { return vim_ex_fail(app, "E474: Invalid argument") }
     at += 1
   }
-  if !vim_range_valid(app, doc, range) {
-    return true
-  }
+  if !vim_range_valid(app, doc, range) { return true }
   low := buffer.line_position(doc, range.first + 1)
   high := doc.length
   if range.last < vim_last_row(doc) {
     high = buffer.line_position(doc, range.last + 2)
   }
-  if high <= low {
-    return true
-  }
+  if high <= low { return true }
   mark := mem.arena_mark(app.scratch)
   defer mem.arena_rewind(app.scratch, mark)
-  source := mem.push_bytes_uninit(app.scratch, high - low)
+  source := mem.push_bytes(app.scratch, high - low)
   buffer.copy_range(doc, low, high, source)
   // A range ending at the end of a file without a final newline keeps it so.
-  final_newline := source[#len(source) - 1] == 10
+  final_newline := source[source.len - 1] == 10
   count: usize = 0
   for byte in source {
     if byte == 10 {
@@ -53,11 +47,11 @@ fn vim_ex_sort(app: *App, doc: *buffer.Document, range_in: VimRange, text: []con
   if !final_newline {
     count += 1
   }
-  lines := mem.push_array([]const u8, app.scratch, count)
-  scratch := mem.push_array([]const u8, app.scratch, count)
+  lines := mem.push_array<[]const u8>(app.scratch, count)
+  scratch := mem.push_array<[]const u8>(app.scratch, count)
   line: usize = 0
   begin: usize = 0
-  for index in 0..#len(source) {
+  for index in 0..source.len {
     if source[index] == 10 {
       lines[line] = source[begin..index]
       line += 1
@@ -68,7 +62,7 @@ fn vim_ex_sort(app: *App, doc: *buffer.Document, range_in: VimRange, text: []con
     lines[line] = source[begin..]
   }
   sort_lines(lines, scratch, options)
-  output := mem.push_bytes_uninit(app.scratch, #len(source))
+  output := mem.push_bytes(app.scratch, source.len)
   used: usize = 0
   kept: usize = 0
   for index in 0..count {
@@ -113,16 +107,16 @@ fn vim_ex_sort(app: *App, doc: *buffer.Document, range_in: VimRange, text: []con
 // Stable merge sort, so equal lines keep their order.
 fn sort_lines(lines: [][]const u8, scratch: [][]const u8, options: SortOptions) {
   width: usize = 1
-  for width < #len(lines) {
+  for width < lines.len {
     low: usize = 0
-    for low < #len(lines) {
+    for low < lines.len {
       middle := low + width
-      if middle > #len(lines) {
-        middle = #len(lines)
+      if middle > lines.len {
+        middle = lines.len
       }
       high := middle + width
-      if high > #len(lines) {
-        high = #len(lines)
+      if high > lines.len {
+        high = lines.len
       }
       left := low
       right := middle
@@ -148,7 +142,7 @@ fn sort_lines(lines: [][]const u8, scratch: [][]const u8, options: SortOptions) 
       }
       low = high
     }
-    for index in 0..#len(lines) {
+    for index in 0..lines.len {
       lines[index] = scratch[index]
     }
     width *= 2
@@ -160,22 +154,18 @@ fn sort_compare(a: []const u8, b: []const u8, options: SortOptions) i32 {
     a_number := sort_number(a)
     b_number := sort_number(b)
     if a_number.found != b_number.found {
-      if a_number.found {
-        return 1
-      }
+      if a_number.found { return 1 }
       return -1
     }
     if a_number.value != b_number.value {
-      if a_number.value < b_number.value {
-        return -1
-      }
+      if a_number.value < b_number.value { return -1 }
       return 1
     }
     return 0
   }
-  length := #len(a)
-  if #len(b) < length {
-    length = #len(b)
+  length := a.len
+  if b.len < length {
+    length = b.len
   }
   for index in 0..length {
     x := a[index]
@@ -185,30 +175,24 @@ fn sort_compare(a: []const u8, b: []const u8, options: SortOptions) i32 {
       y = lower(y)
     }
     if x != y {
-      if x < y {
-        return -1
-      }
+      if x < y { return -1 }
       return 1
     }
   }
-  if #len(a) == #len(b) {
-    return 0
-  }
-  if #len(a) < #len(b) {
-    return -1
-  }
+  if a.len == b.len { return 0 }
+  if a.len < b.len { return -1 }
   return 1
 }
 
 struct SortNumber { value: i64, found: bool }
 // The first decimal number in a line, with a directly preceding minus sign.
 fn sort_number(line: []const u8) SortNumber {
-  for index in 0..#len(line) {
+  for index in 0..line.len {
     if line[index] >= '0' && line[index] <= '9' {
       negative := index > 0 && line[index - 1] == '-'
       value: i64 = 0
       at := index
-      for at < #len(line) && line[at] >= '0' && line[at] <= '9' && value < 100000000000000000 {
+      for at < line.len && line[at] >= '0' && line[at] <= '9' && value < 100000000000000000 {
         value = value * 10 + #cast(i64, line[at] - '0')
         at += 1
       }

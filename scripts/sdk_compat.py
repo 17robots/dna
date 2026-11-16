@@ -29,7 +29,7 @@ def environment(compiler, base=None):
     needs_darwin = sum('extern fn native_errno "__error"() *i32' in text for text in darwin_sources) > 1
     if declaration not in original and not needs_darwin:
         return result
-    fingerprint = hashlib.sha256((str(source.resolve())+'v3').encode())
+    fingerprint = hashlib.sha256((str(source.resolve())+'v4').encode())
     # A developer SDK can change in place. Never retain stale modules behind
     # an overlay whose one patched declaration happened to stay unchanged.
     for path in sorted(source.rglob('*')):
@@ -50,7 +50,7 @@ def environment(compiler, base=None):
                 shutil.copytree(source/'std', destination/'std', dirs_exist_ok=True)
                 shutil.copytree(source/'vendor', destination/'vendor', dirs_exist_ok=True)
             patched = original.replace(declaration,
-                'use "std/os/windows" compat_windows\n'
+                'use compat_windows "std/os/windows"\n'
                 'fn native_error() u32 { return #cast(u32, 0 - compat_windows.thread_error()) }')
             (destination/'std/dynlib/windows.dyn').write_text(patched)
             # The pinned Darwin thread/process/watch modules independently import
@@ -70,7 +70,7 @@ def environment(compiler, base=None):
                 declaration = 'extern fn native_errno "__error"() *i32'
                 if declaration in text:
                     path.write_text(text.replace(declaration,
-                        'use "std/os/darwin/errno" sdk_errno\n'
+                        'use sdk_errno "std/os/darwin/errno"\n'
                         'fn native_errno() *i32 { return sdk_errno.get() }'))
             (destination/'.ready').write_text(str(source.resolve()))
     result['DYN_SDK'] = str(destination)

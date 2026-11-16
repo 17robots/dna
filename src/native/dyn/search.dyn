@@ -51,12 +51,7 @@ fn search_cancelled(scan: *SearchScan) bool {
     scan.partial = true
     return true
   }
-  sample := time.monotonic_now()
-  if io.failed(sample.failure) {
-    scan.partial = true
-    return true
-  }
-  now := sample.value
+  now := time.monotonic_now()
   if now.seconds > scan.deadline.seconds || (now.seconds == scan.deadline.seconds && now.nanoseconds >= scan.deadline.nanoseconds) {
     scan.partial = true
     return true
@@ -64,15 +59,13 @@ fn search_cancelled(scan: *SearchScan) bool {
   return sync.load_u32(&scan.owner.stop) != 0 || sync.load_u64(&scan.owner.generation) != scan.generation
 }
 fn search_callout(block: rawptr, data: rawptr) i32 {
-  if search_cancelled(#cast(*SearchScan, data)) {
-    return -37
-  }
+  if search_cancelled(#cast(*SearchScan, data)) { return -37 }
   return 0
 }
 fn search_copy_text(output: []u8, input: *const u8) {
   length := string_length(input)
-  if length >= #len(output) {
-    length = #len(output) - 1
+  if length >= output.len {
+    length = output.len - 1
   }
   _ = copy(&output[0], input, length)
   output[length] = 0
@@ -80,19 +73,13 @@ fn search_copy_text(output: []u8, input: *const u8) {
 // Accept only nonempty printable ASCII without regex syntax. Unicode, escapes,
 // flags, anchors and all other patterns retain the existing PCRE2 path.
 fn search_plain_literal(query: *const u8, length: usize) bool {
-  if length == 0 {
-    return false
-  }
+  if length == 0 { return false }
   syntax: []const u8 = "\\.^$|?*+()[]{}"
   for i in 0..length {
     byte := #slice(query, length)[i]
-    if byte < 32 || byte > 126 {
-      return false
-    }
+    if byte < 32 || byte > 126 { return false }
     for special in syntax {
-      if byte == special {
-        return false
-      }
+      if byte == special { return false }
     }
   }
   return true
@@ -106,12 +93,8 @@ fn search_literal_match(scan: *SearchScan, bytes: *const u8, length: usize, star
       chunk = limit
     }
     found := pred_find(&#slice(bytes, length)[at], chunk, scan.query, scan.query_length)
-    if found != nil {
-      return found
-    }
-    if chunk < limit {
-      break
-    }
+    if found != nil { return found }
+    if chunk < limit { break }
     at += 65536
   }
   return nil
@@ -157,9 +140,7 @@ fn search_file(scan: *SearchScan, parent: i32, leaf: *const u8, path: *const u8)
       _ = rec_close(fd)
       return
     }
-    if count == 0 {
-      break
-    }
+    if count == 0 { break }
     length += #cast(usize, count)
   }
   _ = rec_close(fd)
@@ -169,16 +150,12 @@ fn search_file(scan: *SearchScan, parent: i32, leaf: *const u8, path: *const u8)
   }
   binary_at: usize = 0
   for binary_at < length {
-    if search_cancelled(scan) {
-      return
-    }
+    if search_cancelled(scan) { return }
     chunk := length - binary_at
     if chunk > 65536 {
       chunk = 65536
     }
-    if search_byte(&#slice(bytes, room)[binary_at], 0, chunk) != nil {
-      return
-    }
+    if search_byte(&#slice(bytes, room)[binary_at], 0, chunk) != nil { return }
     binary_at += chunk
   }
   at: usize = 0
@@ -190,16 +167,12 @@ fn search_file(scan: *SearchScan, parent: i32, leaf: *const u8, path: *const u8)
     range: [2]usize
     if scan.literal && match_options != 0 {
       found := search_literal_match(scan, bytes, length, at)
-      if found == nil {
-        break
-      }
+      if found == nil { break }
       range[0] = #cast(usize, found) - #cast(usize, bytes)
       range[1] = range[0] + scan.query_length
     } else {
       result := search_match(scan.code, bytes, length, at, match_options, scan.data, scan.context)
-      if result == -1 {
-        break
-      }
+      if result == -1 { break }
       if result < 0 {
         scan.partial = true
         break
@@ -246,9 +219,7 @@ fn search_file(scan: *SearchScan, parent: i32, leaf: *const u8, path: *const u8)
     }
     at = range[1]
     if range[0] == range[1] {
-      if at == length {
-        break
-      }
+      if at == length { break }
       at += 1
       for at < length && (#slice(bytes, room)[at] & 192) == 128 {
         at += 1
@@ -262,12 +233,8 @@ fn search_valid_name(name: *const u8) bool {
   for i < length {
     first := #slice(name, length)[i]
     i += 1
-    if first < 32 || first == 127 {
-      return false
-    }
-    if first < 128 {
-      continue
-    }
+    if first < 32 || first == 127 { return false }
+    if first < 128 { continue }
     count: usize = 0
     value: u32 = 0
     if first >= 194 && first <= 223 {
@@ -282,15 +249,11 @@ fn search_valid_name(name: *const u8) bool {
     } else {
       return false
     }
-    if length - i < count {
-      return false
-    }
+    if length - i < count { return false }
     for n in 0..count {
       byte := #slice(name, length)[i]
       i += 1
-      if (byte & 192) != 128 {
-        return false
-      }
+      if (byte & 192) != 128 { return false }
       value = (value << 6) | (byte & 63)
     }
     if (count == 2 && value < 2048) || (count == 3 && value < 65536) || value > 1114111 || (value >= 55296 && value <= 57343) {
@@ -314,9 +277,7 @@ fn search_walk(scan: *SearchScan, fd: i32, prefix: *const u8, depth: usize) {
   }
   for !search_cancelled(scan) {
     entry := install_readdir(directory)
-    if entry == nil {
-      break
-    }
+    if entry == nil { break }
     scan.visited += 1
     if scan.visited > 20000 {
       scan.partial = true
@@ -396,12 +357,8 @@ fn search_worker(opaque: rawptr) i32 {
     error: i32 = 0
     offset: usize = 0
     deadline := time.deadline_after(5 * time.Second)
-    if !io.failed(deadline.failure) {
-      scan.deadline = deadline.value.at
-      scan.deadline_valid = true
-    } else {
-      scan.partial = true
-    }
+    scan.deadline = deadline.at
+    scan.deadline_valid = true
     scan.code = search_compile(&query[0], #cast(usize, -1), 1704964, &error, &offset, nil)
     status: i32 = 0
     if query[0] != 0 && scan.code == nil {
@@ -452,9 +409,7 @@ fn search_release(search: *SearchWorker) {
 }
 pub fn dna_search_open() *SearchWorker {
   search := #cast(*SearchWorker, search_calloc(1, #sizeof(SearchWorker), 1))
-  if search == nil {
-    return nil
-  }
+  if search == nil { return nil }
   search.lock = rec_mutex()
   search.wake = rec_condition()
   if search.lock == nil || search.wake == nil {
@@ -469,9 +424,7 @@ pub fn dna_search_open() *SearchWorker {
   return search
 }
 pub fn dna_search_submit(search: *SearchWorker, root: *const u8, query: *const u8) {
-  if search == nil {
-    return
-  }
+  if search == nil { return }
   rec_lock(search.lock)
   search_copy_text(search.root[..], root)
   search_copy_text(search.query[..], query)
@@ -493,24 +446,18 @@ pub fn dna_search_count(search: *SearchWorker, status: *i32) usize {
   return count
 }
 pub fn dna_search_row(search: *SearchWorker, index: usize, row: *SearchRow) i32 {
-  if search == nil {
-    return 0
-  }
+  if search == nil { return 0 }
   rec_lock(search.lock)
   ok := index < search.count
   if ok {
     row.* = search.rows[index]
   }
   rec_unlock(search.lock)
-  if ok {
-    return 1
-  }
+  if ok { return 1 }
   return 0
 }
 pub fn dna_search_close(search: *SearchWorker) {
-  if search == nil {
-    return
-  }
+  if search == nil { return }
   rec_lock(search.lock)
   sync.store_u32(&search.stop, 1)
   rec_signal(search.wake)

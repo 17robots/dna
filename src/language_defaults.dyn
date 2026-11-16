@@ -1,5 +1,5 @@
 extern fn language_directory_native "dna_language_resolve_directory"(path: *const u8, output: *u8, capacity: usize) isize
-use "./servers" servers
+use servers "./servers"
 const DefaultServers: usize = servers.DefaultServers
 fn default_server(index: usize) servers.DefaultServer {
   return servers.default_server(index)
@@ -10,15 +10,11 @@ fn on_path(command: []const u8) bool {
 
 // Start the default server for a language once per session when available.
 fn lsp_default_start(app: *App, name: []const u8) {
-  if !app.config.default_servers {
-    return
-  }
+  if !app.config.default_servers { return }
   // Tests set DNA_DEFAULT_SERVERS=0 so results never depend on the PATH.
   switch: [8]u8
-  override := host.environment("DNA_DEFAULT_SERVERS", switch[..])
-  if !io.failed(override.failure) && override.found && buffer.equal(override.value, "0") {
-    return
-  }
+  override := host.environment("DNA_DEFAULT_SERVERS", switch[..]) catch switch[..0]
+  if buffer.equal(override, "0") { return }
   configured := settings.language(&app.config, name)
   // A configured server, or auto_start = false, is the user's choice.
   if configured != nil && ((configured.seen & 16) != 0 || ((configured.seen & 8) != 0 && !configured.auto_start)) {
@@ -45,7 +41,7 @@ fn lsp_default_start(app: *App, name: []const u8) {
 
 fn managed_server_available(app: *App, entry: servers.DefaultServer) bool {
   end: usize = 0
-  for end < #len(entry.command) && entry.command[end] != ' ' {
+  for end < entry.command.len && entry.command[end] != ' ' {
     end += 1
   }
   path: [4096]u8
@@ -54,13 +50,11 @@ fn managed_server_available(app: *App, entry: servers.DefaultServer) bool {
   add_text(path[..], &used, "/.servers/")
   add_text(path[..], &used, entry.language)
   selected: [4096]u8
-  length := language_directory_native(&path[0], &selected[0], #len(selected))
-  if length <= 0 {
-    return false
-  }
+  length := language_directory_native(&path[0], &selected[0], selected.len)
+  if length <= 0 { return false }
   used = copy_text(path[..], selected[..#cast(usize, length)])
   add_text(path[..], &used, "/node_modules/.bin/")
   add_text(path[..], &used, entry.command[..end])
-  info := fs.metadata(path[..used])
-  return !io.failed(info.failure) && (info.mode & 61440) == 32768 && fs.executable(path[..used])
+  info := fs.metadata(path[..used]) catch { return false }
+  return (info.mode & 61440) == 32768 && fs.executable(path[..used])
 }

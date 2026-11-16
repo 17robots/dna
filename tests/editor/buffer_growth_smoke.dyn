@@ -1,14 +1,13 @@
-use "std/io" io
-use "std/parse" parse
+use io "std/io"
+use parse "std/parse"
 // Production document owners and stable slot identities across directory growth.
 fn buffer_growth_smoke() {
   fixture_storage: [4096]u8
-  fixture := host.environment("DNA_WORKFLOW_TEST", fixture_storage[..])
-  if fixture.failure.kind != io.Kind.Ok || !fixture.found {
+  fixture := host.environment("DNA_WORKFLOW_TEST", fixture_storage[..]) catch {
     return
   }
   directory_storage: [4096]u8
-  directory_length := copy_text(directory_storage[..], fixture.value)
+  directory_length := copy_text(directory_storage[..], fixture)
   add_text(directory_storage[..], &directory_length, "/.dna-growth-")
   add_number(directory_storage[..], &directory_length, #cast(usize, host.process_id()))
   directory := directory_storage[..directory_length]
@@ -20,7 +19,7 @@ fn buffer_growth_smoke() {
   scratch := arena_owner.create(2097152)
   defer arena_owner.release(owner)
   defer arena_owner.release(scratch)
-  app := #cast(*App, mem.arena_push(owner, #sizeof(App), #alignof(App)))
+  app := mem.push<App>(owner)
   app.scratch = scratch
   settings.defaults(&app.config)
   app.config.recovery_enabled = false
@@ -65,7 +64,7 @@ fn buffer_growth_smoke() {
       #panic("growing invalidated stable pointer")
     }
   }
-  if app.documents.count != 80 || #len(app.documents.slots) != 80 {
+  if app.documents.count != 80 || app.documents.slots.len != 80 {
     #panic("growing buffer count")
   }
   for index in 0..80 {
@@ -163,9 +162,11 @@ fn buffer_growth_smoke() {
     retained := app.documents.storage
     slot_directory := app.documents.index_storage
     if failure_kind == 1 {
-      app.documents.index_storage = slot_directory[..#len(app.documents.slots)]
+      app.documents.index_storage = slot_directory[..app.documents.slots.len]
     }
-    app.documents.storage = mem.arena_alloc_bounded(mem.ArenaHeader, mem.ArenaHeader)
+    bounded_source := mem.pages(mem.ArenaHeader)
+    bounded_source.block_size = mem.ArenaHeader
+    app.documents.storage = mem.arena_from_source(bounded_source)
     active := app.documents.active
     identity := app.documents.slots[active].identity
     current := app.documents.current
@@ -174,7 +175,7 @@ fn buffer_growth_smoke() {
     mem.arena_release(app.documents.storage)
     app.documents.storage = retained
     app.documents.index_storage = slot_directory
-    if unexpected || app.documents.count != 80 || #len(app.documents.slots) != 80 || app.documents.active != active || app.documents.current != current || app.documents.file != current_file || app.documents.slots[active].identity != identity {
+    if unexpected || app.documents.count != 80 || app.documents.slots.len != 80 || app.documents.active != active || app.documents.current != current || app.documents.file != current_file || app.documents.slots[active].identity != identity {
       #panic("failed buffer allocation changed workspace")
     }
   }
@@ -228,14 +229,17 @@ fn buffer_growth_cleanup(directory: []const u8) {
     add_text(path[..], &length, "/growth-")
     add_number(path[..], &length, index)
     add_text(path[..], &length, ".txt")
-    if fs.remove(path[..length]).failure.kind != io.Kind.Ok {
+    fs.remove(path[..length]) catch {
       #panic("remove growth fixture file")
     }
   }
   session: [4096]u8
   length := copy_text(session[..], directory)
   add_text(session[..], &length, "/growth.session")
-  if fs.remove(session[..length]).failure.kind != io.Kind.Ok || fs.remove_directory(directory).failure.kind != io.Kind.Ok {
+  fs.remove(session[..length]) catch {
+    #panic("remove growth fixture directory")
+  }
+  fs.remove_directory(directory) catch {
     #panic("remove growth fixture directory")
   }
 }

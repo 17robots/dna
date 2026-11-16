@@ -73,7 +73,8 @@ with tempfile.TemporaryDirectory(prefix='dna-clone-save-') as directory:
     linux = linux_path.read_text().replace('WholeFileClones: bool = false', 'WholeFileClones: bool = true')
     linux = linux.replace(function(linux, 'clone_exclusive'), function(macos, 'clone_exclusive'))
     linux = linux.replace(function(linux, 'resize'), function(macos, 'resize'))
-    linux = linux.replace(function(linux, 'copy_range'), '''pub fn copy_range(source:*const File,offset:u64,target:*File,length:usize) Result {return Result{failure:io.Failure{kind:io.Kind.Unsupported}}}''')
+    linux = linux.replace(function(linux, 'copy_range'), '''pub fn copy_range(source:*const File,offset:u64,target:*File,length:usize,transferred:*usize) !io.IoErr {transferred.*=0
+ fail .Unsupported}''')
     linux = linux.replace(function(linux, 'map_file'), 'pub fn map_file(fd:isize,length:u64) *u8 {return test_map(fd,length)}')
     linux = linux.replace(function(linux, 'unmap_file'), 'pub fn unmap_file(bytes:*u8,length:u64) {test_unmap(bytes,length)}')
     linux += '''
@@ -87,26 +88,24 @@ extern fn darwin_truncate "probe_truncate"(file:i32,length:i64) i32
 extern fn darwin_errno "probe_errno"() *i32
 fn darwin_error() isize {return 0-#cast(isize,darwin_errno().*)}
 fn darwin_path(path:[]const u8,storage:[]u8) *const u8 {
- result:=bounded_string(storage,path)
- if result.failure.kind != parse.Kind.Ok || #len(path)==0 {return nil}
- return result.value
+ if path.len==0 {return nil}
+ return bounded_string(storage,path) catch nil
 }
-fn darwin_result(code:i32) Result {
- if code==0 {return Result{}}
- return Result{failure:io.Failure{kind:io.Kind.System,native:darwin_error()}}
+fn darwin_check(code:i32) !io.IoErr {
+ if code!=0 {fail io.IoErr.System(darwin_error())}
 }
 '''
     linux_path.write_text(linux)
     boundary = stage/'filesystem/filesystem.dyn'
-    source = boundary.read_text().replace('pub fn write(file: *File, source: []const u8) Result {', '''pub test_written:usize=0
+    source = boundary.read_text().replace('pub fn write(file: *File, source: []const u8) !io.IoErr {', '''pub test_written:usize=0
 pub test_seeks:usize=0
 extern fn probe_mode "probe_mode"() i32
 pub fn test_mode() i32 {return probe_mode()}
 extern fn probe_after_write "probe_after_write"()
-pub fn write(file: *File, source: []const u8) Result {
-  if probe_mode()==9 {return Result{failure:io.Failure{kind:io.Kind.System,native:-5}}}
+pub fn write(file: *File, source: []const u8) !io.IoErr {
+  if probe_mode()==9 {fail io.IoErr.System(-5)}
   probe_after_write()
-  test_written+=#len(source)''').replace('pub fn seek(file: *File, offset: usize) Result {', 'pub fn seek(file: *File, offset: usize) Result {\n test_seeks+=1')
+  test_written+=source.len''').replace('pub fn seek(file: *File, offset: usize) !io.IoErr {', 'pub fn seek(file: *File, offset: usize) !io.IoErr {\n test_seeks+=1')
     boundary.write_text(source)
     line = b'original line of text\n'
     data = line * ((17 << 20) // len(line))

@@ -21,9 +21,7 @@ struct TaskHeapState { bytes: *u8, used, capacity: usize }
 fn task_allocate(size: usize, data: rawptr) rawptr {
   heap := #cast(*TaskHeapState, data)
   start := (heap.used + 15) & ~#cast(usize, 15)
-  if size > heap.capacity - start || start > heap.capacity {
-    return nil
-  }
+  if size > heap.capacity - start || start > heap.capacity { return nil }
   heap.used = start + size
   return #cast(rawptr, &#slice(heap.bytes, heap.capacity)[start])
 }
@@ -65,9 +63,7 @@ pub struct SearchTask {
 // pattern does not compile or no thread starts; search synchronously then.
 pub fn task_start(text: []const u8, document: *const buffer.Document, offset: usize, backwards: bool) *SearchTask {
   task := task_create(text, document)
-  if task == nil {
-    return nil
-  }
+  if task == nil { return nil }
   task.offset = offset
   task.backwards = backwards
   return task_launch(task)
@@ -76,9 +72,7 @@ pub fn task_start(text: []const u8, document: *const buffer.Document, offset: us
 // worker. Read task_status and task_output when done.
 pub fn task_start_ranges(text: []const u8, document: *const buffer.Document, ranges: *const buffer.Selections, mode: u8) *SearchTask {
   task := task_create(text, document)
-  if task == nil {
-    return nil
-  }
+  if task == nil { return nil }
   task.mode = mode
   task.ranges = ranges.*
   return task_launch(task)
@@ -91,17 +85,17 @@ pub fn task_output(task: *const SearchTask) *const buffer.Selections {
 }
 fn task_create(text: []const u8, document: *const buffer.Document) *SearchTask {
   arena := arena_owner.create(#sizeof(SearchTask) + TaskHeap + SearchWindowLimit + 4096)
-  task := mem.push(SearchTask, arena)
+  task := mem.push<SearchTask>(arena)
   task.arena = arena
-  heap := mem.push_bytes_uninit(arena, TaskHeap)
+  heap := mem.push_bytes(arena, TaskHeap)
   task.heap = TaskHeapState{bytes: &heap[0], capacity: TaskHeap}
-  task.window = mem.push_bytes_uninit(arena, SearchWindowLimit)
+  task.window = mem.push_bytes(arena, SearchWindowLimit)
   task.general = general_create(task_allocate, task_release, #cast(rawptr, &task.heap))
-  if task.general == nil || #len(text) == 0 {
+  if task.general == nil || text.len == 0 {
     task_free(task)
     return nil
   }
-  task.pattern.code = compile(&text[0], #len(text), 0x001a0000, &task.pattern.error, &task.pattern.error_offset, nil)
+  task.pattern.code = compile(&text[0], text.len, 0x001a0000, &task.pattern.error, &task.pattern.error_offset, nil)
   if task.pattern.code != nil {
     task.pattern.data = data_create(task.pattern.code, task.general)
     task.pattern.context = context_create(task.general)
@@ -116,12 +110,10 @@ fn task_create(text: []const u8, document: *const buffer.Document) *SearchTask {
   return task
 }
 fn task_launch(task: *SearchTask) *SearchTask {
-  spawned := thread.spawn_with_size(task.arena, TaskStack, task_run, task)
-  if io.failed(spawned.failure) {
+  task.worker = thread.spawn_with_size(task.arena, TaskStack, task_run, task) catch {
     task_free(task)
     return nil
   }
-  task.worker = spawned.value
   task.started = true
   return task
 }
@@ -136,15 +128,13 @@ pub fn task_revision(task: *const SearchTask) u64 {
 }
 // Cancel if still running, wait for the worker, and free everything.
 pub fn task_finish(task: *SearchTask) {
-  if task == nil {
-    return
-  }
+  if task == nil { return }
   sync.store_u32(&task.cancel, 1)
   task_free(task)
 }
 fn task_free(task: *SearchTask) {
   if task.started {
-    if io.failed(thread.join(task.worker).failure) {
+    _ = thread.join(task.worker) catch {
       #panic("cannot join search worker")
     }
     task.started = false
@@ -172,15 +162,11 @@ fn task_search(task: *SearchTask) Match {
   length := task.subject_high
   if !task.backwards {
     found := task_find(task, task.offset, length + 1)
-    if found.found || found.error || task.offset == 0 {
-      return found
-    }
+    if found.found || found.error || task.offset == 0 { return found }
     return task_find(task, 0, length + 1)
   }
   found := task_last(task, 0, task.offset)
-  if found.found || found.error {
-    return found
-  }
+  if found.found || found.error { return found }
   return task_last(task, task.offset, length + 1)
 }
 fn task_cancelled(task: *const SearchTask) bool {
@@ -192,9 +178,7 @@ fn task_find(task: *SearchTask, from: usize, limit: usize) Match {
   at := from
   size := SearchWindow
   for at < limit && at <= length {
-    if task_cancelled(task) {
-      return Match{}
-    }
+    if task_cancelled(task) { return Match{} }
     lookback := at - task.subject_low
     if lookback > SearchLookback {
       lookback = SearchLookback
@@ -237,26 +221,18 @@ fn task_find(task: *SearchTask, from: usize, limit: usize) Match {
       if found.found {
         found.start += low
         found.end += low
-        if found.start >= limit {
-          return Match{}
-        }
+        if found.start >= limit { return Match{} }
       }
       return found
     }
     window := find_window_options(&task.pattern, text, at - low, Checked)
-    if window.error {
-      return Match{error: true}
-    }
+    if window.error { return Match{error: true} }
     if window.found {
-      if low + window.start >= limit {
-        return Match{}
-      }
+      if low + window.start >= limit { return Match{} }
       return Match{found: true, start: low + window.start, end: low + window.end}
     }
     if window.partial {
-      if low + window.start >= limit {
-        return Match{}
-      }
+      if low + window.start >= limit { return Match{} }
       at = low + window.start
       if size * 2 + SearchLookback > SearchWindowLimit {
         // One match longer than the largest window cannot be found here.
@@ -282,25 +258,17 @@ fn task_last(task: *SearchTask, low: usize, high: usize) Match {
     at := start
     for true {
       found := task_find(task, at, end)
-      if found.error {
-        return found
-      }
-      if !found.found || task_cancelled(task) {
-        break
-      }
+      if found.error { return found }
+      if !found.found || task_cancelled(task) { break }
       last = found
       if found.end > at {
         at = found.end
       } else {
         at = task_next(task, found.end)
       }
-      if at > task.snapshot.length {
-        break
-      }
+      if at > task.snapshot.length { break }
     }
-    if last.found {
-      return last
-    }
+    if last.found { return last }
     end = start
   }
   return Match{}
@@ -311,9 +279,7 @@ fn task_next(task: *SearchTask, offset: usize) usize {
   byte: [1]u8 = [0]
   for at < task.snapshot.length {
     buffer.snapshot_copy(&task.snapshot, at, at + 1, &byte[0])
-    if (byte[0] & 192) != 128 {
-      break
-    }
+    if (byte[0] & 192) != 128 { break }
     at += 1
   }
   return at
@@ -327,9 +293,7 @@ fn task_ranges(task: *SearchTask) u8 {
     task.subject_high = range.cursor
     if task.mode >= 3 {
       found := task_find(task, range.anchor, range.cursor + 1)
-      if found.error {
-        return 3
-      }
+      if found.error { return 3 }
       if found.found != (task.mode == 4) {
         task.output.items[task.output.count] = task.ranges.items[current]
         task.output.count += 1
@@ -340,34 +304,20 @@ fn task_ranges(task: *SearchTask) u8 {
     segment := range.anchor
     attempts: usize = 0
     for at <= range.cursor {
-      if task_cancelled(task) {
-        return 3
-      }
-      if attempts == 4096 {
-        return 3
-      }
+      if task_cancelled(task) { return 3 }
+      if attempts == 4096 { return 3 }
       attempts += 1
       found := task_find(task, at, range.cursor + 1)
-      if found.error {
-        return 3
-      }
-      if !found.found {
-        break
-      }
+      if found.error { return 3 }
+      if !found.found { break }
       if task.mode == 2 {
-        if found.start > segment && !task_add(task, segment, found.start) {
-          return 4
-        }
+        if found.start > segment && !task_add(task, segment, found.start) { return 4 }
         segment = found.end
-      } else if !task_add(task, found.start, found.end) {
-        return 4
-      }
+      } else if !task_add(task, found.start, found.end) { return 4 }
       if found.end > at {
         at = found.end
       } else {
-        if found.end == range.cursor {
-          break
-        }
+        if found.end == range.cursor { break }
         at = task_next(task, found.end)
       }
     }
@@ -375,9 +325,7 @@ fn task_ranges(task: *SearchTask) u8 {
       return 4
     }
   }
-  if task.output.count == 0 {
-    return 1
-  }
+  if task.output.count == 0 { return 1 }
   return 0
 }
 fn task_add(task: *SearchTask, low: usize, high: usize) bool {
@@ -386,9 +334,7 @@ fn task_add(task: *SearchTask, low: usize, high: usize) bool {
       return true
     }
   }
-  if task.output.count == buffer.SelectionCapacity {
-    return false
-  }
+  if task.output.count == buffer.SelectionCapacity { return false }
   task.output.items[task.output.count] = buffer.Selection{anchor: low, cursor: high}
   task.output.count += 1
   return true

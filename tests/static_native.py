@@ -27,7 +27,7 @@ with tempfile.TemporaryDirectory(prefix='dna-static-sdk-') as directory:
     # this consumer reproduced a duplicate std/io.linux definition.
     text = entry.read_text()
     text = 'use "std/io"\nuse "std/sync"\n'+text
-    text = text.replace('fn main() {', 'fn main() {\n  sdk_lock:=sync.mutex()\n  sync.lock(&sdk_lock)\n  check(io.linux(-22)==io.Kind.InvalidInput,"SDK error classification")\n  sync.unlock(&sdk_lock)',1)
+    text = text.replace('fn main() {', 'fn main() {\n  sdk_lock:=sync.mutex()\n  sync.lock(&sdk_lock)\n  case io.linux_err(-22) {\n    .InvalidInput => {}\n    _ => { #panic("SDK error classification") }\n  }\n  sync.unlock(&sdk_lock)',1)
     entry.write_text(text)
     subprocess.run([
         'python3', str(ROOT / 'scripts/compile.py'), os.environ.get('DYN', 'dyn'),

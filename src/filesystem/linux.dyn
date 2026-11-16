@@ -1,161 +1,127 @@
-use "std/parse" parse
-use "../cstring" cstring
 #target(kernel: linux)
+use cstring "../cstring"
 use "std/c"
 
 // Borrow caller storage; invalid input/capacity failure leaves it unchanged.
-fn bounded_string(storage: []u8, source: []const u8) c.StringResult {
-  return cstring.bounded(storage, source)
+fn bounded_string(storage: []u8, source: []const u8) c.string!io.IoErr {
+  return try cstring.bounded(storage, source)
 }
 
 pub type Directory = std_fs.Directory
-fn linux_result(code: isize) Result {
-  return Result{ failure: io.Failure{ kind: io.linux(code), native: code } }
+fn linux_check(code: isize) !io.IoErr {
+  if code < 0 { fail io.linux_err(code) }
 }
-fn path_metadata(path: []const u8, flags: usize) Metadata {
+fn path_metadata(path: []const u8, flags: usize) Metadata!io.IoErr {
+  if path.len == 0 { fail .InvalidInput }
   storage: [4096]u8
-  encoded := bounded_string(storage[..], path)
-  if parse.failed(encoded.failure) || #len(path) == 0 {
-    return Metadata{ failure: io.Failure{ kind: io.Kind.InvalidInput, native: -22 } }
-  }
+  encoded := bounded_string(storage[..], path) catch { fail .InvalidInput }
   raw: [32]u64
-  result := #syscall(332, -100, encoded.value, flags, 2047, &raw[0])
-  if result < 0 {
-    return Metadata{ failure: io.Failure{ kind: io.linux(result), native: result } }
-  }
-  if (raw[0] & 769) != 769 {
-    return Metadata{ failure: io.Failure{ kind: io.Kind.System, native: -5 } }
-  }
+  result := #syscall(332, -100, encoded, flags, 2047, &raw[0])
+  if result < 0 { fail io.linux_err(result) }
+  if (raw[0] & 769) != 769 { fail io.IoErr.System(-5) }
   return Metadata{ size: raw[5], inode: raw[4], device: raw[17], mode: #cast(u16, (raw[3] >> 32)) }
 }
-pub fn metadata(path: []const u8) Metadata {
-  return path_metadata(path, 0)
+pub fn metadata(path: []const u8) Metadata!io.IoErr {
+  return try path_metadata(path, 0)
 }
-pub fn metadata_nofollow(path: []const u8) Metadata {
-  return path_metadata(path, 256)
+pub fn metadata_nofollow(path: []const u8) Metadata!io.IoErr {
+  return try path_metadata(path, 256)
 }
-pub fn file_metadata(file: *const File) Metadata {
-  return std_fs.file_metadata(file)
+pub fn file_metadata(file: *const File) Metadata!io.IoErr {
+  return try std_fs.file_metadata(file)
 }
-pub fn open_directory(path: []const u8, storage: []u8) DirectoryResult {
-  if #len(path) >= 4096 {
-    return DirectoryResult{ failure: io.Failure{ kind: io.linux(-36), native: -36 } }
-  }
-  result := std_fs.open_directory(path, storage)
-  return DirectoryResult{ directory: result.value, failure: io.Failure{ kind: result.failure.kind, native: result.failure.native } }
+pub fn open_directory(path: []const u8, storage: []u8) Directory!io.IoErr {
+  if path.len >= 4096 { fail io.linux_err(-36) }
+  return try std_fs.open_directory(path, storage)
 }
-pub fn directory_next(directory: *Directory) DirectoryEntry {
-  return std_fs.directory_next(directory)
+pub fn directory_next(directory: *Directory) DirectoryEntry!io.IoErr {
+  return try std_fs.directory_next(directory)
 }
 pub fn close_directory(directory: *Directory) {
   std_fs.close_directory(directory)
 }
-pub fn rename(old_path: []const u8, new_path: []const u8) Result {
-  return std_fs.rename(old_path, new_path)
+pub fn rename(old_path: []const u8, new_path: []const u8) !io.IoErr {
+  try std_fs.rename(old_path, new_path)
 }
-pub fn rename_noreplace(old_path: []const u8, new_path: []const u8) Result {
+pub fn rename_noreplace(old_path: []const u8, new_path: []const u8) !io.IoErr {
+  if old_path.len == 0 || new_path.len == 0 { fail .InvalidInput }
   old_storage: [4096]u8
   new_storage: [4096]u8
-  old := bounded_string(old_storage[..], old_path)
-  target := bounded_string(new_storage[..], new_path)
-  if parse.failed(old.failure) || parse.failed(target.failure) || #len(old_path) == 0 || #len(new_path) == 0 {
-    return linux_result(-22)
-  }
-  return linux_result(#syscall(316, -100, old.value, -100, target.value, 1))
+  old := bounded_string(old_storage[..], old_path) catch { fail .InvalidInput }
+  target := bounded_string(new_storage[..], new_path) catch { fail .InvalidInput }
+  try linux_check(#syscall(316, -100, old, -100, target, 1))
 }
-pub fn remove(path: []const u8) Result {
-  return std_fs.remove(path)
+pub fn remove(path: []const u8) !io.IoErr {
+  try std_fs.remove(path)
 }
-pub fn make_directory(path: []const u8, mode: usize) Result {
-  return std_fs.make_directory(path, mode)
+pub fn make_directory(path: []const u8, mode: usize) !io.IoErr {
+  try std_fs.make_directory_exclusive(path, mode)
 }
-pub fn remove_directory(path: []const u8) Result {
-  return std_fs.remove_directory(path)
+pub fn remove_directory(path: []const u8) !io.IoErr {
+  try std_fs.remove_directory(path)
 }
-pub fn read_link(path: []const u8, destination: []u8) PathResult {
+pub fn read_link(path: []const u8, destination: []u8) []u8!io.IoErr {
+  if path.len == 0 { fail io.linux_err(-36) }
   storage: [4096]u8
-  encoded := bounded_string(storage[..], path)
-  if parse.failed(encoded.failure) || #len(path) == 0 {
-    return PathResult{ path: destination[..0], failure: io.Failure{ kind: io.linux(-36), native: -36 } }
-  }
-  if #len(destination) == 0 {
-    return PathResult{ path: destination[..0], failure: io.Failure{ kind: io.linux(-22), native: -22 } }
-  }
+  encoded := bounded_string(storage[..], path) catch { fail io.linux_err(-36) }
+  if destination.len == 0 { fail .InvalidInput }
   // The arena SDK wrapper reserves 4096 bytes, but DNA accepts any output size.
-  result := #syscall(267, -100, encoded.value, &destination[0], #len(destination))
-  if result < 0 {
-    return PathResult{ path: destination[..0], failure: io.Failure{ kind: io.linux(result), native: result } }
-  }
-  return PathResult{ path: destination[..#cast(usize, result)] }
+  result := #syscall(267, -100, encoded, &destination[0], destination.len)
+  if result < 0 { fail io.linux_err(result) }
+  return destination[..#cast(usize, result)]
 }
-pub fn set_permissions(file: *File, mode: usize) Result {
-  if !std_fs.is_open(file) {
-    return linux_result(-9)
-  }
-  return linux_result(#syscall(91, file.descriptor, mode))
+pub fn set_permissions(file: *File, mode: usize) !io.IoErr {
+  if !std_fs.is_open(file) { fail io.linux_err(-9) }
+  try linux_check(#syscall(91, file.descriptor, mode))
 }
 
-pub fn open_nofollow(path: []const u8) FileResult {
+pub fn open_nofollow(path: []const u8) File!io.IoErr {
+  if path.len == 0 { fail .InvalidInput }
   storage: [4096]u8
-  encoded := bounded_string(storage[..], path)
-  if parse.failed(encoded.failure) || #len(path) == 0 {
-    return FileResult{ failure: io.Failure{ kind: io.Kind.InvalidInput, native: -22 } }
-  }
-  descriptor := #syscall(257, -100, encoded.value, 657408, 0)
-  if descriptor < 0 {
-    return FileResult{ failure: io.Failure{ kind: io.linux(descriptor), native: descriptor } }
-  }
-  return FileResult{ value: std_fs.adopt_handle(descriptor) }
+  encoded := bounded_string(storage[..], path) catch { fail .InvalidInput }
+  descriptor := #syscall(257, -100, encoded, 657408, 0)
+  if descriptor < 0 { fail io.linux_err(descriptor) }
+  return std_fs.adopt_handle(descriptor)
 }
 
-fn atomic_create_exclusive(path: []const u8) FileResult {
-  return std_fs.create_exclusive(path)
+fn atomic_create_exclusive(path: []const u8) File!io.IoErr {
+  return try std_fs.create_exclusive(path)
 }
-pub fn create_private_exclusive(path: []const u8) FileResult {
+pub fn create_private_exclusive(path: []const u8) File!io.IoErr {
+  if path.len == 0 { fail .InvalidInput }
   storage: [4096]u8
-  encoded := bounded_string(storage[..], path)
-  if parse.failed(encoded.failure) || #len(path) == 0 {
-    return FileResult{ failure: io.Failure{ kind: io.Kind.InvalidInput, native: -22 } }
-  }
-  descriptor := #syscall(257, -100, encoded.value, 524482, 384)
-  if descriptor < 0 {
-    return FileResult{ failure: io.Failure{ kind: io.linux(descriptor), native: descriptor } }
-  }
-  return FileResult{ value: std_fs.adopt_handle(descriptor) }
+  encoded := bounded_string(storage[..], path) catch { fail .InvalidInput }
+  descriptor := #syscall(257, -100, encoded, 524482, 384)
+  if descriptor < 0 { fail io.linux_err(descriptor) }
+  return std_fs.adopt_handle(descriptor)
 }
-pub fn preserve_permissions(file: *File, source: []const u8) Result {
-  info := metadata(source)
-  if io.failed(info.failure) {
-    return Result{ failure: io.Failure{ kind: info.failure.kind, native: info.failure.native } }
-  }
-  return set_permissions(file, info.mode & 511)
+pub fn preserve_permissions(file: *File, source: []const u8) !io.IoErr {
+  info := try metadata(source)
+  try set_permissions(file, info.mode & 511)
 }
 pub fn file_stamp(file: *const File) Stamp {
   raw: [32]u64
   empty: [1]u8 = [0]
   // statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS)
   result := #syscall(332, file.descriptor, &empty[0], 4096, 2047, &raw[0])
-  if result < 0 {
-    return Stamp{}
-  }
+  if result < 0 { return Stamp{} }
   return Stamp{inode: raw[4], size: raw[5], change_seconds: raw[12], change_nanos: raw[13] & 4294967295, modify_seconds: raw[14], modify_nanos: raw[15] & 4294967295, valid: true}
 }
 // Copy length bytes from source at offset to the end of destination. The
 // kernel shares extents (reflink) where the filesystem supports it.
-pub fn copy_range(source: *const File, offset: u64, destination: *File, length: usize) Result {
+pub fn copy_range(source: *const File, offset: u64, destination: *File, length: usize, transferred: *usize) !io.IoErr {
   position := offset
   done: usize = 0
   for done < length {
     copied := #syscall(326, source.descriptor, &position, destination.descriptor, 0, length - done, 0)
-    if copied == -4 {
-      continue
-    }
+    if copied == -4 { continue }
     if copied <= 0 {
-      return Result{ transferred: done, failure: io.Failure{ kind: io.linux(copied), native: copied } }
+      transferred.* = done
+      fail io.linux_err(copied)
     }
     done += #cast(usize, copied)
   }
-  return Result{ transferred: done }
+  transferred.* = done
 }
 
 // Linux's native host installs its SIGBUS-guarded mapper. Library users
@@ -166,20 +132,18 @@ pub fn map_file(descriptor: isize, length: u64) *u8 {
 pub fn unmap_file(bytes: *u8, length: u64) {}
 
 pub const WholeFileClones: bool = false
-pub fn clone_exclusive(source: *const File, path: []const u8) FileResult {
-  return FileResult{ failure: io.Failure{ kind: io.Kind.Unsupported } }
+pub fn clone_exclusive(source: *const File, path: []const u8) File!io.IoErr {
+  _ = source
+  _ = path
+  fail .Unsupported
 }
-pub fn resize(file: *File, length: usize) Result {
-  if !is_open(file) {
-    return Result{ failure: io.Failure{ kind: io.Kind.InvalidState } }
-  }
-  if length > 9223372036854775807 {
-    return Result{ failure: io.Failure{ kind: io.Kind.InvalidInput } }
-  }
-  return linux_result(#syscall(77, file.descriptor, length))
+pub fn resize(file: *File, length: usize) !io.IoErr {
+  if !is_open(file) { fail .InvalidInput }
+  if length > 9223372036854775807 { fail .InvalidInput }
+  try linux_check(#syscall(77, file.descriptor, length))
 }
 
 pub fn executable(path: []const u8) bool {
-  info := metadata(path)
-  return !io.failed(info.failure) && (info.mode & 61440) == 32768 && (info.mode & 73) != 0
+  info := metadata(path) catch { return false }
+  return (info.mode & 61440) == 32768 && (info.mode & 73) != 0
 }

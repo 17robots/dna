@@ -1,50 +1,64 @@
-use "../../src/owned_arena" arena_owner
+use arena_owner "../../src/owned_arena"
 use "../../src/host"
 use "std/io"
 use "std/mem"
-use "../../src/filesystem" fs
+use fs "../../src/filesystem"
 
 fn equal(a: []const u8, b: []const u8) bool {
-  if #len(a) != #len(b) {
-    return false
-  }
-  for index in 0..#len(a) {
-    if a[index] != b[index] {
-      return false
-    }
+  if a.len != b.len { return false }
+  for index in 0..a.len {
+    if a[index] != b[index] { return false }
   }
   return true
 }
+fn env_fails(name: []const u8, dst: []u8) bool {
+  _ = host.environment(name, dst) catch { return true }
+  return false
+}
+fn env_not_found(name: []const u8, dst: []u8) bool {
+  _ = host.environment(name, dst) catch err {
+    case err {
+      .NotFound => { return true }
+      _ => { return false }
+    }
+  }
+  return false
+}
 fn main() {
   value: [128]u8
-  environment := host.environment("DNA_HOST_TEST", value[..])
-  if environment.failure.kind != io.Kind.Ok || !environment.found || !equal(environment.value, "value café 日本語") {
+  environment := host.environment("DNA_HOST_TEST", value[..]) catch {
     #panic("environment Unicode")
   }
-  missing := host.environment("DNA_HOST_MISSING_7ab218", value[..])
-  if missing.failure.kind != io.Kind.Ok || missing.found {
+  if !equal(environment, "value café 日本語") {
+    #panic("environment Unicode")
+  }
+  if !env_not_found("DNA_HOST_MISSING_7ab218", value[..]) {
     #panic("missing environment")
   }
-  empty := host.environment("DNA_HOST_EMPTY", value[..])
-  if empty.failure.kind != io.Kind.Ok || !empty.found || #len(empty.value) != 0 {
+  empty := host.environment("DNA_HOST_EMPTY", value[..]) catch {
     #panic("empty environment")
   }
-  if host.environment("DNA_HOST_TEST", value[..1]).failure.kind == io.Kind.Ok {
+  if empty.len != 0 {
+    #panic("empty environment")
+  }
+  if !env_fails("DNA_HOST_TEST", value[..1]) {
     #panic("short environment destination")
   }
-  if host.environment("bad=name", value[..]).failure.kind == io.Kind.Ok || host.environment("bad\0name", value[..]).failure.kind == io.Kind.Ok {
+  if !env_fails("bad=name", value[..]) || !env_fails("bad\0name", value[..]) {
     #panic("invalid environment name")
   }
   allocated := arena_owner.create((8192))
   defer arena_owner.release(allocated)
-  arguments := host.arguments(allocated)
-  if arguments.failure.kind != io.Kind.Ok || #len(arguments.values) != 4 {
+  arguments := host.arguments(allocated) catch {
     #panic("argument count")
   }
-  if !equal(arguments.values[1], "argument café 日本語") || #len(arguments.values[2]) != 0 || !equal(arguments.values[3], "with space") {
+  if arguments.len != 4 {
+    #panic("argument count")
+  }
+  if !equal(arguments[1], "argument café 日本語") || arguments[2].len != 0 || !equal(arguments[3], "with space") {
     #panic("argument bytes")
   }
-  if fs.metadata(".").failure.kind != io.Kind.Ok {
+  _ = fs.metadata(".") catch {
     #panic("host and filesystem integration")
   }
 

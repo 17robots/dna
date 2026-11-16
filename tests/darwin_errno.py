@@ -27,24 +27,22 @@ with tempfile.TemporaryDirectory(prefix='dna-darwin-errno-') as directory:
     shutil.copytree(ROOT/'src/cstring', stage/'cstring')
     (stage/'dynlib').mkdir()
     (stage/'dynlib/dynlib.dyn').write_text('''use "std/io"
-pub struct SymbolResult {value:rawptr,failure:io.Failure}
 extern fn resolve "probe_resolve"() rawptr
-pub fn symbol(handle:rawptr,name:[]const u8) SymbolResult {
- if #cast(isize,handle)!=-2 || #len(name)!=7 {#panic("wrong Darwin symbol lookup")}
+pub fn symbol(handle:rawptr,name:[]const u8) rawptr!io.IoErr {
+ if #cast(isize,handle)!=-2 || name.len!=7 {#panic("wrong Darwin symbol lookup")}
  expected:[]const u8="__error"
  for i in 0..7 {if name[i]!=expected[i] {#panic("wrong errno symbol")}}
- return SymbolResult{value:resolve()}
+ return resolve()
 }
 ''')
     source = (ROOT/'src/filesystem/macos.dyn').read_text()
-    helpers = source[source.index('// The pinned SDK thread module'):source.index('fn darwin_result(')]
+    helpers = source[source.index('// The SDK thread module'):source.index('fn darwin_check(')]
     (stage/'main.dyn').write_text('''#link("c")
 #link("pthread")
-use "std/sync" sync
+use sync "std/sync"
 use "std/io"
-use "std/parse"
-use "./dynlib" dynlib
-use "./cstring" cstring
+use dynlib "./dynlib"
+use cstring "./cstring"
 extern fn probe_fail "probe_fail"()
 extern fn probe_race "probe_race"(callback:fn()i32) i32
 extern fn probe_expected "probe_expected"() i32

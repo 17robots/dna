@@ -1,5 +1,5 @@
 #target(kernel: windows)
-use "std/process" process
+use process "std/process"
 use "std/unicode/utf8"
 use "std/io"
 #link("kernel32")
@@ -12,10 +12,8 @@ extern fn host_utf8 "WideCharToMultiByte"(page: u32, flags: u32, source: *const 
 fn native_current_directory(destination: []u8) usize {
   wide: [32768]u16
   length := host_getcwd(32768, &wide[0])
-  if length == 0 || length >= 32768 || #len(destination) > 2147483647 {
-    return 0
-  }
-  used := host_utf8(65001, 128, &wide[0], #cast(i32, length), &destination[0], #cast(i32, #len(destination)) - 1, nil, nil)
+  if length == 0 || length >= 32768 || destination.len > 2147483647 { return 0 }
+  used := host_utf8(65001, 128, &wide[0], #cast(i32, length), &destination[0], #cast(i32, destination.len) - 1, nil, nil)
   if used <= 0 {
     destination[0] = 0
     return 0
@@ -29,14 +27,10 @@ fn native_current_directory(destination: []u8) usize {
   return #cast(usize, used)
 }
 fn native_change_directory(path: []const u8) bool {
-  if #len(path) > 2147483647 {
-    return false
-  }
+  if path.len > 2147483647 { return false }
   wide: [32768]u16
-  used := host_utf16(65001, 8, &path[0], #cast(i32, #len(path)), &wide[0], 32767)
-  if used <= 0 {
-    return false
-  }
+  used := host_utf16(65001, 8, &path[0], #cast(i32, path.len), &wide[0], 32767)
+  if used <= 0 { return false }
   wide[used] = 0
   return host_chdir(&wide[0]) != 0
 }
@@ -47,39 +41,29 @@ fn native_small_pages(memory: []u8) {
   _ = memory
 }
 
-fn native_environment(name: []const u8, destination: []u8) EnvironmentResult {
+fn native_environment(name: []const u8, destination: []u8) []u8!io.IoErr {
   // The allocating SDK wrapper retries Capacity, including permanent name errors.
   units: usize = 0
   at: usize = 0
-  for at < #len(name) {
+  for at < name.len {
     decoded := utf8.decode(name, at)
-    if !decoded.valid {
-      return EnvironmentResult{ failure: io.Failure{ kind: io.Kind.Capacity, native: -28 } }
-    }
+    if !decoded.valid { fail .Capacity }
     units += 1
     if decoded.codepoint > 65535 {
       units += 1
     }
-    if units > 32767 {
-      return EnvironmentResult{ failure: io.Failure{ kind: io.Kind.Capacity, native: -28 } }
-    }
+    if units > 32767 { fail .Capacity }
     at += decoded.width
   }
   temporary := arena_owner.create(0)
   defer arena_owner.release(temporary)
-  result := process.environment(temporary, name)
-  if !io.failed(result.failure) && #len(result.value) > #len(destination) {
-    return EnvironmentResult{ failure: io.Failure{ kind: io.Kind.Capacity, native: -28 } }
-  }
-  if !io.failed(result.failure) {
-    _ = mem.move(destination, result.value)
-    return EnvironmentResult{ value: destination[..#len(result.value)], found: result.found }
-  }
-  return EnvironmentResult{ value: result.value, found: result.found, failure: result.failure }
+  value := try process.environment(temporary, name)
+  if value.len > destination.len { fail .Capacity }
+  _ = mem.move(destination, value)
+  return destination[..value.len]
 }
-fn native_arguments(arena: *mem.Arena) ArgumentsResult {
-  result := process.arguments(arena)
-  return ArgumentsResult{ values: result.value, failure: result.failure }
+fn native_arguments(arena: *mem.Arena) [][]const u8!io.IoErr {
+  return try process.arguments(arena)
 }
 
 // Keep one foreign declaration per Win32 conversion symbol across adapters.

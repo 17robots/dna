@@ -18,7 +18,7 @@ def function(source,name):
         end+=1
     return source[start:end]
 
-FIXTURE=r'''use "std/testing" testing
+FIXTURE=r'''use testing "std/testing"
 images:u32
 buffers:u32
 parameters:u32
@@ -89,11 +89,15 @@ fn renderer()Presenter{
  api:=gl.Api{viewport:viewport,use_program:noop_one,bind_vertex_array:noop_one,bind_buffer:bind_buffer,active_texture:noop_one,bind_sampler:sampler,bind_texture:noop_two,pixel_store_i:pixel_store,tex_parameter_i:texture_parameter,disable:disable,clear_color:color,clear:noop_one,uniform_2f:uniform_two,uniform_1i:uniform_one,tex_image_2d:image,tex_sub_image_2d:update,uniform_4f:uniform_four,buffer_data:buffer_data,draw_arrays:draw_arrays,get_error:error,delete_program:noop_one,delete_vertex_arrays:noop_delete,delete_buffers:noop_delete,delete_textures:noop_delete}
  return Presenter{api:api,program:1,vao:2,buffer:3,texture:4,max_texture:1024}
 }
+fn draw_ok(present:*Presenter, surface:software.Surface) bool {
+ draw(present, surface) catch { return false }
+ return true
+}
 fn main(){
  pixels:[4096]u8
  surface:=software.Surface{pixels:pixels[..],width:16,height:8,stride:64}
  present:=renderer()
- for frame in 0..64{testing.expect(!io.failed(draw(&present,surface).failure),"warm present")}
+ for frame in 0..64{testing.expect(draw_ok(&present,surface),"warm present")}
  // This is the red-cap: the old presenter reallocates 64 times here.
  testing.expect(images==1,"same-size frames must allocate texture once")
  testing.expect(updates==64 && quads==64,"each frame updates and draws")
@@ -102,7 +106,7 @@ fn main(){
  surface.width=24
 surface.height=10
 surface.stride=96
- testing.expect(!io.failed(draw(&present,surface).failure),"resize present")
+ testing.expect(draw_ok(&present,surface),"resize present")
  testing.expect(images==2 && updates==65 && image_width==24 && image_height==10 && update_width==24 && update_height==10,"resize storage and full update")
  testing.expect(buffers==1,"resize must keep static vertex storage")
  surface.width=32
@@ -110,24 +114,24 @@ surface.height=12
 surface.stride=128
  fail_image=true
  before:=quads
- testing.expect(io.failed(draw(&present,surface).failure),"allocation error surfaced")
+ testing.expect(!draw_ok(&present,surface),"allocation error surfaced")
  testing.expect(images==3 && updates==65 && quads==before,"failed allocation never updates or draws")
- testing.expect(!io.failed(draw(&present,surface).failure),"allocation retry")
+ testing.expect(draw_ok(&present,surface),"allocation retry")
  testing.expect(images==4 && updates==66 && quads==before+1,"allocation failure does not cache dimensions")
  fail_update=true
- testing.expect(io.failed(draw(&present,surface).failure),"upload error surfaced")
- testing.expect(!io.failed(draw(&present,surface).failure),"upload retry")
+ testing.expect(!draw_ok(&present,surface),"upload error surfaced")
+ testing.expect(draw_ok(&present,surface),"upload retry")
  testing.expect(images==4 && updates==68,"upload failure preserves storage and retries content")
  surface.width=1025
  before=images
- testing.expect(io.failed(draw(&present,surface).failure) && images==before,"over-limit input rejected before allocation")
+ testing.expect(!draw_ok(&present,surface) && images==before,"over-limit input rejected before allocation")
  close(&present)
  testing.expect(present.program==0 && present.texture==0,"close clears resource state")
  present=renderer()
  surface.width=16
 surface.height=8
 surface.stride=64
- testing.expect(!io.failed(draw(&present,surface).failure) && images==before+1,"recreated presenter allocates fresh storage")
+ testing.expect(draw_ok(&present,surface) && images==before+1,"recreated presenter allocates fresh storage")
  // A failed vertex allocation must retry even when texture storage succeeded.
  close(&present)
  present=renderer()
@@ -136,15 +140,14 @@ surface.stride=64
  before=quads
  vertex_attempts:=buffers
  fail_buffer=true
- testing.expect(io.failed(draw(&present,surface).failure) && quads==before,"vertex allocation error surfaced before drawing")
- testing.expect(!io.failed(draw(&present,surface).failure) && buffers==vertex_attempts+2,"vertex allocation retried")
+ testing.expect(!draw_ok(&present,surface) && quads==before,"vertex allocation error surfaced before drawing")
+ testing.expect(draw_ok(&present,surface) && buffers==vertex_attempts+2,"vertex allocation retried")
  close(&present)
 }
 '''
 source=SOURCE.read_text()
-header='use "vendor/opengl" gl\nuse "std/ui"\nuse "std/ui/software"\nuse "std/io"\n'
+header='use gl "vendor/opengl"\nuse "std/ui"\nuse "std/ui/software"\nuse "std/io"\n'
 header+=re.search(r'pub struct Presenter \{[^\n]+',source).group()+'\n'
-header+='pub struct Result {failure:io.Failure}\n'
 header+='\n'.join(function(source,name) for name in ('healthy','healthy_result','quad','draw','close'))+'\n'
 with tempfile.TemporaryDirectory(prefix='dna-present-reuse-') as temporary:
     stage=Path(temporary)

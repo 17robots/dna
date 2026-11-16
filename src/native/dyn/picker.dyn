@@ -37,38 +37,30 @@ fn picker_capacity(current: usize, need: usize) usize {
   return capacity
 }
 fn picker_grow_names(worker: *NativePicker, need: usize) bool {
-  if need <= #len(worker.names) {
-    return true
-  }
-  capacity := picker_capacity(#len(worker.names), need)
+  if need <= worker.names.len { return true }
+  capacity := picker_capacity(worker.names.len, need)
   rec_lock(worker.lock)
   defer rec_unlock(worker.lock)
   old: rawptr = nil
-  if #len(worker.names) != 0 {
+  if worker.names.len != 0 {
     old = #cast(rawptr, &worker.names[0])
   }
   pointer := #cast(*u8, dna_memory_realloc(old, capacity, 1))
-  if pointer == nil {
-    return false
-  }
+  if pointer == nil { return false }
   worker.names = #slice(pointer, capacity)
   return true
 }
 fn picker_grow_offsets(worker: *NativePicker, need: usize) bool {
-  if need <= #len(worker.offsets) {
-    return true
-  }
-  capacity := picker_capacity(#len(worker.offsets), need)
+  if need <= worker.offsets.len { return true }
+  capacity := picker_capacity(worker.offsets.len, need)
   rec_lock(worker.lock)
   defer rec_unlock(worker.lock)
   old: rawptr = nil
-  if #len(worker.offsets) != 0 {
+  if worker.offsets.len != 0 {
     old = #cast(rawptr, &worker.offsets[0])
   }
   pointer := #cast(*usize, dna_memory_realloc(old, capacity * #sizeof(usize), 1))
-  if pointer == nil {
-    return false
-  }
+  if pointer == nil { return false }
   worker.offsets = #slice(pointer, capacity)
   return true
 }
@@ -96,10 +88,10 @@ fn picker_enqueue(scan: *PickerScan, queue: *PickerQueue, relative: *const u8, l
     scan.flags |= 1
     return
   }
-  if queue.used + length + 1 > #len(queue.bytes) {
-    capacity := picker_capacity(#len(queue.bytes), queue.used + length + 1)
+  if queue.used + length + 1 > queue.bytes.len {
+    capacity := picker_capacity(queue.bytes.len, queue.used + length + 1)
     old: rawptr = nil
-    if #len(queue.bytes) != 0 {
+    if queue.bytes.len != 0 {
       old = #cast(rawptr, &queue.bytes[0])
     }
     pointer := #cast(*u8, dna_memory_realloc(old, capacity, 1))
@@ -132,14 +124,10 @@ fn picker_directory(scan: *PickerScan, queue: *PickerQueue, path: *const u8, rel
   defer _ = install_closedir(directory)
   for !picker_cancelled(scan) && scan.visited < PickerVisitLimit {
     entry := install_readdir(directory)
-    if entry == nil {
-      return
-    }
+    if entry == nil { return }
     scan.visited += 1
     name := &entry.name[0]
-    if name.* == 46 || !search_valid_name(name) {
-      continue
-    }
+    if name.* == 46 || !search_valid_name(name) { continue }
     name_length := string_length(name)
     prefix_length := string_length(relative)
     path_length := string_length(path)
@@ -192,7 +180,7 @@ fn picker_directory(scan: *PickerScan, queue: *PickerQueue, path: *const u8, rel
 fn picker_walk(scan: *PickerScan, root: *const u8) {
   queue := PickerQueue{}
   defer {
-    if #len(queue.bytes) != 0 {
+    if queue.bytes.len != 0 {
       dna_memory_free(#cast(rawptr, &queue.bytes[0]))
     }
   }
@@ -254,9 +242,7 @@ fn picker_worker(pointer: rawptr) i32 {
 }
 pub fn dna_picker_open() *NativePicker {
   worker := #cast(*NativePicker, search_calloc(1, #sizeof(NativePicker), 1))
-  if worker == nil {
-    return nil
-  }
+  if worker == nil { return nil }
   worker.lock = rec_mutex()
   worker.wake = rec_condition()
   worker.watch = dna_directory_watch_open()
@@ -279,9 +265,7 @@ pub fn dna_picker_open() *NativePicker {
   return worker
 }
 pub fn dna_picker_submit(worker: *NativePicker, root: *const u8) u64 {
-  if worker == nil {
-    return 0
-  }
+  if worker == nil { return 0 }
   rec_lock(worker.lock)
   search_copy_text(worker.root[..], root)
   request_generation := sync.fetch_add_u64(&worker.generation, 1) + 1
@@ -291,29 +275,19 @@ pub fn dna_picker_submit(worker: *NativePicker, root: *const u8) u64 {
 }
 // -1 stale, 0 pending, 1 complete, 2 partial. flags: limited=1,error=2,watch fallback=4.
 pub fn dna_picker_poll(worker: *NativePicker, request_generation: u64, count: *usize, visited: *usize, flags: *u32) i32 {
-  if worker == nil {
-    return -1
-  }
+  if worker == nil { return -1 }
   rec_lock(worker.lock)
   defer rec_unlock(worker.lock)
-  if sync.load_u64(&worker.generation) != request_generation {
-    return -1
-  }
-  if worker.published != request_generation {
-    return 0
-  }
+  if sync.load_u64(&worker.generation) != request_generation { return -1 }
+  if worker.published != request_generation { return 0 }
   count.* = worker.count
   visited.* = worker.visited
   flags.* = worker.flags & 7
-  if (worker.flags & 8) != 0 {
-    return 2
-  }
+  if (worker.flags & 8) != 0 { return 2 }
   return 1
 }
 pub fn dna_picker_row(worker: *NativePicker, request_generation: u64, index: usize, output: *u8, capacity: usize) usize {
-  if worker == nil {
-    return 0
-  }
+  if worker == nil { return 0 }
   rec_lock(worker.lock)
   defer rec_unlock(worker.lock)
   if sync.load_u64(&worker.generation) != request_generation || worker.published != request_generation || index >= worker.count {
@@ -321,24 +295,18 @@ pub fn dna_picker_row(worker: *NativePicker, request_generation: u64, index: usi
   }
   row := &worker.names[worker.offsets[index]]
   length := string_length(row)
-  if length >= capacity {
-    return 0
-  }
+  if length >= capacity { return 0 }
   _ = copy(output, row, length + 1)
   return length
 }
 pub fn dna_picker_changed(worker: *NativePicker) i32 {
-  if worker == nil {
-    return 0
-  }
+  if worker == nil { return 0 }
   rec_lock(worker.lock)
   defer rec_unlock(worker.lock)
   return dna_directory_watch_poll(worker.watch)
 }
 pub fn dna_picker_close(worker: *NativePicker) {
-  if worker == nil {
-    return
-  }
+  if worker == nil { return }
   rec_lock(worker.lock)
   sync.store_u32(&worker.stop, 1)
   rec_signal(worker.wake)
@@ -347,10 +315,10 @@ pub fn dna_picker_close(worker: *NativePicker) {
   dna_directory_watch_close(worker.watch)
   rec_condition_free(worker.wake)
   rec_mutex_free(worker.lock)
-  if #len(worker.names) != 0 {
+  if worker.names.len != 0 {
     dna_memory_free(#cast(rawptr, &worker.names[0]))
   }
-  if #len(worker.offsets) != 0 {
+  if worker.offsets.len != 0 {
     dna_memory_free(#cast(rawptr, &worker.offsets[0]))
   }
   search_free(#cast(rawptr, worker))

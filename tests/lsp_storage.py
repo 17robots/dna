@@ -17,10 +17,10 @@ def function(source,name):
         end+=1
     return source[start:end]
 HEADER='''use "std/mem"
-use "./owner" arena_owner
-use "./buffer" buffer
-use "./host" host
-use "./sdl" sdl
+use arena_owner "./owner"
+use buffer "./buffer"
+use host "./host"
+use sdl "./sdl"
 struct LspShadow {snapshot:buffer.TextSnapshot,ready:bool}
 struct LspDocument {shadow:LspShadow,identity:u64,revision:u64,observed:u64,changed:u64,path:[4096]u8}
 struct LanguageServer {documents:[]LspDocument,documents_arena:*mem.Arena,allocation_retry_due:u64,ready:bool,dirty_first:*Slot,attach_scan:bool}
@@ -48,7 +48,7 @@ fn main(){
  shadow.ready=true
  records:=server.documents_arena
  failed=true
- check(!lsp_documents_ensure(server,97) && server.documents_arena==records && #len(server.documents)==1)
+ check(!lsp_documents_ensure(server,97) && server.documents_arena==records && server.documents.len==1)
  // No record exists for the unattached new slot, but scheduler still wakes.
  server.ready=true
  sdl.now=100

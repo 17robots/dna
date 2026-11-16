@@ -10,14 +10,14 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 DYN = str(Path(os.environ.get('DYN', ROOT.parent/'dyn/compiler/build/dyn-release')).resolve())
 SOURCE = r'''
-use "std/io" io
-use "std/bytes" byte_ops
+use io "std/io"
+use byte_ops "std/bytes"
 pub struct Substring { flags:u32, offset:i32, length:i32, line:i32, cluster:i32, x:i32, y:i32, width:i32, height:i32 }
 fn check(ok:bool) { if !ok { #panic("native text contract") } }
 fn main() {
  path: [4096]u8
  name := "FONT_PATH"
- _ = mem.copy(path[..#len(name)],name)
+ _ = mem.copy(path[..name.len],name)
  font := ttf_open(&path[0],16.0)
  check(font!=nil)
  check(ttf_font_height(nil)==0)
@@ -27,23 +27,22 @@ fn main() {
  if #sizeof(NativeFont)>16384 {#panic("font metadata startup budget")}
  // Verify the real HarfBuzz blob shares the font bytes we retain, rather than
  // silently copying an entire font file again.
- get_face:=#cast(fn(rawptr)rawptr,dynlib.symbol(native_libraries.harfbuzz,"hb_font_get_face").value)
- reference_blob:=#cast(fn(rawptr)rawptr,dynlib.symbol(native_libraries.harfbuzz,"hb_face_reference_blob").value)
- get_data:=#cast(fn(rawptr,*u32)*const u8,dynlib.symbol(native_libraries.harfbuzz,"hb_blob_get_data").value)
+ get_face:=#cast(fn(rawptr)rawptr,dynlib.symbol(native_libraries.harfbuzz,"hb_font_get_face") catch nil)
+ reference_blob:=#cast(fn(rawptr)rawptr,dynlib.symbol(native_libraries.harfbuzz,"hb_face_reference_blob") catch nil)
+ get_data:=#cast(fn(rawptr,*u32)*const u8,dynlib.symbol(native_libraries.harfbuzz,"hb_blob_get_data") catch nil)
  real_font:=#cast(*NativeFont,font)
  blob:=reference_blob(get_face(real_font.shaped))
  blob_length:u32=0
  blob_bytes:=get_data(blob,&blob_length)
- check(blob_bytes==&real_font.face.data[0] && #cast(usize,blob_length)==#len(real_font.face.data))
+ check(blob_bytes==&real_font.face.data[0] && #cast(usize,blob_length)==real_font.face.data.len)
  native_libraries.hb.blob_destroy(blob)
  large_name:="LARGE_FONT_FILE\x00"
  large:=ttf_open(&large_name[0],16.0)
  check(large!=nil)
  large_font:=#cast(*NativeFont,large)
- if large_font.file.backing>#len(large_font.face.data)+131072 {#panic("font reader retained geometric growth copies")}
- replacement:=std_fs.create(large_name[..#len(large_name)-1])
- check(!io.failed(replacement.failure))
- std_fs.close(&replacement.value)
+ if large_font.file.backing>large_font.face.data.len+131072 {#panic("font reader retained geometric growth copies")}
+ replacement:=std_fs.create(large_name[..large_name.len-1]) catch { #panic("replacement create") }
+ std_fs.close(&replacement)
  a_text_for_large:[1]u8=[97]
  large_width:i32=0
  check(ttf_measure(large,&a_text_for_large[0],1,&large_width,nil))
@@ -62,7 +61,7 @@ fn main() {
  text := ttf_create(renderer,font,&bytes[0],8)
  check(text!=nil)
  owned:=#cast(*NativeText,text)
- if mem.arena_capacity(owned.owner)>1048576 || mem.arena_capacity(owned.payload)>1048576 {#panic("text arena startup budget")}
+ if mem.arena_used(owned.owner)+mem.arena_room(owned.owner)>1048576 || mem.arena_used(owned.payload)+mem.arena_room(owned.payload)>1048576 {#panic("text arena startup budget")}
  build_count:=native_build_count
  payload_before:=owned.payload
  check(ttf_set(text,&bytes[0],8) && ttf_set_font(text,font) && ttf_wrap(text,0))
@@ -147,10 +146,10 @@ fn main() {
  check(ttf_substring(text,2,&hit) && hit.y==50 && hit.height==50)
  // A large one-off layout/measurement must not remain as reusable scratch.
  large_memory:=mem.arena_alloc(65536)
- large_bytes:=mem.push_bytes_uninit(large_memory,20000)
- for index in 0..#len(large_bytes) {large_bytes[index]=120}
- check(ttf_set(text,&large_bytes[0],#len(large_bytes)))
- check(ttf_measure(font,&large_bytes[0],#len(large_bytes),&a_width,nil))
+ large_bytes:=mem.push_bytes(large_memory,20000)
+ for index in 0..large_bytes.len {large_bytes[index]=120}
+ check(ttf_set(text,&large_bytes[0],large_bytes.len))
+ check(ttf_measure(font,&large_bytes[0],large_bytes.len,&a_width,nil))
  check(real_font.measure.backing<=65536)
  check(ttf_set(text,&a_text[0],1))
  check(owned.spare==nil || owned.spare.backing<=65536)
@@ -226,7 +225,7 @@ with tempfile.TemporaryDirectory(prefix='dna-native-text-') as directory:
     SOURCE=SOURCE.replace('LARGE_FONT_FILE',str(work/'large.ttf'))
     with (work/'oversized.ttf').open('wb') as output:output.truncate(67108865)
     SOURCE=SOURCE.replace('OVERSIZED_FONT_FILE',str(work/'oversized.ttf'))
-    backend=(ROOT/'src/text/native.dyn').read_text().replace('use "../platform" sdl','use "./platform" sdl')
+    backend=(ROOT/'src/text/native.dyn').read_text().replace('use sdl "../platform"','use sdl "./platform"')
     backend=re.sub(r'extern fn native_text_attach[^\n]+','fn native_text_attach(callbacks:*const NativeTextCallbacks) bool { return dna_native_text_attach(callbacks) }',backend)
     backend=re.sub(r'extern fn native_tracked_create[^\n]+','fn native_tracked_create(engine:rawptr,font:rawptr,text:*const u8,length:usize) rawptr { return dna_text_create(engine,font,text,length) }',backend)
     backend=re.sub(r'extern fn native_tracked_destroy[^\n]+','fn native_tracked_destroy(text:rawptr) { dna_text_destroy(text) }',backend)
@@ -239,9 +238,9 @@ with tempfile.TemporaryDirectory(prefix='dna-native-text-') as directory:
 fn native_probe_arena_create(capacity:usize)*mem.Arena {native_arena_count+=1
  return mem.arena_alloc(capacity)}
 native_build_count:usize
-fn native_build(arena:*mem.Arena,font:*NativeFont,text:[]const u8,wrap:i32)text_layout.Result {
+fn native_build(arena:*mem.Arena,font:*NativeFont,text:[]const u8,wrap:i32)text_layout.Layout!io.IoErr {
  native_build_count+=1
- return native_build_actual(arena,font,text,wrap)
+ return try native_build_actual(arena,font,text,wrap)
 }
 '''
     (module/'text.dyn').write_text(backend)
@@ -261,7 +260,7 @@ fn native_build(arena:*mem.Arena,font:*NativeFont,text:[]const u8,wrap:i32)text_
         other.append('''if true {
  format_name:[4096]u8
  format_path:[]const u8="'''+str(path)+'''"
- _=mem.copy(format_name[..#len(format_path)],format_path)
+ _=mem.copy(format_name[..format_path.len],format_path)
  format_font:=ttf_open(&format_name[0],16.0)
  check(format_font!=nil && #cast(*NativeFont,format_font).freetype.face!=nil)
  sample:="abc"

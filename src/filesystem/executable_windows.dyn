@@ -1,6 +1,6 @@
 #target(kernel: windows)
-use "std/dynlib" execute_loader
-use "std/sync" execute_sync
+use execute_loader "std/dynlib"
+use execute_sync "std/sync"
 use "std/io"
 
 struct ExecuteMapping { read, write, execute, all: u32 }
@@ -15,25 +15,19 @@ struct ExecuteWindowsAPI {
 execute_windows_api: ExecuteWindowsAPI
 execute_windows_once: execute_sync.Once
 fn execute_windows_symbol(library: rawptr, name: []const u8) rawptr {
-  result := execute_loader.symbol(library, name)
-  if !io.failed(result.failure) {
-    return result.value
-  }
-  return nil
+  return execute_loader.symbol(library, name) catch nil
 }
 fn execute_windows_prepare() bool {
   if execute_sync.once_begin(&execute_windows_once) {
-    security := execute_loader.open("advapi32.dll", 0)
-    kernel := execute_loader.open("kernel32.dll", 0)
-    if !io.failed(security.failure) && !io.failed(kernel.failure) {
-      execute_windows_api.security = #cast(fn(rawptr, u32, u32, rawptr, rawptr, rawptr, rawptr, *rawptr) u32, execute_windows_symbol(security.value, "GetSecurityInfo"))
-      execute_windows_api.process = #cast(fn() rawptr, execute_windows_symbol(kernel.value, "GetCurrentProcess"))
-      execute_windows_api.token = #cast(fn(rawptr, u32, *rawptr) i32, execute_windows_symbol(security.value, "OpenProcessToken"))
-      execute_windows_api.duplicate = #cast(fn(rawptr, i32, *rawptr) i32, execute_windows_symbol(security.value, "DuplicateToken"))
-      execute_windows_api.check = #cast(fn(rawptr, rawptr, u32, *ExecuteMapping, rawptr, *u32, *u32, *i32) i32, execute_windows_symbol(security.value, "AccessCheck"))
-      execute_windows_api.ready = execute_windows_api.security != nil && execute_windows_api.process != nil && execute_windows_api.token != nil && execute_windows_api.duplicate != nil && execute_windows_api.check != nil
-    }
-    execute_sync.once_complete(&execute_windows_once)
+    defer execute_sync.once_complete(&execute_windows_once)
+    security := execute_loader.open("advapi32.dll", 0) catch { return false }
+    kernel := execute_loader.open("kernel32.dll", 0) catch { return false }
+    execute_windows_api.security = #cast(fn(rawptr, u32, u32, rawptr, rawptr, rawptr, rawptr, *rawptr) u32, execute_windows_symbol(security, "GetSecurityInfo"))
+    execute_windows_api.process = #cast(fn() rawptr, execute_windows_symbol(kernel, "GetCurrentProcess"))
+    execute_windows_api.token = #cast(fn(rawptr, u32, *rawptr) i32, execute_windows_symbol(security, "OpenProcessToken"))
+    execute_windows_api.duplicate = #cast(fn(rawptr, i32, *rawptr) i32, execute_windows_symbol(security, "DuplicateToken"))
+    execute_windows_api.check = #cast(fn(rawptr, rawptr, u32, *ExecuteMapping, rawptr, *u32, *u32, *i32) i32, execute_windows_symbol(security, "AccessCheck"))
+    execute_windows_api.ready = execute_windows_api.security != nil && execute_windows_api.process != nil && execute_windows_api.token != nil && execute_windows_api.duplicate != nil && execute_windows_api.check != nil
   }
   return execute_windows_api.ready
 }
@@ -41,17 +35,14 @@ fn execute_windows_prepare() bool {
 // that need execution, against the descriptor of the retained nofollow file.
 // Metadata and directory scans keep their existing inexpensive contract.
 pub fn executable(path: []const u8) bool {
-  if !execute_windows_prepare() {
+  if !execute_windows_prepare() { return false }
+  opened := open_nofollow(path) catch {
     return false
   }
-  opened := open_nofollow(path)
-  if io.failed(opened.failure) {
-    return false
-  }
-  defer _ = close(&opened.value)
+  defer close(&opened)
   descriptor: rawptr = nil
   // AccessCheck requires owner and group SIDs, not only the DACL.
-  if execute_windows_api.security(#cast(rawptr, opened.value.descriptor), 1, 7, nil, nil, nil, nil, &descriptor) != 0 || descriptor == nil {
+  if execute_windows_api.security(#cast(rawptr, opened.descriptor), 1, 7, nil, nil, nil, nil, &descriptor) != 0 || descriptor == nil {
     if descriptor != nil {
       _ = fs_local_free(descriptor)
     }
@@ -60,14 +51,10 @@ pub fn executable(path: []const u8) bool {
   defer _ = fs_local_free(descriptor)
   primary: rawptr = nil
   // TOKEN_QUERY | TOKEN_DUPLICATE; AccessCheck needs an impersonation token.
-  if execute_windows_api.token(execute_windows_api.process(), 10, &primary) == 0 {
-    return false
-  }
+  if execute_windows_api.token(execute_windows_api.process(), 10, &primary) == 0 { return false }
   defer _ = fs_close(primary)
   impersonation: rawptr = nil
-  if execute_windows_api.duplicate(primary, 2, &impersonation) == 0 {
-    return false
-  }
+  if execute_windows_api.duplicate(primary, 2, &impersonation) == 0 { return false }
   defer _ = fs_close(impersonation)
   mapping := ExecuteMapping{read: 0x120089, write: 0x120116, execute: 0x1200a0, all: 0x1f01ff}
   privileges: [128]u64

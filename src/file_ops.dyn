@@ -49,19 +49,13 @@ fn file_op_begin(app: *App, kind: u8, base: []const u8, source: []const u8) {
 }
 fn file_op_title(app: *const App) []const u8 {
   kind := app.file_ops.kind
-  if kind == FileOpCreate {
-    return "New file (end with / for a folder)"
-  }
-  if kind == FileOpRename {
-    return "Rename to"
-  }
-  if kind == FileOpCopy {
-    return "Copy to"
-  }
+  if kind == FileOpCreate { return "New file (end with / for a folder)" }
+  if kind == FileOpRename { return "Rename to" }
+  if kind == FileOpCopy { return "Copy to" }
   return "Move to"
 }
 fn file_op_leaf(path: []const u8) []const u8 {
-  end := #len(path)
+  end := path.len
   for end > 1 && path[end - 1] == '/' {
     end -= 1
   }
@@ -73,29 +67,23 @@ fn file_op_leaf(path: []const u8) []const u8 {
 }
 // base + "/" + typed, with "." and ".." resolved. Empty when invalid.
 fn file_op_target(base: []const u8, typed: []const u8, output: []u8) []const u8 {
-  if #len(typed) == 0 || #len(typed) >= 3000 {
-    return output[..0]
-  }
+  if typed.len == 0 || typed.len >= 3000 { return output[..0] }
   for byte in typed {
-    if byte < 32 || byte == 127 {
-      return output[..0]
-    }
+    if byte < 32 || byte == 127 { return output[..0] }
   }
   used: usize = 0
   if typed[0] != '/' {
     used = copy_text(output[..3000], base)
   }
   at: usize = 0
-  for at < #len(typed) {
+  for at < typed.len {
     end := at
-    for end < #len(typed) && typed[end] != '/' {
+    for end < typed.len && typed[end] != '/' {
       end += 1
     }
     part := typed[at..end]
     at = end + 1
-    if #len(part) == 0 || buffer.equal(part, ".") {
-      continue
-    }
+    if part.len == 0 || buffer.equal(part, ".") { continue }
     if buffer.equal(part, "..") {
       for used > 0 && output[used - 1] != '/' {
         used -= 1
@@ -108,14 +96,12 @@ fn file_op_target(base: []const u8, typed: []const u8, output: []u8) []const u8 
     add_text(output, &used, "/")
     add_text(output, &used, part)
   }
-  if used == 0 || used >= #len(output) - 1 {
-    return output[..0]
-  }
+  if used == 0 || used >= output.len - 1 { return output[..0] }
   return output[..used]
 }
 // True when `path` is `root` or inside it.
 fn file_op_within(path: []const u8, root: []const u8) bool {
-  return #len(path) >= #len(root) && buffer.equal(path[..#len(root)], root) && (#len(path) == #len(root) || path[#len(root)] == '/')
+  return path.len >= root.len && buffer.equal(path[..root.len], root) && (path.len == root.len || path[root.len] == '/')
 }
 fn file_op_dirty_inside(app: *App, root: []const u8) bool {
   for slot in app.documents.slots {
@@ -127,15 +113,13 @@ fn file_op_dirty_inside(app: *App, root: []const u8) bool {
 }
 // Open documents at or under `source` now live under `destination`.
 fn file_op_follow(app: *App, source: []const u8, destination: []const u8) {
-  for index in 0..#len(app.documents.slots) {
+  for index in 0..app.documents.slots.len {
     slot := app.documents.slots[index]
     name := files.name(&slot.file)
-    if slot.document == nil || !file_op_within(name, source) {
-      continue
-    }
+    if slot.document == nil || !file_op_within(name, source) { continue }
     moved: [4096]u8
     used := copy_text(moved[..4000], destination)
-    add_text(moved[..], &used, name[#len(source)..])
+    add_text(moved[..], &used, name[source.len..])
     files.discard_recovery(&slot.file)
     _ = files.set_name(&slot.file, moved[..used])
     document_lifecycle_changed(app, index)
@@ -145,17 +129,13 @@ fn file_op_follow(app: *App, source: []const u8, destination: []const u8) {
 // mkdir -p for every folder above `path` (and `path` itself when `last`).
 fn file_op_make_parents(path: []const u8, last: bool) bool {
   at: usize = 1
-  for at <= #len(path) {
-    if at == #len(path) || path[at] == '/' {
-      if at < #len(path) || last {
-        info := fs.metadata(path[..at])
-        if io.failed(info.failure) {
-          if io.failed(fs.make_directory(path[..at], 493).failure) {
-            return false
-          }
-        } else if (info.mode & 61440) != 16384 {
-          return false
-        }
+  for at <= path.len {
+    if at == path.len || path[at] == '/' {
+      if at < path.len || last {
+        info := fs.metadata(path[..at]) catch fs.Metadata{}
+        if info.mode == 0 {
+          fs.make_directory(path[..at], 493) catch { return false }
+        } else if (info.mode & 61440) != 16384 { return false }
       }
     }
     at += 1
@@ -163,32 +143,27 @@ fn file_op_make_parents(path: []const u8, last: bool) bool {
   return true
 }
 fn file_op_exists(path: []const u8) bool {
-  return !io.failed(fs.metadata_nofollow(path).failure)
+  _ = fs.metadata_nofollow(path) catch { return false }
+  return true
 }
 // Copies a file, or a folder and everything below it, refusing symlinks and
 // existing destinations. `depth` bounds recursion.
 fn file_op_copy(source: []const u8, destination: []const u8, depth: usize) bool {
-  info := fs.metadata_nofollow(source)
-  if io.failed(info.failure) || depth > 32 || file_op_exists(destination) {
-    return false
-  }
+  info := fs.metadata_nofollow(source) catch { return false }
+  if depth > 32 || file_op_exists(destination) { return false }
   kind := info.mode & 61440
   if kind == 16384 {
-    if io.failed(fs.make_directory(destination, 493).failure) {
-      return false
-    }
+    fs.make_directory(destination, 493) catch { return false }
     storage: [8192]u8
-    opened := fs.open_directory(source, storage[..])
-    if io.failed(opened.failure) {
-      return false
-    }
+    opened := fs.open_directory(source, storage[..]) catch { return false }
+    defer fs.close_directory(&opened)
     ok := true
     for ok {
-      entry := fs.directory_next(&opened.directory)
-      if !entry.found {
-        ok = entry.failure.native == 0
+      entry := fs.directory_next(&opened) catch {
+        ok = false
         break
       }
+      if opened.ended { break }
       from: [4096]u8
       to: [4096]u8
       from_length := copy_text(from[..3800], source)
@@ -203,39 +178,21 @@ fn file_op_copy(source: []const u8, destination: []const u8, depth: usize) bool 
       }
       ok = file_op_copy(from[..from_length], to[..to_length], depth + 1)
     }
-    fs.close_directory(&opened.directory)
     return ok
   }
-  if kind != 32768 {
-    return false
-  }
-  input := fs.open_nofollow(source)
-  if io.failed(input.failure) {
-    return false
-  }
-  defer fs.close(&input.value)
-  output := fs.create_exclusive(destination)
-  if io.failed(output.failure) {
-    return false
-  }
+  if kind != 32768 { return false }
+  input := fs.open_nofollow(source) catch { return false }
+  defer fs.close(&input)
+  output := fs.create_exclusive(destination) catch { return false }
+  defer fs.close(&output)
   chunk: [65536]u8
-  ok := true
-  for ok {
-    read := fs.read(&input.value, chunk[..])
-    if io.failed(read.failure) {
-      ok = false
-      break
-    }
-    if read.transferred == 0 {
-      break
-    }
-    ok = !io.failed(fs.write(&output.value, chunk[..read.transferred]).failure)
+  for {
+    read := fs.read(&input, chunk[..]) catch { return false }
+    if read == 0 { break }
+    fs.write(&output, chunk[..read]) catch { return false }
   }
-  if ok {
-    ok = !io.failed(fs.preserve_permissions(&output.value, source).failure)
-  }
-  fs.close(&output.value)
-  return ok
+  fs.preserve_permissions(&output, source) catch { return false }
+  return true
 }
 // Enter in the prompt: apply the typed path.
 fn file_op_submit(app: *App) {
@@ -243,22 +200,22 @@ fn file_op_submit(app: *App) {
   base := ops.base[..ops.base_length]
   source := ops.source[..ops.source_length]
   typed := app.prompt_state.text[..app.prompt_state.length]
-  folder := #len(typed) > 0 && typed[#len(typed) - 1] == '/'
+  folder := typed.len > 0 && typed[typed.len - 1] == '/'
   // Rename keeps the entry in its folder; the others resolve against base.
   relative_to := base
   if ops.kind == FileOpRename || ops.kind == FileOpCopy || ops.kind == FileOpMove {
-    relative_to = source[..#len(source) - #len(file_op_leaf(source))]
-    for #len(relative_to) > 1 && relative_to[#len(relative_to) - 1] == '/' {
-      relative_to = relative_to[..#len(relative_to) - 1]
+    relative_to = source[..source.len - file_op_leaf(source).len]
+    for relative_to.len > 1 && relative_to[relative_to.len - 1] == '/' {
+      relative_to = relative_to[..relative_to.len - 1]
     }
   }
   target_storage: [4096]u8
   target := file_op_target(relative_to, typed, target_storage[..])
-  if #len(target) == 0 {
+  if target.len == 0 {
     notice(app, "Enter a name or relative path.")
     return
   }
-  if ops.kind == FileOpRename && (#len(typed) == 0 || buffer.equal(typed, file_op_leaf(source))) {
+  if ops.kind == FileOpRename && (typed.len == 0 || buffer.equal(typed, file_op_leaf(source))) {
     file_op_finish(app, "")
     return
   }
@@ -272,12 +229,11 @@ fn file_op_submit(app: *App) {
       return
     }
     if !folder {
-      created := fs.create_exclusive(target)
-      if io.failed(created.failure) {
+      created := fs.create_exclusive(target) catch {
         notice(app, "Cannot create that file.")
         return
       }
-      fs.close(&created.value)
+      fs.close(&created)
     }
     file_op_finish(app, target)
     return
@@ -303,7 +259,7 @@ fn file_op_submit(app: *App) {
     file_op_finish(app, target)
     return
   }
-  if io.failed(fs.rename_noreplace(source, target).failure) {
+  fs.rename_noreplace(source, target) catch {
     notice(app, "Move failed: the destination exists, is on another disk, or permissions deny it.")
     return
   }
@@ -320,20 +276,23 @@ fn file_op_trash(app: *App) {
     return
   }
   leaf := file_op_leaf(source)
-  folder := source[..#len(source) - #len(leaf)]
+  folder := source[..source.len - leaf.len]
   trash: [4096]u8
   trash_length := copy_text(trash[..3800], folder)
   add_text(trash[..], &trash_length, ".dna-trash")
   link: [4096]u8
-  if !io.failed(fs.read_link(trash[..trash_length], link[..]).failure) {
+  target_link := fs.read_link(trash[..trash_length], link[..]) catch link[..0]
+  if target_link.len > 0 {
     notice(app, "Trash destination must not be a symlink.")
     file_op_finish(app, "")
     return
   }
-  if !file_op_exists(trash[..trash_length]) && io.failed(fs.make_directory(trash[..trash_length], 448).failure) {
-    notice(app, "Cannot create the .dna-trash folder.")
-    file_op_finish(app, "")
-    return
+  if !file_op_exists(trash[..trash_length]) {
+    fs.make_directory(trash[..trash_length], 448) catch {
+      notice(app, "Cannot create the .dna-trash folder.")
+      file_op_finish(app, "")
+      return
+    }
   }
   for suffix in 0..1000 {
     target: [4096]u8
@@ -344,10 +303,8 @@ fn file_op_trash(app: *App) {
       add_text(target[..], &used, ".")
       add_number(target[..], &used, suffix)
     }
-    if file_op_exists(target[..used]) {
-      continue
-    }
-    if io.failed(fs.rename_noreplace(source, target[..used]).failure) {
+    if file_op_exists(target[..used]) { continue }
+    fs.rename_noreplace(source, target[..used]) catch {
       notice(app, "Moving to .dna-trash failed.")
       file_op_finish(app, "")
       return
