@@ -16,7 +16,7 @@ The preview package is for Linux x86-64 and needs **glibc 2.38 or newer**
 graphics libraries for the window frontend.
 
 ```sh
-mise use -g 'github:17robots/dna[prerelease=true,strip_components=1,bin_path=.]@0.1.0-preview.20'
+mise use -g 'github:17robots/dna[prerelease=true,strip_components=1,bin_path=.]@0.1.0-preview.21'
 dna path/to/file.dyn
 dna path/to/project
 ```
