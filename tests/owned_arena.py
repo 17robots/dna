@@ -8,18 +8,21 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 DYN = os.environ.get('DYN', 'dyn')
-SOURCE = r'''use "./owned_arena" owner
-use "./cstring" cstring
+SOURCE = r'''use owner "./owned_arena"
+use cstring "./cstring"
 use "std/mem"
-use "std/parse"
 fn check(ok: bool) { if !ok { #panic("arena ownership contract") } }
+fn cstr_ok(storage: []u8, text: []const u8) bool {
+  _ = cstring.bounded(storage, text) catch { return false }
+  return true
+}
 fn main() {
   check(owner.try_create(#cast(usize, -1)) == nil)
   check(owner.try_create(#cast(usize, -1) - 4095) == nil)
   arena := owner.try_create(3145728)
   check(arena != nil)
-  check(mem.arena_used(arena) == 0 && mem.arena_capacity(arena) == 3145728)
-  bytes := mem.push_bytes_uninit(arena, 2500000)
+  check(mem.arena_used(arena) == 0 && mem.arena_room(arena) >= 3145728)
+  bytes := mem.push_bytes(arena, 2500000)
   bytes[0] = 11
   bytes[2499999] = 99
   check(bytes[0] == 11 && bytes[2499999] == 99)
@@ -27,7 +30,7 @@ fn main() {
   // LINUX_RESERVATION_CHECK
   mem.arena_reset(arena)
   check(mem.arena_used(arena) == 0)
-  again := mem.push_bytes_uninit(arena, 2500000)
+  again := mem.push_bytes(arena, 2500000)
   check(&again[0] == &bytes[0])
   transferred := arena
   arena = nil
@@ -35,12 +38,12 @@ fn main() {
   owner.release(transferred)
   lazy := owner.create(0)
   check(mem.arena_used(lazy) == 0)
-  _ = mem.push_bytes_uninit(lazy, 32)
+  _ = mem.push_bytes(lazy, 32)
   owner.release(lazy)
   storage: [5]u8 = [7,7,7,7,7]
-  check(parse.failed(cstring.bounded(storage[..], "large").failure) && storage[0] == 7)
-  check(parse.failed(cstring.bounded(storage[..], "a\0b").failure) && storage[0] == 7)
-  check(!parse.failed(cstring.bounded(storage[..], "text").failure) && storage[4] == 0)
+  check(!cstr_ok(storage[..], "large") && storage[0] == 7)
+  check(!cstr_ok(storage[..], "a\0b") && storage[0] == 7)
+  check(cstr_ok(storage[..], "text") && storage[4] == 0)
 }
 '''
 with tempfile.TemporaryDirectory(prefix='dna-arena-') as directory:

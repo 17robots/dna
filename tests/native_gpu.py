@@ -69,7 +69,7 @@ fn scene(renderer:rawptr,phase:i32) {
  check(texture!=nil && sdl_target(renderer,texture),"texture target")
  if native_gui.direct {
   cached:=#cast(*NativeTexture,texture)
-  check(cached.storage==nil && #len(cached.pixels)==0 && cached.framebuffer!=0,"GPU target retained CPU pixels")
+  check(cached.storage==nil && cached.pixels.len==0 && cached.framebuffer!=0,"GPU target retained CPU pixels")
  }
  check(sdl_color(renderer,19,203,77,123) && sdl_clear(renderer),"target clear")
  rect=Rect{x:3.0,y:2.0,width:6.0,height:5.0}
@@ -161,9 +161,9 @@ fn main() {
  owner:=mem.arena_alloc(65536)
  defer mem.arena_release(owner)
  size:=#cast(usize,native_gui.surface.width*native_gui.surface.height)*4
- reference:=mem.push_bytes_uninit(owner,size)
- popup_reference:=mem.push_bytes_uninit(owner,size)
- actual:=mem.push_bytes_uninit(owner,size)
+ reference:=mem.push_bytes(owner,size)
+ popup_reference:=mem.push_bytes(owner,size)
+ actual:=mem.push_bytes(owner,size)
  scene(renderer,0)
  snapshot(reference)
  popup_scene(renderer)
@@ -173,7 +173,7 @@ fn main() {
  renderer=sdl_create_renderer(window,nil)
  check(renderer!=nil && native_gui.direct,"direct renderer")
  check(sdl_create_renderer(window,nil)==nil && native_gui.direct,"duplicate renderer changed active state")
- check(native_gui.pixels==nil && #len(native_gui.surface.pixels)==0,"direct path allocated window pixels")
+ check(native_gui.pixels==nil && native_gui.surface.pixels.len==0,"direct path allocated window pixels")
  original_upload=native_gui.gpu.api.tex_sub_image_2d
  original_storage=native_gui.gpu.api.tex_image_2d
  native_gui.gpu.api.tex_sub_image_2d=upload
@@ -239,7 +239,7 @@ fn main() {
  check(native_gui.gpu.slot_count<=2048 && native_present.gpu_flush(&native_gui.gpu),"bounded atlas")
  // Force atlas-space rollover with pending vertices. Earlier glyphs must
  // be submitted before their texels are overwritten by the new generation.
- large:=mem.push_bytes_uninit(owner,1024*512)
+ large:=mem.push_bytes(owner,1024*512)
  clear:=Rect{x:250.0,y:150.0,width:3.0,height:1.0}
  check(sdl_color(renderer,0,0,0,255) && sdl_fill(renderer,&clear),"rollover background")
  check(sdl_scale(renderer,1.0/1024.0,1.0/512.0),"rollover scale")
@@ -247,7 +247,7 @@ fn main() {
   value:u8=55
   if i==1 {value=111}
   if i==2 {value=199}
-  for at in 0..#len(large) {large[at]=value}
+  for at in 0..large.len {large[at]=value}
   check(native_text_cached_bitmap(renderer,#cast(u64,900000+i),&large[0],1024,512,#cast(f32,(250+i)*1024),150.0*512.0,255,255,255,255),"atlas space rollover")
  }
  check(sdl_scale(renderer,1.0,1.0),"rollover scale reset")
@@ -274,19 +274,19 @@ fn main() {
  check(sdl_color(renderer,177,11,55,255) && sdl_fill(renderer,&corner),"retained corner")
  shifted:=Rect{x:1.0,width:2.0,height:2.0}
  check(sdl_render_texture(renderer,retained,nil,&shifted),"sequential self-blit")
- check(retained_texture.storage==nil && #len(retained_texture.pixels)==0,"self-blit retained CPU scratch")
+ check(retained_texture.storage==nil && retained_texture.pixels.len==0,"self-blit retained CPU scratch")
  check(sdl_target(renderer,nil),"retained target reset")
  destination:=Rect{x:1.0,y:1.0,width:2.0,height:2.0}
  check(sdl_render_texture(renderer,retained,nil,&destination),"retained composite")
  check(retained_texture.gpu!=0 && retained_texture.storage==nil,"texture allocation retry state")
  sdl_destroy_renderer(renderer)
- check(retained_texture.gpu==0 && retained_texture.framebuffer==0 && #len(retained_texture.pixels)==16,"renderer recreation lost target backup")
+ check(retained_texture.gpu==0 && retained_texture.framebuffer==0 && retained_texture.pixels.len==16,"renderer recreation lost target backup")
  check(native_gui.gpu.program==0,"destroy resources")
  renderer=sdl_create_renderer(window,nil)
  check(renderer!=nil && native_gui.gpu.slot_count==0,"recreate context resources")
  check(native_gui.pixels==nil,"recreate allocated window pixels")
  check(sdl_render_texture(renderer,retained,nil,&destination),"recreated texture upload")
- check(retained_texture.storage==nil && #len(retained_texture.pixels)==0,"recreated target retained CPU backup")
+ check(retained_texture.storage==nil && retained_texture.pixels.len==0,"recreated target retained CPU backup")
  snapshot(actual)
  top:=#cast(usize,native_gui.surface.width+1)*4
  bottom:=#cast(usize,native_gui.surface.width*2+2)*4

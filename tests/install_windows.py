@@ -21,7 +21,7 @@ extern fn rec_free "free"(value:rawptr)
 extern fn test_read "_read"(fd:i32, bytes:*u8, length:u32) i32
 fn equal(left:*const u8, right:[]const u8) bool {
   length:=string_length(left)
-  if length!=#len(right) { return false }
+  if length!=right.len { return false }
   for at in 0..length { if #slice(left, length)[at]!=right[at] { return false } }
   return true
 }
@@ -86,8 +86,8 @@ fn main() {
   occupied:[]const u8="occupied.txt\0"
   if install_rename(root_fd,&destination[0],root_fd,&occupied[0],1)==0 || rec_errno().*!=17 { #panic("rename must not overwrite") }
   if install_rename(root_fd,&destination[0],root_fd,&occupied[0],2)==0 || rec_errno().*!=95 { #panic("exchange must report unsupported") }
-  kernel:=win_io_loader.open("kernel32.dll",0)
-  handles:=#cast(fn(rawptr,*u32)i32,win_io_symbol(kernel.value,"GetProcessHandleCount"))
+  kernel:=win_io_loader.open("kernel32.dll",0) catch { #panic("missing kernel32") }
+  handles:=#cast(fn(rawptr,*u32)i32,win_io_symbol(kernel,"GetProcessHandleCount"))
   before:u32=0
   after:u32=0
   if handles(install_win_api.process(),&before)==0 { #panic("initial handle count") }
@@ -106,7 +106,7 @@ fn main() {
   if rec_close(root_fd)!=0 { #panic("root ownership") }
   temporary:[32]u8
   pattern:[]const u8="private-XXXXXX"
-  for at in 0..#len(pattern) { temporary[at]=pattern[at] }
+  for at in 0..pattern.len { temporary[at]=pattern[at] }
   if install_mkdtemp(&temporary[0])==nil || install_lstat(&temporary[0],&info)!=0 || (info.mode&61440)!=16384 || install_rmdir(&temporary[0])!=0 { #panic("private temporary directory") }
 }
 '''

@@ -13,7 +13,10 @@ extern fn fs_dacl "GetSecurityDescriptorDacl"(descriptor: rawptr, present: *i32,
 extern fn fs_set_security "SetSecurityInfo"(handle: rawptr, object_type: u32, information: u32, owner: rawptr, group: rawptr, dacl: rawptr, sacl: rawptr) u32
 extern fn fs_reopen "ReOpenFile"(handle: rawptr, access: u32, share: u32, flags: u32) rawptr
 extern fn fs_volume "GetVolumeInformationByHandleW"(handle: rawptr, name: rawptr, name_length: u32, serial: rawptr, component_length: rawptr, flags: *u32, filesystem: rawptr, filesystem_length: u32) i32
-fn windows_private_descriptor_for(directory: bool, executable: bool, output: *rawptr) Result {
+fn windows_err(code: u32) io.IoErr {
+  return io.windows_err(0 - #cast(isize, code))
+}
+fn windows_private_descriptor_for(directory: bool, executable: bool, output: *rawptr) !io.IoErr {
   text: []const u8 = "D:P(A;;FRFWSDWDWO;;;OW)"
   if directory {
     text = "D:P(A;OICI;FA;;;OW)"
@@ -21,28 +24,17 @@ fn windows_private_descriptor_for(directory: bool, executable: bool, output: *ra
     text = "D:P(A;;FRFWFXSDWDWO;;;OW)"
   }
   wide: [64]u16
-  converted := windows_path(text, wide[..])
-  if io.failed(converted.failure) {
-    return converted
-  }
+  _ = try windows_path(text, wide[..])
   size: u32 = 0
-  if fs_sddl(&wide[0], 1, output, &size) == 0 {
-    return windows_failure(fs_error())
-  }
-  return Result{}
+  if fs_sddl(&wide[0], 1, output, &size) == 0 { fail windows_err(fs_error()) }
 }
-fn windows_private_descriptor(directory: bool, output: *rawptr) Result {
-  return windows_private_descriptor_for(directory, false, output)
+fn windows_private_descriptor(directory: bool, output: *rawptr) !io.IoErr {
+  try windows_private_descriptor_for(directory, false, output)
 }
-fn windows_acl_volume(handle: rawptr) Result {
+fn windows_acl_volume(handle: rawptr) !io.IoErr {
   flags: u32 = 0
-  if fs_volume(handle, nil, 0, nil, nil, &flags, nil, 0) == 0 {
-    return windows_failure(fs_error())
-  }
-  if (flags & 8) == 0 {
-    return windows_failure(50)
-  }
-  return Result{}
+  if fs_volume(handle, nil, 0, nil, nil, &flags, nil, 0) == 0 { fail windows_err(fs_error()) }
+  if (flags & 8) == 0 { fail .Unsupported }
 }
 
 // Native layouts contain only DWORD/WORD fields (FILETIME is two DWORDs).
@@ -50,7 +42,7 @@ struct WinInformation { attributes: u32, times: [6]u32, volume, size_high, size_
 struct WinFindData { attributes: u32, times: [6]u32, size_high, size_low, reserved0, reserved1: u32, name: [260]u16, alternate: [14]u16 }
 struct WinReparseData { tag: u32, length, reserved: u16, payload: [8188]u16 }
 extern fn fs_ioctl "DeviceIoControl"(handle: rawptr, code: u32, input: rawptr, input_length: u32, output: *WinReparseData, output_length: u32, returned: *u32, overlapped: rawptr) i32
-pub struct Directory { handle: rawptr, data: WinFindData, storage: []u8, pending, active: bool }
+pub struct Directory { handle: rawptr, data: WinFindData, storage: []u8, pending, active, ended: bool }
 extern fn fs_open "CreateFileW"(path: *const u16, access: u32, share: u32, security: rawptr, creation: u32, flags: u32, template: rawptr) rawptr
 extern fn fs_type "GetFileType"(handle: rawptr) u32
 extern fn fs_close "CloseHandle"(handle: rawptr) i32
@@ -63,31 +55,18 @@ extern fn fs_move "MoveFileExW"(old: *const u16, new: *const u16, flags: u32) i3
 extern fn fs_delete "DeleteFileW"(path: *const u16) i32
 extern fn fs_mkdir "CreateDirectoryW"(path: *const u16, security: rawptr) i32
 extern fn fs_rmdir "RemoveDirectoryW"(path: *const u16) i32
-fn windows_failure(code: u32) Result {
-  return Result{ failure: io.Failure{ kind: io.windows(#cast(isize, code)), native: 0 - #cast(isize, code) } }
-}
-fn windows_path(path: []const u8, output: []u16) Result {
-  if #len(path) == 0 || #len(path) > 2147483647 {
-    return windows_failure(87)
+fn windows_path(path: []const u8, output: []u16) usize!io.IoErr {
+  if path.len == 0 || path.len > 2147483647 { fail .InvalidInput }
+  for byte in path {
+    if byte == 0 { fail .InvalidInput }
   }
-  index: usize = 0
-  for index < #len(path) {
-    if path[index] == 0 {
-      return windows_failure(87)
-    }
-    index += 1
-  }
-  used := host.utf16(65001, 8, &path[0], #cast(i32, #len(path)), &output[0], #cast(i32, #len(output)) - 1)
-  if used <= 0 {
-    return windows_failure(fs_error())
-  }
+  used := host.utf16(65001, 8, &path[0], #cast(i32, path.len), &output[0], #cast(i32, output.len) - 1)
+  if used <= 0 { fail windows_err(fs_error()) }
   output[used] = 0
-  return Result{ transferred: #cast(usize, used) }
+  return #cast(usize, used)
 }
 fn windows_mode(attributes: u32, nofollow: bool) u16 {
-  if nofollow && (attributes & 1024) != 0 {
-    return 0o120000
-  }
+  if nofollow && (attributes & 1024) != 0 { return 0o120000 }
   mode: u16 = 0o100444
   if (attributes & 16) != 0 {
     mode = 0o040555
@@ -97,300 +76,184 @@ fn windows_mode(attributes: u32, nofollow: bool) u16 {
   }
   return mode
 }
-fn windows_metadata(handle: rawptr, nofollow: bool) Metadata {
+fn windows_metadata(handle: rawptr, nofollow: bool) Metadata!io.IoErr {
   information := WinInformation{}
-  if fs_info(handle, &information) == 0 {
-    failure := windows_failure(fs_error())
-    return Metadata{ failure: io.Failure{ kind: failure.failure.kind, native: failure.failure.native } }
-  }
+  if fs_info(handle, &information) == 0 { fail windows_err(fs_error()) }
   return Metadata{ size: (#cast(u64, information.size_high) << 32) | #cast(u64, information.size_low), inode: (#cast(u64, information.index_high) << 32) | #cast(u64, information.index_low), device: information.volume, mode: windows_mode(information.attributes, nofollow) }
 }
-fn windows_path_metadata(path: []const u8, nofollow: bool) Metadata {
+fn windows_path_metadata(path: []const u8, nofollow: bool) Metadata!io.IoErr {
   wide: [32768]u16
-  converted := windows_path(path, wide[..])
-  if io.failed(converted.failure) {
-    return Metadata{ failure: io.Failure{ kind: converted.failure.kind, native: converted.failure.native } }
-  }
+  _ = try windows_path(path, wide[..])
   flags: u32 = 33554432
   if nofollow {
     flags |= 2097152
   }
   handle := fs_open(&wide[0], 0, 7, nil, 3, flags, nil)
-  if #cast(isize, handle) == -1 {
-    failure := windows_failure(fs_error())
-    return Metadata{ failure: io.Failure{ kind: failure.failure.kind, native: failure.failure.native } }
-  }
+  if #cast(isize, handle) == -1 { fail windows_err(fs_error()) }
   defer _ = fs_close(handle)
-  return windows_metadata(handle, nofollow)
+  return try windows_metadata(handle, nofollow)
 }
-pub fn metadata(path: []const u8) Metadata {
-  return windows_path_metadata(path, false)
+pub fn metadata(path: []const u8) Metadata!io.IoErr {
+  return try windows_path_metadata(path, false)
 }
-pub fn metadata_nofollow(path: []const u8) Metadata {
-  return windows_path_metadata(path, true)
+pub fn metadata_nofollow(path: []const u8) Metadata!io.IoErr {
+  return try windows_path_metadata(path, true)
 }
-pub fn file_metadata(file: *const File) Metadata {
-  if !std_fs.is_open(file) {
-    return Metadata{ failure: io.Failure{ kind: io.Kind.InvalidState, native: -6 } }
-  }
-  return windows_metadata(#cast(rawptr, file.descriptor), false)
+pub fn file_metadata(file: *const File) Metadata!io.IoErr {
+  if !std_fs.is_open(file) { fail .InvalidInput }
+  return try windows_metadata(#cast(rawptr, file.descriptor), false)
 }
-pub fn open_nofollow(path: []const u8) FileResult {
+pub fn open_nofollow(path: []const u8) File!io.IoErr {
   wide: [32768]u16
-  converted := windows_path(path, wide[..])
-  if io.failed(converted.failure) {
-    return FileResult{ failure: io.Failure{ kind: converted.failure.kind, native: converted.failure.native } }
-  }
+  _ = try windows_path(path, wide[..])
   handle := fs_open(&wide[0], 2147483648, 7, nil, 3, 35651584, nil)
-  if #cast(isize, handle) == -1 {
-    failure := windows_failure(fs_error())
-    return FileResult{ failure: io.Failure{ kind: failure.failure.kind, native: failure.failure.native } }
-  }
-  if fs_type(handle) != 1 {
-    _ = fs_close(handle)
-    return FileResult{ failure: io.Failure{ kind: io.Kind.Unsupported, native: -50 } }
-  }
-  info := windows_metadata(handle, true)
-  if io.failed(info.failure) {
-    _ = fs_close(handle)
-    return FileResult{ failure: io.Failure{ kind: info.failure.kind, native: info.failure.native } }
-  }
-  if (info.mode & 0o170000) != 0o100000 {
-    _ = fs_close(handle)
-    return FileResult{ failure: io.Failure{ kind: io.Kind.Unsupported, native: -50 } }
-  }
-  return FileResult{ value: std_fs.adopt_handle(#cast(isize, handle)) }
+  if #cast(isize, handle) == -1 { fail windows_err(fs_error()) }
+  errdefer _ = fs_close(handle)
+  if fs_type(handle) != 1 { fail .Unsupported }
+  info := try windows_metadata(handle, true)
+  if (info.mode & 0o170000) != 0o100000 { fail .Unsupported }
+  return std_fs.adopt_handle(#cast(isize, handle))
 }
-pub fn open_directory(path: []const u8, storage: []u8) DirectoryResult {
-  if #len(storage) == 0 {
-    return DirectoryResult{ failure: io.Failure{ kind: io.Kind.Capacity, native: -122 } }
-  }
+pub fn open_directory(path: []const u8, storage: []u8) Directory!io.IoErr {
+  if storage.len == 0 { fail .Capacity }
   wide: [32768]u16
-  converted := windows_path(path, wide[..])
-  if io.failed(converted.failure) {
-    return DirectoryResult{ failure: io.Failure{ kind: converted.failure.kind, native: converted.failure.native } }
-  }
+  used := try windows_path(path, wide[..])
   // Wildcards are not directory names. Otherwise FindFirstFile could enumerate
   // a different directory than the caller requested.
-  index: usize = 0
-  for index < #len(path) {
-    if path[index] == '*' || (path[index] == '?' && !(index == 2 && #len(path) >= 4 && path[0] == 92 && path[1] == 92 && path[3] == 92)) {
-      return DirectoryResult{ failure: io.Failure{ kind: io.Kind.InvalidInput, native: -87 } }
+  for byte, index in path {
+    if byte == '*' || (byte == '?' && !(index == 2 && path.len >= 4 && path[0] == 92 && path[1] == 92 && path[3] == 92)) {
+      fail .InvalidInput
     }
-    index += 1
   }
-  info := metadata(path)
-  if io.failed(info.failure) {
-    return DirectoryResult{ failure: io.Failure{ kind: info.failure.kind, native: info.failure.native } }
-  }
-  if (info.mode & 0o170000) != 0o040000 {
-    return DirectoryResult{ failure: io.Failure{ kind: io.Kind.InvalidInput, native: -267 } }
-  }
-  used := converted.transferred
-  if used + 3 > #len(wide) {
-    return DirectoryResult{ failure: io.Failure{ kind: io.Kind.Capacity, native: -122 } }
-  }
+  info := try metadata(path)
+  if (info.mode & 0o170000) != 0o040000 { fail .InvalidInput }
+  if used + 3 > wide.len { fail .Capacity }
   if wide[used - 1] != 92 && wide[used - 1] != 47 {
     wide[used] = 92
     used += 1
   }
   wide[used] = 42
   wide[used + 1] = 0
-  directory := Directory{storage: storage}
+  directory := Directory{ storage: storage }
   directory.handle = fs_first(&wide[0], &directory.data)
   if #cast(isize, directory.handle) == -1 {
     code := fs_error()
-    if code == 2 {
-      return DirectoryResult{ directory: directory }
-    }
-    failure := windows_failure(code)
-    return DirectoryResult{ failure: io.Failure{ kind: failure.failure.kind, native: failure.failure.native } }
+    if code == 2 { return directory }
+    fail windows_err(code)
   }
   directory.active = true
   directory.pending = true
-  return DirectoryResult{ directory: directory }
+  return directory
 }
-pub fn directory_next(directory: *Directory) DirectoryEntry {
+pub fn directory_next(directory: *Directory) DirectoryEntry!io.IoErr {
   if !directory.active {
+    directory.ended = true
     return DirectoryEntry{}
   }
   for {
     if !directory.pending && fs_next(directory.handle, &directory.data) == 0 {
       code := fs_error()
       if code == 18 {
+        directory.ended = true
         return DirectoryEntry{}
       }
-      failure := windows_failure(code)
-      return DirectoryEntry{ failure: io.Failure{ kind: failure.failure.kind, native: failure.failure.native } }
+      fail windows_err(code)
     }
     directory.pending = false
     length: usize = 0
     for length < 260 && directory.data.name[length] != 0 {
       length += 1
     }
-    if length == 260 {
-      return DirectoryEntry{ failure: io.Failure{ kind: io.Kind.InvalidInput, native: -87 } }
-    }
-    if length == 1 && directory.data.name[0] == 46 {
-      continue
-    }
-    if length == 2 && directory.data.name[0] == 46 && directory.data.name[1] == 46 {
-      continue
-    }
-    capacity := #len(directory.storage)
-    if capacity > 2147483647 {
-      capacity = 2147483647
-    }
+    if length == 260 { fail .InvalidInput }
+    if length == 1 && directory.data.name[0] == 46 { continue }
+    if length == 2 && directory.data.name[0] == 46 && directory.data.name[1] == 46 { continue }
+    capacity := directory.storage.len
+    if capacity > 2147483647 { capacity = 2147483647 }
     used := host.utf8(65001, 128, &directory.data.name[0], #cast(i32, length), &directory.storage[0], #cast(i32, capacity), nil, nil)
-    if used <= 0 {
-      failure := windows_failure(fs_error())
-      return DirectoryEntry{ failure: io.Failure{ kind: failure.failure.kind, native: failure.failure.native } }
-    }
+    if used <= 0 { fail windows_err(fs_error()) }
     kind: u8 = 8
-    if (directory.data.attributes & 16) != 0 {
-      kind = 4
-    }
-    if (directory.data.attributes & 1024) != 0 {
-      kind = 10
-    }
-    return DirectoryEntry{ name: directory.storage[..used], kind: kind, found: true }
+    if (directory.data.attributes & 16) != 0 { kind = 4 }
+    if (directory.data.attributes & 1024) != 0 { kind = 10 }
+    return DirectoryEntry{ name: directory.storage[..used], kind: kind }
   }
   return DirectoryEntry{}
 }
 pub fn close_directory(directory: *Directory) {
-  if !directory.active {
-    return
-  }
-  if fs_find_close(directory.handle) == 0 {
-    _ = windows_failure(fs_error())
-    return
-  }
+  if !directory.active { return }
+  if fs_find_close(directory.handle) == 0 { return }
   directory.active = false
   directory.handle = nil
 }
-fn windows_rename(old: []const u8, new: []const u8, replace: bool) Result {
+fn windows_rename(old: []const u8, new: []const u8, replace: bool) !io.IoErr {
   old_wide: [32768]u16
   new_wide: [32768]u16
-  first := windows_path(old, old_wide[..])
-  if io.failed(first.failure) {
-    return first
-  }
-  second := windows_path(new, new_wide[..])
-  if io.failed(second.failure) {
-    return second
-  }
+  _ = try windows_path(old, old_wide[..])
+  _ = try windows_path(new, new_wide[..])
   // Never COPY_ALLOWED: cross-volume moves must fail, preserving atomicity.
   flags: u32 = 0
-  if replace {
-    flags = 1
-  }
-  if fs_move(&old_wide[0], &new_wide[0], flags) == 0 {
-    return windows_failure(fs_error())
-  }
-  return Result{}
+  if replace { flags = 1 }
+  if fs_move(&old_wide[0], &new_wide[0], flags) == 0 { fail windows_err(fs_error()) }
 }
-pub fn rename(old: []const u8, new: []const u8) Result {
-  return windows_rename(old, new, true)
+pub fn rename(old: []const u8, new: []const u8) !io.IoErr {
+  try windows_rename(old, new, true)
 }
-pub fn rename_noreplace(old: []const u8, new: []const u8) Result {
-  return windows_rename(old, new, false)
+pub fn rename_noreplace(old: []const u8, new: []const u8) !io.IoErr {
+  try windows_rename(old, new, false)
 }
-pub fn remove(path: []const u8) Result {
+pub fn remove(path: []const u8) !io.IoErr {
   wide: [32768]u16
-  converted := windows_path(path, wide[..])
-  if io.failed(converted.failure) {
-    return converted
-  }
-  if fs_delete(&wide[0]) == 0 {
-    return windows_failure(fs_error())
-  }
-  return Result{}
+  _ = try windows_path(path, wide[..])
+  if fs_delete(&wide[0]) == 0 { fail windows_err(fs_error()) }
 }
-pub fn make_directory(path: []const u8, mode: usize) Result {
-  if mode != 0o700 && mode != 0o755 && mode != 0o777 {
-    return windows_failure(50)
-  }
+pub fn make_directory(path: []const u8, mode: usize) !io.IoErr {
+  if mode != 0o700 && mode != 0o755 && mode != 0o777 { fail .Unsupported }
   wide: [32768]u16
-  converted := windows_path(path, wide[..])
-  if io.failed(converted.failure) {
-    return converted
-  }
+  _ = try windows_path(path, wide[..])
   if mode != 0o700 {
-    if fs_mkdir(&wide[0], nil) == 0 {
-      return windows_failure(fs_error())
-    }
-    return Result{}
+    if fs_mkdir(&wide[0], nil) == 0 { fail windows_err(fs_error()) }
+    return
   }
   descriptor: rawptr = nil
-  prepared := windows_private_descriptor(true, &descriptor)
-  if io.failed(prepared.failure) {
-    return prepared
-  }
+  try windows_private_descriptor(true, &descriptor)
   defer _ = fs_local_free(descriptor)
-  security := WinSecurityAttributes{length: #cast(u32, #sizeof(WinSecurityAttributes)), descriptor: descriptor}
-  if fs_mkdir(&wide[0], #cast(rawptr, &security)) == 0 {
-    return windows_failure(fs_error())
-  }
+  security := WinSecurityAttributes{ length: #cast(u32, #sizeof(WinSecurityAttributes)), descriptor: descriptor }
+  if fs_mkdir(&wide[0], #cast(rawptr, &security)) == 0 { fail windows_err(fs_error()) }
+  errdefer _ = fs_rmdir(&wide[0])
   handle := fs_open(&wide[0], 0, 7, nil, 3, 35651584, nil)
-  if #cast(isize, handle) == -1 {
-    failure := windows_failure(fs_error())
-    _ = fs_rmdir(&wide[0])
-    return failure
-  }
-  supported := windows_acl_volume(handle)
-  _ = fs_close(handle)
-  if io.failed(supported.failure) {
-    _ = fs_rmdir(&wide[0])
-  }
-  return supported
+  if #cast(isize, handle) == -1 { fail windows_err(fs_error()) }
+  defer _ = fs_close(handle)
+  try windows_acl_volume(handle)
 }
-pub fn remove_directory(path: []const u8) Result {
+pub fn remove_directory(path: []const u8) !io.IoErr {
   wide: [32768]u16
-  converted := windows_path(path, wide[..])
-  if io.failed(converted.failure) {
-    return converted
-  }
-  if fs_rmdir(&wide[0]) == 0 {
-    return windows_failure(fs_error())
-  }
-  return Result{}
+  _ = try windows_path(path, wide[..])
+  if fs_rmdir(&wide[0]) == 0 { fail windows_err(fs_error()) }
 }
-pub fn read_link(path: []const u8, destination: []u8) PathResult {
+pub fn read_link(path: []const u8, destination: []u8) []u8!io.IoErr {
   wide: [32768]u16
-  converted := windows_path(path, wide[..])
-  if io.failed(converted.failure) {
-    return PathResult{ failure: io.Failure{ kind: converted.failure.kind, native: converted.failure.native } }
-  }
+  _ = try windows_path(path, wide[..])
   handle := fs_open(&wide[0], 0, 7, nil, 3, 35651584, nil)
-  if #cast(isize, handle) == -1 {
-    failure := windows_failure(fs_error())
-    return PathResult{ failure: io.Failure{ kind: failure.failure.kind, native: failure.failure.native } }
-  }
+  if #cast(isize, handle) == -1 { fail windows_err(fs_error()) }
   defer _ = fs_close(handle)
   data := WinReparseData{}
   returned: u32 = 0
   if fs_ioctl(handle, 589992, nil, 0, &data, 16384, &returned, nil) == 0 {
-    failure := windows_failure(fs_error())
-    return PathResult{ failure: io.Failure{ kind: failure.failure.kind, native: failure.failure.native } }
+    fail windows_err(fs_error())
   }
-  if returned < 8 || #cast(usize, data.length) + 8 > #cast(usize, returned) {
-    return PathResult{ failure: io.Failure{ kind: io.Kind.InvalidInput, native: -87 } }
-  }
+  if returned < 8 || #cast(usize, data.length) + 8 > #cast(usize, returned) { fail .InvalidInput }
   prefix: usize = 0
   if data.tag == 0xA000000C {
     prefix = 12
   } else if data.tag == 0xA0000003 {
     prefix = 8
   } else {
-    return PathResult{ failure: io.Failure{ kind: io.Kind.Unsupported, native: -50 } }
+    fail .Unsupported
   }
-  if data.length < prefix {
-    return PathResult{ failure: io.Failure{ kind: io.Kind.InvalidInput, native: -87 } }
-  }
+  if data.length < prefix { fail .InvalidInput }
   offset := #cast(usize, data.payload[0])
   length := #cast(usize, data.payload[1])
   if (offset & 1) != 0 || (length & 1) != 0 || length == 0 || prefix + offset + length > data.length {
-    return PathResult{ failure: io.Failure{ kind: io.Kind.InvalidInput, native: -87 } }
+    fail .InvalidInput
   }
   start := (prefix + offset) / 2
   count := length / 2
@@ -399,101 +262,71 @@ pub fn read_link(path: []const u8, destination: []u8) PathResult {
   if count >= 4 && data.payload[start] == 92 && data.payload[start + 1] == 63 && data.payload[start + 2] == 63 && data.payload[start + 3] == 92 {
     data.payload[start + 1] = 92
   }
-  if #len(destination) == 0 {
-    return PathResult{ failure: io.Failure{ kind: io.Kind.Capacity, native: -122 } }
-  }
-  capacity := #len(destination)
-  if capacity > 2147483647 {
-    capacity = 2147483647
-  }
+  if destination.len == 0 { fail .Capacity }
+  capacity := destination.len
+  if capacity > 2147483647 { capacity = 2147483647 }
   used := host.utf8(65001, 128, &data.payload[start], #cast(i32, count), &destination[0], #cast(i32, capacity), nil, nil)
-  if used <= 0 {
-    failure := windows_failure(fs_error())
-    return PathResult{ failure: io.Failure{ kind: failure.failure.kind, native: failure.failure.native } }
-  }
-  return PathResult{ path: destination[..used] }
+  if used <= 0 { fail windows_err(fs_error()) }
+  return destination[..used]
 }
 // Restrict at creation, before any other process can acquire a permissive
 // handle. A later chmod alone cannot revoke access from already-open handles.
-fn windows_create_private(path: []const u8, executable: bool) FileResult {
+fn windows_create_private(path: []const u8, executable: bool) File!io.IoErr {
   wide: [32768]u16
-  converted := windows_path(path, wide[..])
-  if io.failed(converted.failure) {
-    return FileResult{ failure: io.Failure{ kind: converted.failure.kind, native: converted.failure.native } }
-  }
+  _ = try windows_path(path, wide[..])
   descriptor: rawptr = nil
-  prepared := windows_private_descriptor_for(false, executable, &descriptor)
-  if io.failed(prepared.failure) {
-    return FileResult{ failure: io.Failure{ kind: prepared.failure.kind, native: prepared.failure.native } }
-  }
+  try windows_private_descriptor_for(false, executable, &descriptor)
   defer _ = fs_local_free(descriptor)
-  security := WinSecurityAttributes{length: #cast(u32, #sizeof(WinSecurityAttributes)), descriptor: descriptor}
+  security := WinSecurityAttributes{ length: #cast(u32, #sizeof(WinSecurityAttributes)), descriptor: descriptor }
   handle := fs_open(&wide[0], 1073741824, 7, #cast(rawptr, &security), 1, 128, nil)
-  if #cast(isize, handle) == -1 {
-    failure := windows_failure(fs_error())
-    return FileResult{ failure: io.Failure{ kind: failure.failure.kind, native: failure.failure.native } }
-  }
-  supported := windows_acl_volume(handle)
-  if io.failed(supported.failure) {
-    _ = fs_close(handle)
-    _ = fs_delete(&wide[0])
-    return FileResult{ failure: io.Failure{ kind: supported.failure.kind, native: supported.failure.native } }
-  }
-  return FileResult{ value: std_fs.adopt_handle(#cast(isize, handle)) }
+  if #cast(isize, handle) == -1 { fail windows_err(fs_error()) }
+  errdefer _ = fs_delete(&wide[0])
+  errdefer _ = fs_close(handle)
+  try windows_acl_volume(handle)
+  return std_fs.adopt_handle(#cast(isize, handle))
 }
-pub fn create_private_exclusive(path: []const u8) FileResult {
-  return windows_create_private(path, false)
+pub fn create_private_exclusive(path: []const u8) File!io.IoErr {
+  return try windows_create_private(path, false)
 }
 // Private executable payloads need FILE_EXECUTE as well as the data rights.
 // Establish the protected owner-only DACL in CreateFileW, never after writing.
-pub fn create_private_executable_exclusive(path: []const u8) FileResult {
-  return windows_create_private(path, true)
+pub fn create_private_executable_exclusive(path: []const u8) File!io.IoErr {
+  return try windows_create_private(path, true)
 }
-pub fn set_permissions(file: *File, mode: usize) Result {
-  if !std_fs.is_open(file) {
-    return windows_failure(6)
-  }
-  if mode != 0o600 {
-    return windows_failure(50)
-  }
-  supported := windows_acl_volume(#cast(rawptr, file.descriptor))
-  if io.failed(supported.failure) {
+pub fn set_permissions(file: *File, mode: usize) !io.IoErr {
+  if !std_fs.is_open(file) { fail .InvalidInput }
+  if mode != 0o600 { fail .Unsupported }
+  windows_acl_volume(#cast(rawptr, file.descriptor)) catch err {
     host.write_error("private chmod: volume query failed\n")
-    return supported
+    fail err
   }
   descriptor: rawptr = nil
-  prepared := windows_private_descriptor(false, &descriptor)
-  if io.failed(prepared.failure) {
+  windows_private_descriptor(false, &descriptor) catch err {
     host.write_error("private chmod: descriptor conversion failed\n")
-    return prepared
+    fail err
   }
   defer _ = fs_local_free(descriptor)
   present: i32 = 0
   defaulted: i32 = 0
   acl: rawptr = nil
-  if fs_dacl(descriptor, &present, &acl, &defaulted) == 0 {
-    return windows_failure(fs_error())
-  }
-  if present == 0 || acl == nil {
-    return windows_failure(87)
-  }
+  if fs_dacl(descriptor, &present, &acl, &defaulted) == 0 { fail windows_err(fs_error()) }
+  if present == 0 || acl == nil { fail .InvalidInput }
   // Reopen the object identity, never its pathname; keep File's position and
   // ownership unchanged. Include READ_CONTROL because filesystem ACL
   // inheritance processing may read the existing descriptor. SDK handles do
   // not request WRITE_DAC.
   handle := fs_reopen(#cast(rawptr, file.descriptor), 393216, 7, 2097152)
   if #cast(isize, handle) == -1 {
-    failure := windows_failure(fs_error())
+    err := windows_err(fs_error())
     host.write_error("private chmod: ReOpenFile failed\n")
-    return failure
+    fail err
   }
   defer _ = fs_close(handle)
   code := fs_set_security(handle, 1, 2147483652, nil, nil, acl, nil)
   if code != 0 {
     host.write_error("private chmod: SetSecurityInfo failed\n")
-    return windows_failure(code)
+    fail windows_err(code)
   }
-  return Result{}
 }
 
 struct WinBasicInformation { created, accessed, written, changed: i64, attributes: u32 }
@@ -505,107 +338,73 @@ extern fn fs_set_basic "SetFileInformationByHandle"(handle: rawptr, information_
 // Intended for a sibling atomic-save temporary. Unlike POSIX mode emulation,
 // this retains the actual DACL and its inheritance policy. Never change owner
 // or group implicitly: owner-relative ACEs must retain their original meaning.
-pub fn preserve_permissions(file: *File, source: []const u8) Result {
-  if !std_fs.is_open(file) {
-    return windows_failure(6)
-  }
+pub fn preserve_permissions(file: *File, source: []const u8) !io.IoErr {
+  if !std_fs.is_open(file) { fail .InvalidInput }
   wide: [32768]u16
-  converted := windows_path(source, wide[..])
-  if io.failed(converted.failure) {
-    return converted
-  }
+  _ = try windows_path(source, wide[..])
   original := fs_open(&wide[0], 131200, 7, nil, 3, 35651584, nil)
-  if #cast(isize, original) == -1 {
-    return windows_failure(fs_error())
-  }
+  if #cast(isize, original) == -1 { fail windows_err(fs_error()) }
   defer _ = fs_close(original)
   replacement := fs_reopen(#cast(rawptr, file.descriptor), 393600, 7, 2097152)
-  if #cast(isize, replacement) == -1 {
-    return windows_failure(fs_error())
-  }
+  if #cast(isize, replacement) == -1 { fail windows_err(fs_error()) }
   defer _ = fs_close(replacement)
-  supported := windows_acl_volume(original)
-  if io.failed(supported.failure) {
-    return supported
-  }
-  supported = windows_acl_volume(replacement)
-  if io.failed(supported.failure) {
-    return supported
-  }
+  try windows_acl_volume(original)
+  try windows_acl_volume(replacement)
   original_info := WinInformation{}
   replacement_info := WinInformation{}
   if fs_info(original, &original_info) == 0 || fs_info(replacement, &replacement_info) == 0 {
-    return windows_failure(fs_error())
+    fail windows_err(fs_error())
   }
   if fs_type(original) != 1 || fs_type(replacement) != 1 || (original_info.attributes & 1040) != 0 || (replacement_info.attributes & 1040) != 0 {
-    return windows_failure(50)
+    fail .Unsupported
   }
   original_owner: rawptr = nil
   original_group: rawptr = nil
   original_acl: rawptr = nil
   original_descriptor: rawptr = nil
   code := fs_get_security(original, 1, 7, &original_owner, &original_group, &original_acl, nil, &original_descriptor)
-  if code != 0 {
-    return windows_failure(code)
-  }
+  if code != 0 { fail windows_err(code) }
   defer _ = fs_local_free(original_descriptor)
   replacement_owner: rawptr = nil
   replacement_group: rawptr = nil
   replacement_acl: rawptr = nil
   replacement_descriptor: rawptr = nil
   code = fs_get_security(replacement, 1, 7, &replacement_owner, &replacement_group, &replacement_acl, nil, &replacement_descriptor)
-  if code != 0 {
-    return windows_failure(code)
-  }
+  if code != 0 { fail windows_err(code) }
   defer _ = fs_local_free(replacement_descriptor)
   if original_owner == nil || original_group == nil || replacement_owner == nil || replacement_group == nil || original_acl == nil {
-    return windows_failure(50)
+    fail .Unsupported
   }
   if fs_equal_sid(original_owner, replacement_owner) == 0 || fs_equal_sid(original_group, replacement_group) == 0 {
-    return windows_failure(50)
+    fail .Unsupported
   }
   control: u16 = 0
   revision: u32 = 0
-  if fs_control(original_descriptor, &control, &revision) == 0 {
-    return windows_failure(fs_error())
-  }
-  if (control & 4) == 0 {
-    return windows_failure(50)
-  }
+  if fs_control(original_descriptor, &control, &revision) == 0 { fail windows_err(fs_error()) }
+  if (control & 4) == 0 { fail .Unsupported }
   security_information: u32 = 536870916
-  if (control & 4096) != 0 {
-    security_information = 2147483652
-  }
+  if (control & 4096) != 0 { security_information = 2147483652 }
   // Zero timestamp fields mean leave unchanged. Retain temporary's other
   // attributes; only the source's readonly bit is a permission attribute.
-  basic := WinBasicInformation{attributes: (replacement_info.attributes & ~#cast(u32, 1)) | (original_info.attributes & 1)}
-  if basic.attributes == 0 {
-    basic.attributes = 128
-  }
-  if basic.attributes != 128 {
-    basic.attributes &= ~#cast(u32, 128)
-  }
+  basic := WinBasicInformation{ attributes: (replacement_info.attributes & ~#cast(u32, 1)) | (original_info.attributes & 1) }
+  if basic.attributes == 0 { basic.attributes = 128 }
+  if basic.attributes != 128 { basic.attributes &= ~#cast(u32, 128) }
   if fs_set_basic(replacement, 0, #cast(rawptr, &basic), #cast(u32, #sizeof(WinBasicInformation))) == 0 {
-    return windows_failure(fs_error())
+    fail windows_err(fs_error())
   }
   code = fs_set_security(replacement, 1, security_information, nil, nil, original_acl, nil)
-  if code != 0 {
-    return windows_failure(code)
-  }
-  return Result{}
+  if code != 0 { fail windows_err(code) }
 }
 
-fn atomic_create_exclusive(path: []const u8) FileResult {
-  return create_private_exclusive(path)
+fn atomic_create_exclusive(path: []const u8) File!io.IoErr {
+  return try create_private_exclusive(path)
 }
 // Identity, size and last write time of an open file. Windows has no
 // change time; the volume serial stands in for it, so a file moved to
 // another volume never matches.
 pub fn file_stamp(file: *const File) Stamp {
   information := WinInformation{}
-  if fs_info(#cast(rawptr, file.descriptor), &information) == 0 {
-    return Stamp{}
-  }
+  if fs_info(#cast(rawptr, file.descriptor), &information) == 0 { return Stamp{} }
   // FILETIME counts 100 ns intervals.
   written := (#cast(u64, information.times[5]) << 32) | #cast(u64, information.times[4])
   return Stamp{inode: (#cast(u64, information.index_high) << 32) | #cast(u64, information.index_low), size: (#cast(u64, information.size_high) << 32) | #cast(u64, information.size_low), modify_seconds: written / 10000000, modify_nanos: (written % 10000000) * 100, change_seconds: information.volume, valid: true}
@@ -614,98 +413,72 @@ pub fn file_stamp(file: *const File) Stamp {
 // independently reopened source handle, leaving the origin's position alone.
 // Unsupported volumes/alignment fall back to the caller's immutable bytes.
 struct WinCloneRange { source: rawptr, source_offset, destination_offset, length: i64 }
-fn windows_copy_edge(source: *File, offset: u64, destination: *File, length: usize) Result {
-  if length == 0 {
-    return Result{}
-  }
-  positioned := std_fs.seek(source, #cast(isize, offset), 0)
-  if io.failed(positioned.failure) {
-    return Result{ failure: io.Failure{ kind: positioned.failure.kind, native: positioned.failure.native } }
-  }
+fn windows_copy_edge(source: *File, offset: u64, destination: *File, length: usize, transferred: *usize) !io.IoErr {
+  if length == 0 { return }
+  _ = try std_fs.seek(source, #cast(isize, offset), 0)
   storage: [65536]u8
   done: usize = 0
   for done < length {
-    part := std_fs.read(source, storage[..length - done])
-    if io.failed(part.failure) || part.transferred == 0 {
-      return Result{ transferred: done, failure: io.Failure{ kind: io.Kind.System, native: part.failure.native } }
+    part := std_fs.read(source, storage[..length - done]) catch err {
+      transferred.* += done
+      fail err
     }
-    written := std_fs.write(destination, storage[..part.transferred])
-    done += written.transferred
-    if io.failed(written.failure) {
-      return Result{ transferred: done, failure: io.Failure{ kind: written.failure.kind, native: written.failure.native } }
+    if part == 0 {
+      transferred.* += done
+      fail io.IoErr.System(0)
     }
+    std_fs.write(destination, storage[..part]) catch err {
+      transferred.* += done
+      fail err
+    }
+    done += part
   }
-  return Result{ transferred: done }
+  transferred.* += done
 }
-pub fn copy_range(source: *const File, offset: u64, destination: *File, length: usize) Result {
-  if !is_open(source) || !is_open(destination) {
-    return Result{ failure: io.Failure{ kind: io.Kind.InvalidState } }
-  }
-  if length == 0 {
-    return Result{}
-  }
-  position := std_fs.seek(destination, 0, 1)
-  if io.failed(position.failure) {
-    return Result{ failure: io.Failure{ kind: position.failure.kind, native: position.failure.native } }
-  }
+pub fn copy_range(source: *const File, offset: u64, destination: *File, length: usize, transferred: *usize) !io.IoErr {
+  transferred.* = 0
+  if !is_open(source) || !is_open(destination) { fail .InvalidInput }
+  if length == 0 { return }
+  position := try std_fs.seek(destination, 0, 1)
   // 64 KiB is a multiple of the supported ReFS cluster sizes. Other volumes
   // reject the ioctl and retain the ordinary write fallback.
   alignment: usize = 65536
-  if length > 9223372036854775807 {
-    return Result{ failure: io.Failure{ kind: io.Kind.Unsupported } }
-  }
-  if #cast(usize, offset % alignment) != position.value % alignment || offset > 9223372036854775807 - #cast(u64, length) || position.value > 9223372036854775807 - length {
-    return Result{ failure: io.Failure{ kind: io.Kind.Unsupported } }
+  if length > 9223372036854775807 { fail .Unsupported }
+  if #cast(usize, offset % alignment) != position % alignment || offset > 9223372036854775807 - #cast(u64, length) || position > 9223372036854775807 - length {
+    fail .Unsupported
   }
   head := (alignment - #cast(usize, offset % alignment)) % alignment
-  if head > length {
-    head = length
-  }
+  if head > length { head = length }
   middle := ((length - head) / alignment) * alignment
   tail := length - head - middle
-  if middle == 0 {
-    return Result{ failure: io.Failure{ kind: io.Kind.Unsupported } }
-  }
+  if middle == 0 { fail .Unsupported }
   reopened := File{}
   if head + tail != 0 {
     handle := fs_reopen(#cast(rawptr, source.descriptor), 2147483648, 7, 0)
-    if #cast(isize, handle) == -1 {
-      return windows_failure(fs_error())
-    }
+    if #cast(isize, handle) == -1 { fail windows_err(fs_error()) }
     reopened = adopt_handle(#cast(isize, handle))
   }
   defer {
     if is_open(&reopened) {
-      _ = close(&reopened)
+      close(&reopened)
     }
   }
-  end := #cast(i64, position.value + length)
-  existing := file_metadata(destination)
-  if io.failed(existing.failure) {
-    return Result{ failure: io.Failure{ kind: existing.failure.kind, native: existing.failure.native } }
-  }
+  end := #cast(i64, position + length)
+  existing := try file_metadata(destination)
   if existing.size < #cast(u64, end) && fs_set_basic(#cast(rawptr, destination.descriptor), 6, #cast(rawptr, &end), 8) == 0 {
-    return windows_failure(fs_error())
+    fail windows_err(fs_error())
   }
-  range := WinCloneRange{source: #cast(rawptr, source.descriptor), source_offset: #cast(i64, offset + head), destination_offset: #cast(i64, position.value + head), length: #cast(i64, middle)}
+  range := WinCloneRange{ source: #cast(rawptr, source.descriptor), source_offset: #cast(i64, offset + head), destination_offset: #cast(i64, position + head), length: #cast(i64, middle) }
   returned: u32 = 0
   if fs_ioctl(#cast(rawptr, destination.descriptor), 623428, #cast(rawptr, &range), #cast(u32, #sizeof(WinCloneRange)), nil, 0, &returned, nil) == 0 {
     // The transaction is private. The caller overwrites the entire requested
     // range on fallback, including any extents changed by a failed ioctl.
-    return windows_failure(fs_error())
+    fail windows_err(fs_error())
   }
-  first := windows_copy_edge(&reopened, offset, destination, head)
-  if io.failed(first.failure) {
-    first.transferred += middle
-    return first
-  }
-  skipped := std_fs.seek(destination, #cast(isize, middle), 1)
-  if io.failed(skipped.failure) {
-    return Result{ transferred: head + middle, failure: io.Failure{ kind: skipped.failure.kind, native: skipped.failure.native } }
-  }
-  last := windows_copy_edge(&reopened, offset + (head + middle), destination, tail)
-  last.transferred += head + middle
-  return last
+  transferred.* = middle
+  try windows_copy_edge(&reopened, offset, destination, head, transferred)
+  _ = try std_fs.seek(destination, #cast(isize, middle), 1)
+  try windows_copy_edge(&reopened, offset + (head + middle), destination, tail, transferred)
 }
 
 extern fn fs_mapping "CreateFileMappingW"(file: rawptr, security: rawptr, protection: u32, high: u32, low: u32, name: *const u16) rawptr
@@ -714,13 +487,9 @@ extern fn fs_unmap_view "UnmapViewOfFile"(bytes: *u8) i32
 // A view retains the section after its mapping handle closes. Windows refuses
 // SetEndOfFile while a view exists, so external truncation cannot invalidate it.
 pub fn map_file(descriptor: isize, length: u64) *u8 {
-  if descriptor == -1 || length == 0 {
-    return nil
-  }
+  if descriptor == -1 || length == 0 { return nil }
   mapping := fs_mapping(#cast(rawptr, descriptor), nil, 2, #cast(u32, length >> 32), #cast(u32, length & 4294967295), nil)
-  if mapping == nil {
-    return nil
-  }
+  if mapping == nil { return nil }
   bytes := fs_map_view(mapping, 4, 0, 0, #cast(usize, length))
   _ = fs_close(mapping)
   return bytes
@@ -731,19 +500,15 @@ pub fn unmap_file(bytes: *u8, length: u64) {
 }
 
 pub const WholeFileClones: bool = false
-pub fn clone_exclusive(source: *const File, path: []const u8) FileResult {
-  return FileResult{ failure: io.Failure{ kind: io.Kind.Unsupported } }
+pub fn clone_exclusive(source: *const File, path: []const u8) File!io.IoErr {
+  _ = source
+  _ = path
+  fail .Unsupported
 }
-pub fn resize(file: *File, length: usize) Result {
-  if !is_open(file) {
-    return Result{ failure: io.Failure{ kind: io.Kind.InvalidState } }
-  }
-  if length > 9223372036854775807 {
-    return Result{ failure: io.Failure{ kind: io.Kind.InvalidInput } }
-  }
+pub fn resize(file: *File, length: usize) !io.IoErr {
+  if !is_open(file) || length > 9223372036854775807 { fail .InvalidInput }
   end := #cast(i64, length)
   if fs_set_basic(#cast(rawptr, file.descriptor), 6, #cast(rawptr, &end), 8) == 0 {
-    return windows_failure(fs_error())
+    fail windows_err(fs_error())
   }
-  return Result{}
 }

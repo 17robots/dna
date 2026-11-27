@@ -1,4 +1,4 @@
-use "std/crypto/sha2" sha2
+use sha2 "std/crypto/sha2"
 
 // Project configuration: dna.toml in the project directory or an ancestor,
 // applied over the global config. Keys that run programs or load files wait
@@ -38,8 +38,8 @@ fn project_config_find(app: *App) {
     if buffer.equal(candidate[..length], app.configuration.path[..app.configuration.path_length]) {
       return
     }
-    info := files.metadata(candidate[..length])
-    if !io.failed(info.failure) && (info.mode & 61440) == 32768 {
+    info := files.metadata(candidate[..length]) catch fs.Metadata{}
+    if (info.mode & 61440) == 32768 {
       state.path_length = copy_text(state.path[..], candidate[..length])
       return
     }
@@ -53,8 +53,8 @@ fn project_config_find(app: *App) {
     }
     if directory == 0 && state.root[0] == '/' && length > 9 {
       root_file := "/dna.toml"
-      root_info := files.metadata(root_file)
-      if !io.failed(root_info.failure) && (root_info.mode & 61440) == 32768 {
+      root_info := files.metadata(root_file) catch fs.Metadata{}
+      if (root_info.mode & 61440) == 32768 {
         state.path_length = copy_text(state.path[..], root_file)
       }
       return
@@ -64,15 +64,14 @@ fn project_config_find(app: *App) {
 fn trust_store_path(output: []u8) []const u8 {
   storage: [4096]u8
   used: usize = 0
-  base := host.environment("XDG_STATE_HOME", storage[..])
-  if !io.failed(base.failure) && base.found && #len(base.value) > 0 {
-    used = copy_text(output, base.value)
+  base := host.environment("XDG_STATE_HOME", storage[..]) catch storage[..0]
+  if base.len > 0 {
+    used = copy_text(output, base)
   } else {
-    home := host.environment("HOME", storage[..])
-    if io.failed(home.failure) || !home.found {
+    home := host.environment("HOME", storage[..]) catch {
       return output[..0]
     }
-    used = copy_text(output, home.value)
+    used = copy_text(output, home)
     add_text(output, &used, "/.local/state")
   }
   add_text(output, &used, "/dna/trust")
@@ -92,26 +91,23 @@ fn trust_digest(text: []const u8, output: []u8) []const u8 {
 fn trust_check(app: *App, path: []const u8, text: []const u8) bool {
   store_storage: [4096]u8
   store := trust_store_path(store_storage[..])
-  if #len(store) == 0 {
-    return false
-  }
+  if store.len == 0 { return false }
   mark := mem.arena_mark(app.scratch)
   defer mem.arena_rewind(app.scratch, mark)
-  read := fs.read_all(app.scratch, store, 262144)
-  if io.failed(read.failure) {
+  read := fs.read_all(app.scratch, store, 262144) catch {
     return false
   }
   digest_storage: [64]u8
   digest := trust_digest(text, digest_storage[..])
   trusted := false
   at: usize = 0
-  for at < #len(read.value) {
+  for at < read.len {
     end := at
-    for end < #len(read.value) && read.value[end] != 10 {
+    for end < read.len && read[end] != 10 {
       end += 1
     }
-    line := read.value[at..end]
-    if #len(line) > 65 && line[64] == ' ' && buffer.equal(line[65..], path) {
+    line := read[at..end]
+    if line.len > 65 && line[64] == ' ' && buffer.equal(line[65..], path) {
       trusted = buffer.equal(line[..64], digest)
     }
     at = end + 1
@@ -134,11 +130,11 @@ fn trust_project(app: *App, typography: *Typography) {
   }
   store_storage: [4096]u8
   store := trust_store_path(store_storage[..])
-  if #len(store) == 0 {
+  if store.len == 0 {
     notice(app, "No state directory for trust: set HOME or XDG_STATE_HOME.")
     return
   }
-  parent := #len(store)
+  parent := store.len
   for parent > 0 && store[parent - 1] != '/' {
     parent -= 1
   }
@@ -155,14 +151,12 @@ fn trust_project(app: *App, typography: *Typography) {
   add_text(line[..], &used, " ")
   add_text(line[..], &used, path)
   add_text(line[..], &used, "\n")
-  opened := fs.append(store)
-  if io.failed(opened.failure) {
+  opened := fs.append(store) catch {
     notice(app, "Cannot write the trust store.")
     return
   }
-  written := fs.write(&opened.value, line[..used])
-  fs.close(&opened.value)
-  if io.failed(written.failure) {
+  defer fs.close(&opened)
+  fs.write(&opened, line[..used]) catch {
     notice(app, "Cannot write the trust store.")
     return
   }
@@ -183,20 +177,17 @@ fn project_config_apply(app: *App, parsed: *settings.Settings, global: *const se
     }
     add_text(state.locks[..], &state.locks_length, global.locks[index])
   }
-  if state.path_length == 0 {
-    return true
-  }
+  if state.path_length == 0 { return true }
   path := state.path[..state.path_length]
-  read := fs.read_all(app.scratch, path, 16384)
-  if io.failed(read.failure) {
+  read := fs.read_all(app.scratch, path, 16384) catch {
     notice(app, "Cannot read dna.toml (maximum 16 KiB); project settings ignored.")
     return false
   }
-  layer := settings.Layer{project: true, trusted: trust_check(app, path, read.value)}
+  layer := settings.Layer{project: true, trusted: trust_check(app, path, read)}
   layer.locks = global.locks
   layer.lock_count = global.lock_count
   state.trusted = layer.trusted
-  if !settings.parse_layer(read.value, parsed, &layer) {
+  if !settings.parse_layer(read, parsed, &layer) {
     message: [256]u8
     used: usize = 0
     add_text(message[..], &used, "Invalid dna.toml at line ")
@@ -237,17 +228,11 @@ fn project_config_apply(app: *App, parsed: *settings.Settings, global: *const se
 // the file is yours.
 fn project_sections_apply(app: *App, parsed: *settings.Settings, global: *const settings.Layer, source: []const u8) {
   app.project_config.sections = 0
-  if #len(source) == 0 || app.workspace.project_length == 0 {
-    return
-  }
-  output := #slice(mem.arena_push(app.scratch, #len(source), 1), #len(source))
+  if source.len == 0 || app.workspace.project_length == 0 { return }
+  output := mem.push_bytes(app.scratch, source.len)
   trial := scratch_settings(app)
   home_storage: [4096]u8
-  home := host.environment("HOME", home_storage[..])
-  home_text: []const u8 = ""
-  if !io.failed(home.failure) && home.found {
-    home_text = home.value
-  }
+  home_text := host.environment("HOME", home_storage[..]) catch home_storage[..0]
   project := app.workspace.project[..app.workspace.project_length]
   at: usize = 0
   for settings.project_section_next(source, project, home_text, &at, output) {
@@ -312,14 +297,12 @@ fn config_sources(app: *App) {
 fn config_locked(app: *const App, name: []const u8) bool {
   locks := app.project_config.locks[..app.project_config.locks_length]
   at: usize = 0
-  for at < #len(locks) {
+  for at < locks.len {
     end := at
-    for end < #len(locks) && locks[end] != ',' {
+    for end < locks.len && locks[end] != ',' {
       end += 1
     }
-    if buffer.equal(locks[at..end], name) {
-      return true
-    }
+    if buffer.equal(locks[at..end], name) { return true }
     at = end + 2
   }
   return false

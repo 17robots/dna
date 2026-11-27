@@ -8,7 +8,7 @@ DYN = os.environ.get('DYN', str(ROOT.parent / 'dyn/compiler/build/dyn-release'))
 s = (ROOT / 'src/explorer.dyn').read_text()
 start = s.index('fn explorer_columns_progress(')
 end = s.index('\nfn draw_explorer(', start)
-source = '''use "./motion" motion
+source = '''use motion "./motion"
 struct Config {popup_animation_ms:f32,popup_transitions:bool}
 struct Animation {now:f32,active,surfaces_ready,resized,geometry_active:bool,geometry_elapsed:f32}
 struct View {animation:Animation,reduced_motion:bool}

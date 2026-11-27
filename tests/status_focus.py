@@ -17,7 +17,7 @@ def function(source, name):
         end += 1
     return source[start:end] + '\n'
 
-source = '''use "./buffer" buffer
+source = '''use buffer "./buffer"
 const UiBackground:u32=2
 const UiText:u32=8
 const UiClip:u32=16
@@ -64,7 +64,7 @@ fn main() {
 with tempfile.TemporaryDirectory(prefix='dna-status-focus-') as temporary:
     work=Path(temporary)
     (work/'buffer').mkdir()
-    (work/'buffer/buffer.dyn').write_text('pub fn equal(a,b:[]const u8) bool {if #len(a)!=#len(b) {return false}\n for i in 0..#len(a) {if a[i]!=b[i] {return false}}\n return true}\n')
+    (work/'buffer/buffer.dyn').write_text('pub fn equal(a,b:[]const u8) bool {if a.len!=b.len {return false}\n for i in 0..a.len {if a[i]!=b[i] {return false}}\n return true}\n')
     (work/'main.dyn').write_text(source)
     for mode in ('debug','release'):
         binary=work/('status-'+mode)

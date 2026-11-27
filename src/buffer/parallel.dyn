@@ -27,18 +27,14 @@ fn load_job_run(job: *LoadJob) isize {
   if job.fill {
     for leaf in job.first..job.last {
       table := #slice(job.tables, job.last)[leaf]
-      if table == nil {
-        continue
-      }
+      if table == nil { continue }
       low := leaf * LeafLimit
       length := leaf_length(job.total, leaf)
       count: usize = 0
       at: usize = 0
       for at < length {
         hit := find_byte(&#slice(job.data, job.total)[low + at], 10, length - at)
-        if hit == nil {
-          break
-        }
+        if hit == nil { break }
         position := #cast(usize, hit) - #cast(usize, &#slice(job.data, job.total)[low])
         #slice(table, count + 1)[count] = #cast(u16, position)
         count += 1
@@ -69,9 +65,7 @@ fn load_job_run(job: *LoadJob) isize {
 }
 fn leaf_length(total: usize, leaf: usize) usize {
   low := leaf * LeafLimit
-  if total - low < LeafLimit {
-    return total - low
-  }
+  if total - low < LeafLimit { return total - low }
   return LeafLimit
 }
 // Threads worth starting for one parallel pass over text.
@@ -89,17 +83,14 @@ fn load_run(jobs: []LoadJob) {
   defer mem.arena_release(arena)
   threads: [16]*thread.Thread
   started: [16]bool
-  for index in 1..#len(jobs) {
-    spawned := thread.spawn_with_size(arena, ParallelStack, load_job_run, &jobs[index])
-    if !io.failed(spawned.failure) {
-      threads[index] = spawned.value
-      started[index] = true
-    }
+  for index in 1..jobs.len {
+    threads[index] = thread.spawn_with_size(arena, ParallelStack, load_job_run, &jobs[index]) catch nil
+    started[index] = threads[index] != nil
   }
   _ = load_job_run(&jobs[0])
-  for index in 1..#len(jobs) {
+  for index in 1..jobs.len {
     if started[index] {
-      if io.failed(thread.join(threads[index]).failure) {
+      _ = thread.join(threads[index]) catch {
         #panic("cannot join text loader")
       }
     } else {
@@ -111,17 +102,13 @@ fn load_run(jobs: []LoadJob) {
 // for large blocks. Returns nil with ok false for text that is not UTF-8.
 struct LoadResult { root: *RopeNode, valid: bool }
 fn rope_load_block(block: *RopeBlock, total: usize) LoadResult {
-  if total == 0 {
-    return LoadResult{valid: true}
-  }
+  if total == 0 { return LoadResult{valid: true} }
   workers := load_cpus()
   if workers > ParallelWorkers {
     workers = ParallelWorkers
   }
   if total < ParallelMinimum || workers < 2 {
-    if !valid(#slice(block.bytes, total)) {
-      return LoadResult{}
-    }
+    if !valid(#slice(block.bytes, total)) { return LoadResult{} }
     return LoadResult{root: rope_from_block(block, total), valid: true}
   }
   leaves := (total + LeafLimit - 1) / LeafLimit
@@ -139,9 +126,7 @@ fn rope_load_block(block: *RopeBlock, total: usize) LoadResult {
   }
   load_run(jobs)
   for index in 0..workers {
-    if !jobs[index].valid {
-      return LoadResult{}
-    }
+    if !jobs[index].valid { return LoadResult{} }
   }
   for leaf in 0..leaves {
     count := #slice(counts, leaves)[leaf]

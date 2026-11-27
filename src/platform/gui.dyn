@@ -1,14 +1,14 @@
-use "std/io" io
+use io "std/io"
 // Native GUI backend. The public platform wrapper keeps terminal dispatch.
 use "vendor/window/events"
-use "std/text/edit" surrounding_edit
+use surrounding_edit "std/text/edit"
 use "std/ui"
 use "std/ui/software"
 use "std/c"
 use "std/time"
-use "host" renderer_host
-use "./native_present" native_present
-use "./backend" native_backend
+use renderer_host "host"
+use native_present "./native_present"
+use native_backend "./backend"
 
 struct NativeTexture { next: *NativeTexture, gpu, framebuffer: u32, storage: *mem.Arena, premultiplied: bool, owner: *mem.Arena, pixels: []u8, width, height: i32, alpha: u8}
 struct NativeClipboard { owner: *mem.Arena, bytes: []u8, next: *NativeClipboard }
@@ -65,19 +65,14 @@ pub fn init(flags: u32) bool {
 }
 pub fn quit() {}
 fn sdl_create_window(title: *const u8, width, height: i32, flags: u64) rawptr {
-  if native_gui.listening || title == nil {
-    return nil
-  }
-  if native_gui.presenter.program!=0 || native_gui.gpu.program!=0 {
-    return nil
-  }
+  if native_gui.listening || title == nil { return nil }
+  if native_gui.presenter.program!=0 || native_gui.gpu.program!=0 { return nil }
   // Static storage starts zero. Clearing it again would touch every page.
   if native_gui.closed {
     native_gui=NativeGui{}
   }
   native_gui.draw_alpha=255
-  result := window_api.open(&native_gui.window, #slice(title, c.string_length(title, 4096)), width, height)
-  if result.kind != io.Kind.Ok {
+  window_api.open(&native_gui.window, #slice(title, c.string_length(title, 4096)), width, height) catch {
     return nil
   }
   window_api.listen_events(&native_gui.window, true)
@@ -100,20 +95,18 @@ fn sdl_destroy_window(window: rawptr) {
 }
 fn native_software_requested() bool {
   storage: [32]u8
-  value := renderer_host.environment("DNA_RENDERER", storage[..])
-  return !io.failed(value.failure) && value.found && mem.equal(value.value, "software")
+  value := renderer_host.environment("DNA_RENDERER", storage[..]) catch { return false }
+  return mem.equal(value, "software")
 }
 fn sdl_create_renderer(window: rawptr, name: *const u8) rawptr {
-  if window==nil || native_gui.presenter.program!=0 || native_gui.gpu.program!=0 {
-    return nil
-  }
+  if window==nil || native_gui.presenter.program!=0 || native_gui.gpu.program!=0 { return nil }
   native_gui.direct=!native_software_requested()
   if native_gui.direct {
-    if !native_present.gpu_open(&native_gui.gpu) {
+    if !native_present.gpu_open(&native_gui.gpu) { return nil }
+  } else {
+    native_present.open(&native_gui.presenter) catch {
       return nil
     }
-  } else if io.failed(native_present.open(&native_gui.presenter).failure) {
-    return nil
   }
   if !native_resize() {
     native_present.close(&native_gui.presenter)
@@ -121,7 +114,7 @@ fn sdl_create_renderer(window: rawptr, name: *const u8) rawptr {
     return nil
   }
   native_gui.draw_alpha = 255
-  _=window_api.set_swap_interval(&native_gui.window, 0)
+  window_api.set_swap_interval(&native_gui.window, 0) catch {}
   return #cast(rawptr, &native_gui)
 }
 fn sdl_destroy_renderer(renderer: rawptr) {
@@ -162,16 +155,10 @@ fn sdl_destroy_renderer(renderer: rawptr) {
 fn native_resize() bool {
   width := native_gui.window.width
   height := native_gui.window.height
-  if width <= 0 || height <= 0 || width > 16384 || height > 16384 {
-    return false
-  }
-  if native_gui.surface.width == width && native_gui.surface.height == height {
-    return true
-  }
+  if width <= 0 || height <= 0 || width > 16384 || height > 16384 { return false }
+  if native_gui.surface.width == width && native_gui.surface.height == height { return true }
   if native_gui.direct {
-    if !native_present.gpu_flush(&native_gui.gpu) {
-      return false
-    }
+    if !native_present.gpu_flush(&native_gui.gpu) { return false }
     native_gui.surface=software.Surface{width:width, height:height, stride:#cast(usize, width)*4}
     native_gui.viewport=PixelRect{width:width, height:height}
     native_gui.gpu.width=width
@@ -183,7 +170,7 @@ fn native_resize() bool {
   } else {
     mem.arena_reset(native_gui.pixels)
   }
-  pixels := mem.push_bytes_uninit(native_gui.pixels, #cast(usize, width)*#cast(usize, height)*4)
+  pixels := mem.push_bytes(native_gui.pixels, #cast(usize, width)*#cast(usize, height)*4)
   native_gui.surface = software.Surface{pixels:pixels, width:width, height:height, stride:#cast(usize, width)*4}
   native_gui.viewport = PixelRect{width:width, height:height}
   return true
@@ -218,9 +205,7 @@ fn sdl_draw_opacity(renderer: rawptr, alpha: u8) bool {
 // Cached targets retain their original pixels. Only drawing/compositing into
 // the window applies the current pane's opacity, exactly once.
 fn native_draw_alpha(alpha: u8) u8 {
-  if native_gui.target != nil || native_gui.draw_alpha == 255 {
-    return alpha
-  }
+  if native_gui.target != nil || native_gui.draw_alpha == 255 { return alpha }
   return #cast(u8, (#cast(u32, alpha) * #cast(u32, native_gui.draw_alpha) + 127) / 255)
 }
 // Paint one row, then copy its complete RGBA span. Surfaces are owned native
@@ -228,9 +213,7 @@ fn native_draw_alpha(alpha: u8) u8 {
 // A one-byte-larger check bound preserves the optimized libc entry points
 // instead of folding these calls into the runtime's byte-loop intrinsics.
 fn native_fill_span(surface:*software.Surface, bounds:ui.Rect, color:ui.Color) {
-  if bounds.width<=0 || bounds.height<=0 {
-    return
-  }
+  if bounds.width<=0 || bounds.height<=0 { return }
   bytes:=#cast(usize, bounds.width)*4
   first:=#cast(usize, bounds.y)*surface.stride+#cast(usize, bounds.x)*4
   if color.r==color.g && color.g==color.b && color.b==color.a {
@@ -265,28 +248,24 @@ fn sdl_clear(renderer:rawptr) bool {
 
 fn sdl_present(renderer: rawptr) bool {
   if native_gui.direct {
-    if !native_present.gpu_flush(&native_gui.gpu) {
-      return false
-    }
-    return window_api.swap(&native_gui.window).kind == io.Kind.Ok
+    if !native_present.gpu_flush(&native_gui.gpu) { return false }
+    window_api.swap(&native_gui.window) catch { return false }
+    return true
   }
-  if io.failed(native_present.draw(&native_gui.presenter, native_gui.surface).failure) {
+  native_present.draw(&native_gui.presenter, native_gui.surface) catch {
     return false
   }
-  return window_api.swap(&native_gui.window).kind == io.Kind.Ok
+  window_api.swap(&native_gui.window) catch { return false }
+  return true
 }
 fn sdl_scale(renderer: rawptr, x, y: f32) bool {
-  if !(x>0.0 && y>0.0) || x>16.0 || y>16.0 {
-    return false
-  }
+  if !(x>0.0 && y>0.0) || x>16.0 || y>16.0 { return false }
   native_gui.sx=x
   native_gui.sy=y
   return true
 }
 fn sdl_fill(renderer: rawptr, rect: *const Rect) bool {
-  if rect == nil {
-    return false
-  }
+  if rect == nil { return false }
   surface := native_surface()
   color := native_gui.color
   color.a = native_draw_alpha(color.a)
@@ -299,7 +278,8 @@ fn sdl_fill(renderer: rawptr, rect: *const Rect) bool {
     native_fill_span(&surface, bounds, color)
     return true
   }
-  return !io.failed(software.render(&surface, &command, software.Font{}).failure)
+  software.render(&surface, &command, software.Font{}) catch { return false }
+  return true
 }
 fn sdl_size(renderer: rawptr, width, height: *i32) bool {
   width.*=native_gui.surface.width
@@ -326,11 +306,9 @@ fn sdl_viewport(renderer: rawptr, rect: *const PixelRect) bool {
   return true
 }
 fn sdl_create_texture(renderer: rawptr, format: u32, access, width, height: i32) rawptr {
-  if width<=0 || height<=0 || width>16384 || height>16384 {
-    return nil
-  }
+  if width<=0 || height<=0 || width>16384 || height>16384 { return nil }
   owner := mem.arena_alloc(4096)
-  t := mem.push(NativeTexture, owner)
+  t := mem.push<NativeTexture>(owner)
   t.*=NativeTexture{alpha:255, owner:owner, width:width, height:height, next:native_gui.textures}
   native_gui.textures=t
   if !native_gui.direct {
@@ -347,9 +325,7 @@ fn sdl_destroy_texture(texture: rawptr) {
       previous=item
       item=item.next
     }
-    if item==nil {
-      return
-    }
+    if item==nil { return }
     if previous==nil {
       native_gui.textures=t.next
     } else {
@@ -372,9 +348,7 @@ fn sdl_texture_blend(texture: rawptr, mode: u32) bool {
   return mode==1
 }
 fn sdl_texture_alpha(texture: rawptr, alpha: u8) bool {
-  if texture==nil {
-    return false
-  }
+  if texture==nil { return false }
   #cast(*NativeTexture, texture).alpha=alpha
   return true
 }
@@ -385,16 +359,12 @@ fn sdl_target(renderer: rawptr, texture: rawptr) bool {
     width:=native_gui.surface.width
     height:=native_gui.surface.height
     if target!=nil {
-      if !native_texture_gpu(target) {
-        return false
-      }
+      if !native_texture_gpu(target) { return false }
       framebuffer=target.framebuffer
       width=target.width
       height=target.height
     }
-    if !native_present.gpu_bind(&native_gui.gpu, framebuffer, width, height) {
-      return false
-    }
+    if !native_present.gpu_bind(&native_gui.gpu, framebuffer, width, height) { return false }
   } else if target!=nil {
     native_texture_cpu(target)
   }
@@ -402,13 +372,9 @@ fn sdl_target(renderer: rawptr, texture: rawptr) bool {
   return sdl_viewport(renderer, nil)
 }
 fn native_blend(surface: *software.Surface, x, y: i32, r, g, b, a: u8) {
-  if a==0 {
-    return
-  }
+  if a==0 { return }
   clip:=native_clip(surface.*)
-  if !ui.contains(clip, x, y) {
-    return
-  }
+  if !ui.contains(clip, x, y) { return }
   at:=#cast(usize, y)*surface.stride+#cast(usize, x)*4
   native_blend_at(surface, at, r, g, b, a)
 }
@@ -441,9 +407,7 @@ fn native_blend_at(surface:*software.Surface, at:usize, r, g, b, a:u8) {
   surface.pixels[at+3]=#cast(u8, (denominator+127)/255)
 }
 fn sdl_render_texture(renderer: rawptr, texture: rawptr, source, destination: *const Rect) bool {
-  if texture==nil {
-    return false
-  }
+  if texture==nil { return false }
   t:=#cast(*NativeTexture, texture)
   draw_alpha:=native_draw_alpha(t.alpha)
   src:=Rect{width:#cast(f32, t.width), height:#cast(f32, t.height)}
@@ -454,31 +418,21 @@ fn sdl_render_texture(renderer: rawptr, texture: rawptr, source, destination: *c
   if destination!=nil {
     dst=destination.*
   }
-  if src.width<=0.0 || src.height<=0.0 || dst.width<=0.0 || dst.height<=0.0 {
-    return false
-  }
+  if src.width<=0.0 || src.height<=0.0 || dst.width<=0.0 || dst.height<=0.0 { return false }
   surface:=native_surface()
   width:=#cast(i32, dst.width*native_gui.sx)
   height:=#cast(i32, dst.height*native_gui.sy)
-  if width<=0 || height<=0 || draw_alpha==0 {
-    return true
-  }
+  if width<=0 || height<=0 || draw_alpha==0 { return true }
   left:=native_gui.viewport.x+#cast(i32, dst.x*native_gui.sx)
   top:=native_gui.viewport.y+#cast(i32, dst.y*native_gui.sy)
   bounds:=ui.Rect{x:left, y:top, width:width, height:height}
   clip:=ui.intersect(native_clip(surface), bounds)
-  if clip.width<=0 || clip.height<=0 {
-    return true
-  }
+  if clip.width<=0 || clip.height<=0 { return true }
   if native_gui.direct {
     // Preserve the software adapter's sequential overlapping self-blit
     // semantics without sampling the current framebuffer attachment.
-    if t==native_gui.target {
-      return native_texture_self_blit(renderer, t, source, destination)
-    }
-    if !native_texture_gpu(t) {
-      return false
-    }
+    if t==native_gui.target { return native_texture_self_blit(renderer, t, source, destination) }
+    if !native_texture_gpu(t) { return false }
     // Restrict to valid source texels; out-of-range source pixels are skipped
     // by the software reference rather than clamped to an edge texel.
     valid:=clip
@@ -520,7 +474,7 @@ fn sdl_render_texture(renderer: rawptr, texture: rawptr, source, destination: *c
   // original sequential sampling and blending behavior.
   texture_begin:=#cast(usize, &t.pixels[0])
   target_begin:=#cast(usize, &surface.pixels[0])
-  disjoint:=texture_begin+#len(t.pixels)<=target_begin || target_begin+#len(surface.pixels)<=texture_begin
+  disjoint:=texture_begin+t.pixels.len<=target_begin || target_begin+surface.pixels.len<=texture_begin
   copy_opaque:=unit_x && unit_y && draw_alpha==255 && disjoint
   for row in 0..clip.height {
     y:=clip.y-top+row
@@ -528,9 +482,7 @@ fn sdl_render_texture(renderer: rawptr, texture: rawptr, source, destination: *c
     if !unit_y {
       ty=#cast(i32, src.y+#cast(f32, y)*src.height/#cast(f32, height))
     }
-    if ty<0 || ty>=t.height {
-      continue
-    }
+    if ty<0 || ty>=t.height { continue }
     source_row:=#cast(usize, ty)*#cast(usize, t.width)*4
     target_row:=#cast(usize, clip.y+row)*surface.stride+#cast(usize, clip.x)*4
     if copy_opaque {
@@ -570,9 +522,7 @@ fn sdl_render_texture(renderer: rawptr, texture: rawptr, source, destination: *c
       if !unit_x {
         tx=#cast(i32, src.x+#cast(f32, x)*src.width/#cast(f32, width))
       }
-      if tx<0 || tx>=t.width {
-        continue
-      }
+      if tx<0 || tx>=t.width { continue }
       at:=source_row+#cast(usize, tx)*4
       alpha:=#cast(u8, (#cast(u32, t.pixels[at+3])*#cast(u32, draw_alpha)+127)/255)
       if alpha!=0 {
@@ -590,9 +540,7 @@ pub fn native_text_cached_bitmap(renderer:rawptr, key:u64, pixels:*const u8, wid
     return false
   }
   a=native_draw_alpha(a)
-  if width==0 || height==0 || a==0 {
-    return true
-  }
+  if width==0 || height==0 || a==0 { return true }
   surface:=native_surface()
   scaled_width:=#cast(i32, #cast(f32, width)*native_gui.sx)
   scaled_height:=#cast(i32, #cast(f32, height)*native_gui.sy)
@@ -601,9 +549,7 @@ pub fn native_text_cached_bitmap(renderer:rawptr, key:u64, pixels:*const u8, wid
   bounds:=ui.Rect{x:left, y:top, width:scaled_width, height:scaled_height}
   pane_clip:=native_clip(surface)
   clip:=ui.intersect(pane_clip, bounds)
-  if clip.width<=0 || clip.height<=0 {
-    return true
-  }
+  if clip.width<=0 || clip.height<=0 { return true }
   if native_gui.direct {
     return native_present.gpu_glyph(&native_gui.gpu, key, pixels, width, height, bounds, pane_clip, ui.Color{r:r, g:g, b:b, a:a}, native_gui.sx, native_gui.sy)
   }
@@ -629,68 +575,36 @@ pub fn native_text_cached_bitmap(renderer:rawptr, key:u64, pixels:*const u8, wid
 }
 
 fn native_key(key:u32) u32 {
-  if key<events.Escape {
-    return key
-  }
+  if key<events.Escape { return key }
   if key>=events.F1 && key<=events.F24 {
-    if key>=events.F1+12 {
-      return 1073741928+key-events.F1-12
-    }
+    if key>=events.F1+12 { return 1073741928+key-events.F1-12 }
     return 1073741882+key-events.F1
   }
-  if key==events.Escape {
-    return 27
-  }
-  if key==events.Enter {
-    return 13
-  }
-  if key==events.Tab {
-    return 9
-  }
-  if key==events.Backspace {
-    return 8
-  }
-  if key==events.Delete {
-    return 127
-  }
-  if key==events.Left {
-    return 1073741904
-  }
-  if key==events.Right {
-    return 1073741903
-  }
-  if key==events.Up {
-    return 1073741906
-  }
-  if key==events.Down {
-    return 1073741905
-  }
-  if key==events.Home {
-    return 1073741898
-  }
-  if key==events.End {
-    return 1073741901
-  }
-  if key==events.PageUp {
-    return 1073741899
-  }
-  if key==events.PageDown {
-    return 1073741902
-  }
+  if key==events.Escape { return 27 }
+  if key==events.Enter { return 13 }
+  if key==events.Tab { return 9 }
+  if key==events.Backspace { return 8 }
+  if key==events.Delete { return 127 }
+  if key==events.Left { return 1073741904 }
+  if key==events.Right { return 1073741903 }
+  if key==events.Up { return 1073741906 }
+  if key==events.Down { return 1073741905 }
+  if key==events.Home { return 1073741898 }
+  if key==events.End { return 1073741901 }
+  if key==events.PageUp { return 1073741899 }
+  if key==events.PageDown { return 1073741902 }
   return 0
 }
 fn native_event(source:*const events.Event, event:*Event) bool {
   if source.kind==events.Kind.Edit || native_gui.edit_chunks.active {
-    collected:=events.collect_edit(&native_gui.edit_chunks, source)
+    collected:=events.collect_edit(&native_gui.edit_chunks, source) catch events.EditResult{}
     if collected.ready {
       length:=mem.copy(native_gui.edit_text[..], collected.value.text)
       native_gui.edit=ImeEdit{text:native_gui.edit_text[..length], start:collected.value.start, end:collected.value.end, token:collected.value.token}
       event.words[0]=ImeEditEvent
       return true
     }
-    if source.kind==events.Kind.Edit {
-      return false
-    }
+    if source.kind==events.Kind.Edit { return false }
   }
   event.*=Event{}
   mods:u16=0
@@ -772,8 +686,8 @@ fn native_event(source:*const events.Event, event:*Event) bool {
     }
     if target.down {
       now:=time.monotonic_now()
-      delta:=time.elapsed(native_gui.click_at, now.value)
-      same:=native_gui.click_valid && !io.failed(now.failure) && !io.failed(delta.failure) && delta.value>=0 && delta.value<=500*time.Millisecond && native_gui.click_button==source.button && source.x>=native_gui.click_x-4 && source.x<=native_gui.click_x+4 && source.y>=native_gui.click_y-4 && source.y<=native_gui.click_y+4
+      delta:=time.elapsed(native_gui.click_at, now)
+      same:=native_gui.click_valid && delta>=0 && delta<=500*time.Millisecond && native_gui.click_button==source.button && source.x>=native_gui.click_x-4 && source.x<=native_gui.click_x+4 && source.y>=native_gui.click_y-4 && source.y<=native_gui.click_y+4
       if same && native_gui.click_count<3 {
         native_gui.click_count+=1
       } else {
@@ -782,8 +696,8 @@ fn native_event(source:*const events.Event, event:*Event) bool {
       native_gui.click_button=source.button
       native_gui.click_x=source.x
       native_gui.click_y=source.y
-      native_gui.click_at=now.value
-      native_gui.click_valid=!io.failed(now.failure)
+      native_gui.click_at=now
+      native_gui.click_valid=true
     }
     target.clicks=native_gui.click_count
     target.x=#cast(f32, source.x)
@@ -864,9 +778,7 @@ fn sdl_poll(event:*Event) bool {
     for i in 0..native_gui.deferred_count {
       native_gui.deferred[i]=native_gui.deferred[i+1]
     }
-    if native_event(&deferred, event) {
-      return true
-    }
+    if native_event(&deferred, event) { return true }
   }
   if native_gui.deferred_overflow {
     native_gui.deferred_overflow=false
@@ -875,24 +787,18 @@ fn sdl_poll(event:*Event) bool {
   }
   source:=events.Event{}
   for window_api.next_event(&native_gui.window, &source) {
-    if native_event(&source, event) {
-      return true
-    }
+    if native_event(&source, event) { return true }
   }
-  if window_api.poll(&native_gui.window).kind != io.Kind.Ok {
+  window_api.poll(&native_gui.window) catch {
     return false
   }
   for window_api.next_event(&native_gui.window, &source) {
-    if native_event(&source, event) {
-      return true
-    }
+    if native_event(&source, event) { return true }
   }
   return false
 }
 fn sdl_wait_timeout(event:*Event, milliseconds:i32) bool {
-  if sdl_poll(event) {
-    return true
-  }
+  if sdl_poll(event) { return true }
   window_api.wait(&native_gui.window, milliseconds)
   return sdl_poll(event)
 }
@@ -903,32 +809,27 @@ fn sdl_wait(event:*Event) bool {
 fn injected_slot(index:usize) []u8 {
   if native_gui.injected_arena==nil {
     native_gui.injected_arena=mem.arena_alloc(128*4097+65536)
-    native_gui.injected_text=#slice(mem.arena_push(native_gui.injected_arena, 128*4097, 1), 128*4097)
+    native_gui.injected_text=mem.push_bytes(native_gui.injected_arena, 128*4097)
   }
   return native_gui.injected_text[index*4097..(index+1)*4097]
 }
 fn sdl_push(event:*Event) bool {
-  if event==nil || native_gui.injected_count>=128 {
-    return false
-  }
+  if event==nil || native_gui.injected_count>=128 { return false }
   at:=native_gui.injected_count
   native_gui.injected[at]=event.*
   kind:=#cast(u32, event.words[0]&4294967295)
   if kind==770 || kind==771 {
     text:=#cast(*TextEvent, event).text
-    if text==nil {
-      return false
-    }
+    if text==nil { return false }
     n:=c.string_length(text, 4097)
-    if n>4096 {
-      return false
-    }
+    if n>4096 { return false }
     slot:=injected_slot(at)
     _=mem.copy(slot[..n], #slice(text, n))
     slot[n]=0
   }
   native_gui.injected_count+=1
-  return window_api.wake(&native_gui.window).kind == io.Kind.Ok
+  window_api.wake(&native_gui.window) catch { return false }
+  return true
 }
 fn sdl_start_text(window:rawptr) bool {
   window_api.set_text_input(&native_gui.window, true, 0, 0, 1, 1)
@@ -945,18 +846,15 @@ fn sdl_surrounding(window:rawptr, text:[]const u8, cursor, anchor:usize) u64 {
   if native_gui.from_input_method {
     cause=surrounding_edit.Cause.InputMethod
   }
-  snapshot:=surrounding_edit.snapshot(&native_gui.surrounding, 1, text, cursor, anchor, cause)
-  if snapshot.failure.kind != io.Kind.Ok {
+  snapshot:=surrounding_edit.snapshot(&native_gui.surrounding, 1, text, cursor, anchor, cause) catch {
     return 0
   }
-  if snapshot.value.token == native_gui.published {
-    return native_gui.published
-  }
-  if window_api.set_surrounding_text(&native_gui.window, snapshot.value).kind != io.Kind.Ok {
+  if snapshot.token == native_gui.published { return native_gui.published }
+  window_api.set_surrounding_text(&native_gui.window, snapshot) catch {
     native_gui.published=0
     return 0
   }
-  native_gui.published=snapshot.value.token
+  native_gui.published=snapshot.token
   native_gui.from_input_method=false
   return native_gui.published
 }
@@ -968,9 +866,7 @@ fn sdl_ime_edit_applied() {
   native_gui.edit=ImeEdit{}
 }
 fn sdl_text_area(window:rawptr, area:*const PixelRect, cursor:i32) bool {
-  if area==nil {
-    return false
-  }
+  if area==nil { return false }
   window_api.set_text_input(&native_gui.window, true, area.x+cursor, area.y, area.width, area.height)
   return true
 }
@@ -985,7 +881,8 @@ fn sdl_key_from_scancode(scancode:u32, modifiers:u16, key_event:bool) u32 {
 }
 
 fn sdl_render_vsync(renderer:rawptr, vsync:i32) bool {
-  return window_api.set_swap_interval(&native_gui.window, vsync).kind == io.Kind.Ok
+  window_api.set_swap_interval(&native_gui.window, vsync) catch { return false }
+  return true
 }
 fn sdl_window_display(window:rawptr) u32 {
   return 0
@@ -998,18 +895,10 @@ fn sdl_system_cursor(id:u32) rawptr {
 }
 fn sdl_destroy_cursor(cursor:rawptr) {}
 fn native_cursor(id:usize) window_api.Cursor {
-  if id==2 {
-    return window_api.Cursor.Text
-  }
-  if id==12 {
-    return window_api.Cursor.Hand
-  }
-  if id==8 {
-    return window_api.Cursor.ResizeX
-  }
-  if id==9 {
-    return window_api.Cursor.ResizeY
-  }
+  if id==2 { return window_api.Cursor.Text }
+  if id==12 { return window_api.Cursor.Hand }
+  if id==8 { return window_api.Cursor.ResizeX }
+  if id==9 { return window_api.Cursor.ResizeY }
   return window_api.Cursor.Arrow
 }
 fn sdl_set_cursor(cursor:rawptr) bool {
@@ -1018,30 +907,22 @@ fn sdl_set_cursor(cursor:rawptr) bool {
 }
 
 fn sdl_clipboard_set(text:*const u8) bool {
-  if text==nil {
-    return false
-  }
+  if text==nil { return false }
   length:=c.string_length(text, 16777217)
-  if length>16777216 {
-    return false
-  }
-  return window_api.try_set_clipboard(&native_gui.window, #slice(text, length)).kind == io.Kind.Ok
+  if length>16777216 { return false }
+  window_api.try_set_clipboard(&native_gui.window, #slice(text, length)) catch { return false }
+  return true
 }
 fn sdl_clipboard_get() *const u8 {
   window_api.request_paste_snapshot(&native_gui.window)
   started:=time.monotonic_now()
-  if io.failed(started.failure) {
-    return nil
-  }
   // The SDK ends stalled transfers after five seconds without progress.
   // Bound the synchronous adapter as well, without counting input wakeups.
   for {
     now:=time.monotonic_now()
-    elapsed:=time.elapsed(started.value, now.value)
-    if io.failed(now.failure) || io.failed(elapsed.failure) || elapsed.value<0 || elapsed.value>=30*time.Second {
-      return nil
-    }
-    if window_api.poll(&native_gui.window).kind != io.Kind.Ok {
+    elapsed:=time.elapsed(started, now)
+    if elapsed<0 || elapsed>=30*time.Second { return nil }
+    window_api.poll(&native_gui.window) catch {
       return nil
     }
     source:=events.Event{}
@@ -1058,16 +939,16 @@ fn sdl_clipboard_get() *const u8 {
       }
     }
     if !window_api.paste_pending(&native_gui.window) {
-      if window_api.paste_status(&native_gui.window).kind != io.Kind.Ok {
+      window_api.paste_status(&native_gui.window) catch {
         return nil
       }
       text:=window_api.clipboard(&native_gui.window)
       owner:=mem.arena_alloc(4096)
-      copied:=mem.push(NativeClipboard, owner)
+      copied:=mem.push<NativeClipboard>(owner)
       copied.*=NativeClipboard{owner:owner, next:native_gui.clipboards}
-      copied.bytes=mem.push_bytes_uninit(copied.owner, #len(text)+1)
-      _=mem.copy(copied.bytes[..#len(text)], text)
-      copied.bytes[#len(text)]=0
+      copied.bytes=mem.push_bytes(copied.owner, text.len+1)
+      _=mem.copy(copied.bytes[..text.len], text)
+      copied.bytes[text.len]=0
       native_gui.clipboards=copied
       return &copied.bytes[0]
     }
@@ -1095,7 +976,9 @@ fn sdl_free(pointer:rawptr) {
   }
 }
 fn sdl_title(window:rawptr, title:*const u8) bool {
-  return title!=nil && window_api.set_title(&native_gui.window, #slice(title, c.string_length(title, 4096))).kind == io.Kind.Ok
+  if title==nil { return false }
+  window_api.set_title(&native_gui.window, #slice(title, c.string_length(title, 4096))) catch { return false }
+  return true
 }
 fn sdl_clear_composition(window:rawptr) bool {
   window_api.set_text_input(&native_gui.window, false, 0, 0, 1, 1)
@@ -1105,11 +988,12 @@ fn sdl_clear_composition(window:rawptr) bool {
 fn sdl_set_window_size(window:rawptr, width, height:i32) bool {
   native_gui.requested_width=width
   native_gui.requested_height=height
-  return window_api.set_size(&native_gui.window, width, height).kind == io.Kind.Ok
+  window_api.set_size(&native_gui.window, width, height) catch { return false }
+  return true
 }
 fn sdl_sync_window(window:rawptr) bool {
   for attempt in 0..100 {
-    if window_api.poll(&native_gui.window).kind != io.Kind.Ok {
+    window_api.poll(&native_gui.window) catch {
       return false
     }
     if native_gui.window.width==native_gui.requested_width && native_gui.window.height==native_gui.requested_height {
@@ -1123,9 +1007,7 @@ fn native_edge(a, b:Vertex, x, y:f32) f32 {
   return (x-a.x)*(b.y-a.y)-(y-a.y)*(b.x-a.x)
 }
 fn sdl_geometry(renderer, texture:rawptr, vertices:*const Vertex, count:i32, indices:*const i32, index_count:i32) bool {
-  if texture!=nil || count<0 || index_count<0 || index_count%3!=0 {
-    return false
-  }
+  if texture!=nil || count<0 || index_count<0 || index_count%3!=0 { return false }
   surface:=native_surface()
   clip:=native_clip(surface)
   opacity:=#cast(f32, native_draw_alpha(255))/255.0
@@ -1133,9 +1015,7 @@ fn sdl_geometry(renderer, texture:rawptr, vertices:*const Vertex, count:i32, ind
     ia:=#slice(indices, index_count)[triangle*3]
     ib:=#slice(indices, index_count)[triangle*3+1]
     ic:=#slice(indices, index_count)[triangle*3+2]
-    if ia<0 || ib<0 || ic<0 || ia>=count || ib>=count || ic>=count {
-      return false
-    }
+    if ia<0 || ib<0 || ic<0 || ia>=count || ib>=count || ic>=count { return false }
     a:=#slice(vertices, count)[ia]
     b:=#slice(vertices, count)[ib]
     ch:=#slice(vertices, count)[ic]
@@ -1152,9 +1032,7 @@ fn sdl_geometry(renderer, texture:rawptr, vertices:*const Vertex, count:i32, ind
       ga:=native_present.GpuVertex{x:a.x, y:a.y, r:a.red, g:a.green, b:a.blue, a:a.alpha}
       gb:=native_present.GpuVertex{x:b.x, y:b.y, r:b.red, g:b.green, b:b.blue, a:b.alpha}
       gc:=native_present.GpuVertex{x:ch.x, y:ch.y, r:ch.red, g:ch.green, b:ch.blue, a:ch.alpha}
-      if !native_present.gpu_triangle(&native_gui.gpu, ga, gb, gc, clip) {
-        return false
-      }
+      if !native_present.gpu_triangle(&native_gui.gpu, ga, gb, gc, clip) { return false }
       continue
     }
     area:=native_edge(a, b, ch.x, ch.y)
@@ -1164,9 +1042,7 @@ fn sdl_geometry(renderer, texture:rawptr, vertices:*const Vertex, count:i32, ind
       ch=temporary
       area=0.0-area
     }
-    if area==0.0 || area!=area || clip.width<=0 || clip.height<=0 {
-      continue
-    }
+    if area==0.0 || area!=area || clip.width<=0 || clip.height<=0 { continue }
     // Bound work by the triangle, not the whole pane. Intersect in floating
     // point before integer conversion so large/offscreen coordinates stay safe.
     low_x := a.x
@@ -1248,7 +1124,7 @@ pub fn native_fill(renderer:rawptr, x, y, width, height:f32) bool {
 }
 extern fn native_gui_attach "dna_native_gui_attach"(callback:fn(rawptr), data:rawptr)
 fn native_gui_wake(data:rawptr) {
-  _=window_api.wake(#cast(*window_api.Window, data))
+  window_api.wake(#cast(*window_api.Window, data)) catch {}
 }
 
 fn native_top_left(a, b:Vertex) bool {
@@ -1260,15 +1136,13 @@ fn native_top_left(a, b:Vertex) bool {
 fn native_texture_storage(texture:*NativeTexture) {
   if texture.storage==nil {
     texture.storage=mem.arena_alloc(65536)
-    texture.pixels=mem.push_bytes_uninit(texture.storage, #cast(usize, texture.width)*#cast(usize, texture.height)*4)
+    texture.pixels=mem.push_bytes(texture.storage, #cast(usize, texture.width)*#cast(usize, texture.height)*4)
   }
 }
 // Renderer backups use GL's bottom-up premultiplied representation; software
 // targets use top-down straight alpha. Convert only when crossing renderers.
 fn native_texture_convert(texture:*NativeTexture, premultiplied:bool) {
-  if texture.premultiplied==premultiplied || #len(texture.pixels)==0 {
-    return
-  }
+  if texture.premultiplied==premultiplied || texture.pixels.len==0 { return }
   stride:=#cast(usize, texture.width)*4
   for y in 0..texture.height/2 {
     top:=#cast(usize, y)*stride
@@ -1279,7 +1153,7 @@ fn native_texture_convert(texture:*NativeTexture, premultiplied:bool) {
       texture.pixels[bottom+x]=value
     }
   }
-  for i in 0..#len(texture.pixels)/4 {
+  for i in 0..texture.pixels.len/4 {
     at:=i*4
     alpha:=#cast(u32, texture.pixels[at+3])
     for channel in 0..3 {
@@ -1304,12 +1178,10 @@ fn native_texture_cpu(texture:*NativeTexture) {
   native_texture_convert(texture, false)
 }
 fn native_texture_gpu(texture:*NativeTexture)bool {
-  if texture.gpu!=0 {
-    return true
-  }
+  if texture.gpu!=0 { return true }
   native_texture_convert(texture, true)
   data:*const u8=nil
-  if #len(texture.pixels)>0 {
+  if texture.pixels.len>0 {
     data=&texture.pixels[0]
   }
   if !native_present.gpu_target_create(&native_gui.gpu, &texture.gpu, &texture.framebuffer, data, texture.width, texture.height) {

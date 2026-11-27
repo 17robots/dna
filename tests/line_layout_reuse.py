@@ -29,9 +29,9 @@ pub fn draw(text:rawptr,x,y:f32)bool{return true}
 pub fn substring(text:rawptr,offset:i32,out:*Substring)bool{return true}
 ''')
 main='''use "std/mem"
-use "./owned_arena" arena_owner
-use "./buffer" buffer
-use "./ttf" ttf
+use arena_owner "./owned_arena"
+use buffer "./buffer"
+use ttf "./ttf"
 struct Typography {font:rawptr,engine:rawptr,line:f32}
 struct Rgb {red:u8,green:u8,blue:u8}
 fn tint(text:rawptr,color:Rgb)bool{return true}

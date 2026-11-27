@@ -18,8 +18,8 @@ pub fn open(path:*const u8,points:f32)rawptr {opens+=1
 ''')
     (root/'main.dyn').write_text('''use "std/c"
 use "std/mem"
-use "./buffer" buffer
-use "./ttf" ttf
+use buffer "./buffer"
+use ttf "./ttf"
 struct Fonts {original_font_path:[4096]u8,original_font_length:usize}
 struct App {fonts:Fonts}
 struct Typography {original_font:rawptr,points,scale:f32}
@@ -28,9 +28,9 @@ fn main(){
  app:=App{}
  path:[32]u8
  name:[]const u8="same.ttf"
- _=mem.copy(path[..#len(name)],name)
- _=mem.copy(app.fonts.original_font_path[..#len(name)],name)
- app.fonts.original_font_length=#len(name)
+ _=mem.copy(path[..name.len],name)
+ _=mem.copy(app.fonts.original_font_path[..name.len],name)
+ app.fonts.original_font_length=name.len
  typography:=Typography{original_font:#cast(rawptr,1),points:16.0,scale:2.0}
  if config_open_font(&app,&typography,&path[0],32.0,true)!=typography.original_font || ttf.opens!=0 {#panic("startup font opened twice")}
  if config_open_font(&app,&typography,&path[0],32.0,false)==typography.original_font || ttf.opens!=1 {#panic("explicit reload must reopen font file")}

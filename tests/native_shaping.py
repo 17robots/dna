@@ -35,7 +35,7 @@ fn main(){
  defer quit()
  name: [4096]u8
  path: []const u8="FONT_PATH"
- _=mem.copy(name[..#len(path)],path)
+ _=mem.copy(name[..path.len],path)
  font:=ttf_open(&name[0],16.0)
  check(font!=nil)
  defer ttf_close(font)
@@ -55,7 +55,7 @@ with tempfile.TemporaryDirectory(prefix='dna-shaping-') as directory:
     flags=subprocess.check_output(['pkg-config','--cflags','--libs','harfbuzz'],text=True).split()
     subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror',str(work/'oracle.c'),*flags,'-o',str(work/'oracle')],check=True)
     platform=work/'platform';platform.mkdir();(platform/'platform.dyn').write_text(PLATFORM)
-    backend=(ROOT/'src/text/native.dyn').read_text().replace('use "../platform" sdl','use "./platform" sdl')
+    backend=(ROOT/'src/text/native.dyn').read_text().replace('use sdl "../platform"','use sdl "./platform"')
     backend=re.sub(r'extern fn native_text_attach[^\n]+','fn native_text_attach(callbacks:*const NativeTextCallbacks)bool{return dna_native_text_attach(callbacks)}',backend)
     backend=re.sub(r'extern fn native_tracked_create[^\n]+','fn native_tracked_create(engine:rawptr,font:rawptr,text:*const u8,length:usize)rawptr{return dna_text_create(engine,font,text,length)}',backend)
     backend=re.sub(r'extern fn native_tracked_destroy[^\n]+','fn native_tracked_destroy(text:rawptr){dna_text_destroy(text)}',backend)
@@ -66,7 +66,7 @@ with tempfile.TemporaryDirectory(prefix='dna-shaping-') as directory:
     for index,text in enumerate(['office','سلام','שָׁלוֹם','e\u0301','कर्म']):
         rows=[list(map(int,line.split())) for line in subprocess.check_output([str(work/'oracle'),str(font),text],text=True).splitlines()]
         data=text.encode();clusters=sorted(set(row[1] for row in rows))+[len(data)]
-        lines=[f'if true {{ source:[]const u8={literal(data)}', 'handle:=ttf_create(renderer,font,&source[0],#len(source))','check(handle!=nil)','text:=#cast(*NativeText,handle)',f'check(#len(text.layout.glyphs)=={len(rows)})']
+        lines=[f'if true {{ source:[]const u8={literal(data)}', 'handle:=ttf_create(renderer,font,&source[0],source.len)','check(handle!=nil)','text:=#cast(*NativeText,handle)',f'check(text.layout.glyphs.len=={len(rows)})']
         x=0
         for i,(glyph,cluster,advance,xoff,yoff) in enumerate(rows):
             end=clusters[clusters.index(cluster)+1]
@@ -93,13 +93,13 @@ with tempfile.TemporaryDirectory(prefix='dna-shaping-') as directory:
 }
 if true {
  source:="سلام"
- handle:=ttf_create(renderer,font,&source[0],#len(source))
+ handle:=ttf_create(renderer,font,&source[0],source.len)
  check(handle!=nil)
  start:=Substring{}
  end:=Substring{}
- check(ttf_substring(handle,0,&start) && ttf_substring(handle,#cast(i32,#len(source)),&end))
- check((start.flags&255)==5 && start.offset==0 && start.x>end.x && end.offset==#cast(i32,#len(source)))
- check(ttf_at_point(handle,-1000,0,&end) && end.offset==#cast(i32,#len(source)) && end.length==0 && (end.flags&255)==5)
+ check(ttf_substring(handle,0,&start) && ttf_substring(handle,#cast(i32,source.len),&end))
+ check((start.flags&255)==5 && start.offset==0 && start.x>end.x && end.offset==#cast(i32,source.len))
+ check(ttf_at_point(handle,-1000,0,&end) && end.offset==#cast(i32,source.len) && end.length==0 && (end.flags&255)==5)
  check(ttf_at_point(handle,100000,0,&end) && end.offset==0 && end.length==0 && (end.flags&255)==5)
  check(ttf_at_point(handle,start.x+start.width/2,0,&end) && end.offset==start.offset && end.length==start.length)
  ttf_destroy(handle)

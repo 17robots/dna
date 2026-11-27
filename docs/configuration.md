@@ -62,7 +62,9 @@ panes after you open a file, with focus on the file. **Space e** toggles the
 tree from anywhere: it closes an open tree, focused or not, and otherwise opens
 it on the current file. **Space E** (or a click) moves focus back to an open
 tree. Set `close_on_open = true` under `[explorer]` to close the tree whenever
-you open a file from it.
+you open a file from it. The first row is the root folder itself: select it and
+press `a` to create a file or folder directly in the root. `:cd` moves the
+tree's root along with the project directory.
 
 | Key | Tree action |
 | --- | --- |

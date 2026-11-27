@@ -32,9 +32,7 @@ extern fn recovery_error "dna_recovery_error"(recovery: rawptr) i32
 extern fn recovery_close "dna_recovery_close"(recovery: rawptr)
 
 fn session_path(app: *App, argument: []const u8, output: []u8) []const u8 {
-  if #len(argument) > 0 {
-    return expand_home(argument, output)
-  }
+  if argument.len > 0 { return expand_home(argument, output) }
   length := copy_text(output, app.configuration.path[..app.configuration.path_length])
   add_text(output, &length, ".session")
   return output[..length]
@@ -58,14 +56,9 @@ fn recovery_pieces(saved: *workspace.SavedBuffer, state: *workspace.State, doc: 
     state.patches = mem.arena_alloc(RecoveryPatchLimit + 268435456)
   }
   list := buffer.saved_pieces(doc, state.patches, RecoveryPatchLimit)
-  if !list.valid {
-    return false
-  }
-  records := mem.arena_try_push_uninit(state.patches, #len(list.pieces) * 24 + 1, 8)
-  if !records.ok {
-    return false
-  }
-  encoded := #slice((#cast(*u8, records.memory)), #len(list.pieces) * 24)
+  if !list.valid { return false }
+  if mem.arena_room(state.patches) < list.pieces.len * 24 + 1 { return false }
+  encoded := mem.push_bytes(state.patches, list.pieces.len * 24 + 1)[..list.pieces.len * 24]
   for piece, index in list.pieces {
     kind: usize = 0
     if piece.literal {
@@ -86,24 +79,14 @@ fn recovery_pieces(saved: *workspace.SavedBuffer, state: *workspace.State, doc: 
 fn recovery_patch(saved: *workspace.SavedBuffer, state: *workspace.State, slot: *Slot) bool {
   doc := slot.document
   // Edits against a partly loaded file are recorded once it completes.
-  if buffer.load_state(doc) != buffer.LoadComplete {
-    return true
-  }
-  if !buffer.dirty_cached(doc) {
-    return true
-  }
+  if buffer.load_state(doc) != buffer.LoadComplete { return true }
+  if !buffer.dirty_cached(doc) { return true }
   stamp := files.saved_stamp(&slot.file)
-  if !stamp.valid {
-    return false
-  }
+  if !stamp.valid { return false }
   low := doc.saved_prefix
-  if low > doc.saved_length || low > doc.length {
-    return false
-  }
+  if low > doc.saved_length || low > doc.length { return false }
   suffix := doc.saved_suffix
-  if suffix > doc.saved_length - low || suffix > doc.length - low {
-    return false
-  }
+  if suffix > doc.saved_length - low || suffix > doc.length - low { return false }
   high := doc.length - suffix
   saved.stamp = [stamp.inode, stamp.size, stamp.modify_seconds, stamp.modify_nanos]
   if high - low > RecoveryPiecesMinimum {
@@ -119,10 +102,10 @@ fn recovery_patch(saved: *workspace.SavedBuffer, state: *workspace.State, slot: 
   return true
 }
 fn recovery_apply_pieces(doc: *buffer.Document, saved: *const workspace.SavedBuffer) bool {
-  count := #len(saved.pieces) / 24
+  count := saved.pieces.len / 24
   arena := arena_owner.create(count * #sizeof(buffer.Piece) + 64)
   defer arena_owner.release(arena)
-  pieces := #slice((#cast(*buffer.Piece, &mem.push_bytes_uninit(arena, count * #sizeof(buffer.Piece) + 16)[0])), count)
+  pieces := #slice((#cast(*buffer.Piece, &mem.push_bytes(arena, count * #sizeof(buffer.Piece) + 16)[0])), count)
   for index in 0..count {
     words: [3]usize
     for word in 0..3 {
@@ -130,14 +113,10 @@ fn recovery_apply_pieces(doc: *buffer.Document, saved: *const workspace.SavedBuf
         words[word] |= #cast(usize, saved.pieces[index * 24 + word * 8 + byte]) << (byte * 8)
       }
     }
-    if words[0] > 1 {
-      return false
-    }
+    if words[0] > 1 { return false }
     pieces[index] = buffer.Piece{literal: words[0] == 1, offset: words[1], length: words[2]}
   }
-  if !buffer.apply_pieces(doc, pieces, saved.patch) {
-    return false
-  }
+  if !buffer.apply_pieces(doc, pieces, saved.patch) { return false }
   buffer.checkpoint(doc)
   return true
 }
@@ -145,7 +124,7 @@ fn session_capture(app: *App, state: *workspace.State, recovery: bool) bool {
   pane_init(app)
   pane_store(app)
   mem.clear(state)
-  if !workspace.prepare(state, #len(app.documents.slots)) {
+  if !workspace.prepare(state, app.documents.slots.len) {
     notice(app, "Could not allocate session metadata. Workspace unchanged.")
     return false
   }
@@ -203,15 +182,13 @@ fn session_capture(app: *App, state: *workspace.State, recovery: bool) bool {
 fn session_save(app: *App, argument: []const u8) bool {
   path_storage: [4096]u8
   path := session_path(app, argument, path_storage[..])
-  if #len(path) == 0 || #len(path) > 3980 {
+  if path.len == 0 || path.len > 3980 {
     notice(app, "Invalid session path.")
     return false
   }
   state := workspace.State{}
   defer workspace.release(&state)
-  if !session_capture(app, &state, false) {
-    return false
-  }
+  if !session_capture(app, &state, false) { return false }
   snapshot_size := workspace.encoded_size(&state)
   allocated := arena_owner.try_create(snapshot_size)
   if allocated == nil {
@@ -219,7 +196,7 @@ fn session_save(app: *App, argument: []const u8) bool {
     return false
   }
   defer arena_owner.release(allocated)
-  bytes := mem.push_bytes_uninit(allocated, snapshot_size)
+  bytes := mem.push_bytes(allocated, snapshot_size)
   length := workspace.encode(&state, bytes)
   if length == 0 {
     notice(app, "Session exceeds snapshot capacity.")
@@ -228,17 +205,24 @@ fn session_save(app: *App, argument: []const u8) bool {
   temporary: [4096]u8
   used := copy_text(temporary[..], path)
   add_text(temporary[..], &used, ".tmp")
-  tx := fs.atomic_begin_private(path, temporary[..used])
-  if io.failed(tx.failure) {
+  tx := fs.atomic_begin_private(path, temporary[..used]) catch {
     notice(app, "Cannot create session snapshot. Ensure its parent directory exists and no .tmp file remains.")
     return false
   }
   defer {
-    if tx.transaction.active {
-      _ = fs.atomic_abort(&tx.transaction)
+    if tx.active {
+      fs.atomic_abort(&tx) catch {}
     }
   }
-  if io.failed(fs.set_permissions(&tx.transaction.file, 384).failure) || io.failed(fs.write(&tx.transaction.file, bytes[..length]).failure) || io.failed(fs.atomic_commit(&tx.transaction).failure) {
+  fs.set_permissions(&tx.file, 384) catch {
+    notice(app, "Session write failed.")
+    return false
+  }
+  fs.write(&tx.file, bytes[..length]) catch {
+    notice(app, "Session write failed.")
+    return false
+  }
+  fs.atomic_commit(&tx) catch {
     notice(app, "Session write failed.")
     return false
   }
@@ -250,7 +234,7 @@ fn session_restore(app: *App, argument: []const u8) bool {
     notice(app, "Apply or discard explorer edits before restoring a session.")
     return false
   }
-  for slot_index in 0..#len(app.documents.slots) {
+  for slot_index in 0..app.documents.slots.len {
     if app.documents.slots[slot_index].document != nil && (buffer.dirty_cached(app.documents.slots[slot_index].document) || app.documents.slots[slot_index].terminal.handle != nil) {
       notice(app, "Save/discard edits and close terminals before restoring a session.")
       return false
@@ -258,14 +242,15 @@ fn session_restore(app: *App, argument: []const u8) bool {
   }
   path_storage: [4096]u8
   path := session_path(app, argument, path_storage[..])
-  info := files.metadata(path)
-  if io.failed(info.failure) || (info.mode & 61440) != 32768 {
+  info := files.metadata(path) catch {
     notice(app, "Session must be a regular file.")
     return false
   }
-  if info.size > (#cast(usize, -1) - 4096) {
+  if (info.mode & 61440) != 32768 {
+    notice(app, "Session must be a regular file.")
     return false
   }
+  if info.size > (#cast(usize, -1) - 4096) { return false }
   session_limit := #cast(usize, info.size)
   allocated := arena_owner.try_create(session_limit + 4096)
   if allocated == nil {
@@ -273,10 +258,13 @@ fn session_restore(app: *App, argument: []const u8) bool {
     return false
   }
   defer arena_owner.release(allocated)
-  read := fs.read_all(allocated, path, session_limit)
   state := workspace.State{}
   defer workspace.release(&state)
-  if io.failed(read.failure) || !workspace.decode(read.value, &state) {
+  read := fs.read_all(allocated, path, session_limit) catch {
+    notice(app, "Invalid, truncated, or unsupported session. Workspace unchanged.")
+    return false
+  }
+  if !workspace.decode(read, &state) {
     notice(app, "Invalid, truncated, or unsupported session. Workspace unchanged.")
     return false
   }
@@ -284,17 +272,17 @@ fn session_restore(app: *App, argument: []const u8) bool {
   if count > #cast(usize, -1) / #sizeof(RestoredDocument) || count > #cast(u64, -1) - app.documents.next_identity {
     return false
   }
-  metadata := arena_owner.try_create(count * #sizeof(RestoredDocument))
+  metadata := arena_owner.try_create(count * #sizeof(RestoredDocument) + #alignof(RestoredDocument))
   if metadata == nil {
     notice(app, "Could not allocate restored buffer metadata. Workspace unchanged.")
     return false
   }
   defer arena_owner.release(metadata)
-  restored := mem.try_push_array(RestoredDocument, metadata, count)
-  if #len(restored) != count {
+  if mem.arena_room(metadata) < count * #sizeof(RestoredDocument) + #alignof(RestoredDocument) {
     notice(app, "Could not initialize restored metadata. Workspace unchanged.")
     return false
   }
+  restored := mem.push_array<RestoredDocument>(metadata, count)
   committed := false
   defer {
     if !committed {
@@ -312,17 +300,16 @@ fn session_restore(app: *App, argument: []const u8) bool {
       restored[index].arena = memory
       memory = nil
       restored[index].document = buffer.try_allocate(restored[index].arena)
-      colors := mem.arena_try_push_uninit(restored[index].arena, buffer.Capacity + 1, 1)
-      if restored[index].document == nil || !colors.ok {
+      if restored[index].document == nil || mem.arena_room(restored[index].arena) < buffer.Capacity + 1 {
         notice(app, "Could not initialize a restored buffer. Workspace unchanged.")
         return false
       }
-      restored[index].colors = #slice(colors.memory, buffer.Capacity + 1)
+      restored[index].colors = mem.push_bytes(restored[index].arena, buffer.Capacity + 1)
       doc := restored[index].document
       if saved.reload {
         // Read (or map) the file straight into storage the document adopts.
         disk := files.read_document(saved.path)
-        loaded := disk.valid && buffer.load_storage(doc, &disk.storage, #len(disk.data))
+        loaded := disk.valid && buffer.load_storage(doc, &disk.storage, disk.data.len)
         stamp := disk.stamp
         restored[index].stamp = stamp
         files.release_text(&disk)
@@ -333,7 +320,7 @@ fn session_restore(app: *App, argument: []const u8) bool {
         if saved.patched {
           // Edits apply only to the exact file they were made against.
           same := stamp.valid && stamp.inode == saved.stamp[0] && stamp.size == saved.stamp[1] && stamp.modify_seconds == saved.stamp[2] && stamp.modify_nanos == saved.stamp[3]
-          if same && #len(saved.pieces) > 0 {
+          if same && saved.pieces.len > 0 {
             if !recovery_apply_pieces(doc, saved) {
               notice(app, "Cannot apply recovered edits. Workspace and recovery record unchanged.")
               return false
@@ -374,8 +361,8 @@ fn session_restore(app: *App, argument: []const u8) bool {
   }
   // Growing the directory never moves existing Slot records. Restore failure
   // keeps any new empty metadata unpublished and reusable by a later attempt.
-  previous_length := #len(app.documents.slots)
-  for #len(app.documents.slots) < count {
+  previous_length := app.documents.slots.len
+  for app.documents.slots.len < count {
     if documents_append_slot(app) == nil {
       app.documents.slots = app.documents.index_storage[..previous_length]
       notice(app, "Could not grow restored buffer storage. Workspace unchanged.")
@@ -393,7 +380,7 @@ fn session_restore(app: *App, argument: []const u8) bool {
   app.documents.current = nil
   app.documents.file = nil
   app.documents.count = 0
-  for index in 0..#len(app.documents.slots) {
+  for index in 0..app.documents.slots.len {
     current := app.documents.slots[index]
     if current.document != nil {
       files.discard_recovery(&current.file)
@@ -432,7 +419,7 @@ fn session_restore(app: *App, argument: []const u8) bool {
       app.documents.next_identity += 1
       current.identity = app.documents.next_identity
       record := workspace.buffer_at(&state, index)
-      if #len(record.path) > 0 {
+      if record.path.len > 0 {
         _ = files.set_name(&current.file, record.path)
       }
       current.filetype_length = copy_text(current.filetype[..], record.filetype)
@@ -486,7 +473,7 @@ fn session_restore(app: *App, argument: []const u8) bool {
 }
 fn cleanup_restored(documents: []RestoredDocument) {
   index: usize = 0
-  for index < #len(documents) {
+  for index < documents.len {
     if documents[index].arena != nil {
       if documents[index].document != nil {
         buffer.release(documents[index].document)
@@ -505,25 +492,17 @@ fn recovery_release(app: *App) {
   }
 }
 fn recovery_tick(app: *App) {
-  if !app.config.recovery_enabled {
-    return
-  }
+  if !app.config.recovery_enabled { return }
   now := sdl.ticks()
-  if now - app.recovery.time < recovery_delay(app) {
-    return
-  }
+  if now - app.recovery.time < recovery_delay(app) { return }
   app.recovery.time = now
-  if !recovery_allowed(app) {
-    return
-  }
+  if !recovery_allowed(app) { return }
   if recovery_error(app.recovery.worker) != 0 {
     app.recovery.ready = false
     plugin_log(app, "Session recovery write failed. Save important edits explicitly.")
   }
   changed := recovery_needed(app)
-  if !changed {
-    return
-  }
+  if !changed { return }
   if app.recovery.worker == nil {
     path: [4096]u8
     parent := app.configuration.path_length
@@ -540,20 +519,16 @@ fn recovery_tick(app: *App) {
   }
   state := workspace.State{}
   defer workspace.release(&state)
-  if !session_capture(app, &state, true) {
-    return
-  }
+  if !session_capture(app, &state, true) { return }
   snapshot_size := workspace.encoded_size(&state)
   if snapshot_size > RecoveryRecordLimit {
     plugin_log(app, "Recovery snapshot exceeds its size limit. Previous recovery retained; save explicitly.")
     return
   }
   work := &app.operations.recovery_encode
-  if !work_acquire(app, work, snapshot_size, "recovery_encode") {
-    return
-  }
+  if !work_acquire(app, work, snapshot_size, "recovery_encode") { return }
   defer work_finish(app, work, "recovery_encode")
-  bytes := mem.push_bytes_uninit(work.arena, snapshot_size)
+  bytes := mem.push_bytes(work.arena, snapshot_size)
   encode_started := operation_begin(app)
   encoded_length := workspace.encode(&state, bytes)
   app.recovery.last_size = encoded_length
@@ -577,15 +552,12 @@ fn recovery_tick(app: *App) {
 }
 
 fn recovery_allowed(app: *App) bool {
-  if !app.config.recovery_enabled {
-    return false
-  }
+  if !app.config.recovery_enabled { return false }
   if !app.recovery.checked {
     env: [32]u8
-    disabled := host.environment("DNA_RECOVERY", env[..])
-    app.recovery.disabled = !io.failed(disabled.failure) && disabled.found && buffer.equal(disabled.value, "0")
-    smoke := host.environment("DYN_EDITOR_SMOKE", env[..])
-    if smoke.found {
+    disabled := host.environment("DNA_RECOVERY", env[..]) catch env[..0]
+    app.recovery.disabled = buffer.equal(disabled, "0")
+    if has_environment("DYN_EDITOR_SMOKE", env[..]) {
       app.recovery.disabled = true
     }
     app.recovery.checked = true

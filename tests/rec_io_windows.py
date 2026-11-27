@@ -55,7 +55,7 @@ fn main() {
   if rec_open(&junction[0],720896,0)>=0 || rec_errno().*!=95 { #panic("nofollow must refuse a junction") }
   template:[32]u8
   pattern:[]const u8="private-XXXXXX"
-  for at in 0..#len(pattern) { template[at]=pattern[at] }
+  for at in 0..pattern.len { template[at]=pattern[at] }
   fd=rec_temp(&template[0])
   if fd<0 || rec_write(fd,&changed[0],3)!=3 || rec_sync(fd)!=0 || rec_close(fd)!=0 { #panic("exclusive private temporary") }
   if rec_unlink(&template[0])!=0 { #panic("temporary cleanup") }

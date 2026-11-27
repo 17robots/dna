@@ -27,10 +27,11 @@ fn workset_stale_diagnostics(app:*App, slot:*Slot, version:usize) {
   add_text(message[..], &used, ",\"version\":")
   add_number(message[..], &used, version)
   add_text(message[..], &used, ",\"diagnostics\":[]}")
-  parsed:=json.parse(app.scratch, message[..used])
-  workset_check(parsed.failure.kind == parse.Kind.Ok)
+  parsed:=json.parse(app.scratch, message[..used]) catch {
+    #panic("LSP targeted workset contract")
+  }
   slot.diagnostics.count=1
-  _=lsp_diagnostics(app, 0, parsed.root)
+  _=lsp_diagnostics(app, 0, parsed)
   workset_check(slot.diagnostics.count==1)
 }
 fn main() {
@@ -40,23 +41,22 @@ fn main() {
   scratch:=arena_owner.create(2097152)
   defer arena_owner.release(owner)
   defer arena_owner.release(scratch)
-  app:=mem.push(App, owner)
+  app:=mem.push<App>(owner)
   app.scratch=scratch
   settings.defaults(&app.config)
   defer operations_release(app)
   defer release_editor_state(app)
   defer lsp_release(app)
   root:[4096]u8
-  directory:=host.environment("DNA_WORKSET_DIR", root[..])
+  directory:=host.environment("DNA_WORKSET_DIR", root[..]) catch { #panic("DNA_WORKSET_DIR") }
   command:[4096]u8
-  peer:=host.environment("DNA_WORKSET_LSP", command[..])
-  workset_check(directory.failure.kind == io.Kind.Ok && directory.found && peer.failure.kind == io.Kind.Ok && peer.found)
-  app.workspace.project_length=copy_text(app.workspace.project[..], directory.value)
+  peer:=host.environment("DNA_WORKSET_LSP", command[..]) catch { #panic("DNA_WORKSET_LSP") }
+  app.workspace.project_length=copy_text(app.workspace.project[..], directory)
   for i in 0..80 {
     workset_check(new_buffer(app))
     slot:=app.documents.slots[app.documents.active]
     path:[4096]u8
-    used:=copy_text(path[..], directory.value)
+    used:=copy_text(path[..], directory)
     add_text(path[..], &used, "/workset-")
     add_number(path[..], &used, i)
     add_text(path[..], &used, ".dyn")
@@ -64,10 +64,10 @@ fn main() {
     workset_check(buffer.load(slot.document, "alpha\n"))
     slot.filetype_length=copy_text(slot.filetype[..], "dyn")
   }
-  lsp_start(app, "dyn", peer.value)
+  lsp_start(app, "dyn", peer)
   workset_wait(app)
   server:=&app.lsp.servers[0]
-  workset_check(#len(server.documents)>=80)
+  workset_check(server.documents.len>=80)
   for i in 0..80 {
     workset_check(server.documents[i].identity==app.documents.slots[i].identity)
   }
@@ -109,7 +109,7 @@ fn main() {
   workset_check(new_buffer(app))
   custom:=app.documents.slots[app.documents.active]
   custom_path:[4096]u8
-  custom_used:=copy_text(custom_path[..], directory.value)
+  custom_used:=copy_text(custom_path[..], directory)
   add_text(custom_path[..], &custom_used, "/immediate.qzxbench")
   workset_check(files.set_name(&custom.file, custom_path[..custom_used]))
   workset_check(buffer.load(custom.document, "custom\n") && custom.filetype_length==0)
@@ -128,7 +128,7 @@ fn main() {
   workset_check(new_buffer(app) && app.documents.active==40)
   replacement:=app.documents.slots[40]
   path:[4096]u8
-  used:=copy_text(path[..], directory.value)
+  used:=copy_text(path[..], directory)
   add_text(path[..], &used, "/workset-40.dyn")
   workset_check(files.set_name(&replacement.file, path[..used]))
   workset_check(buffer.load(replacement.document, "new\n"))
@@ -145,7 +145,7 @@ fn main() {
   lsp_sync(app, 0, false)
   workset_check(new_buffer(app) && app.documents.active==0)
   occupant:=app.documents.slots[0]
-  used=copy_text(path[..], directory.value)
+  used=copy_text(path[..], directory)
   add_text(path[..], &used, "/occupant.dyn")
   workset_check(files.set_name(&occupant.file, path[..used]))
   workset_check(buffer.load(occupant.document, "occupant\n"))
@@ -156,7 +156,7 @@ fn main() {
   workset_check(server.documents[39].identity==0)
   workset_check(new_buffer(app) && app.documents.active==39)
   moved:=app.documents.slots[39]
-  used=copy_text(path[..], directory.value)
+  used=copy_text(path[..], directory)
   add_text(path[..], &used, "/workset-0.dyn")
   workset_check(files.set_name(&moved.file, path[..used]))
   workset_check(buffer.load(moved.document, "moved\n"))
@@ -168,12 +168,12 @@ fn main() {
   workset_check(buffer.replace(moved.document, "exhaustion"))
   lsp_sync(app, 0, true)
   workset_check(!server.ready && server.process==nil && server.documents_arena==nil)
-  lsp_start(app, "dyn", peer.value)
+  lsp_start(app, "dyn", peer)
   workset_wait(app)
   workset_check(server.next_document_version<2147483647 && server.documents[39].identity==moved.identity)
   lsp_stop(app, 0)
   workset_check(server.dirty_first==nil && server.attached_first==nil)
-  for i in 0..#len(app.documents.slots) {
+  for i in 0..app.documents.slots.len {
     slot:=app.documents.slots[i]
     workset_check(slot.lsp_dirty_mask==0 && slot.lsp_attached_mask==0)
   }

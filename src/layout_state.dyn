@@ -60,13 +60,13 @@ fn layout_tree_text(app: *App, index: usize, output: []u8, used: *usize) {
   add_text(output, used, ")")
 }
 fn layout_save(app: *App, argument: []const u8) {
-  if #len(argument) == 0 {
+  if argument.len == 0 {
     notice(app, "Use :layout-save /path/name.toml. Place it in the config layouts directory to appear in :layouts.")
     return
   }
   storage: [4096]u8
   path := expand_home(argument, storage[..])
-  if #len(path) == 0 || #len(path) > 3980 {
+  if path.len == 0 || path.len > 3980 {
     notice(app, "Invalid layout path.")
     return
   }
@@ -106,25 +106,28 @@ fn layout_save(app: *App, argument: []const u8) {
   } else {
     add_text(output[..], &used, "0\n")
   }
-  info := files.metadata(path)
-  if !io.failed(info.failure) && (info.mode & 61440) != 32768 {
+  info := files.metadata(path) catch fs.Metadata{}
+  if info.mode != 0 && (info.mode & 61440) != 32768 {
     notice(app, "Layout destination must be a regular file.")
     return
   }
   temporary: [4096]u8
   length := copy_text(temporary[..], path)
   add_text(temporary[..], &length, ".tmp")
-  tx := fs.atomic_begin(path, temporary[..length])
-  if io.failed(tx.failure) {
+  tx := fs.atomic_begin(path, temporary[..length]) catch {
     notice(app, "Cannot write layout; check parent directory and temporary file.")
     return
   }
   defer {
-    if tx.transaction.active {
-      _ = fs.atomic_abort(&tx.transaction)
+    if tx.active {
+      fs.atomic_abort(&tx) catch {}
     }
   }
-  if io.failed(fs.write(&tx.transaction.file, output[..used]).failure) || io.failed(fs.atomic_commit(&tx.transaction).failure) {
+  fs.write(&tx.file, output[..used]) catch {
+    notice(app, "Layout write failed.")
+    return
+  }
+  fs.atomic_commit(&tx) catch {
     notice(app, "Layout write failed.")
     return
   }

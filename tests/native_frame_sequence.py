@@ -13,12 +13,12 @@ import subprocess
 import sys
 import tempfile
 ROOT=Path(__file__).resolve().parents[1]
-FIXTURE=r'''use "vendor/window/wayland" window_api
+FIXTURE=r'''use window_api "vendor/window/wayland"
 use "vendor/window/events"
 use "std/ui/software"
-use "std/io" io
+use io "std/io"
 use "std/mem"
-use "./presenter" presenter
+use presenter "./presenter"
 #link("c")
 extern fn sequence_compare "memcmp"(first:*const u8,second:*const u8,length:usize)i32
 fn check(ok:bool,message:[]const u8) {if !ok {#panic(message)}}
@@ -37,20 +37,20 @@ fn verify(renderer:*presenter.Presenter,surface:software.Surface,readback:[]u8) 
 }
 fn main() {
  host:=window_api.Window{}
- check(window_api.open(&host,"DNA native frame sequence",320,160).kind == io.Kind.Ok,"sequence window")
+ window_api.open(&host,"DNA native frame sequence",320,160) catch { #panic("sequence window") }
  defer window_api.close(&host)
  window_api.listen_events(&host,true)
- _=window_api.set_swap_interval(&host,0)
+ window_api.set_swap_interval(&host,0) catch {}
  renderer:=presenter.Presenter{}
- check(!io.failed(presenter.open(&renderer).failure),"sequence presenter")
+ presenter.open(&renderer) catch { #panic("sequence presenter") }
  defer presenter.close(&renderer)
  owner:=mem.arena_alloc(0)
  defer mem.arena_release(owner)
  max_width:=host.width
  max_height:=host.height
  check(max_width>0 && max_height>0,"sequence dimensions")
- pixels:=mem.push_bytes_uninit(owner,#cast(usize,max_width)*#cast(usize,max_height)*4)
- readback:=mem.push_bytes_uninit(owner,#len(pixels))
+ pixels:=mem.push_bytes(owner,#cast(usize,max_width)*#cast(usize,max_height)*4)
+ readback:=mem.push_bytes(owner,pixels.len)
  // A stable background and glyph-like stripes make a lost text row or whole
  // pane visible to the exact comparison. Only a small region changes per frame.
  for y in 0..max_height {
@@ -65,7 +65,7 @@ fn main() {
   }
  }
  for frame in 0..FRAME_COUNT {
-  check(window_api.poll(&host).kind == io.Kind.Ok,"sequence event poll")
+  window_api.poll(&host) catch { #panic("sequence event poll") }
   event:=events.Event{}
   for window_api.next_event(&host,&event) {}
   // Keep CPU memory allocated and reuse it immediately after prior swap.
@@ -84,12 +84,12 @@ fn main() {
    height=max_height/2}
   length:=#cast(usize,width)*#cast(usize,height)*4
   surface:=software.Surface{pixels:pixels[..length],width:width,height:height,stride:#cast(usize,width)*4}
-  check(!io.failed(presenter.draw(&renderer,surface).failure),"sequence upload")
+  presenter.draw(&renderer,surface) catch { #panic("sequence upload") }
   verify(&renderer,surface,readback[..length])
-  check(window_api.swap(&host).kind == io.Kind.Ok,"sequence swap")
+  window_api.swap(&host) catch { #panic("sequence swap") }
   if frame%53==27 {
    presenter.close(&renderer)
-   check(!io.failed(presenter.open(&renderer).failure),"sequence recreate")
+   presenter.open(&renderer) catch { #panic("sequence recreate") }
   }
  }
 }

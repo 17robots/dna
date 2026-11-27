@@ -9,7 +9,7 @@ ROOT=Path(__file__).resolve().parents[1]
 source=Path(os.environ.get('DNA_PICKER_SOURCE',ROOT/'src'))
 BASE='''use "std/mem"
 use "./buffer"
-use "./platform" sdl
+use sdl "./platform"
 struct Entry {name:[512]u8,length:usize,directory:bool}
 enum Panel {None,Open,SaveAs}
 struct Resource {kind:usize,fonts:bool}
@@ -30,8 +30,8 @@ fn language_manager_refresh(app:*App){}
 fn task_refresh(app:*App){}
 fn font_refresh(app:*App){}
 fn lower(byte:u8)u8{return byte}
-fn contains(text:[]const u8,query:[]const u8)bool{if #len(query)>#len(text){return false} for at in 0..(#len(text)-#len(query)+1){if buffer.equal(text[at..at+#len(query)],query){return true}}return false}
-fn copy_text(output:[]u8,text:[]const u8)usize{for at in 0..#len(text){output[at]=text[at]}if #len(text)<#len(output){output[#len(text)]=0}return #len(text)}
+fn contains(text:[]const u8,query:[]const u8)bool{if query.len>text.len{return false} for at in 0..(text.len-query.len+1){if buffer.equal(text[at..at+query.len],query){return true}}return false}
+fn copy_text(output:[]u8,text:[]const u8)usize{for at in 0..text.len{output[at]=text[at]}if text.len<output.len{output[text.len]=0}return text.len}
 fn expand_home(path:[]const u8,output:[]u8)[]const u8{return path}
 '''
 CHECK='''fn main(){
@@ -78,7 +78,7 @@ CHECK='''fn main(){
 with tempfile.TemporaryDirectory(prefix='dna-picker-state-',dir=ROOT/'build') as d:
  stage=Path(d)
  shutil.copytree(ROOT/'src/owned_arena',stage/'owned_arena')
- (stage/'buffer').mkdir();(stage/'buffer/buffer.dyn').write_text('pub fn equal(a:[]const u8,b:[]const u8)bool{if #len(a)!=#len(b){return false}\nfor i in 0..#len(a){if a[i]!=b[i]{return false}}\nreturn true}\n')
+ (stage/'buffer').mkdir();(stage/'buffer/buffer.dyn').write_text('pub fn equal(a:[]const u8,b:[]const u8)bool{if a.len!=b.len{return false}\nfor i in 0..a.len{if a[i]!=b[i]{return false}}\nreturn true}\n')
  (stage/'platform').mkdir();(stage/'platform/platform.dyn').write_text('pub fn ticks()u64{return 100}\n')
  completion=(source/'completion.dyn').read_text()
  completion=completion[:completion.index('fn complete_path(')]

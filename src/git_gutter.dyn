@@ -37,9 +37,7 @@ struct GitDiff {
 
 fn git_release(slot: *Slot) {
   diff := slot.git
-  if diff == nil {
-    return
-  }
+  if diff == nil { return }
   if diff.job != nil {
     job_close(diff.job)
   }
@@ -63,7 +61,7 @@ fn git_hash_bytes(bytes: []const u8, output: []u64) usize {
   hash: u64 = 14695981039346656037
   for byte in bytes {
     if byte == 10 {
-      if count < #len(output) {
+      if count < output.len {
         output[count] = hash
       }
       count += 1
@@ -72,7 +70,7 @@ fn git_hash_bytes(bytes: []const u8, output: []u64) usize {
       hash = math.wrapping_mul(hash ^ byte, 1099511628211)
     }
   }
-  if count < #len(output) {
+  if count < output.len {
     output[count] = hash
   }
   return count + 1
@@ -83,12 +81,10 @@ fn git_hash_document(doc: *const buffer.Document, output: []u64) usize {
   at: usize = 0
   for at < doc.length {
     chunk := buffer.chunk_at(doc, at)
-    if #len(chunk) == 0 {
-      break
-    }
+    if chunk.len == 0 { break }
     for byte in chunk {
       if byte == 10 {
-        if count < #len(output) {
+        if count < output.len {
           output[count] = hash
         }
         count += 1
@@ -97,17 +93,15 @@ fn git_hash_document(doc: *const buffer.Document, output: []u64) usize {
         hash = math.wrapping_mul(hash ^ byte, 1099511628211)
       }
     }
-    at += #len(chunk)
+    at += chunk.len
   }
-  if count < #len(output) {
+  if count < output.len {
     output[count] = hash
   }
   return count + 1
 }
 fn git_hunk(diff: *GitDiff, first: usize, inserted: usize, deleted: usize) {
-  if (inserted == 0 && deleted == 0) || diff.hunk_count == GitMaxHunks {
-    return
-  }
+  if (inserted == 0 && deleted == 0) || diff.hunk_count == GitMaxHunks { return }
   kind := GitModified
   if deleted == 0 {
     kind = GitAdded
@@ -120,16 +114,16 @@ fn git_hunk(diff: *GitDiff, first: usize, inserted: usize, deleted: usize) {
 // Myers' shortest edit script between base[low..low+n] and current[low..low+m],
 // as hunks. False when it needs more than GitMaxEdits edits.
 fn git_myers(diff: *GitDiff, scratch: *mem.Arena, base: []const u64, current: []const u64, low: usize) bool {
-  n := #len(base)
-  m := #len(current)
+  n := base.len
+  m := current.len
   limit := n + m
   if limit > GitMaxEdits {
     limit = GitMaxEdits
   }
   width := 2 * limit + 3
   offset := limit + 1
-  trace := mem.push_array(i32, scratch, (limit + 1) * width)
-  v := mem.push_array(i32, scratch, width)
+  trace := mem.push_array<i32>(scratch, (limit + 1) * width)
+  v := mem.push_array<i32>(scratch, width)
   for index in 0..width {
     v[index] = 0
   }
@@ -157,16 +151,12 @@ fn git_myers(diff: *GitDiff, scratch: *mem.Arena, base: []const u64, current: []
       k += 2
     }
     _ = mem.copy(trace[d * width..], v[..width])
-    if found <= limit {
-      break
-    }
+    if found <= limit { break }
   }
-  if found > limit {
-    return false
-  }
+  if found > limit { return false }
   // Walk back from the end, recording each edit: insertions at their row of
   // the current text, deletions at the row they precede.
-  edits := mem.push_array(usize, scratch, (found + 1) * 2)
+  edits := mem.push_array<usize>(scratch, (found + 1) * 2)
   edit_count: usize = 0
   x := #cast(isize, n)
   y := #cast(isize, m)
@@ -232,20 +222,16 @@ fn git_myers(diff: *GitDiff, scratch: *mem.Arena, base: []const u64, current: []
 fn git_compute(diff: *GitDiff, doc: *const buffer.Document) {
   diff.hunk_count = 0
   diff.revision = doc.revision
-  if doc.length > GitMaxBytes {
-    return
-  }
+  if doc.length > GitMaxBytes { return }
   scratch := arena_owner.create(doc.line_count * 8 + 65536)
   defer arena_owner.release(scratch)
   rows := doc.line_count + 1
-  storage := mem.push_array(u64, scratch, rows)
+  storage := mem.push_array<u64>(scratch, rows)
   m := git_hash_document(doc, storage)
-  if m > rows {
-    return
-  }
+  if m > rows { return }
   current := storage[..m]
   base := diff.base
-  n := #len(base)
+  n := base.len
   prefix: usize = 0
   for prefix < n && prefix < m && base[prefix] == current[prefix] {
     prefix += 1
@@ -254,9 +240,7 @@ fn git_compute(diff: *GitDiff, doc: *const buffer.Document) {
   for suffix < n - prefix && suffix < m - prefix && base[n - 1 - suffix] == current[m - 1 - suffix] {
     suffix += 1
   }
-  if prefix == n && prefix == m {
-    return
-  }
+  if prefix == n && prefix == m { return }
   middle_base := base[prefix..n - suffix]
   middle_current := current[prefix..m - suffix]
   work := arena_owner.create((GitMaxEdits + 1) * (2 * GitMaxEdits + 3) * 4 + (GitMaxEdits + 1) * 16 + 65536)
@@ -264,14 +248,14 @@ fn git_compute(diff: *GitDiff, doc: *const buffer.Document) {
   if !git_myers(diff, work, middle_base, middle_current, prefix) {
     // Too many edits to align: mark the whole changed block.
     diff.hunk_count = 0
-    git_hunk(diff, prefix, #len(middle_current), #len(middle_base))
+    git_hunk(diff, prefix, middle_current.len, middle_base.len)
   }
 }
 fn git_fetch(slot: *Slot, path: []const u8) {
   diff := slot.git
   // Run in the file's directory with the bare name, so the repository and
   // its relative path both come from git.
-  split := #len(path)
+  split := path.len
   for split > 0 && path[split - 1] != '/' && path[split - 1] != 92 {
     split -= 1
   }
@@ -307,24 +291,18 @@ fn git_tick(app: *App) bool {
   now := sdl.ticks()
   for slot in app.documents.slots {
     doc := slot.document
-    if doc == nil || slot.terminal.handle != nil {
-      continue
-    }
+    if doc == nil || slot.terminal.handle != nil { continue }
     path := files.name(&slot.file)
-    if #len(path) == 0 {
-      continue
-    }
+    if path.len == 0 { continue }
     if slot.git == nil {
       owner := arena_owner.create(#sizeof(GitDiff) + 4096)
-      slot.git = mem.push(GitDiff, owner)
+      slot.git = mem.push<GitDiff>(owner)
       slot.git.owner = owner
     }
     diff := slot.git
     if diff.state == 1 {
       status := job_status(diff.job)
-      if status == 1 {
-        continue
-      }
+      if status == 1 { continue }
       length := #cast(usize, job_output_length(diff.job))
       if status != 2 || length > GitMaxBytes {
         diff.state = 3
@@ -333,7 +311,7 @@ fn git_tick(app: *App) bool {
           arena_owner.release(diff.arena)
         }
         diff.arena = arena_owner.create(length * 9 + 65536)
-        bytes := mem.push_bytes_uninit(diff.arena, length + 1)
+        bytes := mem.push_bytes(diff.arena, length + 1)
         _ = job_output(diff.job, &bytes[0], length + 1)
         rows: usize = 1
         for byte in bytes[..length] {
@@ -341,7 +319,7 @@ fn git_tick(app: *App) bool {
             rows += 1
           }
         }
-        storage := mem.push_array(u64, diff.arena, rows)
+        storage := mem.push_array<u64>(diff.arena, rows)
         diff.base = storage[..git_hash_bytes(bytes[..length], storage)]
         diff.state = 2
         diff.revision = 0
@@ -377,9 +355,7 @@ fn git_tick(app: *App) bool {
 }
 // The row after a hunk's marked rows; a deletion marks one row.
 fn git_hunk_end(hunk: GitHunk) usize {
-  if hunk.count == 0 {
-    return hunk.first + 1
-  }
+  if hunk.count == 0 { return hunk.first + 1 }
   return hunk.first + hunk.count
 }
 // Whether diff's hunks describe doc's current text.

@@ -1,4 +1,4 @@
-use "std/io" io
+use io "std/io"
 use "../host"
 #link("dna_native")
 // Terminal backend behind the platform and text APIs. DNA keeps laying out in
@@ -102,19 +102,17 @@ pub fn tui_active() bool {
 }
 // Take over the terminal. Returns false when stdin/stdout is not a terminal.
 pub fn tui_start() bool {
-  if tty_enter() == 0 {
-    return false
-  }
-  if #len(grid) == 0 {
+  if tty_enter() == 0 { return false }
+  if grid.len == 0 {
     // Keep bounded screen capacity separate from unrelated static data: the
     // loader can touch a huge BSS page before we can apply a residency hint.
     // Fresh owning mappings supply zero cells without touching unused rows.
     count := MaxColumns * MaxRows
     screen_storage = mem.arena_alloc(2 * count * #sizeof(Cell) + 1048576 + mem.ArenaBufferOverhead)
     host.small_pages(screen_storage.data)
-    grid = #slice((#cast(*Cell, mem.arena_push_uninit(screen_storage, count * #sizeof(Cell), #alignof(Cell)))), count)
-    shown = #slice((#cast(*Cell, mem.arena_push_uninit(screen_storage, count * #sizeof(Cell), #alignof(Cell)))), count)
-    output = mem.push_bytes_uninit(screen_storage, 1048576)
+    grid = mem.push_array<Cell>(screen_storage, count)
+    shown = mem.push_array<Cell>(screen_storage, count)
+    output = mem.push_bytes(screen_storage, 1048576)
   }
   state.active = true
   state.color = 0
@@ -127,55 +125,42 @@ pub fn tui_start() bool {
 }
 fn environment_is(name: []const u8, wanted: []const u8) bool {
   storage: [4096]u8
-  value := host.environment(name[..#len(name) - 1], storage[..])
-  return !io.failed(value.failure) && value.found && mem.equal(value.value, wanted)
+  value := host.environment(name[..name.len - 1], storage[..]) catch { return false }
+  return mem.equal(value, wanted)
 }
 fn environment_contains(name: []const u8, part: []const u8) bool {
   storage: [4096]u8
-  value := host.environment(name[..#len(name) - 1], storage[..])
-  return !io.failed(value.failure) && value.found && find(value.value, part, 0) < #len(value.value)
+  value := host.environment(name[..name.len - 1], storage[..]) catch { return false }
+  return find(value, part, 0) < value.len
 }
 // 24-bit color when the terminal says so (COLORTERM, a -direct TERM) or is
 // known to; DNA_TRUECOLOR=1 or 0 overrides either way.
 fn truecolor_supported() bool {
-  if environment_is("DNA_TRUECOLOR\0", "1") {
-    return true
-  }
-  if environment_is("DNA_TRUECOLOR\0", "0") {
-    return false
-  }
+  if environment_is("DNA_TRUECOLOR\0", "1") { return true }
+  if environment_is("DNA_TRUECOLOR\0", "0") { return false }
   if environment_is("COLORTERM\0", "truecolor") || environment_is("COLORTERM\0", "24bit") || environment_contains("TERM\0", "-direct") {
     return true
   }
   known: [6][]const u8 = ["kitty", "alacritty", "foot", "wezterm", "ghostty", "contour"]
   for name in known {
-    if environment_contains("TERM\0", name) {
-      return true
-    }
+    if environment_contains("TERM\0", name) { return true }
   }
   return false
 }
 // Curly, colored underlines where the terminal is known to draw them;
 // DNA_UNDERCURL=1 or 0 overrides. Others get a plain underline.
 fn undercurl_supported() bool {
-  if environment_is("DNA_UNDERCURL\0", "1") {
-    return true
-  }
-  if environment_is("DNA_UNDERCURL\0", "0") {
+  if environment_is("DNA_UNDERCURL\0", "1") { return true }
+  if environment_is("DNA_UNDERCURL\0", "0") { return false }
+  vte_storage: [4096]u8
+  _ = host.environment("VTE_VERSION", vte_storage[..]) catch {
+    known: [5][]const u8 = ["kitty", "wezterm", "foot", "ghostty", "contour"]
+    for name in known {
+      if environment_contains("TERM\0", name) { return true }
+    }
     return false
   }
-  vte_storage: [4096]u8
-  vte := host.environment("VTE_VERSION", vte_storage[..])
-  if !io.failed(vte.failure) && vte.found {
-    return true
-  }
-  known: [5][]const u8 = ["kitty", "wezterm", "foot", "ghostty", "contour"]
-  for name in known {
-    if environment_contains("TERM\0", name) {
-      return true
-    }
-  }
-  return false
+  return true
 }
 pub fn tui_stop() {
   if state.active {
@@ -218,9 +203,7 @@ fn cell_at(column: i32, row: i32) *Cell {
 }
 pub fn tui_clear() {
   state.last_valid = false
-  if state.texture_target {
-    return
-  }
+  if state.texture_target { return }
   for row in 0..state.rows {
     for column in 0..state.columns {
       cell_at(column, row).* = Cell{character: 32, foreground: 13948116, background: state.color}
@@ -291,12 +274,8 @@ fn cell_on_screen(column: i32, row: i32) bool {
 }
 // Whether the cell's centre is inside the clip and on screen.
 fn cell_visible(column: i32, row: i32) bool {
-  if column < 0 || row < 0 || column >= state.columns || row >= state.rows {
-    return false
-  }
-  if !state.clipping {
-    return true
-  }
+  if column < 0 || row < 0 || column >= state.columns || row >= state.rows { return false }
+  if !state.clipping { return true }
   x := #cast(f32, column) * CellWidth + CellWidth * 0.5
   y := #cast(f32, row) * CellHeight + CellHeight * 0.5
   return x >= #cast(f32, state.clip.x) && x < #cast(f32, (state.clip.x + state.clip.width)) && y >= #cast(f32, state.clip.y) && y < #cast(f32, (state.clip.y + state.clip.height))
@@ -310,9 +289,7 @@ fn to_row(y: f32) i32 {
 fn floor_cell(value: f32, size: f32) i32 {
   scaled := value / size
   truncated := #cast(i32, scaled)
-  if scaled < #cast(f32, truncated) {
-    return truncated - 1
-  }
+  if scaled < #cast(f32, truncated) { return truncated - 1 }
   return truncated
 }
 pub fn tui_fill(rectangle: *const Rect) {
@@ -320,9 +297,7 @@ pub fn tui_fill(rectangle: *const Rect) {
   y := rectangle.y + #cast(f32, state.origin_y)
   width := rectangle.width
   height := rectangle.height
-  if width <= 0.0 || height <= 0.0 {
-    return
-  }
+  if width <= 0.0 || height <= 0.0 { return }
   // A border is a fill in the border color followed by a fill inset by a
   // pixel or two: draw a box-drawing frame instead of losing it.
   previous := state.last_fill
@@ -337,9 +312,7 @@ pub fn tui_fill(rectangle: *const Rect) {
   }
   thin_width := width < CellWidth * 0.5
   thin_height := height < CellHeight * 0.4
-  if thin_width && thin_height {
-    return
-  }
+  if thin_width && thin_height { return }
   if thin_height {
     row := floor_cell(y, CellHeight)
     first := to_column(x)
@@ -347,9 +320,7 @@ pub fn tui_fill(rectangle: *const Rect) {
     // Low in its cell: an underline (diagnostics). Otherwise a border line.
     underline := y - #cast(f32, row) * CellHeight > CellHeight * 0.6
     for column in first..=last {
-      if !cell_visible(column, row) {
-        continue
-      }
+      if !cell_visible(column, row) { continue }
       cell := cell_at(column, row)
       if underline {
         cell.flags = cell.flags | Underline
@@ -390,9 +361,7 @@ pub fn tui_fill(rectangle: *const Rect) {
       return
     }
     for row in first_row..=last_row {
-      if !cell_visible(column, row) {
-        continue
-      }
+      if !cell_visible(column, row) { continue }
       cell := cell_at(column, row)
       bits: u8 = LineUp | LineDown
       if row == first_row {
@@ -465,9 +434,7 @@ fn tui_frame(outer: Rect, border: u32) {
   last_column := to_column(outer.x + outer.width) - 1
   first_row := to_row(outer.y)
   last_row := to_row(outer.y + outer.height) - 1
-  if last_column - first_column < 1 || last_row - first_row < 1 {
-    return
-  }
+  if last_column - first_column < 1 || last_row - first_row < 1 { return }
   if first_row > 0 {
     first_row -= 1
   }
@@ -476,9 +443,7 @@ fn tui_frame(outer: Rect, border: u32) {
   }
   for row in first_row..=last_row {
     for column in first_column..=last_column {
-      if !cell_visible(column, row) {
-        continue
-      }
+      if !cell_visible(column, row) { continue }
       bits: u8 = 0
       if row == first_row || row == last_row {
         if column > first_column {
@@ -501,9 +466,7 @@ fn tui_frame(outer: Rect, border: u32) {
   }
 }
 fn put_character(column: i32, row: i32, character: u32, foreground: u32, italic: bool) {
-  if !cell_visible(column, row) {
-    return
-  }
+  if !cell_visible(column, row) { return }
   cell := cell_at(column, row)
   cell.character = character
   cell.foreground = foreground
@@ -567,23 +530,21 @@ pub fn tui_text_wrap(handle: rawptr, pixels: i32) {
   (#cast(*TuiText, handle)).wrap = pixels
 }
 fn text_bytes(text: *const TuiText) []const u8 {
-  if text.bytes == nil {
-    return ""
-  }
+  if text.bytes == nil { return "" }
   return #slice((#cast(*const u8, text.bytes)), text.length)
 }
 // Decode one UTF-8 codepoint; invalid bytes read as themselves.
 fn decode(bytes: []const u8, at: usize, width: *usize) u32 {
   first := bytes[at]
-  if first < 128 || at + 1 >= #len(bytes) {
+  if first < 128 || at + 1 >= bytes.len {
     width.* = 1
     return first
   }
-  if first >= 240 && at + 3 < #len(bytes) {
+  if first >= 240 && at + 3 < bytes.len {
     width.* = 4
     return ((#cast(u32, first) & 7) << 18) | ((#cast(u32, bytes[at + 1]) & 63) << 12) | ((#cast(u32, bytes[at + 2]) & 63) << 6) | (#cast(u32, bytes[at + 3]) & 63)
   }
-  if first >= 224 && at + 2 < #len(bytes) {
+  if first >= 224 && at + 2 < bytes.len {
     width.* = 3
     return ((#cast(u32, first) & 15) << 12) | ((#cast(u32, bytes[at + 1]) & 63) << 6) | (#cast(u32, bytes[at + 2]) & 63)
   }
@@ -609,9 +570,7 @@ fn display_width(character: u32) i32 {
 struct LayoutStep { offset: usize, bytes: usize, character: u32, column: i32, row: i32, width: i32 }
 fn layout_next(text: *const TuiText, step: *LayoutStep) bool {
   bytes := text_bytes(text)
-  if step.offset >= #len(bytes) {
-    return false
-  }
+  if step.offset >= bytes.len { return false }
   // Advance past the previous codepoint.
   if step.bytes > 0 {
     step.offset += step.bytes
@@ -623,9 +582,7 @@ fn layout_next(text: *const TuiText, step: *LayoutStep) bool {
     } else {
       step.column += step.width
     }
-    if step.offset >= #len(bytes) {
-      return false
-    }
+    if step.offset >= bytes.len { return false }
   }
   width: usize = 1
   step.character = decode(bytes, step.offset, &width)
@@ -679,7 +636,7 @@ pub fn tui_text_size(handle: rawptr, width: *i32, height: *i32) {
     }
   }
   bytes := text_bytes(text)
-  if #len(bytes) > 0 && bytes[#len(bytes) - 1] == 10 {
+  if bytes.len > 0 && bytes[bytes.len - 1] == 10 {
     rows += 1
   }
   width.* = widest * #cast(i32, CellWidth)
@@ -726,9 +683,7 @@ pub fn tui_text_at_point(handle: rawptr, x: i32, y: i32) i32 {
     if step.row == row && (column < step.column + step.width || step.character == 10) {
       return #cast(i32, step.offset)
     }
-    if step.row > row {
-      return #cast(i32, step.offset)
-    }
+    if step.row > row { return #cast(i32, step.offset) }
   }
   return #cast(i32, text.length)
 }
@@ -749,7 +704,7 @@ pub fn tui_measure_string(bytes: *const u8, length: usize, width: *i32, height: 
 // Present: write what changed since the last frame.
 
 fn emit(bytes: []const u8) {
-  if output_used + #len(bytes) > #len(output) {
+  if output_used + bytes.len > output.len {
     tty_write(&output[0], output_used)
     output_used = 0
   }
@@ -766,9 +721,7 @@ fn emit_number(value: u32) {
     digits[11 - count] = #cast(u8, (remaining % 10)) + '0'
     count += 1
     remaining /= 10
-    if remaining == 0 {
-      break
-    }
+    if remaining == 0 { break }
   }
   emit(digits[12 - count..])
 }
@@ -833,18 +786,12 @@ fn emit_underline_color(color: u32) {
 // The closest xterm-256 color: the 6x6x6 cube (16-231) or the gray ramp
 // (232-255), whichever is nearer.
 fn cube_level(value: u32) u32 {
-  if value < 48 {
-    return 0
-  }
-  if value < 115 {
-    return 1
-  }
+  if value < 48 { return 0 }
+  if value < 115 { return 1 }
   return (value - 35) / 40
 }
 fn cube_value(level: u32) u32 {
-  if level == 0 {
-    return 0
-  }
+  if level == 0 { return 0 }
   return level * 40 + 55
 }
 fn distance(red: u32, green: u32, blue: u32, other_red: u32, other_green: u32, other_blue: u32) u32 {
@@ -871,9 +818,7 @@ fn nearest_256(color: u32) u32 {
   }
   gray_value := step * 10 + 8
   gray := distance(red, green, blue, gray_value, gray_value, gray_value)
-  if gray < cube {
-    return step + 232
-  }
+  if gray < cube { return step + 232 }
   return r * 36 + g * 6 + b + 16
 }
 fn box_character(flags: u8) u32 {
@@ -895,9 +840,7 @@ fn box_character(flags: u8) u32 {
     }
     return 9532
   }
-  if horizontal {
-    return 9472
-  }
+  if horizontal { return 9472 }
   return 9474
 }
 pub fn tui_present() {
@@ -1077,9 +1020,7 @@ pub fn tui_clipboard_get() *const u8 {
     }
   }
   copy := heap_alloc(length + 1)
-  if copy == nil {
-    return nil
-  }
+  if copy == nil { return nil }
   target := #slice((#cast(*u8, copy)), length + 1)
   if length > 0 {
     _ = native_span_copy(&target[0], #cast(*const u8, state.clipboard), length, length + 1)
@@ -1105,9 +1046,7 @@ const ModAlt: u16 = 768
 const ModCtrl: u16 = 192
 
 fn queue(event: Event) {
-  if state.event_count == 64 {
-    return
-  }
+  if state.event_count == 64 { return }
   state.events[(state.event_head + state.event_count) % 64] = event
   state.event_count += 1
 }
@@ -1126,13 +1065,11 @@ fn queue_key(key: u32, modifiers: u16, character: u32) {
 // it. take delivers it only if text input was on when its key was taken.
 const PendingText: u64 = 0x10303
 fn queue_text(bytes: []const u8) {
-  if #len(bytes) == 0 || #len(bytes) >= 256 {
-    return
-  }
+  if bytes.len == 0 || bytes.len >= 256 { return }
   slot_index := state.text_next
   state.text_next = (state.text_next + 1) % 64
   _ = mem.copy(state.texts[slot_index][..], bytes)
-  state.texts[slot_index][#len(bytes)] = 0
+  state.texts[slot_index][bytes.len] = 0
   event := Event{}
   text := #cast(*TextEvent, &event)
   text.text = &state.texts[slot_index][0]
@@ -1154,9 +1091,7 @@ fn queue_character(character: u32, modifiers: u16, bytes: []const u8) {
 }
 fn kitty_modifiers(value: u32) u16 {
   // 1 + bit flags; 0 is malformed and means none.
-  if value == 0 {
-    return 0
-  }
+  if value == 0 { return 0 }
   bits := value - 1
   modifiers: u16 = 0
   if (bits & 1) != 0 {
@@ -1172,55 +1107,23 @@ fn kitty_modifiers(value: u32) u16 {
 }
 // Internal keycodes for special keys (scancode | 1 << 30).
 fn special_key(final: u8, number: u32) u32 {
-  if final == 'A' {
-    return 1073741906
-  }
-  if final == 'B' {
-    return 1073741905
-  }
-  if final == 'C' {
-    return 1073741903
-  }
-  if final == 'D' {
-    return 1073741904
-  }
-  if final == 'H' {
-    return 1073741898
-  }
-  if final == 'F' {
-    return 1073741901
-  }
-  if final == 'P' {
-    return 1073741882
-  }
+  if final == 'A' { return 1073741906 }
+  if final == 'B' { return 1073741905 }
+  if final == 'C' { return 1073741903 }
+  if final == 'D' { return 1073741904 }
+  if final == 'H' { return 1073741898 }
+  if final == 'F' { return 1073741901 }
+  if final == 'P' { return 1073741882 }
   if final == '~' {
-    if number == 1 || number == 7 {
-      return 1073741898
-    }
-    if number == 4 || number == 8 {
-      return 1073741901
-    }
-    if number == 5 {
-      return 1073741899
-    }
-    if number == 6 {
-      return 1073741902
-    }
-    if number == 3 {
-      return 127
-    }
-    if number == 2 {
-      return 1073741897
-    }
-    if number >= 11 && number <= 15 {
-      return 1073741882 + (number - 11)
-    }
-    if number >= 17 && number <= 21 {
-      return 1073741887 + (number - 17)
-    }
-    if number == 23 || number == 24 {
-      return 1073741892 + (number - 23)
-    }
+    if number == 1 || number == 7 { return 1073741898 }
+    if number == 4 || number == 8 { return 1073741901 }
+    if number == 5 { return 1073741899 }
+    if number == 6 { return 1073741902 }
+    if number == 3 { return 127 }
+    if number == 2 { return 1073741897 }
+    if number >= 11 && number <= 15 { return 1073741882 + (number - 11) }
+    if number >= 17 && number <= 21 { return 1073741887 + (number - 17) }
+    if number == 23 || number == 24 { return 1073741892 + (number - 23) }
   }
   return 0
 }
@@ -1271,21 +1174,17 @@ fn mouse_event(kind: u32, button: u8, column: i32, row: i32, down: bool) {
 const PasteLimit: usize = 67108864
 pub const PasteEvent: u32 = 32769
 fn paste_append(bytes: []const u8) {
-  if #len(bytes) == 0 || state.paste_length + #len(bytes) > PasteLimit {
-    return
-  }
-  if state.paste_length + #len(bytes) > state.paste_capacity {
+  if bytes.len == 0 || state.paste_length + bytes.len > PasteLimit { return }
+  if state.paste_length + bytes.len > state.paste_capacity {
     capacity := state.paste_capacity * 2
     if capacity < 65536 {
       capacity = 65536
     }
-    for capacity < state.paste_length + #len(bytes) {
+    for capacity < state.paste_length + bytes.len {
       capacity *= 2
     }
     grown := heap_alloc(capacity)
-    if grown == nil {
-      return
-    }
+    if grown == nil { return }
     if state.paste != nil {
       if state.paste_length > 0 {
         _ = native_span_copy(#cast(*u8, grown), #cast(*const u8, state.paste), state.paste_length, state.paste_length + 1)
@@ -1295,8 +1194,8 @@ fn paste_append(bytes: []const u8) {
     state.paste = grown
     state.paste_capacity = capacity
   }
-  _ = native_span_copy(#offset(#cast(*u8, state.paste), state.paste_length), &bytes[0], #len(bytes), #len(bytes) + 1)
-  state.paste_length += #len(bytes)
+  _ = native_span_copy(&#slice(#cast(*u8, state.paste), state.paste_capacity)[state.paste_length], &bytes[0], bytes.len, bytes.len + 1)
+  state.paste_length += bytes.len
 }
 // Inside a paste: everything up to ESC [201~ is text, never keys, however
 // many reads it spans. Holds back a possible partial terminator.
@@ -1309,23 +1208,19 @@ fn paste_finish() {
 fn paste_continue() usize {
   bytes := state.input[..state.input_used]
   terminator := find(bytes, "\x1b[201~", 0)
-  if terminator < #len(bytes) {
+  if terminator < bytes.len {
     paste_append(bytes[..terminator])
     paste_finish()
     return terminator + 6
   }
-  if #len(bytes) <= 5 {
-    return 0
-  }
-  keep := #len(bytes) - 5
+  if bytes.len <= 5 { return 0 }
+  keep := bytes.len - 5
   paste_append(bytes[..keep])
   return keep
 }
 // The finished paste, valid until tui_paste_clear.
 pub fn tui_paste() []const u8 {
-  if state.paste == nil {
-    return ""
-  }
+  if state.paste == nil { return "" }
   return #slice((#cast(*const u8, state.paste)), state.paste_length)
 }
 pub fn tui_paste_clear() {
@@ -1339,9 +1234,7 @@ pub fn tui_paste_clear() {
 // Parse one sequence from the front of the input. Returns bytes consumed, or
 // 0 when the sequence is incomplete.
 fn parse_one(force_escape: bool) usize {
-  if state.pasting {
-    return paste_continue()
-  }
+  if state.pasting { return paste_continue() }
   bytes := state.input[..state.input_used]
   first := bytes[0]
   if first != 27 {
@@ -1379,19 +1272,15 @@ fn parse_one(force_escape: bool) usize {
       if first >= 240 {
         width = 4
       }
-      if #len(bytes) < width {
-        return 0
-      }
+      if bytes.len < width { return 0 }
     }
     decoded_width: usize = 1
     character := decode(bytes, 0, &decoded_width)
     queue_character(character, 0, bytes[..width])
     return width
   }
-  if #len(bytes) == 1 {
-    if !force_escape {
-      return 0
-    }
+  if bytes.len == 1 {
+    if !force_escape { return 0 }
     queue_key(27, 0, 0)
     return 1
   }
@@ -1430,13 +1319,13 @@ fn parse_one(force_escape: bool) usize {
   }
   // CSI / SS3: parameters, then a final byte in 64..126.
   end: usize = 2
-  for end < #len(bytes) && (bytes[end] < 64 || bytes[end] > 126) {
+  for end < bytes.len && (bytes[end] < 64 || bytes[end] > 126) {
     end += 1
   }
-  if end == #len(bytes) {
-    if #len(bytes) > 64 || force_escape {
+  if end == bytes.len {
+    if bytes.len > 64 || force_escape {
       // Unterminated: drop it.
-      return #len(bytes)
+      return bytes.len
     }
     return 0
   }
@@ -1450,7 +1339,7 @@ fn parse_one(force_escape: bool) usize {
     return end + 1
   }
   // SGR mouse: ESC [ < b ; x ; y M|m
-  if #len(parameters) > 0 && parameters[0] == '<' && (final == 'M' || final == 'm') {
+  if parameters.len > 0 && parameters[0] == '<' && (final == 'M' || final == 'm') {
     values: [3]u32
     count := numbers(parameters[1..], values[..])
     if count == 3 {
@@ -1554,13 +1443,11 @@ fn encode(character: u32, encoded: []u8) usize {
 }
 fn find(bytes: []const u8, pattern: []const u8, from: usize) usize {
   at := from
-  for at + #len(pattern) <= #len(bytes) {
-    if mem.equal(bytes[at..at + #len(pattern)], pattern) {
-      return at
-    }
+  for at + pattern.len <= bytes.len {
+    if mem.equal(bytes[at..at + pattern.len], pattern) { return at }
     at += 1
   }
-  return #len(bytes)
+  return bytes.len
 }
 fn numbers(text: []const u8, values: []u32) usize {
   count: usize = 0
@@ -1573,7 +1460,7 @@ fn numbers(text: []const u8, values: []u32) usize {
       }
       digits = true
     } else if byte == ';' || byte == ':' {
-      if count < #len(values) && digits {
+      if count < values.len && digits {
         values[count] = value
       }
       count += 1
@@ -1581,7 +1468,7 @@ fn numbers(text: []const u8, values: []u32) usize {
       digits = false
     }
   }
-  if digits && count < #len(values) {
+  if digits && count < values.len {
     values[count] = value
     count += 1
   }
@@ -1592,19 +1479,15 @@ fn parse_input(force_escape: bool) {
   // room and leave the rest of the bytes for after it drains.
   for state.input_used > 0 && state.event_count + 4 <= 64 {
     used := parse_one(force_escape)
-    if used == 0 {
-      return
-    }
+    if used == 0 { return }
     remaining := state.input_used - used
     _ = mem.move(state.input[..], state.input[used..used + remaining])
     state.input_used = remaining
   }
 }
 fn read_input(timeout: i32) i32 {
-  if state.input_used >= #len(state.input) {
-    return 0
-  }
-  count := tty_read(&state.input[state.input_used], #cast(i32, (#len(state.input) - state.input_used)), timeout)
+  if state.input_used >= state.input.len { return 0 }
+  count := tty_read(&state.input[state.input_used], #cast(i32, (state.input.len - state.input_used)), timeout)
   if count > 0 {
     state.input_used += #cast(usize, count)
     if state.pasting {
@@ -1618,15 +1501,11 @@ fn read_input(timeout: i32) i32 {
 }
 fn take(event: *Event) bool {
   for {
-    if state.event_count == 0 {
-      return false
-    }
+    if state.event_count == 0 { return false }
     event.* = state.events[state.event_head]
     state.event_head = (state.event_head + 1) % 64
     state.event_count -= 1
-    if (event.words[0] & 4294967295) != PendingText {
-      break
-    }
+    if (event.words[0] & 4294967295) != PendingText { break }
     if state.key_text_input {
       event.words[0] = (event.words[0] & 0xFFFFFFFF00000000) | 771
       break
@@ -1649,18 +1528,12 @@ fn take(event: *Event) bool {
 // Wait up to milliseconds (-1 forever) for an event, with a bounded native wait.
 pub fn tui_wait(event: *Event, milliseconds: i32) bool {
   // Thread wake-ups and pushed events arrive through the native queue.
-  if sdl_poll(event) {
-    return true
-  }
-  if take(event) {
-    return true
-  }
+  if sdl_poll(event) { return true }
+  if take(event) { return true }
   // Bytes left over when the queue filled come before any new read.
   if state.input_used > 0 {
     parse_input(false)
-    if take(event) {
-      return true
-    }
+    if take(event) { return true }
   }
   if tty_resized() != 0 {
     tui_measure()
@@ -1692,9 +1565,7 @@ pub fn tui_wait(event: *Event, milliseconds: i32) bool {
   // Woken by a worker thread: consume a queued native event or synthesize
   // a user event so either frontend runs its pending service work.
   if count == -2 {
-    if sdl_poll(event) {
-      return true
-    }
+    if sdl_poll(event) { return true }
     wake := Event{}
     wake.words[0] = WorkerWakeEvent
     event.* = wake
@@ -1707,9 +1578,7 @@ pub fn tui_wait(event: *Event, milliseconds: i32) bool {
     return true
   }
   parse_input(count == 0 && escape_pending)
-  if take(event) {
-    return true
-  }
+  if take(event) { return true }
   return sdl_poll(event)
 }
 pub fn tui_poll(event: *Event) bool {
@@ -1726,9 +1595,7 @@ pub fn tui_modifiers() u16 {
 extern fn tty_suspend "dna_tty_suspend"() i32
 // Stop DNA as a shell job; on `fg`, redraw everything at the current size.
 pub fn tui_suspend() bool {
-  if !state.active || tty_suspend() == 0 {
-    return false
-  }
+  if !state.active || tty_suspend() == 0 { return false }
   tui_measure()
   state.full_redraw = true
   return true
@@ -1736,24 +1603,16 @@ pub fn tui_suspend() bool {
 
 // Borrowed until the next text mutation or destruction.
 pub fn tui_text_bytes(handle:rawptr) []const u8 {
-  if handle==nil {
-    return ""
-  }
+  if handle==nil { return "" }
   text:=#cast(*TuiText, handle)
-  if !text.alive {
-    return ""
-  }
+  if !text.alive { return "" }
   return text_bytes(text)
 }
 // Linear cell walk for selection and other read-only geometry consumers.
 pub fn tui_text_visit(handle:rawptr, callback:fn(rawptr, usize, usize, i32, i32, i32, i32, i32)bool, data:rawptr) bool {
-  if handle==nil || callback==nil {
-    return false
-  }
+  if handle==nil || callback==nil { return false }
   text:=#cast(*TuiText, handle)
-  if !text.alive {
-    return false
-  }
+  if !text.alive { return false }
   step:=LayoutStep{}
   for layout_next(text, &step) {
     width:=step.width

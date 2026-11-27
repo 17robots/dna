@@ -1,27 +1,19 @@
-use "std/parse" parse
+use parse "std/parse"
 fn lsp_edit_file(app: *App, uri: []const u8, edits: *const json.Value, version: *const json.Value) bool {
   plan := &app.lsp.edits
-  if plan.count == 16 {
-    return false
-  }
+  if plan.count == 16 { return false }
   path: [4096]u8
   decoded := lsp.path(uri, path[..])
-  if #len(decoded) == 0 {
-    return false
-  }
+  if decoded.len == 0 { return false }
   for index in 0..plan.count {
-    if buffer.equal(plan.files[index].path[..plan.files[index].length], decoded) {
-      return false
-    }
+    if buffer.equal(plan.files[index].path[..plan.files[index].length], decoded) { return false }
   }
   item := &plan.files[plan.count]
   item.slot = #cast(usize, -1)
   item.length = copy_text(item.path[..], decoded)
   for slot, slot_index in app.documents.slots {
     if slot.document != nil && buffer.equal(files.name(&slot.file), decoded) {
-      if slot_index >= #len(app.lsp.servers[app.lsp.results.server].documents) {
-        return false
-      }
+      if slot_index >= app.lsp.servers[app.lsp.results.server].documents.len { return false }
       tracked := &app.lsp.servers[app.lsp.results.server].documents[slot_index]
       if tracked.identity != slot.identity || tracked.revision != slot.document.revision {
         return false
@@ -33,31 +25,23 @@ fn lsp_edit_file(app: *App, uri: []const u8, edits: *const json.Value, version: 
       item.slot = slot_index
       item.identity = slot.identity
       item.revision = slot.document.revision
-      storage := mem.push_bytes_uninit(plan.arena, slot.document.length + 1)
+      storage := mem.push_bytes(plan.arena, slot.document.length + 1)
       _ = copy_text(storage, buffer.all(slot.document))
       item.before = storage[..slot.document.length]
       break
     }
   }
   if item.slot == #cast(usize, -1) {
-    if !json.is_missing(version) && !json.is_null(version) {
-      return false
-    }
-    info := files.metadata(decoded)
-    if io.failed(info.failure) || (info.mode & 61440) != 32768 {
-      return false
-    }
-    read := fs.read_all(plan.arena, decoded, buffer.Capacity)
-    if io.failed(read.failure) || !buffer.valid(read.value) {
-      return false
-    }
-    item.before = read.value
+    if !json.is_missing(version) && !json.is_null(version) { return false }
+    info := files.metadata(decoded) catch { return false }
+    if (info.mode & 61440) != 32768 { return false }
+    read := fs.read_all(plan.arena, decoded, buffer.Capacity) catch { return false }
+    if !buffer.valid(read) { return false }
+    item.before = read
   }
-  output := mem.push_bytes_uninit(plan.arena, buffer.Capacity + 1)
+  output := mem.push_bytes(plan.arena, buffer.Capacity + 1)
   applied := lsp.edits(item.before, edits, output)
-  if !applied.valid {
-    return false
-  }
+  if !applied.valid { return false }
   item.after = output[..applied.value]
   plan.count += 1
   return true
@@ -110,9 +94,9 @@ fn lsp_preview_edits(app: *App) {
     preview := &app.lsp.edits.files[index]
     add_text(app.prompt_state.message[..], &app.prompt_state.message_length, preview.path[..preview.length])
     add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\n")
-    add_number(app.prompt_state.message[..], &app.prompt_state.message_length, #len(preview.before))
+    add_number(app.prompt_state.message[..], &app.prompt_state.message_length, preview.before.len)
     add_text(app.prompt_state.message[..], &app.prompt_state.message_length, " -> ")
-    add_number(app.prompt_state.message[..], &app.prompt_state.message_length, #len(preview.after))
+    add_number(app.prompt_state.message[..], &app.prompt_state.message_length, preview.after.len)
     add_text(app.prompt_state.message[..], &app.prompt_state.message_length, " bytes\n")
     diff_preview(app.prompt_state.message[..], &app.prompt_state.message_length, preview.before, preview.after)
     add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\n")
@@ -127,7 +111,7 @@ fn lsp_apply(app: *App) {
   plan := &app.lsp.edits
   for index in 0..plan.count {
     item := &plan.files[index]
-    if item.slot < #len(app.documents.slots) {
+    if item.slot < app.documents.slots.len {
       slot := app.documents.slots[item.slot]
       if slot.document == nil || slot.identity != item.identity || slot.document.revision != item.revision {
         notice(app, "Buffer changed after preview. Nothing applied.")
@@ -141,9 +125,9 @@ fn lsp_apply(app: *App) {
           return
         }
       }
-      info := files.metadata(item.path[..item.length])
+      info := files.metadata(item.path[..item.length]) catch fs.Metadata{}
       read := files.read_text(item.path[..item.length])
-      same := !io.failed(info.failure) && (info.mode & 61440) == 32768 && read.valid && buffer.equal(read.data, item.before)
+      same := (info.mode & 61440) == 32768 && read.valid && buffer.equal(read.data, item.before)
       files.release_text(&read)
       if !same {
         notice(app, "File changed after preview. Nothing applied.")
@@ -208,14 +192,14 @@ fn lsp_completion(app: *App, item: *const json.Value) {
   allocated := arena_owner.create(((buffer.Capacity + 1) * 24))
   defer arena_owner.release(allocated)
   capacity := (buffer.Capacity + 1) * 6
-  message := mem.push_bytes_uninit(allocated, capacity)
-  encoded := mem.push_bytes_uninit(allocated, capacity)
+  message := mem.push_bytes(allocated, capacity)
+  encoded := mem.push_bytes(allocated, capacity)
   used := copy_text(message, "{\"changes\":{")
   lsp_document_uri(message, &used, files.name(&slot.file))
   add_text(message, &used, ":[")
   edit := json.object_get(item, "textEdit")
   content := json_text(item, "insertText")
-  if #len(content) == 0 {
+  if content.len == 0 {
     content = json_text(item, "label")
   }
   if json.is_object(edit) {
@@ -224,7 +208,7 @@ fn lsp_completion(app: *App, item: *const json.Value) {
   snippet := lsp.Snippet{}
   insertion_start := state.position
   if format.value == 2 {
-    plain := mem.push_bytes_uninit(allocated, buffer.Capacity + 1)
+    plain := mem.push_bytes(allocated, buffer.Capacity + 1)
     snippet = lsp.parse_snippet(content, plain)
     if !snippet.valid {
       notice(app, "Completion uses unsupported snippet variables, choices, or transforms; buffer unchanged.")
@@ -263,7 +247,7 @@ fn lsp_completion(app: *App, item: *const json.Value) {
       }
       prefix = previous
     }
-    if prefix > 0 && #len(content) > 0 && content[0] == '#' && buffer.byte_at(doc, prefix - 1) == '#' {
+    if prefix > 0 && content.len > 0 && content[0] == '#' && buffer.byte_at(doc, prefix - 1) == '#' {
       prefix -= 1
     }
     insertion_start = prefix
@@ -280,7 +264,7 @@ fn lsp_completion(app: *App, item: *const json.Value) {
     extra := additional.first
     for extra != nil {
       serialized := lsp_json_encode(encoded, extra)
-      if #len(serialized) == 0 || used + #len(serialized) + 8 >= capacity {
+      if serialized.len == 0 || used + serialized.len + 8 >= capacity {
         notice(app, "Completion exceeds message capacity.")
         return
       }
@@ -290,12 +274,11 @@ fn lsp_completion(app: *App, item: *const json.Value) {
     }
   }
   add_text(message, &used, "]}}")
-  parsed := json.parse(allocated, message[..used])
-  if parse.failed(parsed.failure) {
+  parsed := json.parse(allocated, message[..used]) catch {
     notice(app, "Invalid completion edit.")
     return
   }
-  lsp_prepare_edit(app, parsed.root)
+  lsp_prepare_edit(app, parsed)
   if app.prompt_state.panel == Panel.LspEdit && snippet.valid {
     adjusted := insertion_start
     extra_edit := additional.first
@@ -304,7 +287,7 @@ fn lsp_completion(app: *App, item: *const json.Value) {
       extra_start := lsp.json_offset(buffer.all(slot.document), json.object_get(extra_range, "start"))
       extra_end := lsp.json_offset(buffer.all(slot.document), json.object_get(extra_range, "end"))
       if extra_start.valid && extra_end.valid && extra_end.value <= insertion_start {
-        adjusted = adjusted - (extra_end.value - extra_start.value) + #len(json_text(extra_edit, "newText"))
+        adjusted = adjusted - (extra_end.value - extra_start.value) + json_text(extra_edit, "newText").len
       }
       extra_edit = extra_edit.next
     }
@@ -324,9 +307,7 @@ fn lsp_accept(app: *App) {
     lsp_results_release(app)
     return
   }
-  if app.prompt_state.selected >= state.count {
-    return
-  }
+  if app.prompt_state.selected >= state.count { return }
   item := state.items[app.prompt_state.selected]
   if state.kind == 1 {
     completion_cancel_refresh(app)
@@ -369,7 +350,7 @@ fn lsp_accept(app: *App) {
     decoded = lsp_symbol_location(app, item, path[..], &range)
   } else {
     uri := json_text(item, "uri")
-    if #len(uri) == 0 {
+    if uri.len == 0 {
       uri = json_text(item, "targetUri")
     }
     decoded = lsp.path(uri, path[..])
@@ -378,14 +359,12 @@ fn lsp_accept(app: *App) {
       range = json.object_get(item, "targetSelectionRange")
     }
   }
-  if #len(decoded) == 0 {
+  if decoded.len == 0 {
     notice(app, "Language result is not a local file URI.")
     return
   }
   open_file(app, decoded)
-  if app.prompt_state.panel == Panel.Message {
-    return
-  }
+  if app.prompt_state.panel == Panel.Message { return }
   low := lsp.json_offset(buffer.all(app.documents.current), json.object_get(range, "start"))
   high := lsp.json_offset(buffer.all(app.documents.current), json.object_get(range, "end"))
   if !low.valid || !high.valid {
@@ -410,13 +389,11 @@ fn lsp_action_request(app: *App, item: *const json.Value, resolve: bool) {
     return
   }
   lsp_sync(app, state.server, true)
-  if app.lsp.servers[state.server].process == nil {
-    return
-  }
+  if app.lsp.servers[state.server].process == nil { return }
   message: [131072]u8
   encoded: [65536]u8
   serialized := lsp_json_encode(encoded[..], item)
-  if #len(serialized) == 0 {
+  if serialized.len == 0 {
     notice(app, "Code action arguments exceed capacity.")
     return
   }
@@ -445,9 +422,7 @@ fn lsp_action_request(app: *App, item: *const json.Value, resolve: bool) {
 }
 fn lsp_edit_reply(app: *App, applied: bool) {
   plan := &app.lsp.edits
-  if plan.reply_length == 0 {
-    return
-  }
+  if plan.reply_length == 0 { return }
   message: [1024]u8
   used := copy_text(message[..], "{\"jsonrpc\":\"2.0\",\"id\":")
   add_text(message[..], &used, plan.reply[..plan.reply_length])

@@ -22,7 +22,7 @@ def function(name):
         depth += (source[end] == '{')-(source[end] == '}')
         end += 1
     body = source[start:end]
-    for loop in ('for slot != nil {', 'for index in 0..#len(app.documents.slots) {'):
+    for loop in ('for slot != nil {', 'for index in 0..app.documents.slots.len {'):
         body = body.replace(loop, loop+'\n    visits += 1')
     return body
 

@@ -12,25 +12,20 @@ fn directory_refresh(app: *App) {
     previous_length = copy_text(previous_name[..], previous.name[..previous.length])
   }
   storage: [8192]u8
-  opened := fs.open_directory(app.directory_state.path[..app.directory_state.length], storage[..])
-  if io.failed(opened.failure) {
+  opened := fs.open_directory(app.directory_state.path[..app.directory_state.length], storage[..]) catch {
     notice(app, "Cannot read directory.")
     return
   }
-  defer fs.close_directory(&opened.directory)
+  defer fs.close_directory(&opened)
   app.directory_state.count = 0
   app.directory_state.selected = 0
   for app.directory_state.count < 256 {
-    entry := fs.directory_next(&opened.directory)
-    if !entry.found {
-      if entry.failure.native != 0 {
-        notice(app, "Directory read failed.")
-      }
+    entry := fs.directory_next(&opened) catch {
+      notice(app, "Directory read failed.")
       break
     }
-    if #len(entry.name) >= 512 || !utf8.valid(entry.name) {
-      continue
-    }
+    if opened.ended { break }
+    if entry.name.len >= 512 || !utf8.valid(entry.name) { continue }
     output := &app.directory_state.entries[app.directory_state.count]
     output.length = copy_text(output.name[..], entry.name)
     output.directory = entry.kind == 4
@@ -60,19 +55,17 @@ fn joined(app: *const App, leaf: []const u8, output: []u8) []const u8 {
     separator = 1
   }
   add_text(output, &count, leaf)
-  if count != app.directory_state.length + separator + #len(leaf) {
-    return output[..0]
-  }
+  if count != app.directory_state.length + separator + leaf.len { return output[..0] }
   return output[..count]
 }
 fn open_file(app: *App, path: []const u8) {
   normalized: [4096]u8
   resolved := files.resolve(path, normalized[..])
-  if #len(resolved) == 0 {
+  if resolved.len == 0 {
     notice(app, "Invalid path or missing parent directory.")
     return
   }
-  for index in 0..#len(app.documents.slots) {
+  for index in 0..app.documents.slots.len {
     if app.documents.slots[index].document != nil && buffer.equal(files.name(&app.documents.slots[index].file), resolved) {
       activate(app, index)
       return
@@ -80,11 +73,9 @@ fn open_file(app: *App, path: []const u8) {
   }
   previous := app.documents.active
   reuse := app.documents.slots[app.documents.active].terminal.handle == nil && app.documents.file.length == 0 && app.documents.current.length == 0 && !buffer.dirty_cached(app.documents.current)
-  if !reuse && !new_buffer(app) {
-    return
-  }
+  if !reuse && !new_buffer(app) { return }
   error := files.open(app.documents.file, app.documents.current, resolved, app.scratch)
-  if #len(error) > 0 {
+  if error.len > 0 {
     if !reuse {
       failed := app.documents.active
       activate(app, previous)
@@ -150,7 +141,7 @@ fn save_file_ready(app: *App, path: []const u8) {
     return
   }
   error := files.save(app.documents.file, app.documents.current, resolved, app.scratch)
-  if #len(error) > 0 {
+  if error.len > 0 {
     save_cancel(app)
     notice(app, error)
     return
@@ -178,7 +169,7 @@ fn save_background(app: *App, path: []const u8) {
     return
   }
   arena := arena_owner.create(#sizeof(SaveTask) + 4096)
-  task := mem.push(SaveTask, arena)
+  task := mem.push<SaveTask>(arena)
   task.arena = arena
   task.identity = app.documents.slots[app.documents.active].identity
   if !files.save_start(&task.job, app.documents.file, app.documents.current, path, app.scratch) {
@@ -187,13 +178,11 @@ fn save_background(app: *App, path: []const u8) {
     arena_owner.release(arena)
     return
   }
-  spawned := thread.spawn_with_size(arena, 65536, save_task_run, task)
-  if io.failed(spawned.failure) {
+  task.worker = thread.spawn_with_size(arena, 65536, save_task_run, task) catch nil
+  if task.worker == nil {
     // No worker: write here instead.
     files.save_write(&task.job)
     sync.store_u32(&task.done, 1)
-  } else {
-    task.worker = spawned.value
   }
   app.documents.save_task = task
   notice(app, "Saving...")
@@ -202,35 +191,35 @@ fn save_background(app: *App, path: []const u8) {
 // view changed.
 fn save_tick(app: *App) bool {
   task := app.documents.save_task
-  if task == nil || sync.load_u32(&task.done) == 0 {
-    return false
-  }
+  if task == nil || sync.load_u32(&task.done) == 0 { return false }
   save_join(app)
   return true
 }
 fn save_join(app: *App) {
   task := app.documents.save_task
-  if task.worker != nil && io.failed(thread.join(task.worker).failure) {
-    #panic("cannot join save worker")
+  if task.worker != nil {
+    _ = thread.join(task.worker) catch {
+      #panic("cannot join save worker")
+    }
   }
   app.documents.save_task = nil
   defer arena_owner.release(task.arena)
   // The buffer may have closed meanwhile; the file is still committed only
   // when its document is there to check against.
-  index := #len(app.documents.slots)
-  for candidate in 0..#len(app.documents.slots) {
+  index := app.documents.slots.len
+  for candidate in 0..app.documents.slots.len {
     if app.documents.slots[candidate].identity == task.identity && app.documents.slots[candidate].document != nil {
       index = candidate
     }
   }
-  if index == #len(app.documents.slots) {
+  if index == app.documents.slots.len {
     files.save_abort(&task.job)
     save_cancel(app)
     return
   }
   slot := app.documents.slots[index]
   error := files.save_finish(&task.job, &slot.file, slot.document, app.scratch)
-  if #len(error) > 0 {
+  if error.len > 0 {
     save_cancel(app)
     notice(app, error)
     return
@@ -259,7 +248,7 @@ fn save_completed(app: *App, index: usize) {
   plugin_event(app, "buffer-saved")
   // Saving a rules file changes other documents' settings.
   leaf := files.name(&slot.file)
-  leaf_start := #len(leaf)
+  leaf_start := leaf.len
   for leaf_start > 0 && leaf[leaf_start - 1] != '/' {
     leaf_start -= 1
   }
@@ -286,13 +275,11 @@ fn save_completed(app: *App, index: usize) {
   }
 }
 fn valid_leaf(name: []const u8) bool {
-  if #len(name) == 0 || #len(name) >= 512 || buffer.equal(name, ".") || buffer.equal(name, "..") {
+  if name.len == 0 || name.len >= 512 || buffer.equal(name, ".") || buffer.equal(name, "..") {
     return false
   }
   for byte in name {
-    if byte == '/' || byte < 32 || byte == 127 {
-      return false
-    }
+    if byte == '/' || byte < 32 || byte == 127 { return false }
   }
   return utf8.valid(name)
 }
@@ -311,13 +298,11 @@ fn trash_leaf(app: *const App, name: []const u8, output: []u8) usize {
     add_text(relative[..], &relative_length, leaf[..used])
     path: [4096]u8
     full := joined(app, relative[..relative_length], path[..])
-    if #len(full) == 0 || used >= #len(output) {
-      return 0
-    }
+    if full.len == 0 || used >= output.len { return 0 }
     link: [4096]u8
-    if io.failed(files.metadata(full).failure) && io.failed(fs.read_link(full, link[..]).failure) {
-      return copy_text(output, leaf[..used])
-    }
+    meta := files.metadata(full) catch fs.Metadata{}
+    target_link := fs.read_link(full, link[..]) catch link[..0]
+    if meta.mode == 0 && target_link.len == 0 { return copy_text(output, leaf[..used]) }
   }
   return 0
 }

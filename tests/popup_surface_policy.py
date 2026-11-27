@@ -13,9 +13,9 @@ def function(source,name):
   end+=1
  return source[start:end]+'\n'
 s=(ROOT/'src/animation.dyn').read_text()
-source='''use "./motion" motion
-use "./sdl" sdl
-use "./settings" settings
+source='''use motion "./motion"
+use sdl "./sdl"
+use settings "./settings"
 struct Config {popup_animation_ms:f32,popup_transitions:bool,placement:settings.Placement}
 struct Animation {now:f32,active,surfaces_ready,resized,geometry_active:bool,geometry_elapsed:f32,surface_geometry:[8]motion.Rectangle,surface_seen:[8]u64}
 struct View {animation:Animation,reduced_motion:bool}

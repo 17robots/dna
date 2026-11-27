@@ -48,7 +48,7 @@ fn macro_buffer_ready(app: *App, storage: *MacroBuffer) {
     storage.arena = allocated
     allocated = nil
     storage.owned = true
-    storage.bytes = mem.push_bytes_uninit(storage.arena, MacroCapacity)
+    storage.bytes = mem.push_bytes(storage.arena, MacroCapacity)
     storage.length = 0
   }
 }
@@ -64,20 +64,14 @@ fn macro_active(app: *const App) bool {
   return app.macro_state.depth > 0
 }
 fn macro_register_text(app: *App, slot: usize) []const u8 {
-  if slot == 0 {
-    return app.macro_state.default_text.bytes[..app.macro_state.default_text.length]
-  }
+  if slot == 0 { return app.macro_state.default_text.bytes[..app.macro_state.default_text.length] }
   register := &app.register_state.named[slot - 1]
-  if !register.owned {
-    return ""
-  }
+  if !register.owned { return "" }
   return register.text
 }
 // qa starts recording into a; qA (append) keeps a's text and adds to it.
 fn macro_start(app: *App, slot: usize, append: bool) {
-  if app.macro_state.replaying || app.macro_state.recording {
-    return
-  }
+  if app.macro_state.replaying || app.macro_state.recording { return }
   if slot > 26 {
     notice(app, "Macros use registers a-z.")
     return
@@ -86,12 +80,12 @@ fn macro_start(app: *App, slot: usize, append: bool) {
   app.macro_state.record.length = 0
   if append {
     existing := macro_register_text(app, slot)
-    if #len(existing) > MacroCapacity {
+    if existing.len > MacroCapacity {
       notice(app, "Register is too long to append a macro to.")
       return
     }
     buffer.copy(app.macro_state.record.bytes[..], existing)
-    app.macro_state.record.length = #len(existing)
+    app.macro_state.record.length = existing.len
   }
   app.macro_state.slot = slot
   app.macro_state.append = append
@@ -101,20 +95,18 @@ fn macro_start(app: *App, slot: usize, append: bool) {
 }
 // Store what was recorded in its register.
 fn macro_stop(app: *App) {
-  if !app.macro_state.recording {
-    return
-  }
+  if !app.macro_state.recording { return }
   app.macro_state.recording = false
   text := app.macro_state.record.bytes[..app.macro_state.record.length]
   slot := app.macro_state.slot
   if slot == 0 {
     macro_buffer_ready(app, &app.macro_state.default_text)
     buffer.copy(app.macro_state.default_text.bytes[..], text)
-    app.macro_state.default_text.length = #len(text)
+    app.macro_state.default_text.length = text.len
     return
   }
   register := &app.register_state.named[slot - 1]
-  if #len(text) == 0 {
+  if text.len == 0 {
     if register.owned {
       arena_owner.release(register.arena)
       register.arena = nil
@@ -125,10 +117,10 @@ fn macro_stop(app: *App) {
     register.linewise = false
     return
   }
-  allocated := arena_owner.create((#len(text) + 1))
-  storage := mem.push_bytes_uninit(allocated, #len(text) + 1)
-  _ = buffer.copy_bytes(&storage[0], &text[0], #len(text))
-  storage[#len(text)] = 0
+  allocated := arena_owner.create((text.len + 1))
+  storage := mem.push_bytes(allocated, text.len + 1)
+  _ = buffer.copy_bytes(&storage[0], &text[0], text.len)
+  storage[text.len] = 0
   if register.owned {
     arena_owner.release(register.arena)
     register.arena = nil
@@ -136,17 +128,15 @@ fn macro_stop(app: *App) {
   register.arena = allocated
   allocated = nil
   register.owned = true
-  register.text = storage[..#len(text)]
+  register.text = storage[..text.len]
   register.count = 1
   register.starts[0] = 0
-  register.lengths[0] = #len(text)
+  register.lengths[0] = text.len
   register.linewise = false
 }
 // Helix keymap: Q toggles recording into the selected register.
 fn macro_toggle(app: *App) {
-  if app.macro_state.replaying {
-    return
-  }
+  if app.macro_state.replaying { return }
   if app.macro_state.recording {
     macro_stop(app)
     app.register_state.selected = 0
@@ -167,14 +157,14 @@ fn macro_recording_input(app: *App) bool {
 }
 fn macro_put(app: *App, bytes: []const u8) {
   record := &app.macro_state.record
-  if record.length + #len(bytes) > MacroCapacity {
+  if record.length + bytes.len > MacroCapacity {
     app.macro_state.recording = false
     record.length = 0
     notice(app, "Macro exceeded 64 KiB; recording discarded.")
     return
   }
   buffer.copy(record.bytes[record.length..], bytes)
-  record.length += #len(bytes)
+  record.length += bytes.len
 }
 fn macro_put_number(app: *App, value: usize, end: u8) {
   digits: [24]u8
@@ -183,18 +173,14 @@ fn macro_put_number(app: *App, value: usize, end: u8) {
     digits[23 - used] = #cast(u8, (value % 10)) + '0'
     used += 1
     value /= 10
-    if value == 0 {
-      break
-    }
+    if value == 0 { break }
   }
   macro_put(app, digits[24 - used..])
   ending: [1]u8 = [end]
   macro_put(app, ending[..])
 }
 fn macro_key(app: *App, key: u32, modifiers: u16) {
-  if !macro_recording_input(app) {
-    return
-  }
+  if !macro_recording_input(app) { return }
   app.macro_state.unit_start = app.macro_state.record.length
   app.macro_state.companion = 0
   character := app.input_state.character
@@ -237,16 +223,12 @@ fn macro_key(app: *App, key: u32, modifiers: u16) {
   macro_put_number(app, character, ';')
 }
 fn macro_text(app: *App, text: []const u8) {
-  if !macro_recording_input(app) {
-    return
-  }
+  if !macro_recording_input(app) { return }
   companion := app.macro_state.companion
   app.macro_state.companion = 0
   if companion != 0 {
     bytes: [4]u8
-    if buffer.equal(text, bytes[..vim_encode(companion, bytes[..])]) {
-      return
-    }
+    if buffer.equal(text, bytes[..vim_encode(companion, bytes[..])]) { return }
   }
   // Other text (an IME commit, a paste) replays as typed characters.
   app.macro_state.unit_start = app.macro_state.record.length
@@ -268,7 +250,7 @@ fn macro_play(app: *App, typography: *Typography) {
     return
   }
   text := macro_register_text(app, selected)
-  if #len(text) == 0 {
+  if text.len == 0 {
     // Silent, as in Vim: @a while recording a (qa...@aq) is the usual way
     // to write a recursive macro.
     macro_fail(app)
@@ -284,19 +266,17 @@ fn macro_push(app: *App, typography: *Typography, text: []const u8, count: usize
     state.depth -= 1
     state.play.length = state.frames[state.depth].start
   }
-  if state.depth == MacroDepth || state.play.length + #len(text) > MacroCapacity {
+  if state.depth == MacroDepth || state.play.length + text.len > MacroCapacity {
     macro_fail(app)
     notice(app, "E223: Macro nested too deeply")
     return
   }
   start := state.play.length
   buffer.copy(state.play.bytes[start..], text)
-  state.play.length += #len(text)
-  state.frames[state.depth] = MacroFrame{start: start, length: #len(text), position: 0, repeats: count - 1, mapping: mapping}
+  state.play.length += text.len
+  state.frames[state.depth] = MacroFrame{start: start, length: text.len, position: 0, repeats: count - 1, mapping: mapping}
   state.depth += 1
-  if state.replaying {
-    return
-  }
+  if state.replaying { return }
   state.failed = false
   state.steps = 0
   // Replay runs to its end before any other input or asynchronous UI
@@ -316,11 +296,9 @@ fn macro_feed(app: *App, typography: *Typography, notation: []const u8) {
   encoded: [1024]u8
   used: usize = 0
   at: usize = 0
-  for at < #len(notation) && used + 40 < #len(encoded) {
+  for at < notation.len && used + 40 < encoded.len {
     stroke := settings.notation_next(notation, &at)
-    if stroke.key == 0 && stroke.character == 0 {
-      break
-    }
+    if stroke.key == 0 && stroke.character == 0 { break }
     if (stroke.key == 0 || (stroke.key == 32 && stroke.modifiers == 0)) && stroke.character != MacroEscape {
       if stroke.character == 0 {
         stroke.character = 32
@@ -336,9 +314,7 @@ fn macro_feed(app: *App, typography: *Typography, notation: []const u8) {
     add_number(encoded[..], &used, 0)
     add_text(encoded[..], &used, ";")
   }
-  if used == 0 {
-    return
-  }
+  if used == 0 { return }
   macro_push(app, typography, encoded[..used], 1, true)
 }
 // A motion, search or ex command failed. During replay this aborts the
@@ -354,11 +330,11 @@ fn macro_cancel(app: *App) {
 }
 fn macro_number(bytes: []const u8, at: *usize, end: u8) u32 {
   value: u32 = 0
-  for at.* < #len(bytes) && bytes[at.*] != end {
+  for at.* < bytes.len && bytes[at.*] != end {
     value = value * 10 + (bytes[at.*] - '0')
     at.* += 1
   }
-  if at.* < #len(bytes) {
+  if at.* < bytes.len {
     at.* += 1
   }
   return value
@@ -380,8 +356,8 @@ fn macro_step(app: *App, typography: *Typography) {
   at := frame.position
   byte := bytes[at]
   size := rx_char_size(byte)
-  if at + size > #len(bytes) {
-    size = #len(bytes) - at
+  if at + size > bytes.len {
+    size = bytes.len - at
   }
   character := #cast(u32, byte)
   if size > 1 {
@@ -422,9 +398,7 @@ fn macro_step(app: *App, typography: *Typography) {
   }
 }
 fn macro_tick(app: *App, typography: *Typography) bool {
-  if app.macro_state.depth == 0 {
-    return false
-  }
+  if app.macro_state.depth == 0 { return false }
   app.macro_state.replaying = true
   processed: usize = 0
   deadline := sdl.ticks() + 8
@@ -444,9 +418,7 @@ fn macro_tick(app: *App, typography: *Typography) bool {
     // A nested explorer event may queue activation until its outer draft
     // borrow ends. Yield at that completed event, retaining the next event;
     // otherwise later macro input would still target the old draft.
-    if app.explorer.dispatch_pending != 0 {
-      break
-    }
+    if app.explorer.dispatch_pending != 0 { break }
   }
   app.macro_state.replaying = false
   return true

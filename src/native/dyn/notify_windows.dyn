@@ -11,7 +11,7 @@ notify_enabled: bool = false
 notify_running: bool = false
 notify_thread: rawptr = nil
 notify_stop_event: rawptr = nil
-use "std/dynlib" notify_loader
+use notify_loader "std/dynlib"
 use "std/io"
 struct WindowsNotifyAPI {
   create: fn(rawptr, i32, i32, *const u16) rawptr,
@@ -22,22 +22,23 @@ struct WindowsNotifyAPI {
 notify_api: WindowsNotifyAPI
 notify_api_once: sync.Once
 fn notify_symbol(library: rawptr, name: []const u8) rawptr {
-  result := notify_loader.symbol(library, name)
-  if io.failed(result.failure) || result.value == nil {
+  result := notify_loader.symbol(library, name) catch {
     #panic("missing Windows notification API")
   }
-  return result.value
+  if result == nil {
+    #panic("missing Windows notification API")
+  }
+  return result
 }
 fn notify_prepare() {
   if sync.once_begin(&notify_api_once) {
-    library := notify_loader.open("kernel32.dll", 0)
-    if io.failed(library.failure) {
+    library := notify_loader.open("kernel32.dll", 0) catch {
       #panic("missing Windows kernel API")
     }
-    notify_api.create = #cast(fn(rawptr, i32, i32, *const u16) rawptr, notify_symbol(library.value, "CreateEventW"))
-    notify_api.set = #cast(fn(rawptr) i32, notify_symbol(library.value, "SetEvent"))
-    notify_api.wait = #cast(fn(rawptr, u32) u32, notify_symbol(library.value, "WaitForSingleObject"))
-    notify_api.close = #cast(fn(rawptr) i32, notify_symbol(library.value, "CloseHandle"))
+    notify_api.create = #cast(fn(rawptr, i32, i32, *const u16) rawptr, notify_symbol(library, "CreateEventW"))
+    notify_api.set = #cast(fn(rawptr) i32, notify_symbol(library, "SetEvent"))
+    notify_api.wait = #cast(fn(rawptr, u32) u32, notify_symbol(library, "WaitForSingleObject"))
+    notify_api.close = #cast(fn(rawptr) i32, notify_symbol(library, "CloseHandle"))
     sync.once_complete(&notify_api_once)
   }
 }
@@ -82,13 +83,9 @@ pub fn dna_notify_start() i32 {
   notify_prepare()
   _ = sync_mutex_lock(#cast(rawptr, &notify_registry))
   defer _ = sync_mutex_unlock(#cast(rawptr, &notify_registry))
-  if notify_running {
-    return 0
-  }
+  if notify_running { return 0 }
   notify_stop_event = notify_api.create(nil, 1, 0, nil)
-  if notify_stop_event == nil {
-    return 0
-  }
+  if notify_stop_event == nil { return 0 }
   notify_thread = dna_thread_create(notify_worker, nil)
   if notify_thread == nil {
     _ = notify_api.close(notify_stop_event)
@@ -130,14 +127,10 @@ pub fn dna_notify_stop() {
 }
 pub fn dna_watch(fd: i32, writing: i32) {
   native_initialize()
-  if fd < 0 {
-    return
-  }
+  if fd < 0 { return }
   _ = sync_mutex_lock(#cast(rawptr, &notify_registry))
   defer _ = sync_mutex_unlock(#cast(rawptr, &notify_registry))
-  if !notify_running {
-    return
-  }
+  if !notify_running { return }
   watch := notify_watches
   for watch != nil {
     if watch.fd == fd {
@@ -154,9 +147,7 @@ pub fn dna_watch(fd: i32, writing: i32) {
   }
 }
 pub fn dna_unwatch(fd: i32) {
-  if fd < 0 {
-    return
-  }
+  if fd < 0 { return }
   _ = sync_mutex_lock(#cast(rawptr, &notify_registry))
   defer _ = sync_mutex_unlock(#cast(rawptr, &notify_registry))
   link := &notify_watches

@@ -1,4 +1,4 @@
-use "std/parse" parse
+use parse "std/parse"
 use "./cstring"
 use "host"
 use "std/mem"
@@ -12,15 +12,27 @@ extern fn handoff_run "dna_handoff_run"()
 // replaces this process with the other frontend.
 fn main() i32 {
   early := cli_early()
-  if early >= 0 {
-    return early
-  }
+  if early >= 0 { return early }
   status := editor_main()
-  if status != 0 {
-    return status
-  }
+  if status != 0 { return status }
   handoff_run()
   return 0
+}
+
+fn has_environment(name: []const u8, storage: []u8) bool {
+  _ = host.environment(name, storage) catch { return false }
+  return true
+}
+
+fn load_configured_font_path(destination: []u8) bool {
+  configured := host.environment("DNA_FONT", destination[..destination.len - 1]) catch err {
+    case err {
+      .NotFound => { return false }
+      _ => { #panic("DNA_FONT is too long or unavailable") }
+    }
+  }
+  destination[configured.len] = 0
+  return true
 }
 // Startup problems the user can fix end with a message and exit status 1;
 // panics remain for internal invariants.
@@ -45,7 +57,7 @@ fn editor_main() i32 {
   host.small_pages(owned.data)
   host.small_pages(scratch.data)
   // Uninitialized: App is large and every field is set before use.
-  app := #cast(*App, mem.arena_push_uninit(owned, #sizeof(App), #alignof(App)))
+  app := mem.push<App>(owned)
   render_trace_open(app)
   defer render_trace_close(app)
   defer operations_release(app)
@@ -71,8 +83,7 @@ fn editor_main() i32 {
   config_location(app)
   language_root(app)
 
-  arguments := host.arguments(scratch)
-  if io.failed(arguments.failure) {
+  arguments := host.arguments(scratch) catch {
     #panic("arguments unavailable")
   }
   // --tui and --gui choose the frontend for this launch; the first other
@@ -81,15 +92,15 @@ fn editor_main() i32 {
   target_seen := false
   literal_paths := false
   launch_directory := false
-  for index in 1..#len(arguments.values) {
-    argument := arguments.values[index]
+  for index in 1..arguments.len {
+    argument := arguments[index]
     if !literal_paths && buffer.equal(argument, "--") {
       literal_paths = true
     } else if !literal_paths && buffer.equal(argument, "--tui") {
       flag_frontend = 2
     } else if !literal_paths && buffer.equal(argument, "--gui") {
       flag_frontend = 1
-    } else if #len(argument) > 0 && !target_seen {
+    } else if argument.len > 0 && !target_seen {
       target_seen = true
       launch_directory = launch_open(app, argument)
     }
@@ -110,9 +121,7 @@ fn editor_main() i32 {
     sdl_flags = 16384
   }
   if !sdl.init(sdl_flags) {
-    if terminal {
-      return startup_failure("terminal frontend could not start")
-    }
+    if terminal { return startup_failure("terminal frontend could not start") }
     return startup_failure("no usable display (set WAYLAND_DISPLAY or DISPLAY, or run dna --tui)")
   }
   defer sdl.quit()
@@ -122,13 +131,12 @@ fn editor_main() i32 {
   defer notifications_stop()
 
   title: [64]u8
-  encoded_title := cstring.bounded(title[..], "DNA")
-  if parse.failed(encoded_title.failure) {
+  encoded_title := cstring.bounded(title[..], "DNA") catch {
     #panic("title capacity")
   }
 
   egl_selected := egl_vendor_set()
-  window := sdl.create_window(encoded_title.value, 1100, 760, 8224)
+  window := sdl.create_window(encoded_title, 1100, 760, 8224)
   if egl_selected {
     egl_vendor_clear()
   }
@@ -145,8 +153,8 @@ fn editor_main() i32 {
   // Frames land on the display's refresh, evenly spaced and without tearing.
   // DNA_VSYNC=0 opts out (timer pacing from the display refresh instead).
   vsync_storage: [8]u8
-  vsync_setting := host.environment("DNA_VSYNC", vsync_storage[..])
-  if !(!io.failed(vsync_setting.failure) && vsync_setting.found && buffer.equal(vsync_setting.value, "0")) {
+  vsync_setting := host.environment("DNA_VSYNC", vsync_storage[..]) catch vsync_storage[..0]
+  if !buffer.equal(vsync_setting, "0") {
     // Probe support, then start with immediate presentation; draw() turns
     // vsync on only while something animates.
     app.view.vsync_supported = sdl.render_vsync(renderer, 1) && sdl.render_vsync(renderer, 0)
@@ -161,26 +169,20 @@ fn editor_main() i32 {
   defer ttf.quit()
 
   font_path: [4096]u8
-  configured := host.environment("DNA_FONT", font_path[..4095])
-  if io.failed(configured.failure) {
-    #panic("DNA_FONT is too long or unavailable")
-  }
-  if configured.found {
-    font_path[#len(configured.value)] = 0
-  } else {
-    default_font := cstring.bounded(font_path[..], "/usr/share/fonts/TTF/ZedMonoNerdFontMono-Regular.ttf")
-    if parse.failed(default_font.failure) {
+  font_configured := load_configured_font_path(font_path[..])
+  if !font_configured {
+    _ = cstring.bounded(font_path[..], "/usr/share/fonts/TTF/ZedMonoNerdFontMono-Regular.ttf") catch {
       #panic("font path capacity")
     }
   }
   font := ttf.open(&font_path[0], 16.0)
-  if font == nil && !configured.found {
-    fallback := cstring.bounded(font_path[..], "/usr/share/fonts/noto/NotoSansMono-Regular.ttf")
-    if !parse.failed(fallback.failure) {
-      font = ttf.open(fallback.value, 16.0)
+  if font == nil && !font_configured {
+    fallback := cstring.bounded(font_path[..], "/usr/share/fonts/noto/NotoSansMono-Regular.ttf") catch nil
+    if fallback != nil {
+      font = ttf.open(fallback, 16.0)
     }
   }
-  if font == nil && !configured.found && default_system_font(&font_path[0], 4096) != 0 {
+  if font == nil && !font_configured && default_system_font(&font_path[0], 4096) != 0 {
     font = ttf.open(&font_path[0], 16.0)
   }
   if font == nil {
@@ -257,18 +259,18 @@ fn editor_main() i32 {
     app.config.document_padding = 0.0
   }
   environment: [16]u8
-  smoke := host.environment("DYN_EDITOR_SMOKE", environment[..])
+  smoke_set := has_environment("DYN_EDITOR_SMOKE", environment[..])
   input_storage: [64]u8
   reduced_storage: [16]u8
-  reduced := host.environment("DNA_REDUCED_MOTION", reduced_storage[..])
-  if !io.failed(reduced.failure) && reduced.found {
-    app.view.reduced_motion = buffer.equal(reduced.value, "1")
+  reduced := host.environment("DNA_REDUCED_MOTION", reduced_storage[..]) catch reduced_storage[..0]
+  if reduced.len > 0 {
+    app.view.reduced_motion = buffer.equal(reduced, "1")
   }
   // Terminals cannot animate smoothly; everything snaps.
   if terminal {
     app.view.reduced_motion = true
   }
-  if !io.failed(smoke.failure) && smoke.found {
+  if smoke_set {
     startup_probe(app, &typography, renderer, window, input_storage[..])
   }
   frontend_handoff_restore(app, &typography)
@@ -299,9 +301,7 @@ fn editor_main() i32 {
         background_again = false
       }
     }
-    if !app.running {
-      break
-    }
+    if !app.running { break }
 
     // Geometry changes must be presented before interpreting queued pointer input.
     if (app.render_pending & (RenderConfig | RenderMacro)) != 0 {
@@ -491,9 +491,7 @@ fn editor_main() i32 {
       }
       processed += 1
 
-      if !app.running || processed >= 64 || !render_trace_poll(app, &event) {
-        break
-      }
+      if !app.running || processed >= 64 || !render_trace_poll(app, &event) { break }
     }
     operation_end(app, "input", input_started)
     app.render_trace.event_seen = 0
@@ -514,7 +512,7 @@ fn editor_main() i32 {
     files.discard_recovery(app.documents.file)
   }
 
-  if !io.failed(smoke.failure) && smoke.found {
+  if smoke_set {
     finish_probe(app)
   }
   return 0

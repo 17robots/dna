@@ -19,54 +19,65 @@ from sdk_compat import environment
 
 FIXTURE = r'''
 use "std/c"
-use "./host" host
-use "./servers" server_discovery
-use "std/fs" frontend_test_fs
+use host "./host"
+use server_discovery "./servers"
+use frontend_test_fs "std/fs"
 struct ThreadTime { seconds, nanoseconds: i64 }
 fn command_tests() {
   root_storage:[4096]u8
   helper_storage:[4096]u8
   script_storage:[8192]u8
-  root:=host.environment("DNA_COMMAND_ROOT",root_storage[..])
-  helper:=host.environment("DNA_COMMAND_HELPER",helper_storage[..])
-  script:=host.environment("DNA_COMMAND_SCRIPT",script_storage[..])
-  if root.failure.kind != io.Kind.Ok || !root.found || helper.failure.kind != io.Kind.Ok || !helper.found || script.failure.kind != io.Kind.Ok || !script.found { #panic("command fixture environment") }
+  root:=host.environment("DNA_COMMAND_ROOT",root_storage[..]) catch { #panic("command fixture environment") }
+  helper:=host.environment("DNA_COMMAND_HELPER",helper_storage[..]) catch { #panic("command fixture environment") }
+  script:=host.environment("DNA_COMMAND_SCRIPT",script_storage[..]) catch { #panic("command fixture environment") }
   command:[32768]u8
   used:usize=0
-  if !platform_language_command(command[..],&used,root.value,helper.value,"-c",script.value) || used==0 || command[used]!=0 { #panic("language command builder") }
+  if !platform_language_command(command[..],&used,root,helper,"-c",script) || used==0 || command[used]!=0 { #panic("language command builder") }
   for byte in command[..used] { if byte>=128 { #panic("command must contain only ASCII") } }
-  if frontend_test_fs.write_all("language-command.txt",command[..used]).failure.kind != io.Kind.Ok { #panic("command fixture write") }
+  frontend_test_fs.write_all("language-command.txt",command[..used]) catch { #panic("command fixture write") }
   protocol_storage:[8192]u8
-  protocol:=host.environment("DNA_COMMAND_PROTOCOL",protocol_storage[..])
-  if protocol.failure.kind != io.Kind.Ok || !protocol.found { #panic("protocol fixture environment") }
+  protocol:=host.environment("DNA_COMMAND_PROTOCOL",protocol_storage[..]) catch { #panic("protocol fixture environment") }
   used=0
-  if !platform_language_command(command[..],&used,root.value,helper.value,"-c",protocol.value) || frontend_test_fs.write_all("language-protocol-command.txt",command[..used]).failure.kind != io.Kind.Ok { #panic("protocol command builder") }
+  if !platform_language_command(command[..],&used,root,helper,"-c",protocol) { #panic("protocol command builder") }
+  frontend_test_fs.write_all("language-protocol-command.txt",command[..used]) catch { #panic("protocol command builder") }
   used=0
-  if !platform_language_command(command[..],&used,root.value,helper.value,"--version","") || frontend_test_fs.write_all("language-version-command.txt",command[..used]).failure.kind != io.Kind.Ok { #panic("optional name omitted") }
+  if !platform_language_command(command[..],&used,root,helper,"--version","") { #panic("optional name omitted") }
+  frontend_test_fs.write_all("language-version-command.txt",command[..used]) catch { #panic("optional name omitted") }
   used=0
-  if !platform_language_command(command[..],&used,root.value,helper.value,"-c","import sys;sys.exit(7)") || frontend_test_fs.write_all("language-failure-command.txt",command[..used]).failure.kind != io.Kind.Ok { #panic("failure command") }
+  if !platform_language_command(command[..],&used,root,helper,"-c","import sys;sys.exit(7)") { #panic("failure command") }
+  frontend_test_fs.write_all("language-failure-command.txt",command[..used]) catch { #panic("failure command") }
   rejected:[32]u8
   for at in 0..32 { rejected[at]=90 }
   previous:usize=3
-  if platform_language_command(rejected[..],&previous,root.value,helper.value,"-c",script.value) || previous!=3 { #panic("command capacity refusal") }
+  if platform_language_command(rejected[..],&previous,root,helper,"-c",script) || previous!=3 { #panic("command capacity refusal") }
   for byte in rejected { if byte!=90 { #panic("failed command must preserve output") } }
   nul:[3]u8=[97,0,98]
   invalid:[1]u8=[255]
   for bad in [nul[..],invalid[..]] {
-    if platform_language_command(command[..],&previous,root.value,helper.value,"-c",bad) || previous!=3 { #panic("invalid command input") }
+    if platform_language_command(command[..],&previous,root,helper,"-c",bad) || previous!=3 { #panic("invalid command input") }
   }
   huge:[10000]u8
   for at in 0..10000 { huge[at]=97 }
-  if platform_language_command(command[..],&previous,root.value,helper.value,"-c",huge[..]) || previous!=3 { #panic("cmd encoded length bound") }
+  if platform_language_command(command[..],&previous,root,helper,"-c",huge[..]) || previous!=3 { #panic("cmd encoded length bound") }
   directory:[32768]u8
   size:=platform_job_directory(directory[..])
-  if size<3 || directory[size]!=0 || directory[1]!=58 || directory[2]!=47 || frontend_test_fs.write_all("language-directory.txt",directory[..size]).failure.kind != io.Kind.Ok { #panic("trusted native job directory") }
+  if size<3 || directory[size]!=0 || directory[1]!=58 || directory[2]!=47 { #panic("trusted native job directory") }
+  frontend_test_fs.write_all("language-directory.txt",directory[..size]) catch { #panic("trusted native job directory") }
   if platform_job_directory(rejected[..1])!=0 || rejected[0]!=90 { #panic("job directory capacity") }
   parent:[64]u8
-  value:=host.environment("DNA_LANGUAGE_DIR",parent[..])
+  value:=host.environment("DNA_LANGUAGE_DIR",parent[..]) catch { #panic("parent language environment") }
   expected:[]const u8="parent unchanged"
-  if value.failure.kind != io.Kind.Ok || !value.found || #len(value.value)!=#len(expected) { #panic("parent language environment") }
-  for at in 0..#len(expected) { if value.value[at]!=expected[at] { #panic("command builder must not change parent environment") } }
+  if value.len!=expected.len { #panic("parent language environment") }
+  for at in 0..expected.len { if value[at]!=expected[at] { #panic("command builder must not change parent environment") } }
+}
+fn environment_missing(name: []const u8, storage: []u8) bool {
+  _ = host.environment(name, storage) catch err {
+    case err {
+      .NotFound => { return true }
+      _ => { return false }
+    }
+  }
+  return false
 }
 fn main() {
   if !server_discovery.on_path("dna-fixture-exe --stdio") || !server_discovery.on_path("dna-fixture-cmd --stdio") || !server_discovery.on_path("dna-fixture-exe.exe --stdio") { #panic("Windows PATH, PATHEXT and executable discovery") }
@@ -81,17 +92,16 @@ fn main() {
   second := "changed\0"
   if handoff_setenv(&key[0], &first[0], 1) != 0 { #panic("Unicode environment set") }
   storage: [4096]u8
-  value := host.environment(key[..#len(key)-1], storage[..])
-  if value.failure.kind != io.Kind.Ok || !value.found || #len(value.value) != #len(first)-1 { #panic("Unicode environment read") }
-  for at in 0..#len(value.value) {
-    if value.value[at] != first[at] { #panic("Unicode environment bytes") }
+  value := host.environment(key[..key.len-1], storage[..]) catch { #panic("Unicode environment read") }
+  if value.len != first.len-1 { #panic("Unicode environment read") }
+  for at in 0..value.len {
+    if value[at] != first[at] { #panic("Unicode environment bytes") }
   }
   if handoff_setenv(&key[0], &second[0], 0) != 0 { #panic("environment no-overwrite") }
-  value = host.environment(key[..#len(key)-1], storage[..])
-  if #len(value.value) != #len(first)-1 { #panic("environment must retain original") }
+  value = host.environment(key[..key.len-1], storage[..]) catch { #panic("environment must retain original") }
+  if value.len != first.len-1 { #panic("environment must retain original") }
   if handoff_unsetenv(&key[0]) != 0 { #panic("environment removal") }
-  value = host.environment(key[..#len(key)-1], storage[..])
-  if value.failure.kind != io.Kind.Ok || value.found { #panic("removed environment") }
+  if !environment_missing(key[..key.len-1], storage[..]) { #panic("removed environment") }
   thread_before := ThreadTime{}
   process_before := ThreadTime{}
   if thread_clock(3, &thread_before) != 0 || thread_clock(2, &process_before) != 0 { #panic("native CPU clocks") }

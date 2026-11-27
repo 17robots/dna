@@ -28,22 +28,16 @@ extern fn pred_disable "ts_query_disable_pattern"(query: rawptr, index: u32)
 extern fn pred_start "ts_node_start_byte"(node: TsNode) u32
 extern fn pred_end "ts_node_end_byte"(node: TsNode) u32
 fn pred_equal(left: []const u8, right: []const u8) bool {
-  if #len(left) != #len(right) {
-    return false
-  }
-  if #len(left) == 0 {
-    return true
-  }
-  return pred_compare(&left[0], &right[0], #len(left)) == 0
+  if left.len != right.len { return false }
+  if left.len == 0 { return true }
+  return pred_compare(&left[0], &right[0], left.len) == 0
 }
 fn pred_put(output: []u8, used: *usize, text: []const u8) bool {
-  if used.* + #len(text) + 1 >= #len(output) {
-    return false
+  if used.* + text.len + 1 >= output.len { return false }
+  if text.len > 0 {
+    _ = copy(&output[used.*], &text[0], text.len)
   }
-  if #len(text) > 0 {
-    _ = copy(&output[used.*], &text[0], #len(text))
-  }
-  used.* += #len(text)
+  used.* += text.len
   return true
 }
 // Translate the Lua classes used in Neovim highlight queries to PCRE2.
@@ -51,10 +45,10 @@ fn pred_lua(source: []const u8, output: []u8) usize {
   used: usize = 0
   bracket := false
   i: usize = 0
-  for i < #len(source) {
+  for i < source.len {
     char := source[i]
     i += 1
-    if char == 37 && i < #len(source) {
+    if char == 37 && i < source.len {
       kind := source[i]
       i += 1
       cls: []const u8 = ""
@@ -75,9 +69,7 @@ fn pred_lua(source: []const u8, output: []u8) usize {
       } else if kind == 99 {
         cls = "\\x00-\\x1f"
       } else if kind == 115 {
-        if !pred_put(output, &used, "\\s") {
-          return 0
-        }
+        if !pred_put(output, &used, "\\s") { return 0 }
         continue
       } else {
         escaped: [2]u8 = [92, kind]
@@ -85,20 +77,12 @@ fn pred_lua(source: []const u8, output: []u8) usize {
         if kind == 0 {
           amount = 1
         }
-        if !pred_put(output, &used, escaped[..amount]) {
-          return 0
-        }
+        if !pred_put(output, &used, escaped[..amount]) { return 0 }
         continue
       }
-      if !bracket && !pred_put(output, &used, "[") {
-        return 0
-      }
-      if !pred_put(output, &used, cls) {
-        return 0
-      }
-      if !bracket && !pred_put(output, &used, "]") {
-        return 0
-      }
+      if !bracket && !pred_put(output, &used, "[") { return 0 }
+      if !pred_put(output, &used, cls) { return 0 }
+      if !bracket && !pred_put(output, &used, "]") { return 0 }
       continue
     }
     if char == 91 {
@@ -107,24 +91,16 @@ fn pred_lua(source: []const u8, output: []u8) usize {
       bracket = false
     }
     if char == 45 && !bracket {
-      if !pred_put(output, &used, "*?") {
-        return 0
-      }
+      if !pred_put(output, &used, "*?") { return 0 }
       continue
     }
     if !bracket && (char == 92 || char == 123 || char == 125 || char == 124) {
-      if !pred_put(output, &used, "\\") {
-        return 0
-      }
+      if !pred_put(output, &used, "\\") { return 0 }
     }
     if char != 0 {
       single: [1]u8 = [char]
-      if !pred_put(output, &used, single[..]) {
-        return 0
-      }
-    } else if !pred_put(output, &used, "") {
-      return 0
-    }
+      if !pred_put(output, &used, single[..]) { return 0 }
+    } else if !pred_put(output, &used, "") { return 0 }
   }
   output[used] = 0
   return used
@@ -135,50 +111,40 @@ fn pred_compile_regex(item: *Predicate, pattern: *const u8, length: u32, lua: bo
   size := length
   if lua {
     converted_length := pred_lua(#slice(pattern, length), converted[..])
-    if converted_length == 0 && length != 0 {
-      return false
-    }
+    if converted_length == 0 && length != 0 { return false }
     source = &converted[0]
     size = #cast(u32, converted_length)
   }
   error: i32 = 0
   offset: usize = 0
   item.code = search_compile(source, size, 524288, &error, &offset, nil)
-  if item.code == nil {
-    return false
-  }
+  if item.code == nil { return false }
   item.data = search_data(item.code, nil)
   return item.data != nil
 }
 fn pred_parse(query: rawptr, steps: []const TsPredicateStep, item: *Predicate, directive: *bool) bool {
   directive.* = false
   item.* = Predicate{}
-  if #len(steps) < 1 || steps[0].kind != 2 {
-    return false
-  }
+  if steps.len < 1 || steps[0].kind != 2 { return false }
   length: u32 = 0
   raw := pred_string(query, steps[0].id, &length)
   name := #slice(raw, length)
-  if #len(name) > 0 && name[#len(name) - 1] == 33 {
+  if name.len > 0 && name[name.len - 1] == 33 {
     directive.* = true
     return true
   }
-  if #len(name) > 4 && pred_equal(name[..4], "any-") {
+  if name.len > 4 && pred_equal(name[..4], "any-") {
     name = name[4..]
   }
-  if #len(name) > 4 && pred_equal(name[..4], "not-") {
+  if name.len > 4 && pred_equal(name[..4], "not-") {
     item.negate = true
     name = name[4..]
   }
-  if #len(steps) < 3 || steps[1].kind != 1 {
-    return false
-  }
+  if steps.len < 3 || steps[1].kind != 1 { return false }
   item.capture = steps[1].id
   if pred_equal(name, "eq?") {
     item.kind = 0
-    if #len(steps) != 3 {
-      return false
-    }
+    if steps.len != 3 { return false }
     if steps[2].kind == 1 {
       item.other_capture = true
       item.other = steps[2].id
@@ -189,9 +155,7 @@ fn pred_parse(query: rawptr, steps: []const TsPredicateStep, item: *Predicate, d
     return true
   }
   if pred_equal(name, "match?") || pred_equal(name, "vim-match?") || pred_equal(name, "lua-match?") {
-    if #len(steps) != 3 || steps[2].kind != 2 {
-      return false
-    }
+    if steps.len != 3 || steps[2].kind != 2 { return false }
     item.kind = 1
     pattern_length: u32 = 0
     pattern := pred_string(query, steps[2].id, &pattern_length)
@@ -202,22 +166,18 @@ fn pred_parse(query: rawptr, steps: []const TsPredicateStep, item: *Predicate, d
     if pred_equal(name, "contains?") {
       item.kind = 3
     }
-    for i in 2..#len(steps) {
-      if steps[i].kind != 2 {
-        return false
-      }
+    for i in 2..steps.len {
+      if steps[i].kind != 2 { return false }
     }
     item.arguments = &steps[2]
-    item.argument_count = #cast(u32, (#len(steps) - 2))
+    item.argument_count = #cast(u32, (steps.len - 2))
     return true
   }
   return false
 }
 pub fn predicates_compile(query: rawptr) *Predicates {
   result := #cast(*Predicates, search_calloc(1, #sizeof(Predicates), 4))
-  if result == nil {
-    return nil
-  }
+  if result == nil { return nil }
   result.query = query
   result.patterns = pred_pattern_count(query)
   capacity: u32 = 0
@@ -237,15 +197,11 @@ pub fn predicates_compile(query: rawptr) *Predicates {
     length: u32 = 0
     raw_steps := pred_steps(query, #cast(u32, pattern), &length)
     #slice(result.first, result.patterns)[pattern] = result.total
-    if length == 0 {
-      continue
-    }
+    if length == 0 { continue }
     steps := #slice(raw_steps, length)
     begin: usize = 0
-    for i in 0..#len(steps) {
-      if steps[i].kind != 0 {
-        continue
-      }
+    for i in 0..steps.len {
+      if steps[i].kind != 0 { continue }
       directive := false
       item := Predicate{}
       if !pred_parse(query, steps[begin..i], &item, &directive) {
@@ -291,31 +247,23 @@ fn pred_capture_source(match: *const TsMatch, capture: u32, source: *const Predi
   return false
 }
 fn pred_contains(value: []const u8, argument: []const u8) bool {
-  if #len(argument) > #len(value) {
-    return false
-  }
-  if #len(argument) == 0 {
-    return true
-  }
-  return pred_find(&value[0], #len(value), &argument[0], #len(argument)) != nil
+  if argument.len > value.len { return false }
+  if argument.len == 0 { return true }
+  return pred_find(&value[0], value.len, &argument[0], argument.len) != nil
 }
 pub fn predicates_pass(predicates: *Predicates, match: *const TsMatch, text: *const u8, length: u32) bool {
   source := PredicateSource{context: #cast(rawptr, text), length: length, range: pred_contiguous}
   return predicates_pass_source(predicates, match, &source)
 }
 fn predicates_pass_source(predicates: *Predicates, match: *const TsMatch, source: *const PredicateSource) bool {
-  if predicates == nil || match.pattern_index >= predicates.patterns {
-    return true
-  }
+  if predicates == nil || match.pattern_index >= predicates.patterns { return true }
   first := #slice(predicates.first, predicates.patterns)[match.pattern_index]
   count := #slice(predicates.count, predicates.patterns)[match.pattern_index]
   for i in #cast(usize, first)..#cast(usize, (first + count)) {
     item := &#slice(predicates.items, predicates.total)[i]
     value: *const u8 = nil
     value_length: u32 = 0
-    if !pred_capture_source(match, item.capture, source, 0, &value, &value_length) {
-      continue
-    }
+    if !pred_capture_source(match, item.capture, source, 0, &value, &value_length) { continue }
     result := false
     if item.kind == 1 {
       result = search_match(item.code, value, value_length, 0, 0, item.data, nil) >= 0
@@ -325,9 +273,7 @@ fn predicates_pass_source(predicates: *Predicates, match: *const TsMatch, source
       result = pred_capture_source(match, item.other, source, 1, &other, &other_length) && pred_equal(#slice(other, other_length), #slice(value, value_length))
     } else {
       for a in 0..#cast(usize, item.argument_count) {
-        if result {
-          break
-        }
+        if result { break }
         argument_length: u32 = 0
         argument := pred_string(predicates.query, #slice(item.arguments, item.argument_count)[a].id, &argument_length)
         if item.kind == 3 {
@@ -337,16 +283,12 @@ fn predicates_pass_source(predicates: *Predicates, match: *const TsMatch, source
         }
       }
     }
-    if result == item.negate {
-      return false
-    }
+    if result == item.negate { return false }
   }
   return true
 }
 pub fn predicates_free(predicates: *Predicates) {
-  if predicates == nil {
-    return
-  }
+  if predicates == nil { return }
   for i in 0..#cast(usize, predicates.total) {
     item := &#slice(predicates.items, predicates.total)[i]
     if item.code != nil {

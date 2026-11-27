@@ -1,4 +1,4 @@
-use "./owned_arena" arena_owner
+use arena_owner "./owned_arena"
 struct CompletionState {
   entries: [128]Entry,
   count: usize,
@@ -26,15 +26,15 @@ struct PickerIndex {
 }
 
 fn expand_home(path: []const u8, output: []u8) []const u8 {
-  if #len(path) > 0 && path[0] == '~' && (#len(path) == 1 || path[1] == '/') {
+  if path.len > 0 && path[0] == '~' && (path.len == 1 || path[1] == '/') {
     home_storage: [4096]u8
-    result := host.environment("HOME", home_storage[..])
-    if io.failed(result.failure) || !result.found || #len(result.value) + #len(path) >= #len(output) {
+    home := host.environment("HOME", home_storage[..]) catch {
       return output[..0]
     }
+    if home.len + path.len >= output.len { return output[..0] }
     used: usize = 0
-    add_text(output, &used, result.value)
-    if #len(path) == 1 {
+    add_text(output, &used, home)
+    if path.len == 1 {
       add_text(output, &used, "/")
     } else {
       add_text(output, &used, path[1..])
@@ -48,11 +48,11 @@ fn expand_home(path: []const u8, output: []u8) []const u8 {
 fn picker_match(name: []const u8, query: []const u8) bool {
   at: usize = 0
   for byte in name {
-    if at < #len(query) && lower(byte) == lower(query[at]) {
+    if at < query.len && lower(byte) == lower(query[at]) {
       at += 1
     }
   }
-  return at == #len(query)
+  return at == query.len
 }
 fn completion_refresh(app: *App) {
   if app.resource_state.kind == 6 {
@@ -73,7 +73,7 @@ fn completion_refresh(app: *App) {
   app.completion.error = false
   expanded: [4096]u8
   path := expand_home(app.prompt_state.text[..app.prompt_state.length], expanded[..])
-  split := #len(path)
+  split := path.len
   for split > 0 && path[split - 1] != '/' {
     split -= 1
   }
@@ -88,11 +88,9 @@ fn completion_refresh(app: *App) {
     app.picker_state.arena = allocated
     allocated = nil
     // A fresh mapping is already zero; only touched entries become resident.
-    app.picker_state.index = #cast(*PickerIndex, mem.arena_push_uninit(app.picker_state.arena, #sizeof(PickerIndex), #alignof(PickerIndex)))
-    offsets := #cast(*usize, mem.arena_push_uninit(app.picker_state.arena, #sizeof(usize) * PickerIndexRows, #alignof(usize)))
-    app.picker_state.index.offsets = #slice(offsets, PickerIndexRows)
-    names := #cast(*u8, mem.arena_push_uninit(app.picker_state.arena, PickerIndexBytes, 1))
-    app.picker_state.index.names = #slice(names, PickerIndexBytes)
+    app.picker_state.index = mem.push<PickerIndex>(app.picker_state.arena)
+    app.picker_state.index.offsets = mem.push_array<usize>(app.picker_state.arena, PickerIndexRows)
+    app.picker_state.index.names = mem.push_bytes(app.picker_state.arena, PickerIndexBytes)
   }
   index := app.picker_state.index
   changed_root := !buffer.equal(directory, index.root[..index.root_length])
@@ -114,7 +112,7 @@ fn completion_refresh(app: *App) {
     row: usize = 0
     for row < index.count && app.completion.count < 128 {
       name := picker_index_name(index, row)
-      prefix := #len(fragment) <= #len(name) && contains(name[..#len(fragment)], fragment)
+      prefix := fragment.len <= name.len && contains(name[..fragment.len], fragment)
       substring := contains(name, fragment)
       if (pass == 0 && prefix) || (pass == 1 && !prefix && substring) || (pass == 2 && !substring && picker_match(name, fragment)) {
         output := &app.completion.entries[app.completion.count]
@@ -127,9 +125,7 @@ fn completion_refresh(app: *App) {
   }
 }
 fn complete_path(app: *App) bool {
-  if app.completion.count == 0 {
-    return false
-  }
+  if app.completion.count == 0 { return false }
   entry := &app.completion.entries[app.completion.selected]
   if app.completion.prefix_length + entry.length >= 4096 {
     notice(app, "Completed path is too long.")
@@ -154,8 +150,8 @@ fn open_prompt(app: *App, typography: *Typography) {
   }
   expanded: [4096]u8
   path := expand_home(app.prompt_state.text[..app.prompt_state.length], expanded[..])
-  info := files.metadata(path)
-  if !app.completion.chosen && !io.failed(info.failure) && (info.mode & 61440) == 32768 {
+  info := files.metadata(path) catch fs.Metadata{}
+  if !app.completion.chosen && (info.mode & 61440) == 32768 {
     open_file(app, path)
     return
   }
@@ -172,9 +168,7 @@ fn open_prompt(app: *App, typography: *Typography) {
 // Enter in the palette: a selected suggestion fills in first; a folder or an
 // option name waits for the rest of the input.
 fn command_submit(app: *App, typography: *Typography) {
-  if palette_enter(app) {
-    return
-  }
+  if palette_enter(app) { return }
   command_history_remember(app)
   command_execute(app, typography)
 }
@@ -270,7 +264,7 @@ fn command_execute(app: *App, typography: *Typography) {
     return
   }
   // Vim spellings that DNA runs under another name.
-  if (#len(text) > 4 && buffer.equal(text[..4], "sav ")) || (#len(text) > 7 && buffer.equal(text[..7], "saveas ")) || (#len(text) > 1 && text[0] == '!') {
+  if (text.len > 4 && buffer.equal(text[..4], "sav ")) || (text.len > 7 && buffer.equal(text[..7], "saveas ")) || (text.len > 1 && text[0] == '!') {
     rewritten: [4096]u8
     used: usize = 0
     if text[0] == '!' {
@@ -289,18 +283,18 @@ fn command_execute(app: *App, typography: *Typography) {
     return
   }
   if vim_ex_command(app, typography, text) {
-    if #len(text) <= 1024 {
+    if text.len <= 1024 {
       app.vim_session.last_length = copy_text(app.vim_session.last[..], text)
     }
     return
   }
   split: usize = 0
-  for split < #len(text) && text[split] != ' ' {
+  for split < text.len && text[split] != ' ' {
     split += 1
   }
   verb := text[..split]
   argument := split
-  for argument < #len(text) && text[argument] == ' ' {
+  for argument < text.len && text[argument] == ' ' {
     argument += 1
   }
   // Bare, these do something of their own; their palette rows ask for an argument.
@@ -320,11 +314,11 @@ fn command_execute(app: *App, typography: *Typography) {
     help_open(app, true)
     return
   }
-  if (buffer.equal(verb, "set") || buffer.equal(verb, "se")) && argument < #len(text) {
+  if (buffer.equal(verb, "set") || buffer.equal(verb, "se")) && argument < text.len {
     set_command(app, typography, text[argument..])
     return
   }
-  if argument == #len(text) {
+  if argument == text.len {
     command := command_named(verb)
     if command < BuiltinCommands {
       action(app, typography, command)
@@ -392,16 +386,14 @@ fn command_execute(app: *App, typography: *Typography) {
     server_tool(app, verb, settings.trim(text[argument..]))
     return
   }
-  if lsp_command(app, verb, text[argument..]) {
-    return
-  }
-  if (buffer.equal(verb, "open") || buffer.equal(verb, "e")) && argument < #len(text) {
+  if lsp_command(app, verb, text[argument..]) { return }
+  if (buffer.equal(verb, "open") || buffer.equal(verb, "e")) && argument < text.len {
     storage: [4096]u8
     path := expand_home(text[argument..], storage[..])
     open_file(app, path)
     return
   }
-  if (buffer.equal(verb, "write") || buffer.equal(verb, "w")) && argument < #len(text) {
+  if (buffer.equal(verb, "write") || buffer.equal(verb, "w")) && argument < text.len {
     output: [4096]u8
     destination := expand_home(text[argument..], output[..])
     save_file(app, destination)
@@ -460,7 +452,7 @@ fn command_execute(app: *App, typography: *Typography) {
     layout_save(app, text[argument..])
     return
   }
-  if buffer.equal(verb, "layout") && argument < #len(text) {
+  if buffer.equal(verb, "layout") && argument < text.len {
     target: [4096]u8
     target_length := copy_text(target[..], text[argument..])
     panel(app, Panel.Layout)
@@ -472,23 +464,23 @@ fn command_execute(app: *App, typography: *Typography) {
     filetype_command(app, settings.trim(text[argument..]))
     return
   }
-  if #len(text) > 17 && buffer.equal(text[..17], "language-install ") {
+  if text.len > 17 && buffer.equal(text[..17], "language-install ") {
     language_install(app, settings.trim(text[17..]))
     return
   }
-  if #len(text) > 4 && buffer.equal(text[..4], "run ") {
+  if text.len > 4 && buffer.equal(text[..4], "run ") {
     terminal_show(app, true, text[4..])
     return
   }
-  if #len(text) > 6 && buffer.equal(text[..6], "theme ") {
+  if text.len > 6 && buffer.equal(text[..6], "theme ") {
     theme_switch(app, typography, settings.trim(text[6..]))
     return
   }
-  if #len(text) > 5 && buffer.equal(text[..5], "font ") {
+  if text.len > 5 && buffer.equal(text[..5], "font ") {
     font_select(app, typography, text[5..])
     return
   }
-  if #len(text) > 3 && buffer.equal(text[..3], "cd ") {
+  if text.len > 3 && buffer.equal(text[..3], "cd ") {
     project_cd(app, settings.trim(text[3..]))
     return
   }
@@ -499,7 +491,7 @@ fn command_execute(app: *App, typography: *Typography) {
   }
   // Like Vim's E492: a typo never runs the nearest fuzzy match.
   app.prompt_state.panel = Panel.None
-  if #len(text) > 0 {
+  if text.len > 0 {
     status_error_with(app, "Not an editor command: ", text)
   }
 }

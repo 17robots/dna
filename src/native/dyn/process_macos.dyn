@@ -1,6 +1,6 @@
 #target(kernel: darwin)
 #link("System")
-use "std/dynlib" proc_loader
+use proc_loader "std/dynlib"
 use "std/io"
 
 // Darwin owns pointer-sized spawn objects. The child remains waitable until
@@ -38,11 +38,13 @@ struct DarwinProcessAPI {
 proc_api: DarwinProcessAPI
 proc_api_once: sync.Once
 fn proc_library_symbol(name: []const u8) rawptr {
-  found := proc_loader.symbol(#cast(rawptr, #cast(isize, -2)), name)
-  if io.failed(found.failure) || found.value == nil {
+  found := proc_loader.symbol(#cast(rawptr, #cast(isize, -2)), name) catch {
     #panic("missing libSystem process routine")
   }
-  return found.value
+  if found == nil {
+    #panic("missing libSystem process routine")
+  }
+  return found
 }
 fn proc_prepare() {
   // Resolve errno before IO; loader initialization can otherwise clobber it.
@@ -86,9 +88,7 @@ fn proc_fcntl(fd: i32, operation: i32, value: i32) i32 {
 }
 fn proc_pipe(fds: *i32, flags: i32) i32 {
   proc_prepare()
-  if proc_api.pipe(fds) != 0 {
-    return -1
-  }
+  if proc_api.pipe(fds) != 0 { return -1 }
   values := #slice(fds, 2)
   if ((flags & 524288) != 0 && (proc_fcntl(values[0], 2, 1) != 0 || proc_fcntl(values[1], 2, 1) != 0)) || ((flags & 2048) != 0 && (!proc_nonblocking(values[0]) || !proc_nonblocking(values[1]))) {
     saved := rec_errno().*
@@ -105,8 +105,7 @@ fn proc_symbol(library: rawptr, name: *const u8) rawptr {
   if library == nil {
     library = #cast(rawptr, #cast(isize, -2))
   }
-  found := proc_loader.symbol(library, #slice(name, string_length(name)))
-  return found.value
+  return proc_loader.symbol(library, #slice(name, string_length(name))) catch nil
 }
 fn proc_watch(fd: i32, writing: i32) {
   dna_watch(fd, writing)
@@ -135,9 +134,7 @@ fn proc_wait(pid: i32, status: *i32, flags: i32) i32 {
 }
 fn proc_poll(fds: *PollDescriptor, count: usize, timeout: i32) i32 {
   proc_prepare()
-  if count > 4294967295 {
-    return -1
-  }
+  if count > 4294967295 { return -1 }
   return proc_api.poll(fds, #cast(u32, count), timeout)
 }
 fn proc_read_raw(fd: i32, bytes: *u8, length: usize) isize {
@@ -190,22 +187,16 @@ fn proc_open(command: *const u8, directory: *const u8, shell: bool) OwnedProcess
   for index in 0..6 {
     if descriptors[index] < 3 {
       lifted := proc_fcntl(descriptors[index], 67, 3)
-      if lifted < 0 {
-        return empty
-      }
+      if lifted < 0 { return empty }
       _ = rec_close(descriptors[index])
       descriptors[index] = lifted
     }
   }
   actions: rawptr = nil
   attributes: rawptr = nil
-  if proc_api.actions_init(&actions) != 0 {
-    return empty
-  }
+  if proc_api.actions_init(&actions) != 0 { return empty }
   defer _ = proc_api.actions_destroy(&actions)
-  if proc_api.attributes_init(&attributes) != 0 {
-    return empty
-  }
+  if proc_api.attributes_init(&attributes) != 0 { return empty }
   defer _ = proc_api.attributes_destroy(&attributes)
   // Explicit dup2 actions survive CLOEXEC_DEFAULT; all unrelated descriptors
   // close in the child, including concurrent threads' transient pipe handles.
@@ -214,9 +205,7 @@ fn proc_open(command: *const u8, directory: *const u8, shell: bool) OwnedProcess
   }
   // Suppress signal generation on this owned write endpoint only. Existing
   // signal masks and pending SIGPIPE remain untouched, including on EPIPE.
-  if proc_fcntl(descriptors[1], 73, 1) != 0 {
-    return empty
-  }
+  if proc_fcntl(descriptors[1], 73, 1) != 0 { return empty }
   shell_path: []const u8 = "/bin/sh\0"
   shell_arg: []const u8 = "-c\0"
   arguments: [4]*const u8 = [command, nil, nil, nil]
@@ -228,9 +217,7 @@ fn proc_open(command: *const u8, directory: *const u8, shell: bool) OwnedProcess
     arguments[2] = command
   }
   environment := proc_api.environment()
-  if environment == nil {
-    return empty
-  }
+  if environment == nil { return empty }
   pid: i32 = 0
   if proc_api.spawn(&pid, executable, &actions, &attributes, #cast(rawptr, &arguments[0]), environment.*) != 0 {
     return empty
@@ -247,24 +234,18 @@ fn proc_open(command: *const u8, directory: *const u8, shell: bool) OwnedProcess
 }
 fn proc_error_code() isize {
   error := rec_errno().*
-  if error == 35 {
-    return -11
-  } // Shared transport callers use EAGAIN = 11.
+  if error == 35 { return -11 } // Shared transport callers use EAGAIN = 11.
   return -#cast(isize, error)
 }
 fn proc_read(fd: i32, bytes: *u8, length: usize) isize {
   value := proc_read_raw(fd, bytes, length)
-  if value < 0 {
-    return proc_error_code()
-  }
+  if value < 0 { return proc_error_code() }
   return value
 }
 fn proc_write(fd: i32, bytes: *const u8, length: usize) isize {
   proc_prepare()
   value := rec_write(fd, bytes, length)
-  if value < 0 {
-    return proc_error_code()
-  }
+  if value < 0 { return proc_error_code() }
   return value
 }
 // WNOWAIT pins the leader PID until proc_close kills the owned group and reaps.
@@ -272,33 +253,27 @@ fn proc_peek(child: *const OwnedProcess) i32 {
   proc_prepare()
   info := DarwinChildInfo{}
   if proc_api.wait_info(1, #cast(u32, child.pid), &info, 37) != 0 {
-    if rec_errno().* == 4 {
-      return 0
-    }
+    if rec_errno().* == 4 { return 0 }
     return -1
   }
-  if info.pid != child.pid {
-    return 0
-  }
-  if info.code == 1 && info.status == 0 {
-    return 1
-  }
+  if info.pid != child.pid { return 0 }
+  if info.code == 1 && info.status == 0 { return 1 }
   return 2
 }
 fn proc_log(log: []u8, used: *usize, bytes: []const u8) {
-  amount := #len(bytes)
-  if amount >= #len(log) {
-    amount = #len(log) - 1
+  amount := bytes.len
+  if amount >= log.len {
+    amount = log.len - 1
   }
   keep := used.*
-  if keep > #len(log) - 1 - amount {
-    keep = #len(log) - 1 - amount
+  if keep > log.len - 1 - amount {
+    keep = log.len - 1 - amount
   }
   if keep > 0 {
     _ = proc_move(&log[0], &log[used.* - keep], keep)
   }
   if amount > 0 {
-    _ = copy(&log[keep], &bytes[#len(bytes) - amount], amount)
+    _ = copy(&log[keep], &bytes[bytes.len - amount], amount)
   }
   used.* = keep + amount
   log[used.*] = 0

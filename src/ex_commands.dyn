@@ -75,14 +75,14 @@ struct VimAddress { found, valid: bool, row: usize }
 
 fn vim_number(text: []const u8, at: *usize) usize {
   value: usize = 0
-  for at.* < #len(text) && text[at.*] >= '0' && text[at.*] <= '9' && value < 100000000 {
+  for at.* < text.len && text[at.*] >= '0' && text[at.*] <= '9' && value < 100000000 {
     value = value * 10 + (text[at.*] - '0')
     at.* += 1
   }
   return value
 }
 fn vim_ex_skip_space(text: []const u8, at: *usize) {
-  for at.* < #len(text) && (text[at.*] == ' ' || text[at.*] == 9) {
+  for at.* < text.len && (text[at.*] == ' ' || text[at.*] == 9) {
     at.* += 1
   }
 }
@@ -91,10 +91,8 @@ fn vim_ex_alpha(byte: u8) bool {
 }
 // word abbreviates full with at least minimum letters.
 fn vim_ex_name(word: []const u8, full: []const u8, minimum: usize) bool {
-  if #len(word) < minimum || #len(word) > #len(full) {
-    return false
-  }
-  return buffer.equal(word, full[..#len(word)])
+  if word.len < minimum || word.len > full.len { return false }
+  return buffer.equal(word, full[..word.len])
 }
 fn vim_ex_fail(app: *App, message: []const u8) bool {
   macro_fail(app)
@@ -105,7 +103,7 @@ fn vim_last_search(app: *App) []const u8 {
   return app.search_history.text[..app.search_history.length]
 }
 fn vim_set_last_search(app: *App, source: []const u8) {
-  if #len(source) > 0 {
+  if source.len > 0 {
     app.search_history.length = copy_text(app.search_history.text[..], source)
   }
 }
@@ -113,26 +111,26 @@ fn vim_set_last_search(app: *App, source: []const u8) {
 // outside a [] collection.
 fn vim_skip_pattern(text: []const u8, at: usize, delimiter: u8) usize {
   index := at
-  for index < #len(text) && text[index] != delimiter {
-    if text[index] == '\\' && index + 1 < #len(text) {
+  for index < text.len && text[index] != delimiter {
+    if text[index] == '\\' && index + 1 < text.len {
       index += 2
       continue
     }
     if text[index] == '[' {
       close := index + 1
-      if close < #len(text) && text[close] == '^' {
+      if close < text.len && text[close] == '^' {
         close += 1
       }
-      if close < #len(text) && text[close] == ']' {
+      if close < text.len && text[close] == ']' {
         close += 1
       }
-      for close < #len(text) && text[close] != ']' {
-        if text[close] == '\\' && close + 1 < #len(text) {
+      for close < text.len && text[close] != ']' {
+        if text[close] == '\\' && close + 1 < text.len {
           close += 1
         }
         close += 1
       }
-      if close < #len(text) {
+      if close < text.len {
         index = close + 1
         continue
       }
@@ -144,29 +142,21 @@ fn vim_skip_pattern(text: []const u8, at: usize, delimiter: u8) usize {
 // End of the text a multi-line pattern may see: a final newline ends the
 // last line, it does not join it to anything, as in Vim.
 fn vim_text_limit(doc: *buffer.Document) usize {
-  if doc.length > 0 && buffer.byte_at(doc, doc.length - 1) == 10 {
-    return doc.length - 1
-  }
+  if doc.length > 0 && buffer.byte_at(doc, doc.length - 1) == 10 { return doc.length - 1 }
   return doc.length
 }
 // 'ignorecase', unless 'smartcase' and the pattern has an upper case letter
 // (one not escaped with a backslash, as Vim counts them).
 fn vim_ignore(app: *App, source: []const u8) bool {
-  if !app.vim_session.ignorecase {
-    return false
-  }
-  if !app.vim_session.smartcase {
-    return true
-  }
+  if !app.vim_session.ignorecase { return false }
+  if !app.vim_session.smartcase { return true }
   index: usize = 0
-  for index < #len(source) {
+  for index < source.len {
     if source[index] == '\\' {
       index += 2
       continue
     }
-    if source[index] >= 'A' && source[index] <= 'Z' {
-      return false
-    }
+    if source[index] >= 'A' && source[index] <= 'Z' { return false }
     index += 1
   }
   return true
@@ -177,9 +167,7 @@ fn vim_compile(app: *App, source: []const u8, case: u8, regex: *VimRegex) patter
   query: [4400]u8
   ignore := case == 'i' || (case == 0 && vim_ignore(app, source))
   length := vim_regex_query(source, true, ignore, app.vim.ex.replacement[..app.vim.ex.replacement_length], query[..], regex)
-  if !regex.valid {
-    return pattern.Pattern{}
-  }
+  if !regex.valid { return pattern.Pattern{} }
   return pattern.open(query[..length])
 }
 
@@ -247,9 +235,7 @@ fn vim_search_row(app: *App, doc: *buffer.Document, source: []const u8, row: usi
 fn vim_mark_row(app: *App, doc: *buffer.Document, mark: u8, row: *usize) bool {
   if mark >= 'a' && mark <= 'z' {
     index := #cast(usize, mark - 'a')
-    if (doc.named_marks & (#cast(u32, 1) << #cast(u32, index))) == 0 {
-      return false
-    }
+    if (doc.named_marks & (#cast(u32, 1) << #cast(u32, index))) == 0 { return false }
     row.* = buffer.row_at(doc, doc.marks[buffer.NamedMarkBase + index])
     return true
   }
@@ -273,9 +259,7 @@ fn vim_mark_row(app: *App, doc: *buffer.Document, mark: u8, row: *usize) bool {
 fn vim_address(app: *App, doc: *buffer.Document, text: []const u8, at: *usize, base: usize) VimAddress {
   result := VimAddress{valid: true, row: base}
   vim_ex_skip_space(text, at)
-  if at.* >= #len(text) {
-    return result
-  }
+  if at.* >= text.len { return result }
   byte := text[at.*]
   if byte >= '0' && byte <= '9' {
     number := vim_number(text, at)
@@ -293,7 +277,7 @@ fn vim_address(app: *App, doc: *buffer.Document, text: []const u8, at: *usize, b
     result.found = true
     result.row = vim_last_row(doc)
   } else if byte == 39 {
-    if at.* + 1 >= #len(text) || !vim_mark_row(app, doc, text[at.* + 1], &result.row) {
+    if at.* + 1 >= text.len || !vim_mark_row(app, doc, text[at.* + 1], &result.row) {
       status_error(app, "E20: Mark not set")
       result.valid = false
       return result
@@ -303,10 +287,10 @@ fn vim_address(app: *App, doc: *buffer.Document, text: []const u8, at: *usize, b
   } else if byte == '/' || byte == '?' {
     end := vim_skip_pattern(text, at.* + 1, byte)
     source := text[at.* + 1..end]
-    if #len(source) == 0 {
+    if source.len == 0 {
       source = vim_last_search(app)
     }
-    if #len(source) == 0 {
+    if source.len == 0 {
       status_error(app, "E35: No previous regular expression")
       result.valid = false
       return result
@@ -317,16 +301,16 @@ fn vim_address(app: *App, doc: *buffer.Document, text: []const u8, at: *usize, b
     }
     vim_set_last_search(app, source)
     at.* = end
-    if at.* < #len(text) {
+    if at.* < text.len {
       at.* += 1
     }
     result.found = true
-  } else if byte == '\\' && at.* + 1 < #len(text) && (text[at.* + 1] == '/' || text[at.* + 1] == '?' || text[at.* + 1] == '&') {
+  } else if byte == '\\' && at.* + 1 < text.len && (text[at.* + 1] == '/' || text[at.* + 1] == '?' || text[at.* + 1] == '&') {
     source := vim_last_search(app)
     if text[at.* + 1] == '&' {
       source = app.vim.ex.pattern[..app.vim.ex.pattern_length]
     }
-    if #len(source) == 0 {
+    if source.len == 0 {
       status_error(app, "E35: No previous regular expression")
       result.valid = false
       return result
@@ -339,7 +323,7 @@ fn vim_address(app: *App, doc: *buffer.Document, text: []const u8, at: *usize, b
     result.found = true
   }
   // Offsets: +N -N, a bare + or - is 1, digits after an address add.
-  for at.* < #len(text) && (text[at.*] == '+' || text[at.*] == '-' || (result.found && text[at.*] >= '0' && text[at.*] <= '9')) {
+  for at.* < text.len && (text[at.*] == '+' || text[at.*] == '-' || (result.found && text[at.*] >= '0' && text[at.*] <= '9')) {
     sign := text[at.*]
     if sign == '+' || sign == '-' {
       at.* += 1
@@ -347,7 +331,7 @@ fn vim_address(app: *App, doc: *buffer.Document, text: []const u8, at: *usize, b
       sign = '+'
     }
     amount: usize = 1
-    if at.* < #len(text) && text[at.*] >= '0' && text[at.*] <= '9' {
+    if at.* < text.len && text[at.*] >= '0' && text[at.*] <= '9' {
       amount = vim_number(text, at)
     }
     result.found = true
@@ -366,10 +350,10 @@ fn vim_address(app: *App, doc: *buffer.Document, text: []const u8, at: *usize, b
 fn vim_range(app: *App, doc: *buffer.Document, text: []const u8, at: *usize) VimRange {
   cursor_row := buffer.row_at(doc, buffer.head(doc))
   result := VimRange{first: cursor_row, last: cursor_row, valid: true}
-  for at.* < #len(text) && (text[at.*] == ':' || text[at.*] == ' ' || text[at.*] == 9) {
+  for at.* < text.len && (text[at.*] == ':' || text[at.*] == ' ' || text[at.*] == 9) {
     at.* += 1
   }
-  if at.* < #len(text) && text[at.*] == '%' {
+  if at.* < text.len && text[at.*] == '%' {
     at.* += 1
     result.first = 0
     result.last = vim_last_row(doc)
@@ -387,7 +371,7 @@ fn vim_range(app: *App, doc: *buffer.Document, text: []const u8, at: *usize) Vim
     result.given = 1
   }
   vim_ex_skip_space(text, at)
-  if at.* < #len(text) && (text[at.*] == ',' || text[at.*] == ';') {
+  if at.* < text.len && (text[at.*] == ',' || text[at.*] == ';') {
     base := cursor_row
     if text[at.*] == ';' {
       base = result.first
@@ -437,12 +421,10 @@ fn vim_ex_goto(app: *App, doc: *buffer.Document, row: usize) {
 // Command dispatch
 
 fn vim_ex_command(app: *App, typography: *Typography, text: []const u8) bool {
-  if #len(text) == 0 || app.documents.current == nil || terminal_target(app) != nil || app.vim.ex.confirming {
+  if text.len == 0 || app.documents.current == nil || terminal_target(app) != nil || app.vim.ex.confirming {
     return false
   }
-  if app.vim.ex.depth > 8 {
-    return vim_ex_fail(app, "E169: Command too recursive")
-  }
+  if app.vim.ex.depth > 8 { return vim_ex_fail(app, "E169: Command too recursive") }
   app.vim.ex.depth += 1
   defer {
     app.vim.ex.depth -= 1
@@ -451,18 +433,12 @@ fn vim_ex_command(app: *App, typography: *Typography, text: []const u8) bool {
   at: usize = 0
   // Commands with names are recognised before the range is evaluated, so
   // text meant for the palette never runs a range search.
-  if !vim_ex_recognised(text) {
-    return false
-  }
+  if !vim_ex_recognised(text) { return false }
   range := vim_range(app, doc, text, &at)
-  if !range.valid {
-    return true
-  }
+  if !range.valid { return true }
   vim_ex_skip_space(text, &at)
-  if at == #len(text) {
-    if range.given == 0 {
-      return false
-    }
+  if at == text.len {
+    if range.given == 0 { return false }
     app.prompt_state.panel = Panel.None
     vim_ex_goto(app, doc, range.last)
     return true
@@ -471,13 +447,13 @@ fn vim_ex_command(app: *App, typography: *Typography, text: []const u8) bool {
   if text[at] == '&' || text[at] == '~' || text[at] == '#' {
     at += 1
   } else {
-    for at < #len(text) && vim_ex_alpha(text[at]) {
+    for at < text.len && vim_ex_alpha(text[at]) {
       at += 1
     }
   }
   name := text[name_start..at]
   bang := false
-  if at < #len(text) && text[at] == '!' && (vim_ex_name(name, "global", 1) || vim_ex_name(name, "normal", 4) || vim_ex_name(name, "join", 1) || vim_ex_name(name, "sort", 3)) {
+  if at < text.len && text[at] == '!' && (vim_ex_name(name, "global", 1) || vim_ex_name(name, "normal", 4) || vim_ex_name(name, "join", 1) || vim_ex_name(name, "sort", 3)) {
     bang = true
     at += 1
   }
@@ -517,13 +493,9 @@ fn vim_ex_command(app: *App, typography: *Typography, text: []const u8) bool {
   if vim_ex_name(name, "registers", 3) || vim_ex_name(name, "display", 2) {
     return vim_ex_registers(app, text, at)
   }
-  if vim_ex_name(name, "sort", 3) {
-    return vim_ex_sort(app, doc, range, text, at, bang)
-  }
+  if vim_ex_name(name, "sort", 3) { return vim_ex_sort(app, doc, range, text, at, bang) }
   if (vim_ex_name(name, "print", 1) || vim_ex_name(name, "number", 2) || vim_ex_name(name, "list", 1) || buffer.equal(name, "#")) && (range.given > 0 || app.vim.ex.batch) {
-    if !vim_range_valid(app, doc, range) {
-      return true
-    }
+    if !vim_range_valid(app, doc, range) { return true }
     numbered := name[0] == 'n' || name[0] == '#'
     for row in range.first..=range.last {
       vim_ex_print(app, doc, row, numbered)
@@ -540,11 +512,11 @@ fn vim_ex_command(app: *App, typography: *Typography, text: []const u8) bool {
 fn vim_ex_recognised(text: []const u8) bool {
   at: usize = 0
   // Skip the range without evaluating it: addresses, offsets, separators.
-  for at < #len(text) {
+  for at < text.len {
     byte := text[at]
     if byte == '/' || byte == '?' {
       at = vim_skip_pattern(text, at + 1, byte)
-      if at < #len(text) {
+      if at < text.len {
         at += 1
       }
       continue
@@ -553,7 +525,7 @@ fn vim_ex_recognised(text: []const u8) bool {
       at += 2
       continue
     }
-    if byte == '\\' && at + 1 < #len(text) && (text[at + 1] == '/' || text[at + 1] == '?' || text[at + 1] == '&') {
+    if byte == '\\' && at + 1 < text.len && (text[at + 1] == '/' || text[at + 1] == '?' || text[at + 1] == '&') {
       at += 2
       continue
     }
@@ -564,20 +536,16 @@ fn vim_ex_recognised(text: []const u8) bool {
     break
   }
   ranged := at > 0
-  if at >= #len(text) {
-    return ranged
-  }
-  if text[at] == '&' || text[at] == '~' || text[at] == '#' {
-    return true
-  }
+  if at >= text.len { return ranged }
+  if text[at] == '&' || text[at] == '~' || text[at] == '#' { return true }
   start := at
-  for at < #len(text) && vim_ex_alpha(text[at]) {
+  for at < text.len && vim_ex_alpha(text[at]) {
     at += 1
   }
   name := text[start..at]
   rest := text[at..]
   next: u8 = 0
-  if #len(rest) > 0 {
+  if rest.len > 0 {
     next = rest[0]
   }
   delimited := next != 0 && !vim_ex_alpha(next) && !(next >= '0' && next <= '9')
@@ -588,9 +556,7 @@ fn vim_ex_recognised(text: []const u8) bool {
   if vim_ex_name(name, "global", 1) || vim_ex_name(name, "vglobal", 1) {
     return delimited && next != ' '
   }
-  if vim_ex_name(name, "normal", 4) {
-    return next == 0 || next == ' ' || next == '!'
-  }
+  if vim_ex_name(name, "normal", 4) { return next == 0 || next == ' ' || next == '!' }
   if vim_ex_name(name, "delete", 1) {
     return next == 0 || next == ' ' || (next >= '0' && next <= '9')
   }
@@ -607,20 +573,16 @@ fn vim_ex_recognised(text: []const u8) bool {
   if vim_ex_name(name, "registers", 3) || vim_ex_name(name, "display", 2) {
     return !ranged && (next == 0 || next == ' ')
   }
-  if vim_ex_name(name, "sort", 3) {
-    return next == 0 || next == ' ' || next == '!'
-  }
+  if vim_ex_name(name, "sort", 3) { return next == 0 || next == ' ' || next == '!' }
   return false
 }
 // After a command: nothing, a "comment, or | and the next command.
 fn vim_ex_trailing(app: *App, typography: *Typography, text: []const u8, at: usize) bool {
   index := at
   vim_ex_skip_space(text, &index)
-  if index >= #len(text) || text[index] == '"' {
-    return true
-  }
+  if index >= text.len || text[index] == '"' { return true }
   if text[index] == '|' {
-    if index + 1 < #len(text) && !vim_ex_command(app, typography, text[index + 1..]) {
+    if index + 1 < text.len && !vim_ex_command(app, typography, text[index + 1..]) {
       status_error(app, "E492: Not an editor command")
     }
     return true
@@ -630,7 +592,7 @@ fn vim_ex_trailing(app: *App, typography: *Typography, text: []const u8, at: usi
 }
 fn vim_ex_print(app: *App, doc: *buffer.Document, row: usize, numbered: bool) {
   state := &app.vim.ex
-  capacity := #len(state.printed) - 1
+  capacity := state.printed.len - 1
   if state.printed_length > 0 && state.printed_length < capacity {
     state.printed[state.printed_length] = 10
     state.printed_length += 1
@@ -682,12 +644,10 @@ fn vim_tilde(app: *App, source: []const u8, magic: bool) bool {
   expanded: [1024]u8
   used: usize = 0
   index: usize = 0
-  for index < #len(source) {
+  for index < source.len {
     byte := source[index]
-    if (magic && byte == '~') || (!magic && byte == '\\' && index + 1 < #len(source) && source[index + 1] == '~') {
-      if used + state.replacement_length >= #len(expanded) {
-        return false
-      }
+    if (magic && byte == '~') || (!magic && byte == '\\' && index + 1 < source.len && source[index + 1] == '~') {
+      if used + state.replacement_length >= expanded.len { return false }
       for previous in state.replacement[..state.replacement_length] {
         expanded[used] = previous
         used += 1
@@ -699,12 +659,10 @@ fn vim_tilde(app: *App, source: []const u8, magic: bool) bool {
       continue
     }
     count: usize = 1
-    if byte == '\\' && index + 1 < #len(source) {
+    if byte == '\\' && index + 1 < source.len {
       count = 2
     }
-    if used + count >= #len(expanded) {
-      return false
-    }
+    if used + count >= expanded.len { return false }
     buffer.copy(expanded[used..], source[index..index + count])
     used += count
     index += count
@@ -721,13 +679,13 @@ fn vim_ex_substitute(app: *App, typography: *Typography, doc: *buffer.Document, 
   magic := magic_mode != 2
   source: []const u8 = ""
   fresh := false
-  if kind == 's' && at < #len(text) && text[at] != ' ' && text[at] != 9 && !rx_one_of(text[at], "0123456789cegriIp|\"&") {
+  if kind == 's' && at < text.len && text[at] != ' ' && text[at] != 9 && !rx_one_of(text[at], "0123456789cegriIp|\"&") {
     delimiter := text[at]
     if vim_ex_alpha(delimiter) {
       return vim_ex_fail(app, "E146: Regular expressions can't be delimited by letters")
     }
     if delimiter == '\\' {
-      if at + 1 >= #len(text) || (text[at + 1] != '/' && text[at + 1] != '?' && text[at + 1] != '&') {
+      if at + 1 >= text.len || (text[at + 1] != '/' && text[at + 1] != '?' && text[at + 1] != '&') {
         return vim_ex_fail(app, "E10: \\ should be followed by /, ? or &")
       }
       if text[at + 1] == '&' {
@@ -742,26 +700,26 @@ fn vim_ex_substitute(app: *App, typography: *Typography, doc: *buffer.Document, 
       end := vim_skip_pattern(text, at, delimiter)
       source = text[at..end]
       at = end
-      if at < #len(text) {
+      if at < text.len {
         at += 1
       }
-      if #len(source) == 0 {
+      if source.len == 0 {
         source = vim_last_search(app)
       }
     }
     // The substitute string runs to the next unescaped delimiter.
     replacement_start := at
-    for at < #len(text) && text[at] != delimiter {
-      if text[at] == '\\' && at + 1 < #len(text) {
+    for at < text.len && text[at] != delimiter {
+      if text[at] == '\\' && at + 1 < text.len {
         at += 1
       }
       at += 1
     }
     replacement := text[replacement_start..at]
-    if at < #len(text) {
+    if at < text.len {
       at += 1
     }
-    if #len(replacement) >= 2 && replacement[0] == '\\' && replacement[1] == '=' {
+    if replacement.len >= 2 && replacement[0] == '\\' && replacement[1] == '=' {
       return vim_ex_fail(app, "Expression replacements (\\=) need Vimscript and are not supported.")
     }
     if !vim_tilde(app, replacement, magic) {
@@ -771,12 +729,12 @@ fn vim_ex_substitute(app: *App, typography: *Typography, doc: *buffer.Document, 
   }
   // Flags.
   flags := VimSubFlags{global: app.vim_session.gdefault}
-  if at < #len(text) && text[at] == '&' {
+  if at < text.len && text[at] == '&' {
     flags = state.flags
     at += 1
   }
   use_search := kind == '~'
-  for at < #len(text) && rx_one_of(text[at], "cegiInp#lr") {
+  for at < text.len && rx_one_of(text[at], "cegiInp#lr") {
     flag := text[at]
     if flag == 'g' {
       flags.global = !flags.global
@@ -796,11 +754,9 @@ fn vim_ex_substitute(app: *App, typography: *Typography, doc: *buffer.Document, 
     at += 1
   }
   vim_ex_skip_space(text, &at)
-  if at < #len(text) && text[at] >= '0' && text[at] <= '9' {
+  if at < text.len && text[at] >= '0' && text[at] <= '9' {
     count := vim_number(text, &at)
-    if count == 0 {
-      return vim_ex_fail(app, "E939: Positive count required")
-    }
+    if count == 0 { return vim_ex_fail(app, "E939: Positive count required") }
     range.first = range.last
     range.last = range.last + count - 1
     if range.last > vim_last_row(doc) {
@@ -809,7 +765,7 @@ fn vim_ex_substitute(app: *App, typography: *Typography, doc: *buffer.Document, 
   }
   tail := at
   vim_ex_skip_space(text, &tail)
-  if tail < #len(text) && text[tail] != '|' && text[tail] != '"' {
+  if tail < text.len && text[tail] != '|' && text[tail] != '"' {
     return vim_ex_fail(app, "E488: Trailing characters")
   }
   if !fresh {
@@ -818,16 +774,10 @@ fn vim_ex_substitute(app: *App, typography: *Typography, doc: *buffer.Document, 
     } else {
       source = state.pattern[..state.pattern_length]
     }
-    if !state.replacement_valid {
-      return vim_ex_fail(app, "E35: No previous regular expression")
-    }
+    if !state.replacement_valid { return vim_ex_fail(app, "E35: No previous regular expression") }
   }
-  if #len(source) == 0 {
-    return vim_ex_fail(app, "E35: No previous regular expression")
-  }
-  if !vim_range_valid(app, doc, range) {
-    return true
-  }
+  if source.len == 0 { return vim_ex_fail(app, "E35: No previous regular expression") }
+  if !vim_range_valid(app, doc, range) { return true }
   // The pattern becomes both the last substitute and the last search
   // pattern; a :snomagic pattern keeps its meaning through \M.
   job := &state.job
@@ -854,9 +804,7 @@ fn vim_ex_substitute(app: *App, typography: *Typography, doc: *buffer.Document, 
   job.compiled = vim_compile(app, effective, flags.case, &job.regex)
   if !job.compiled.valid {
     pattern.close(&job.compiled)
-    if !job.regex.valid {
-      return vim_ex_fail(app, job.regex.message)
-    }
+    if !job.regex.valid { return vim_ex_fail(app, job.regex.message) }
     return vim_ex_fail(app, "Invalid substitute pattern.")
   }
   job.cursor = buffer.head(doc)
@@ -888,9 +836,7 @@ struct VimCallout { app: *App, doc: *buffer.Document, regex: *VimRegex, cursor: 
 fn vim_callout(block: rawptr, data: rawptr) i32 {
   context := #cast(*VimCallout, data)
   number := #cast(usize, pattern.callout_number(block))
-  if number == 0 || number > context.regex.filter_count {
-    return 0
-  }
+  if number == 0 || number > context.regex.filter_count { return 0 }
   position := context.base + pattern.callout_position(block)
   if vim_filter_check(context.app, context.doc, context.regex.filters[number - 1], position, context.cursor) {
     return 0
@@ -905,9 +851,7 @@ fn vim_filter_check(app: *App, doc: *buffer.Document, filter: VimRegexFilter, po
     actual: usize = 0
     wanted := filter.value
     if filter.kind == 'V' {
-      if !app.vim.last_valid {
-        return false
-      }
+      if !app.vim.last_valid { return false }
       low := app.vim.last_anchor
       high := app.vim.last_head
       if high < low {
@@ -915,16 +859,12 @@ fn vim_filter_check(app: *App, doc: *buffer.Document, filter: VimRegexFilter, po
         high = app.vim.last_anchor
       }
       if app.vim.last_mode == VimMode.Visual {
-        if position < low || position > high {
-          return false
-        }
+        if position < low || position > high { return false }
         continue
       }
       first_row := buffer.row_at(doc, low)
       last_row := buffer.row_at(doc, high)
-      if row < first_row || row > last_row {
-        return false
-      }
+      if row < first_row || row > last_row { return false }
       if app.vim.last_mode == VimMode.VisualBlock {
         left := low - buffer.row_start(doc, first_row)
         right := high - buffer.row_start(doc, last_row)
@@ -933,24 +873,18 @@ fn vim_filter_check(app: *App, doc: *buffer.Document, filter: VimRegexFilter, po
           left = right
           right = swap
         }
-        if column < left || column > right {
-          return false
-        }
+        if column < left || column > right { return false }
       }
       continue
     }
     if filter.kind == '#' {
-      if position != cursor {
-        return false
-      }
+      if position != cursor { return false }
       continue
     }
     if filter.kind == 'm' {
       mark_row: usize = 0
       mark := #cast(u8, filter.value)
-      if !vim_mark_row(app, doc, mark, &mark_row) {
-        return false
-      }
+      if !vim_mark_row(app, doc, mark, &mark_row) { return false }
       // Marks compare by position; '< and '> by their visual ends.
       target := buffer.row_start(doc, mark_row)
       if mark >= 'a' && mark <= 'z' {
@@ -987,15 +921,9 @@ fn vim_filter_check(app: *App, doc: *buffer.Document, filter: VimRegexFilter, po
         }
       }
     }
-    if filter.compare == '=' && actual != wanted {
-      return false
-    }
-    if filter.compare == '<' && actual >= wanted {
-      return false
-    }
-    if filter.compare == '>' && actual <= wanted {
-      return false
-    }
+    if filter.compare == '=' && actual != wanted { return false }
+    if filter.compare == '<' && actual >= wanted { return false }
+    if filter.compare == '>' && actual <= wanted { return false }
   }
   return true
 }
@@ -1018,13 +946,9 @@ fn vim_sub_find(app: *App, doc: *buffer.Document, job: *VimSub) pattern.Match {
   callout := VimCallout{app: app, doc: doc, regex: &job.regex, cursor: job.cursor}
   pattern.set_callout(&job.compiled, vim_callout, #cast(rawptr, &callout))
   for true {
-    if job.at > doc.length {
-      return pattern.Match{}
-    }
+    if job.at > doc.length { return pattern.Match{} }
     row := buffer.row_at(doc, job.at)
-    if row > job.last_row {
-      return pattern.Match{}
-    }
+    if row > job.last_row { return pattern.Match{} }
     line_low := buffer.row_start(doc, row)
     line_high := vim_text_end(doc, line_low)
     hay_base := line_low
@@ -1032,34 +956,24 @@ fn vim_sub_find(app: *App, doc: *buffer.Document, job: *VimSub) pattern.Match {
     if job.regex.multiline {
       hay_base = job.base
       limit := vim_text_limit(doc)
-      if job.at > limit {
-        return pattern.Match{}
-      }
+      if job.at > limit { return pattern.Match{} }
       callout.base = hay_base
       found = pattern.find(&job.compiled, buffer.range(doc, job.base, limit), job.at - job.base)
-      if found.error {
-        return found
-      }
+      if found.error { return found }
       if !found.found || buffer.row_at(doc, job.base + found.start) > job.last_row {
         return pattern.Match{}
       }
     } else {
       if job.at > line_high {
-        if row + 1 >= doc.line_count {
-          return pattern.Match{}
-        }
+        if row + 1 >= doc.line_count { return pattern.Match{} }
         job.at = buffer.row_start(doc, row + 1)
         continue
       }
       callout.base = hay_base
       found = pattern.find(&job.compiled, buffer.range(doc, line_low, line_high), job.at - line_low)
-      if found.error {
-        return found
-      }
+      if found.error { return found }
       if !found.found {
-        if row + 1 >= doc.line_count {
-          return pattern.Match{}
-        }
+        if row + 1 >= doc.line_count { return pattern.Match{} }
         job.at = buffer.row_start(doc, row + 1)
         continue
       }
@@ -1075,9 +989,7 @@ fn vim_sub_find(app: *App, doc: *buffer.Document, job: *VimSub) pattern.Match {
     start := hay_base + found.start
     end := hay_base + found.end
     if start == end && start == job.skip_empty {
-      if start >= doc.length {
-        return pattern.Match{}
-      }
+      if start >= doc.length { return pattern.Match{} }
       job.at = buffer.next(doc, start)
       continue
     }
@@ -1120,15 +1032,9 @@ fn vim_case_map(character: u32, upper: bool) u32 {
     if (ch >= 'a' && ch <= 'z') || (ch >= 0xe0 && ch <= 0xfe && ch != 0xf7) || (ch >= 0x3b1 && ch <= 0x3c9 && ch != 0x3c2) || (ch >= 0x430 && ch <= 0x44f) {
       return ch - 32
     }
-    if ch == 0xff {
-      return 0x178
-    }
-    if ch == 0x3c2 {
-      return 0x3a3
-    }
-    if ch >= 0x450 && ch <= 0x45f {
-      return ch - 80
-    }
+    if ch == 0xff { return 0x178 }
+    if ch == 0x3c2 { return 0x3a3 }
+    if ch >= 0x450 && ch <= 0x45f { return ch - 80 }
     if (ch >= 0x101 && ch <= 0x137 && (ch & 1) == 1) || (ch >= 0x13a && ch <= 0x148 && (ch & 1) == 0) || (ch >= 0x14b && ch <= 0x177 && (ch & 1) == 1) || (ch >= 0x17a && ch <= 0x17e && (ch & 1) == 0) {
       return ch - 1
     }
@@ -1137,12 +1043,8 @@ fn vim_case_map(character: u32, upper: bool) u32 {
   if (ch >= 'A' && ch <= 'Z') || (ch >= 0xc0 && ch <= 0xde && ch != 0xd7) || (ch >= 0x391 && ch <= 0x3a9 && ch != 0x3a2) || (ch >= 0x410 && ch <= 0x42f) {
     return ch + 32
   }
-  if ch == 0x178 {
-    return 0xff
-  }
-  if ch >= 0x400 && ch <= 0x40f {
-    return ch + 80
-  }
+  if ch == 0x178 { return 0xff }
+  if ch >= 0x400 && ch <= 0x40f { return ch + 80 }
   if (ch >= 0x100 && ch <= 0x136 && (ch & 1) == 0) || (ch >= 0x139 && ch <= 0x147 && (ch & 1) == 1) || (ch >= 0x14a && ch <= 0x176 && (ch & 1) == 0) || (ch >= 0x179 && ch <= 0x17d && (ch & 1) == 1) {
     return ch + 1
   }
@@ -1180,9 +1082,7 @@ fn vim_case_region(output: []u8, from: usize, to: usize, one: *u8, all: u8) {
 // One literal byte. A multi-byte character arrives byte by byte; its case
 // is applied once its last byte is in.
 fn vim_sub_put(output: []u8, used: *usize, byte: u8, one: *u8, all: u8) bool {
-  if used.* + 1 > buffer.Capacity {
-    return false
-  }
+  if used.* + 1 > buffer.Capacity { return false }
   output[used.*] = byte
   used.* += 1
   if (byte & 192) != 128 && byte < 192 {
@@ -1201,13 +1101,9 @@ fn vim_sub_put(output: []u8, used: *usize, byte: u8, one: *u8, all: u8) bool {
 }
 fn vim_sub_group(doc: *buffer.Document, job: *VimSub, index: usize, output: []u8, used: *usize, one: *u8, all: u8) bool {
   group := job.groups[index]
-  if !group.found || group.end <= group.start {
-    return true
-  }
+  if !group.found || group.end <= group.start { return true }
   length := group.end - group.start
-  if used.* + length > buffer.Capacity {
-    return false
-  }
+  if used.* + length > buffer.Capacity { return false }
   buffer.copy_range(doc, group.start, group.end, output[used.*..])
   vim_case_region(output, used.*, used.* + length, one, all)
   used.* += length
@@ -1218,10 +1114,10 @@ fn vim_sub_expand(doc: *buffer.Document, job: *VimSub, output: []u8, used: *usiz
   one: u8 = 0
   all: u8 = 0
   index: usize = 0
-  for index < #len(replacement) {
+  for index < replacement.len {
     byte := replacement[index]
     ok := true
-    if byte == '\\' && index + 1 < #len(replacement) {
+    if byte == '\\' && index + 1 < replacement.len {
       escaped := replacement[index + 1]
       index += 2
       if escaped >= '0' && escaped <= '9' {
@@ -1253,9 +1149,7 @@ fn vim_sub_expand(doc: *buffer.Document, job: *VimSub, output: []u8, used: *usiz
         ok = vim_sub_put(output, used, byte, &one, all)
       }
     }
-    if !ok {
-      return false
-    }
+    if !ok { return false }
   }
   return true
 }
@@ -1293,16 +1187,14 @@ fn vim_add_number(output: []u8, used: *usize, value: usize) {
     rest /= 10
     count += 1
   }
-  for count > 0 && used.* + 1 < #len(output) {
+  for count > 0 && used.* + 1 < output.len {
     count -= 1
     output[used.*] = digits[count]
     used.* += 1
   }
 }
 fn vim_sub_not_found(app: *App, job: *VimSub) {
-  if app.vim.ex.flags.quiet || app.vim.ex.batch {
-    return
-  }
+  if app.vim.ex.flags.quiet || app.vim.ex.batch { return }
   macro_fail(app)
   message: [1200]u8
   used := copy_text(message[..], "E486: Pattern not found: ")
@@ -1316,7 +1208,7 @@ fn vim_sub_run(app: *App, doc: *buffer.Document) bool {
   job := &app.vim.ex.job
   reserved := arena_owner.create((buffer.Capacity + 1))
   defer arena_owner.release(reserved)
-  output := mem.push_bytes_uninit(reserved, buffer.Capacity + 1)
+  output := mem.push_bytes(reserved, buffer.Capacity + 1)
   used: usize = 0
   low := VimRxNone
   copied: usize = 0
@@ -1327,9 +1219,7 @@ fn vim_sub_run(app: *App, doc: *buffer.Document) bool {
       notice(app, "Substitute pattern exceeded its work limit.")
       return false
     }
-    if !found.found {
-      break
-    }
+    if !found.found { break }
     vim_sub_count(job, doc, found.start)
     if !job.count_only && found.start >= copied {
       if low == VimRxNone {
@@ -1359,9 +1249,7 @@ fn vim_sub_run(app: *App, doc: *buffer.Document) bool {
     vim_sub_report(app, job, "match")
     return true
   }
-  if low == VimRxNone {
-    return true
-  }
+  if low == VimRxNone { return true }
   if !app.vim.ex.batch {
     buffer.checkpoint(doc)
   }
@@ -1427,7 +1315,7 @@ fn vim_confirm_replace(app: *App) bool {
   end := state.confirm_end
   reserved := arena_owner.create((buffer.Capacity + 1))
   defer arena_owner.release(reserved)
-  output := mem.push_bytes_uninit(reserved, buffer.Capacity + 1)
+  output := mem.push_bytes(reserved, buffer.Capacity + 1)
   used: usize = 0
   if !vim_sub_expand(doc, job, output, &used) {
     notice(app, "Substitution exceeds document capacity.")
@@ -1521,13 +1409,9 @@ fn vim_confirm_key(app: *App, typography: *Typography, key: u32, modifiers: u16)
     vim_confirm_next(app)
   } else if character == 'a' {
     for true {
-      if !vim_confirm_replace(app) {
-        break
-      }
+      if !vim_confirm_replace(app) { break }
       found := vim_sub_find(app, vim_doc(app), &app.vim.ex.job)
-      if !found.found {
-        break
-      }
+      if !found.found { break }
       app.vim.ex.confirm_start = found.start
       app.vim.ex.confirm_end = found.end
     }
@@ -1541,25 +1425,19 @@ fn vim_confirm_key(app: *App, typography: *Typography, key: u32, modifiers: u16)
 
 fn vim_ex_global(app: *App, typography: *Typography, doc: *buffer.Document, range_in: VimRange, text: []const u8, start: usize, invert: bool) bool {
   state := &app.vim.ex
-  if state.batch {
-    return vim_ex_fail(app, "E147: Cannot do :global recursive")
-  }
+  if state.batch { return vim_ex_fail(app, "E147: Cannot do :global recursive") }
   range := range_in
   if range.given == 0 {
     range.first = 0
     range.last = vim_last_row(doc)
   }
-  if !vim_range_valid(app, doc, range) {
-    return true
-  }
+  if !vim_range_valid(app, doc, range) { return true }
   at := start
-  if at >= #len(text) {
-    return vim_ex_fail(app, "E35: No previous regular expression")
-  }
+  if at >= text.len { return vim_ex_fail(app, "E35: No previous regular expression") }
   delimiter := text[at]
   source: []const u8 = ""
   if delimiter == '\\' {
-    if at + 1 >= #len(text) || (text[at + 1] != '/' && text[at + 1] != '?' && text[at + 1] != '&') {
+    if at + 1 >= text.len || (text[at + 1] != '/' && text[at + 1] != '?' && text[at + 1] != '&') {
       return vim_ex_fail(app, "E10: \\ should be followed by /, ? or &")
     }
     source = vim_last_search(app)
@@ -1574,22 +1452,20 @@ fn vim_ex_global(app: *App, typography: *Typography, doc: *buffer.Document, rang
     end := vim_skip_pattern(text, at + 1, delimiter)
     source = text[at + 1..end]
     at = end
-    if at < #len(text) {
+    if at < text.len {
       at += 1
     }
-    if #len(source) == 0 {
+    if source.len == 0 {
       source = vim_last_search(app)
     }
   }
-  if #len(source) == 0 {
-    return vim_ex_fail(app, "E35: No previous regular expression")
-  }
+  if source.len == 0 { return vim_ex_fail(app, "E35: No previous regular expression") }
   saved: [1100]u8
   saved_length := copy_text(saved[..], source)
   vim_set_last_search(app, saved[..saved_length])
   command: []const u8 = "p"
   vim_ex_skip_space(text, &at)
-  if at < #len(text) {
+  if at < text.len {
     command = text[at..]
   }
   // Mark the lines first, as Vim does; then run the command on each, top
@@ -1598,9 +1474,7 @@ fn vim_ex_global(app: *App, typography: *Typography, doc: *buffer.Document, rang
   job.compiled = vim_compile(app, saved[..saved_length], 0, &job.regex)
   if !job.compiled.valid {
     pattern.close(&job.compiled)
-    if !job.regex.valid {
-      return vim_ex_fail(app, job.regex.message)
-    }
+    if !job.regex.valid { return vim_ex_fail(app, job.regex.message) }
     return vim_ex_fail(app, "Invalid pattern.")
   }
   job.cursor = buffer.head(doc)
@@ -1611,7 +1485,7 @@ fn vim_ex_global(app: *App, typography: *Typography, doc: *buffer.Document, rang
   rows_count := range.last - range.first + 1
   reserved := arena_owner.create((rows_count + 64) * #sizeof(bool))
   defer arena_owner.release(reserved)
-  matched := mem.push_array(bool, reserved, rows_count)
+  matched := mem.push_array<bool>(reserved, rows_count)
   for index in 0..rows_count {
     matched[index] = false
   }
@@ -1621,14 +1495,10 @@ fn vim_ex_global(app: *App, typography: *Typography, doc: *buffer.Document, rang
       pattern.close(&job.compiled)
       return vim_ex_fail(app, "Pattern exceeded its work limit.")
     }
-    if !found.found {
-      break
-    }
+    if !found.found { break }
     row := buffer.row_at(doc, found.start)
     matched[row - range.first] = true
-    if row + 1 >= doc.line_count {
-      break
-    }
+    if row + 1 >= doc.line_count { break }
     job.at = buffer.row_start(doc, row + 1)
   }
   pattern.close(&job.compiled)
@@ -1664,13 +1534,9 @@ fn vim_ex_global(app: *App, typography: *Typography, doc: *buffer.Document, rang
   state.printed_length = 0
   failed := false
   for index in 0..marked.count {
-    if failed {
-      break
-    }
+    if failed { break }
     position := vim_marked_position(&marked, doc, index)
-    if position == VimRxNone {
-      continue
-    }
+    if position == VimRxNone { continue }
     revision := doc.revision
     old_length := doc.length
     doc.secondary.count = 0
@@ -1707,7 +1573,7 @@ fn vim_ex_delete(app: *App, typography: *Typography, doc: *buffer.Document, rang
   at := start
   vim_ex_skip_space(text, &at)
   register: u8 = 0
-  if at < #len(text) && (text[at] < '0' || text[at] > '9') && text[at] != '|' && text[at] != '"' {
+  if at < text.len && (text[at] < '0' || text[at] > '9') && text[at] != '|' && text[at] != '"' {
     register = text[at]
     if !((register >= 'a' && register <= 'z') || (register >= 'A' && register <= 'Z') || register == '_' || register == '+' || register == '*') {
       return vim_ex_fail(app, "E488: Trailing characters")
@@ -1715,7 +1581,7 @@ fn vim_ex_delete(app: *App, typography: *Typography, doc: *buffer.Document, rang
     at += 1
     vim_ex_skip_space(text, &at)
   }
-  if at < #len(text) && text[at] >= '0' && text[at] <= '9' {
+  if at < text.len && text[at] >= '0' && text[at] <= '9' {
     count := vim_number(text, &at)
     range.first = range.last
     range.last = range.last + count - 1
@@ -1725,12 +1591,10 @@ fn vim_ex_delete(app: *App, typography: *Typography, doc: *buffer.Document, rang
   }
   tail := at
   vim_ex_skip_space(text, &tail)
-  if tail < #len(text) && text[tail] != '|' && text[tail] != '"' {
+  if tail < text.len && text[tail] != '|' && text[tail] != '"' {
     return vim_ex_fail(app, "E488: Trailing characters")
   }
-  if !vim_range_valid(app, doc, range) {
-    return true
-  }
+  if !vim_range_valid(app, doc, range) { return true }
   // The same as {count}dd on the first line, with its register.
   keys: [48]u8
   used: usize = 0
@@ -1757,12 +1621,10 @@ fn vim_ex_delete(app: *App, typography: *Typography, doc: *buffer.Document, rang
 }
 fn vim_ex_normal(app: *App, typography: *Typography, doc: *buffer.Document, range: VimRange, text: []const u8, start: usize) bool {
   at := start
-  if at < #len(text) && text[at] == ' ' {
+  if at < text.len && text[at] == ' ' {
     at += 1
   }
-  if at >= #len(text) {
-    return vim_ex_fail(app, "E471: Argument required")
-  }
+  if at >= text.len { return vim_ex_fail(app, "E471: Argument required") }
   keys: [4096]u8
   length := copy_text(keys[..], text[at..])
   if !app.vim.ex.batch {
@@ -1772,9 +1634,7 @@ fn vim_ex_normal(app: *App, typography: *Typography, doc: *buffer.Document, rang
     vim_feed(app, typography, keys[..length])
     return true
   }
-  if !vim_range_valid(app, doc, range) {
-    return true
-  }
+  if !vim_range_valid(app, doc, range) { return true }
   if !app.vim.ex.batch {
     buffer.checkpoint(doc)
   }
@@ -1786,9 +1646,7 @@ fn vim_ex_normal(app: *App, typography: *Typography, doc: *buffer.Document, rang
   }
   for index in 0..marked.count {
     position := vim_marked_position(&marked, doc, index)
-    if position == VimRxNone {
-      continue
-    }
+    if position == VimRxNone { continue }
     revision := doc.revision
     old_length := doc.length
     vim_escape(app)
@@ -1811,11 +1669,11 @@ fn vim_feed(app: *App, typography: *Typography, keys: []const u8) {
     app.macro_state.feeding = feeding
   }
   index: usize = 0
-  for index < #len(keys) {
+  for index < keys.len {
     byte := keys[index]
     size := rx_char_size(byte)
-    if index + size > #len(keys) {
-      size = #len(keys) - index
+    if index + size > keys.len {
+      size = keys.len - index
     }
     character := #cast(u32, byte)
     if size > 1 {
@@ -1887,13 +1745,11 @@ fn vim_encode(character: u32, output: []u8) usize {
 }
 
 fn vim_decode(bytes: []const u8) u32 {
-  if #len(bytes) == 2 {
-    return (#cast(u32, bytes[0] & 0x1f) << 6) | #cast(u32, bytes[1] & 0x3f)
-  }
-  if #len(bytes) == 3 {
+  if bytes.len == 2 { return (#cast(u32, bytes[0] & 0x1f) << 6) | #cast(u32, bytes[1] & 0x3f) }
+  if bytes.len == 3 {
     return (#cast(u32, bytes[0] & 0x0f) << 12) | (#cast(u32, bytes[1] & 0x3f) << 6) | #cast(u32, bytes[2] & 0x3f)
   }
-  if #len(bytes) == 4 {
+  if bytes.len == 4 {
     return (#cast(u32, bytes[0] & 0x07) << 18) | (#cast(u32, bytes[1] & 0x3f) << 12) | (#cast(u32, bytes[2] & 0x3f) << 6) | #cast(u32, bytes[3] & 0x3f)
   }
   return bytes[0]
@@ -1923,9 +1779,7 @@ fn vim_repeat_ex(app: *App, typography: *Typography, count: usize) {
 
 // The byte after a row's newline (its end when it is the last row).
 fn vim_row_after(doc: *buffer.Document, row: usize) usize {
-  if row + 1 < doc.line_count {
-    return buffer.row_start(doc, row + 1)
-  }
+  if row + 1 < doc.line_count { return buffer.row_start(doc, row + 1) }
   return doc.length
 }
 // Line commands work on whole lines; a document without a final newline
@@ -1953,19 +1807,17 @@ fn vim_lines_end(app: *App, doc: *buffer.Document, added: bool) {
 // :m and :t destination: the line to put the text below; 0 is above line 1.
 fn vim_ex_destination(app: *App, doc: *buffer.Document, text: []const u8, at: *usize, below: *usize) bool {
   vim_ex_skip_space(text, at)
-  if at.* >= #len(text) || text[at.*] == '|' || text[at.*] == '"' {
+  if at.* >= text.len || text[at.*] == '|' || text[at.*] == '"' {
     status_error(app, "E14: Invalid address")
     return false
   }
-  if text[at.*] == '0' && (at.* + 1 >= #len(text) || text[at.* + 1] < '0' || text[at.* + 1] > '9') && (at.* + 1 >= #len(text) || (text[at.* + 1] != '+' && text[at.* + 1] != '-')) {
+  if text[at.*] == '0' && (at.* + 1 >= text.len || text[at.* + 1] < '0' || text[at.* + 1] > '9') && (at.* + 1 >= text.len || (text[at.* + 1] != '+' && text[at.* + 1] != '-')) {
     at.* += 1
     below.* = 0
     return true
   }
   address := vim_address(app, doc, text, at, buffer.row_at(doc, buffer.head(doc)))
-  if !address.valid {
-    return false
-  }
+  if !address.valid { return false }
   if address.row > vim_last_row(doc) {
     status_error(app, "E16: Invalid range")
     return false
@@ -2001,7 +1853,7 @@ fn vim_ex_move(app: *App, typography: *Typography, doc: *buffer.Document, range:
   high := vim_row_after(doc, range.last)
   reserved := arena_owner.create((high - low + 1))
   defer arena_owner.release(reserved)
-  block := mem.push_bytes_uninit(reserved, high - low + 1)
+  block := mem.push_bytes(reserved, high - low + 1)
   buffer.copy_range(doc, low, high, block[..high - low])
   insert_at: usize = 0
   if below > 0 {
@@ -2047,11 +1899,9 @@ fn vim_ex_join(app: *App, typography: *Typography, doc: *buffer.Document, range_
   range := range_in
   at := start
   vim_ex_skip_space(text, &at)
-  if at < #len(text) && text[at] >= '0' && text[at] <= '9' {
+  if at < text.len && text[at] >= '0' && text[at] <= '9' {
     count := vim_number(text, &at)
-    if count == 0 {
-      return vim_ex_fail(app, "E939: Positive count required")
-    }
+    if count == 0 { return vim_ex_fail(app, "E939: Positive count required") }
     range.first = range.last
     range.last = range.last + count - 1
   } else if range.given < 2 {
@@ -2060,15 +1910,11 @@ fn vim_ex_join(app: *App, typography: *Typography, doc: *buffer.Document, range_
   if range.last > vim_last_row(doc) {
     range.last = vim_last_row(doc)
   }
-  if range.first > range.last {
-    return vim_ex_fail(app, "E493: Backwards range given")
-  }
+  if range.first > range.last { return vim_ex_fail(app, "E493: Backwards range given") }
   if !app.vim.ex.batch {
     app.prompt_state.panel = Panel.None
   }
-  if range.first == range.last {
-    return vim_ex_trailing(app, typography, text, at)
-  }
+  if range.first == range.last { return vim_ex_trailing(app, typography, text, at) }
   keys: [32]u8
   used: usize = 0
   vim_add_number(keys[..], &used, range.last - range.first + 1)
@@ -2087,7 +1933,7 @@ fn vim_ex_join(app: *App, typography: *Typography, doc: *buffer.Document, range_
 // control characters as ^X, cut to fit one line.
 fn vim_ex_register_line(app: *App, name: u8, text: []const u8, linewise: bool) {
   state := &app.vim.ex
-  capacity := #len(state.printed) - 1
+  capacity := state.printed.len - 1
   line: [128]u8
   used := copy_text(line[..], "  c  \"")
   if linewise {
@@ -2099,7 +1945,7 @@ fn vim_ex_register_line(app: *App, name: u8, text: []const u8, linewise: bool) {
   line[used + 1] = ' '
   used += 2
   index: usize = 0
-  for index < #len(text) && used < 120 {
+  for index < text.len && used < 120 {
     byte := text[index]
     if byte < 32 || byte == 127 {
       line[used] = '^'
@@ -2109,9 +1955,7 @@ fn vim_ex_register_line(app: *App, name: u8, text: []const u8, linewise: bool) {
       continue
     }
     size := rx_char_size(byte)
-    if index + size > #len(text) || used + size > 120 {
-      break
-    }
+    if index + size > text.len || used + size > 120 { break }
     for part in 0..size {
       line[used + part] = text[index + part]
     }
@@ -2130,13 +1974,9 @@ fn vim_ex_register_line(app: *App, name: u8, text: []const u8, linewise: bool) {
   }
 }
 fn vim_ex_register_wanted(names: []const u8, name: u8) bool {
-  if #len(names) == 0 {
-    return true
-  }
+  if names.len == 0 { return true }
   for byte in names {
-    if byte == name || (byte >= 'A' && byte <= 'Z' && byte + 32 == name) {
-      return true
-    }
+    if byte == name || (byte >= 'A' && byte <= 'Z' && byte + 32 == name) { return true }
   }
   return false
 }
@@ -2155,7 +1995,7 @@ fn vim_ex_registers(app: *App, text: []const u8, start: usize) bool {
   for index in 0..26 {
     register := &app.register_state.named[index]
     name := #cast(u8, index) + 'a'
-    if register.owned && #len(register.text) > 0 && vim_ex_register_wanted(names, name) {
+    if register.owned && register.text.len > 0 && vim_ex_register_wanted(names, name) {
       vim_ex_register_line(app, name, register.text, register.linewise)
     }
   }
@@ -2163,7 +2003,7 @@ fn vim_ex_registers(app: *App, text: []const u8, start: usize) bool {
     vim_ex_register_line(app, ':', app.vim_session.last[..app.vim_session.last_length], false)
   }
   search := vim_last_search(app)
-  if #len(search) > 0 && vim_ex_register_wanted(names, '/') {
+  if search.len > 0 && vim_ex_register_wanted(names, '/') {
     vim_ex_register_line(app, '/', search, false)
   }
   vim_ex_show_printed(app)
@@ -2188,10 +2028,10 @@ fn vim_marked_open(doc: *buffer.Document, capacity: usize) VimMarked {
   bytes := (capacity + 1) * (#sizeof(usize) * 2 + #sizeof(bool) + #sizeof(i64)) + 256
   reserved := arena_owner.create(bytes)
   marked := VimMarked{reserved: reserved}
-  marked.starts = mem.push_array(usize, reserved, capacity + 1)
-  marked.lengths = mem.push_array(usize, reserved, capacity + 1)
-  marked.live = mem.push_array(bool, reserved, capacity + 1)
-  marked.tree = mem.push_array(i64, reserved, capacity + 2)
+  marked.starts = mem.push_array<usize>(reserved, capacity + 1)
+  marked.lengths = mem.push_array<usize>(reserved, capacity + 1)
+  marked.live = mem.push_array<bool>(reserved, capacity + 1)
+  marked.tree = mem.push_array<i64>(reserved, capacity + 2)
   for index in 0..capacity + 2 {
     marked.tree[index] = 0
   }
@@ -2247,9 +2087,7 @@ fn vim_marked_edit(marked: *VimMarked, from: usize, low: usize, high: usize, ins
   index := lower
   for index < marked.count {
     start := vim_marked_start(marked, index)
-    if start >= high {
-      break
-    }
+    if start >= high { break }
     ending := start + marked.lengths[index]
     if marked.live[index] {
       if low <= start && high >= ending {
@@ -2272,9 +2110,7 @@ fn vim_marked_edit(marked: *VimMarked, from: usize, low: usize, high: usize, ins
 // Follow the edits since revision; without the journal, shift by the
 // length change and let the caller snap to line starts.
 fn vim_marked_track(marked: *VimMarked, doc: *buffer.Document, revision: u64, old_length: usize, from: usize) {
-  if from >= marked.count || revision == doc.revision {
-    return
-  }
+  if from >= marked.count || revision == doc.revision { return }
   step_revision := revision + 1
   for step_revision <= doc.revision {
     if !buffer.change_step(doc, step_revision).found {
@@ -2292,9 +2128,7 @@ fn vim_marked_track(marked: *VimMarked, doc: *buffer.Document, revision: u64, ol
 }
 // The line start a live mark now names, or VimRxNone.
 fn vim_marked_position(marked: *VimMarked, doc: *buffer.Document, index: usize) usize {
-  if !marked.live[index] {
-    return VimRxNone
-  }
+  if !marked.live[index] { return VimRxNone }
   start := vim_marked_start(marked, index)
   if start > doc.length || (start == doc.length && start > 0 && buffer.byte_at(doc, start - 1) == 10) {
     return VimRxNone
@@ -2309,32 +2143,30 @@ fn vim_set_option(app: *App, text: []const u8) bool {
   checked := false
   for pass in 0..2 {
     at = 0
-    for at < #len(text) {
-      for at < #len(text) && text[at] == ' ' {
+    for at < text.len {
+      for at < text.len && text[at] == ' ' {
         at += 1
       }
       start := at
-      for at < #len(text) && text[at] != ' ' {
+      for at < text.len && text[at] != ' ' {
         at += 1
       }
-      if start == at {
-        continue
-      }
+      if start == at { continue }
       word := text[start..at]
       query := false
       toggle := false
-      if word[#len(word) - 1] == '?' {
+      if word[word.len - 1] == '?' {
         query = true
-        word = word[..#len(word) - 1]
-      } else if word[#len(word) - 1] == '!' {
+        word = word[..word.len - 1]
+      } else if word[word.len - 1] == '!' {
         toggle = true
-        word = word[..#len(word) - 1]
+        word = word[..word.len - 1]
       }
       value := true
-      if #len(word) > 3 && buffer.equal(word[..3], "inv") {
+      if word.len > 3 && buffer.equal(word[..3], "inv") {
         toggle = true
         word = word[3..]
-      } else if #len(word) > 2 && buffer.equal(word[..2], "no") {
+      } else if word.len > 2 && buffer.equal(word[..2], "no") {
         value = false
         word = word[2..]
       }
@@ -2351,12 +2183,8 @@ fn vim_set_option(app: *App, text: []const u8) bool {
         }
         _ => {}
       }
-      if option == nil {
-        return false
-      }
-      if pass == 0 {
-        continue
-      }
+      if option == nil { return false }
+      if pass == 0 { continue }
       if query {
         message: [32]u8
         used: usize = 0
@@ -2382,12 +2210,12 @@ fn vim_set_option(app: *App, text: []const u8) bool {
 // Whether word is a Vim option for :set, with its no/inv prefix or !/? suffix.
 fn vim_option_word(word_in: []const u8) bool {
   word := word_in
-  if #len(word) > 0 && (word[#len(word) - 1] == '?' || word[#len(word) - 1] == '!') {
-    word = word[..#len(word) - 1]
+  if word.len > 0 && (word[word.len - 1] == '?' || word[word.len - 1] == '!') {
+    word = word[..word.len - 1]
   }
-  if #len(word) > 3 && buffer.equal(word[..3], "inv") {
+  if word.len > 3 && buffer.equal(word[..3], "inv") {
     word = word[3..]
-  } else if #len(word) > 2 && buffer.equal(word[..2], "no") {
+  } else if word.len > 2 && buffer.equal(word[..2], "no") {
     word = word[2..]
   }
   return buffer.equal(word, "ignorecase") || buffer.equal(word, "ic") || buffer.equal(word, "smartcase") || buffer.equal(word, "scs") || buffer.equal(word, "gdefault") || buffer.equal(word, "gd")

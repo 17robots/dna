@@ -1,4 +1,4 @@
-use "std/io" io
+use io "std/io"
 use "std/unicode/utf8"
 use "std/mem"
 
@@ -95,9 +95,7 @@ fn end_change(document: *Document) {
 }
 fn notify_changed(document: *Document) {
   document.notification_pending = true
-  if document.notification_depth != 0 {
-    return
-  }
+  if document.notification_depth != 0 { return }
   document.notification_pending = false
   if document.on_change != nil {
     document.on_change(document.change_context)
@@ -109,13 +107,11 @@ fn notify_changed(document: *Document) {
 // pages. Works with reused/poisoned arenas too: metadata is explicitly zeroed,
 // and load/checkpoint initialize every byte before it becomes readable.
 pub fn try_allocate(arena: *mem.Arena) *Document {
-  allocated := mem.arena_try_push_uninit(arena, #sizeof(Document), #alignof(Document))
-  if !allocated.ok {
-    return nil
-  }
-  document := #cast(*Document, allocated.memory)
-  memory := #cast(*u8, document)
-  mem.zero(#slice(memory, #sizeof(Document)))
+  align := #alignof(Document)
+  used := mem.arena_used(arena)
+  padding := (align - (used % align)) % align
+  if mem.arena_room(arena) < #sizeof(Document) + padding { return nil }
+  document := mem.push<Document>(arena)
   _ = load(document, "")
   return document
 }
@@ -127,37 +123,33 @@ pub fn allocate(arena: *mem.Arena) *Document {
   return result
 }
 pub fn equal(a: []const u8, b: []const u8) bool {
-  if #len(a) != #len(b) {
-    return false
-  }
-  if #len(a) == 0 {
-    return true
-  }
-  return compare_bytes(&a[0], &b[0], #len(a)) == 0
+  if a.len != b.len { return false }
+  if a.len == 0 { return true }
+  return compare_bytes(&a[0], &b[0], a.len) == 0
 }
 // Copies source into the start of destination with the C library's bulk copy.
 // The ranges must not overlap; use move for that. Panics when destination is short.
 pub fn copy(destination: []u8, source: []const u8) {
-  if #len(source) > #len(destination) {
+  if source.len > destination.len {
     #panic("copy destination too small")
   }
-  if #len(source) > 0 {
-    _ = copy_bytes(&destination[0], &source[0], #len(source))
+  if source.len > 0 {
+    _ = copy_bytes(&destination[0], &source[0], source.len)
   }
 }
 // Like copy, but source and destination may overlap.
 pub fn move(destination: []u8, source: []const u8) {
-  if #len(source) > #len(destination) {
+  if source.len > destination.len {
     #panic("move destination too small")
   }
-  if #len(source) > 0 {
-    _ = move_bytes(&destination[0], &source[0], #len(source))
+  if source.len > 0 {
+    _ = move_bytes(&destination[0], &source[0], source.len)
   }
 }
 // UTF-8 without NUL. Aligned ASCII runs are checked a word at a time, so
 // loading a large file costs a fraction of decoding it byte by byte.
 pub fn valid(text: []const u8) bool {
-  length := #len(text)
+  length := text.len
   at: usize = 0
   for at < length {
     if length - at >= 8 && (#cast(usize, &text[at]) & 7) == 0 {
@@ -170,17 +162,13 @@ pub fn valid(text: []const u8) bool {
       }
     }
     byte := text[at]
-    if byte == 0 {
-      return false
-    }
+    if byte == 0 { return false }
     if byte < 128 {
       at += 1
       continue
     }
     decoded := utf8.decode(text, at)
-    if !decoded.valid {
-      return false
-    }
+    if !decoded.valid { return false }
     at += decoded.width
   }
   return true
@@ -235,9 +223,7 @@ fn before_change(document: *Document, low: usize, high: usize) {
   shrink_bounds(document, &document.checkpoint_prefix, &document.checkpoint_suffix, low, high)
 }
 pub fn load(document: *Document, text: []const u8) bool {
-  if !valid(text) {
-    return false
-  }
+  if !valid(text) { return false }
   // Build first: text may be a view of this document.
   return load_root(document, rope_from(text))
 }
@@ -270,21 +256,15 @@ fn load_root(document: *Document, root: *RopeNode) bool {
   return true
 }
 fn same_rows(a: *const RowAnchors, b: *const RowAnchors) bool {
-  if a.count != b.count {
-    return false
-  }
+  if a.count != b.count { return false }
   for index in 0..a.count {
-    if a.offsets[index] != b.offsets[index] {
-      return false
-    }
+    if a.offsets[index] != b.offsets[index] { return false }
   }
   return true
 }
 // Optional stable row identities, kept outside editable/clipboard text and in history.
 pub fn track_rows(document: *Document, count: usize) {
-  if count > 256 {
-    return
-  }
+  if count > 256 { return }
 
   checkpoint(document)
   document.rows.count = count
@@ -306,9 +286,7 @@ pub fn row_id(document: *const Document, offset: usize) usize {
 
   for index in 0..document.rows.count {
     if document.rows.offsets[index] == beginning {
-      if found != 0 {
-        return 257
-      }
+      if found != 0 { return 257 }
       found = index + 1
     }
   }
@@ -334,29 +312,19 @@ pub fn dirty(document: *const Document) bool {
   return saved_text_changed(document) || !same_rows(&document.rows, &document.saved_rows)
 }
 fn saved_text_changed(document: *const Document) bool {
-  if document.root == document.saved_root {
-    return false
-  }
-  if document.length != document.saved_length {
-    return true
-  }
+  if document.root == document.saved_root { return false }
+  if document.length != document.saved_length { return true }
   low := document.saved_prefix
   high := document.length - document.saved_suffix
-  if low >= high {
-    return false
-  }
+  if low >= high { return false }
   return !rope_equal(document.root, low, document.saved_root, low, high - low)
 }
 pub fn start(document: *const Document) usize {
-  if document.cursor < document.anchor {
-    return document.cursor
-  }
+  if document.cursor < document.anchor { return document.cursor }
   return document.anchor
 }
 pub fn end(document: *const Document) usize {
-  if document.cursor > document.anchor {
-    return document.cursor
-  }
+  if document.cursor > document.anchor { return document.cursor }
   return document.anchor
 }
 // Retained view positions follow edits, including changes applied by undo/redo.
@@ -386,20 +354,14 @@ fn shifted_mark(position: usize, low: usize, high: usize, inserted: usize, lengt
   if offset > length {
     offset = length
   }
-  if offset >= high {
-    return offset - (high - low) + inserted
-  }
-  if offset > low {
-    return low + inserted
-  }
+  if offset >= high { return offset - (high - low) + inserted }
+  if offset > low { return low + inserted }
   return offset
 }
 pub fn replace(document: *Document, text: []const u8) bool {
-  if !valid(text) {
-    return false
-  }
+  if !valid(text) { return false }
   // Build the new tree before anything is released: text may be a view.
-  replace_built(document, rope_replace(rope_retain(document.root), start(document), end(document), text), #len(text))
+  replace_built(document, rope_replace(rope_retain(document.root), start(document), end(document), text), text.len)
   return true
 }
 // Install root, an owned tree equal to the document with the selection
@@ -444,9 +406,7 @@ fn replace_built(document: *Document, root: *RopeNode, inserted: usize) {
 // Shrinking block sizes for the checkpoint diff's prefix and suffix scans.
 const Blocks: [4]usize = [65536, 1024, 16, 1]
 pub fn checkpoint(document: *Document) {
-  if document.batching {
-    return
-  }
+  if document.batching { return }
   entry := &document.history[document.history_at]
   if !checkpoint_changed(document) && same_rows(&document.rows, &entry.rows) {
     entry.cursor = document.cursor
@@ -574,18 +534,14 @@ pub fn undo(document: *Document) {
 }
 pub fn redo(document: *Document) {
   entry := &document.history[document.history_at]
-  if checkpoint_changed(document) || !same_rows(&document.rows, &entry.rows) {
-    return
-  }
+  if checkpoint_changed(document) || !same_rows(&document.rows, &entry.rows) { return }
   if document.history_at + 1 < document.history_count {
     document.history_at += 1
     restore(document, &document.history[document.history_at], true)
   }
 }
 pub fn move_to(document: *Document, position: usize, extend: bool) {
-  if position > document.length {
-    return
-  }
+  if position > document.length { return }
   document.goal_valid = false
   document.cursor = position
   if !extend {
@@ -597,9 +553,7 @@ pub fn line_start(document: *const Document, position: usize) usize {
 }
 pub fn line_end(document: *const Document, position: usize) usize {
   row := row_at(document, position)
-  if row + 1 >= document.line_count {
-    return document.length
-  }
+  if row + 1 >= document.line_count { return document.length }
   return row_start(document, row + 1) - 1
 }
 fn vertical_goal_valid(document: *const Document) bool {
@@ -632,14 +586,10 @@ pub fn vertical(document: *Document, down: bool, extend: bool) {
   destination: usize = 0
   if down {
     ending := line_end(document, document.cursor)
-    if ending == document.length {
-      return
-    }
+    if ending == document.length { return }
     destination = ending + 1
   } else {
-    if beginning == 0 {
-      return
-    }
+    if beginning == 0 { return }
     destination = line_start(document, beginning - 1)
   }
   moved: usize = 0
@@ -680,12 +630,8 @@ pub fn select_line(document: *Document) {
 pub fn lines_selected(document: *const Document) bool {
   low := start(document)
   high := end(document)
-  if high <= low || line_start(document, low) != low {
-    return false
-  }
-  if high != document.length && byte_at(document, high - 1) != 10 {
-    return false
-  }
+  if high <= low || line_start(document, low) != low { return false }
+  if high != document.length && byte_at(document, high - 1) != 10 { return false }
   return true
 }
 // Extend the selection by one whole line upward, keeping the head on top.
@@ -703,9 +649,7 @@ pub fn extend_line_above(document: *Document) {
   document.cursor = low
 }
 pub fn find(document: *Document, query: []const u8, backwards: bool) bool {
-  if #len(query) == 0 || #len(query) > document.length {
-    return false
-  }
+  if query.len == 0 || query.len > document.length { return false }
   base := document.cursor
   if backwards {
     base = start(document)
@@ -716,9 +660,9 @@ pub fn find(document: *Document, query: []const u8, backwards: bool) bool {
     if backwards {
       at = (base + document.length - (step % (document.length + 1))) % (document.length + 1)
     }
-    if at + #len(query) <= document.length && equal(range(document, at, at + #len(query)), query) {
+    if at + query.len <= document.length && equal(range(document, at, at + query.len), query) {
       document.anchor = at
-      document.cursor = at + #len(query)
+      document.cursor = at + query.len
       return true
     }
     step += 1
@@ -728,22 +672,14 @@ pub fn find(document: *Document, query: []const u8, backwards: bool) bool {
 
 // Whitespace, identifier text (including UTF-8), and punctuation form runs.
 fn word_class(document: *const Document, at: usize, big: bool) u8 {
-  if at >= document.length {
-    return 0
-  }
+  if at >= document.length { return 0 }
   byte := byte_at(document, at)
-  if byte == 32 || byte == 9 || byte == 10 || byte == 13 {
-    return 0
-  }
+  if byte == 32 || byte == 9 || byte == 10 || byte == 13 { return 0 }
   if byte >= 128 && !big {
     rune := utf8.decode(decode_window(document, at), 0)
     category := unicode_category(#cast(i32, rune.codepoint))
-    if category >= 23 && category <= 25 {
-      return 0
-    }
-    if category >= 1 && category <= 11 {
-      return 1
-    }
+    if category >= 23 && category <= 25 { return 0 }
+    if category >= 1 && category <= 11 { return 1 }
     return 2
   }
   if big || byte >= 128 || byte == 95 || (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) {
@@ -818,9 +754,7 @@ pub fn line_nonblank(document: *const Document, position: usize) usize {
   for at < ending && (byte_at(document, at) == 32 || byte_at(document, at) == 9 || byte_at(document, at) == 13) {
     at += 1
   }
-  if at == ending {
-    return beginning
-  }
+  if at == ending { return beginning }
   return at
 }
 pub fn line_last(document: *const Document, position: usize) usize {
@@ -829,9 +763,7 @@ pub fn line_last(document: *const Document, position: usize) usize {
   if ending > beginning && byte_at(document, ending - 1) == 13 {
     ending -= 1
   }
-  if ending > beginning {
-    return previous(document, ending)
-  }
+  if ending > beginning { return previous(document, ending) }
   return beginning
 }
 
@@ -844,12 +776,8 @@ pub fn row_at(document: *const Document, position: usize) usize {
   return rope_newlines_before(document.root, offset)
 }
 pub fn row_start(document: *const Document, row: usize) usize {
-  if row >= document.line_count {
-    return document.length
-  }
-  if row == 0 {
-    return 0
-  }
+  if row >= document.line_count { return document.length }
+  if row == 0 { return 0 }
   return rope_after_newline(document.root, row)
 }
 
@@ -860,7 +788,7 @@ pub fn codepoints(document: *const Document, low: usize, high: usize) usize {
   at := low
   for at < high {
     text := chunk_at(document, at)
-    length := #len(text)
+    length := text.len
     if length > high - at {
       length = high - at
     }

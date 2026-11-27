@@ -17,7 +17,7 @@ def function(source, name):
     return source[start:end]+'\n'
 view = (ROOT/'src/view.dyn').read_text()
 scheduler = (ROOT/'src/scheduler.dyn').read_text()
-base = '''use "./sdl" sdl
+base = '''use sdl "./sdl"
 struct Animation {active:bool}
 struct View {vsync,vsync_supported:bool,refresh_ms:f32,animation:Animation}
 struct Config {frame_interval_ms:f32}

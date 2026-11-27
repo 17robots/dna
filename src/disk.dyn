@@ -52,13 +52,9 @@ fn disk_replace(doc: *buffer.Document, bytes: []const u8) {
 }
 // Only registration changes and worker-published results enter this workset.
 fn disk_dirty_slot(app: *App, index: usize) {
-  if index >= #len(app.documents.slots) {
-    return
-  }
+  if index >= app.documents.slots.len { return }
   slot := app.documents.slots[index]
-  if slot.watch.dirty {
-    return
-  }
+  if slot.watch.dirty { return }
   slot.watch.dirty = true
   slot.watch.next = nil
   if app.disk.last == nil {
@@ -73,9 +69,7 @@ fn disk_register(app: *App, slot: *Slot) bool {
   if slot.document == nil || slot.file.length == 0 || slot.terminal.handle != nil {
     if watched.identity != 0 {
       blank: [1]u8 = [0]
-      if disk_watch(app.disk.worker, slot.index, 0, &blank[0], &blank[0], 0) == 0 {
-        return false
-      }
+      if disk_watch(app.disk.worker, slot.index, 0, &blank[0], &blank[0], 0) == 0 { return false }
       watched.identity = 0
     }
     watched.ready = false
@@ -83,15 +77,11 @@ fn disk_register(app: *App, slot: *Slot) bool {
   }
   if app.disk.worker == nil {
     app.disk.worker = disk_open()
-    if app.disk.worker == nil {
-      return false
-    }
+    if app.disk.worker == nil { return false }
   }
   // A file still loading has only part of its text to compare; watch it
   // once complete.
-  if buffer.load_state(slot.document) != buffer.LoadComplete {
-    return true
-  }
+  if buffer.load_state(slot.document) != buffer.LoadComplete { return true }
   if watched.identity != slot.identity || watched.epoch != slot.document.saved_epoch || !buffer.equal(watched.path[..watched.length], files.name(&slot.file)) {
     // The watcher compares a hash. With the file's stamp from when it held
     // the saved text, the watcher hashes the file itself on its own thread;
@@ -132,11 +122,11 @@ fn disk_process(app: *App, slot: *Slot) bool {
     return false
   }
   defer arena_owner.release(allocated)
-  bytes := mem.push_bytes_uninit(allocated, #cast(usize, pending))
+  bytes := mem.push_bytes(allocated, #cast(usize, pending))
   changed := false
-  if disk_take(app.disk.worker, slot.index, slot.identity, &bytes[0], #len(bytes)) == 1 {
-    content := bytes[..#len(bytes) - 1]
-    if app.config.reload_clean_buffers && !buffer.dirty_cached(slot.document) && #len(content) <= buffer.Capacity && buffer.valid(content) {
+  if disk_take(app.disk.worker, slot.index, slot.identity, &bytes[0], bytes.len) == 1 {
+    content := bytes[..bytes.len - 1]
+    if app.config.reload_clean_buffers && !buffer.dirty_cached(slot.document) && content.len <= buffer.Capacity && buffer.valid(content) {
       disk_replace(slot.document, content)
       // The bytes came from the watcher; their stamp is not known here.
       files.forget_stamp(&slot.file)
@@ -154,13 +144,13 @@ fn disk_tick(app: *App) bool {
   // Bootstrap supports restored/manual fixtures; mutations maintain the queue.
   if !app.disk.initialized {
     app.disk.initialized = true
-    for index in 0..#len(app.documents.slots) {
+    for index in 0..app.documents.slots.len {
       disk_dirty_slot(app, index)
     }
   }
   ready := DiskReady{}
   for disk_next(app.disk.worker, &ready) != 0 {
-    if ready.index < #len(app.documents.slots) {
+    if ready.index < app.documents.slots.len {
       slot := app.documents.slots[ready.index]
       if slot.document != nil && slot.identity == ready.identity {
         slot.watch.ready = true
@@ -201,8 +191,11 @@ fn disk_reload(app: *App, confirmed: bool) {
   mark := mem.arena_mark(app.scratch)
   defer mem.arena_rewind(app.scratch, mark)
   path := files.name(app.documents.file)
-  info := files.metadata(path)
-  if io.failed(info.failure) || (info.mode & 61440) != 32768 {
+  info := files.metadata(path) catch {
+    notice(app, "File is missing or is not a regular file. Buffer preserved.")
+    return
+  }
+  if (info.mode & 61440) != 32768 {
     notice(app, "File is missing or is not a regular file. Buffer preserved.")
     return
   }

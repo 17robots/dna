@@ -1,9 +1,9 @@
-use "std/parse" parse
-use "../../src/owned_arena" arena_owner
-use "../../src/lsp" lsp
-use "../../src/buffer" buffer
+use parse "std/parse"
+use arena_owner "../../src/owned_arena"
+use lsp "../../src/lsp"
+use buffer "../../src/buffer"
 use "std/mem"
-use "std/encoding/json" json
+use json "std/encoding/json"
 fn main() {
   snippet_output: [256]u8
   snippet := lsp.plain_snippet("helper(${1:value}, ${2:${3:other}})$0", snippet_output[..])
@@ -48,25 +48,25 @@ fn main() {
   if lsp.offset(text, position).value != 7 || lsp.offset(text, lsp.Position{character: 3}).valid {
     #panic("surrogate boundary")
   }
-  if lsp.offset(text, lsp.Position{line: 1, character: 2}).value != #len(text) || lsp.offset(text, lsp.Position{line: 8}).valid {
+  if lsp.offset(text, lsp.Position{line: 1, character: 2}).value != text.len || lsp.offset(text, lsp.Position{line: 8}).valid {
     #panic("line bounds")
   }
   uri: [256]u8
   path: [256]u8
   encoded := lsp.uri("/tmp/a #é.dyn", uri[..])
-  if !buffer.equal(encoded, "file:///tmp/a%20%23%C3%A9.dyn") || !buffer.equal(lsp.path(encoded, path[..]), "/tmp/a #é.dyn") || #len(lsp.path("file:///tmp/%00x", path[..])) != 0 || #len(lsp.path("file://host/path", path[..])) != 0 {
+  if !buffer.equal(encoded, "file:///tmp/a%20%23%C3%A9.dyn") || !buffer.equal(lsp.path(encoded, path[..]), "/tmp/a #é.dyn") || lsp.path("file:///tmp/%00x", path[..]).len != 0 || lsp.path("file://host/path", path[..]).len != 0 {
     #panic("URI validation")
   }
   owner := arena_owner.create((65536))
   defer arena_owner.release(owner)
-  parsed := json.parse(owner, "[{\"range\":{\"start\":{\"line\":0,\"character\":2},\"end\":{\"line\":0,\"character\":4}},\"newText\":\"X\"},{\"range\":{\"start\":{\"line\":1,\"character\":0},\"end\":{\"line\":1,\"character\":1}},\"newText\":\"last\"}]")
+  parsed := json.parse(owner, "[{\"range\":{\"start\":{\"line\":0,\"character\":2},\"end\":{\"line\":0,\"character\":4}},\"newText\":\"X\"},{\"range\":{\"start\":{\"line\":1,\"character\":0},\"end\":{\"line\":1,\"character\":1}},\"newText\":\"last\"}]") catch { #panic("unicode edit json") }
   output: [256]u8
-  result := lsp.edits(text, parsed.root, output[..])
+  result := lsp.edits(text, parsed, output[..])
   if !result.valid || !buffer.equal(output[..result.value], "aéX\r\nlast中") {
     #panic("Unicode edit")
   }
-  bad := json.parse(owner, "[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":4}},\"newText\":\"x\"},{\"range\":{\"start\":{\"line\":0,\"character\":1},\"end\":{\"line\":0,\"character\":2}},\"newText\":\"y\"}]")
-  if lsp.edits(text, bad.root, output[..]).valid {
+  bad := json.parse(owner, "[{\"range\":{\"start\":{\"line\":0,\"character\":0},\"end\":{\"line\":0,\"character\":4}},\"newText\":\"x\"},{\"range\":{\"start\":{\"line\":0,\"character\":1},\"end\":{\"line\":0,\"character\":2}},\"newText\":\"y\"}]") catch { #panic("overlap json") }
+  if lsp.edits(text, bad, output[..]).valid {
     #panic("overlap accepted")
   }
   many_edits()
@@ -75,7 +75,7 @@ fn main() {
 fn many_edits() {
   owner := arena_owner.create((4194304))
   defer arena_owner.release(owner)
-  source := #slice((#cast(*u8, mem.arena_push_uninit(owner, 4000, 1))), 4000)
+  source := mem.push_bytes(owner, 4000)
   index: usize = 0
   for index < 1000 {
     source[index * 4] = 'a'
@@ -84,7 +84,7 @@ fn many_edits() {
     source[index * 4 + 3] = 10
     index += 1
   }
-  request := #slice((#cast(*u8, mem.arena_push_uninit(owner, 131072, 1))), 131072)
+  request := mem.push_bytes(owner, 131072)
   used: usize = 0
   request[used] = '['
   used += 1
@@ -104,9 +104,7 @@ fn many_edits() {
       digits[count] = #cast(u8, (48 + value % 10))
       count += 1
       value /= 10
-      if value == 0 {
-        break
-      }
+      if value == 0 { break }
     }
     for count > 0 {
       count -= 1
@@ -123,9 +121,7 @@ fn many_edits() {
       digits[count] = #cast(u8, (48 + value % 10))
       count += 1
       value /= 10
-      if value == 0 {
-        break
-      }
+      if value == 0 { break }
     }
     for count > 0 {
       count -= 1
@@ -147,12 +143,11 @@ fn many_edits() {
   }
   request[used] = ']'
   used += 1
-  parsed := json.parse(owner, request[..used])
-  output := #slice((#cast(*u8, mem.arena_push_uninit(owner, 1048577, 1))), 1048577)
-  result := lsp.edits(source, parsed.root, output)
-  if parsed.failure.kind != parse.Kind.Ok {
+  parsed := json.parse(owner, request[..used]) catch {
     #panic("many edits request")
   }
+  output := mem.push_bytes(owner, 1048577)
+  result := lsp.edits(source, parsed, output)
   if !result.valid {
     #panic("many reversed edits")
   }

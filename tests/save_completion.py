@@ -24,11 +24,11 @@ def function(source, name):
 
 
 source = (ROOT / "src/file_actions.dyn").read_text()
-fixture = '''use "std/io" io
-use "./buffer" buffer
-use "./files" files
-use "./owner" arena_owner
-use "./thread" thread
+fixture = '''use io "std/io"
+use buffer "./buffer"
+use files "./files"
+use arena_owner "./owner"
+use thread "./thread"
 struct SaveTask {arena:rawptr,worker:rawptr,identity:u64,job:files.SaveJob}
 struct Slot {identity:u64,document:*buffer.Document,file:files.State,syntax_checked:bool,syntax_revision:u64}
 struct SaveSequence {active:bool,waiting:bool}
@@ -95,11 +95,11 @@ modules = {
 pub fn dirty_cached(document:*Document) bool {return document.dirty}
 pub fn checkpoint(document:*Document) {}
 pub fn equal(a:[]const u8,b:[]const u8) bool {
- if #len(a)!=#len(b) {return false}
- for index in 0..#len(a) {if a[index]!=b[index] {return false}}
+ if a.len!=b.len {return false}
+ for index in 0..a.len {if a[index]!=b[index] {return false}}
  return true}
 ''',
-    "files": '''use "../buffer" buffer
+    "files": '''use buffer "../buffer"
 pub struct State {}
 pub struct SaveJob {}
 pub finished:usize=0
@@ -112,9 +112,8 @@ pub fn save_abort(job:*SaveJob) {aborted+=1}
     "owner": '''pub released:usize=0
 pub fn release(arena:rawptr) {released+=1}
 ''',
-    "thread": '''use "std/io" io
-pub struct Result {failure:io.Failure}
-pub fn join(worker:rawptr) Result {return Result{}}
+    "thread": '''use io "std/io"
+pub fn join(worker:rawptr) i32!io.IoErr {return 0}
 ''',
 }
 with tempfile.TemporaryDirectory(prefix="dna-save-completion-") as temporary:

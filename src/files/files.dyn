@@ -1,16 +1,15 @@
-use "std/io" io
-use "std/parse" parse
-use "../cstring" cstring
-use "../owned_arena" arena_owner
-use "../filesystem" fs
+use io "std/io"
+use cstring "../cstring"
+use arena_owner "../owned_arena"
+use fs "../filesystem"
 use "std/mem"
 use "std/c"
-use "std/path" paths
+use paths "std/path"
 use "../buffer"
 
 // Borrow caller storage; invalid input/capacity failure leaves it unchanged.
-fn bounded_string(storage: []u8, source: []const u8) c.StringResult {
-  return cstring.bounded(storage, source)
+fn bounded_string(storage: []u8, source: []const u8) c.string!io.IoErr {
+  return try cstring.bounded(storage, source)
 }
 
 
@@ -23,23 +22,17 @@ pub fn name(state: *const State) []const u8 {
   return state.path[..state.length]
 }
 pub fn set_name(state: *State, path: []const u8) bool {
-  if #len(path) == 0 || #len(path) >= 4000 {
-    return false
-  }
+  if path.len == 0 || path.len >= 4000 { return false }
   for byte in path {
-    if byte == 0 || byte == 10 || byte == 13 {
-      return false
-    }
+    if byte == 0 || byte == 10 || byte == 13 { return false }
   }
   _ = mem.copy(state.path[..], path)
-  state.length = #len(path)
+  state.length = path.len
   state.path[state.length] = 0
   return true
 }
 fn suffix(path: []const u8, ending: []const u8, output: []u8) []const u8 {
-  if #len(path) + #len(ending) >= #len(output) {
-    return output[..0]
-  }
+  if path.len + ending.len >= output.len { return output[..0] }
   at: usize = 0
   for byte in path {
     output[at] = byte
@@ -54,41 +47,31 @@ fn suffix(path: []const u8, ending: []const u8, output: []u8) []const u8 {
 }
 // Resolve the parent, preserving the final component so symlinks can be refused.
 pub fn resolve(path: []const u8, output: []u8) []const u8 {
-  if #len(path) == 0 || #len(path) >= 4000 {
-    return output[..0]
-  }
+  if path.len == 0 || path.len >= 4000 { return output[..0] }
   for byte in path {
-    if byte == 0 || byte == 10 || byte == 13 {
-      return output[..0]
-    }
+    if byte == 0 || byte == 10 || byte == 13 { return output[..0] }
   }
   normalized: [4096]u8
   path = file_normalize_path(path, normalized[..])
-  if #len(path) == 0 {
-    return output[..0]
-  }
+  if path.len == 0 { return output[..0] }
   parent_storage: [4096]u8
   absolute: [4096]u8
-  parent := bounded_string(parent_storage[..], paths.dirname(path))
-  if parse.failed(parent.failure) || realpath(parent.value, &absolute[0]) == nil {
+  parent := bounded_string(parent_storage[..], paths.dirname(path)) catch {
     return output[..0]
   }
+  if realpath(parent, &absolute[0]) == nil { return output[..0] }
   length := c.string_length(&absolute[0], 4096)
   leaf := paths.basename(path)
   // join reserves both components plus one separator byte. Leave room for NUL.
-  if length + #len(leaf) + 1 > #len(output) {
-    return output[..0]
-  }
+  if length + leaf.len + 1 > output.len { return output[..0] }
   // Join directly into bounded caller storage: an arena header would consume
   // part of the promised output capacity and shift the returned bytes.
-  joined_length := length + #len(leaf)
-  separator := length > 0 && absolute[length - 1] != '/' && #len(leaf) > 0 && leaf[0] != '/'
+  joined_length := length + leaf.len
+  separator := length > 0 && absolute[length - 1] != '/' && leaf.len > 0 && leaf[0] != '/'
   if separator {
     joined_length += 1
   }
-  if joined_length >= 4000 || joined_length >= #len(output) {
-    return output[..0]
-  }
+  if joined_length >= 4000 || joined_length >= output.len { return output[..0] }
   _ = mem.copy(output, absolute[..length])
   at := length
   if separator {
@@ -103,8 +86,8 @@ pub fn resolve(path: []const u8, output: []u8) []const u8 {
   return output[..at]
 }
 // Path stat must not open a FIFO/device and block the UI.
-pub fn metadata(path: []const u8) fs.Metadata {
-  return fs.metadata_nofollow(path)
+pub fn metadata(path: []const u8) fs.Metadata!io.IoErr {
+  return try fs.metadata_nofollow(path)
 }
 // A whole file read into its own reserved mapping, outside the bounded frame
 // scratch. Release with release_text once copied; FileText owns its arena.
@@ -144,9 +127,7 @@ fn stamp_values(stamp: fs.Stamp) [6]u64 {
 }
 fn same_values(a: [6]u64, b: [6]u64) bool {
   for index in 0..6 {
-    if a[index] != b[index] {
-      return false
-    }
+    if a[index] != b[index] { return false }
   }
   return true
 }
@@ -156,32 +137,36 @@ fn same_stamp(a: fs.Stamp, b: fs.Stamp) bool {
 struct CloneSeed { descriptor: isize, stamp: [6]u64 }
 // Clone only an origin whose current stamp still matches its snapshot bytes.
 // A stamp change during cloning invalidates the seed before any edit is written.
-fn save_seed(destination: []const u8, temporary: []const u8, snapshot: *const buffer.TextSnapshot, seed: *CloneSeed) fs.AtomicResult {
+fn save_seed(destination: []const u8, temporary: []const u8, snapshot: *const buffer.TextSnapshot, seed: *CloneSeed) fs.AtomicFile!io.IoErr {
   at: usize = 0
   for at < snapshot.length {
     source := buffer.snapshot_source_at(snapshot, at)
     if source.descriptor >= 0 && source.offset == at {
-      origin := fs.File{descriptor: source.descriptor, active: true, owned: false}
+      origin := fs.File{ descriptor: source.descriptor, active: true }
       before := fs.file_stamp(&origin)
       if before.valid && same_values(stamp_values(before), source.stamp) {
-        cloned := fs.clone_exclusive(&origin, temporary)
-        if !io.failed(cloned.failure) {
-          transaction := fs.AtomicFile{file: cloned.value, destination: destination, temporary: temporary, active: true}
+        cloned_ok := true
+        cloned := fs.clone_exclusive(&origin, temporary) catch {
+          cloned_ok = false
+          break
+        }
+        if cloned_ok {
+          transaction := fs.AtomicFile{ file: cloned, destination: destination, temporary: temporary, active: true }
           after := fs.file_stamp(&origin)
           if after.valid && same_stamp(before, after) {
             seed.descriptor = source.descriptor
             seed.stamp = source.stamp
-            return fs.AtomicResult{transaction: transaction}
+            return transaction
           }
-          _ = fs.atomic_abort(&transaction)
+          fs.atomic_abort(&transaction) catch {}
         }
       }
       // One clone attempt per save; other origins still use the normal writer.
       break
     }
-    at += #len(source.bytes)
+    at += source.bytes.len
   }
-  return fs.atomic_begin(destination, temporary)
+  return try fs.atomic_begin(destination, temporary)
 }
 // A mapped baseline can change underneath a shared snapshot. Recheck after
 // writing and immediately before publication, not only before reading a run.
@@ -194,13 +179,11 @@ fn mapped_sources_current(snapshot: *const buffer.TextSnapshot) bool {
     if source.mapped && (source.descriptor != checked || !same_values(checked_stamp, source.stamp)) {
       checked = source.descriptor
       checked_stamp = source.stamp
-      origin := fs.File{descriptor: source.descriptor, active: true, owned: false}
+      origin := fs.File{ descriptor: source.descriptor, active: true }
       now := fs.file_stamp(&origin)
-      if !now.valid || !same_values(stamp_values(now), source.stamp) {
-        return false
-      }
+      if !now.valid || !same_values(stamp_values(now), source.stamp) { return false }
     }
-    at += #len(source.bytes)
+    at += source.bytes.len
   }
   return true
 }
@@ -216,9 +199,9 @@ fn write_document(file: *fs.File, snapshot: *const buffer.TextSnapshot, seed: *c
   at: usize = 0
   for at < snapshot.length {
     source := buffer.snapshot_source_at(snapshot, at)
-    length := #len(source.bytes)
+    length := source.bytes.len
     if source.descriptor >= 0 {
-      origin := fs.File{descriptor: source.descriptor, active: true, owned: false}
+      origin := fs.File{ descriptor: source.descriptor, active: true }
       if source.descriptor != checked || !same_values(checked_stamp, source.stamp) {
         checked = source.descriptor
         checked_stamp = source.stamp
@@ -234,22 +217,22 @@ fn write_document(file: *fs.File, snapshot: *const buffer.TextSnapshot, seed: *c
           if following.descriptor != source.descriptor || following.offset != source.offset + (next - at) || !same_values(following.stamp, source.stamp) {
             break
           }
-          next += #len(following.bytes)
+          next += following.bytes.len
         }
         if seed.descriptor == source.descriptor && source.offset == at && same_values(seed.stamp, source.stamp) {
-          if io.failed(fs.seek(file, next).failure) {
-            return false
-          }
+          fs.seek(file, next) catch { return false }
           at = next
           continue
         }
-        copied := fs.copy_range(&origin, source.offset, file, next - at)
-        if !io.failed(copied.failure) {
+        copied: usize = 0
+        range_ok := true
+        fs.copy_range(&origin, source.offset, file, next - at, &copied) catch {
+          if copied > 0 { return false }
+          range_ok = false
+        }
+        if range_ok {
           at = next
           continue
-        }
-        if copied.transferred > 0 {
-          return false
         }
         usable = false
       }
@@ -258,9 +241,7 @@ fn write_document(file: *fs.File, snapshot: *const buffer.TextSnapshot, seed: *c
         return false
       }
     }
-    if io.failed(fs.write(file, source.bytes).failure) {
-      return false
-    }
+    fs.write(file, source.bytes) catch { return false }
     at += length
   }
   if !mapped_sources_current(snapshot) {
@@ -280,17 +261,14 @@ pub fn set_mapper(map: fn(isize, u64) *u8, unmap: fn(*u8, u64)) {
 // Map a large file instead of reading it: the page cache holds its text, so
 // unchanged parts cost no private memory and open time does not copy it.
 fn read_mapped(path: []const u8) FileText {
-  opened := fs.open(path)
-  if io.failed(opened.failure) {
-    return FileText{}
-  }
-  stamp := fs.file_stamp(&opened.value)
+  opened := fs.open(path) catch { return FileText{} }
+  stamp := fs.file_stamp(&opened)
   if stamp.valid && stamp.size >= OriginMinimum && #cast(usize, stamp.size) < DocumentLimit {
-    bytes := mapper.map(opened.value.descriptor, stamp.size)
+    bytes := mapper.map(opened.descriptor, stamp.size)
     if bytes != nil {
       result := FileText{storage: buffer.storage_mapped(bytes, #cast(usize, stamp.size), mapper.unmap)}
       if result.storage.block != nil {
-        buffer.storage_set_origin(&result.storage, opened.value.descriptor, stamp_values(stamp), close_origin)
+        buffer.storage_set_origin(&result.storage, opened.descriptor, stamp_values(stamp), close_origin)
         result.stamp = stamp
         result.data = result.storage.bytes
         result.valid = true
@@ -299,20 +277,18 @@ fn read_mapped(path: []const u8) FileText {
       mapper.unmap(bytes, stamp.size)
     }
   }
-  fs.close(&opened.value)
+  fs.close(&opened)
   return FileText{}
 }
 fn read_bounded(path: []const u8, limit: usize) FileText {
   if limit > buffer.Capacity && mapper.map != nil {
     mapped := read_mapped(path)
-    if mapped.valid {
-      return mapped
-    }
+    if mapped.valid { return mapped }
   }
   room := limit
   if limit > buffer.Capacity {
-    info := fs.metadata(path)
-    if !io.failed(info.failure) && #cast(usize, info.size) < limit - 16777216 {
+    info := fs.metadata(path) catch fs.Metadata{}
+    if info.mode != 0 && #cast(usize, info.size) < limit - 16777216 {
       room = #cast(usize, info.size) + 16777216
     }
   }
@@ -322,24 +298,21 @@ fn read_bounded(path: []const u8, limit: usize) FileText {
   storage: []u8 = result.storage.bytes
   if limit > buffer.Capacity {
     result.storage = buffer.storage_create(room + 1)
-    if result.storage.block == nil {
-      return FileText{}
-    }
+    if result.storage.block == nil { return FileText{} }
     storage = result.storage.bytes
   } else {
     result.arena = arena_owner.create(room + 1)
-    storage = mem.push_bytes_uninit(result.arena, room + 1)
+    storage = mem.push_bytes(result.arena, room + 1)
   }
-  opened := fs.open(path)
-  if io.failed(opened.failure) {
+  opened := fs.open(path) catch {
     release_text(&result)
     return FileText{}
   }
   total: usize = 0
   failed := false
-  before := fs.file_stamp(&opened.value)
+  before := fs.file_stamp(&opened)
   for {
-    free := #len(storage) - total
+    free := storage.len - total
     if free == 0 {
       // One byte past the limit proves the file is too large.
       result.too_large = true
@@ -348,21 +321,18 @@ fn read_bounded(path: []const u8, limit: usize) FileText {
     if free > 1048576 {
       free = 1048576
     }
-    part := fs.read(&opened.value, storage[total..total + free])
-    if io.failed(part.failure) {
+    part := fs.read(&opened, storage[total..total + free]) catch {
       failed = true
       break
     }
-    if part.transferred == 0 {
-      break
-    }
-    total += part.transferred
+    if part == 0 { break }
+    total += part
   }
   // A large document keeps its file open: while the file's stamp is
   // unchanged, saving copies untouched ranges from it in-kernel.
-  after := fs.file_stamp(&opened.value)
+  after := fs.file_stamp(&opened)
   if !failed && !result.too_large && result.storage.block != nil && total >= OriginMinimum && before.valid && after.valid && same_stamp(before, after) && after.size == total {
-    buffer.storage_set_origin(&result.storage, opened.value.descriptor, stamp_values(after), close_origin)
+    buffer.storage_set_origin(&result.storage, opened.descriptor, stamp_values(after), close_origin)
     result.stamp = after
     result.data = storage[..total]
     result.valid = true
@@ -371,7 +341,7 @@ fn read_bounded(path: []const u8, limit: usize) FileText {
   if before.valid && after.valid && same_stamp(before, after) && after.size == total {
     result.stamp = after
   }
-  fs.close(&opened.value)
+  fs.close(&opened)
   if failed || result.too_large || total > room {
     too_large := result.too_large || total > room
     release_text(&result)
@@ -384,25 +354,17 @@ fn read_bounded(path: []const u8, limit: usize) FileText {
 // The start of a file for previews: up to maximum bytes from arena, cut back
 // to the last complete line when the file continues past them.
 pub fn read_prefix(arena: *mem.Arena, path: []const u8, maximum: usize) []const u8 {
-  opened := fs.open(path)
-  if io.failed(opened.failure) {
-    return ""
+  opened := fs.open(path) catch { return "" }
+  defer fs.close(&opened)
+  if maximum > mem.arena_room(arena) {
+    maximum = mem.arena_room(arena)
   }
-  defer fs.close(&opened.value)
-  if maximum > mem.arena_remaining(arena) {
-    maximum = mem.arena_remaining(arena)
-  }
-  storage := mem.push_bytes_uninit(arena, maximum)
+  storage := mem.push_bytes(arena, maximum)
   total: usize = 0
   for total < maximum {
-    part := fs.read(&opened.value, storage[total..])
-    if io.failed(part.failure) {
-      return ""
-    }
-    if part.transferred == 0 {
-      return storage[..total]
-    }
-    total += part.transferred
+    part := fs.read(&opened, storage[total..]) catch { return "" }
+    if part == 0 { return storage[..total] }
+    total += part
   }
   for total > 0 && storage[total - 1] != 10 {
     total -= 1
@@ -422,33 +384,26 @@ pub fn open(state: *State, document: *buffer.Document, path: []const u8, scratch
   if buffer.dirty(document) {
     return "Save or discard the current changes before opening another file."
   }
-  if #len(path) == 0 || #len(path) >= 4000 {
-    return "Invalid or too-long file path."
-  }
+  if path.len == 0 || path.len >= 4000 { return "Invalid or too-long file path." }
   link_storage: [4096]u8
-  if !io.failed(fs.read_link(path, link_storage[..]).failure) {
+  link := fs.read_link(path, link_storage[..]) catch link_storage[..0]
+  if link.len > 0 {
     return "Open the symlink target explicitly; symlink editing is not supported yet."
   }
-  info := metadata(path)
-  if io.failed(info.failure) || (info.mode & 61440) != 32768 {
+  info := metadata(path) catch {
     return "Cannot open: expected a readable regular file."
   }
+  if (info.mode & 61440) != 32768 { return "Cannot open: expected a readable regular file." }
   read := read_document(path)
   defer release_text(&read)
-  if read.too_large {
-    return "File is too large to open."
-  }
-  if !read.valid {
-    return "Read failed."
-  }
+  if read.too_large { return "File is too large to open." }
+  if !read.valid { return "Read failed." }
   // Stage the name before loading: load validates once and leaves the old
   // document untouched on failure. Commit file ownership only after success.
   candidate := State{}
-  if !set_name(&candidate, path) {
-    return "Invalid file path."
-  }
+  if !set_name(&candidate, path) { return "Invalid file path." }
   // Very large files appear after their first lines load; the rest follows.
-  if !buffer.load_storage_lazy(document, &read.storage, #len(read.data)) {
+  if !buffer.load_storage_lazy(document, &read.storage, read.data.len) {
     return "File is not valid UTF-8 text, or contains NUL bytes."
   }
   candidate.stamp = read.stamp
@@ -457,20 +412,15 @@ pub fn open(state: *State, document: *buffer.Document, path: []const u8, scratch
   return ""
 }
 fn path_stamp(path: []const u8) fs.Stamp {
-  opened := fs.open(path)
-  if io.failed(opened.failure) {
-    return fs.Stamp{}
-  }
-  stamp := fs.file_stamp(&opened.value)
-  fs.close(&opened.value)
+  opened := fs.open(path) catch { return fs.Stamp{} }
+  stamp := fs.file_stamp(&opened)
+  fs.close(&opened)
   return stamp
 }
 fn unchanged(state: *const State, document: *const buffer.Document, path: []const u8, scratch: *mem.Arena) bool {
   if state.stamp.valid {
     current := path_stamp(path)
-    if current.valid && same_stamp(current, state.stamp) {
-      return true
-    }
+    if current.valid && same_stamp(current, state.stamp) { return true }
   }
   read := read_document(path)
   defer release_text(&read)
@@ -503,7 +453,7 @@ pub fn save_start(job: *SaveJob, state: *State, document: *const buffer.Document
     job.error = "Only the start of this file loaded (later text is not valid UTF-8); saving would truncate it."
     return false
   }
-  if #len(path) == 0 || #len(path) >= 4000 {
+  if path.len == 0 || path.len >= 4000 {
     job.error = "Enter a valid file path."
     return false
   }
@@ -513,55 +463,67 @@ pub fn save_start(job: *SaveJob, state: *State, document: *const buffer.Document
     return false
   }
   job.same = buffer.equal(path, name(state))
-  info := metadata(path)
+  info := metadata(path) catch fs.Metadata{}
+  exists := info.mode != 0
   link_storage: [4096]u8
-  if !io.failed(fs.read_link(path, link_storage[..]).failure) {
+  link := fs.read_link(path, link_storage[..]) catch link_storage[..0]
+  if link.len > 0 {
     job.error = "Refusing to replace a symlink."
     return false
   }
-  if !io.failed(info.failure) && (!job.same || !unchanged(state, document, path, scratch)) {
+  if exists && (!job.same || !unchanged(state, document, path, scratch)) {
     job.error = "File exists or changed externally. Save As a different path."
     return false
   }
-  if job.same && io.failed(info.failure) {
+  if job.same && !exists {
     job.error = "Original file disappeared; use Save As."
     return false
   }
-  if !io.failed(info.failure) && (info.mode & 61440) != 32768 {
+  if exists && (info.mode & 61440) != 32768 {
     job.error = "Destination is not a regular file."
     return false
   }
-  job.path_length = #len(path)
+  job.path_length = path.len
   _ = suffix(path, "", job.path[..])
   temporary := suffix(path, ".dna-write", job.temporary[..])
   job.snapshot = buffer.snapshot_take(document)
-  transaction := fs.AtomicResult{}
   if job.same && fs.WholeFileClones {
-    transaction = save_seed(job.path[..job.path_length], temporary, &job.snapshot, &job.seed)
+    job.transaction = save_seed(job.path[..job.path_length], temporary, &job.snapshot, &job.seed) catch {
+      buffer.snapshot_release(&job.snapshot)
+      job.error = "Cannot create save temporary file; check permissions or a leftover .dna-write file."
+      return false
+    }
   } else {
-    transaction = fs.atomic_begin(job.path[..job.path_length], temporary)
+    job.transaction = fs.atomic_begin(job.path[..job.path_length], temporary) catch {
+      buffer.snapshot_release(&job.snapshot)
+      job.error = "Cannot create save temporary file; check permissions or a leftover .dna-write file."
+      return false
+    }
   }
-  if io.failed(transaction.failure) {
-    buffer.snapshot_release(&job.snapshot)
-    job.error = "Cannot create save temporary file; check permissions or a leftover .dna-write file."
-    return false
-  }
-  job.transaction = transaction.transaction
-  if !io.failed(info.failure) && io.failed(fs.preserve_permissions(&job.transaction.file, path).failure) {
-    save_abort(job)
-    job.error = "Cannot preserve file permissions."
-    return false
+  if exists {
+    fs.preserve_permissions(&job.transaction.file, path) catch {
+      save_abort(job)
+      job.error = "Cannot preserve file permissions."
+      return false
+    }
   }
   return true
 }
 // Stream the snapshot's storage chunks (no flattened copy) and flush them.
 pub fn save_write(job: *SaveJob) {
-  job.written = write_document(&job.transaction.file, &job.snapshot, &job.seed, &job.mapped_changed) && (job.seed.descriptor < 0 || !io.failed(fs.resize(&job.transaction.file, job.snapshot.length).failure)) && !io.failed(fs.sync(&job.transaction.file).failure)
+  if !write_document(&job.transaction.file, &job.snapshot, &job.seed, &job.mapped_changed) {
+    return
+  }
+  if job.seed.descriptor >= 0 {
+    fs.resize(&job.transaction.file, job.snapshot.length) catch { return }
+  }
+  fs.sync(&job.transaction.file) catch { return }
+  job.written = true
 }
 // Drop a started save without touching the destination.
 pub fn save_abort(job: *SaveJob) {
   if job.transaction.active {
-    _ = fs.atomic_abort(&job.transaction)
+    fs.atomic_abort(&job.transaction) catch {}
   }
   buffer.snapshot_release(&job.snapshot)
 }
@@ -570,9 +532,7 @@ pub fn save_finish(job: *SaveJob, state: *State, document: *buffer.Document, scr
   defer save_abort(job)
   path := job.path[..job.path_length]
   if !job.written {
-    if job.mapped_changed {
-      return "File changed on disk while open; reload it before saving."
-    }
+    if job.mapped_changed { return "File changed on disk while open; reload it before saving." }
     return "Write failed; original file was not replaced."
   }
   if !mapped_sources_current(&job.snapshot) {
@@ -582,7 +542,7 @@ pub fn save_finish(job: *SaveJob, state: *State, document: *buffer.Document, scr
     if !unchanged(state, document, path, scratch) {
       return "File changed during save; original was not replaced."
     }
-    if io.failed(fs.atomic_commit(&job.transaction).failure) {
+    fs.atomic_commit(&job.transaction) catch {
       return "Atomic save failed."
     }
     // Replacing the pathname changes the old inode's ctime even though the
@@ -594,22 +554,21 @@ pub fn save_finish(job: *SaveJob, state: *State, document: *buffer.Document, scr
       source := buffer.snapshot_source_at(&job.snapshot, at)
       if source.descriptor >= 0 && source.descriptor != checked && state.stamp.valid && same_values(source.stamp, stamp_values(state.stamp)) {
         checked = source.descriptor
-        origin := fs.File{descriptor: source.descriptor, active: true, owned: false}
+        origin := fs.File{ descriptor: source.descriptor, active: true }
         now := fs.file_stamp(&origin)
         if now.valid && now.inode == state.stamp.inode && now.size == state.stamp.size && now.modify_seconds == state.stamp.modify_seconds && now.modify_nanos == state.stamp.modify_nanos {
           buffer.snapshot_origin_stamp(&job.snapshot, at, source.descriptor, stamp_values(now))
         }
       }
-      at += #len(source.bytes)
+      at += source.bytes.len
     }
   } else {
-    synced := fs.sync(&job.transaction.file)
+    sync_ok := true
+    fs.sync(&job.transaction.file) catch { sync_ok = false }
     fs.close(&job.transaction.file)
-    if io.failed(synced.failure) {
-      return "Cannot flush new file."
-    }
+    if !sync_ok { return "Cannot flush new file." }
     // RENAME_NOREPLACE prevents a racing creator from being overwritten.
-    if io.failed(fs.rename_noreplace(job.transaction.temporary, path).failure) {
+    fs.rename_noreplace(job.transaction.temporary, path) catch {
       return "Cannot create new file without replacing an existing destination."
     }
     job.transaction.active = false
@@ -617,7 +576,7 @@ pub fn save_finish(job: *SaveJob, state: *State, document: *buffer.Document, scr
   old_recovery: [4096]u8
   old_path := suffix(name(state), ".dna-recovery", old_recovery[..])
   if state.recovery_owned {
-    _ = fs.remove(old_path)
+    fs.remove(old_path) catch {}
   }
   _ = set_name(state, path)
   state.recovery_owned = false
@@ -627,32 +586,24 @@ pub fn save_finish(job: *SaveJob, state: *State, document: *buffer.Document, scr
 }
 pub fn save(state: *State, document: *buffer.Document, path: []const u8, scratch: *mem.Arena) []const u8 {
   job := SaveJob{}
-  if !save_start(&job, state, document, path, scratch) {
-    return job.error
-  }
+  if !save_start(&job, state, document, path, scratch) { return job.error }
   save_write(&job)
   return save_finish(&job, state, document, scratch)
 }
 pub fn recover(state: *State, document: *buffer.Document, scratch: *mem.Arena) []const u8 {
-  if state.length == 0 {
-    return "Open a file before restoring its recovery snapshot."
-  }
-  if buffer.dirty(document) {
-    return "Save or discard current edits before restoring recovery."
-  }
+  if state.length == 0 { return "Open a file before restoring its recovery snapshot." }
+  if buffer.dirty(document) { return "Save or discard current edits before restoring recovery." }
   storage: [4096]u8
   path := suffix(name(state), ".dna-recovery", storage[..])
   mark := mem.arena_mark(scratch)
   defer mem.arena_rewind(scratch, mark)
-  info := metadata(path)
-  if io.failed(info.failure) || (info.mode & 61440) != 32768 {
+  info := metadata(path) catch {
     return "Recovery snapshot must be a regular file."
   }
+  if (info.mode & 61440) != 32768 { return "Recovery snapshot must be a regular file." }
   result := read_text(path)
   defer release_text(&result)
-  if !result.valid || !buffer.valid(result.data) {
-    return "No readable text recovery snapshot."
-  }
+  if !result.valid || !buffer.valid(result.data) { return "No readable text recovery snapshot." }
   document.anchor = 0
   document.cursor = document.length
   _ = buffer.replace(document, result.data)
@@ -664,16 +615,15 @@ pub fn discard_recovery(state: *State) {
   if state.recovery_owned {
     storage: [4096]u8
     path := suffix(name(state), ".dna-recovery", storage[..])
-    _ = fs.remove(path)
+    fs.remove(path) catch {}
     state.recovery_owned = false
   }
 }
 
 pub fn directory_path(path: []const u8, output: []u8) usize {
+  if output.len < 4096 { return 0 }
   encoded: [4096]u8
-  name := bounded_string(encoded[..], path)
-  if #len(output) < 4096 || parse.failed(name.failure) || realpath(name.value, &output[0]) == nil {
-    return 0
-  }
+  name := bounded_string(encoded[..], path) catch { return 0 }
+  if realpath(name, &output[0]) == nil { return 0 }
   return c.string_length(&output[0], 4096)
 }

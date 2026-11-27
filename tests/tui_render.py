@@ -957,8 +957,12 @@ with tempfile.TemporaryDirectory(prefix='dna-tui-') as directory:
         rows = session.text()
         if rows[0].index('┐') + 1 < 36:
             fail('dragging the tree edge must resize the dock', rows)
-        # Folders first, sorted: config/, pkg/, state/. Open pkg/, then its file.
+        # The root row comes first, then folders sorted: config/, pkg/,
+        # state/. Open pkg/, then its file.
+        if not any('▾' in row and root.name + '/' in row for row in rows[1:4]):
+            fail('tree must show its root folder as the first row', rows)
         session.send(b'g')
+        session.send(b'j')
         session.send(b'j')
         session.send(b'l', 0.4)
         session.wait_for('inner.txt')
@@ -978,6 +982,18 @@ with tempfile.TemporaryDirectory(prefix='dna-tui-') as directory:
         popup_top = max(0, int(ROWS * .06 + .5) - 1)
         if rows[popup_top].rfind('┌') <= 0 or '_' not in rows[popup_top + 2]:
             fail('dropdown picker must use the shared popup anchor', rows)
+        # :cd moves the docked tree's root along with the project.
+        session.send(b'\x1b[27u', 0.4)
+        session.send(b':', 0.4)
+        session.send(b'cd pkg\r', 0.8)
+        deadline = time.time() + 5
+        while time.time() < deadline and not any('▾' in row and 'pkg/' in row for row in session.text()[1:4]):
+            session.pump(0.1)
+        rows = session.text()
+        if not any('▾' in row and 'pkg/' in row for row in rows[1:4]) or any('state/' in row for row in rows):
+            fail(':cd must re-root the tree explorer', rows)
+        session.send(b':', 0.4)
+        session.send(b'cd -\r', 0.8)
     finally:
         session.close()
     # Both explorer variants use glyphs; disabling icons removes the gutter.

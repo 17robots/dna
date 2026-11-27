@@ -19,8 +19,8 @@ from sdk_compat import environment as sdk_environment
 FIXTURE = r'''
 #link("kernel32")
 #link("ucrt")
-use "std/sync" sync
-use "std/time" time
+use sync "std/sync"
+use time "std/time"
 extern fn rec_alloc "calloc"(count:usize,size:usize) rawptr
 extern fn rec_malloc "malloc"(size:usize) rawptr
 extern fn rec_free "free"(memory:rawptr)

@@ -60,13 +60,9 @@ pub fn load_storage_lazy(document: *Document, storage: *TextStorage, length: usi
   for shown > 0 && bytes[shown - 1] != 10 {
     shown -= 1
   }
-  if shown == 0 || !valid(bytes[..shown]) {
-    return load_storage(document, storage, length)
-  }
+  if shown == 0 || !valid(bytes[..shown]) { return load_storage(document, storage, length) }
   load := #cast(*LazyLoad, rope_malloc(#sizeof(LazyLoad)))
-  if load == nil {
-    return load_storage(document, storage, length)
-  }
+  if load == nil { return load_storage(document, storage, length) }
   load.* = LazyLoad{block: storage.block, offset: shown, total: length - shown}
   storage.block.refs += 1
   load.leaves = (load.total + LeafLimit - 1) / LeafLimit
@@ -102,12 +98,9 @@ fn lazy_launch(load: *LazyLoad, phase: u8) {
   sync.store_u32(&load.done, 0)
   for index in 0..load.workers {
     load.jobs[index].fill = phase == 2
-    load.started[index] = false
-    spawned := thread.spawn_with_size(load.arena, ParallelStack, lazy_job_run, &load.jobs[index])
-    if !io.failed(spawned.failure) {
-      load.threads[index] = spawned.value
-      load.started[index] = true
-    } else {
+    load.threads[index] = thread.spawn_with_size(load.arena, ParallelStack, lazy_job_run, &load.jobs[index]) catch nil
+    load.started[index] = load.threads[index] != nil
+    if !load.started[index] {
       _ = lazy_job_run(&load.jobs[index])
     }
   }
@@ -115,7 +108,7 @@ fn lazy_launch(load: *LazyLoad, phase: u8) {
 fn lazy_join(load: *LazyLoad) {
   for index in 0..load.workers {
     if load.started[index] {
-      if io.failed(thread.join(load.threads[index]).failure) {
+      _ = thread.join(load.threads[index]) catch {
         #panic("cannot join text loader")
       }
       load.started[index] = false
@@ -151,9 +144,7 @@ fn lazy_cancel(document: *Document) {
 // attached, or loading failed and stopped).
 pub fn load_tick(document: *Document) bool {
   load := document.lazy
-  if load == nil || sync.load_u32(&load.done) < #cast(u32, load.workers) {
-    return false
-  }
+  if load == nil || sync.load_u32(&load.done) < #cast(u32, load.workers) { return false }
   lazy_join(load)
   if load.phase == 1 {
     for index in 0..load.workers {

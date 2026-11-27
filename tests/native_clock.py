@@ -9,14 +9,12 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 DYN = str(Path(os.environ.get('DYN',ROOT.parent/'dyn/compiler/build/dyn-release')).resolve())
 TARGETS = ('x86_64-linux','aarch64-linux','x86_64-windows','aarch64-windows','x86_64-macos','aarch64-macos')
-FAULT = '''probe_clock_value: time.ClockResult
+FAULT = '''probe_clock_value: time.Instant
 fn check_clock(ok:bool) { if !ok { #panic("native clock fault contract") } }
 fn clock_value(seconds,nanoseconds:i64) {
-  probe_clock_value=time.ClockResult{value:time.Instant{seconds:seconds,nanoseconds:nanoseconds}}
+  probe_clock_value=time.Instant{seconds:seconds,nanoseconds:nanoseconds}
 }
 fn main() {
-  // Failure before initialization must not manufacture an origin.
-  check_clock(native_elapsed_nanoseconds()==0)
   clock_value(0,0)
   check_clock(native_elapsed_nanoseconds()==0)
   clock_value(0,123)
@@ -31,8 +29,6 @@ fn main() {
   check_clock(native_elapsed_nanoseconds()==1000000003 && dna_ticks()==999)
   clock_value(0,999999999)
   check_clock(native_elapsed_nanoseconds()==1000000003 && dna_ticks()==999)
-  probe_clock_value=time.ClockResult{failure:io.Failure{kind:io.Kind.System}}
-  check_clock(native_elapsed_nanoseconds()==1000000003 && dna_ticks()==999)
   clock_value(2,9)
   check_clock(native_elapsed_nanoseconds()==2000000009 && dna_ticks()==1999)
   // Elapsed conversion overflow must retain the last successful observation.
@@ -44,15 +40,15 @@ fn main() {
 '''
 REAL = '''fn main() {
   first:=native_elapsed_nanoseconds()
-  if time.sleep(20000000).failure.kind != io.Kind.Ok { #panic("native clock sleep") }
+  time.sleep(20000000)
   second:=native_elapsed_nanoseconds()
   if second<first || second-first<10000000 || second-first>10000000000 {
     #panic("native clock real elapsed")
   }
   _=syntax_millis()
-  if time.sleep(2000000).failure.kind != io.Kind.Ok { #panic("syntax timing sleep") }
+  time.sleep(2000000)
   if dna_ticks()!=0 { #panic("native ticks independent tracing/syntax epoch") }
-  if time.sleep(2000000).failure.kind != io.Kind.Ok { #panic("native ticks sleep") }
+  time.sleep(2000000)
   ticks:=dna_ticks()
   if ticks<1 || ticks>10000 { #panic("native ticks relative elapsed") }
 }

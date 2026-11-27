@@ -1,4 +1,4 @@
-use "std/parse" parse
+use parse "std/parse"
 use "std/encoding/json"
 
 struct PluginState {
@@ -42,9 +42,7 @@ extern fn plugin_rollback_native "dna_plugin_rollback"(root: *const u8, name: *c
 
 fn json_text(value: *const json.Value, key: []const u8) []const u8 {
   item := json.object_get(value, key)
-  if !json.is_string(item) {
-    return ""
-  }
+  if !json.is_string(item) { return "" }
   return item.text
 }
 fn plugin_release(app: *App) {
@@ -56,9 +54,7 @@ fn plugin_release(app: *App) {
 }
 fn plugins_running(app: *App) bool {
   for index in 0..8 {
-    if app.plugin_state.slots[index].process != nil {
-      return true
-    }
+    if app.plugin_state.slots[index].process != nil { return true }
   }
   return false
 }
@@ -96,33 +92,38 @@ fn plugin_prepare(app: *App, manifest: []const u8) {
   storage: [4096]u8
   expanded: [4096]u8
   path := files.resolve(expand_home(manifest, expanded[..]), storage[..])
-  if #len(path) == 0 {
+  if path.len == 0 {
     notice(app, "Plugin manifest path is invalid.")
     return
   }
-  if plugin_resolve_native(&storage[0], &expanded[0], #len(expanded)) == 0 {
+  if plugin_resolve_native(&storage[0], &expanded[0], expanded.len) == 0 {
     notice(app, "Installed plugin version is invalid.")
     return
   }
-  path = expanded[..c.string_length(&expanded[0], #len(expanded))]
+  path = expanded[..c.string_length(&expanded[0], expanded.len)]
   mark := mem.arena_mark(app.scratch)
   defer mem.arena_rewind(app.scratch, mark)
-  manifest_info := files.metadata(path)
-  if io.failed(manifest_info.failure) || (manifest_info.mode & 61440) != 32768 {
+  manifest_info := files.metadata(path) catch {
     notice(app, "Plugin manifest must be a regular file.")
     return
   }
-  read := fs.read_all(app.scratch, path, 16384)
-  if io.failed(read.failure) {
+  if (manifest_info.mode & 61440) != 32768 {
+    notice(app, "Plugin manifest must be a regular file.")
+    return
+  }
+  read := fs.read_all(app.scratch, path, 16384) catch {
     notice(app, "Cannot read plugin manifest (maximum 16 KiB).")
     return
   }
-  parsed := json.parse(app.scratch, read.value)
-  if parse.failed(parsed.failure) || !json.is_object(parsed.root) {
+  root := json.parse(app.scratch, read) catch {
     notice(app, "Plugin manifest must be a JSON object.")
     return
   }
-  api := json.object_get(parsed.root, "api_version")
+  if !json.is_object(root) {
+    notice(app, "Plugin manifest must be a JSON object.")
+    return
+  }
+  api := json.object_get(root, "api_version")
   if !json.is_missing(api) {
     supported := lsp.number(api)
     if !supported.valid || supported.value != 1 {
@@ -130,13 +131,13 @@ fn plugin_prepare(app: *App, manifest: []const u8) {
       return
     }
   }
-  version_value := json.object_get(parsed.root, "version")
+  version_value := json.object_get(root, "version")
   if !json.is_missing(version_value) && !json.is_string(version_value) {
     notice(app, "Plugin version must be a string.")
     return
   }
-  version := json_text(parsed.root, "version")
-  if #len(version) > 64 {
+  version := json_text(root, "version")
+  if version.len > 64 {
     notice(app, "Plugin version is too long.")
     return
   }
@@ -146,9 +147,9 @@ fn plugin_prepare(app: *App, manifest: []const u8) {
       return
     }
   }
-  name := json_text(parsed.root, "name")
-  executable := json_text(parsed.root, "executable")
-  if #len(name) == 0 || #len(name) > 127 || !valid_leaf(name) || #len(executable) == 0 || !valid_leaf(executable) {
+  name := json_text(root, "name")
+  executable := json_text(root, "executable")
+  if name.len == 0 || name.len > 127 || !valid_leaf(name) || executable.len == 0 || !valid_leaf(executable) {
     notice(app, "Plugin name and executable must be simple filenames; executable lives beside plugin.json.")
     return
   }
@@ -176,19 +177,22 @@ fn plugin_prepare(app: *App, manifest: []const u8) {
   pending.* = Plugin{}
   pending.length = copy_text(pending.name[..], name)
   pending.version_length = copy_text(pending.version[..], version)
-  parent := #len(path)
+  parent := path.len
   for parent > 0 && path[parent - 1] != '/' {
     parent -= 1
   }
   _ = copy_text(pending.directory[..], path[..parent])
   used := copy_text(pending.executable[..], path[..parent])
   add_text(pending.executable[..], &used, executable)
-  info := files.metadata(pending.executable[..used])
-  if io.failed(info.failure) || (info.mode & 61440) != 32768 || !fs.executable(pending.executable[..used]) {
+  info := files.metadata(pending.executable[..used]) catch {
     notice(app, "Plugin executable must be a regular executable file beside its manifest.")
     return
   }
-  permissions := json.object_get(parsed.root, "permissions")
+  if (info.mode & 61440) != 32768 || !fs.executable(pending.executable[..used]) {
+    notice(app, "Plugin executable must be a regular executable file beside its manifest.")
+    return
+  }
+  permissions := json.object_get(root, "permissions")
   if !json.is_array(permissions) {
     notice(app, "Manifest requires a permissions array.")
     return
@@ -253,7 +257,7 @@ fn plugin_start_pending(app: *App) {
   app.plugin_state.slots[index].active = true
   app.plugin_state.slots[index].deadline = sdl.ticks() + #cast(u64, app.config.plugin_timeout_ms)
   greeting: []const u8 = "{\"type\":\"initialize\",\"version\":1}\n"
-  _ = plugin_send(process_handle, &greeting[0], #len(greeting))
+  _ = plugin_send(process_handle, &greeting[0], greeting.len)
   app.prompt_state.panel = Panel.None
 }
 fn plugin_run_command(app: *App, command_index: usize) {
@@ -275,8 +279,8 @@ fn plugin_run_command(app: *App, command_index: usize) {
   }
   allocated := arena_owner.create((1048576))
   defer arena_owner.release(allocated)
-  message := mem.push_bytes_uninit(allocated, 524288)
-  escaped := mem.push_bytes_uninit(allocated, 524288)
+  message := mem.push_bytes(allocated, 524288)
+  escaped := mem.push_bytes(allocated, 524288)
   used: usize = 0
   add_text(message, &used, "{\"type\":\"command\",\"name\":")
   add_text(message, &used, lsp_json_string(escaped, command.name[..command.length]))
@@ -286,7 +290,7 @@ fn plugin_run_command(app: *App, command_index: usize) {
   add_number(message, &used, #cast(usize, app.documents.current.revision))
   if plugin.read {
     encoded := lsp_json_string(escaped, buffer.all(app.documents.current))
-    if #len(encoded) == 0 {
+    if encoded.len == 0 {
       notice(app, "Buffer contains control characters unsupported by plugin JSON encoding.")
       return
     }
@@ -302,14 +306,10 @@ fn plugin_run_command(app: *App, command_index: usize) {
   app.prompt_state.panel = Panel.None
 }
 fn json_unsigned(value: *const json.Value) usize {
-  if !json.is_number(value) || #len(value.text) == 0 || #len(value.text) > 15 {
-    return #max(usize)
-  }
+  if !json.is_number(value) || value.text.len == 0 || value.text.len > 15 { return #max(usize) }
   result: usize = 0
   for byte in value.text {
-    if byte < 48 || byte > 57 {
-      return #max(usize)
-    }
+    if byte < 48 || byte > 57 { return #max(usize) }
     result = result * 10 + (byte - 48)
   }
   return result
@@ -321,19 +321,22 @@ fn plugin_message(app: *App, index: usize, source: []const u8) {
   }
   mark := mem.arena_mark(app.scratch)
   defer mem.arena_rewind(app.scratch, mark)
-  parsed := json.parse(app.scratch, source)
-  if parse.failed(parsed.failure) || !json.is_object(parsed.root) {
+  root := json.parse(app.scratch, source) catch {
+    plugin_stop(app, index, "Invalid plugin JSON; disabled.")
+    return
+  }
+  if !json.is_object(root) {
     plugin_stop(app, index, "Invalid plugin JSON; disabled.")
     return
   }
   plugin := &app.plugin_state.slots[index]
-  kind := json_text(parsed.root, "type")
+  kind := json_text(root, "type")
   if buffer.equal(kind, "ready") || buffer.equal(kind, "done") {
     plugin.deadline = 0
     return
   }
   if buffer.equal(kind, "notice") {
-    message_text := json_text(parsed.root, "text")
+    message_text := json_text(root, "text")
     if !buffer.valid(message_text) {
       plugin_stop(app, index, "Plugin notice is not valid text; disabled.")
       return
@@ -342,8 +345,8 @@ fn plugin_message(app: *App, index: usize, source: []const u8) {
     return
   }
   if buffer.equal(kind, "command") {
-    name := json_text(parsed.root, "name")
-    if #len(name) == 0 || #len(name) >= 128 || !utf8.valid(name) {
+    name := json_text(root, "name")
+    if name.len == 0 || name.len >= 128 || !utf8.valid(name) {
       plugin_stop(app, index, "Invalid plugin command name; disabled.")
       return
     }
@@ -381,8 +384,8 @@ fn plugin_message(app: *App, index: usize, source: []const u8) {
       plugin_stop(app, index, "Plugin requested buffer.create without permission; disabled.")
       return
     }
-    content := json_text(parsed.root, "text")
-    if !json.is_string(json.object_get(parsed.root, "text")) || !buffer.valid(content) {
+    content := json_text(root, "text")
+    if !json.is_string(json.object_get(root, "text")) || !buffer.valid(content) {
       plugin_stop(app, index, "Plugin buffer exceeds text limit; disabled.")
       return
     }
@@ -402,10 +405,10 @@ fn plugin_message(app: *App, index: usize, source: []const u8) {
       plugin_stop(app, index, "Plugin requested document.write without permission; disabled.")
       return
     }
-    target := json_unsigned(json.object_get(parsed.root, "buffer"))
-    revision := json_unsigned(json.object_get(parsed.root, "revision"))
-    replacement := json_text(parsed.root, "text")
-    if target >= #len(app.documents.slots) || target != plugin.command_slot || plugin.command_identity != app.documents.slots[target].identity || plugin.command_revision != revision || app.documents.slots[target].document == nil || app.documents.slots[target].terminal.handle != nil || app.documents.slots[target].document.revision != revision || !json.is_string(json.object_get(parsed.root, "text")) || #len(replacement) > 65535 || !buffer.valid(replacement) {
+    target := json_unsigned(json.object_get(root, "buffer"))
+    revision := json_unsigned(json.object_get(root, "revision"))
+    replacement := json_text(root, "text")
+    if target >= app.documents.slots.len || target != plugin.command_slot || plugin.command_identity != app.documents.slots[target].identity || plugin.command_revision != revision || app.documents.slots[target].document == nil || app.documents.slots[target].terminal.handle != nil || app.documents.slots[target].document.revision != revision || !json.is_string(json.object_get(root, "text")) || replacement.len > 65535 || !buffer.valid(replacement) {
       plugin_log(app, "Plugin edit rejected: stale buffer/revision or invalid text.")
       return
     }
@@ -420,7 +423,7 @@ fn plugin_message(app: *App, index: usize, source: []const u8) {
     app.plugin_state.edit_document = app.documents.slots[target].document
     app.prompt_state.panel = Panel.PluginEdit
     app.prompt_state.message_length = copy_text(app.prompt_state.message[..], "Plugin replacement preview (whole buffer).\nEnter applies as one undoable edit; Escape cancels.\n\n")
-    preview_length := #len(replacement)
+    preview_length := replacement.len
     if preview_length > 7000 {
       preview_length = 7000
       for preview_length > 0 && (replacement[preview_length] & 192) == 128 {
@@ -447,9 +450,7 @@ fn plugin_tick(app: *App) bool {
             plugin_stop(app, index, "Plugin exited or exceeded protocol limits; disabled.")
             break
           }
-          if result == 0 {
-            break
-          }
+          if result == 0 { break }
           plugin_message(app, index, app.plugin_state.incoming[..#cast(usize, result)])
           redraw = true
           messages += 1
@@ -518,15 +519,13 @@ fn plugin_list(app: *App) {
   length := copy_text(directory[..], app.configuration.path[..parent])
   add_text(directory[..], &length, "plugins")
   storage: [8192]u8
-  opened := fs.open_directory(directory[..length], storage[..])
-  if !io.failed(opened.failure) {
-    defer fs.close_directory(&opened.directory)
+  opened := fs.open_directory(directory[..length], storage[..]) catch fs.Directory{ended: true}
+  if !opened.ended {
+    defer fs.close_directory(&opened)
     for used < 7000 {
-      entry := fs.directory_next(&opened.directory)
-      if !entry.found {
-        break
-      }
-      if entry.kind == 4 && #len(entry.name) > 0 && entry.name[0] != '.' && valid_leaf(entry.name) {
+      entry := fs.directory_next(&opened) catch { break }
+      if opened.ended { break }
+      if entry.kind == 4 && entry.name.len > 0 && entry.name[0] != '.' && valid_leaf(entry.name) {
         add_text(text[..], &used, "  ")
         add_text(text[..], &used, entry.name)
         add_text(text[..], &used, "\n")
@@ -546,7 +545,12 @@ fn plugin_list(app: *App) {
         add_text(installed[..], &installed_length, candidate.key)
         add_text(installed[..], &installed_length, "/plugin.json")
         active_manifest: [4096]u8
-        if plugin_resolve_native(&installed[0], &active_manifest[0], #len(active_manifest)) == 0 || io.failed(files.metadata(active_manifest[..c.string_length(&active_manifest[0], #len(active_manifest))]).failure) {
+        active_ok := plugin_resolve_native(&installed[0], &active_manifest[0], active_manifest.len) != 0
+        if active_ok {
+          ameta := files.metadata(active_manifest[..c.string_length(&active_manifest[0], active_manifest.len)]) catch fs.Metadata{}
+          active_ok = ameta.mode != 0
+        }
+        if !active_ok {
           add_text(text[..], &used, "  ")
           add_text(text[..], &used, candidate.key)
           add_text(text[..], &used, "\n")
@@ -562,9 +566,7 @@ fn plugin_list(app: *App) {
 
 fn plugin_install(app: *App, source: []const u8) bool {
   plugin_prepare(app, source)
-  if app.prompt_state.panel != Panel.PluginGrant {
-    return false
-  }
+  if app.prompt_state.panel != Panel.PluginGrant { return false }
   // Copying is inert. Loading still requires accepting the API permissions.
   pending := &app.plugin_state.pending
   root: [4096]u8
@@ -577,11 +579,11 @@ fn plugin_install(app: *App, source: []const u8) bool {
   manifest: [4096]u8
   expanded: [4096]u8
   resolved := files.resolve(expand_home(source, expanded[..]), manifest[..])
-  if #len(resolved) == 0 {
+  if resolved.len == 0 {
     notice(app, "Invalid plugin source.")
     return false
   }
-  if plugin_resolve_native(&manifest[0], &expanded[0], #len(expanded)) == 0 {
+  if plugin_resolve_native(&manifest[0], &expanded[0], expanded.len) == 0 {
     notice(app, "Installed plugin source version is invalid.")
     return false
   }
@@ -641,19 +643,22 @@ fn plugin_update(app: *App, name: []const u8) {
   add_text(path[..], &length, name)
   add_text(path[..], &length, "/.dna-source")
   resolved_source: [4096]u8
-  if plugin_resolve_native(&path[0], &resolved_source[0], #len(resolved_source)) == 0 {
+  if plugin_resolve_native(&path[0], &resolved_source[0], resolved_source.len) == 0 {
     notice(app, "Installed plugin source version is invalid.")
     return
   }
   mark := mem.arena_mark(app.scratch)
   defer mem.arena_rewind(app.scratch, mark)
-  read := fs.read_all(app.scratch, resolved_source[..c.string_length(&resolved_source[0], #len(resolved_source))], 4095)
-  if io.failed(read.failure) || #len(read.value) == 0 {
+  read := fs.read_all(app.scratch, resolved_source[..c.string_length(&resolved_source[0], resolved_source.len)], 4095) catch {
+    notice(app, "This installation has no recorded source. Use :plugin-install /path/plugin.json first.")
+    return
+  }
+  if read.len == 0 {
     notice(app, "This installation has no recorded source. Use :plugin-install /path/plugin.json first.")
     return
   }
   source: [4096]u8
-  source_length := copy_text(source[..], read.value)
+  source_length := copy_text(source[..], read)
   if plugin_install(app, source[..source_length]) {
     plugin_load_named(app, name)
   }
@@ -666,15 +671,14 @@ fn plugin_catalog(app: *App, arena: *mem.Arena) *const json.Value {
   }
   length := copy_text(path[..], app.configuration.path[..parent])
   add_text(path[..], &length, "plugin-catalog.json")
-  read := fs.read_all(arena, path[..length], 32768)
-  if io.failed(read.failure) {
+  read := fs.read_all(arena, path[..length], 32768) catch {
     return nil
   }
-  parsed := json.parse(arena, read.value)
-  if parse.failed(parsed.failure) || !json.is_object(parsed.root) {
+  root := json.parse(arena, read) catch {
     return nil
   }
-  return parsed.root
+  if !json.is_object(root) { return nil }
+  return root
 }
 fn plugin_install_named(app: *App, source: []const u8) {
   if !valid_leaf(source) {

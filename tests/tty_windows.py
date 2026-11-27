@@ -14,8 +14,8 @@ from dyn_path import real_dyn
 from sdk_compat import environment as sdk_environment
 
 SOURCE = r'''#link("ucrt")
-use "std/parse" parse
-use "std/sync" sync
+use parse "std/parse"
+use sync "std/sync"
 use "std/thread"
 use "std/mem"
 use "std/io"
@@ -48,8 +48,8 @@ fn read_worker(context:*u8)isize {
   return 0
 }
 fn expect_bytes(actual:[]const u8,expected:[]const u8) {
-  if #len(actual)!=#len(expected) { #panic("console input length") }
-  for at in 0..#len(actual) { if actual[at]!=expected[at] { #panic("console input bytes") } }
+  if actual.len!=expected.len { #panic("console input length") }
+  for at in 0..actual.len { if actual[at]!=expected[at] { #panic("console input bytes") } }
 }
 fixture_input:rawptr
 fixture_peek:fn(rawptr,*WinTtyRecord,u32,*u32)i32
@@ -61,20 +61,20 @@ fn fixture_read_exact(expected:[]const u8, chunk_limit:i32) {
   used:usize=0
   started:=win_tty_api.ticks()
   last:i32=0
-  for used<#len(expected) {
+  for used<expected.len {
     elapsed:=win_tty_api.ticks()-started
     if elapsed>=100 { break }
     remaining:=100-elapsed
-    want:=#len(expected)-used
+    want:=expected.len-used
     if want>#cast(usize,chunk_limit) { want=#cast(usize,chunk_limit) }
     last=tty_read_host(&bytes[used],#cast(i32,want),#cast(i32,remaining))
     if last>0 { used+=#cast(usize,last)
     } else if last!=-2 && last!=0 { break }
   }
-  valid:=used==#len(expected)
+  valid:=used==expected.len
   for at in 0..used { if bytes[at]!=expected[at] { valid=false } }
   if !valid {
-    io.eprintln("console exact read: expected {} bytes, received {}, last {}, pending length {}, offset {}, repeat {}",#len(expected),used,last,win_tty_length,win_tty_offset,win_tty_repeat)
+    io.eprintln("console exact read: expected {} bytes, received {}, last {}, pending length {}, offset {}, repeat {}",expected.len,used,last,win_tty_length,win_tty_offset,win_tty_repeat)
     for at in 0..used { io.eprintln("console byte {} = {}",at,bytes[at]) }
     for at in 0..#cast(usize,record_count) {
       key:=#cast(*WinTtyKey,&records[at].data[0])
@@ -93,28 +93,27 @@ fn main() {
   if at<#cast(usize,length) && tty_command_line[at]==45 {
     expected:[5][]const u8=["--child","", "space value", "quote\"slash\\", "日本語"]
     for argument in expected {
-      expect_bytes(tty_command_line[at..at+#len(argument)],argument)
-      if tty_command_line[at+#len(argument)]!=0 { #panic("handoff argv terminator") }
-      at+=#len(argument)+1
+      expect_bytes(tty_command_line[at..at+argument.len],argument)
+      if tty_command_line[at+argument.len]!=0 { #panic("handoff argv terminator") }
+      at+=argument.len+1
     }
     value:[128]u8
-    result:=win_io_host.environment("DNA_HANDOFF",value[..])
-    if io.failed(result.failure) || !result.found { #panic("handoff environment") }
-    expect_bytes(result.value,"session café 日本語")
+    result:=win_io_host.environment("DNA_HANDOFF",value[..]) catch { #panic("handoff environment") }
+    expect_bytes(result,"session café 日本語")
     file:[]const u8="handoff-ok.txt\0"
     fd:=rec_open(&file[0],524481,384)
     if fd<0 || rec_close(fd)!=0 { #panic("handoff child acknowledgement") }
     return
   }
-  kernel:=win_io_loader.open("kernel32.dll",0)
-  allocate:=#cast(fn()i32,win_io_symbol(kernel.value,"AllocConsole"))
-  release:=#cast(fn()i32,win_io_symbol(kernel.value,"FreeConsole"))
-  standard:=#cast(fn(u32,rawptr)i32,win_io_symbol(kernel.value,"SetStdHandle"))
-  write_input:=#cast(fn(rawptr,*const WinTtyRecord,u32,*u32)i32,win_io_symbol(kernel.value,"WriteConsoleInputW"))
-  fixture_peek=#cast(fn(rawptr,*WinTtyRecord,u32,*u32)i32,win_io_symbol(kernel.value,"PeekConsoleInputW"))
-  flush_input:=#cast(fn(rawptr)i32,win_io_symbol(kernel.value,"FlushConsoleInputBuffer"))
-  handles:=#cast(fn(rawptr,*u32)i32,win_io_symbol(kernel.value,"GetProcessHandleCount"))
-  sleep:=#cast(fn(u32),win_io_symbol(kernel.value,"Sleep"))
+  kernel:=win_io_loader.open("kernel32.dll",0) catch { #panic("kernel32") }
+  allocate:=#cast(fn()i32,win_io_symbol(kernel,"AllocConsole"))
+  release:=#cast(fn()i32,win_io_symbol(kernel,"FreeConsole"))
+  standard:=#cast(fn(u32,rawptr)i32,win_io_symbol(kernel,"SetStdHandle"))
+  write_input:=#cast(fn(rawptr,*const WinTtyRecord,u32,*u32)i32,win_io_symbol(kernel,"WriteConsoleInputW"))
+  fixture_peek=#cast(fn(rawptr,*WinTtyRecord,u32,*u32)i32,win_io_symbol(kernel,"PeekConsoleInputW"))
+  flush_input:=#cast(fn(rawptr)i32,win_io_symbol(kernel,"FlushConsoleInputBuffer"))
+  handles:=#cast(fn(rawptr,*u32)i32,win_io_symbol(kernel,"GetProcessHandleCount"))
+  sleep:=#cast(fn(u32),win_io_symbol(kernel,"Sleep"))
   original_input:=win_tty_api.standard(4294967286)
   original_output:=win_tty_api.standard(4294967285)
   original_error:=win_tty_api.standard(4294967284)
@@ -191,8 +190,7 @@ fn main() {
   if tty_read_host(&bytes[0],64,100)!=-2 || sync.exchange_u32(&tty_resize_pending,0)!=1 { #panic("resize-only read") }
   _=flush_input(input)
   owner:=mem.arena_alloc(8192)
-  worker:=thread.spawn_with_size(owner,1048576,read_worker,nil)
-  if io.failed(worker.failure) { #panic("pending reader thread") }
+  worker:=thread.spawn_with_size(owner,1048576,read_worker,nil) catch { #panic("pending reader thread") }
   for sync.load_u32(&read_started)==0 { sleep(1) }
   deadline:=win_tty_api.ticks()+1000
   for {
@@ -204,7 +202,8 @@ fn main() {
     sleep(1)
   }
   tty_leave_host()
-  if io.failed(thread.join(worker.value).failure) || (read_result!=-1 && read_result!=-2) { #panic("leave must release pending reader") }
+  _ = thread.join(worker) catch { #panic("leave must release pending reader") }
+  if read_result!=-1 && read_result!=-2 { #panic("leave must release pending reader") }
   mem.arena_release(owner)
   if win_tty_api.mode(input,&mode)==0 || mode!=before_input || win_tty_api.input_page()!=before_input_page || win_tty_api.output_page()!=before_output_page { #panic("input mode and page restoration") }
   if win_tty_api.mode(output,&mode)==0 || mode!=before_output { #panic("output mode restoration") }
@@ -232,9 +231,8 @@ fn main() {
   session:[]const u8="session café 日本語\0"
   if !tty_handoff_host(executable,&arguments[0],&session[0]) { #panic("frontend handoff") }
   parent_value:[128]u8
-  parent_environment:=win_io_host.environment("DNA_HANDOFF",parent_value[..])
-  if io.failed(parent_environment.failure) || !parent_environment.found { #panic("parent handoff environment") }
-  expect_bytes(parent_environment.value,"parent value")
+  parent_environment:=win_io_host.environment("DNA_HANDOFF",parent_value[..]) catch { #panic("parent handoff environment") }
+  expect_bytes(parent_environment,"parent value")
   _=standard(4294967286,original_input)
   _=standard(4294967285,original_output)
   _=win_io_api.close(input)
