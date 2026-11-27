@@ -3,6 +3,7 @@
 A private FBO gives each fake resize its exact dimensions, independent of the
 window manager. Readback storage and FBOs never enter the production executable.
 """
+import re
 HELPER=r'''
 native_probe_framebuffer:u32
 native_probe_texture:u32
@@ -94,5 +95,8 @@ def install(source):
     source=source.replace('return native_gui.surface.pixels','return native_probe_pixels()')
     source=source.replace('if !native_resize()', 'if !native_probe_resize()')
     source=source.replace('native_memory.zero(native_gui.surface.pixels)','native_probe_blank()')
-    source=source.replace('fn sdl_destroy_renderer(renderer: rawptr) {','fn sdl_destroy_renderer(renderer: rawptr) {\n native_probe_destroy()')
+    # The hook must land: without it renderer recreation keeps stale probe
+    # storage. Match the signature by shape, not its parameter name.
+    source,hooked=re.subn(r'(fn sdl_destroy_renderer\(\w+: rawptr\) \{)',r'\1\n native_probe_destroy()',source)
+    assert hooked==1,'native_gpu_probe: sdl_destroy_renderer hook did not apply'
     return source+'\n'+HELPER
