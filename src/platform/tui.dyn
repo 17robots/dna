@@ -32,7 +32,7 @@ const Curl: u8 = 64
 // Bold, from applications in terminal panes.
 const Bold: u8 = 128
 
-struct Cell { character: u32, foreground: u32, background: u32, underline: u32, flags: u8 }
+struct Cell { character: u32, foreground: u32, background: u32, underline: u32, flags: u8, pad: [3]u8 }
 
 struct Tui {
   active: bool,
@@ -122,44 +122,42 @@ pub fn tui_start() bool {
   tui_measure()
   return true
 }
-fn environment_is(name: str, wanted: str) bool {
-  storage: [4096]u8
-  value := host.environment(name[..name.len - 1], storage[..]) catch { return false }
-  return mem.equal(value, wanted)
-}
-fn environment_contains(name: str, part: str) bool {
-  storage: [4096]u8
-  value := host.environment(name[..name.len - 1], storage[..]) catch { return false }
-  return find(value, part, 0) < value.len
+fn environment_value(name: str, storage: []u8) str {
+  return host.environment(name, storage) catch storage[..0]
 }
 // 24-bit color when the terminal says so (COLORTERM, a -direct TERM) or is
 // known to; DNA_TRUECOLOR=1 or 0 overrides either way.
 fn truecolor_supported() bool {
-  if environment_is("DNA_TRUECOLOR\0", "1") { return true }
-  if environment_is("DNA_TRUECOLOR\0", "0") { return false }
-  if environment_is("COLORTERM\0", "truecolor") || environment_is("COLORTERM\0", "24bit") || environment_contains("TERM\0", "-direct") {
-    return true
-  }
+  storage: [256]u8
+  override := environment_value("DNA_TRUECOLOR", storage[..])
+  if mem.equal(override, "1") { return true }
+  if mem.equal(override, "0") { return false }
+  colorterm := environment_value("COLORTERM", storage[..])
+  if mem.equal(colorterm, "truecolor") || mem.equal(colorterm, "24bit") { return true }
+  term := environment_value("TERM", storage[..])
+  if term.len == 0 { return false }
+  if find(term, "-direct", 0) < term.len { return true }
   known: [6]str = ["kitty", "alacritty", "foot", "wezterm", "ghostty", "contour"]
   for name in known {
-    if environment_contains("TERM\0", name) { return true }
+    if find(term, name, 0) < term.len { return true }
   }
   return false
 }
 // Curly, colored underlines where the terminal is known to draw them;
 // DNA_UNDERCURL=1 or 0 overrides. Others get a plain underline.
 fn undercurl_supported() bool {
-  if environment_is("DNA_UNDERCURL\0", "1") { return true }
-  if environment_is("DNA_UNDERCURL\0", "0") { return false }
-  vte_storage: [4096]u8
-  _ = host.environment("VTE_VERSION", vte_storage[..]) catch {
-    known: [5]str = ["kitty", "wezterm", "foot", "ghostty", "contour"]
-    for name in known {
-      if environment_contains("TERM\0", name) { return true }
-    }
-    return false
+  storage: [256]u8
+  override := environment_value("DNA_UNDERCURL", storage[..])
+  if mem.equal(override, "1") { return true }
+  if mem.equal(override, "0") { return false }
+  if environment_value("VTE_VERSION", storage[..]).len > 0 { return true }
+  term := environment_value("TERM", storage[..])
+  if term.len == 0 { return false }
+  known: [5]str = ["kitty", "wezterm", "foot", "ghostty", "contour"]
+  for name in known {
+    if find(term, name, 0) < term.len { return true }
   }
-  return true
+  return false
 }
 pub fn tui_stop() {
   if state.active {
@@ -479,12 +477,23 @@ fn put_character(column: i32, row: i32, character: u32, foreground: u32, italic:
 // Text objects: UTF-8 laid out in whole cells (monospace terminals).
 
 pub struct TuiText { bytes: rawptr, length: usize, capacity: usize, color: u32, wrap: i32, alive: bool, italic: bool }
-texts: [4096]TuiText
+const TuiTextCapacity: usize = 4096
+text_storage: *mem.Arena
+texts: []TuiText
+text_hint: usize = 0
 
 pub fn tui_text_create() rawptr {
-  for index in 0..4096 {
+  if texts.len == 0 {
+    text_storage = mem.arena_alloc(TuiTextCapacity * #sizeof(TuiText) + mem.ArenaBufferOverhead)
+    host.small_pages(text_storage.data)
+    texts = mem.push_array<TuiText>(text_storage, TuiTextCapacity)
+    text_hint = 0
+  }
+  for step in 0..TuiTextCapacity {
+    index := (text_hint + step) & (TuiTextCapacity - 1)
     if !texts[index].alive {
       texts[index] = TuiText{alive: true, color: 16777215}
+      text_hint = (index + 1) & (TuiTextCapacity - 1)
       return #cast(rawptr, &texts[index])
     }
   }
@@ -496,6 +505,16 @@ pub fn tui_text_destroy(handle: rawptr) {
     heap_free(text.bytes)
   }
   text.* = TuiText{}
+  if texts.len > 0 {
+    base := #cast(usize, &texts[0])
+    address := #cast(usize, text)
+    if address >= base {
+      index := (address - base) / #sizeof(TuiText)
+      if index < texts.len {
+        text_hint = index
+      }
+    }
+  }
 }
 pub fn tui_text_set(handle: rawptr, bytes: *const u8, length: usize) bool {
   text := #cast(*TuiText, handle)
@@ -868,8 +887,15 @@ pub fn tui_present() {
   cursor_column: i32 = -1
   cursor_row: i32 = -1
   for row in 0..state.rows {
+    row_base := #cast(usize, row) * MaxColumns
+    if !state.full_redraw && state.columns > 0 {
+      row_bytes := #cast(usize, state.columns) * #sizeof(Cell)
+      if mem.equal(#slice(#cast(*const u8, &grid[row_base]), row_bytes), #slice(#cast(*const u8, &shown[row_base]), row_bytes)) {
+        continue
+      }
+    }
     for column in 0..state.columns {
-      index := #cast(usize, row) * MaxColumns + #cast(usize, column)
+      index := row_base + #cast(usize, column)
       cell := grid[index]
       character := cell.character
       if character == 32 && (cell.flags & 15) != 0 {
@@ -1209,8 +1235,7 @@ fn paste_finish() {
   event.words[0] = PasteEvent
   queue(event)
 }
-fn paste_continue() usize {
-  bytes := state.input[..state.input_used]
+fn paste_continue(bytes: str) usize {
   terminator := find(bytes, "\x1b[201~", 0)
   if terminator < bytes.len {
     paste_append(bytes[..terminator])
@@ -1235,11 +1260,10 @@ pub fn tui_paste_clear() {
     state.paste_capacity = 0
   }
 }
-// Parse one sequence from the front of the input. Returns bytes consumed, or
+// Parse one sequence from the front of bytes. Returns bytes consumed, or
 // 0 when the sequence is incomplete.
-fn parse_one(force_escape: bool) usize {
-  if state.pasting { return paste_continue() }
-  bytes := state.input[..state.input_used]
+fn parse_one(bytes: str, force_escape: bool) usize {
+  if state.pasting { return paste_continue(bytes) }
   first := bytes[0]
   if first != 27 {
     if first == 13 || first == 10 {
@@ -1481,13 +1505,18 @@ fn numbers(text: str, values: []u32) usize {
 fn parse_input(force_escape: bool) {
   // A character queues a key and a text event; stop while the queue lacks
   // room and leave the rest of the bytes for after it drains.
-  for state.input_used > 0 && state.event_count + 4 <= 64 {
-    used := parse_one(force_escape)
-    if used == 0 { return }
-    remaining := state.input_used - used
-    _ = mem.move(state.input[..], state.input[used..used + remaining])
-    state.input_used = remaining
+  head: usize = 0
+  for head < state.input_used && state.event_count + 4 <= 64 {
+    used := parse_one(state.input[head..state.input_used], force_escape)
+    if used == 0 { break }
+    head += used
   }
+  if head == 0 { return }
+  remaining := state.input_used - head
+  if remaining > 0 {
+    _ = mem.move(state.input[..], state.input[head..state.input_used])
+  }
+  state.input_used = remaining
 }
 fn read_input(timeout: i32) i32 {
   if state.input_used >= state.input.len { return 0 }

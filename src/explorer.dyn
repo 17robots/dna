@@ -14,7 +14,10 @@ struct Explorer {
   path: [4096]u8,
   context: ExplorerContext,
   document: *buffer.Document,
-  vim: VimState, vim_borrowed:bool, dispatch_pending:u8,
+  vim: VimState,
+  saved_vim: ExplorerVimBorrow,
+  vim_borrowed: bool,
+  dispatch_pending: u8,
   insert: bool,
   extend: bool,
   commands: bool,
@@ -49,28 +52,32 @@ fn explorer_open(app: *App) {
 fn explorer_buffer_open(app: *App) {
   if explorer_dirty(app) {
     app.directory_state.length = copy_text(app.directory_state.path[..], app.explorer.path[..app.explorer.path_length])
-    app.prompt_state.panel = Panel.Directory
+    app.prompt_state.panel = .Directory
     return
   }
   // A fresh opening starts without ancestor columns.
   explorer_context_restart(app)
   if app.explorer.document != nil && buffer.equal(app.directory_state.path[..app.directory_state.length], app.explorer.path[..app.explorer.path_length]) && !app.explorer.stale {
-    app.prompt_state.panel = Panel.Directory
+    app.prompt_state.panel = .Directory
     explorer_context_reset(app)
     return
   }
-  app.prompt_state.panel = Panel.Directory
+  app.prompt_state.panel = .Directory
   directory_refresh(app)
 }
 fn explorer_load(app: *App) {
   if app.explorer.document == nil {
-    allocated := arena_owner.create((#sizeof(buffer.Document)))
+    allocated := arena_owner.create(#sizeof(buffer.Document))
+    host.small_pages(allocated.data)
     app.explorer.arena = allocated
     allocated = nil
     app.explorer.document = buffer.allocate(app.explorer.arena)
     _ = buffer.load(app.explorer.document, "")
   }
-  listing: [65536]u8
+  mark := mem.arena_mark(app.scratch)
+  defer mem.arena_rewind(app.scratch, mark)
+  listing := mem.push_bytes(app.scratch, 65536)
+  listing[0] = 0
   used: usize = 0
   index: usize = 0
   selected_cursor: usize = 0
@@ -140,7 +147,7 @@ fn explorer_selected(app: *App) {
     app.directory_state.selected = app.directory_state.count
   }
 }
-fn explorer_add_edit(app: *App, kind: FileAction, original: usize, name: []const u8) bool {
+fn explorer_add_edit(app: *App, kind: FileAction, original: usize, name: str) bool {
   if app.explorer.edit_count == 256 { return false }
   edit := &app.explorer.edits[app.explorer.edit_count]
   edit.kind = kind
@@ -149,7 +156,7 @@ fn explorer_add_edit(app: *App, kind: FileAction, original: usize, name: []const
   app.explorer.edit_count += 1
   return true
 }
-fn explorer_plan(app: *App) []const u8 {
+fn explorer_plan(app: *App) str {
   state := &app.explorer
   doc := state.document
   state.edit_count = 0
@@ -158,7 +165,7 @@ fn explorer_plan(app: *App) []const u8 {
     return "Explorer listing is stale. Discard the draft and refresh before applying more changes."
   }
   // Slices borrow the stable draft only during this function; plans own names.
-  names: [256][]const u8
+  names: [256]str
   seen: [256]bool
   count: usize = 0
   at: usize = 0
@@ -191,14 +198,12 @@ fn explorer_plan(app: *App) []const u8 {
         return "Each row must contain one filename without slashes or control characters."
       }
       if !is_directory && !buffer.equal(name, original.name[..original.length]) {
-        if !explorer_add_edit(app, FileAction.Rename, id, name) {
-          return "Too many filesystem operations."
-        }
+        if !explorer_add_edit(app, .Rename, id, name) { return "Too many filesystem operations." }
       }
     } else {
       creation := FileAction.Create
       if name[name.len - 1] == '/' {
-        creation = FileAction.CreateDirectory
+        creation = .CreateDirectory
         name = name[..name.len - 1]
       }
       if !valid_leaf(name) {
@@ -214,8 +219,7 @@ fn explorer_plan(app: *App) []const u8 {
     names[count] = name
     count += 1
   }
-  missing: usize = 0
-  for missing < app.directory_state.count {
+  for missing in 0..app.directory_state.count {
     if !seen[missing] {
       original_entry := &app.directory_state.entries[missing]
       if buffer.equal(original_entry.name[..original_entry.length], ".dna-trash") {
@@ -224,11 +228,10 @@ fn explorer_plan(app: *App) []const u8 {
       trash_name: [512]u8
       trash_length := trash_leaf(app, original_entry.name[..original_entry.length], trash_name[..])
       if trash_length == 0 { return "Cannot choose a free name inside .dna-trash." }
-      if !explorer_add_edit(app, FileAction.Trash, missing + 1, trash_name[..trash_length]) {
+      if !explorer_add_edit(app, .Trash, missing + 1, trash_name[..trash_length]) {
         return "Too many filesystem operations."
       }
     }
-    missing += 1
   }
   state.plan_revision = doc.revision
   return ""
@@ -238,7 +241,7 @@ fn edit_paths(app: *App, edit: *const FileEdit, source: []u8, destination: []u8)
     entry := &app.directory_state.entries[edit.original - 1]
     if joined(app, entry.name[..entry.length], source).len == 0 { return false }
   }
-  if edit.kind == FileAction.Trash {
+  if edit.kind == .Trash {
     leaf: [1024]u8
     used: usize = 0
     add_text(leaf[..], &used, ".dna-trash/")
@@ -247,11 +250,11 @@ fn edit_paths(app: *App, edit: *const FileEdit, source: []u8, destination: []u8)
   }
   return joined(app, edit.name[..edit.length], destination).len > 0
 }
-fn explorer_affected(path: []const u8, source: []const u8, directory: bool) bool {
+fn explorer_affected(path: str, source: str, directory: bool) bool {
   if buffer.equal(path, source) { return true }
   return directory && path.len > source.len && path[source.len] == '/' && buffer.equal(path[..source.len], source)
 }
-fn explorer_validate(app: *App) []const u8 {
+fn explorer_validate(app: *App) str {
   state := &app.explorer
   if state.document == nil || state.document.revision != state.plan_revision {
     return "Draft changed after preview. Run :write again."
@@ -265,8 +268,7 @@ fn explorer_validate(app: *App) []const u8 {
   trash_storage: [4096]u8
   trash_path := joined(app, ".dna-trash", trash_storage[..])
   trash := files.metadata(trash_path) catch fs.Metadata{}
-  index: usize = 0
-  for index < state.edit_count {
+  for index in 0..state.edit_count {
     edit := &state.edits[index]
     source: [4096]u8
     destination: [4096]u8
@@ -294,14 +296,13 @@ fn explorer_validate(app: *App) []const u8 {
         }
       }
     }
-    if edit.kind == FileAction.Trash && trash.mode != 0 && (trash.mode & 61440) != 16384 {
+    if edit.kind == .Trash && trash.mode != 0 && (trash.mode & 61440) != 16384 {
       return ".dna-trash must be a real directory, not a symlink or file."
     }
     dest_info := files.metadata(destination[..destination_length]) catch fs.Metadata{}
     if dest_info.mode != 0 {
       return "A destination already exists. Renames cannot overwrite files or swap names in one batch."
     }
-    index += 1
   }
   return ""
 }
@@ -322,11 +323,11 @@ fn explorer_preview(app: *App) {
     return
   }
   if app.explorer.edit_count == 0 {
-    app.prompt_state.panel = Panel.Directory
+    app.prompt_state.panel = .Directory
     return
   }
   app.explorer.preview_row = 0
-  app.prompt_state.panel = Panel.DirectoryApply
+  app.prompt_state.panel = .DirectoryApply
 }
 fn explorer_plan_text(app: *App, output: []u8) usize {
   used: usize = 0
@@ -338,11 +339,11 @@ fn explorer_plan_text(app: *App, output: []u8) usize {
   at := app.explorer.preview_row
   for at < app.explorer.edit_count && at < app.explorer.preview_row + 7 {
     edit := &app.explorer.edits[at]
-    if edit.kind == FileAction.Create {
+    if edit.kind == .Create {
       add_text(output, &used, "+ create  ")
-    } else if edit.kind == FileAction.CreateDirectory {
+    } else if edit.kind == .CreateDirectory {
       add_text(output, &used, "+ folder  ")
-    } else if edit.kind == FileAction.Trash {
+    } else if edit.kind == .Trash {
       add_text(output, &used, "- trash   ")
       trashed := &app.directory_state.entries[edit.original - 1]
       if !buffer.equal(trashed.name[..trashed.length], edit.name[..edit.length]) {
@@ -356,7 +357,7 @@ fn explorer_plan_text(app: *App, output: []u8) usize {
       add_text(output, &used, " -> ")
     }
     add_text(output, &used, edit.name[..edit.length])
-    if edit.kind == FileAction.CreateDirectory || (edit.original > 0 && app.directory_state.entries[edit.original - 1].directory) {
+    if edit.kind == .CreateDirectory || (edit.original > 0 && app.directory_state.entries[edit.original - 1].directory) {
       add_text(output, &used, "/")
     }
     add_text(output, &used, "\n")
@@ -383,12 +384,12 @@ fn explorer_apply(app: *App) {
     }
     source_length := c.string_length(&source[0], 4096)
     destination_length := c.string_length(&destination[0], 4096)
-    if edit.kind == FileAction.CreateDirectory {
+    if edit.kind == .CreateDirectory {
       fs.make_directory(destination[..destination_length], 493) catch {
         failed = true
         break
       }
-    } else if edit.kind == FileAction.Create {
+    } else if edit.kind == .Create {
       created := fs.create_exclusive(destination[..destination_length]) catch {
         failed = true
         break
@@ -404,7 +405,7 @@ fn explorer_apply(app: *App) {
         failed = true
         break
       }
-      if edit.kind == FileAction.Trash {
+      if edit.kind == .Trash {
         trash_storage: [4096]u8
         trash_path := joined(app, ".dna-trash", trash_storage[..])
         info := files.metadata(trash_path) catch fs.Metadata{}
@@ -449,56 +450,67 @@ fn explorer_apply(app: *App) {
     return
   }
   buffer.mark_saved(app.explorer.document)
-  app.prompt_state.panel = Panel.Directory
+  app.prompt_state.panel = .Directory
   directory_refresh(app)
 }
 // Borrow the draft's document, modal key state and scroll only while dispatching
 // its input (including its search prompt). Nested dot/macro playback shares the
 // live borrow; the owning file and its Vim state are restored exactly once.
 struct ExplorerVimBorrow {
-  active:bool, document:*buffer.Document, insert:bool, extend:bool,
-  scroll_x:f32, scroll_y:f32, draft_scroll_x:f32, draft_scroll_y:f32, vim:VimState,
+  document: *buffer.Document,
+  insert, extend: bool,
+  scroll_x, scroll_y, draft_scroll_x, draft_scroll_y: f32,
+  vim: VimState,
 }
-fn explorer_vim_begin(app:*App)ExplorerVimBorrow {
-  owned:=app.prompt_state.panel==Panel.Directory || (search_prompt(app.prompt_state.panel) && app.search_state.explorer)
-  if !app.config.vim_keys || !owned || app.explorer.document==nil || app.explorer.vim_borrowed {
-    return ExplorerVimBorrow{}
+fn explorer_vim_begin(app: *App) bool {
+  owned := app.prompt_state.panel == .Directory || (search_prompt(app.prompt_state.panel) && app.search_state.explorer)
+  if !app.config.vim_keys || !owned || app.explorer.document == nil || app.explorer.vim_borrowed {
+    return false
   }
-  saved:=ExplorerVimBorrow{active:true, document:app.documents.current, insert:app.view.insert, extend:app.view.extend, scroll_x:app.view.scroll_x, scroll_y:app.view.scroll_y, draft_scroll_x:app.explorer.scroll_x, draft_scroll_y:app.explorer.scroll_y, vim:app.vim}
-  app.explorer.vim_borrowed=true
-  app.documents.current=app.explorer.document
-  app.view.insert=app.explorer.insert
-  app.view.extend=app.explorer.extend
-  app.view.scroll_x=app.explorer.scroll_x
-  app.view.scroll_y=app.explorer.scroll_y
-  app.vim=app.explorer.vim
-  return saved
+  saved := &app.explorer.saved_vim
+  saved.document = app.documents.current
+  saved.insert = app.view.insert
+  saved.extend = app.view.extend
+  saved.scroll_x = app.view.scroll_x
+  saved.scroll_y = app.view.scroll_y
+  saved.draft_scroll_x = app.explorer.scroll_x
+  saved.draft_scroll_y = app.explorer.scroll_y
+  saved.vim = app.vim
+  app.explorer.vim_borrowed = true
+  app.documents.current = app.explorer.document
+  app.view.insert = app.explorer.insert
+  app.view.extend = app.explorer.extend
+  app.view.scroll_x = app.explorer.scroll_x
+  app.view.scroll_y = app.explorer.scroll_y
+  app.vim = app.explorer.vim
+  return true
 }
-fn explorer_vim_end(app:*App, saved:*ExplorerVimBorrow) {
-  if !saved.active { return }
-  saved.active=false
-  app.explorer.vim=app.vim
-  app.explorer.insert=app.view.insert
-  app.explorer.extend=app.view.extend
-  if app.view.scroll_x!=saved.draft_scroll_x {
-    app.explorer.scroll_x=app.view.scroll_x
+fn explorer_vim_end(app: *App, borrowed: *bool) {
+  if !borrowed.* { return }
+  borrowed.* = false
+  saved := &app.explorer.saved_vim
+  app.explorer.vim = app.vim
+  app.explorer.insert = app.view.insert
+  app.explorer.extend = app.view.extend
+  if app.view.scroll_x != saved.draft_scroll_x {
+    app.explorer.scroll_x = app.view.scroll_x
   }
-  if app.view.scroll_y!=saved.draft_scroll_y {
-    app.explorer.scroll_y=app.view.scroll_y
+  if app.view.scroll_y != saved.draft_scroll_y {
+    app.explorer.scroll_y = app.view.scroll_y
   }
-  app.documents.current=saved.document
-  app.view.insert=saved.insert
-  app.view.extend=saved.extend
-  app.view.scroll_x=saved.scroll_x
-  app.view.scroll_y=saved.scroll_y
-  app.vim=saved.vim
-  app.explorer.vim_borrowed=false
+  app.documents.current = saved.document
+  app.view.insert = saved.insert
+  app.view.extend = saved.extend
+  app.view.scroll_x = saved.scroll_x
+  app.view.scroll_y = saved.scroll_y
+  app.vim = saved.vim
+  app.explorer.vim_borrowed = false
 }
 // File activation and listing replacement must see the real owning slot and
 // view, never the temporarily borrowed draft. Inner replay frames only queue;
 // the outermost input frame restores ownership before running the action.
-fn explorer_vim_finish(app:*App, typography:*Typography, saved:*ExplorerVimBorrow) {
-  explorer_vim_end(app, saved)
+fn explorer_vim_finish(app: *App, typography: *Typography, borrowed: *bool) {
+  explorer_vim_end(app, borrowed)
   if app.explorer.vim_borrowed { return }
   pending:=app.explorer.dispatch_pending
   app.explorer.dispatch_pending=0
@@ -527,7 +539,7 @@ fn explorer_vim_key(app:*App, typography:*Typography, key:u32, modifiers:u16) {
       vim_escape(app)
       buffer.checkpoint(app.documents.current)
     } else {
-      app.prompt_state.panel=Panel.None
+      app.prompt_state.panel=.None
     }
     return
   }
@@ -536,18 +548,18 @@ fn explorer_vim_key(app:*App, typography:*Typography, key:u32, modifiers:u16) {
     return
   }
   if idle && !control && !shift && key==KeyQ {
-    app.prompt_state.panel=Panel.None
+    app.prompt_state.panel=.None
     return
   }
   if !app.view.insert && !control && (key==KeyColon || (key==KeySemicolon && shift)) {
     vim_escape(app)
-    panel(app, Panel.Commands)
+    panel(app, .Commands)
     app.explorer.commands=true
     return
   }
   if idle && !control && key==KeySpace {
     app.input_state.leader_explorer=true
-    panel(app, Panel.Leader)
+    panel(app, .Leader)
     return
   }
   if idle && !control && (key==KeyBackspace || key==KeyMinus) {
@@ -561,7 +573,7 @@ fn explorer_vim_key(app:*App, typography:*Typography, key:u32, modifiers:u16) {
   if !app.view.insert && !control && (key==KeySlash || key==KeyQuestion) {
     vim_escape(app)
     app.input_state.search_backwards=shift || key==KeyQuestion
-    search_open(app, Panel.Search, true)
+    search_open(app, .Search, true)
     return
   }
   if idle && !control && key==KeyN {
@@ -580,7 +592,7 @@ fn explorer_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
   }
   doc := app.explorer.document
   if doc == nil {
-    app.prompt_state.panel = Panel.None
+    app.prompt_state.panel = .None
     return
   }
   shift := (modifiers & ModShift) != 0
@@ -596,13 +608,13 @@ fn explorer_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
       app.explorer.insert = false
       app.explorer.extend = false
     } else {
-      app.prompt_state.panel = Panel.None
+      app.prompt_state.panel = .None
     }
     return
   }
   if !app.explorer.insert && (modifiers & ModAlt) == 0 && (key == KeyColon || (key == KeySemicolon && shift)) {
     buffer.checkpoint(doc)
-    panel(app, Panel.Commands)
+    panel(app, .Commands)
     app.explorer.commands = true
     return
   }
@@ -612,7 +624,7 @@ fn explorer_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
     app.input_state.pending = 0
     app.input_state.repeat_count = 0
     buffer.checkpoint(doc)
-    app.prompt_state.panel = Panel.None
+    app.prompt_state.panel = .None
     return
   }
   if !app.explorer.insert && !control && key == KeyM {
@@ -621,19 +633,19 @@ fn explorer_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
   }
   if !app.explorer.insert && !control && key == KeySpace {
     app.input_state.leader_explorer = true
-    panel(app, Panel.Leader)
+    panel(app, .Leader)
     return
   }
   if !app.explorer.insert && !control && !shift && key == KeyG {
     app.input_state.goto_count = app.input_state.repeat_count
     app.input_state.goto_explorer = true
-    panel(app, Panel.Goto)
+    panel(app, .Goto)
     return
   }
   if !app.explorer.insert && !control && shift && key == KeyK {
     filter_kind := Panel.Keep
     if (modifiers & ModAlt) != 0 {
-      filter_kind = Panel.Remove
+      filter_kind = .Remove
     }
     search_open(app, filter_kind, true)
     return
@@ -641,9 +653,9 @@ fn explorer_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
   if !app.explorer.insert && !control && (key == KeyS || key == KeySlash || key == KeyQuestion) {
     kind := Panel.Select
     if key == KeyS && shift {
-      kind = Panel.Split
+      kind = .Split
     } else if key != KeyS {
-      kind = Panel.Search
+      kind = .Search
       app.input_state.search_backwards = shift || key == KeyQuestion
     }
     search_open(app, kind, true)
@@ -707,14 +719,14 @@ fn explorer_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
 // Side column of directory entries (parent or contents). Rows are clickable;
 // the selected entry keeps a highlight. Returns nothing: icons draw after
 // layout from the recorded rows.
-fn explorer_column(ui: *UiState, app: *App, typography: *Typography, name: []const u8, title: []const u8, entries: []Entry, selected: usize, width: f32, kind: usize) {
+fn explorer_column(ui: *UiState, app: *App, typography: *Typography, name: str, title: str, entries: []Entry, selected: usize, width: f32, kind: usize) {
   scale := typography.scale
   column := ui_make(ui, ui_key(ui, name), UiBackground | UiBorder | UiClip)
   ui.boxes[column].fill = theme().surface
   ui.boxes[column].padding[0] = 14.0 * scale
   ui.boxes[column].padding[1] = 14.0 * scale
-  ui_size(ui, column, UiAxisX, UiSizeKind.Pixels, width / scale, 1.0)
-  ui_size(ui, column, UiAxisY, UiSizeKind.Percent, 1.0, 1.0)
+  ui_size(ui, column, UiAxisX, .Pixels, width / scale, 1.0)
+  ui_size(ui, column, UiAxisY, .Percent, 1.0, 1.0)
   ui_push(ui, column)
   header: [8192]u8
   header_length: usize = 0
@@ -725,8 +737,8 @@ fn explorer_column(ui: *UiState, app: *App, typography: *Typography, name: []con
   }
   add_text(header[..], &header_length, title)
   heading := ui_label(ui, "title", header[..header_length], 0)
-  ui_size(ui, heading, UiAxisX, UiSizeKind.Percent, 1.0, 0.0)
-  ui_size(ui, heading, UiAxisY, UiSizeKind.Pixels, typography.line * 1.5 / scale, 1.0)
+  ui_size(ui, heading, UiAxisX, .Percent, 1.0, 0.0)
+  ui_size(ui, heading, UiAxisY, .Pixels, typography.line * 1.5 / scale, 1.0)
   previous := ui.boxes[column].rect.height
   rows: usize = 8
   if previous > 28.0 * scale + typography.line * 3.0 {
@@ -755,8 +767,8 @@ fn explorer_column(ui: *UiState, app: *App, typography: *Typography, name: []con
     if app.config.explorer_icons {
       ui.boxes[row].padding[0] += typography.cell * 2.0
     }
-    ui_size(ui, row, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
-    ui_size(ui, row, UiAxisY, UiSizeKind.Pixels, typography.line / scale, 1.0)
+    ui_size(ui, row, UiAxisX, .Percent, 1.0, 1.0)
+    ui_size(ui, row, UiAxisY, .Pixels, typography.line / scale, 1.0)
     ui_animate(app, ui, row, index == selected)
     index += 1
   }
@@ -769,7 +781,7 @@ fn explorer_column(ui: *UiState, app: *App, typography: *Typography, name: []con
   ui_pop(ui)
 }
 // Draw file and folder icons into the text padding of recorded rows.
-fn explorer_column_icons(renderer: rawptr, app: *App, ui: *UiState, typography: *Typography, name: []const u8, entries: []Entry, selected: usize) {
+fn explorer_column_icons(renderer: rawptr, app: *App, ui: *UiState, typography: *Typography, name: str, entries: []Entry, selected: usize) {
   column := ui_make_lookup(ui, ui_child_key("explorer", name))
   if column == 0 { return }
   clip := sdl.PixelRect{x: #cast(i32, ui.boxes[column].rect.x), y: #cast(i32, ui.boxes[column].rect.y), width: #cast(i32, ui.boxes[column].rect.width), height: #cast(i32, ui.boxes[column].rect.height)}
@@ -890,24 +902,24 @@ fn draw_explorer(renderer: rawptr, app: *App, typography: *Typography, width: i3
   ui.boxes[root].axis = UiAxisX
   ui.boxes[root].floating[0] = rect.x
   ui.boxes[root].floating[1] = rect.y
-  ui_size(ui, root, UiAxisX, UiSizeKind.Pixels, rect.width / scale, 1.0)
-  ui_size(ui, root, UiAxisY, UiSizeKind.Pixels, rect.height / scale, 1.0)
+  ui_size(ui, root, UiAxisX, .Pixels, rect.width / scale, 1.0)
+  ui_size(ui, root, UiAxisY, .Pixels, rect.height / scale, 1.0)
   ui_push(ui, root)
   for index in context.trail_count - shown..context.trail_count {
     column := &context.trail[index]
-    names: [6][]const u8 = ["trail 0", "trail 1", "trail 2", "trail 3", "trail 4", "trail 5"]
+    names: [6]str = ["trail 0", "trail 1", "trail 2", "trail 3", "trail 4", "trail 5"]
     explorer_column(ui, app, typography, names[index], column.path[..column.path_length], column.entries[..column.count], column.selected, explorer_column_extent(progress, index - (context.trail_count - shown), rect.width, gap), index + 1)
     space := ui_make(ui, ui_hash(ui_key(ui, "gap"), names[index]), 0)
-    ui_size(ui, space, UiAxisX, UiSizeKind.Pixels, gap * explorer_column_fraction(progress, index - (context.trail_count - shown) + 1) / scale, 1.0)
+    ui_size(ui, space, UiAxisX, .Pixels, gap * explorer_column_fraction(progress, index - (context.trail_count - shown) + 1) / scale, 1.0)
   }
   main := ui_make(ui, ui_key(ui, "main"), UiBackground | UiBorder | UiClip | UiFocus)
   ui.boxes[main].fill = theme().surface
-  ui_size(ui, main, UiAxisX, UiSizeKind.Pixels, column_width / scale, 1.0)
-  ui_size(ui, main, UiAxisY, UiSizeKind.Percent, 1.0, 1.0)
+  ui_size(ui, main, UiAxisX, .Pixels, column_width / scale, 1.0)
+  ui_size(ui, main, UiAxisY, .Percent, 1.0, 1.0)
   preview_body: usize = 0
   if preview {
     space_right := ui_make(ui, ui_key(ui, "right gap"), 0)
-    ui_size(ui, space_right, UiAxisX, UiSizeKind.Pixels, gap * explorer_column_fraction(progress, shown + 1) / scale, 1.0)
+    ui_size(ui, space_right, UiAxisX, .Pixels, gap * explorer_column_fraction(progress, shown + 1) / scale, 1.0)
     if context.preview_directory {
       explorer_column(ui, app, typography, "contents", "", context.children[..context.child_count], 64, preview_width, ExplorerTrail + 1)
     } else {
@@ -915,12 +927,12 @@ fn draw_explorer(renderer: rawptr, app: *App, typography: *Typography, width: i3
       ui.boxes[pane].fill = theme().surface
       ui.boxes[pane].padding[0] = padding
       ui.boxes[pane].padding[1] = padding
-      ui_size(ui, pane, UiAxisX, UiSizeKind.Pixels, preview_width / scale, 1.0)
-      ui_size(ui, pane, UiAxisY, UiSizeKind.Percent, 1.0, 1.0)
+      ui_size(ui, pane, UiAxisX, .Pixels, preview_width / scale, 1.0)
+      ui_size(ui, pane, UiAxisY, .Percent, 1.0, 1.0)
       ui_push(ui, pane)
       preview_body = ui_make(ui, ui_key(ui, "body"), UiClip)
-      ui_size(ui, preview_body, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
-      ui_size(ui, preview_body, UiAxisY, UiSizeKind.Percent, 1.0, 0.0)
+      ui_size(ui, preview_body, UiAxisX, .Percent, 1.0, 1.0)
+      ui_size(ui, preview_body, UiAxisY, .Percent, 1.0, 0.0)
       ui_pop(ui)
     }
   }
@@ -939,12 +951,12 @@ fn draw_explorer(renderer: rawptr, app: *App, typography: *Typography, width: i3
       ui.boxes[retiring].fill = theme().surface
       ui.boxes[retiring].padding[0] = padding
       ui.boxes[retiring].padding[1] = padding
-      ui_size(ui, retiring, UiAxisX, UiSizeKind.Pixels, remaining / scale, 1.0)
-      ui_size(ui, retiring, UiAxisY, UiSizeKind.Percent, 1.0, 1.0)
+      ui_size(ui, retiring, UiAxisX, .Pixels, remaining / scale, 1.0)
+      ui_size(ui, retiring, UiAxisY, .Percent, 1.0, 1.0)
       ui_push(ui, retiring)
       retiring_body = ui_make(ui, ui_key(ui, "body"), UiClip)
-      ui_size(ui, retiring_body, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
-      ui_size(ui, retiring_body, UiAxisY, UiSizeKind.Percent, 1.0, 0.0)
+      ui_size(ui, retiring_body, UiAxisX, .Percent, 1.0, 1.0)
+      ui_size(ui, retiring_body, UiAxisY, .Percent, 1.0, 0.0)
       ui_pop(ui)
     }
   }
@@ -952,7 +964,7 @@ fn draw_explorer(renderer: rawptr, app: *App, typography: *Typography, width: i3
   ui_layout(ui)
   ui_render(renderer, ui, typography, width, height)
   if app.config.explorer_icons || app.view.line_numbers {
-    trail_names: [6][]const u8 = ["trail 0", "trail 1", "trail 2", "trail 3", "trail 4", "trail 5"]
+    trail_names: [6]str = ["trail 0", "trail 1", "trail 2", "trail 3", "trail 4", "trail 5"]
     for index in context.trail_count - shown..context.trail_count {
       explorer_column_icons(renderer, app, ui, typography, trail_names[index], context.trail[index].entries[..context.trail[index].count], context.trail[index].selected)
     }
@@ -1042,7 +1054,7 @@ fn draw_explorer(renderer: rawptr, app: *App, typography: *Typography, width: i3
     app.explorer.scroll_x = x + typography.cell - available
   }
   visual := &app.view.animation.directory
-  reset := app.view.animation.reset || app.view.animation.panel != Panel.Directory
+  reset := app.view.animation.reset || app.view.animation.panel != .Directory
   animated_scroll(app, visual, app.explorer.scroll_x, app.explorer.scroll_y, body_height, reset)
   if app.explorer.insert {
     editing_scroll_visible(visual, x, y, typography.cell, typography.line, available, body_height, app.explorer.scroll_x, app.explorer.scroll_y)

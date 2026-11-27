@@ -4,6 +4,7 @@ use arena_owner "../owned_arena"
 use "std/mem"
 // Opaque PCRE2 handles; no native structures escape this module.
 extern fn compile "pcre2_compile_8"(bytes: *const u8, length: usize, options: u32, error: *i32, offset: *usize, context: rawptr) rawptr
+extern fn jit_compile "pcre2_jit_compile_8"(code: rawptr, options: u32) i32
 extern fn code_free "pcre2_code_free_8"(code: rawptr)
 extern fn data_create "pcre2_match_data_create_from_pattern_8"(code: rawptr, context: rawptr) rawptr
 extern fn data_free "pcre2_match_data_free_8"(data: rawptr)
@@ -25,10 +26,92 @@ struct CalloutBlock {
 
 // base: where the text of the last find_document call starts in the
 // document, for callouts that need document positions.
-pub struct Pattern { code, data, context: rawptr, valid: bool, error: i32, error_offset: usize, base: usize }
+pub struct Pattern {
+  code, data, context: rawptr,
+  valid: bool,
+  error: i32,
+  error_offset: usize,
+  base: usize,
+  options: u32,
+  literal: [256]u8,
+  literal_len: usize,
+  match_start, match_end: usize,
+  matched: bool,
+}
 pub struct Match { found, error: bool, start, end: usize }
 // partial: a match may start at or after offset but needs text past the end.
 pub struct Window { found, partial, error: bool, start, end: usize }
+
+// Plain printable ASCII without regex syntax runs directly via memchr/mem.equal
+// instead of compiling and interpreting PCRE2 bytecode.
+fn pattern_plain_literal(text: str) bool {
+  if text.len == 0 || text.len > 256 { return false }
+  syntax: str = "\\.^$|?*+()[]{}"
+  for byte in text {
+    if byte < 32 || byte > 126 { return false }
+    for special in syntax {
+      if byte == special { return false }
+    }
+  }
+  return true
+}
+fn literal_find(text: str, offset: usize, needle: str) usize {
+  if needle.len == 0 || offset + needle.len > text.len { return text.len }
+  first := needle[0]
+  limit := text.len - needle.len + 1
+  at := offset
+  for at < limit {
+    hit := buffer.find_byte_in(text[..limit], at, first)
+    if hit >= limit { return text.len }
+    if needle.len == 1 || mem.equal(text[hit + 1..hit + needle.len], needle[1..]) { return hit }
+    at = hit + 1
+  }
+  return text.len
+}
+fn literal_find_document(doc: *const buffer.Document, offset: usize, needle: str) Match {
+  if needle.len == 0 || offset + needle.len > doc.length { return Match{} }
+  first := needle[0]
+  at := offset
+  for at + needle.len <= doc.length {
+    chunk := buffer.chunk_at(doc, at)
+    if chunk.len == 0 { break }
+    pos: usize = 0
+    for pos < chunk.len {
+      hit := buffer.find_byte_in(chunk, pos, first)
+      if hit >= chunk.len { break }
+      doc_pos := at + hit
+      if doc_pos + needle.len > doc.length { return Match{} }
+      if needle.len == 1 { return Match{found: true, start: doc_pos, end: doc_pos + 1} }
+      if hit + needle.len <= chunk.len {
+        if mem.equal(chunk[hit + 1..hit + needle.len], needle[1..]) {
+          return Match{found: true, start: doc_pos, end: doc_pos + needle.len}
+        }
+      } else {
+        scratch: [256]u8
+        buffer.copy_range(doc, doc_pos, doc_pos + needle.len, scratch[..needle.len])
+        if mem.equal(scratch[..needle.len], needle) {
+          return Match{found: true, start: doc_pos, end: doc_pos + needle.len}
+        }
+      }
+      pos = hit + 1
+    }
+    at += chunk.len
+  }
+  return Match{}
+}
+fn compile_pcre2(result: *Pattern, text: str, options: u32) bool {
+  result.code = compile(&text[0], text.len, options, &result.error, &result.error_offset, nil)
+  if result.code == nil { return false }
+  result.data = data_create(result.code, nil)
+  result.context = context_create(nil)
+  if result.data == nil || result.context == nil { return false }
+  if match_limit(result.context, 10000) != 0 || depth_limit(result.context, 128) != 0 || heap_limit(result.context, 4096) != 0 {
+    return false
+  }
+  // Best-effort JIT compilation for PCRE2_JIT_COMPLETE | PCRE2_JIT_PARTIAL_HARD.
+  _ = jit_compile(result.code, 5)
+  return true
+}
 
 pub fn open(text: str) Pattern {
   return open_options(text, 0x001a0000)
@@ -37,16 +120,15 @@ pub fn open_lines(text: str) Pattern {
   return open_options(text, 0x001a0400)
 }
 fn open_options(text: str, options: u32) Pattern {
-  result := Pattern{}
+  result := Pattern{options: options}
   if text.len == 0 { return result }
-  result.code = compile(&text[0], text.len, options, &result.error, &result.error_offset, nil)
-  if result.code == nil { return result }
-  result.data = data_create(result.code, nil)
-  result.context = context_create(nil)
-  if result.data == nil || result.context == nil { return result }
-  if match_limit(result.context, 10000) != 0 || depth_limit(result.context, 128) != 0 || heap_limit(result.context, 4096) != 0 {
+  if pattern_plain_literal(text) {
+    _ = mem.copy(result.literal[..text.len], text)
+    result.literal_len = text.len
+    result.valid = true
     return result
   }
+  if !compile_pcre2(&result, text, options) { return result }
   result.valid = true
   return result
 }
@@ -63,6 +145,8 @@ pub fn close(pattern: *Pattern) {
   pattern.data = nil
   pattern.context = nil
   pattern.code = nil
+  pattern.literal_len = 0
+  pattern.matched = false
   pattern.valid = false
 }
 pub fn find(pattern: *Pattern, text: str, offset: usize) Match {
@@ -73,6 +157,18 @@ pub fn find(pattern: *Pattern, text: str, offset: usize) Match {
 const Checked: u32 = 0x40000000
 fn find_options(pattern: *Pattern, text: str, offset: usize, options: u32) Match {
   if !pattern.valid || offset > text.len { return Match{error: true} }
+  if pattern.literal_len > 0 && pattern.code == nil {
+    needle := pattern.literal[..pattern.literal_len]
+    hit := literal_find(text, offset, needle)
+    if hit >= text.len {
+      pattern.matched = false
+      return Match{}
+    }
+    pattern.matched = true
+    pattern.match_start = hit
+    pattern.match_end = hit + needle.len
+    return Match{found: true, start: hit, end: hit + needle.len}
+  }
   empty: [1]u8 = [0]
   bytes: *const u8 = &empty[0]
   if text.len > 0 {
@@ -89,6 +185,12 @@ fn find_options(pattern: *Pattern, text: str, offset: usize, options: u32) Match
 // next find on the same pattern.
 pub fn group(pattern: *const Pattern, index: usize) Match {
   if !pattern.valid { return Match{} }
+  if pattern.literal_len > 0 && pattern.code == nil {
+    if index == 0 && pattern.matched {
+      return Match{found: true, start: pattern.match_start, end: pattern.match_end}
+    }
+    return Match{}
+  }
   count := #cast(usize, offset_count(pattern.data))
   if index >= count { return Match{} }
   vector := #slice(offsets(pattern.data), 2 * count)
@@ -106,6 +208,27 @@ pub fn find_window(pattern: *Pattern, text: str, offset: usize) Window {
 }
 fn find_window_options(pattern: *Pattern, text: str, offset: usize, options: u32) Window {
   if !pattern.valid || offset > text.len { return Window{error: true} }
+  if pattern.literal_len > 0 && pattern.code == nil {
+    needle := pattern.literal[..pattern.literal_len]
+    hit := literal_find(text, offset, needle)
+    if hit < text.len {
+      pattern.matched = true
+      pattern.match_start = hit
+      pattern.match_end = hit + needle.len
+      return Window{found: true, start: hit, end: hit + needle.len}
+    }
+    pattern.matched = false
+    start_tail := offset
+    if text.len + 1 > needle.len && text.len - (needle.len - 1) > start_tail {
+      start_tail = text.len - (needle.len - 1)
+    }
+    for tail in start_tail..text.len {
+      if mem.equal(text[tail..], needle[..text.len - tail]) {
+        return Window{partial: true, start: tail}
+      }
+    }
+    return Window{}
+  }
   empty: [1]u8 = [0]
   bytes: *const u8 = &empty[0]
   if text.len > 0 {
@@ -137,8 +260,15 @@ search_window_low: usize = 0
 search_window_high: usize = 0
 pub fn find_document(compiled: *Pattern, doc: *const buffer.Document, offset: usize) Match {
   compiled.base = 0
+  if !compiled.valid || offset > doc.length { return Match{error: true} }
+  if compiled.literal_len > 0 && compiled.code == nil {
+    found := literal_find_document(doc, offset, compiled.literal[..compiled.literal_len])
+    compiled.matched = found.found
+    compiled.match_start = found.start
+    compiled.match_end = found.end
+    return found
+  }
   if doc.length <= SearchWindow { return find(compiled, buffer.all(doc), offset) }
-  if offset > doc.length { return Match{error: true} }
   if search_window_arena == nil {
     search_window_arena = arena_owner.create(SearchWindowLimit)
     search_window_bytes = mem.push_bytes(search_window_arena, SearchWindowLimit)
@@ -200,6 +330,9 @@ pub fn find_document(compiled: *Pattern, doc: *const buffer.Document, offset: us
 // Call callout at each (?Cn) of the pattern with data; it returns 0 to go on
 // matching there and 1 to fail at that point.
 pub fn set_callout(pattern: *Pattern, callout: fn(rawptr, rawptr) i32, data: rawptr) {
+  if pattern.code == nil && pattern.literal_len > 0 {
+    _ = compile_pcre2(pattern, pattern.literal[..pattern.literal_len], pattern.options)
+  }
   if pattern.context != nil {
     _ = callout_set(pattern.context, callout, data)
   }

@@ -1,3 +1,4 @@
+use "std/mem"
 use "std/ui"
 // Direct window drawing: bounded vertex batches and a bounded, single-channel
 // glyph atlas. Popup targets live in framebuffer textures; no window or popup
@@ -23,6 +24,7 @@ pub struct Gpu {
   mask, premultiplied: bool,
   clip: ui.Rect,
   slots: [2048]GlyphSlot,
+  slot_index: [4096]u16,
   slot_count: usize,
   atlas_x, atlas_y, atlas_row: i32,
   failed: bool,
@@ -238,22 +240,39 @@ pub fn gpu_upload(gpu:*Gpu, texture:*u32, pixels:*const u8, width, height:i32, c
   }
   return healthy(&gpu.api)
 }
-pub fn gpu_glyph(gpu:*Gpu, key:u64, pixels:*const u8, width, height:i32, bounds, clip:ui.Rect, color:ui.Color, sx, sy:f32) bool {
-  if bounds.width<=0 || bounds.height<=0 || ui.intersect(bounds, clip).width<=0 || ui.intersect(bounds, clip).height<=0 {
-    return true
-  }
-  slot:=GlyphSlot{}
-  found:=false
-  if key!=0 {
-    for i in 0..gpu.slot_count {
-      candidate:=gpu.slots[i]
-      if candidate.key==key && candidate.width==width && candidate.height==height {
-        slot=candidate
-        found=true
-        break
-      }
+fn gpu_atlas_hash(key: u64) usize {
+  return #cast(usize, #wrapping(key ^ (key >> 16) ^ (key >> 32))) & 4095
+}
+fn gpu_atlas_find(gpu: *const Gpu, key: u64, width, height: i32, out_slot: *GlyphSlot, out_probe: *usize) bool {
+  probe := gpu_atlas_hash(key)
+  for _ in 0..4096 {
+    entry := gpu.slot_index[probe]
+    if entry == 0 {
+      out_probe.* = probe
+      return false
     }
+    candidate := &gpu.slots[entry - 1]
+    if candidate.key == key && candidate.width == width && candidate.height == height {
+      out_slot.* = candidate.*
+      return true
+    }
+    probe = (probe + 1) & 4095
   }
+  return false
+}
+fn gpu_atlas_reset(gpu: *Gpu) {
+  gpu.slot_count = 0
+  mem.clear(&gpu.slot_index)
+  gpu.atlas_x = 0
+  gpu.atlas_y = 0
+  gpu.atlas_row = 0
+}
+pub fn gpu_glyph(gpu:*Gpu, key:u64, pixels:*const u8, width, height:i32, bounds, clip:ui.Rect, color:ui.Color, sx, sy:f32) bool {
+  visible := ui.intersect(bounds, clip)
+  if bounds.width<=0 || bounds.height<=0 || visible.width<=0 || visible.height<=0 { return true }
+  slot:=GlyphSlot{}
+  probe: usize = 0
+  found := key != 0 && gpu_atlas_find(gpu, key, width, height, &slot, &probe)
   texture:=gpu.atlas
   divisor_x:f32=1024.0
   divisor_y:f32=1024.0
@@ -276,10 +295,8 @@ pub fn gpu_glyph(gpu:*Gpu, key:u64, pixels:*const u8, width, height:i32, bounds,
       if gpu.atlas_y+height>1024 || gpu.slot_count==gpu.slots.len {
         // Flush before overwriting texels still referenced by pending vertices.
         if !gpu_flush(gpu) { return false }
-        gpu.slot_count=0
-        gpu.atlas_x=0
-        gpu.atlas_y=0
-        gpu.atlas_row=0
+        gpu_atlas_reset(gpu)
+        probe = gpu_atlas_hash(key)
       }
       slot=GlyphSlot{key:key, x:gpu.atlas_x, y:gpu.atlas_y, width:width, height:height}
       gpu_unpack(gpu)
@@ -289,6 +306,7 @@ pub fn gpu_glyph(gpu:*Gpu, key:u64, pixels:*const u8, width, height:i32, bounds,
       gpu.api.tex_sub_image_2d(gl.Texture2d, 0, slot.x, slot.y, width, height, gl.Red, gl.UnsignedByte, #cast(rawptr, pixels))
       gpu.slots[gpu.slot_count]=slot
       gpu.slot_count+=1
+      gpu.slot_index[probe]=#cast(u16, gpu.slot_count)
       gpu.atlas_x+=width
       if height>gpu.atlas_row {
         gpu.atlas_row=height
