@@ -21,7 +21,7 @@ PREFIX = ROOT/'build/deps/install'
 ENV = dict(os.environ, LD_LIBRARY_PATH=os.pathsep.join(str(path) for path in
            (PREFIX/'lib', ROOT/'build/native-wayland', ROOT/'build/native-gui')))
 NAME = 'dna-preview-linux-x86_64'
-VERSION = re.search(r'const DnaVersion: \[\]const u8 = "([^"]+)"', (ROOT/'src/version.dyn').read_text())[1]
+VERSION = re.search(r'const DnaVersion: (?:str|\[\]const u8) = "([^"]+)"', (ROOT/'src/version.dyn').read_text())[1]
 GLIBC = re.compile(r'^(libc|libm|libpthread|librt|libdl|libresolv|libutil)\.so\.')
 # Display-server and GL dispatch libraries must match the host's graphics
 # driver: NVIDIA's EGL/GLX vendor libraries load them too, and an older bundled

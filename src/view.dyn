@@ -13,6 +13,46 @@ fn present_pacing(app: *App, renderer: rawptr) {
     }
   }
 }
+fn update_window_title(window: rawptr, app: *App, doc: *buffer.Document) {
+  dirty := buffer.dirty_cached(doc)
+  name := files.name(app.documents.file)
+  state := &app.title_state
+  if state.ready && state.dirty == dirty && state.insert == app.view.insert && state.extend == app.view.extend && buffer.equal(name, state.text[state.name_start..state.name_end]) {
+    return
+  }
+  used: usize = 0
+  if dirty {
+    add_text(state.text[..8191], &used, "[+] ")
+  }
+  if app.view.insert {
+    add_text(state.text[..8191], &used, "INSERT  ")
+  } else if app.view.extend {
+    add_text(state.text[..8191], &used, "SELECT  ")
+  } else {
+    add_text(state.text[..8191], &used, "NORMAL  ")
+  }
+  name_start := used
+  if name.len == 0 {
+    add_text(state.text[..8191], &used, "Untitled")
+  } else {
+    add_text(state.text[..8191], &used, name)
+  }
+  name_end := used
+  if name.len == 0 {
+    name_end = name_start
+  }
+  add_text(state.text[..8191], &used, " — DNA")
+  state.text[used] = 0
+  if !sdl.title(window, &state.text[0]) {
+    #panic("title update failed")
+  }
+  state.name_start = name_start
+  state.name_end = name_end
+  state.dirty = dirty
+  state.insert = app.view.insert
+  state.extend = app.view.extend
+  state.ready = true
+}
 fn draw(renderer: rawptr, window: rawptr, app: *App, typography: *Typography) {
   render_trace_begin(app, typography)
 
@@ -55,73 +95,47 @@ fn draw(renderer: rawptr, window: rawptr, app: *App, typography: *Typography) {
     status_height = typography.line
   }
 
-  if (search_prompt(app.prompt_state.panel) && app.search_state.explorer) || (app.prompt_state.panel == Panel.Match && app.match_state.explorer) {
+  if (search_prompt(app.prompt_state.panel) && app.search_state.explorer) || (app.prompt_state.panel == .Match && app.match_state.explorer) {
     draw_explorer(renderer, app, typography, width, height)
   }
   if popup_shown(app) {
     popup_begin(renderer, app)
   }
-  if app.prompt_state.panel == Panel.Terminal {
+  if app.prompt_state.panel == .Terminal {
     draw_terminal(renderer, app, typography, width, height, true, true)
-  } else if app.prompt_state.panel == Panel.Directory {
+  } else if app.prompt_state.panel == .Directory {
     draw_explorer(renderer, app, typography, width, height)
   } else if key_menu_is(app.prompt_state.panel) || vim_menu_active(app) {
     // Menus opened from the explorer overlay it instead of hiding it.
-    if (app.prompt_state.panel == Panel.Goto && app.input_state.goto_explorer) || (app.prompt_state.panel == Panel.Leader && app.input_state.leader_explorer) {
+    if (app.prompt_state.panel == .Goto && app.input_state.goto_explorer) || (app.prompt_state.panel == .Leader && app.input_state.leader_explorer) {
       draw_explorer(renderer, app, typography, width, height)
     }
     draw_key_menu(renderer, app, typography, width, height, status_height)
-  } else if app.prompt_state.panel == Panel.Hover {
+  } else if app.prompt_state.panel == .Hover {
     draw_hover(renderer, app, typography, width, height)
   } else if completion_visible(app) {
     draw_completion(renderer, app, typography, width, height)
-  } else if app.prompt_state.panel == Panel.Commands {
+  } else if app.prompt_state.panel == .Commands {
     if app.explorer.commands {
       draw_explorer(renderer, app, typography, width, height)
     }
     draw_command_palette(renderer, app, typography, width, height)
-  } else if app.prompt_state.panel == Panel.ReplacePreview {
+  } else if app.prompt_state.panel == .ReplacePreview {
     draw_replace_preview(renderer, app, typography, width, height, status_height)
-  } else if app.prompt_state.panel == Panel.ProjectSearch {
+  } else if app.prompt_state.panel == .ProjectSearch {
     draw_project_search(renderer, app, typography, width, height, status_height)
-  } else if app.prompt_state.panel == Panel.Open || app.prompt_state.panel == Panel.Buffers {
+  } else if app.prompt_state.panel == .Open || app.prompt_state.panel == .Buffers {
     draw_picker(renderer, app, typography, width, height, status_height)
-  } else if app.prompt_state.panel == Panel.Tree {
+  } else if app.prompt_state.panel == .Tree {
     if !tree_docked(app) {
       draw_tree(renderer, app, typography, width, height)
     }
-  } else if app.prompt_state.panel != Panel.None {
+  } else if app.prompt_state.panel != .None {
     draw_dialog(renderer, app, typography, width, height, status_height)
   }
   popup_present(renderer, app)
   composition_draw(renderer, window, app, typography, width, height)
-  title: [8192]u8
-  used: usize = 0
-
-  if buffer.dirty_cached(doc) {
-    add_text(title[..], &used, "[+] ")
-  }
-  if app.view.insert {
-    add_text(title[..], &used, "INSERT  ")
-  } else if app.view.extend {
-    add_text(title[..], &used, "SELECT  ")
-  } else {
-    add_text(title[..], &used, "NORMAL  ")
-  }
-  if app.documents.file.length == 0 {
-    add_text(title[..], &used, "Untitled")
-  } else {
-    add_text(title[..], &used, files.name(app.documents.file))
-  }
-
-  add_text(title[..], &used, " — DNA")
-
-  if !buffer.equal(title[..used], app.title_state.text[..app.title_state.length]) {
-    if !sdl.title(window, &title[0]) {
-      #panic("title update failed")
-    }
-    app.title_state.length = copy_text(app.title_state.text[..], title[..used])
-  }
+  update_window_title(window, app, doc)
   if app.render_trace.enabled {
     app.render_trace.present_started = render_clock()
   }

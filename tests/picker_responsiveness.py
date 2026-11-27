@@ -12,7 +12,8 @@ use "./buffer"
 use sdl "./platform"
 struct Entry {name:[512]u8,length:usize,directory:bool}
 enum Panel {None,Open,SaveAs}
-struct Resource {kind:usize,fonts:bool}
+enum ResourceKind {None,Themes,Layouts,Settings,Recovery,TaskOutput,Languages}
+struct Resource {kind:ResourceKind,fonts:bool}
 struct Prompt {panel:Panel,text:[4096]u8,length:usize}
 struct PickerState {worker:rawptr,generation,refresh_due:u64,pending,watching,watch_fallback:bool,index:*PickerIndex,arena:*mem.Arena,received_count:usize}
 struct App {completion:CompletionState,picker_state:PickerState,resource_state:Resource,prompt_state:Prompt}

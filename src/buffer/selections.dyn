@@ -55,7 +55,7 @@ pub fn shift(selections: *Selections, low: usize, high: usize, inserted: usize, 
 }
 // Replaces [low, high) and shifts `selections` to match. Clears the
 // document's secondary selections; callers store() their set afterwards.
-pub fn replace_range(document: *Document, low: usize, high: usize, text: []const u8, selections: *Selections) bool {
+pub fn replace_range(document: *Document, low: usize, high: usize, text: str, selections: *Selections) bool {
   document.secondary.count = 0
   document.anchor = low
   document.cursor = high
@@ -165,10 +165,10 @@ pub fn add_cursor(document: *Document, down: bool) bool {
 }
 // Validate and merge the entire batch before changing any bytes. Descending
 // writes retain original offsets; resulting cursors are rebuilt in ascending order.
-pub fn replace_all(document: *Document, text: []const u8) bool {
+pub fn replace_all(document: *Document, text: str) bool {
   return replace_many(document, text, false)
 }
-pub fn replace_characters(document: *Document, text: []const u8) bool {
+pub fn replace_characters(document: *Document, text: str) bool {
   begin_change(document)
   defer end_change(document)
   if document.cursor == document.anchor {
@@ -187,7 +187,7 @@ pub fn replace_characters(document: *Document, text: []const u8) bool {
   }
   return ok
 }
-fn replace_many(document: *Document, text: []const u8, characters: bool) bool {
+fn replace_many(document: *Document, text: str, characters: bool) bool {
   begin_change(document)
   defer end_change(document)
   if !characters && document.secondary.count == 0 { return replace(document, text) }
@@ -254,7 +254,7 @@ fn replace_many(document: *Document, text: []const u8, characters: bool) bool {
   // Character replacement repeats text across the longest range.
   scratch: *mem.Arena
   if characters && text.len > 0 {
-    scratch = arena_owner.create((largest + 1))
+    scratch = arena_owner.create(largest + 1)
   }
   defer arena_owner.release(scratch)
   repeated: []u8
@@ -264,10 +264,8 @@ fn replace_many(document: *Document, text: []const u8, characters: bool) bool {
   filled: usize = 0
   if characters && text.len > 0 {
     for filled < largest {
-      for byte in text {
-        repeated[filled] = byte
-        filled += 1
-      }
+      copy(repeated[filled..], text)
+      filled += text.len
     }
   }
   // Delete all ranges first: a final-size-valid batch may otherwise overflow
@@ -410,7 +408,7 @@ pub fn insert_line_positions(document: *Document, after: bool) {
 
 // Clipboard fragments correspond to selections in document order. Validate the
 // whole batch before mutation; differing fragment sizes cannot partially paste.
-pub fn replace_fragments(document: *Document, fragments: []const []const u8) bool {
+pub fn replace_fragments(document: *Document, fragments: []const str) bool {
   begin_change(document)
   defer end_change(document)
   count := document.secondary.count + 1
@@ -620,11 +618,11 @@ pub fn rotate_contents(document: *Document, backward: bool, count: usize) bool {
     total += ranges[index].high - ranges[index].low
   }
   if total == 0 { return true }
-  owned := arena_owner.create((total))
+  owned := arena_owner.create(total)
   defer arena_owner.release(owned)
   storage := mem.push_bytes(owned, total)
-  original: [32][]const u8
-  fragments: [32][]const u8
+  original: [32]str
+  fragments: [32]str
   used: usize = 0
   for index in 0..size {
     length := ranges[index].high - ranges[index].low

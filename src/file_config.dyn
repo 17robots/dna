@@ -8,11 +8,7 @@
 // slot until the path, filetype or configuration generation changes.
 
 // Where a value came from, for :config-sources.
-const SourceGlobal: u8 = 0
-const SourceEditorConfig: u8 = 1
-const SourceProject: u8 = 2
-const SourceSection: u8 = 3
-const SourceSession: u8 = 4
+enum ConfigSource { Global, EditorConfig, Project, Section, Session }
 
 struct FileConfig {
   ready: bool,
@@ -32,7 +28,7 @@ struct FileConfig {
   has_language: bool,
   // indent_width, insert_tabs, trim_trailing_whitespace, final_newline,
   // formatter, format_on_save.
-  sources: [6]u8,
+  sources: [6]ConfigSource,
   project: [4096]u8,
   project_length: usize,
   editorconfig_count: usize,
@@ -59,7 +55,7 @@ fn file_config_invalidate(app: *App) {
   app.configuration.file_generation += 1
 }
 // The file's absolute path; an unnamed buffer stands in the project directory.
-fn file_config_location(app: *App, slot: *Slot, output: []u8) []const u8 {
+fn file_config_location(app: *App, slot: *Slot, output: []u8) str {
   name := files.name(&slot.file)
   if name.len > 0 && slot.terminal.handle == nil {
     resolved := files.resolve(name, output)
@@ -74,7 +70,7 @@ fn file_config_location(app: *App, slot: *Slot, output: []u8) []const u8 {
   }
   return output[..used]
 }
-fn file_config_resolve(app: *App, config: *FileConfig, absolute: []const u8, filetype: []const u8) {
+fn file_config_resolve(app: *App, config: *FileConfig, absolute: str, filetype: str) {
   config.* = FileConfig{}
   config.generation = app.configuration.file_generation
   config.path_length = copy_text(config.path[..], absolute)
@@ -94,7 +90,7 @@ fn file_config_resolve(app: *App, config: *FileConfig, absolute: []const u8, fil
     return
   }
   global_layer := settings.Layer{}
-  global_text: []const u8 = ""
+  global_text: str = ""
   if app.configuration.global_source_ready {
     global_text = app.configuration.global_source[..app.configuration.global_source_length]
   } else if app.configuration.path_length > 0 {
@@ -147,7 +143,7 @@ fn file_config_resolve(app: *App, config: *FileConfig, absolute: []const u8, fil
       layer.locks = global_layer.locks
       layer.lock_count = global_layer.lock_count
       if settings.parse_layer(read, layered, &layer) {
-        file_config_layer(config, layered, filetype, SourceProject)
+        file_config_layer(config, layered, filetype, .Project)
         config.project_length = copy_text(config.project[..], project_path)
       }
     }
@@ -168,7 +164,7 @@ fn file_config_resolve(app: *App, config: *FileConfig, absolute: []const u8, fil
       layer.locks = global_layer.locks
       layer.lock_count = global_layer.lock_count
       if settings.parse_layer(output, layered, &layer) {
-        file_config_layer(config, layered, filetype, SourceSection)
+        file_config_layer(config, layered, filetype, .Section)
       }
     }
   }
@@ -182,7 +178,7 @@ fn file_config_resolve(app: *App, config: *FileConfig, absolute: []const u8, fil
     layer.locks = global_layer.locks
     layer.lock_count = global_layer.lock_count
     if settings.parse_layer(overrides_text(app, text), layered, &layer) {
-      file_config_layer(config, layered, filetype, SourceSession)
+      file_config_layer(config, layered, filetype, .Session)
     }
   }
   config.ready = true
@@ -192,7 +188,7 @@ fn scratch_settings(app: *App) *settings.Settings {
 }
 // Applies the keys one layer set explicitly: top-level ones, then its
 // section for this filetype.
-fn file_config_layer(config: *FileConfig, layered: *const settings.Settings, filetype: []const u8, source: u8) {
+fn file_config_layer(config: *FileConfig, layered: *const settings.Settings, filetype: str, source: ConfigSource) {
   if (layered.explicit_legacy & 16) != 0 {
     config.indent_width = layered.indent_width
     config.indent_explicit = true
@@ -238,8 +234,8 @@ fn file_config_layer(config: *FileConfig, layered: *const settings.Settings, fil
   config.language.seen = config.language.seen | language.seen
 }
 // .editorconfig files from the file's directory up to the first root = true.
-fn file_config_editorconfig(app: *App, config: *FileConfig, absolute: []const u8, global: *const settings.Layer) {
-  texts: [32][]const u8
+fn file_config_editorconfig(app: *App, config: *FileConfig, absolute: str, global: *const settings.Layer) {
+  texts: [32]str
   lengths: [32]usize
   count: usize = 0
   directory := file_config_directory(absolute)
@@ -279,7 +275,7 @@ fn file_config_editorconfig(app: *App, config: *FileConfig, absolute: []const u8
   if !result.matched { return }
   if result.indent_style != 0 && !file_config_locked(global, "insert_tabs") {
     config.insert_tabs = result.indent_style == settings.EditorTab
-    config.sources[1] = SourceEditorConfig
+    config.sources[1] = .EditorConfig
   }
   width: usize = result.indent_size
   if result.indent_size == settings.EditorSizeTab || (result.indent_size == 0 && result.indent_style == settings.EditorTab) {
@@ -288,19 +284,19 @@ fn file_config_editorconfig(app: *App, config: *FileConfig, absolute: []const u8
   if width >= 1 && width <= 16 && !file_config_locked(global, "indent_width") {
     config.indent_width = width
     config.indent_explicit = true
-    config.sources[0] = SourceEditorConfig
+    config.sources[0] = .EditorConfig
   }
   if result.trim_trailing_whitespace != 0 && !file_config_locked(global, "trim_trailing_whitespace") {
     config.trim_trailing_whitespace = result.trim_trailing_whitespace == 2
-    config.sources[2] = SourceEditorConfig
+    config.sources[2] = .EditorConfig
   }
   if result.insert_final_newline != 0 && !file_config_locked(global, "final_newline") {
     config.final_newline = result.insert_final_newline == 2
-    config.sources[3] = SourceEditorConfig
+    config.sources[3] = .EditorConfig
   }
 }
 // "/a/b/c.txt" -> "/a/b"; "/a/b/" -> "/a/b"; "/c.txt" -> "".
-fn file_config_directory(absolute: []const u8) []const u8 {
+fn file_config_directory(absolute: str) str {
   end := absolute.len
   for end > 0 && absolute[end - 1] != '/' {
     end -= 1
@@ -310,7 +306,7 @@ fn file_config_directory(absolute: []const u8) []const u8 {
   }
   return absolute[..end]
 }
-fn file_config_find_upward(directory: []const u8, name: []const u8, output: []u8) []const u8 {
+fn file_config_find_upward(directory: str, name: str, output: []u8) str {
   length := directory.len
   for {
     used := copy_text(output[..4000], directory[..length])
@@ -326,12 +322,14 @@ fn file_config_find_upward(directory: []const u8, name: []const u8, output: []u8
   }
   return output[..0]
 }
-fn file_config_source_name(source: u8) []const u8 {
-  if source == SourceEditorConfig { return ".editorconfig" }
-  if source == SourceProject { return "dna.toml" }
-  if source == SourceSection { return "[project] section" }
-  if source == SourceSession { return ":set" }
-  return "global"
+fn file_config_source_name(source: ConfigSource) str {
+  case source {
+    .Global => { return "global" }
+    .EditorConfig => { return ".editorconfig" }
+    .Project => { return "dna.toml" }
+    .Section => { return "[project] section" }
+    .Session => { return ":set" }
+  }
 }
 // :config-sources lines for the active document.
 fn file_config_report(app: *App, report: []u8, used: *usize) {
@@ -357,7 +355,7 @@ fn file_config_report(app: *App, report: []u8, used: *usize) {
   } else {
     add_text(report, used, " (guessed or global)")
   }
-  names: [5][]const u8 = ["insert_tabs", "trim_trailing_whitespace", "final_newline", "formatter", "format_on_save"]
+  names: [5]str = ["insert_tabs", "trim_trailing_whitespace", "final_newline", "formatter", "format_on_save"]
   for index in 0..5 {
     add_text(report, used, "\n  ")
     add_text(report, used, names[index])
@@ -384,7 +382,7 @@ fn file_config_report(app: *App, report: []u8, used: *usize) {
 }
 
 // EditorConfig obeys the same global editor locks as dna.toml and :set.
-fn file_config_locked(layer: *const settings.Layer, key: []const u8) bool {
+fn file_config_locked(layer: *const settings.Layer, key: str) bool {
   for index in 0..layer.lock_count {
     if settings.lock_matches(layer.locks[index], "editor", key, key) { return true }
   }
@@ -392,7 +390,7 @@ fn file_config_locked(layer: *const settings.Layer, key: []const u8) bool {
 }
 
 // Save As uses the destination's rules before formatting or whitespace cleanup.
-fn save_file_config(app: *App, path: []const u8, output: *FileConfig) *FileConfig {
+fn save_file_config(app: *App, path: str, output: *FileConfig) *FileConfig {
   storage: [4096]u8
   absolute := files.resolve(path, storage[..])
   current := active_file_config(app)

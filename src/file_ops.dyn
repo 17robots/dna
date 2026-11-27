@@ -5,14 +5,10 @@
 // created. Open documents follow renames and moves; a dirty document blocks
 // changes to its file.
 
-const FileOpCreate: u8 = 1
-const FileOpRename: u8 = 2
-const FileOpCopy: u8 = 3
-const FileOpMove: u8 = 4
-const FileOpTrash: u8 = 5
+enum FileOpKind { None, Create, Rename, Copy, Move, Trash }
 
 struct FileOps {
-  kind: u8,
+  kind: FileOpKind,
   // The folder prompts resolve against.
   base: [4096]u8,
   base_length: usize,
@@ -25,36 +21,37 @@ struct FileOps {
 
 // Starts an action on `source` (an entry) inside folder `base`. Text
 // actions open the prompt prefilled; trash asks for confirmation.
-fn file_op_begin(app: *App, kind: u8, base: []const u8, source: []const u8) {
+fn file_op_begin(app: *App, kind: FileOpKind, base: str, source: str) {
   ops := &app.file_ops
   ops.kind = kind
   ops.base_length = copy_text(ops.base[..4000], base)
   ops.source_length = copy_text(ops.source[..4000], source)
   ops.return_panel = app.prompt_state.panel
-  if kind != FileOpCreate && ops.source_length == 0 {
+  if kind != .Create && ops.source_length == 0 {
     status_error(app, "Select a file or folder first.")
     return
   }
-  if kind == FileOpTrash {
-    app.prompt_state.panel = Panel.Trash
+  if kind == .Trash {
+    app.prompt_state.panel = .Trash
     return
   }
-  app.prompt_state.panel = Panel.FileOp
+  app.prompt_state.panel = .FileOp
   app.prompt_state.length = 0
   // Rename and move start from the current name so small edits are quick.
-  if kind == FileOpRename || kind == FileOpMove || kind == FileOpCopy {
+  if kind == .Rename || kind == .Move || kind == .Copy {
     app.prompt_state.length = copy_text(app.prompt_state.text[..4095], file_op_leaf(source))
   }
   app.prompt_state.text[app.prompt_state.length] = 0
 }
-fn file_op_title(app: *const App) []const u8 {
-  kind := app.file_ops.kind
-  if kind == FileOpCreate { return "New file (end with / for a folder)" }
-  if kind == FileOpRename { return "Rename to" }
-  if kind == FileOpCopy { return "Copy to" }
-  return "Move to"
+fn file_op_title(app: *const App) str {
+  case app.file_ops.kind {
+    .Create => { return "New file (end with / for a folder)" }
+    .Rename => { return "Rename to" }
+    .Copy => { return "Copy to" }
+    .Move, .Trash, .None => { return "Move to" }
+  }
 }
-fn file_op_leaf(path: []const u8) []const u8 {
+fn file_op_leaf(path: str) str {
   end := path.len
   for end > 1 && path[end - 1] == '/' {
     end -= 1
@@ -66,7 +63,7 @@ fn file_op_leaf(path: []const u8) []const u8 {
   return path[start..end]
 }
 // base + "/" + typed, with "." and ".." resolved. Empty when invalid.
-fn file_op_target(base: []const u8, typed: []const u8, output: []u8) []const u8 {
+fn file_op_target(base: str, typed: str, output: []u8) str {
   if typed.len == 0 || typed.len >= 3000 { return output[..0] }
   for byte in typed {
     if byte < 32 || byte == 127 { return output[..0] }
@@ -100,10 +97,10 @@ fn file_op_target(base: []const u8, typed: []const u8, output: []u8) []const u8 
   return output[..used]
 }
 // True when `path` is `root` or inside it.
-fn file_op_within(path: []const u8, root: []const u8) bool {
+fn file_op_within(path: str, root: str) bool {
   return path.len >= root.len && buffer.equal(path[..root.len], root) && (path.len == root.len || path[root.len] == '/')
 }
-fn file_op_dirty_inside(app: *App, root: []const u8) bool {
+fn file_op_dirty_inside(app: *App, root: str) bool {
   for slot in app.documents.slots {
     if slot.document != nil && file_op_within(files.name(&slot.file), root) && buffer.dirty_cached(slot.document) {
       return true
@@ -112,7 +109,7 @@ fn file_op_dirty_inside(app: *App, root: []const u8) bool {
   return false
 }
 // Open documents at or under `source` now live under `destination`.
-fn file_op_follow(app: *App, source: []const u8, destination: []const u8) {
+fn file_op_follow(app: *App, source: str, destination: str) {
   for index in 0..app.documents.slots.len {
     slot := app.documents.slots[index]
     name := files.name(&slot.file)
@@ -127,7 +124,7 @@ fn file_op_follow(app: *App, source: []const u8, destination: []const u8) {
   app.view.revision += 1
 }
 // mkdir -p for every folder above `path` (and `path` itself when `last`).
-fn file_op_make_parents(path: []const u8, last: bool) bool {
+fn file_op_make_parents(path: str, last: bool) bool {
   at: usize = 1
   for at <= path.len {
     if at == path.len || path[at] == '/' {
@@ -142,13 +139,13 @@ fn file_op_make_parents(path: []const u8, last: bool) bool {
   }
   return true
 }
-fn file_op_exists(path: []const u8) bool {
+fn file_op_exists(path: str) bool {
   _ = fs.metadata_nofollow(path) catch { return false }
   return true
 }
 // Copies a file, or a folder and everything below it, refusing symlinks and
 // existing destinations. `depth` bounds recursion.
-fn file_op_copy(source: []const u8, destination: []const u8, depth: usize) bool {
+fn file_op_copy(source: str, destination: str, depth: usize) bool {
   info := fs.metadata_nofollow(source) catch { return false }
   if depth > 32 || file_op_exists(destination) { return false }
   kind := info.mode & 61440
@@ -181,6 +178,9 @@ fn file_op_copy(source: []const u8, destination: []const u8, depth: usize) bool 
     return ok
   }
   if kind != 32768 { return false }
+  return file_op_copy_file(source, destination)
+}
+fn file_op_copy_file(source: str, destination: str) bool {
   input := fs.open_nofollow(source) catch { return false }
   defer fs.close(&input)
   output := fs.create_exclusive(destination) catch { return false }
@@ -203,7 +203,7 @@ fn file_op_submit(app: *App) {
   folder := typed.len > 0 && typed[typed.len - 1] == '/'
   // Rename keeps the entry in its folder; the others resolve against base.
   relative_to := base
-  if ops.kind == FileOpRename || ops.kind == FileOpCopy || ops.kind == FileOpMove {
+  if ops.kind == .Rename || ops.kind == .Copy || ops.kind == .Move {
     relative_to = source[..source.len - file_op_leaf(source).len]
     for relative_to.len > 1 && relative_to[relative_to.len - 1] == '/' {
       relative_to = relative_to[..relative_to.len - 1]
@@ -215,7 +215,7 @@ fn file_op_submit(app: *App) {
     notice(app, "Enter a name or relative path.")
     return
   }
-  if ops.kind == FileOpRename && (typed.len == 0 || buffer.equal(typed, file_op_leaf(source))) {
+  if ops.kind == .Rename && (typed.len == 0 || buffer.equal(typed, file_op_leaf(source))) {
     file_op_finish(app, "")
     return
   }
@@ -223,7 +223,7 @@ fn file_op_submit(app: *App) {
     notice(app, "Something with that name already exists.")
     return
   }
-  if ops.kind == FileOpCreate {
+  if ops.kind == .Create {
     if !file_op_make_parents(target, folder) {
       notice(app, "Cannot create the folders on that path.")
       return
@@ -242,7 +242,7 @@ fn file_op_submit(app: *App) {
     notice(app, "A folder cannot go inside itself.")
     return
   }
-  if ops.kind != FileOpCopy && file_op_dirty_inside(app, source) {
+  if ops.kind != .Copy && file_op_dirty_inside(app, source) {
     notice(app, "Save or close the changed buffers inside it first.")
     return
   }
@@ -250,7 +250,7 @@ fn file_op_submit(app: *App) {
     notice(app, "Cannot create the folders on that path.")
     return
   }
-  if ops.kind == FileOpCopy {
+  if ops.kind == .Copy {
     if !file_op_copy(source, target, 0) {
       notice(app, "Copy failed; anything copied before the failure was kept.")
       file_op_finish(app, "")
@@ -318,7 +318,7 @@ fn file_op_trash(app: *App) {
 }
 // The palette's create/rename/trash commands act on the explorer's folder
 // and selected entry.
-fn directory_file_op(app: *App, kind: u8) {
+fn directory_file_op(app: *App, kind: FileOpKind) {
   if app.explorer.path_length > 0 {
     app.directory_state.length = copy_text(app.directory_state.path[..], app.explorer.path[..app.explorer.path_length])
   }
@@ -331,15 +331,15 @@ fn directory_file_op(app: *App, kind: u8) {
   }
   file_op_begin(app, kind, base, source[..source_length])
   // action() clears the panel first; these always return to the directory.
-  app.file_ops.return_panel = Panel.Directory
+  app.file_ops.return_panel = .Directory
 }
 // Back to the explorer that started it, refreshed, showing `selected`.
-fn file_op_finish(app: *App, selected: []const u8) {
+fn file_op_finish(app: *App, selected: str) {
   app.prompt_state.panel = app.file_ops.return_panel
-  if app.prompt_state.panel == Panel.Trash || app.prompt_state.panel == Panel.FileOp {
-    app.prompt_state.panel = Panel.None
+  if app.prompt_state.panel == .Trash || app.prompt_state.panel == .FileOp {
+    app.prompt_state.panel = .None
   }
-  if app.prompt_state.panel == Panel.Directory {
+  if app.prompt_state.panel == .Directory {
     directory_refresh(app)
   }
   tree_after_file_op(app, selected)

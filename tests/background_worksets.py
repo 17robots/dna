@@ -68,8 +68,8 @@ pub fn pointer(doc:*const Document, low:usize, high:usize) *const u8 { return &d
 pub fn release_views(doc:*Document) {}
 pub fn copy_range(doc:*const Document, low:usize, high:usize, output:[]u8) {}
 pub fn saved_hash(doc:*const Document) u64 { return 0 }
-pub const LoadComplete:u8=0
-pub fn load_state(doc:*const Document) u8 { return 0 }
+pub enum LoadState { Complete, Running, Failed }
+pub fn load_state(doc:*const Document) LoadState { return .Complete }
 pub fn chunk_at(doc:*const Document, offset:usize) []const u8 { return doc.bytes[offset..doc.length] }
 pub fn dirty_cached(doc:*Document) bool { return false }
 pub fn valid(bytes:[]const u8) bool { return true }

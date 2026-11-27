@@ -17,7 +17,7 @@ fn editor_wait_ms(app: *App, notifications: bool) i32 {
   if recovery_allowed(app) && recovery_needed(app) {
     delay = deadline_wait(now, app.recovery.time + recovery_delay(app), delay)
   }
-  if app.lsp.pending == 0 && app.lsp.completion_due != 0 && app.view.insert && (app.prompt_state.panel == Panel.None || completion_visible(app)) {
+  if app.lsp.pending == 0 && app.lsp.completion_due != 0 && app.view.insert && (app.prompt_state.panel == .None || completion_visible(app)) {
     delay = deadline_wait(now, app.lsp.completion_due, delay)
   }
   delay = deadline_wait(now, app.pointer.hover_due, delay)
@@ -83,93 +83,105 @@ fn lsp_running(app: *const App) bool {
 // A phase may finish its own transaction; the slice budget is checked afterward.
 fn background_step(app: *App, typography: *Typography, phase: *usize) {
   started := operation_begin(app)
-  if phase.* == 0 {
-    if app.pointer.hover_due != 0 && sdl.ticks() >= app.pointer.hover_due {
-      app.pointer.hover_due = 0
-      render_request(app, RenderHover)
+  case phase.* {
+    0 => {
+      if app.pointer.hover_due != 0 && sdl.ticks() >= app.pointer.hover_due {
+        app.pointer.hover_due = 0
+        render_request(app, RenderHover)
+      }
+      if config_watch(app, typography) {
+        render_request(app, RenderConfig)
+      }
+      _ = terminal_escape_tick(app)
+      operation_end(app, "config", started)
     }
-    if config_watch(app, typography) {
-      render_request(app, RenderConfig)
+    1 => {
+      recovery_tick(app)
+      operation_end(app, "recovery", started)
     }
-    _ = terminal_escape_tick(app)
-    operation_end(app, "config", started)
-  } else if phase.* == 1 {
-    recovery_tick(app)
-    operation_end(app, "recovery", started)
-  } else if phase.* == 2 {
-    if syntax_tick(app) {
-      render_request(app, RenderSyntax)
+    2 => {
+      if syntax_tick(app) {
+        render_request(app, RenderSyntax)
+      }
+      if search_tick(app) {
+        render_request(app, RenderSyntax)
+      }
+      operation_end(app, "syntax", started)
     }
-    if search_tick(app) {
-      render_request(app, RenderSyntax)
+    3 => {
+      if plugin_tick(app) {
+        render_request(app, RenderPlugin)
+      }
+      operation_end(app, "plugins", started)
     }
-    operation_end(app, "syntax", started)
-  } else if phase.* == 3 {
-    if plugin_tick(app) {
-      render_request(app, RenderPlugin)
+    4 => {
+      configured_filetypes(app)
+      lsp_auto_start(app)
+      completion_tick(app)
+      operation_end(app, "language_setup", started)
     }
-    operation_end(app, "plugins", started)
-  } else if phase.* == 4 {
-    configured_filetypes(app)
-    lsp_auto_start(app)
-    completion_tick(app)
-    operation_end(app, "language_setup", started)
-  } else if phase.* == 5 {
-    changed := disk_tick(app)
-    if documents_load_tick(app) {
-      changed = true
+    5 => {
+      changed := disk_tick(app)
+      if documents_load_tick(app) {
+        changed = true
+      }
+      if tree_tick(app) {
+        changed = true
+      }
+      if changed {
+        render_request(app, RenderDisk)
+      }
+      operation_end(app, "disk", started)
     }
-    if tree_tick(app) {
-      changed = true
+    6 => {
+      if lsp_tick(app) {
+        render_request(app, RenderLsp)
+      }
+      completion_tick(app)
+      operation_end(app, "lsp", started)
     }
-    if changed {
-      render_request(app, RenderDisk)
+    7 => {
+      changed := format_tick(app)
+      if git_tick(app) {
+        changed = true
+      }
+      if language_manager_tick(app) {
+        changed = true
+      }
+      save_sequence_tick(app)
+      if save_tick(app) {
+        changed = true
+      }
+      if changed {
+        render_request(app, RenderFormat)
+      }
+      operation_end(app, "format", started)
     }
-    operation_end(app, "disk", started)
-  } else if phase.* == 6 {
-    if lsp_tick(app) {
-      render_request(app, RenderLsp)
+    8 => {
+      changed := project_search_tick(app)
+      if picker_index_tick(app) {
+        changed = true
+      }
+      if changed {
+        render_request(app, RenderSearch)
+      }
+      operation_end(app, "search", started)
     }
-    completion_tick(app)
-    operation_end(app, "lsp", started)
-  } else if phase.* == 7 {
-    changed := format_tick(app)
-    if git_tick(app) {
-      changed = true
+    9 => {
+      if macro_tick(app, typography) {
+        render_request(app, RenderMacro)
+      }
+      if binding_tick(app, typography) {
+        render_request(app, RenderMacro)
+      }
+      operation_end(app, "macros", started)
     }
-    if language_manager_tick(app) {
-      changed = true
+    _ => {
+      if terminal_tick(app) {
+        render_request(app, RenderTerminal)
+      }
+      operation_end(app, "terminal", started)
     }
-    save_sequence_tick(app)
-    if save_tick(app) {
-      changed = true
-    }
-    if changed {
-      render_request(app, RenderFormat)
-    }
-    operation_end(app, "format", started)
-  } else if phase.* == 8 {
-    changed := project_search_tick(app)
-    if picker_index_tick(app) {
-      changed = true
-    }
-    if changed {
-      render_request(app, RenderSearch)
-    }
-    operation_end(app, "search", started)
-  } else if phase.* == 9 {
-    if macro_tick(app, typography) {
-      render_request(app, RenderMacro)
-    }
-    if binding_tick(app, typography) {
-      render_request(app, RenderMacro)
-    }
-    operation_end(app, "macros", started)
-  } else {
-    if terminal_tick(app) {
-      render_request(app, RenderTerminal)
-    }
-    operation_end(app, "terminal", started)
   }
   phase.* = (phase.* + 1) % 11
 }
@@ -177,7 +189,7 @@ fn background_step(app: *App, typography: *Typography, phase: *usize) {
 // At least one phase progresses after each input paint, including under floods.
 fn background_input_slice(app: *App, typography: *Typography, phase: *usize, event: *sdl.Event) bool {
   deadline := sdl.ticks() + 2
-  for true {
+  for {
     background_step(app, typography, phase)
     if !app.running { return false }
     if render_trace_poll(app, event) { return true }

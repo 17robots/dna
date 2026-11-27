@@ -20,7 +20,7 @@ struct InstallerWindowsEnvironmentAPI {
   free: fn(*u16) i32,
   utf8: fn(u32, u32, *const u16, i32, *u8, i32, rawptr, rawptr) i32,
 }
-struct InstallerWindowsEnvironment { values: [][]const u8, ok: bool }
+struct InstallerWindowsEnvironment { values: []str, ok: bool }
 installer_windows_environment_api: InstallerWindowsEnvironmentAPI
 installer_windows_environment_once: installer_windows_sync.Once
 installer_windows_tools_once: installer_windows_sync.Once
@@ -30,7 +30,7 @@ installer_windows_prefix: [4096]u8
 installer_windows_prelude: [49152]u8
 installer_windows_bash_length: usize
 installer_windows_prelude_length: usize
-fn installer_windows_symbol(library: rawptr, name: []const u8) rawptr {
+fn installer_windows_symbol(library: rawptr, name: str) rawptr {
   result := installer_windows_loader.symbol(library, name) catch {
     #panic("missing Windows installer environment routine")
   }
@@ -57,7 +57,7 @@ fn installer_windows_environment(arena: *installer_windows_mem.Arena) InstallerW
     return InstallerWindowsEnvironment{}
   }
   defer _ = installer_windows_environment_api.free(block)
-  values := installer_windows_mem.push_array<[]const u8>(arena, 4096)
+  values := installer_windows_mem.push_array<str>(arena, 4096)
   count: usize = 0
   at: usize = 0
   for at < 32767 && #slice(block, 32767)[at] != 0 {
@@ -91,7 +91,7 @@ fn installer_windows_environment(arena: *installer_windows_mem.Arena) InstallerW
   }
   return InstallerWindowsEnvironment{values: values[..count], ok: true}
 }
-fn installer_absolute(path: []const u8) bool {
+fn installer_absolute(path: str) bool {
   if path.len >= 3 && ((path[0] >= 65 && path[0] <= 90) || (path[0] >= 97 && path[0] <= 122)) && path[1] == 58 && (path[2] == 47 || path[2] == 92) {
     return true
   }
@@ -104,7 +104,7 @@ fn installer_absolute(path: []const u8) bool {
   }
   return end > 2 && end + 1 < path.len
 }
-fn installer_windows_setting(name, fallback: []const u8, output: []u8) usize {
+fn installer_windows_setting(name, fallback: str, output: []u8) usize {
   length: usize = 0
   found := true
   value := installer_windows_host.environment(name, output) catch err {
@@ -143,7 +143,7 @@ fn installer_windows_normalize_setting(output: []u8, initial: usize) usize {
   output[length] = 0
   return length
 }
-fn installer_windows_append(output: []u8, used: *usize, text: []const u8) bool {
+fn installer_windows_append(output: []u8, used: *usize, text: str) bool {
   if text.len >= output.len - used.* {
     return false
   }
@@ -154,7 +154,7 @@ fn installer_windows_append(output: []u8, used: *usize, text: []const u8) bool {
   output[used.*] = 0
   return true
 }
-fn installer_windows_quote(output: []u8, used: *usize, text: []const u8) bool {
+fn installer_windows_quote(output: []u8, used: *usize, text: str) bool {
   if !installer_windows_append(output, used, "'") {
     return false
   }
@@ -173,7 +173,7 @@ fn installer_windows_quote(output: []u8, used: *usize, text: []const u8) bool {
   }
   return installer_windows_append(output, used, "'")
 }
-fn installer_windows_posix(path: []const u8, output: []u8) []const u8 {
+fn installer_windows_posix(path: str, output: []u8) str {
   used: usize = 0
   if path.len >= 3 && path[1] == 58 {
     if path.len + 1 >= output.len {
@@ -248,7 +248,7 @@ fn installer_windows_tools_configure() bool {
   installer_windows_prelude_length = used
   return true
 }
-fn installer_shell_tools() []const u8 {
+fn installer_shell_tools() str {
   installer_windows_tools_prepare()
   return installer_windows_prelude[..installer_windows_prelude_length]
 }
@@ -272,7 +272,7 @@ fn system(command: *const u8) i32 {
     installer_windows_io.eprintln("dna-language: cannot preserve the bounded Windows environment")
     return -1
   }
-  arguments: [5][]const u8 = [installer_windows_bash[..installer_windows_bash_length], "--noprofile", "--norc", "-c", #slice(command, length)]
+  arguments: [5]str = [installer_windows_bash[..installer_windows_bash_length], "--noprofile", "--norc", "-c", #slice(command, length)]
   child := installer_windows_process.spawn(arena, arguments[0], arguments[..], installer_windows_process.Options{environment: inherited.values}) catch {
     installer_windows_io.eprintln("dna-language: cannot start configured MSYS2 bash.exe")
     return -1
@@ -310,7 +310,7 @@ fn installer_directory(output: []u8) usize {
 fn temporary(path: *u8) *u8 {
   return installer_windows_temporary(path)
 }
-fn installer_symbolic_link(target, path: []const u8) !installer_windows_io.IoErr {
+fn installer_symbolic_link(target, path: str) !installer_windows_io.IoErr {
   arena := installer_windows_mem.arena_alloc(16384)
   defer installer_windows_mem.arena_release(arena)
   version := try installer_windows_c.string_from_bytes(arena, target)
@@ -319,7 +319,7 @@ fn installer_symbolic_link(target, path: []const u8) !installer_windows_io.IoErr
     fail installer_windows_io.linux_err(-5)
   }
 }
-fn installer_read_link(arena: *installer_windows_mem.Arena, path: []const u8) []u8!installer_windows_io.IoErr {
+fn installer_read_link(arena: *installer_windows_mem.Arena, path: str) []u8!installer_windows_io.IoErr {
   name := try installer_windows_c.string_from_bytes(arena, path)
   output := installer_windows_mem.push_array<u8>(arena, 4096)
   count := installer_windows_read_pointer(name, &output[0], output.len)
@@ -331,7 +331,7 @@ fn installer_read_link(arena: *installer_windows_mem.Arena, path: []const u8) []
   }
   return output[..#cast(usize, count)]
 }
-fn installer_remove_tree(path: []const u8) !installer_windows_io.IoErr {
+fn installer_remove_tree(path: str) !installer_windows_io.IoErr {
   arena := installer_windows_mem.arena_alloc(8192)
   defer installer_windows_mem.arena_release(arena)
   name := try installer_windows_c.string_from_bytes(arena, path)
@@ -339,7 +339,7 @@ fn installer_remove_tree(path: []const u8) !installer_windows_io.IoErr {
     fail installer_windows_io.linux_err(-5)
   }
 }
-fn installer_package_path(path: []const u8, storage: []u8) []const u8 {
+fn installer_package_path(path: str, storage: []u8) str {
   if storage.len == 0 {
     return ""
   }
@@ -356,6 +356,6 @@ fn installer_package_path(path: []const u8, storage: []u8) []const u8 {
   }
   return storage[..#cast(usize, count)]
 }
-fn installer_executable(path: []const u8) bool {
+fn installer_executable(path: str) bool {
   return installer_windows_files.executable(path)
 }

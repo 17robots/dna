@@ -1,5 +1,4 @@
-use parse "std/parse"
-fn lsp_edit_file(app: *App, uri: []const u8, edits: *const json.Value, version: *const json.Value) bool {
+fn lsp_edit_file(app: *App, uri: str, edits: *const json.Value, version: *const json.Value) bool {
   plan := &app.lsp.edits
   if plan.count == 16 { return false }
   path: [4096]u8
@@ -105,7 +104,7 @@ fn lsp_preview_edits(app: *App) {
       break
     }
   }
-  app.prompt_state.panel = Panel.LspEdit
+  app.prompt_state.panel = .LspEdit
 }
 fn lsp_apply(app: *App) {
   plan := &app.lsp.edits
@@ -161,7 +160,7 @@ fn lsp_apply(app: *App) {
   }
   activate(app, original)
   lsp_edit_reply(app, true)
-  app.prompt_state.panel = Panel.None
+  app.prompt_state.panel = .None
   command := plan.command
   if !json.is_missing(command) {
     app.lsp.results.revision = app.documents.slots[app.lsp.results.slot].document.revision
@@ -195,7 +194,7 @@ fn lsp_completion(app: *App, item: *const json.Value) {
   message := mem.push_bytes(allocated, capacity)
   encoded := mem.push_bytes(allocated, capacity)
   used := copy_text(message, "{\"changes\":{")
-  lsp_document_uri(message, &used, files.name(&slot.file))
+  lsp_document_uri(app.scratch, message, &used, files.name(&slot.file))
   add_text(message, &used, ":[")
   edit := json.object_get(item, "textEdit")
   content := json_text(item, "insertText")
@@ -279,7 +278,7 @@ fn lsp_completion(app: *App, item: *const json.Value) {
     return
   }
   lsp_prepare_edit(app, parsed)
-  if app.prompt_state.panel == Panel.LspEdit && snippet.valid {
+  if app.prompt_state.panel == .LspEdit && snippet.valid {
     adjusted := insertion_start
     extra_edit := additional.first
     for extra_edit != nil {
@@ -303,7 +302,7 @@ fn lsp_accept(app: *App) {
     if state.kind == 1 {
       completion_cancel_refresh(app)
     }
-    app.prompt_state.panel = Panel.None
+    app.prompt_state.panel = .None
     lsp_results_release(app)
     return
   }
@@ -322,7 +321,7 @@ fn lsp_accept(app: *App) {
     edit := json.object_get(item, "edit")
     if !json.is_missing(edit) {
       lsp_prepare_edit(app, edit)
-      if app.prompt_state.panel == Panel.LspEdit {
+      if app.prompt_state.panel == .LspEdit {
         app.lsp.edits.command = json.object_get(item, "command")
       }
       return
@@ -344,7 +343,7 @@ fn lsp_accept(app: *App) {
     return
   }
   path: [4096]u8
-  decoded: []const u8 = path[..0]
+  decoded: str = path[..0]
   range: *const json.Value = nil
   if state.kind == 13 || state.kind == 14 {
     decoded = lsp_symbol_location(app, item, path[..], &range)
@@ -364,7 +363,7 @@ fn lsp_accept(app: *App) {
     return
   }
   open_file(app, decoded)
-  if app.prompt_state.panel == Panel.Message { return }
+  if app.prompt_state.panel == .Message { return }
   low := lsp.json_offset(buffer.all(app.documents.current), json.object_get(range, "start"))
   high := lsp.json_offset(buffer.all(app.documents.current), json.object_get(range, "end"))
   if !low.valid || !high.valid {
@@ -379,7 +378,7 @@ fn lsp_accept(app: *App) {
   }
   app.view.insert = false
   app.view.extend = false
-  app.prompt_state.panel = Panel.None
+  app.prompt_state.panel = .None
 }
 fn lsp_action_request(app: *App, item: *const json.Value, resolve: bool) {
   state := &app.lsp.results
@@ -390,9 +389,11 @@ fn lsp_action_request(app: *App, item: *const json.Value, resolve: bool) {
   }
   lsp_sync(app, state.server, true)
   if app.lsp.servers[state.server].process == nil { return }
-  message: [131072]u8
-  encoded: [65536]u8
-  serialized := lsp_json_encode(encoded[..], item)
+  mark := mem.arena_mark(app.scratch)
+  defer mem.arena_rewind(app.scratch, mark)
+  message := mem.push_bytes(app.scratch, 131072)
+  encoded := mem.push_bytes(app.scratch, 65536)
+  serialized := lsp_json_encode(encoded, item)
   if serialized.len == 0 {
     notice(app, "Code action arguments exceed capacity.")
     return
@@ -407,7 +408,7 @@ fn lsp_action_request(app: *App, item: *const json.Value, resolve: bool) {
   app.lsp.position = state.position
   app.lsp.insert = state.insert
   app.lsp.deadline = sdl.ticks() + #cast(u64, app.config.lsp_timeout_ms)
-  method: []const u8 = "workspace/executeCommand"
+  method: str = "workspace/executeCommand"
   app.lsp.kind = 8
   if resolve {
     method = "codeAction/resolve"
@@ -418,7 +419,7 @@ fn lsp_action_request(app: *App, item: *const json.Value, resolve: bool) {
   add_text(message[..], &used, serialized)
   add_text(message[..], &used, "}")
   _ = lsp_send(app, state.server, message[..used])
-  app.prompt_state.panel = Panel.None
+  app.prompt_state.panel = .None
 }
 fn lsp_edit_reply(app: *App, applied: bool) {
   plan := &app.lsp.edits

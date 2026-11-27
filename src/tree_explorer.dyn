@@ -50,18 +50,18 @@ fn tree_open(app: *const App) bool {
   return app.config.explorer_style == 1 && app.tree.open
 }
 fn tree_docked(app: *const App) bool {
-  return tree_open(app) && place_of(app, SurfaceExplorer).mode == settings.PlaceDock
+  return tree_open(app) && place_of(app, SurfaceExplorer).mode == .Dock
 }
 // The explorer's file operations changed the disk; reload on the next look.
 fn tree_invalidate(app: *App) {
   app.tree.stale = true
 }
-fn tree_name(tree: *const TreeState, index: usize) []const u8 {
+fn tree_name(tree: *const TreeState, index: usize) str {
   node := &tree.nodes[index]
   return tree.names[node.offset..#cast(usize, node.offset) + #cast(usize, node.length)]
 }
 // Path of a node below the root, "a/b/c"; empty for the root itself.
-fn tree_relative(tree: *const TreeState, index: usize, output: []u8) []const u8 {
+fn tree_relative(tree: *const TreeState, index: usize, output: []u8) str {
   chain: [48]usize
   count: usize = 0
   if index < tree.count && tree.nodes[index].depth > 0 {
@@ -89,7 +89,7 @@ fn tree_relative(tree: *const TreeState, index: usize, output: []u8) []const u8 
   }
   return output[..used]
 }
-fn tree_path(tree: *const TreeState, index: usize, output: []u8) []const u8 {
+fn tree_path(tree: *const TreeState, index: usize, output: []u8) str {
   used := copy_text(output, tree.root[..tree.root_length])
   relative: [4096]u8
   below := tree_relative(tree, index, relative[..])
@@ -118,7 +118,7 @@ fn tree_expand(app: *App, parent: usize) {
   tree := &app.tree
   depth: u16 = 0
   path: [4096]u8
-  directory: []const u8 = tree.root[..tree.root_length]
+  directory: str = tree.root[..tree.root_length]
   nested := parent < tree.count
   if nested {
     if !tree.nodes[parent].directory || tree.nodes[parent].expanded { return }
@@ -274,7 +274,7 @@ fn tree_reload(app: *App) {
   }
 }
 // Expand down to a path below the root and select it. False when absent.
-fn tree_reveal_relative(app: *App, relative: []const u8) bool {
+fn tree_reveal_relative(app: *App, relative: str) bool {
   tree := &app.tree
   if tree.count == 0 { return false }
   parent: usize = 0
@@ -315,7 +315,7 @@ fn tree_reveal_current(app: *App) {
   }
   _ = tree_reveal_relative(app, name[root.len + 1..])
 }
-fn tree_set_root(app: *App, path: []const u8) {
+fn tree_set_root(app: *App, path: str) {
   app.tree.root_length = copy_text(app.tree.root[..], path)
   for app.tree.root_length > 1 && app.tree.root[app.tree.root_length - 1] == '/' {
     app.tree.root_length -= 1
@@ -340,7 +340,7 @@ fn tree_focus(app: *App) {
   tree_search_cancel(tree)
   if tree.open {
     tree_reveal_current(app)
-    app.prompt_state.panel = Panel.Tree
+    app.prompt_state.panel = .Tree
     return
   }
   project := app.workspace.project[..app.workspace.project_length]
@@ -351,7 +351,7 @@ fn tree_focus(app: *App) {
   }
   tree.open = true
   tree_reveal_current(app)
-  app.prompt_state.panel = Panel.Tree
+  app.prompt_state.panel = .Tree
 }
 // Escape: a docked tree stays in view; a floating one closes.
 fn tree_unfocus(app: *App) {
@@ -359,13 +359,13 @@ fn tree_unfocus(app: *App) {
   if !tree_docked(app) {
     app.tree.open = false
   }
-  app.prompt_state.panel = Panel.None
+  app.prompt_state.panel = .None
 }
 fn tree_close(app: *App) {
   tree_search_cancel(&app.tree)
   app.tree.open = false
-  if app.prompt_state.panel == Panel.Tree {
-    app.prompt_state.panel = Panel.None
+  if app.prompt_state.panel == .Tree {
+    app.prompt_state.panel = .None
   }
 }
 // Enter on a node: directories fold and unfold, files open in the editor.
@@ -463,7 +463,7 @@ fn tree_search_refresh(tree:*TreeState) {
     _=tree_search_find(tree, false, true)
   }
 }
-fn tree_search_text(app:*App, text:[]const u8) {
+fn tree_search_text(app:*App, text:str) {
   tree:=&app.tree
   if !tree.searching || !buffer.valid(text) || text.len>=256-tree.search_length { return }
   add_text(tree.search[..], &tree.search_length, text)
@@ -650,17 +650,17 @@ fn tree_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
   } else if key == KeyA || key == KeyR || key == KeyD || key == KeyC || key == KeyM {
     // a creates beside the selection (inside it for a folder); the others
     // act on the selected entry.
-    kind := FileOpCreate
+    kind := FileOpKind.Create
     if key == KeyR {
-      kind = FileOpRename
+      kind = .Rename
     } else if key == KeyD {
-      kind = FileOpTrash
+      kind = .Trash
     } else if key == KeyC {
-      kind = FileOpCopy
+      kind = .Copy
     } else if key == KeyM {
-      kind = FileOpMove
+      kind = .Move
     }
-    if kind != FileOpCreate && tree.selected < tree.count && tree.nodes[tree.selected].depth == 0 {
+    if kind != .Create && tree.selected < tree.count && tree.nodes[tree.selected].depth == 0 {
       status_error(app, "The root folder only takes a (create); use :cd or Backspace to move it.")
       return
     }
@@ -698,10 +698,10 @@ fn tree_key(app: *App, typography: *Typography, key: u32, modifiers: u16) {
     explorer_buffer_open(app)
     return
   } else if key == KeyColon || (key == KeySemicolon && shift) {
-    panel(app, Panel.Commands)
+    panel(app, .Commands)
     return
   } else if key == KeySpace {
-    panel(app, Panel.Leader)
+    panel(app, .Leader)
     return
   }
   if tree.count == 0 {
@@ -721,7 +721,7 @@ fn draw_tree(renderer: rawptr, app: *App, typography: *Typography, width: i32, h
   scale := typography.scale
   line := typography.line
   padding := 10.0 * scale
-  focused := app.prompt_state.panel == Panel.Tree
+  focused := app.prompt_state.panel == .Tree
   natural := sdl.Rect{x: #cast(f32, width) * 0.04, y: #cast(f32, height) * 0.1, width: #cast(f32, width) * 0.32, height: #cast(f32, height) * 0.8}
   rect := place_rect(app, SurfaceExplorer, width, height, 0.0, scale, natural)
   if tree_docked(app) {
@@ -761,8 +761,8 @@ fn draw_tree(renderer: rawptr, app: *App, typography: *Typography, width: i32, h
   ui.boxes[frame].fill = theme().surface
   ui.boxes[frame].padding[0] = padding
   ui.boxes[frame].padding[1] = padding
-  ui_size(ui, frame, UiAxisX, UiSizeKind.Pixels, rect.width / scale, 1.0)
-  ui_size(ui, frame, UiAxisY, UiSizeKind.Pixels, rect.height / scale, 1.0)
+  ui_size(ui, frame, UiAxisX, .Pixels, rect.width / scale, 1.0)
+  ui_size(ui, frame, UiAxisY, .Pixels, rect.height / scale, 1.0)
   ui_push(ui, frame)
   root := tree.root[..tree.root_length]
   leaf := root.len
@@ -789,12 +789,12 @@ fn draw_tree(renderer: rawptr, app: *App, typography: *Typography, width: i32, h
     heading_flags = 0
   }
   heading := ui_label(ui, "title", title[..title_length], heading_flags)
-  ui_size(ui, heading, UiAxisX, UiSizeKind.Percent, 1.0, 0.0)
+  ui_size(ui, heading, UiAxisX, .Percent, 1.0, 0.0)
   gap := ui_make(ui, ui_key(ui, "gap"), 0)
-  ui_size(ui, gap, UiAxisY, UiSizeKind.Pixels, line * 0.5 / scale, 1.0)
+  ui_size(ui, gap, UiAxisY, .Pixels, line * 0.5 / scale, 1.0)
   list := ui_make(ui, ui_key(ui, "list"), UiClip | UiScroll)
-  ui_size(ui, list, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
-  ui_size(ui, list, UiAxisY, UiSizeKind.Pixels, line * #cast(f32, rows) / scale, 1.0)
+  ui_size(ui, list, UiAxisX, .Percent, 1.0, 1.0)
+  ui_size(ui, list, UiAxisY, .Pixels, line * #cast(f32, rows) / scale, 1.0)
   follow := tree.selected != tree.drawn_selected || tree.count != tree.drawn_count
   tree.drawn_selected = tree.selected
   tree.drawn_count = tree.count
@@ -831,8 +831,8 @@ fn draw_tree(renderer: rawptr, app: *App, typography: *Typography, width: i32, h
       indent = node.depth - 1
     }
     ui.boxes[item].padding[0] = typography.cell * (1.0 + 2.0 * #cast(f32, indent))
-    ui_size(ui, item, UiAxisX, UiSizeKind.Percent, 1.0, 1.0)
-    ui_size(ui, item, UiAxisY, UiSizeKind.Pixels, line / scale, 1.0)
+    ui_size(ui, item, UiAxisX, .Percent, 1.0, 1.0)
+    ui_size(ui, item, UiAxisY, .Pixels, line / scale, 1.0)
     ui_animate(app, ui, item, row == tree.selected && focused)
   }
   ui_spacer(ui, "below", #cast(f32, (tree.count - window.last)) * line)
@@ -866,7 +866,7 @@ fn draw_tree(renderer: rawptr, app: *App, typography: *Typography, width: i32, h
 // Returns true when the tree took the event.
 fn tree_mouse(app: *App, typography: *Typography, x: f32, y: f32, pressed: bool, moved: bool, clicks: u8) bool {
   tree := &app.tree
-  if !tree_open(app) || (app.prompt_state.panel != Panel.Tree && app.prompt_state.panel != Panel.None) {
+  if !tree_open(app) || (app.prompt_state.panel != .Tree && app.prompt_state.panel != .None) {
     tree.pointer_inside = false
     return false
   }
@@ -882,12 +882,12 @@ fn tree_mouse(app: *App, typography: *Typography, x: f32, y: f32, pressed: bool,
   if !pressed { return inside && !app.pointer.dragging }
   if !inside {
     // Clicking the editor hands focus back to it.
-    if app.prompt_state.panel == Panel.Tree {
+    if app.prompt_state.panel == .Tree {
       tree_unfocus(app)
     }
     return false
   }
-  app.prompt_state.panel = Panel.Tree
+  app.prompt_state.panel = .Tree
   hit := ui_hit(&app.ui, x, y)
   if hit != 0 && app.ui.boxes[hit].value < tree.count {
     tree_activate(app, app.ui.boxes[hit].value, true)
@@ -940,7 +940,7 @@ fn tree_release(app: *App) {
   }
 }
 // After a file action: reload and select what it produced.
-fn tree_after_file_op(app: *App, selected: []const u8) {
+fn tree_after_file_op(app: *App, selected: str) {
   if !app.tree.open { return }
   tree_reload(app)
   root := app.tree.root[..app.tree.root_length]

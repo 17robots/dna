@@ -1,4 +1,4 @@
-use sha2 "std/crypto/sha2"
+use "std/crypto/sha2"
 
 // Project configuration: dna.toml in the project directory or an ancestor,
 // applied over the global config. Keys that run programs or load files wait
@@ -61,7 +61,7 @@ fn project_config_find(app: *App) {
     }
   }
 }
-fn trust_store_path(output: []u8) []const u8 {
+fn trust_store_path(output: []u8) str {
   storage: [4096]u8
   used: usize = 0
   base := host.environment("XDG_STATE_HOME", storage[..]) catch storage[..0]
@@ -77,10 +77,10 @@ fn trust_store_path(output: []u8) []const u8 {
   add_text(output, &used, "/dna/trust")
   return output[..used]
 }
-fn trust_digest(text: []const u8, output: []u8) []const u8 {
+fn trust_digest(text: str, output: []u8) str {
   digest: [32]u8
   _ = sha2.sum256(digest[..], text)
-  digits: []const u8 = "0123456789abcdef"
+  digits: str = "0123456789abcdef"
   for index in 0..32 {
     output[index * 2] = digits[digest[index] >> 4]
     output[index * 2 + 1] = digits[digest[index] & 15]
@@ -88,7 +88,7 @@ fn trust_digest(text: []const u8, output: []u8) []const u8 {
   return output[..64]
 }
 // Trust lines are "<sha256> <path>"; the newest line for a path wins.
-fn trust_check(app: *App, path: []const u8, text: []const u8) bool {
+fn trust_check(app: *App, path: str, text: str) bool {
   store_storage: [4096]u8
   store := trust_store_path(store_storage[..])
   if store.len == 0 { return false }
@@ -208,14 +208,13 @@ fn project_config_apply(app: *App, parsed: *settings.Settings, global: *const se
       add_text(state.skipped[..], &state.skipped_length, ", ")
     }
     add_text(state.skipped[..], &state.skipped_length, layer.skipped[index])
-    reason := layer.skip_reasons[index]
-    if reason == settings.SkipLocked {
-      add_text(state.skipped[..], &state.skipped_length, " (locked)")
-    } else if reason == settings.SkipPersonal {
-      add_text(state.skipped[..], &state.skipped_length, " (personal)")
-    } else {
-      add_text(state.skipped[..], &state.skipped_length, " (needs :trust)")
-      untrusted += 1
+    case layer.skip_reasons[index] {
+      .Locked => { add_text(state.skipped[..], &state.skipped_length, " (locked)") }
+      .Personal => { add_text(state.skipped[..], &state.skipped_length, " (personal)") }
+      .Untrusted, .None => {
+        add_text(state.skipped[..], &state.skipped_length, " (needs :trust)")
+        untrusted += 1
+      }
     }
   }
   if untrusted > 0 {
@@ -226,7 +225,7 @@ fn project_config_apply(app: *App, parsed: *settings.Settings, global: *const se
 // [project."PATH"] sections of the global file whose PATH holds the project
 // directory apply over dna.toml, in file order. Personal keys are allowed:
 // the file is yours.
-fn project_sections_apply(app: *App, parsed: *settings.Settings, global: *const settings.Layer, source: []const u8) {
+fn project_sections_apply(app: *App, parsed: *settings.Settings, global: *const settings.Layer, source: str) {
   app.project_config.sections = 0
   if source.len == 0 || app.workspace.project_length == 0 { return }
   output := mem.push_bytes(app.scratch, source.len)
@@ -294,7 +293,7 @@ fn config_sources(app: *App) {
   hover_notice(app, report[..used])
 }
 // Locks from the global file also bind in-editor changes such as :keymap.
-fn config_locked(app: *const App, name: []const u8) bool {
+fn config_locked(app: *const App, name: str) bool {
   locks := app.project_config.locks[..app.project_config.locks_length]
   at: usize = 0
   for at < locks.len {

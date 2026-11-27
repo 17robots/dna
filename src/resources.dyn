@@ -1,5 +1,7 @@
+enum ResourceKind { None, Themes, Layouts, Settings, Recovery, TaskOutput, Languages }
+
 struct ResourceState {
-  kind: u8,
+  kind: ResourceKind,
   fonts: bool,
   font_list: [65536]u8,
   font_list_length: usize,
@@ -7,26 +9,24 @@ struct ResourceState {
 
 // Theme/layout discovery shares the existing filtered picker. The list owns its
 // strings and never keeps pointers into temporary directory entries.
-fn resource_picker(app: *App, kind: u8) {
+fn resource_picker(app: *App, kind: ResourceKind) {
   app.resource_state.kind = kind
   app.resource_state.fonts = false
   app.resource_state.font_list_length = 0
-  if kind == 1 {
+  if kind == .Themes {
     add_text(app.resource_state.font_list[..], &app.resource_state.font_list_length, settings.BuiltinThemeNames)
   }
-  if kind == 3 {
+  if kind == .Settings {
     add_text(app.resource_state.font_list[..], &app.resource_state.font_list_length, "font\nfont_family\nfont_size\nline_height\nfallback_font\ntheme\nindent_width\nreduced_motion\nline_numbers\nrelative_numbers\nstatus_line\nhighlight_line\nshell\nterminal_escape\nexplorer_icons\nexplorer_columns\nexplorer_preview\nbuild_command\ntest_command\nrun_command\n[keys.normal]\n[keys.insert]\n[keys.select]\n[keys.space]\n")
     for index in 0..settings.ExtraCount {
       add_text(app.resource_state.font_list[..], &app.resource_state.font_list_length, settings.option(index).key)
       add_text(app.resource_state.font_list[..], &app.resource_state.font_list_length, "\n")
     }
-    language_index: usize = 0
-    for language_index < app.config.language_count {
+    for language_index in 0..app.config.language_count {
       language := &app.config.languages[language_index]
       add_text(app.resource_state.font_list[..], &app.resource_state.font_list_length, "[languages.")
       add_text(app.resource_state.font_list[..], &app.resource_state.font_list_length, language.name[..language.name_length])
       add_text(app.resource_state.font_list[..], &app.resource_state.font_list_length, "]\n")
-      language_index += 1
     }
     if app.documents.current != nil {
       active_type := filetype_name(app.documents.slots[app.documents.active])
@@ -43,26 +43,24 @@ fn resource_picker(app: *App, kind: u8) {
       parent -= 1
     }
     length := copy_text(path[..], app.configuration.path[..parent])
-    if kind == 1 {
-      add_text(path[..], &length, "themes/")
-    } else if kind == 2 {
-      add_text(path[..], &length, "layouts/")
-    } else {
-      add_text(path[..], &length, "recovery/")
+    case kind {
+      .Themes => { add_text(path[..], &length, "themes/") }
+      .Layouts => { add_text(path[..], &length, "layouts/") }
+      _ => { add_text(path[..], &length, "recovery/") }
     }
     storage: [8192]u8
     opened := fs.open_directory(path[..length], storage[..]) catch {
-      panel(app, Panel.Open)
+      panel(app, .Open)
       return
     }
     defer fs.close_directory(&opened)
-    for true {
+    for {
       entry := fs.directory_next(&opened) catch { break }
       if opened.ended { break }
       if entry.kind != 8 || !valid_leaf(entry.name) || !utf8.valid(entry.name) || length + entry.name.len >= 512 || entry.name.len < 5 {
         continue
       }
-      if kind != 4 && !buffer.equal(entry.name[entry.name.len - 5..], ".toml") && (kind != 2 || entry.name.len < 11 || !buffer.equal(entry.name[entry.name.len - 11..], ".dna-layout")) {
+      if kind != .Recovery && !buffer.equal(entry.name[entry.name.len - 5..], ".toml") && (kind != .Layouts || entry.name.len < 11 || !buffer.equal(entry.name[entry.name.len - 11..], ".dna-layout")) {
         continue
       }
       if app.resource_state.font_list_length + length + entry.name.len + 1 >= 65536 { break }
@@ -71,10 +69,10 @@ fn resource_picker(app: *App, kind: u8) {
       add_text(app.resource_state.font_list[..], &app.resource_state.font_list_length, "\n")
     }
   }
-  panel(app, Panel.Open)
+  panel(app, .Open)
 }
 fn resource_select(app: *App, typography: *Typography) {
-  if app.resource_state.kind == 6 {
+  if app.resource_state.kind == .Languages {
     language_manager_select(app)
     return
   }
@@ -83,30 +81,30 @@ fn resource_select(app: *App, typography: *Typography) {
   chosen: [512]u8
   length := copy_text(chosen[..], entry.name[..entry.length])
   kind := app.resource_state.kind
-  app.resource_state.kind = 0
-  if kind == 1 {
-    theme_switch(app, typography, chosen[..length])
-  } else if kind == 2 {
-    panel(app, Panel.Layout)
-    app.prompt_state.length = copy_text(app.prompt_state.text[..], chosen[..length])
-    submit(app, typography)
-  } else if kind == 5 {
-    task_open_location(app, task_location(chosen[..length]))
-  } else if kind == 4 {
-    _ = session_restore(app, chosen[..length])
-  } else {
-    if setting_inspect(app, typography, chosen[..length]) { return }
-    open_file(app, app.configuration.path[..app.configuration.path_length])
-    if app.prompt_state.panel == Panel.Message { return }
-    position: usize = 0
-    for position + length <= app.documents.current.length {
-      if buffer.equal(buffer.range(app.documents.current, position, position + length), chosen[..length]) {
-        app.documents.current.anchor = position
-        app.documents.current.cursor = position + length
-        return
-      }
-      position += 1
+  app.resource_state.kind = .None
+  case kind {
+    .Themes => { theme_switch(app, typography, chosen[..length]) }
+    .Layouts => {
+      panel(app, .Layout)
+      app.prompt_state.length = copy_text(app.prompt_state.text[..], chosen[..length])
+      submit(app, typography)
     }
-    notice(app, "Setting is not present yet. Add it to config.toml, save, then :config-reload. See config.example.toml for values.")
+    .TaskOutput => { task_open_location(app, task_location(chosen[..length])) }
+    .Recovery => { _ = session_restore(app, chosen[..length]) }
+    .None, .Settings, .Languages => {
+      if setting_inspect(app, typography, chosen[..length]) { return }
+      open_file(app, app.configuration.path[..app.configuration.path_length])
+      if app.prompt_state.panel == .Message { return }
+      position: usize = 0
+      for position + length <= app.documents.current.length {
+        if buffer.equal(buffer.range(app.documents.current, position, position + length), chosen[..length]) {
+          app.documents.current.anchor = position
+          app.documents.current.cursor = position + length
+          return
+        }
+        position += 1
+      }
+      notice(app, "Setting is not present yet. Add it to config.toml, save, then :config-reload. See config.example.toml for values.")
+    }
   }
 }

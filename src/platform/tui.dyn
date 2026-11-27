@@ -1,4 +1,3 @@
-use io "std/io"
 use "../host"
 #link("dna_native")
 // Terminal backend behind the platform and text APIs. DNA keeps laying out in
@@ -123,12 +122,12 @@ pub fn tui_start() bool {
   tui_measure()
   return true
 }
-fn environment_is(name: []const u8, wanted: []const u8) bool {
+fn environment_is(name: str, wanted: str) bool {
   storage: [4096]u8
   value := host.environment(name[..name.len - 1], storage[..]) catch { return false }
   return mem.equal(value, wanted)
 }
-fn environment_contains(name: []const u8, part: []const u8) bool {
+fn environment_contains(name: str, part: str) bool {
   storage: [4096]u8
   value := host.environment(name[..name.len - 1], storage[..]) catch { return false }
   return find(value, part, 0) < value.len
@@ -141,7 +140,7 @@ fn truecolor_supported() bool {
   if environment_is("COLORTERM\0", "truecolor") || environment_is("COLORTERM\0", "24bit") || environment_contains("TERM\0", "-direct") {
     return true
   }
-  known: [6][]const u8 = ["kitty", "alacritty", "foot", "wezterm", "ghostty", "contour"]
+  known: [6]str = ["kitty", "alacritty", "foot", "wezterm", "ghostty", "contour"]
   for name in known {
     if environment_contains("TERM\0", name) { return true }
   }
@@ -154,7 +153,7 @@ fn undercurl_supported() bool {
   if environment_is("DNA_UNDERCURL\0", "0") { return false }
   vte_storage: [4096]u8
   _ = host.environment("VTE_VERSION", vte_storage[..]) catch {
-    known: [5][]const u8 = ["kitty", "wezterm", "foot", "ghostty", "contour"]
+    known: [5]str = ["kitty", "wezterm", "foot", "ghostty", "contour"]
     for name in known {
       if environment_contains("TERM\0", name) { return true }
     }
@@ -529,12 +528,12 @@ pub fn tui_text_italic(handle: rawptr, italic: bool) {
 pub fn tui_text_wrap(handle: rawptr, pixels: i32) {
   (#cast(*TuiText, handle)).wrap = pixels
 }
-fn text_bytes(text: *const TuiText) []const u8 {
+fn text_bytes(text: *const TuiText) str {
   if text.bytes == nil { return "" }
   return #slice((#cast(*const u8, text.bytes)), text.length)
 }
 // Decode one UTF-8 codepoint; invalid bytes read as themselves.
-fn decode(bytes: []const u8, at: usize, width: *usize) u32 {
+fn decode(bytes: str, at: usize, width: *usize) u32 {
   first := bytes[at]
   if first < 128 || at + 1 >= bytes.len {
     width.* = 1
@@ -703,15 +702,14 @@ pub fn tui_measure_string(bytes: *const u8, length: usize, width: *i32, height: 
 // ---------------------------------------------------------------------------
 // Present: write what changed since the last frame.
 
-fn emit(bytes: []const u8) {
+fn emit(bytes: str) {
+  if bytes.len == 0 { return }
   if output_used + bytes.len > output.len {
     tty_write(&output[0], output_used)
     output_used = 0
   }
-  for byte in bytes {
-    output[output_used] = byte
-    output_used += 1
-  }
+  _ = mem.copy(output[output_used..], bytes)
+  output_used += bytes.len
 }
 fn emit_number(value: u32) {
   digits: [12]u8
@@ -726,11 +724,17 @@ fn emit_number(value: u32) {
   emit(digits[12 - count..])
 }
 fn emit_character(character: u32) {
-  encoded: [4]u8
   if character < 128 {
-    encoded[0] = #cast(u8, character)
-    emit(encoded[..1])
-  } else if character < 2048 {
+    if output_used == output.len {
+      tty_write(&output[0], output_used)
+      output_used = 0
+    }
+    output[output_used] = #cast(u8, character)
+    output_used += 1
+    return
+  }
+  encoded: [4]u8
+  if character < 2048 {
     encoded[0] = #cast(u8, ((character >> 6) | 192))
     encoded[1] = #cast(u8, ((character & 63) | 128))
     emit(encoded[..2])
@@ -981,7 +985,7 @@ pub fn tui_clipboard_set(text: *const u8, length: usize) {
     }
     copy[length] = 0
   }
-  alphabet: []const u8 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  alphabet: str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
   output_used = 0
   emit("\x1b]52;c;")
   bytes := #slice(text, length)
@@ -1064,7 +1068,7 @@ fn queue_key(key: u32, modifiers: u16, character: u32) {
 // one read can hold a key that starts text input (O, :) and the text after
 // it. take delivers it only if text input was on when its key was taken.
 const PendingText: u64 = 0x10303
-fn queue_text(bytes: []const u8) {
+fn queue_text(bytes: str) {
   if bytes.len == 0 || bytes.len >= 256 { return }
   slot_index := state.text_next
   state.text_next = (state.text_next + 1) % 64
@@ -1077,7 +1081,7 @@ fn queue_text(bytes: []const u8) {
   queue(event)
 }
 // A typed character: a key event, then text while text input is on.
-fn queue_character(character: u32, modifiers: u16, bytes: []const u8) {
+fn queue_character(character: u32, modifiers: u16, bytes: str) {
   key := character
   extra := modifiers
   if character >= 'A' && character <= 'Z' {
@@ -1173,7 +1177,7 @@ fn mouse_event(kind: u32, button: u8, column: i32, row: i32, down: bool) {
 // Pastes past this size keep their first 64 MiB.
 const PasteLimit: usize = 67108864
 pub const PasteEvent: u32 = 32769
-fn paste_append(bytes: []const u8) {
+fn paste_append(bytes: str) {
   if bytes.len == 0 || state.paste_length + bytes.len > PasteLimit { return }
   if state.paste_length + bytes.len > state.paste_capacity {
     capacity := state.paste_capacity * 2
@@ -1219,7 +1223,7 @@ fn paste_continue() usize {
   return keep
 }
 // The finished paste, valid until tui_paste_clear.
-pub fn tui_paste() []const u8 {
+pub fn tui_paste() str {
   if state.paste == nil { return "" }
   return #slice((#cast(*const u8, state.paste)), state.paste_length)
 }
@@ -1359,7 +1363,7 @@ fn parse_one(force_escape: bool) usize {
       }
       state.mouse_modifiers = held
       if (button & 64) != 0 {
-        mouse_event(1027, #cast(u8, (button & 1)), column, row, true)
+        mouse_event(1027, button & 1, column, row, true)
       } else if (button & 32) != 0 {
         mouse_event(1024, 0, column, row, true)
       } else {
@@ -1441,7 +1445,7 @@ fn encode(character: u32, encoded: []u8) usize {
   encoded[3] = #cast(u8, ((character & 63) | 128))
   return 4
 }
-fn find(bytes: []const u8, pattern: []const u8, from: usize) usize {
+fn find(bytes: str, pattern: str, from: usize) usize {
   at := from
   for at + pattern.len <= bytes.len {
     if mem.equal(bytes[at..at + pattern.len], pattern) { return at }
@@ -1449,7 +1453,7 @@ fn find(bytes: []const u8, pattern: []const u8, from: usize) usize {
   }
   return bytes.len
 }
-fn numbers(text: []const u8, values: []u32) usize {
+fn numbers(text: str, values: []u32) usize {
   count: usize = 0
   value: u32 = 0
   digits := false
@@ -1602,7 +1606,7 @@ pub fn tui_suspend() bool {
 }
 
 // Borrowed until the next text mutation or destruction.
-pub fn tui_text_bytes(handle:rawptr) []const u8 {
+pub fn tui_text_bytes(handle:rawptr) str {
   if handle==nil { return "" }
   text:=#cast(*TuiText, handle)
   if !text.alive { return "" }

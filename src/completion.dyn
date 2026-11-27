@@ -25,7 +25,7 @@ struct PickerIndex {
   error: bool,
 }
 
-fn expand_home(path: []const u8, output: []u8) []const u8 {
+fn expand_home(path: str, output: []u8) str {
   if path.len > 0 && path[0] == '~' && (path.len == 1 || path[1] == '/') {
     home_storage: [4096]u8
     home := host.environment("HOME", home_storage[..]) catch {
@@ -45,7 +45,7 @@ fn expand_home(path: []const u8, output: []u8) []const u8 {
   return output[..length]
 }
 // Bounded, cached file-only index. Typing filters memory, not the filesystem.
-fn picker_match(name: []const u8, query: []const u8) bool {
+fn picker_match(name: str, query: str) bool {
   at: usize = 0
   for byte in name {
     if at < query.len && lower(byte) == lower(query[at]) {
@@ -55,15 +55,15 @@ fn picker_match(name: []const u8, query: []const u8) bool {
   return at == query.len
 }
 fn completion_refresh(app: *App) {
-  if app.resource_state.kind == 6 {
+  if app.resource_state.kind == .Languages {
     language_manager_refresh(app)
     return
   }
-  if app.resource_state.kind == 5 {
+  if app.resource_state.kind == .TaskOutput {
     task_refresh(app)
     return
   }
-  if app.resource_state.fonts || app.resource_state.kind != 0 {
+  if app.resource_state.fonts || app.resource_state.kind != .None {
     font_refresh(app)
     return
   }
@@ -78,7 +78,7 @@ fn completion_refresh(app: *App) {
     split -= 1
   }
   app.completion.prefix_length = copy_text(app.completion.prefix[..], path[..split])
-  directory: []const u8 = "."
+  directory: str = "."
   if split > 0 {
     directory = path[..split]
   }
@@ -137,7 +137,7 @@ fn complete_path(app: *App) bool {
   return true
 }
 fn open_prompt(app: *App, typography: *Typography) {
-  if app.resource_state.kind != 0 {
+  if app.resource_state.kind != .None {
     resource_select(app, typography)
     return
   }
@@ -178,7 +178,7 @@ fn command_execute(app: *App, typography: *Typography) {
   if app.terminal_state.commands {
     app.terminal_state.commands = false
     if buffer.equal(text, "q") || buffer.equal(text, "quit") {
-      app.prompt_state.panel = Panel.None
+      app.prompt_state.panel = .None
       return
     }
     if buffer.equal(text, "bd") {
@@ -194,25 +194,25 @@ fn command_execute(app: *App, typography: *Typography) {
       return
     }
     if buffer.equal(text, "q") || buffer.equal(text, "quit") {
-      app.prompt_state.panel = Panel.None
+      app.prompt_state.panel = .None
       return
     }
     if buffer.equal(text, "undo") {
       buffer.undo(app.explorer.document)
-      app.prompt_state.panel = Panel.Directory
+      app.prompt_state.panel = .Directory
       return
     }
     if buffer.equal(text, "redo") {
       buffer.redo(app.explorer.document)
-      app.prompt_state.panel = Panel.Directory
+      app.prompt_state.panel = .Directory
       return
     }
     if buffer.equal(text, "discard") {
-      action(app, typography, 30)
+      run_command(app, typography, .ExplorerDiscard)
       return
     }
     if buffer.equal(text, "refresh") {
-      action(app, typography, 31)
+      run_command(app, typography, .ExplorerRefresh)
       return
     }
     app.explorer.commands = true
@@ -228,22 +228,22 @@ fn command_execute(app: *App, typography: *Typography) {
   }
   // Forced forms: ! discards unsaved changes instead of asking.
   if buffer.equal(text, "q!") || buffer.equal(text, "quit!") || buffer.equal(text, "bd!") {
-    app.prompt_state.panel = Panel.None
+    app.prompt_state.panel = .None
     close_clean(app)
     return
   }
   if buffer.equal(text, "qa!") || buffer.equal(text, "qall!") || buffer.equal(text, "quit-all!") {
-    app.prompt_state.panel = Panel.None
+    app.prompt_state.panel = .None
     app.running = false
     return
   }
   if buffer.equal(text, "e!") || buffer.equal(text, "reload!") {
-    app.prompt_state.panel = Panel.None
+    app.prompt_state.panel = .None
     disk_reload(app, true)
     return
   }
   if buffer.equal(text, "w!") {
-    action(app, typography, 1)
+    run_command(app, typography, .Write)
     return
   }
   if buffer.equal(text, "messages") || buffer.equal(text, "mes") {
@@ -255,12 +255,12 @@ fn command_execute(app: *App, typography: *Typography) {
     return
   }
   if buffer.equal(text, "ls") || buffer.equal(text, "buffers!") {
-    action(app, typography, 21)
+    run_command(app, typography, .Buffers)
     return
   }
   // Search highlights end with the search; nothing stays highlighted to clear.
   if buffer.equal(text, "noh") || buffer.equal(text, "nohlsearch") {
-    app.prompt_state.panel = Panel.None
+    app.prompt_state.panel = .None
     return
   }
   // Vim spellings that DNA runs under another name.
@@ -344,12 +344,12 @@ fn command_execute(app: *App, typography: *Typography) {
   }
   if buffer.equal(text, "increment") || buffer.equal(text, "decrement") {
     increment_selections(app, 1, buffer.equal(text, "decrement"))
-    app.prompt_state.panel = Panel.None
+    app.prompt_state.panel = .None
     return
   }
   if buffer.equal(text, "comment") {
     comment_toggle(app)
-    app.prompt_state.panel = Panel.None
+    app.prompt_state.panel = .None
     return
   }
   if buffer.equal(verb, "keymap") {
@@ -379,7 +379,7 @@ fn command_execute(app: *App, typography: *Typography) {
   if buffer.equal(verb, "format-cancel") {
     format_release(app)
     save_cancel(app)
-    app.prompt_state.panel = Panel.None
+    app.prompt_state.panel = .None
     return
   }
   if buffer.equal(verb, "server-install") || buffer.equal(verb, "server-update") || buffer.equal(verb, "server-start") {
@@ -455,7 +455,7 @@ fn command_execute(app: *App, typography: *Typography) {
   if buffer.equal(verb, "layout") && argument < text.len {
     target: [4096]u8
     target_length := copy_text(target[..], text[argument..])
-    panel(app, Panel.Layout)
+    panel(app, .Layout)
     app.prompt_state.length = copy_text(app.prompt_state.text[..], target[..target_length])
     submit(app, typography)
     return
@@ -490,7 +490,7 @@ fn command_execute(app: *App, typography: *Typography) {
     return
   }
   // Like Vim's E492: a typo never runs the nearest fuzzy match.
-  app.prompt_state.panel = Panel.None
+  app.prompt_state.panel = .None
   if text.len > 0 {
     status_error_with(app, "Not an editor command: ", text)
   }

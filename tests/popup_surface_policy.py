@@ -36,7 +36,7 @@ fn place_of(app:*const App,surface:usize)settings.Placement{return app.config.pl
 fn equal(a,b:sdl.Rect) bool {return a.x==b.x && a.y==b.y && a.width==b.width && a.height==b.height}
 fn dock_case(side:u8) {
  app:=App{config:Config{popup_animation_ms:40.0,popup_transitions:true}}
- app.config.placement=settings.Placement{mode:settings.PlaceDock,side:side}
+ app.config.placement=settings.Placement{mode:.Dock,side:side}
  app.view.animation.surfaces_ready=true
  app.ui.frame=10
  target:=sdl.Rect{width:1000.0,height:600.0}
@@ -129,7 +129,7 @@ with tempfile.TemporaryDirectory(prefix='dna-popup-policy-') as temporary:
  work=Path(temporary);shutil.copytree(ROOT/'src/motion',work/'motion');(work/'sdl').mkdir()
  (work/'sdl/sdl.dyn').write_text('pub struct Rect{x,y,width,height:f32}\npub terminal:bool\npub fn tui_active()bool{return terminal}\n')
  (work/'settings').mkdir()
- (work/'settings/settings.dyn').write_text('pub const PlaceDock:u8=2\npub struct Placement{mode,side:u8}\n')
+ (work/'settings/settings.dyn').write_text('pub enum PlaceMode{Default,Float,Dock,Cursor}\npub struct Placement{mode:PlaceMode,side:u8}\n')
  (work/'main.dyn').write_text(source)
  for mode in ('debug','release'):
   binary=work/'test'

@@ -19,9 +19,9 @@ pub fn lazy_thresholds(minimum: usize, prefix: usize) {
   lazy_prefix = prefix
 }
 
-pub const LoadComplete: u8 = 0
-pub const LoadRunning: u8 = 1
-pub const LoadFailed: u8 = 2
+pub enum LoadState { Complete, Running, Failed }
+
+enum LazyPhase { Idle, Counting, Filling }
 
 struct LazyLoad {
   block: *RopeBlock,
@@ -35,8 +35,7 @@ struct LazyLoad {
   arena: *mem.Arena,
   threads: [16]*thread.Thread,
   started: [16]bool,
-  // 1: counting, 2: filling tables.
-  phase: u8,
+  phase: LazyPhase,
   done: sync.AtomicU32,
 }
 fn lazy_job_run(job: *LoadJob) isize {
@@ -44,7 +43,7 @@ fn lazy_job_run(job: *LoadJob) isize {
   _ = sync.fetch_add_u32(&job.owner.done, 1)
   return 0
 }
-pub fn load_state(document: *const Document) u8 {
+pub fn load_state(document: *const Document) LoadState {
   return document.load_state
 }
 // Like load_storage, but a large block appears after its first LazyPrefix
@@ -89,15 +88,15 @@ pub fn load_storage_lazy(document: *Document, storage: *TextStorage, length: usi
     return false
   }
   document.lazy = load
-  document.load_state = LoadRunning
-  lazy_launch(load, 1)
+  document.load_state = .Running
+  lazy_launch(load, .Counting)
   return true
 }
-fn lazy_launch(load: *LazyLoad, phase: u8) {
+fn lazy_launch(load: *LazyLoad, phase: LazyPhase) {
   load.phase = phase
   sync.store_u32(&load.done, 0)
   for index in 0..load.workers {
-    load.jobs[index].fill = phase == 2
+    load.jobs[index].fill = phase == .Filling
     load.threads[index] = thread.spawn_with_size(load.arena, ParallelStack, lazy_job_run, &load.jobs[index]) catch nil
     load.started[index] = load.threads[index] != nil
     if !load.started[index] {
@@ -118,7 +117,7 @@ fn lazy_join(load: *LazyLoad) {
 fn lazy_free(load: *LazyLoad) {
   lazy_join(load)
   // Tables not yet adopted by leaves.
-  if load.phase != 0 {
+  if load.phase != .Idle {
     for leaf in 0..load.leaves {
       table := #slice(load.tables, load.leaves)[leaf]
       if table != nil {
@@ -138,7 +137,7 @@ fn lazy_cancel(document: *Document) {
     lazy_free(document.lazy)
     document.lazy = nil
   }
-  document.load_state = LoadComplete
+  document.load_state = .Complete
 }
 // Advance a running load. Returns true when the document changed (the tail
 // attached, or loading failed and stopped).
@@ -146,12 +145,12 @@ pub fn load_tick(document: *Document) bool {
   load := document.lazy
   if load == nil || sync.load_u32(&load.done) < #cast(u32, load.workers) { return false }
   lazy_join(load)
-  if load.phase == 1 {
+  if load.phase == .Counting {
     for index in 0..load.workers {
       if !load.jobs[index].valid {
         lazy_free(load)
         document.lazy = nil
-        document.load_state = LoadFailed
+        document.load_state = .Failed
         return true
       }
     }
@@ -164,16 +163,16 @@ pub fn load_tick(document: *Document) bool {
         }
       }
     }
-    lazy_launch(load, 2)
+    lazy_launch(load, .Filling)
     return false
   }
   tail := rope_build_prepared(load.block, &#slice(load.block.bytes, load.offset + load.total)[load.offset], load.total, 0, load.leaves, load.counts, load.tables)
   // Leaves own the tables now.
-  load.phase = 0
+  load.phase = .Idle
   lazy_free(load)
   document.lazy = nil
   lazy_attach(document, tail)
-  document.load_state = LoadComplete
+  document.load_state = .Complete
   return true
 }
 // Append tail (owned) after the current text, the saved text and every undo

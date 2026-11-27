@@ -1,8 +1,8 @@
-struct TaskLocation { path: []const u8, line: usize, column: usize, valid: bool }
+struct TaskLocation { path: str, line: usize, column: usize, valid: bool }
 
 extern fn terminal_log "dna_terminal_log"(terminal: rawptr, output: *u8, capacity: usize) usize
 
-fn run_task(app: *App, command: []const u8) {
+fn run_task(app: *App, command: str) {
   if command.len == 0 {
     notice(app, "Configure build_command, test_command, or run_command, or use :run <shell command>.")
     return
@@ -17,8 +17,10 @@ fn task_next_error(app: *App) {
     return
   }
 
-  output: [65536]u8
-  length := terminal_log(slot.terminal.handle, &output[0], 65536)
+  mark := mem.arena_mark(app.scratch)
+  defer mem.arena_rewind(app.scratch, mark)
+  output := mem.push_bytes(app.scratch, 65536)
+  length := terminal_log(slot.terminal.handle, &output[0], output.len)
   at := app.terminal_state.task_error_offset
   if at >= length {
     at = 0
@@ -30,40 +32,30 @@ fn task_next_error(app: *App) {
     }
     line := settings.trim(output[at..end])
     at = end + 1
-    colon: usize = 0
-    for colon < line.len && line[colon] != 58 {
-      colon += 1
-    }
-    digits := colon + 1
-    for digits < line.len && line[digits] >= 48 && line[digits] <= 57 {
-      digits += 1
-    }
-    if colon == 0 || digits <= colon + 1 || digits >= line.len || line[digits] != 58 { continue }
-    number := settings.number(line[colon + 1..digits])
-    if number < 1.0 { continue }
+    loc := task_location(line)
+    if !loc.valid { continue }
     path: [4096]u8
     used: usize = 0
-    if line[0] != '/' {
+    if loc.path[0] != '/' {
       add_text(path[..], &used, slot.terminal.directory[..slot.terminal.directory_length])
       add_text(path[..], &used, "/")
     }
-    add_text(path[..], &used, line[..colon])
+    if used + loc.path.len >= 4096 { continue }
+    add_text(path[..], &used, loc.path)
 
     _ = files.metadata(path[..used]) catch {
       continue
     }
 
     app.terminal_state.task_error_offset = at
-    open_file(app, path[..used])
-    if app.prompt_state.panel == Panel.Message { return }
-    task_open_location(app, task_location(line))
+    task_open_location(app, loc)
     return
   }
   app.terminal_state.task_error_offset = 0
   notice(app, "No further path:line: diagnostics in captured terminal output.")
 }
 
-fn task_location(text: []const u8) TaskLocation {
+fn task_location(text: str) TaskLocation {
   line := settings.trim(text)
   colon: usize = 0
   for colon < line.len && line[colon] != ':' {
@@ -105,7 +97,7 @@ fn task_open_location(app: *App, location: TaskLocation) {
   }
   add_text(path[..], &used, location.path)
   open_file(app, path[..used])
-  if app.prompt_state.panel == Panel.Message { return }
+  if app.prompt_state.panel == .Message { return }
   row: usize = 1
   position: usize = 0
   for row < location.line && position < app.documents.current.length {
@@ -129,9 +121,9 @@ fn task_picker(app: *App) {
     return
   }
   app.resource_state.font_list_length = terminal_log(slot.terminal.handle, &app.resource_state.font_list[0], 65536)
-  app.resource_state.kind = 5
+  app.resource_state.kind = .TaskOutput
   app.resource_state.fonts = false
-  panel(app, Panel.Open)
+  panel(app, .Open)
 }
 fn task_refresh(app: *App) {
   app.completion.count = 0
@@ -159,8 +151,10 @@ fn task_previous_error(app: *App) {
     notice(app, "No terminal output to inspect.")
     return
   }
-  output: [65536]u8
-  length := terminal_log(slot.terminal.handle, &output[0], 65536)
+  mark := mem.arena_mark(app.scratch)
+  defer mem.arena_rewind(app.scratch, mark)
+  output := mem.push_bytes(app.scratch, 65536)
+  length := terminal_log(slot.terminal.handle, &output[0], output.len)
   at: usize = 0
   previous: usize = 0
   previous_end: usize = 0

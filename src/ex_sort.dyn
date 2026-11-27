@@ -6,7 +6,7 @@ use "std/mem"
 // each run of equal lines. One undo restores the original order.
 struct SortOptions { reverse, ignore_case, numeric, unique: bool }
 
-fn vim_ex_sort(app: *App, doc: *buffer.Document, range_in: VimRange, text: []const u8, start: usize, bang: bool) bool {
+fn vim_ex_sort(app: *App, doc: *buffer.Document, range_in: VimRange, text: str, start: usize, bang: bool) bool {
   range := range_in
   if range.given == 0 {
     range.first = 0
@@ -47,8 +47,8 @@ fn vim_ex_sort(app: *App, doc: *buffer.Document, range_in: VimRange, text: []con
   if !final_newline {
     count += 1
   }
-  lines := mem.push_array<[]const u8>(app.scratch, count)
-  scratch := mem.push_array<[]const u8>(app.scratch, count)
+  lines := mem.push_array<str>(app.scratch, count)
+  scratch := mem.push_array<str>(app.scratch, count)
   line: usize = 0
   begin: usize = 0
   for index in 0..source.len {
@@ -69,9 +69,9 @@ fn vim_ex_sort(app: *App, doc: *buffer.Document, range_in: VimRange, text: []con
     if options.unique && kept > 0 && sort_compare(lines[index], lines[index - 1], options) == 0 {
       continue
     }
-    for byte in lines[index] {
-      output[used] = byte
-      used += 1
+    if lines[index].len > 0 {
+      buffer.copy(output[used..], lines[index])
+      used += lines[index].len
     }
     if index + 1 < count || final_newline {
       output[used] = 10
@@ -80,7 +80,7 @@ fn vim_ex_sort(app: *App, doc: *buffer.Document, range_in: VimRange, text: []con
     kept += 1
   }
   if !app.vim.ex.batch {
-    app.prompt_state.panel = Panel.None
+    app.prompt_state.panel = .None
   }
   buffer.checkpoint(doc)
   doc.anchor = low
@@ -105,7 +105,7 @@ fn vim_ex_sort(app: *App, doc: *buffer.Document, range_in: VimRange, text: []con
 }
 
 // Stable merge sort, so equal lines keep their order.
-fn sort_lines(lines: [][]const u8, scratch: [][]const u8, options: SortOptions) {
+fn sort_lines(lines: []str, scratch: []str, options: SortOptions) {
   width: usize = 1
   for width < lines.len {
     low: usize = 0
@@ -149,18 +149,15 @@ fn sort_lines(lines: [][]const u8, scratch: [][]const u8, options: SortOptions) 
   }
 }
 
-fn sort_compare(a: []const u8, b: []const u8, options: SortOptions) i32 {
+fn sort_compare(a: str, b: str, options: SortOptions) i32 {
   if options.numeric {
-    a_number := sort_number(a)
-    b_number := sort_number(b)
-    if a_number.found != b_number.found {
-      if a_number.found { return 1 }
+    a_value := sort_number(a) catch {
+      _ = sort_number(b) catch { return 0 }
       return -1
     }
-    if a_number.value != b_number.value {
-      if a_number.value < b_number.value { return -1 }
-      return 1
-    }
+    b_value := sort_number(b) catch { return 1 }
+    if a_value < b_value { return -1 }
+    if a_value > b_value { return 1 }
     return 0
   }
   length := a.len
@@ -184,23 +181,22 @@ fn sort_compare(a: []const u8, b: []const u8, options: SortOptions) i32 {
   return 1
 }
 
-struct SortNumber { value: i64, found: bool }
 // The first decimal number in a line, with a directly preceding minus sign.
-fn sort_number(line: []const u8) SortNumber {
+fn sort_number(line: str) i64! {
   for index in 0..line.len {
     if line[index] >= '0' && line[index] <= '9' {
       negative := index > 0 && line[index - 1] == '-'
       value: i64 = 0
       at := index
       for at < line.len && line[at] >= '0' && line[at] <= '9' && value < 100000000000000000 {
-        value = value * 10 + #cast(i64, line[at] - '0')
+        value = value * 10 + (line[at] - '0')
         at += 1
       }
       if negative {
         value = 0 - value
       }
-      return SortNumber{value: value, found: true}
+      return value
     }
   }
-  return SortNumber{}
+  fail
 }

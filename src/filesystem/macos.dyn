@@ -1,8 +1,8 @@
 #target(kernel: darwin)
 #link("System")
-use cstring "../cstring"
-use dynlib "std/dynlib"
-use sync "std/sync"
+use "../cstring"
+use "std/dynlib"
+use "std/sync"
 use "std/io"
 
 // Darwin arm64 uses the 64-bit inode ABI without the Intel $INODE64 suffix.
@@ -51,7 +51,7 @@ fn darwin_errno() *i32 {
   darwin_prepare_errno()
   return darwin_errno_get()
 }
-fn darwin_path(path: []const u8, storage: []u8) *const u8 {
+fn darwin_path(path: str, storage: []u8) *const u8 {
   darwin_prepare_errno()
   if path.len == 0 || path.len >= storage.len { return nil }
   return cstring.bounded(storage, path) catch nil
@@ -66,14 +66,14 @@ fn darwin_metadata(value: i32, info: *const DarwinStat) Metadata!io.IoErr {
   if value != 0 { fail io.darwin_err(darwin_error()) }
   return Metadata{ size: #cast(u64, info.size), inode: info.inode, device: #cast(u32, info.device), mode: info.mode }
 }
-pub fn metadata(path: []const u8) Metadata!io.IoErr {
+pub fn metadata(path: str) Metadata!io.IoErr {
   storage: [4096]u8
   name := darwin_path(path, storage[..])
   if name == nil { fail .InvalidInput }
   info := DarwinStat{}
   return try darwin_metadata(darwin_stat(name, &info), &info)
 }
-pub fn metadata_nofollow(path: []const u8) Metadata!io.IoErr {
+pub fn metadata_nofollow(path: str) Metadata!io.IoErr {
   storage: [4096]u8
   name := darwin_path(path, storage[..])
   if name == nil { fail .InvalidInput }
@@ -86,7 +86,7 @@ pub fn file_metadata(file: *const File) Metadata!io.IoErr {
   info := DarwinStat{}
   return try darwin_metadata(darwin_fstat(#cast(i32, file.descriptor), &info), &info)
 }
-pub fn open_directory(path: []const u8, storage: []u8) Directory!io.IoErr {
+pub fn open_directory(path: str, storage: []u8) Directory!io.IoErr {
   if storage.len < 1024 { fail .InvalidInput }
   path_storage: [4096]u8
   name := darwin_path(path, path_storage[..])
@@ -112,7 +112,7 @@ pub fn directory_next(directory: *Directory) DirectoryEntry!io.IoErr {
     }
     length := #cast(usize, entry.name_length)
     if length >= 1024 || length > directory.storage.len || entry.name[length] != 0 {
-      fail io.IoErr.System(-5)
+      fail .System(-5)
     }
     dot := length == 1 && entry.name[0] == '.'
     dot_dot := length == 2 && entry.name[0] == '.' && entry.name[1] == '.'
@@ -132,7 +132,7 @@ pub fn close_directory(directory: *Directory) {
   directory.* = Directory{}
   _ = darwin_closedir(handle)
 }
-fn darwin_move(source: []const u8, destination: []const u8, exclusive: bool) !io.IoErr {
+fn darwin_move(source: str, destination: str, exclusive: bool) !io.IoErr {
   source_storage: [4096]u8
   destination_storage: [4096]u8
   old_name := darwin_path(source, source_storage[..])
@@ -144,31 +144,31 @@ fn darwin_move(source: []const u8, destination: []const u8, exclusive: bool) !io
     try darwin_check(darwin_rename(old_name, new_name))
   }
 }
-pub fn rename(source: []const u8, destination: []const u8) !io.IoErr {
+pub fn rename(source: str, destination: str) !io.IoErr {
   try darwin_move(source, destination, false)
 }
-pub fn rename_noreplace(source: []const u8, destination: []const u8) !io.IoErr {
+pub fn rename_noreplace(source: str, destination: str) !io.IoErr {
   try darwin_move(source, destination, true)
 }
-pub fn remove(path: []const u8) !io.IoErr {
+pub fn remove(path: str) !io.IoErr {
   storage: [4096]u8
   name := darwin_path(path, storage[..])
   if name == nil { fail .InvalidInput }
   try darwin_check(darwin_unlink(name))
 }
-pub fn make_directory(path: []const u8, mode: usize) !io.IoErr {
+pub fn make_directory(path: str, mode: usize) !io.IoErr {
   storage: [4096]u8
   name := darwin_path(path, storage[..])
   if name == nil || mode > 65535 { fail .InvalidInput }
   try darwin_check(darwin_mkdir(name, #cast(u16, mode)))
 }
-pub fn remove_directory(path: []const u8) !io.IoErr {
+pub fn remove_directory(path: str) !io.IoErr {
   storage: [4096]u8
   name := darwin_path(path, storage[..])
   if name == nil { fail .InvalidInput }
   try darwin_check(darwin_rmdir(name))
 }
-pub fn read_link(path: []const u8, destination: []u8) []u8!io.IoErr {
+pub fn read_link(path: str, destination: []u8) []u8!io.IoErr {
   storage: [4096]u8
   name := darwin_path(path, storage[..])
   if name == nil || destination.len == 0 { fail .InvalidInput }
@@ -184,7 +184,7 @@ pub fn set_permissions(file: *File, mode: usize) !io.IoErr {
 }
 
 // No creation flag: open's variadic mode argument is intentionally absent.
-pub fn open_nofollow(path: []const u8) File!io.IoErr {
+pub fn open_nofollow(path: str) File!io.IoErr {
   storage: [4096]u8
   name := darwin_path(path, storage[..])
   if name == nil { fail .InvalidInput }
@@ -193,10 +193,10 @@ pub fn open_nofollow(path: []const u8) File!io.IoErr {
   return adopt_handle(descriptor)
 }
 
-fn atomic_create_exclusive(path: []const u8) File!io.IoErr {
+fn atomic_create_exclusive(path: str) File!io.IoErr {
   return try std_fs.create_exclusive(path)
 }
-pub fn create_private_exclusive(path: []const u8) File!io.IoErr {
+pub fn create_private_exclusive(path: str) File!io.IoErr {
   storage: [4096]u8
   name := darwin_path(path, storage[..])
   if name == nil { fail .InvalidInput }
@@ -204,7 +204,7 @@ pub fn create_private_exclusive(path: []const u8) File!io.IoErr {
   if descriptor < 0 { fail io.darwin_err(darwin_error()) }
   return adopt_handle(descriptor)
 }
-pub fn preserve_permissions(file: *File, source: []const u8) !io.IoErr {
+pub fn preserve_permissions(file: *File, source: str) !io.IoErr {
   info := try metadata(source)
   try set_permissions(file, info.mode & 511)
 }
@@ -247,7 +247,7 @@ pub fn unmap_file(bytes: *u8, length: u64) {
 pub const WholeFileClones: bool = true
 extern fn darwin_clone "fclonefileat"(source: i32, directory: i32, path: *const u8, flags: u32) i32
 extern fn darwin_truncate "ftruncate"(file: i32, length: i64) i32
-pub fn clone_exclusive(source: *const File, path: []const u8) File!io.IoErr {
+pub fn clone_exclusive(source: *const File, path: str) File!io.IoErr {
   if !is_open(source) { fail .InvalidInput }
   info := file_metadata(source) catch { fail .Unsupported }
   // A read-only origin can still be saved through replacement. Do not change
@@ -277,7 +277,7 @@ pub fn resize(file: *File, length: usize) !io.IoErr {
   try darwin_check(darwin_truncate(#cast(i32, file.descriptor), #cast(i64, length)))
 }
 
-pub fn executable(path: []const u8) bool {
+pub fn executable(path: str) bool {
   info := metadata(path) catch { return false }
   return (info.mode & 61440) == 32768 && (info.mode & 73) != 0
 }
