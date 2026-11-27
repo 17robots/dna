@@ -25,16 +25,16 @@ struct PreviewSyntaxState {
 struct PreviewSpan { text: rawptr, dx, dy: f32, style: u8 }
 struct PreviewSpans { spans: [256]PreviewSpan, count: usize, hash: u64, line: f32, colored: bool }
 
-fn preview_hash(key: []const u8, bytes: []const u8) u64 {
+fn preview_hash(key: str, bytes: str) u64 {
   hash: u64 = 5381
   for byte in key {
-    hash = ((hash * 33) ^ byte) % 1099511627776
+    hash = #wrapping(hash * 33) ^ byte
   }
-  hash = ((hash * 33) ^ 255) % 1099511627776
+  hash = #wrapping(hash * 33) ^ 255
   for value in bytes {
-    hash = ((hash * 33) ^ value) % 1099511627776
+    hash = #wrapping(hash * 33) ^ value
   }
-  return (hash ^ (#cast(u64, bytes.len) << 40)) + 1
+  return #wrapping(hash ^ (#cast(u64, bytes.len) << 40)) | 1
 }
 fn preview_close(handle: rawptr) {
   if handle != nil && syntax_retire(handle) == 0 {
@@ -63,7 +63,7 @@ fn preview_syntax_release(app: *App) {
   preview_forget(&state.hover, state.hover.handle)
 }
 // Extension (or whole leaf name) selects the pooled grammar for a path.
-fn preview_path_key(path: []const u8) []const u8 {
+fn preview_path_key(path: str) str {
   leaf := path.len
   for leaf > 0 && path[leaf - 1] != '/' {
     leaf -= 1
@@ -75,7 +75,7 @@ fn preview_path_key(path: []const u8) []const u8 {
   if dot > leaf + 1 { return path[dot - 1..] }
   return path[leaf..]
 }
-fn preview_highlighter(app: *App, key: []const u8, source: []const u8, by_name: bool) rawptr {
+fn preview_highlighter(app: *App, key: str, source: str, by_name: bool) rawptr {
   state := &app.previews
   if key.len == 0 || key.len >= 64 || source.len >= 4096 { return nil }
   now := sdl.ticks()
@@ -120,7 +120,7 @@ fn preview_poll(request: *PreviewColors) bool {
 }
 // Returns colors for bytes once the worker has parsed them; nil while pending
 // or when no grammar matches. Parsing never blocks drawing.
-fn preview_request(app: *App, request: *PreviewColors, key: []const u8, source: []const u8, by_name: bool, bytes: []const u8) []const u8 {
+fn preview_request(app: *App, request: *PreviewColors, key: str, source: str, by_name: bool, bytes: str) str {
   if !app.config.syntax_enabled || bytes.len == 0 || bytes.len > 8192 { return request.colors[..0] }
   handle := preview_highlighter(app, key, source, by_name)
   if handle == nil {
@@ -158,7 +158,7 @@ fn preview_syntax_waiting(app: *const App) bool {
 }
 
 // base already holds bytes; colors is empty until highlighting is ready.
-fn preview_spans_update(typography: *Typography, spans: *PreviewSpans, base: rawptr, bytes: []const u8, colors: []const u8) {
+fn preview_spans_update(typography: *Typography, spans: *PreviewSpans, base: rawptr, bytes: str, colors: str) {
   hash := preview_hash("", bytes)
   colored := colors.len == bytes.len && bytes.len > 0
   if spans.hash == hash && spans.colored == colored && spans.line == typography.line { return }
@@ -198,13 +198,11 @@ fn preview_spans_update(typography: *Typography, spans: *PreviewSpans, base: raw
   }
 }
 fn preview_spans_draw(spans: *PreviewSpans, x: f32, y: f32) {
-  index: usize = 0
-  for index < spans.count {
+  for index in 0..spans.count {
     span := &spans.spans[index]
     if !tint(span.text, syntax_color(span.style)) || !ttf.draw(span.text, x + span.dx, y + span.dy) {
       #panic("preview span draw")
     }
-    index += 1
   }
 }
 fn preview_spans_release(spans: *PreviewSpans) {
@@ -227,7 +225,7 @@ fn preview_text_release(typography: *Typography) {
   typography.explorer_preview_hash = 0
 }
 
-fn hover_language_alias(name: []const u8) []const u8 {
+fn hover_language_alias(name: str) str {
   if buffer.equal(name, "ts") { return "typescript" }
   if buffer.equal(name, "js") { return "javascript" }
   if buffer.equal(name, "py") { return "python" }
@@ -246,7 +244,7 @@ fn hover_code_range(state: *PreviewSyntaxState, start: usize, end: usize) {
   }
 }
 // Markdown hover: drop ``` fence lines, remember the code between them.
-fn hover_markdown(app: *App, text: []const u8, contents: *const json.Value) {
+fn hover_markdown(app: *App, text: str, contents: *const json.Value) {
   output: [8192]u8
   used: usize = 0
   language: [64]u8
@@ -326,9 +324,9 @@ fn hover_markdown(app: *App, text: []const u8, contents: *const json.Value) {
 fn hover_colors_draw(app: *App, typography: *Typography, x: f32, y: f32) {
   state := &app.previews
   text := app.prompt_state.message[..app.prompt_state.message_length]
-  colors: []const u8 = text[..0]
+  colors: str = text[..0]
   if state.hover_count > 0 && text.len > 0 && text.len <= 8192 {
-    name: []const u8 = state.hover_language[..state.hover_language_length]
+    name: str = state.hover_language[..state.hover_language_length]
     if name.len == 0 {
       name = filetype_name(app.documents.slots[app.documents.active])
     }
@@ -337,8 +335,7 @@ fn hover_colors_draw(app: *App, typography: *Typography, x: f32, y: f32) {
     add_text(key[..], &key_length, name)
     masked: [8192]u8
     _ = mem.copy(masked[..text.len], text)
-    at: usize = 0
-    for at < text.len {
+    for at in 0..text.len {
       inside := false
       for range in 0..state.hover_count {
         if at >= state.hover_starts[range] && at < state.hover_ends[range] {
@@ -348,7 +345,6 @@ fn hover_colors_draw(app: *App, typography: *Typography, x: f32, y: f32) {
       if !inside && masked[at] != 10 {
         masked[at] = 32
       }
-      at += 1
     }
     if name.len > 0 {
       colors = preview_request(app, &state.hover, key[..key_length], name, true, masked[..text.len])

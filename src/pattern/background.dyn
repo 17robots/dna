@@ -15,6 +15,7 @@ extern fn general_free "pcre2_general_context_free_8"(context: rawptr)
 // the vector to grow by doubling.
 const TaskHeap: usize = 16777216
 const TaskStack: usize = 1048576
+const LiteralTaskStack: usize = 131072
 pub const BackgroundMinimum: usize = 16777216
 
 struct TaskHeapState { bytes: *u8, used, capacity: usize }
@@ -61,7 +62,7 @@ pub struct SearchTask {
 // first match at or after offset, else the first one; backwards finds the
 // last match starting before offset, else the last one. Returns nil when the
 // pattern does not compile or no thread starts; search synchronously then.
-pub fn task_start(text: []const u8, document: *const buffer.Document, offset: usize, backwards: bool) *SearchTask {
+pub fn task_start(text: str, document: *const buffer.Document, offset: usize, backwards: bool) *SearchTask {
   task := task_create(text, document)
   if task == nil { return nil }
   task.offset = offset
@@ -70,7 +71,7 @@ pub fn task_start(text: []const u8, document: *const buffer.Document, offset: us
 }
 // Run a range mode (1 select, 2 split, 3 keep, 4 remove) over ranges on a
 // worker. Read task_status and task_output when done.
-pub fn task_start_ranges(text: []const u8, document: *const buffer.Document, ranges: *const buffer.Selections, mode: u8) *SearchTask {
+pub fn task_start_ranges(text: str, document: *const buffer.Document, ranges: *const buffer.Selections, mode: u8) *SearchTask {
   task := task_create(text, document)
   if task == nil { return nil }
   task.mode = mode
@@ -83,15 +84,27 @@ pub fn task_status(task: *const SearchTask) u8 {
 pub fn task_output(task: *const SearchTask) *const buffer.Selections {
   return &task.output
 }
-fn task_create(text: []const u8, document: *const buffer.Document) *SearchTask {
+fn task_create(text: str, document: *const buffer.Document) *SearchTask {
+  if text.len == 0 { return nil }
+  if pattern_plain_literal(text) {
+    arena := arena_owner.create(#sizeof(SearchTask) + LiteralTaskStack + 4096)
+    task := &mem.push_array<SearchTask>(arena, 1)[0]
+    task.arena = arena
+    _ = mem.copy(task.pattern.literal[..text.len], text)
+    task.pattern.literal_len = text.len
+    task.pattern.valid = true
+    task.snapshot = buffer.snapshot_take(document)
+    task.subject_high = task.snapshot.length
+    return task
+  }
   arena := arena_owner.create(#sizeof(SearchTask) + TaskHeap + SearchWindowLimit + 4096)
-  task := mem.push<SearchTask>(arena)
+  task := &mem.push_array<SearchTask>(arena, 1)[0]
   task.arena = arena
   heap := mem.push_bytes(arena, TaskHeap)
   task.heap = TaskHeapState{bytes: &heap[0], capacity: TaskHeap}
   task.window = mem.push_bytes(arena, SearchWindowLimit)
   task.general = general_create(task_allocate, task_release, #cast(rawptr, &task.heap))
-  if task.general == nil || text.len == 0 {
+  if task.general == nil {
     task_free(task)
     return nil
   }
@@ -104,18 +117,31 @@ fn task_create(text: []const u8, document: *const buffer.Document) *SearchTask {
     task_free(task)
     return nil
   }
+  // Best-effort JIT compilation for PCRE2_JIT_COMPLETE | PCRE2_JIT_PARTIAL_HARD.
+  _ = jit_compile(task.pattern.code, 5)
   task.pattern.valid = true
   task.snapshot = buffer.snapshot_take(document)
   task.subject_high = task.snapshot.length
   return task
 }
 fn task_launch(task: *SearchTask) *SearchTask {
-  task.worker = thread.spawn_with_size(task.arena, TaskStack, task_run, task) catch {
+  stack_size := TaskStack
+  if task.pattern.literal_len > 0 && task.pattern.code == nil {
+    stack_size = LiteralTaskStack
+  }
+  task.worker = thread.spawn_with_size(task.arena, stack_size, task_run, task) catch {
     task_free(task)
     return nil
   }
   task.started = true
   return task
+}
+pub fn task_wait(task: *SearchTask) {
+  if task == nil || !task.started { return }
+  _ = thread.join(task.worker) catch {
+    #panic("cannot join search worker")
+  }
+  task.started = false
 }
 pub fn task_done(task: *const SearchTask) bool {
   return sync.load_u32(&task.done) != 0
@@ -172,8 +198,50 @@ fn task_search(task: *SearchTask) Match {
 fn task_cancelled(task: *const SearchTask) bool {
   return sync.load_u32(&task.cancel) != 0
 }
+fn task_find_literal(task: *SearchTask, from: usize, limit: usize) Match {
+  needle := task.pattern.literal[..task.pattern.literal_len]
+  length := task.subject_high
+  if needle.len == 0 || from >= limit || from + needle.len > length { return Match{} }
+  first := needle[0]
+  at := from
+  for at < limit && at + needle.len <= length {
+    if task_cancelled(task) { return Match{} }
+    chunk := buffer.snapshot_chunk(&task.snapshot, at)
+    if chunk.len == 0 { break }
+    scan_len := chunk.len
+    if at + scan_len > limit {
+      scan_len = limit - at
+    }
+    scan := chunk[..scan_len]
+    pos: usize = 0
+    for pos < scan.len {
+      hit := buffer.find_byte_in(scan, pos, first)
+      if hit >= scan.len { break }
+      doc_pos := at + hit
+      if doc_pos >= limit || doc_pos + needle.len > length { return Match{} }
+      if needle.len == 1 { return Match{found: true, start: doc_pos, end: doc_pos + 1} }
+      if hit + needle.len <= chunk.len {
+        if mem.equal(chunk[hit + 1..hit + needle.len], needle[1..]) {
+          return Match{found: true, start: doc_pos, end: doc_pos + needle.len}
+        }
+      } else {
+        scratch: [256]u8
+        buffer.snapshot_copy(&task.snapshot, doc_pos, doc_pos + needle.len, &scratch[0])
+        if mem.equal(scratch[..needle.len], needle) {
+          return Match{found: true, start: doc_pos, end: doc_pos + needle.len}
+        }
+      }
+      pos = hit + 1
+    }
+    at += scan_len
+  }
+  return Match{}
+}
 // First match starting in at..limit, searching windows of the snapshot.
 fn task_find(task: *SearchTask, from: usize, limit: usize) Match {
+  if task.pattern.literal_len > 0 && task.pattern.code == nil {
+    return task_find_literal(task, from, limit)
+  }
   length := task.subject_high
   at := from
   size := SearchWindow
@@ -256,7 +324,7 @@ fn task_last(task: *SearchTask, low: usize, high: usize) Match {
     }
     last := Match{}
     at := start
-    for true {
+    for {
       found := task_find(task, at, end)
       if found.error { return found }
       if !found.found || task_cancelled(task) { break }

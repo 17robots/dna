@@ -11,12 +11,12 @@
 const GitMaxBytes: usize = 8388608
 const GitMaxEdits: usize = 500
 const GitMaxHunks: usize = 1024
-const GitAdded: u8 = 1
-const GitModified: u8 = 2
-const GitDeleted: u8 = 3
+
+enum GitHunkKind { None, Added, Modified, Deleted }
+enum GitDiffState { Idle, Fetching, Ready, Unavailable }
 
 // Rows of the current text; a deletion has count 0 and marks the row after it.
-struct GitHunk { first: usize, count: usize, kind: u8 }
+struct GitHunk { first: usize, count: usize, kind: GitHunkKind }
 struct GitDiff {
   // owner holds this struct; arena owns base and is replaced on each fetch.
   owner: *mem.Arena,
@@ -25,8 +25,7 @@ struct GitDiff {
   saved_epoch: u64,
   path: [4096]u8,
   path_length: usize,
-  // 0 nothing yet, 1 fetching, 2 ready, 3 unavailable (no repository, untracked, too large).
-  state: u8,
+  state: GitDiffState,
   base: []u64,
   hunks: [1024]GitHunk,
   hunk_count: usize,
@@ -49,14 +48,14 @@ fn git_release(slot: *Slot) {
 }
 fn git_waiting(app: *const App) bool {
   for slot in app.documents.slots {
-    if slot.git != nil && (slot.git.state == 1 || (slot.git.state == 2 && slot.document != nil && slot.git.revision != slot.document.revision)) {
+    if slot.git != nil && (slot.git.state == .Fetching || (slot.git.state == .Ready && slot.document != nil && slot.git.revision != slot.document.revision)) {
       return true
     }
   }
   return false
 }
 // FNV-1a over each row, rows split at newlines; the last row may be empty.
-fn git_hash_bytes(bytes: []const u8, output: []u64) usize {
+fn git_hash_bytes(bytes: str, output: []u64) usize {
   count: usize = 0
   hash: u64 = 14695981039346656037
   for byte in bytes {
@@ -102,11 +101,11 @@ fn git_hash_document(doc: *const buffer.Document, output: []u64) usize {
 }
 fn git_hunk(diff: *GitDiff, first: usize, inserted: usize, deleted: usize) {
   if (inserted == 0 && deleted == 0) || diff.hunk_count == GitMaxHunks { return }
-  kind := GitModified
+  kind := GitHunkKind.Modified
   if deleted == 0 {
-    kind = GitAdded
+    kind = .Added
   } else if inserted == 0 {
-    kind = GitDeleted
+    kind = .Deleted
   }
   diff.hunks[diff.hunk_count] = GitHunk{first: first, count: inserted, kind: kind}
   diff.hunk_count += 1
@@ -251,7 +250,7 @@ fn git_compute(diff: *GitDiff, doc: *const buffer.Document) {
     git_hunk(diff, prefix, middle_current.len, middle_base.len)
   }
 }
-fn git_fetch(slot: *Slot, path: []const u8) {
+fn git_fetch(slot: *Slot, path: str) {
   diff := slot.git
   // Run in the file's directory with the bare name, so the repository and
   // its relative path both come from git.
@@ -260,7 +259,7 @@ fn git_fetch(slot: *Slot, path: []const u8) {
     split -= 1
   }
   if split == 0 {
-    diff.state = 3
+    diff.state = .Unavailable
     return
   }
   directory: [4096]u8
@@ -269,14 +268,14 @@ fn git_fetch(slot: *Slot, path: []const u8) {
   command: [16384]u8
   used: usize = 0
   if !git_show_command(command[..16383], &used, path[split..]) {
-    diff.state = 3
+    diff.state = .Unavailable
     return
   }
   command[used] = 0
   diff.job = job_open(&command[0], &directory[0], nil, 0, 10000)
-  diff.state = 1
+  diff.state = .Fetching
   if diff.job == nil {
-    diff.state = 3
+    diff.state = .Unavailable
   }
 }
 // Advance every document's diff; true when markers changed.
@@ -284,7 +283,7 @@ fn git_tick(app: *App) bool {
   changed := false
   fetching := false
   for slot in app.documents.slots {
-    if slot.git != nil && slot.git.state == 1 {
+    if slot.git != nil && slot.git.state == .Fetching {
       fetching = true
     }
   }
@@ -300,12 +299,12 @@ fn git_tick(app: *App) bool {
       slot.git.owner = owner
     }
     diff := slot.git
-    if diff.state == 1 {
+    if diff.state == .Fetching {
       status := job_status(diff.job)
       if status == 1 { continue }
       length := #cast(usize, job_output_length(diff.job))
       if status != 2 || length > GitMaxBytes {
-        diff.state = 3
+        diff.state = .Unavailable
       } else {
         if diff.arena != nil {
           arena_owner.release(diff.arena)
@@ -321,7 +320,7 @@ fn git_tick(app: *App) bool {
         }
         storage := mem.push_array<u64>(diff.arena, rows)
         diff.base = storage[..git_hash_bytes(bytes[..length], storage)]
-        diff.state = 2
+        diff.state = .Ready
         diff.revision = 0
         diff.due = 0
       }
@@ -335,11 +334,11 @@ fn git_tick(app: *App) bool {
       diff.path_length = copy_text(diff.path[..], path)
       diff.hunk_count = 0
       git_fetch(slot, path)
-      fetching = diff.state == 1
+      fetching = diff.state == .Fetching
       changed = true
       continue
     }
-    if diff.state == 2 && diff.revision != doc.revision {
+    if diff.state == .Ready && diff.revision != doc.revision {
       // Wait for a pause in typing before diffing again.
       if diff.due == 0 {
         diff.due = now + 40
@@ -360,5 +359,5 @@ fn git_hunk_end(hunk: GitHunk) usize {
 }
 // Whether diff's hunks describe doc's current text.
 fn git_current(diff: *const GitDiff, doc: *const buffer.Document) bool {
-  return diff != nil && doc != nil && diff.state == 2 && diff.revision == doc.revision
+  return diff != nil && doc != nil && diff.state == .Ready && diff.revision == doc.revision
 }

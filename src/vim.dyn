@@ -74,10 +74,7 @@ struct VimState {
   replacing: bool,
   replaced: [512]VimReplaced,
   replaced_count: usize,
-  // File marks A-Z: a file and a line and column in it.
-  file_marks: [26]VimFileMark,
 }
-struct VimFileMark { path: [4096]u8, path_length: usize, row, column: usize, set: bool }
 // One character typed in Replace mode: its length and the bytes it covered
 // (none past the end of a line, where Replace mode appends).
 struct VimReplaced { inserted: u8, original: [4]u8, original_length: u8 }
@@ -86,10 +83,10 @@ fn vim_reset(app: *App) {
   app.vim = VimState{}
 }
 fn vim_idle(app: *const App) bool {
-  return app.vim.mode == VimMode.Normal && app.vim.operator == 0 && app.vim.pending == 0 && app.vim.count == 0 && !app.vim.register_set && !app.view.insert
+  return app.vim.mode == .Normal && app.vim.operator == 0 && app.vim.pending == 0 && app.vim.count == 0 && !app.vim.register_set && !app.view.insert
 }
 fn vim_visual(app: *const App) bool {
-  return app.vim.mode != VimMode.Normal
+  return app.vim.mode != .Normal
 }
 
 // ---------------------------------------------------------------------------
@@ -108,10 +105,10 @@ fn vim_character(app: *const App, key: u32, modifiers: u16) u32 {
   }
   if key < 32 || key >= 127 { return 0 }
   if !shift { return key }
-  digits: []const u8 = ")!@#$%^&*("
+  digits: str = ")!@#$%^&*("
   if key >= '0' && key <= '9' { return digits[key - '0'] }
-  plain: []const u8 = "-=[]\\;',./`"
-  shifted: []const u8 = "_+{}|:\"<>?~"
+  plain: str = "-=[]\\;',./`"
+  shifted: str = "_+{}|:\"<>?~"
   for index in 0..plain.len {
     if key == plain[index] { return shifted[index] }
   }
@@ -142,11 +139,11 @@ fn vim_select(app: *App) {
     low = app.vim.head
     high = app.vim.anchor
   }
-  if app.vim.mode == VimMode.VisualBlock {
+  if app.vim.mode == .VisualBlock {
     vim_select_block(app)
     return
   }
-  if app.vim.mode == VimMode.VisualLine {
+  if app.vim.mode == .VisualLine {
     low = buffer.line_start(doc, low)
     high = buffer.line_end(doc, high)
     if high < doc.length {
@@ -203,7 +200,7 @@ fn vim_select_block(app: *App) {
   }
 }
 fn vim_enter_visual(app: *App, mode: VimMode) {
-  if app.vim.mode == VimMode.Normal {
+  if app.vim.mode == .Normal {
     app.vim.anchor = buffer.head(vim_doc(app))
     app.vim.head = app.vim.anchor
   }
@@ -221,7 +218,7 @@ fn vim_leave_visual(app: *App) {
   app.vim.last_head = app.vim.head
   app.vim.last_valid = true
   head := app.vim.head
-  app.vim.mode = VimMode.Normal
+  app.vim.mode = .Normal
   vim_place(app, head)
 }
 
@@ -330,7 +327,7 @@ fn vim_paragraph(doc: *const buffer.Document, position: usize, forward: bool, co
   return buffer.row_start(doc, row)
 }
 fn vim_bracket_pair(byte: u8) u8 {
-  pairs: []const u8 = "()[]{}"
+  pairs: str = "()[]{}"
   for index in 0..pairs.len {
     if pairs[index] == byte { return pairs[index ^ 1] }
   }
@@ -368,7 +365,7 @@ fn vim_match(doc: *const buffer.Document, position: usize) VimMotion {
   return VimMotion{}
 }
 // f t F T within the line. Repeating t with ; skips an adjacent match.
-fn vim_find(doc: *const buffer.Document, position: usize, kind: u32, text: []const u8, count: usize, repeat: bool) VimMotion {
+fn vim_find(doc: *const buffer.Document, position: usize, kind: u32, text: str, count: usize, repeat: bool) VimMotion {
   if text.len == 0 { return VimMotion{} }
   forward := kind == 'f' || kind == 't'
   till := kind == 't' || kind == 'T'
@@ -631,7 +628,7 @@ fn vim_motion(app: *App, typography: *Typography, character: u32, key: u32, coun
 // ---------------------------------------------------------------------------
 // Registers
 
-struct VimText { text: []const u8, linewise: bool, system: rawptr }
+struct VimText { text: str, linewise: bool, system: rawptr }
 
 fn vim_register_slot(app: *App) *Clipboard {
   if app.vim.register >= 1 && app.vim.register <= 26 {
@@ -640,14 +637,14 @@ fn vim_register_slot(app: *App) *Clipboard {
   return &app.register_state.clipboard
 }
 // Store yanked or deleted text. The unnamed register is the system clipboard.
-fn vim_store(app: *App, text: []const u8, linewise_in: bool) {
+fn vim_store(app: *App, text: str, linewise_in: bool) {
   linewise := linewise_in
   if app.vim.register == VimBlackHole || text.len == 0 { return }
   slot := vim_register_slot(app)
   // "A appends. Lines added to characters make the register linewise with
   // the old text as its own line, as in Vim.
-  old: []const u8 = ""
-  separator: []const u8 = ""
+  old: str = ""
+  separator: str = ""
   if app.vim.register_append && slot != &app.register_state.clipboard && slot.owned {
     old = slot.text
     if linewise && !slot.linewise && old.len > 0 {
@@ -659,7 +656,7 @@ fn vim_store(app: *App, text: []const u8, linewise_in: bool) {
       if text.len > 0 && text[text.len - 1] != 10 {
         // The appended characters become a line of their own.
         total := old.len + text.len + 1
-        allocated := arena_owner.create((total + 1))
+        allocated := arena_owner.create(total + 1)
         storage := mem.push_bytes(allocated, total + 1)
         _ = buffer.copy_bytes(&storage[0], &old[0], old.len)
         _ = buffer.copy_bytes(&storage[old.len], &text[0], text.len)
@@ -671,7 +668,7 @@ fn vim_store(app: *App, text: []const u8, linewise_in: bool) {
     }
   }
   total := old.len + separator.len + text.len
-  allocated := arena_owner.create((total + 1))
+  allocated := arena_owner.create(total + 1)
   storage := mem.push_bytes(allocated, total + 1)
   if old.len > 0 {
     _ = buffer.copy_bytes(&storage[0], &old[0], old.len)
@@ -738,7 +735,7 @@ fn vim_register_done(app: *App) {
 // ---------------------------------------------------------------------------
 // Edits
 
-fn vim_insert_at(doc: *buffer.Document, position: usize, text: []const u8) bool {
+fn vim_insert_at(doc: *buffer.Document, position: usize, text: str) bool {
   vim_set_range(doc, position, position)
   return buffer.replace(doc, text)
 }
@@ -962,7 +959,7 @@ fn vim_format_lines(app: *App, first: usize, last: usize) {
   vim_place(app, buffer.line_nonblank(doc, buffer.line_start(doc, last_line)))
 }
 // Indentation plus the comment leader, without the spaces after it.
-fn vim_format_kind(line: []const u8, leader: []const u8) []const u8 {
+fn vim_format_kind(line: str, leader: str) str {
   at: usize = 0
   for at < line.len && (line[at] == ' ' || line[at] == 9) {
     at += 1
@@ -972,14 +969,14 @@ fn vim_format_kind(line: []const u8, leader: []const u8) []const u8 {
   }
   return line[..at]
 }
-fn vim_format_blank(line: []const u8) bool {
+fn vim_format_blank(line: str) bool {
   for byte in line {
     if byte != ' ' && byte != 9 && byte != 13 { return false }
   }
   return true
 }
 // Indentation plus a comment leader and the spaces after it.
-fn vim_format_prefix(line: []const u8, leader: []const u8) usize {
+fn vim_format_prefix(line: str, leader: str) usize {
   at: usize = 0
   for at < line.len && (line[at] == ' ' || line[at] == 9) {
     at += 1
@@ -1006,7 +1003,7 @@ fn vim_put(app: *App, after: bool, count: usize) {
   if fetched.linewise && body[body.len - 1] != 10 {
     size += count
   }
-  reserved := arena_owner.create((size + 2))
+  reserved := arena_owner.create(size + 2)
   defer arena_owner.release(reserved)
   storage := mem.push_bytes(reserved, size + 2)
   used: usize = 0
@@ -1072,7 +1069,7 @@ fn vim_replace_characters(app: *App, character: u32, count: usize) {
     encoded[0] = 10
     length = 1
   }
-  reserved := arena_owner.create((length * count + 1))
+  reserved := arena_owner.create(length * count + 1)
   defer arena_owner.release(reserved)
   payload := mem.push_bytes(reserved, length * count + 1)
   used: usize = 0
@@ -1222,7 +1219,7 @@ fn vim_open_line(app: *App, above: bool, count: usize) {
 // Escape from insert: repeat the inserted text for 3ihi or 3o.
 // Replace mode typing: overwrite the character under the cursor, or append
 // at a line end, remembering what was replaced.
-fn vim_replace_text(app: *App, text: []const u8) {
+fn vim_replace_text(app: *App, text: str) {
   doc := vim_doc(app)
   if doc.secondary.count != 0 || doc.anchor != doc.cursor {
     changed(app, text)
@@ -1291,7 +1288,7 @@ fn vim_insert_finish(app: *App) {
   if app.vim.insert_lines {
     piece = typed + 1
   }
-  reserved := arena_owner.create((piece * (count - 1) + 1))
+  reserved := arena_owner.create(piece * (count - 1) + 1)
   defer arena_owner.release(reserved)
   payload := mem.push_bytes(reserved, piece * (count - 1) + 1)
   used: usize = 0
@@ -1311,7 +1308,7 @@ fn vim_insert_finish(app: *App) {
 // ---------------------------------------------------------------------------
 // `.` repeat recording
 
-fn vim_record_event(recording: *VimRecording, key: u32, modifiers: u16, character: u32, text: []const u8) {
+fn vim_record_event(recording: *VimRecording, key: u32, modifiers: u16, character: u32, text: str) {
   if recording.overflow { return }
   if recording.count == 256 || recording.text_used + text.len > 4096 {
     recording.overflow = true
@@ -1328,7 +1325,7 @@ fn vim_record_event(recording: *VimRecording, key: u32, modifiers: u16, characte
 // Called for every key event: a key that starts a command from rest opens a
 // fresh recording.
 fn vim_record_key(app: *App, key: u32, modifiers: u16) {
-  if !app.config.vim_keys || app.vim.replaying || app.prompt_state.panel != Panel.None { return }
+  if !app.config.vim_keys || app.vim.replaying || app.prompt_state.panel != .None { return }
   if !app.vim.recording && vim_idle(app) {
     app.vim.recording = true
     app.vim.changed = false
@@ -1341,7 +1338,7 @@ fn vim_record_key(app: *App, key: u32, modifiers: u16) {
     vim_record_event(&app.vim.candidate, key, modifiers, vim_character(app, key, modifiers), "")
   }
 }
-fn vim_record_text(app: *App, text: []const u8) {
+fn vim_record_text(app: *App, text: str) {
   if app.config.vim_keys && app.vim.recording && !app.vim.replaying {
     vim_record_event(&app.vim.candidate, 0, 0, 0, text)
   }
@@ -1367,7 +1364,7 @@ fn vim_settle(app: *App) {
   app.vim.dot_visual = false
   if app.vim.visual_cut > 0 {
     // Replay from the change key on, over a region rebuilt at the cursor.
-    if app.vim.visual_mode == VimMode.VisualBlock { return }
+    if app.vim.visual_mode == .VisualBlock { return }
     skip = app.vim.visual_cut - 1
     count = 0
     app.vim.dot_visual = true
@@ -1422,7 +1419,7 @@ fn vim_visual_region(app: *App) {
     row = doc.line_count - 1
   }
   head := anchor
-  if app.vim.dot_visual_mode == VimMode.VisualLine {
+  if app.vim.dot_visual_mode == .VisualLine {
     head = buffer.row_start(doc, row)
   } else if app.vim.dot_visual_lines == 1 {
     for step in 1..app.vim.dot_visual_chars {
@@ -1506,7 +1503,7 @@ fn vim_after_search(app: *App) {
 
 // Guides observe pending Vim state; they never become Helix prompt panels.
 fn vim_menu_prefix(app: *const App) u32 {
-  if !app.config.vim_keys || app.view.insert || app.prompt_state.panel != Panel.None { return 0 }
+  if !app.config.vim_keys || app.view.insert || app.prompt_state.panel != .None { return 0 }
   pending := app.vim.pending
   if pending == 'g' || pending == 'z' || pending == 'Z' || pending == 'i' || pending == 'a' {
     return pending
@@ -1515,7 +1512,7 @@ fn vim_menu_prefix(app: *const App) u32 {
 }
 fn vim_menu_context(app: *const App) u32 {
   if app.vim.operator != 0 { return 2 }
-  if app.vim.mode != VimMode.Normal { return 1 }
+  if app.vim.mode != .Normal { return 1 }
   return 0
 }
 
@@ -1558,7 +1555,7 @@ fn vim_key(app: *App, typography: *Typography, key: u32, modifiers: u16) bool {
     // line with its range, so :s covers every selected line.
     if vim_visual(app) && app.vim.operator == 0 {
       vim_leave_visual(app)
-      panel(app, Panel.Commands)
+      panel(app, .Commands)
       app.prompt_state.length = copy_text(app.prompt_state.text[..], "'<,'>")
       return true
     }
@@ -1727,7 +1724,7 @@ fn vim_pending(app: *App, typography: *Typography, character: u32, key: u32) {
       doc.marks[buffer.NamedMarkBase + index] = vim_head(app)
       doc.named_marks |= #cast(u32, 1) << #cast(u32, index)
     } else if character >= 'A' && character <= 'Z' {
-      vim_file_mark_set(app, #cast(usize, (character - 'A')))
+      vim_file_mark_set(app, character - 'A')
     }
     app.vim.count = 0
     return
@@ -1748,7 +1745,7 @@ fn vim_pending(app: *App, typography: *Typography, character: u32, key: u32) {
     } else if character == '`' || character == 39 {
       movement.valid = vim_last_jump(app, &movement.target)
     } else if character >= 'A' && character <= 'Z' {
-      if !vim_file_mark_target(app, #cast(usize, (character - 'A')), &movement.target) {
+      if !vim_file_mark_target(app, character - 'A', &movement.target) {
         app.vim.operator = 0
         return
       }
@@ -1802,9 +1799,9 @@ fn vim_pending(app: *App, typography: *Typography, character: u32, key: u32) {
       view_key(app, typography, KeyB)
     }
     if app.explorer.vim_borrowed {
-      app.prompt_state.panel=Panel.Directory
+      app.prompt_state.panel=.Directory
     } else {
-      app.prompt_state.panel=Panel.None
+      app.prompt_state.panel=.None
     }
     return
   }
@@ -1813,14 +1810,14 @@ fn vim_pending(app: *App, typography: *Typography, character: u32, key: u32) {
       if character=='Z' {
         explorer_preview(app)
       } else if character=='Q' {
-        app.prompt_state.panel=Panel.None
+        app.prompt_state.panel=.None
       }
       return
     }
     if character == 'Z' {
-      action(app, typography, command_named("x"))
+      run_command(app, typography, .SaveClose)
     } else if character == 'Q' {
-      action(app, typography, command_named("quit-all"))
+      run_command(app, typography, .QuitAll)
     }
     return
   }
@@ -1941,7 +1938,7 @@ fn vim_marks_show(app: *App) {
     add_text(output, &used, line[..high - low])
   }
   for index in 0..26 {
-    mark := &app.vim.file_marks[index]
+    mark := &app.vim_session.file_marks[index]
     if !mark.set { continue }
     letter: [1]u8 = [#cast(u8, 'A' + index)]
     vim_marks_row(output, &used, letter[..], mark.row, mark.column)
@@ -1949,10 +1946,10 @@ fn vim_marks_show(app: *App) {
     add_text(output, &used, display_path(app, mark.path[..mark.path_length], shown[..]))
   }
   app.prompt_state.message_length = used
-  app.prompt_state.panel = Panel.Message
+  app.prompt_state.panel = .Message
   app.prompt_state.selected = 0
 }
-fn vim_marks_row(output: []u8, used: *usize, letter: []const u8, row, column: usize) {
+fn vim_marks_row(output: []u8, used: *usize, letter: str, row, column: usize) {
   add_text(output, used, "\n ")
   add_text(output, used, letter)
   add_text(output, used, "    ")
@@ -1975,7 +1972,7 @@ fn vim_file_mark_set(app: *App, index: usize) {
   }
   doc := vim_doc(app)
   head := vim_head(app)
-  mark := &app.vim.file_marks[index]
+  mark := &app.vim_session.file_marks[index]
   mark.path_length = copy_text(mark.path[..], name)
   mark.row = buffer.row_at(doc, head)
   mark.column = head - buffer.line_start(doc, head)
@@ -1984,7 +1981,7 @@ fn vim_file_mark_set(app: *App, index: usize) {
 // The position of file mark index, opening its file first when it is not
 // the current one. False (with a message) when there is nowhere to go.
 fn vim_file_mark_target(app: *App, index: usize, target: *usize) bool {
-  mark := &app.vim.file_marks[index]
+  mark := &app.vim_session.file_marks[index]
   if !mark.set {
     status_error(app, "E20: Mark not set")
     return false
@@ -2043,7 +2040,7 @@ fn vim_finish_motion(app: *App, movement: VimMotion, count: usize) {
   doc := vim_doc(app)
   if vim_visual(app) {
     target := movement.target
-    if app.vim.mode != VimMode.VisualBlock {
+    if app.vim.mode != .VisualBlock {
       target = vim_clamp(doc, target)
     }
     app.vim.head = target
@@ -2143,7 +2140,7 @@ fn vim_text_object(app: *App, character: u32, around: bool) {
   if vim_visual(app) {
     selection = buffer.Selection{anchor: doc.anchor, cursor: doc.cursor}
   }
-  span := buffer.text_object_with_syntax(doc, selection, key, around, count, match_syntax(app, app.prompt_state.panel == Panel.Directory))
+  span := buffer.text_object_with_syntax(doc, selection, key, around, count, match_syntax(app, app.prompt_state.panel == .Directory))
   if !span.found || span.high < span.low {
     app.vim.operator = 0
     return
@@ -2161,8 +2158,8 @@ fn vim_text_object(app: *App, character: u32, around: bool) {
   }
   linewise := key == 'p'
   if vim_visual(app) {
-    if linewise && app.vim.mode == VimMode.Visual {
-      app.vim.mode = VimMode.VisualLine
+    if linewise && app.vim.mode == .Visual {
+      app.vim.mode = .VisualLine
     }
     app.vim.anchor = span.low
     app.vim.head = buffer.previous(doc, span.high)
@@ -2342,9 +2339,9 @@ fn vim_normal_key(app: *App, typography: *Typography, character: u32, key: u32, 
     app.vim.count = 0
     app.input_state.search_backwards = character == '?'
     if app.explorer.vim_borrowed {
-      search_open(app, Panel.Search, true)
+      search_open(app, .Search, true)
     } else {
-      action(app, typography, 3)
+      run_command(app, typography, .Search)
     }
     return
   }
@@ -2361,7 +2358,7 @@ fn vim_normal_key(app: *App, typography: *Typography, character: u32, key: u32, 
   if character == 'K' {
     app.vim.count = 0
     if app.explorer.vim_borrowed { return }
-    action(app, typography, command_named("hover"))
+    run_command(app, typography, .LspHover)
     return
   }
   // G and % tell 1G (line one) from G (last line) by whether a count was typed.
@@ -2372,8 +2369,8 @@ fn vim_normal_key(app: *App, typography: *Typography, character: u32, key: u32, 
 }
 fn vim_visual_operator(app: *App, typography: *Typography, operator: u32) {
   doc := vim_doc(app)
-  linewise := app.vim.mode == VimMode.VisualLine
-  if app.vim.mode == VimMode.VisualBlock {
+  linewise := app.vim.mode == .VisualLine
+  if app.vim.mode == .VisualBlock {
     vim_block_operator(app, operator)
     return
   }
@@ -2418,7 +2415,7 @@ fn vim_block_operator(app: *App, operator: u32) {
   app.vim.last_anchor = app.vim.anchor
   app.vim.last_head = app.vim.head
   app.vim.last_valid = true
-  app.vim.mode = VimMode.Normal
+  app.vim.mode = .Normal
   if app.vim.register <= 26 {
     app.register_state.selected = app.vim.register
   }
@@ -2490,8 +2487,8 @@ fn vim_visual_key(app: *App, typography: *Typography, character: u32, key: u32) 
   }
   if character == 'D' || character == 'X' || character == 'Y' || character == 'C' || character == 'S' || character == 'R' {
     // Whole lines, whatever the visual kind.
-    if app.vim.mode != VimMode.VisualBlock {
-      app.vim.mode = VimMode.VisualLine
+    if app.vim.mode != .VisualBlock {
+      app.vim.mode = .VisualLine
     }
     operator: u32 = 'd'
     if character == 'Y' {
@@ -2519,8 +2516,8 @@ fn vim_visual_key(app: *App, typography: *Typography, character: u32, key: u32) 
     vim_visual_put(app, character == 'p')
     return
   }
-  if (character == 'I' || character == 'A') && app.vim.mode == VimMode.VisualBlock {
-    app.vim.mode = VimMode.Normal
+  if (character == 'I' || character == 'A') && app.vim.mode == .VisualBlock {
+    app.vim.mode = .Normal
     buffer.checkpoint(doc)
     buffer.insert_positions(doc, character == 'A')
     app.view.insert = true
@@ -2538,9 +2535,9 @@ fn vim_visual_key(app: *App, typography: *Typography, character: u32, key: u32) 
   if character == '/' || character == '?' {
     app.input_state.search_backwards = character == '?'
     if app.explorer.vim_borrowed {
-      search_open(app, Panel.Search, true)
+      search_open(app, .Search, true)
     } else {
-      action(app, typography, 3)
+      run_command(app, typography, .Search)
     }
     return
   }
@@ -2559,12 +2556,12 @@ fn vim_visual_put(app: *App, swap: bool) {
     vim_escape(app)
     return
   }
-  reserved := arena_owner.create((fetched.text.len + 1))
+  reserved := arena_owner.create(fetched.text.len + 1)
   defer arena_owner.release(reserved)
   payload := mem.push_bytes(reserved, fetched.text.len + 1)
   _ = buffer.copy_bytes(&payload[0], &fetched.text[0], fetched.text.len)
   replacement := payload[..fetched.text.len]
-  linewise := app.vim.mode == VimMode.VisualLine
+  linewise := app.vim.mode == .VisualLine
   low := app.vim.anchor
   high := app.vim.head
   if low > high {

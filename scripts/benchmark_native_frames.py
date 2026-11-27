@@ -60,9 +60,9 @@ PROBE = r'''fn startup_probe(app:*App, typography:*Typography, renderer:rawptr, 
 }
 fn finish_probe(app:*App) {}
 fn frame_probe_cpu() u64 {
- time:=ThreadTime{}
- if thread_clock(3,&time)!=0 {#panic("thread CPU clock")}
- return #cast(u64,time.seconds)*1000000000+#cast(u64,time.nanoseconds)
+ ts:=ThreadTime{}
+ if thread_clock(3,&ts)!=0 {#panic("thread CPU clock")}
+ return #cast(u64,ts.seconds)*1000000000+#cast(u64,ts.nanoseconds)
 }
 '''
 PICKER = '''app.prompt_state.panel=Panel.Open

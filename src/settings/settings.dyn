@@ -13,18 +13,15 @@ pub const ScopeSpace: u8 = 2
 pub const ScopeInsert: u8 = 6
 pub const ScopeSelect: u8 = 7
 // keymap: 0 both, 1 helix only, 2 vim only.
-pub struct Binding { key: u32, modifiers: u16, scope: u8, keymap: u8, from_project: bool, command: []const u8, steps: [4]Stroke, count: usize }
+pub struct Binding { key: u32, modifiers: u16, scope: u8, keymap: u8, from_project: bool, command: str, steps: [4]Stroke, count: usize }
 // Where a surface shows: float at one of nine anchors, docked to a side
 // (taking space from the editor panes), or next to the cursor. Sizes at or
 // below 1 are fractions of the window; above 1, logical pixels.
-pub const PlaceDefault: u8 = 0
-pub const PlaceFloat: u8 = 1
-pub const PlaceDock: u8 = 2
-pub const PlaceCursor: u8 = 3
+pub enum PlaceMode { Default, Float, Dock, Cursor }
 pub const PlaceSurfaces: usize = 8
-pub struct Placement { mode, anchor, side: u8, width, height, size, margin: f32 }
-pub fn place_surface(name: []const u8) usize {
-  names: [8][]const u8 = ["palette", "picker", "menu", "dialog", "explorer", "terminal", "completion", "hover"]
+pub struct Placement { mode: PlaceMode, anchor, side: u8, width, height, size, margin: f32 }
+pub fn place_surface(name: str) usize {
+  names: [8]str = ["palette", "picker", "menu", "dialog", "explorer", "terminal", "completion", "hover"]
   for index in 0..8 {
     if buffer.equal(names[index], name) { return index }
   }
@@ -32,34 +29,34 @@ pub fn place_surface(name: []const u8) usize {
 }
 // Anchors: 0 top-left, 1 top, 2 top-right, 3 left, 4 center, 5 right,
 // 6 bottom-left, 7 bottom, 8 bottom-right. Sides: 0 left, 1 right, 2 top, 3 bottom.
-pub fn place_anchor(name: []const u8) u8 {
-  names: [9][]const u8 = ["top-left", "top", "top-right", "left", "center", "right", "bottom-left", "bottom", "bottom-right"]
+pub fn place_anchor(name: str) u8 {
+  names: [9]str = ["top-left", "top", "top-right", "left", "center", "right", "bottom-left", "bottom", "bottom-right"]
   for index in 0..9 {
     if buffer.equal(names[index], name) { return #cast(u8, index) }
   }
   return 255
 }
-pub fn place_side(name: []const u8) u8 {
-  names: [4][]const u8 = ["left", "right", "top", "bottom"]
+pub fn place_side(name: str) u8 {
+  names: [4]str = ["left", "right", "top", "bottom"]
   for index in 0..4 {
     if buffer.equal(names[index], name) { return #cast(u8, index) }
   }
   return 255
 }
-fn place_apply(place: *Placement, key: []const u8, value: []const u8) bool {
+fn place_apply(place: *Placement, key: str, value: str) bool {
   if buffer.equal(key, "mode") || buffer.equal(key, "anchor") || buffer.equal(key, "side") {
     if value.len < 3 || value[0] != 34 || value[value.len - 1] != 34 { return false }
     text := value[1..value.len - 1]
     if buffer.equal(key, "mode") {
       case text {
         "float" => {
-          place.mode = PlaceFloat
+          place.mode = .Float
         }
         "dock" => {
-          place.mode = PlaceDock
+          place.mode = .Dock
         }
         "cursor" => {
-          place.mode = PlaceCursor
+          place.mode = .Cursor
         }
         "default" => {
           // The surface's usual place; later keys in the section still apply.
@@ -76,15 +73,15 @@ fn place_apply(place: *Placement, key: []const u8, value: []const u8) bool {
       choice = place_side(text)
       if choice == 255 { return false }
       place.side = choice
-      if place.mode == PlaceDefault {
-        place.mode = PlaceDock
+      if place.mode == .Default {
+        place.mode = .Dock
       }
       return true
     }
     if choice == 255 { return false }
     place.anchor = choice
-    if place.mode == PlaceDefault {
-      place.mode = PlaceFloat
+    if place.mode == .Default {
+      place.mode = .Float
     }
     return true
   }
@@ -133,7 +130,7 @@ pub struct Settings {
   frame_interval_ms: f32,
   font_size: f32,
   line_height: f32,
-  font_family, font, shell, build_command, test_command, run_command, fallback, theme_path: []const u8,
+  font_family, font, shell, build_command, test_command, run_command, fallback, theme_path: str,
   terminal_modifiers: u16,
   explicit_legacy: u32,
   terminal_escape: u32,
@@ -222,7 +219,7 @@ pub fn defaults(result: *Settings) {
   result.status_line = true
   result.highlight_line = true
 }
-pub fn trim(text: []const u8) []const u8 {
+pub fn trim(text: str) str {
   first: usize = 0
   last := text.len
   for first < last && (text[first] == 32 || text[first] == 9 || text[first] == 13) {
@@ -233,7 +230,7 @@ pub fn trim(text: []const u8) []const u8 {
   }
   return text[first..last]
 }
-pub fn number(text: []const u8) f32 {
+pub fn number(text: str) f32 {
   value: f32 = 0.0
   divisor: f32 = 1.0
   decimal: bool = false
@@ -257,26 +254,24 @@ pub fn number(text: []const u8) f32 {
 // Layered configuration: the global file, then a project dna.toml over it.
 // A project layer never sets locked or personal keys, and sets keys that run
 // programs or load files only once trusted; each skip is recorded.
-pub const SkipLocked: u8 = 1
-pub const SkipPersonal: u8 = 2
-pub const SkipUntrusted: u8 = 3
+pub enum SkipReason { None, Locked, Personal, Untrusted }
 pub struct Layer {
   project: bool,
   trusted: bool,
   // :set for this session: applies over the files like a project layer, but
   // may set personal keys. Locks still hold.
   session: bool,
-  locks: [32][]const u8,
+  locks: [32]str,
   lock_count: usize,
-  applied: [64][]const u8,
+  applied: [64]str,
   applied_count: usize,
-  skipped: [32][]const u8,
-  skip_reasons: [32]u8,
+  skipped: [32]str,
+  skip_reasons: [32]SkipReason,
   skipped_count: usize,
 }
 // Index of a module name within its slot, or 255 when unknown.
-pub fn module_choice(slot: []const u8, value: []const u8) u8 {
-  names: []const u8 = ""
+pub fn module_choice(slot: str, value: str) u8 {
+  names: str = ""
   case slot {
     "keymap" => {
       names = "helix vim"
@@ -307,11 +302,11 @@ pub fn module_choice(slot: []const u8, value: []const u8) u8 {
   }
   return 255
 }
-pub fn parse(source: []const u8, result: *Settings) bool {
+pub fn parse(source: str, result: *Settings) bool {
   layer := Layer{}
   return parse_layer(source, result, &layer)
 }
-pub fn lock_matches(lock: []const u8, section: []const u8, key: []const u8, canonical: []const u8) bool {
+pub fn lock_matches(lock: str, section: str, key: str, canonical: str) bool {
   if buffer.equal(lock, canonical) || buffer.equal(lock, key) && section.len == 0 { return true }
   if section.len == 0 { return false }
   // A section name locks everything in it; section.key locks one entry.
@@ -323,13 +318,13 @@ pub fn lock_matches(lock: []const u8, section: []const u8, key: []const u8, cano
 // Keymap and frontend are the user's own; projects never choose them.
 // How you like to work, rather than what a project needs: a dna.toml never
 // sets these. [project."PATH"] sections in the global file can.
-fn personal_key(canonical: []const u8) bool {
+fn personal_key(canonical: str) bool {
   return buffer.equal(canonical, "keymap") || buffer.equal(canonical, "frontend") ||
     buffer.equal(canonical, "theme") || buffer.equal(canonical, "font") || buffer.equal(canonical, "font_family") ||
     buffer.equal(canonical, "fallback_font") || buffer.equal(canonical, "font_size") || buffer.equal(canonical, "line_height")
 }
 // Keys that run programs or make DNA load files from the project.
-fn trust_needed(section: []const u8, key: []const u8, canonical: []const u8) bool {
+fn trust_needed(section: str, key: str, canonical: str) bool {
   if section.len > 5 && buffer.equal(section[..5], "keys.") { return true }
   if section.len > 10 && buffer.equal(section[..10], "languages.") {
     return buffer.equal(key, "server") || buffer.equal(key, "formatter") || buffer.equal(key, "auto_start") || buffer.equal(key, "format_on_save")
@@ -337,35 +332,35 @@ fn trust_needed(section: []const u8, key: []const u8, canonical: []const u8) boo
   return buffer.equal(canonical, "shell") || buffer.equal(canonical, "build_command") || buffer.equal(canonical, "test_command") || buffer.equal(canonical, "run_command") || buffer.equal(canonical, "font") || buffer.equal(canonical, "fallback_font") || buffer.equal(canonical, "theme")
 }
 // Zero when the layer may apply the key, else the reason it is skipped.
-fn layer_skip(layer: *Layer, section: []const u8, key: []const u8, canonical: []const u8) u8 {
-  if !layer.project { return 0 }
-  reason: u8 = 0
+fn layer_skip(layer: *Layer, section: str, key: str, canonical: str) SkipReason {
+  if !layer.project { return .None }
+  reason := SkipReason.None
   for index in 0..layer.lock_count {
     if lock_matches(layer.locks[index], section, key, canonical) {
-      reason = SkipLocked
+      reason = .Locked
     }
   }
-  if reason == 0 && personal_key(canonical) && !layer.session {
-    reason = SkipPersonal
+  if reason == .None && personal_key(canonical) && !layer.session {
+    reason = .Personal
   }
-  if reason == 0 && !layer.trusted && trust_needed(section, key, canonical) {
-    reason = SkipUntrusted
+  if reason == .None && !layer.trusted && trust_needed(section, key, canonical) {
+    reason = .Untrusted
   }
-  if reason != 0 && layer.skipped_count < 32 {
+  if reason != .None && layer.skipped_count < 32 {
     layer.skipped[layer.skipped_count] = canonical
     layer.skip_reasons[layer.skipped_count] = reason
     layer.skipped_count += 1
   }
   return reason
 }
-fn layer_applied(layer: *Layer, canonical: []const u8) {
+fn layer_applied(layer: *Layer, canonical: str) {
   if layer.applied_count < 64 {
     layer.applied[layer.applied_count] = canonical
     layer.applied_count += 1
   }
 }
 // lock = ["keymap", "theme", "languages"]: only in the global file.
-fn parse_locks(layer: *Layer, value: []const u8) bool {
+fn parse_locks(layer: *Layer, value: str) bool {
   if layer.project || value.len < 2 || value[0] != 91 || value[value.len - 1] != 93 { return false }
   at: usize = 1
   for at < value.len - 1 {
@@ -392,7 +387,7 @@ fn parse_locks(layer: *Layer, value: []const u8) bool {
 }
 // Apply one file. The first (global) layer starts from defaults; a project
 // layer applies over the result and may repeat keys the global file set.
-pub fn parse_layer(source: []const u8, result: *Settings, layer: *Layer) bool {
+pub fn parse_layer(source: str, result: *Settings, layer: *Layer) bool {
   if layer.project {
     result.error_line = 0
     for language in 0..result.language_count {
@@ -408,7 +403,7 @@ pub fn parse_layer(source: []const u8, result: *Settings, layer: *Layer) bool {
   keymap: u8 = 0
   language_index: usize = 16
   place_index: usize = PlaceSurfaces
-  section: []const u8 = ""
+  section: str = ""
   for at < source.len {
     result.error_line += 1
     end := at
@@ -461,13 +456,13 @@ pub fn parse_layer(source: []const u8, result: *Settings, layer: *Layer) bool {
     value := trim(line[split + 1..])
     bit: u32 = 0
     if scope == 3 {
-      if layer_skip(layer, section, key, key) != 0 { continue }
+      if layer_skip(layer, section, key, key) != .None { continue }
       if !language_apply(&result.languages[language_index], key, value) { return false }
       layer_applied(layer, section)
       continue
     }
     if scope == 4 {
-      if layer_skip(layer, section, key, section) != 0 { continue }
+      if layer_skip(layer, section, key, section) != .None { continue }
       if !place_apply(&result.places[place_index], key, value) { return false }
       layer_applied(layer, section)
       continue
@@ -476,7 +471,7 @@ pub fn parse_layer(source: []const u8, result: *Settings, layer: *Layer) bool {
       if !parse_locks(layer, value) { return false }
       continue
     }
-    if scope != 0 && layer_skip(layer, section, key, section) != 0 { continue }
+    if scope != 0 && layer_skip(layer, section, key, section) != .None { continue }
     if scope != 0 {
       if key.len < 3 || key[0] != 34 || key[key.len - 1] != 34 || value.len < 3 || value.len > 129 || value[0] != 34 || value[value.len - 1] != 34 || result.binding_count == BindingLimit {
         return false
@@ -513,7 +508,7 @@ pub fn parse_layer(source: []const u8, result: *Settings, layer: *Layer) bool {
       return false
     }
     canonical := section_key(section, key)
-    if layer_skip(layer, section, key, canonical) != 0 { continue }
+    if layer_skip(layer, section, key, canonical) != .None { continue }
     layer_applied(layer, canonical)
     extra_index := extra_find(canonical)
     if extra_index < ExtraCount {
@@ -680,7 +675,7 @@ pub fn parse_layer(source: []const u8, result: *Settings, layer: *Layer) bool {
   return true
 }
 
-pub fn parse_key(text: []const u8) Binding {
+pub fn parse_key(text: str) Binding {
   result := Binding{}
   remaining := text
   if remaining.len > 5 && buffer.equal(remaining[..5], "ctrl-") {
@@ -711,7 +706,7 @@ pub fn parse_key(text: []const u8) Binding {
 pub struct KeysScope { scope: u8, keymap: u8 }
 // [keys.MODE] or [keys.KEYMAP.MODE]: MODE is normal, insert, select (or
 // visual) or space; KEYMAP is vim or helix.
-pub fn keys_section(name: []const u8) KeysScope {
+pub fn keys_section(name: str) KeysScope {
   result := KeysScope{}
   mode := name
   if name.len > 4 && buffer.equal(name[..4], "vim.") {
@@ -748,7 +743,7 @@ fn same_sequence(left: *const Binding, right: *const Binding) bool {
   return true
 }
 // "g x", "space f f", "ctrl-w v": up to four keys separated by spaces.
-pub fn parse_sequence(text: []const u8) Binding {
+pub fn parse_sequence(text: str) Binding {
   result := Binding{}
   at: usize = 0
   for at < text.len {
@@ -779,7 +774,7 @@ pub fn parse_sequence(text: []const u8) Binding {
   }
   return result
 }
-fn lower_ascii(text: []const u8, out: []u8) []const u8 {
+fn lower_ascii(text: str, out: []u8) str {
   if text.len > out.len { return text }
   for byte, index in text {
     if byte >= 'A' && byte <= 'Z' {
@@ -790,7 +785,7 @@ fn lower_ascii(text: []const u8, out: []u8) []const u8 {
   return out[..text.len]
 }
 // A named key's keycode, or 0.
-pub fn key_named(name: []const u8) u32 {
+pub fn key_named(name: str) u32 {
   storage: [16]u8
   lowered := lower_ascii(name, storage[..])
   if buffer.equal(lowered, "space") { return 32 }
@@ -823,7 +818,7 @@ pub fn key_named(name: []const u8) u32 {
 }
 // One key: optional ctrl-/alt-/shift- (or C-/A-/M-/S-) prefixes, then a
 // character or a key name.
-pub fn parse_stroke(text: []const u8) Stroke {
+pub fn parse_stroke(text: str) Stroke {
   result := Stroke{}
   remaining := text
   for remaining.len > 2 {
@@ -887,7 +882,7 @@ fn utf8_size(byte: u8) usize {
   if byte >= 192 { return 2 }
   return 0
 }
-pub fn utf8_value(bytes: []const u8) u32 {
+pub fn utf8_value(bytes: str) u32 {
   size := bytes.len
   if size == 1 { return bytes[0] }
   value: u32 = 0
@@ -906,7 +901,7 @@ pub fn utf8_value(bytes: []const u8) u32 {
 // Vim key notation for "keys:" values: characters type themselves, <Name>
 // is a key (<Esc>, <CR>, <C-w>, <lt> for a literal <). Returns the key at
 // at, advancing past it; a zero stroke ends the text or marks an error.
-pub fn notation_next(text: []const u8, at: *usize) Stroke {
+pub fn notation_next(text: str, at: *usize) Stroke {
   result := Stroke{}
   if at.* >= text.len { return result }
   if text[at.*] == '<' {
@@ -935,7 +930,7 @@ pub fn notation_next(text: []const u8, at: *usize) Stroke {
   at.* += size
   return result
 }
-fn notation_valid(text: []const u8) bool {
+fn notation_valid(text: str) bool {
   at: usize = 0
   count: usize = 0
   for at < text.len {
@@ -945,8 +940,8 @@ fn notation_valid(text: []const u8) bool {
   }
   return count > 0
 }
-pub fn key_display(key: u32) []const u8 {
-  names: []const u8 = "esc enter tab backspace delete insert home pageup end pagedown right left down up"
+pub fn key_display(key: u32) str {
+  names: str = "esc enter tab backspace delete insert home pageup end pagedown right left down up"
   codes: [14]u32 = [27, 13, 9, 8, 127, 1073741897, 1073741898, 1073741899, 1073741901, 1073741902, 1073741903, 1073741904, 1073741905, 1073741906]
   at: usize = 0
   for index in 0..14 {

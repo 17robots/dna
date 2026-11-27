@@ -5,7 +5,7 @@ struct SearchHistory { text: [4096]u8, length: usize }
 
 // The PCRE2 pattern for a search. The Vim keymap searches with Vim's
 // pattern syntax, shared with :s and :g; other keymaps use PCRE2 directly.
-fn search_query(app: *App, text: []const u8, output: []u8, regex: *VimRegex) []const u8 {
+fn search_query(app: *App, text: str, output: []u8, regex: *VimRegex) str {
   if !app.config.vim_keys || text.len == 0 { return text }
   length := vim_regex_query(text, true, vim_ignore(app, text), app.vim.ex.replacement[..app.vim.ex.replacement_length], output, regex)
   if !regex.valid {
@@ -41,10 +41,12 @@ struct SearchState {
   // Large documents search on a worker while the prompt stays responsive;
   // status is 5 until it reports.
   task: *pattern.SearchTask,
+  in_event_batch: bool,
+  preview_pending: bool,
 }
 
 fn search_prompt(kind: Panel) bool {
-  return kind == Panel.Search || kind == Panel.Select || kind == Panel.Split || kind == Panel.Keep || kind == Panel.Remove
+  return kind == .Search || kind == .Select || kind == .Split || kind == .Keep || kind == .Remove
 }
 fn search_open(app: *App, kind: Panel, explorer: bool) {
   doc := app.documents.current
@@ -59,7 +61,8 @@ fn search_open(app: *App, kind: Panel, explorer: bool) {
   }
   panel(app, kind)
   pattern.task_finish(app.search_state.task)
-  app.search_state = SearchState{document: doc, primary: buffer.Selection{cursor: doc.cursor, anchor: doc.anchor}, secondary: doc.secondary, explorer: explorer, extend: extending, scroll_x: scroll_x, scroll_y: scroll_y}
+  in_batch := app.search_state.in_event_batch
+  app.search_state = SearchState{document: doc, primary: buffer.Selection{cursor: doc.cursor, anchor: doc.anchor}, secondary: doc.secondary, explorer: explorer, extend: extending, scroll_x: scroll_x, scroll_y: scroll_y, in_event_batch: in_batch}
 }
 fn search_restore(app: *App) {
   state := &app.search_state
@@ -79,9 +82,10 @@ fn search_restore(app: *App) {
 fn search_close(app: *App) {
   pattern.task_finish(app.search_state.task)
   app.search_state.task = nil
-  app.prompt_state.panel = Panel.None
+  app.search_state.preview_pending = false
+  app.prompt_state.panel = .None
   if app.search_state.explorer {
-    app.prompt_state.panel = Panel.Directory
+    app.prompt_state.panel = .Directory
   }
 }
 // Where a search from selection starts: past an empty cursor going forward,
@@ -205,7 +209,22 @@ fn select_matches(doc: *buffer.Document, compiled: *pattern.Pattern, split: bool
   buffer.store(doc, &output)
   return 0
 }
+fn search_preview_request(app: *App) {
+  if app.search_state.in_event_batch {
+    app.search_state.preview_pending = true
+    return
+  }
+  search_preview(app)
+}
+fn search_preview_flush(app: *App) {
+  if !app.search_state.preview_pending { return }
+  app.search_state.preview_pending = false
+  if search_prompt(app.prompt_state.panel) {
+    search_preview(app)
+  }
+}
 fn search_preview(app: *App) {
+  app.search_state.preview_pending = false
   search_restore(app)
   state := &app.search_state
   state.status = 0
@@ -213,13 +232,13 @@ fn search_preview(app: *App) {
   state.task = nil
   if app.prompt_state.length == 0 { return }
   doc := state.document
-  if app.prompt_state.panel != Panel.Search && doc.length >= pattern.BackgroundMinimum {
+  if app.prompt_state.panel != .Search && doc.length >= pattern.BackgroundMinimum {
     mode: u8 = 1
-    if app.prompt_state.panel == Panel.Split {
+    if app.prompt_state.panel == .Split {
       mode = 2
-    } else if app.prompt_state.panel == Panel.Keep {
+    } else if app.prompt_state.panel == .Keep {
       mode = 3
-    } else if app.prompt_state.panel == Panel.Remove {
+    } else if app.prompt_state.panel == .Remove {
       mode = 4
     }
     ranges := buffer.collect(doc)
@@ -231,12 +250,12 @@ fn search_preview(app: *App) {
   }
   preview_regex := VimRegex{}
   preview_query: [4400]u8
-  typed: []const u8 = app.prompt_state.text[..app.prompt_state.length]
-  if app.prompt_state.panel == Panel.Search {
+  typed: str = app.prompt_state.text[..app.prompt_state.length]
+  if app.prompt_state.panel == .Search {
     typed = search_query(app, typed, preview_query[..], &preview_regex)
   }
   // Position items need the document, so those searches stay here.
-  if app.prompt_state.panel == Panel.Search && doc.length >= pattern.BackgroundMinimum && doc.secondary.count == 0 && preview_regex.filter_count == 0 {
+  if app.prompt_state.panel == .Search && doc.length >= pattern.BackgroundMinimum && doc.secondary.count == 0 && preview_regex.filter_count == 0 {
     backwards := app.input_state.search_backwards
     base := search_base(doc, buffer.Selection{anchor: doc.anchor, cursor: doc.cursor}, backwards)
     state.task = pattern.task_start(typed, doc, base, backwards)
@@ -256,12 +275,12 @@ fn search_preview(app: *App) {
   if preview_regex.filter_count > 0 {
     pattern.set_callout(&compiled, search_callout, #cast(rawptr, &callout))
   }
-  if app.prompt_state.panel == Panel.Search {
+  if app.prompt_state.panel == .Search {
     state.status = search_apply(state.document, &compiled, state.extend, app.input_state.search_backwards)
-  } else if app.prompt_state.panel == Panel.Keep || app.prompt_state.panel == Panel.Remove {
-    state.status = filter_selections(state.document, &compiled, app.prompt_state.panel == Panel.Remove)
+  } else if app.prompt_state.panel == .Keep || app.prompt_state.panel == .Remove {
+    state.status = filter_selections(state.document, &compiled, app.prompt_state.panel == .Remove)
   } else {
-    state.status = select_matches(state.document, &compiled, app.prompt_state.panel == Panel.Split)
+    state.status = select_matches(state.document, &compiled, app.prompt_state.panel == .Split)
   }
 }
 // Apply a finished worker search. Returns true when the view changed.
@@ -278,7 +297,7 @@ fn search_tick(app: *App) bool {
     search_preview(app)
     return true
   }
-  if app.prompt_state.panel != Panel.Search {
+  if app.prompt_state.panel != .Search {
     state.status = ranges_status
     if ranges_status == 0 {
       buffer.store(state.document, &ranges_output)
@@ -298,26 +317,25 @@ fn search_tick(app: *App) bool {
   }
   return true
 }
-fn search_pause() {
-  _ = time.sleep(time.Millisecond)
-}
 fn search_waiting(app: *const App) bool {
   return app.search_state.task != nil
 }
 fn search_submit(app: *App) {
+  had_pending := app.search_state.preview_pending
+  app.search_state.preview_pending = false
   // Enter while a worker searches waits for its answer.
-  for app.search_state.task != nil && !pattern.task_done(app.search_state.task) {
-    search_pause()
+  if app.search_state.task != nil {
+    pattern.task_wait(app.search_state.task)
   }
   _ = search_tick(app)
   // An empty preview dismisses immediately; do not repeat an unsuccessful scan.
   // A large document's preview already ran on the worker; repeating it
   // would only start another.
   background := app.search_state.document != nil && app.search_state.document.length >= pattern.BackgroundMinimum
-  if app.prompt_state.length > 0 && app.search_state.status != 1 && !(background && app.search_state.status == 0) {
+  if app.prompt_state.length > 0 && (had_pending || (app.search_state.status != 1 && !(background && app.search_state.status == 0))) {
     search_preview(app)
-    for app.search_state.task != nil && !pattern.task_done(app.search_state.task) {
-      search_pause()
+    if app.search_state.task != nil {
+      pattern.task_wait(app.search_state.task)
     }
     _ = search_tick(app)
   }
@@ -336,7 +354,7 @@ fn search_submit(app: *App) {
     macro_fail(app)
     return
   }
-  if app.prompt_state.panel == Panel.Search {
+  if app.prompt_state.panel == .Search {
     app.search_history.length = copy_text(app.search_history.text[..], app.prompt_state.text[..app.prompt_state.length])
   }
   search_close(app)
@@ -383,9 +401,7 @@ fn search_repeat_windowed(app: *App, doc: *buffer.Document, extending: bool, bac
   regex := VimRegex{}
   task := pattern.task_start(search_query(app, app.search_history.text[..app.search_history.length], query[..], &regex), doc, search_base(doc, original, backwards), backwards)
   if task == nil { return false }
-  for !pattern.task_done(task) {
-    search_pause()
-  }
+  pattern.task_wait(task)
   result := pattern.task_result(task)
   pattern.task_finish(task)
   if result.found {
@@ -398,7 +414,7 @@ fn search_repeat_windowed(app: *App, doc: *buffer.Document, extending: bool, bac
   }
   return true
 }
-fn search_label(app: *const App) []const u8 {
+fn search_label(app: *const App) str {
   if app.prompt_state.length == 0 { return "Type a regular expression. Escape cancels." }
   if app.search_state.status == 1 { return "No matches. Enter or Escape closes." }
   if app.search_state.status == 2 {

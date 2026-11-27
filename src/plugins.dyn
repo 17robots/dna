@@ -1,4 +1,3 @@
-use parse "std/parse"
 use "std/encoding/json"
 
 struct PluginState {
@@ -40,7 +39,7 @@ extern fn plugin_resolve_native "dna_plugin_resolve"(path: *const u8, output: *u
 extern fn plugin_remove_native "dna_plugin_remove"(root: *const u8, name: *const u8) i32
 extern fn plugin_rollback_native "dna_plugin_rollback"(root: *const u8, name: *const u8) i32
 
-fn json_text(value: *const json.Value, key: []const u8) []const u8 {
+fn json_text(value: *const json.Value, key: str) str {
   item := json.object_get(value, key)
   if !json.is_string(item) { return "" }
   return item.text
@@ -58,10 +57,10 @@ fn plugins_running(app: *App) bool {
   }
   return false
 }
-fn plugin_log(app: *App, text: []const u8) {
+fn plugin_log(app: *App, text: str) {
   app.plugin_state.log_length = copy_text(app.plugin_state.log[..], text)
 }
-fn plugin_stop(app: *App, index: usize, reason: []const u8) {
+fn plugin_stop(app: *App, index: usize, reason: str) {
   plugin := &app.plugin_state.slots[index]
   errors: [4096]u8
   error_length: usize = 0
@@ -72,12 +71,10 @@ fn plugin_stop(app: *App, index: usize, reason: []const u8) {
   }
   plugin.active = false
   plugin.deadline = 0
-  item: usize = 0
-  for item < app.plugin_state.command_count {
+  for item in 0..app.plugin_state.command_count {
     if app.plugin_state.commands[item].owner == index {
       app.plugin_state.commands[item].length = 0
     }
-    item += 1
   }
   app.command_menu.cached = false
   plugin_log(app, reason)
@@ -88,7 +85,7 @@ fn plugin_stop(app: *App, index: usize, reason: []const u8) {
 }
 // Installation is local registration: this manifest points at a trusted local
 // executable. No code executes merely by opening a project or listing plugins.
-fn plugin_prepare(app: *App, manifest: []const u8) {
+fn plugin_prepare(app: *App, manifest: str) {
   storage: [4096]u8
   expanded: [4096]u8
   path := files.resolve(expand_home(manifest, expanded[..]), storage[..])
@@ -241,7 +238,7 @@ fn plugin_prepare(app: *App, manifest: []const u8) {
   }
   add_text(app.prompt_state.message[..], &used, "\nThis executable runs with your OS account permissions. API permissions do not sandbox filesystem/network access.\n\nEnter starts / updates this plugin; Escape cancels.")
   app.prompt_state.message_length = used
-  app.prompt_state.panel = Panel.PluginGrant
+  app.prompt_state.panel = .PluginGrant
 }
 fn plugin_start_pending(app: *App) {
   plugin := &app.plugin_state.pending
@@ -256,9 +253,9 @@ fn plugin_start_pending(app: *App) {
   app.plugin_state.slots[index].process = process_handle
   app.plugin_state.slots[index].active = true
   app.plugin_state.slots[index].deadline = sdl.ticks() + #cast(u64, app.config.plugin_timeout_ms)
-  greeting: []const u8 = "{\"type\":\"initialize\",\"version\":1}\n"
+  greeting: str = "{\"type\":\"initialize\",\"version\":1}\n"
   _ = plugin_send(process_handle, &greeting[0], greeting.len)
-  app.prompt_state.panel = Panel.None
+  app.prompt_state.panel = .None
 }
 fn plugin_run_command(app: *App, command_index: usize) {
   if command_index >= app.plugin_state.command_count || app.plugin_state.commands[command_index].length == 0 {
@@ -277,7 +274,7 @@ fn plugin_run_command(app: *App, command_index: usize) {
     notice(app, "Plugin protocol v1 currently limits document requests to 64 KiB.")
     return
   }
-  allocated := arena_owner.create((1048576))
+  allocated := arena_owner.create(1048576)
   defer arena_owner.release(allocated)
   message := mem.push_bytes(allocated, 524288)
   escaped := mem.push_bytes(allocated, 524288)
@@ -303,7 +300,7 @@ fn plugin_run_command(app: *App, command_index: usize) {
   } else {
     plugin.deadline = sdl.ticks() + #cast(u64, app.config.plugin_timeout_ms)
   }
-  app.prompt_state.panel = Panel.None
+  app.prompt_state.panel = .None
 }
 fn json_unsigned(value: *const json.Value) usize {
   if !json.is_number(value) || value.text.len == 0 || value.text.len > 15 { return #max(usize) }
@@ -314,7 +311,7 @@ fn json_unsigned(value: *const json.Value) usize {
   }
   return result
 }
-fn plugin_message(app: *App, index: usize, source: []const u8) {
+fn plugin_message(app: *App, index: usize, source: str) {
   if !utf8.valid(source) {
     plugin_stop(app, index, "Plugin sent invalid UTF-8; disabled.")
     return
@@ -390,7 +387,7 @@ fn plugin_message(app: *App, index: usize, source: []const u8) {
       return
     }
     // Never interrupt an active prompt with an unsolicited buffer.
-    if app.prompt_state.panel != Panel.None {
+    if app.prompt_state.panel != .None {
       plugin_log(app, "Plugin buffer deferred: close the current prompt and invoke its command again.")
       return
     }
@@ -412,7 +409,7 @@ fn plugin_message(app: *App, index: usize, source: []const u8) {
       plugin_log(app, "Plugin edit rejected: stale buffer/revision or invalid text.")
       return
     }
-    if app.prompt_state.panel != Panel.None {
+    if app.prompt_state.panel != .None {
       plugin_log(app, "Plugin edit rejected while another prompt is active. Invoke again.")
       return
     }
@@ -421,7 +418,7 @@ fn plugin_message(app: *App, index: usize, source: []const u8) {
     app.plugin_state.edit_revision = revision
     app.plugin_state.edit_identity = app.documents.slots[target].identity
     app.plugin_state.edit_document = app.documents.slots[target].document
-    app.prompt_state.panel = Panel.PluginEdit
+    app.prompt_state.panel = .PluginEdit
     app.prompt_state.message_length = copy_text(app.prompt_state.message[..], "Plugin replacement preview (whole buffer).\nEnter applies as one undoable edit; Escape cancels.\n\n")
     preview_length := replacement.len
     if preview_length > 7000 {
@@ -473,10 +470,10 @@ fn plugin_apply_edit(app: *App) {
   doc.cursor = doc.length
   _ = buffer.replace(doc, app.plugin_state.edit[..app.plugin_state.edit_length])
   buffer.checkpoint(doc)
-  app.prompt_state.panel = Panel.None
+  app.prompt_state.panel = .None
 }
 
-fn plugin_event(app: *App, event: []const u8) {
+fn plugin_event(app: *App, event: str) {
   message: [256]u8
   used: usize = 0
   add_text(message[..], &used, "{\"type\":\"event\",\"name\":\"")
@@ -532,7 +529,7 @@ fn plugin_list(app: *App) {
       }
     }
   }
-  allocated := arena_owner.create((262144))
+  allocated := arena_owner.create(262144)
   catalog := plugin_catalog(app, allocated)
   if catalog != nil {
     add_text(text[..], &used, "\nAvailable from your catalog (not installed):\n")
@@ -564,9 +561,9 @@ fn plugin_list(app: *App) {
   notice(app, text[..used])
 }
 
-fn plugin_install(app: *App, source: []const u8) bool {
+fn plugin_install(app: *App, source: str) bool {
   plugin_prepare(app, source)
-  if app.prompt_state.panel != Panel.PluginGrant { return false }
+  if app.prompt_state.panel != .PluginGrant { return false }
   // Copying is inert. Loading still requires accepting the API permissions.
   pending := &app.plugin_state.pending
   root: [4096]u8
@@ -599,7 +596,7 @@ fn plugin_install(app: *App, source: []const u8) bool {
   notice(app, "Plugin installed or updated locally. Use :plugin-load <name> to review permissions and start it. Previous installed versions are retained as hidden directories.")
   return true
 }
-fn plugin_load_named(app: *App, name: []const u8) {
+fn plugin_load_named(app: *App, name: str) {
   if !valid_leaf(name) {
     plugin_prepare(app, name)
     return
@@ -615,18 +612,18 @@ fn plugin_load_named(app: *App, name: []const u8) {
   add_text(path[..], &length, "/plugin.json")
   plugin_prepare(app, path[..length])
 }
-fn plugin_disable_named(app: *App, name: []const u8) {
+fn plugin_disable_named(app: *App, name: str) {
   for index in 0..8 {
     plugin := &app.plugin_state.slots[index]
     if buffer.equal(plugin.name[..plugin.length], name) {
       plugin_stop(app, index, "Plugin disabled by user.")
-      app.prompt_state.panel = Panel.None
+      app.prompt_state.panel = .None
       return
     }
   }
   notice(app, "No session plugin has that name.")
 }
-fn plugin_update(app: *App, name: []const u8) {
+fn plugin_update(app: *App, name: str) {
   if !valid_leaf(name) {
     if plugin_install(app, name) {
       notice(app, "Updated installation. Use :plugin-load <name> to review permissions and restart.")
@@ -680,12 +677,12 @@ fn plugin_catalog(app: *App, arena: *mem.Arena) *const json.Value {
   if !json.is_object(root) { return nil }
   return root
 }
-fn plugin_install_named(app: *App, source: []const u8) {
+fn plugin_install_named(app: *App, source: str) {
   if !valid_leaf(source) {
     _ = plugin_install(app, source)
     return
   }
-  allocated := arena_owner.create((262144))
+  allocated := arena_owner.create(262144)
   defer arena_owner.release(allocated)
   catalog := plugin_catalog(app, allocated)
   entry := json.object_get(catalog, source)
@@ -699,7 +696,7 @@ fn plugin_install_named(app: *App, source: []const u8) {
     }
   }
 }
-fn plugin_remove(app: *App, name: []const u8) {
+fn plugin_remove(app: *App, name: str) {
   if !valid_leaf(name) {
     notice(app, "Use :plugin-remove <installed name>.")
     return
@@ -721,7 +718,7 @@ fn plugin_remove(app: *App, name: []const u8) {
   notice(app, "Plugin removed from installed list. Its files remain in a hidden .removed- directory beside installed plugins.")
 }
 
-fn plugin_rollback(app: *App, name: []const u8) {
+fn plugin_rollback(app: *App, name: str) {
   if !valid_leaf(name) {
     notice(app, "Use :plugin-rollback <installed name>.")
     return

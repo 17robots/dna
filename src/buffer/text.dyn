@@ -32,14 +32,20 @@ pub fn byte_at(document: *const Document, offset: usize) u8 {
   }
   return #slice(document.cache_data, document.cache_high - document.cache_low)[offset - document.cache_low]
 }
-pub fn chunk_at(document: *const Document, offset: usize) []const u8 {
+pub fn find_byte_in(text: str, offset: usize, byte: u8) usize {
+  if offset >= text.len { return text.len }
+  hit := find_byte(&text[offset], byte, text.len - offset)
+  if hit == nil { return text.len }
+  return #cast(usize, hit) - #cast(usize, &text[0])
+}
+pub fn chunk_at(document: *const Document, offset: usize) str {
   if offset >= document.length { return "" }
   if offset < document.cache_low || offset >= document.cache_high {
     cache_run(document, offset)
   }
   return #slice(document.cache_data, document.cache_high - document.cache_low)[offset - document.cache_low..]
 }
-pub fn range(document: *const Document, low: usize, high: usize) []const u8 {
+pub fn range(document: *const Document, low: usize, high: usize) str {
   if high <= low { return zero_byte[..0] }
   if low < document.cache_low || low >= document.cache_high {
     cache_run(document, low)
@@ -49,7 +55,7 @@ pub fn range(document: *const Document, low: usize, high: usize) []const u8 {
   }
   return flatten(document, low, high)
 }
-pub fn all(document: *const Document) []const u8 {
+pub fn all(document: *const Document) str {
   return range(document, 0, document.length)
 }
 // Pointer to bytes low..high as one run, for native calls taking pointer and
@@ -58,7 +64,7 @@ pub fn pointer(document: *const Document, low: usize, high: usize) *const u8 {
   if high <= low { return &zero_byte[0] }
   return &range(document, low, high)[0]
 }
-fn flatten(document: *const Document, low: usize, high: usize) []const u8 {
+fn flatten(document: *const Document, low: usize, high: usize) str {
   writable := mutable(document)
   view := writable.views
   for view != nil {
@@ -130,7 +136,7 @@ pub fn copy_range(document: *const Document, low: usize, high: usize, output: []
 }
 // Storage a file can be read into directly, so loading it needs no second
 // copy. Release unless consumed by load_storage.
-pub struct TextStorage { block: *RopeBlock, bytes: []u8 }
+pub nocopy struct TextStorage { block: *RopeBlock, bytes: []u8 }
 pub fn storage_create(size: usize) TextStorage {
   block := #cast(*RopeBlock, rope_malloc(#sizeof(RopeBlock)))
   if block == nil { return TextStorage{} }
@@ -168,10 +174,9 @@ pub fn storage_release(storage: *TextStorage) {
 // storage; on failure the document is unchanged and storage stays the caller's.
 pub fn load_storage(document: *Document, storage: *TextStorage, length: usize) bool {
   if storage.block == nil { return false }
-  loaded := rope_load_block(storage.block, length)
-  if !loaded.valid { return false }
+  root := rope_load_block(storage.block, length) catch { return false }
   storage_release(storage)
-  return load_root(document, loaded.root)
+  return load_root(document, root)
 }
 // Record the open file storage was read from; the block closes it when freed.
 pub fn storage_set_origin(storage: *TextStorage, descriptor: isize, stamp: [6]u64, close: fn(isize)) {
@@ -184,7 +189,7 @@ pub fn storage_set_origin(storage: *TextStorage, descriptor: isize, stamp: [6]u6
 // The contiguous run at offset and, when it is still the bytes read from a
 // file, that file's descriptor, the run's offset in it and its stamp then.
 // mapped: the bytes are a file mapping, valid only while the stamp holds.
-pub struct TextSource { bytes: []const u8, descriptor: isize, offset: u64, stamp: [6]u64, mapped: bool }
+pub struct TextSource { bytes: str, descriptor: isize, offset: u64, stamp: [6]u64, mapped: bool }
 pub fn source_at(document: *const Document, offset: usize) TextSource {
   return root_source_at(document.root, offset)
 }
@@ -204,7 +209,7 @@ fn root_source_at(root: *const RopeNode, offset: usize) TextSource {
 // A read-only view of the text at one revision that another thread may read
 // while the document keeps changing: the tree is immutable and retained.
 // Take and release only on the thread that owns the document.
-pub struct TextSnapshot { root: *RopeNode, length: usize, revision: u64 }
+pub nocopy struct TextSnapshot { root: *RopeNode, length: usize, revision: u64 }
 // Main-thread metadata update after our own atomic rename unlinks an origin.
 // Text remains immutable. Save workers have joined before this is called;
 // search workers read bytes and do not consult origin stamps.
@@ -227,7 +232,7 @@ pub fn snapshot_release(snapshot: *TextSnapshot) {
 // Copy bytes low..high into output. Safe from any thread; allocates nothing.
 // The stored run holding offset, from offset on; empty at the end. Reads no
 // document state, so any thread may call it.
-pub fn snapshot_chunk(snapshot: *const TextSnapshot, offset: usize) []const u8 {
+pub fn snapshot_chunk(snapshot: *const TextSnapshot, offset: usize) str {
   if offset >= snapshot.length { return "" }
   run := rope_run(snapshot.root, offset)
   return #slice(run.data, run.high - run.low)[offset - run.low..]

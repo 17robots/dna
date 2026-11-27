@@ -39,7 +39,7 @@ struct NativeGlyphPage { values: [256]*NativeGlyph }
 struct NativeFont {
   owner: *mem.Arena,
   file: *mem.Arena,
-  mapping: []const u8,
+  mapping: str,
   face: font_api.Face,
   freetype: ft.Font,
   metrics: ft.FaceMetrics,
@@ -54,12 +54,13 @@ struct NativeFont {
   glyph_memory: *mem.Arena,
   glyphs: [256]*NativeGlyphPage,
   measure: *mem.Arena,
-  measure_text: []const u8,
+  measure_text: str,
   measure_width, measure_height: i32,
   measure_revision: u64,
   measure_fallback_count: usize,
   measure_fallback_revisions: [16]u64,
   measure_valid: bool,
+  selection_scratch: *mem.Arena,
 }
 struct NativeText {
   owner: *mem.Arena,
@@ -85,7 +86,7 @@ struct NativeLibraries {
   closing: bool,
 }
 native_libraries: NativeLibraries
-fn native_library(names: []const []const u8) dynlib.Handle {
+fn native_library(names: []const str) dynlib.Handle {
   for name in names {
     loaded := dynlib.open(name, dynlib.Now|dynlib.Local) catch nil
     if loaded != nil { return loaded }
@@ -98,8 +99,8 @@ pub fn init() bool {
     if native_libraries.closing { return false }
   }
   if native_libraries.harfbuzz!=nil { return !native_libraries.closing }
-  hb_names: [5][]const u8=["libharfbuzz.so.0", "libharfbuzz.so", "libharfbuzz.0.dylib", "libharfbuzz-0.dll", "@rpath/libharfbuzz.0.dylib"]
-  fb_names: [5][]const u8=["libfribidi.so.0", "libfribidi.so", "libfribidi.0.dylib", "libfribidi-0.dll", "@rpath/libfribidi.0.dylib"]
+  hb_names: [5]str=["libharfbuzz.so.0", "libharfbuzz.so", "libharfbuzz.0.dylib", "libharfbuzz-0.dll", "@rpath/libharfbuzz.0.dylib"]
+  fb_names: [5]str=["libfribidi.so.0", "libfribidi.so", "libfribidi.0.dylib", "libfribidi-0.dll", "@rpath/libfribidi.0.dylib"]
   hb_handle:=native_library(hb_names[..])
   if hb_handle==nil { return false }
   hb_api := hb.load(hb_handle) catch {
@@ -116,7 +117,7 @@ pub fn init() bool {
     dynlib.close(&hb_handle) catch {}
     return false
   }
-  ft_names:[5][]const u8=["libfreetype.so.6", "libfreetype.so", "libfreetype.6.dylib", "libfreetype-6.dll", "@rpath/libfreetype.6.dylib"]
+  ft_names:[5]str=["libfreetype.so.6", "libfreetype.so", "libfreetype.6.dylib", "libfreetype-6.dll", "@rpath/libfreetype.6.dylib"]
   ft_handle:=native_library(ft_names[..])
   if ft_handle==nil {
     dynlib.close(&fb_handle) catch {}
@@ -185,7 +186,7 @@ fn ttf_font_height(handle: rawptr) i32 {
 }
 // HarfBuzz borrows the immutable bytes retained by NativeFont.file. Destroy
 // its font before releasing file storage; HB_MEMORY_MODE_READONLY is 1.
-fn native_shaping_font(bytes: []const u8) rawptr {
+fn native_shaping_font(bytes: str) rawptr {
   if bytes.len==0 || #cast(u64, bytes.len)>0xffffffff { return nil }
   api:=&native_libraries.hb
   blob:=api.blob_create(&bytes[0], #cast(u32, bytes.len), 1, nil, nil)
@@ -216,11 +217,11 @@ fn native_shaping_font(bytes: []const u8) rawptr {
 // Other fonts are copied, because truncating a mapped file would turn shaping
 // or rasterization into a mapping fault; read_all sizes regular files exactly.
 // Packages replace system fonts by rename, which leaves a mapping intact.
-fn native_font_mappable(path:[]const u8) bool {
+fn native_font_mappable(path:str) bool {
   if byte_ops.contains(path, "/../") || byte_ops.contains(path, "/./") { return false }
   return byte_ops.starts_with(path, "/usr/share/fonts/") || byte_ops.starts_with(path, "/usr/lib/fonts/")
 }
-fn native_font_map(path:[]const u8) []const u8!io.IoErr {
+fn native_font_map(path:str) str!io.IoErr {
   opened := try std_fs.open(path)
   defer std_fs.close(&opened)
   info := try std_fs.file_metadata(&opened)
@@ -240,12 +241,12 @@ fn ttf_open(path: *const u8, points: f32) rawptr {
   if path == nil || !native_points(points) || !init() { return nil }
   length := c.string_length(path, 4096)
   if length == 0 || length == 4096 { return nil }
-  mapping: []const u8
+  mapping: str
   if native_font_mappable(#slice(path, length)) {
     mapping = native_font_map(#slice(path, length)) catch mapping
   }
   file: *mem.Arena = nil
-  contents: []const u8 = mapping
+  contents: str = mapping
   if contents.len == 0 {
     file = mem.arena_alloc(65536)
     copied := std_fs.read_all(file, #slice(path, length), 67108864) catch {
@@ -288,7 +289,7 @@ fn ttf_open(path: *const u8, points: f32) rawptr {
   }
   return finish_ttf_open(font, owner, contents)
 }
-fn finish_ttf_open(font: *NativeFont, owner: *mem.Arena, contents: []const u8) rawptr {
+fn finish_ttf_open(font: *NativeFont, owner: *mem.Arena, contents: str) rawptr {
   shaped:=native_shaping_font(contents)
   if shaped==nil {
     if font.freetype.face!=nil {
@@ -308,6 +309,7 @@ fn ttf_close(handle: rawptr) {
   font := #cast(*NativeFont, handle)
   mem.arena_release(font.glyph_memory)
   mem.arena_release(font.measure)
+  mem.arena_release(font.selection_scratch)
   native_libraries.hb.font_destroy(font.shaped)
   if font.freetype.face!=nil {
     ft.close(&font.freetype)
@@ -361,7 +363,7 @@ fn native_shape_size(font:*NativeFont) {
     font.space=#cast(f64, shape[0].x_advance)/64.0
   }
 }
-fn native_covered(font:*NativeFont, grapheme:[]const u8) bool {
+fn native_covered(font:*NativeFont, grapheme:str) bool {
   at:usize=0
   for at<grapheme.len {
     scalar:=utf8.decode(grapheme, at)
@@ -373,7 +375,7 @@ fn native_covered(font:*NativeFont, grapheme:[]const u8) bool {
   }
   return true
 }
-fn native_select(data:rawptr, grapheme:[]const u8) text_layout.Face {
+fn native_select(data:rawptr, grapheme:str) text_layout.Face {
   primary:=#cast(*NativeFont, data)
   selected:=primary
   if !native_covered(primary, grapheme) {
@@ -423,7 +425,7 @@ fn native_bitmap(font:*NativeFont, index:u16) *NativeGlyph {
     page=mem.push<NativeGlyphPage>(font.glyph_memory)
     font.glyphs[page_index]=page
   }
-  coverage_gamma(bitmap.pixels[..#cast(usize, bitmap.width)*#cast(usize, bitmap.height)])
+  coverage_gamma(bitmap.pixels[..bitmap.width * bitmap.height])
   glyph:=mem.push<NativeGlyph>(font.glyph_memory)
   native_glyph_serial+=1
   if native_glyph_serial==0 {
@@ -434,7 +436,7 @@ fn native_bitmap(font:*NativeFont, index:u16) *NativeGlyph {
   page.values[offset]=glyph
   return glyph
 }
-fn native_build(arena:*mem.Arena, font:*NativeFont, text:[]const u8, wrap:i32) text_layout.Layout!io.IoErr {
+fn native_build(arena:*mem.Arena, font:*NativeFont, text:str, wrap:i32) text_layout.Layout!io.IoErr {
   if !utf8.valid(text) || text.len>2147483647 { fail .InvalidInput }
   return try text_layout.build(arena, text, text_layout.Font{data:#cast(rawptr, font), select:native_select, line_height:native_line(font), space_advance:font.space}, &native_libraries.hb, &native_libraries.fb, text_layout.Options{width:wrap, no_wrap:wrap<=0})
 }
@@ -447,7 +449,7 @@ fn native_revisions_match(text: *const NativeText, font: *const NativeFont) bool
   }
   return true
 }
-fn native_update(text: *NativeText, font: *NativeFont, source: []const u8, wrap: i32) bool {
+fn native_update(text: *NativeText, font: *NativeFont, source: str, wrap: i32) bool {
   if source.len>2147483647 || wrap<0 { return false }
   if text.wrap==wrap && native_revisions_match(text, font) && byte_ops.equal(text.layout.text, source) {
     return true
@@ -709,9 +711,9 @@ fn ttf_draw_colored(handle:rawptr, x, y:f32, color:fn(rawptr, usize)u32, data:ra
     blue:=text.blue
     if color!=nil {
       ink:=color(data, glyph.start)
-      red=#cast(u8, (ink>>16)&255)
-      green=#cast(u8, (ink>>8)&255)
-      blue=#cast(u8, ink&255)
+      red = (ink >> 16) & 255
+      green = (ink >> 8) & 255
+      blue = ink & 255
     }
     baseline:=math.ceil64(#cast(f64, text.font.metrics.ascent)*#cast(f64, native_em(text.font))/#cast(f64, text.font.metrics.units_per_em))
     if !sdl.native_text_cached_bitmap(text.renderer, bitmap.key, &value.pixels[0], #cast(i32, value.width), #cast(i32, value.height), x+#cast(f32, glyph.x+glyph.x_offset)+#cast(f32, value.x_offset), y+#cast(f32, glyph.y+glyph.y_offset+baseline)+#cast(f32, value.y_offset), red, green, blue, text.alpha) {
@@ -736,8 +738,20 @@ fn ttf_selection(handle:rawptr, start, end:usize, callback:fn(rawptr, *const Sub
   if handle==nil || callback==nil || start>end || end>2147483647 { return false }
   text:=#cast(*NativeText, handle)
   if !native_current(text) { return false }
-  arena:=mem.arena_alloc(65536)
-  defer mem.arena_release(arena)
+  font := text.font
+  if font.selection_scratch == nil {
+    font.selection_scratch = mem.arena_alloc(65536)
+  }
+  arena := font.selection_scratch
+  mem.arena_reset(arena)
+  defer {
+    if arena.backing > 65536 {
+      mem.arena_release(arena)
+      font.selection_scratch = nil
+    } else {
+      mem.arena_reset(arena)
+    }
+  }
   regions := text_layout.selection(arena, &text.layout, start, end) catch {
     return false
   }

@@ -5,7 +5,7 @@
 // bounded room for that working set and changing cursor/status labels.
 const UiTextCapacity: usize = 256
 const UiTextBuckets: usize = 64
-const UiTextBytes: usize = 8192
+const UiTextBytes: usize = 512
 struct UiCachedText {
   handle: rawptr,
   hash: u64,
@@ -59,11 +59,12 @@ fn ui_cache_release(typography: *Typography) {
     typography.ui_cache = nil
   }
 }
-fn cached_ui_text(typography: *Typography, text: []const u8) rawptr {
+fn cached_ui_text(typography: *Typography, text: str) rawptr {
   if text.len == 0 || text.len >= UiTextBytes { return nil }
 
   if typography.ui_cache == nil {
-    allocated := arena_owner.create((#sizeof(UiTextCache) + 16))
+    allocated := arena_owner.create(#sizeof(UiTextCache) + 16)
+    host.small_pages(allocated.data)
     typography.ui_owner = allocated
     allocated = nil
 
@@ -74,19 +75,8 @@ fn cached_ui_text(typography: *Typography, text: []const u8) rawptr {
       allocation_record(typography.observer, "ui_text_cache", #sizeof(UiTextCache) + 16, typography.ui_born, false)
     }
 
-    created_cache := mem.push<UiTextCache>(typography.ui_owner)
-
-    if created_cache == nil {
-      arena_owner.release(typography.ui_owner)
-      typography.ui_owner = nil
-      if typography.observer != nil {
-        allocation_record(typography.observer, "ui_text_cache", #sizeof(UiTextCache) + 16, typography.ui_born, true)
-      }
-      return nil
-    }
-
-    // Initialize metadata only; byte slots are initialized when populated.
-    mem.zero(#slice((#cast(*u8, created_cache)), #cast(usize, &created_cache.bytes[0]) - #cast(usize, created_cache)))
+    // Fresh OS pages stay untouched by push_array; only buckets need non-zero sentinels.
+    created_cache := &mem.push_array<UiTextCache>(typography.ui_owner, 1)[0]
     for bucket_index in 0..UiTextBuckets {
       created_cache.buckets[bucket_index] = UiTextCapacity
     }
@@ -97,9 +87,9 @@ fn cached_ui_text(typography: *Typography, text: []const u8) rawptr {
   cache.serial += 1
   hash: u64 = 5381
   for byte in text {
-    hash = ((hash * 33) ^ byte) % 4294967296
+    hash = #wrapping(hash * 33) ^ byte
   }
-  bucket := #cast(usize, ((hash ^ (hash >> 16)) % UiTextBuckets))
+  bucket := #cast(usize, (hash ^ (hash >> 16)) & (UiTextBuckets - 1))
   index := cache.buckets[bucket]
 
   for index != UiTextCapacity {
@@ -118,17 +108,14 @@ fn cached_ui_text(typography: *Typography, text: []const u8) rawptr {
 
   if chosen == UiTextCapacity {
     chosen = 0
-    index = 1
-
-    for index < UiTextCapacity {
-      if cache.entries[index].stamp < cache.entries[chosen].stamp {
-        chosen = index
+    for slot in 1..UiTextCapacity {
+      if cache.entries[slot].stamp < cache.entries[chosen].stamp {
+        chosen = slot
       }
-      index += 1
     }
 
     previous := &cache.entries[chosen]
-    old_bucket := #cast(usize, ((previous.hash ^ (previous.hash >> 16)) % UiTextBuckets))
+    old_bucket := #cast(usize, (previous.hash ^ (previous.hash >> 16)) & (UiTextBuckets - 1))
     link := &cache.buckets[old_bucket]
 
     for link.* != UiTextCapacity && link.* != chosen {

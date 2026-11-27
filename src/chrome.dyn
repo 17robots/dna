@@ -2,23 +2,21 @@ use "std/math"
 
 struct WindowTitleState {
   text: [8192]u8,
-  length: usize,
+  name_start, name_end: usize,
+  dirty, insert, extend, ready: bool,
 }
 
 fn add_number(output: []u8, used: *usize, number: usize) {
   digits: [24]u8
   value := number
-  count: usize = 0
-  for true {
-    digits[count] = #cast(u8, (value % 10)) + 48
-    count += 1
+  at: usize = 24
+  for {
+    at -= 1
+    digits[at] = #cast(u8, value % 10) + '0'
     value /= 10
     if value == 0 { break }
   }
-  for count > 0 {
-    count -= 1
-    add_text(output, used, digits[count..count + 1])
-  }
+  add_text(output, used, digits[at..])
 }
 fn line_number(doc: *const buffer.Document) usize {
   return line_at(doc, doc.cursor)
@@ -26,7 +24,7 @@ fn line_number(doc: *const buffer.Document) usize {
 fn line_at(doc: *const buffer.Document, position: usize) usize {
   return buffer.row_at(doc, position) + 1
 }
-fn chrome_text(typography: *Typography, text: []const u8, x: f32, y: f32, active: bool) {
+fn chrome_text(typography: *Typography, text: str, x: f32, y: f32, active: bool) {
   color := theme().muted
   if active {
     color = theme().text
@@ -62,14 +60,16 @@ fn draw_chrome(renderer: rawptr, app: *App, typography: *Typography, width: i32,
 }
 
 // Git markers sit in the gap between the numbers and the text.
-fn draw_git_sign(typography: *Typography, kind: u8, x: f32, y: f32) {
-  text: []const u8 = "▎"
+fn draw_git_sign(typography: *Typography, kind: GitHunkKind, x: f32, y: f32) {
+  text: str = "▎"
   color := theme().syntax_string
-  if kind == GitModified {
-    color = theme().diagnostic_warning
-  } else if kind == GitDeleted {
-    text = "▔"
-    color = theme().diagnostic_error
+  case kind {
+    .Modified => { color = theme().diagnostic_warning }
+    .Deleted => {
+      text = "▔"
+      color = theme().diagnostic_error
+    }
+    .Added, .None => {}
   }
   if !tint(typography.chrome, color) || !ttf.set(typography.chrome, &text[0], text.len) || !ttf.draw(typography.chrome, x, y) {
     #panic("git sign draw failed")
@@ -91,7 +91,7 @@ fn draw_gutter(doc: *const buffer.Document, typography: *Typography, right: f32,
   hunk: usize = 0
   hunks := git_current(diff, doc)
   y := top + #cast(f32, first) * typography.line - scroll_y
-  for true {
+  for {
     if y >= bottom { break }
     if y + typography.line > top {
       number := row
@@ -123,7 +123,7 @@ fn draw_gutter(doc: *const buffer.Document, typography: *Typography, right: f32,
         if hunk < diff.hunk_count {
           item := diff.hunks[hunk]
           // A deletion after the last line shows on the last line.
-          if item.first <= index || (row >= doc.line_count && item.kind == GitDeleted) {
+          if item.first <= index || (row >= doc.line_count && item.kind == .Deleted) {
             draw_git_sign(typography, item.kind, right - 1.75 * typography.cell, y)
           }
         }
@@ -136,7 +136,7 @@ fn draw_gutter(doc: *const buffer.Document, typography: *Typography, right: f32,
 }
 const StatusBase: usize = 1000000
 // One status segment; clickable segments run a command for their pane.
-fn status_segment(app: *App, ui: *UiState, pane: usize, name: []const u8, text: []const u8, command: usize, flags: u32) {
+fn status_segment(app: *App, ui: *UiState, pane: usize, name: str, text: str, command: usize, flags: u32) {
   segment_flags := flags | UiText
   // Focus remains readable even when the caret is hidden by a panel or blink.
   // Use existing theme inks, keeping segment dimensions and hit targets stable.
@@ -155,8 +155,8 @@ fn status_segment(app: *App, ui: *UiState, pane: usize, name: []const u8, text: 
   ui_text_set(ui, segment, text)
   ui.boxes[segment].value = StatusBase + pane * 1000 + command
   ui.boxes[segment].padding[0] = ui.cell
-  ui_size(ui, segment, UiAxisX, UiSizeKind.Text, 0.0, 1.0)
-  ui_size(ui, segment, UiAxisY, UiSizeKind.Percent, 1.0, 1.0)
+  ui_size(ui, segment, UiAxisX, .Text, 0.0, 1.0)
+  ui_size(ui, segment, UiAxisY, .Percent, 1.0, 1.0)
   ui_animate(app, ui, segment, false)
 }
 // A new file label grows like a small tab. The source text stays opaque and
@@ -207,11 +207,11 @@ fn status_file_width(app: *App, ui: *UiState, pane: usize, target: f32) f32 {
   }
   return state.width
 }
-fn status_file_segment(app: *App, ui: *UiState, pane: usize, text: []const u8) {
+fn status_file_segment(app: *App, ui: *UiState, pane: usize, text: str) {
   status_segment(app, ui, pane, "file", text, 21, UiClip)
   segment := ui.boxes[ui_parent(ui)].last
   width := status_file_width(app, ui, pane, ui_text_width(ui, text) + ui.cell * 2.0)
-  ui_size(ui, segment, UiAxisX, UiSizeKind.Pixels, width / ui.scale, 1.0)
+  ui_size(ui, segment, UiAxisX, .Pixels, width / ui.scale, 1.0)
 }
 // Status line built from segments. Clicking the file or buffer count opens
 // the buffer picker, the filetype sets the language, !N lists diagnostics,
@@ -231,21 +231,21 @@ fn draw_status(renderer: rawptr, app: *App, typography: *Typography, width: i32,
   if ui.boxes[bar].padding[0] < 0.0 {
     ui.boxes[bar].padding[0] = 0.0
   }
-  ui_size(ui, bar, UiAxisX, UiSizeKind.Pixels, #cast(f32, width) / typography.scale, 1.0)
-  ui_size(ui, bar, UiAxisY, UiSizeKind.Pixels, typography.line / typography.scale, 1.0)
+  ui_size(ui, bar, UiAxisX, .Pixels, #cast(f32, width) / typography.scale, 1.0)
+  ui_size(ui, bar, UiAxisY, .Pixels, typography.line / typography.scale, 1.0)
   ui_push(ui, bar)
-  mode: []const u8 = "NORMAL"
+  mode: str = "NORMAL"
   if app.view.insert && app.config.vim_keys && app.vim.replacing {
     mode = "REPLACE"
   } else if app.view.insert {
     mode = "INSERT"
   } else if app.view.extend {
     mode = "SELECT"
-  } else if app.config.vim_keys && app.vim.mode == VimMode.Visual {
+  } else if app.config.vim_keys && app.vim.mode == .Visual {
     mode = "VISUAL"
-  } else if app.config.vim_keys && app.vim.mode == VimMode.VisualLine {
+  } else if app.config.vim_keys && app.vim.mode == .VisualLine {
     mode = "V-LINE"
-  } else if app.config.vim_keys && app.vim.mode == VimMode.VisualBlock {
+  } else if app.config.vim_keys && app.vim.mode == .VisualBlock {
     mode = "V-BLOCK"
   }
   if app.macro_state.recording {
@@ -328,7 +328,7 @@ fn draw_status(renderer: rawptr, app: *App, typography: *Typography, width: i32,
   }
   // Vim normal mode keeps a one-character Helix-style selection internally;
   // only visual modes select anything the user can see.
-  vim_selecting := !app.config.vim_keys || app.vim.mode == VimMode.Visual || app.vim.mode == VimMode.VisualLine || app.vim.mode == VimMode.VisualBlock || app.view.extend
+  vim_selecting := !app.config.vim_keys || app.vim.mode == .Visual || app.vim.mode == .VisualLine || app.vim.mode == .VisualBlock || app.view.extend
   if doc.anchor != doc.cursor && vim_selecting {
     chosen: [32]u8
     chosen_length := copy_text(chosen[..], "selected ")
@@ -357,7 +357,7 @@ fn draw_status(renderer: rawptr, app: *App, typography: *Typography, width: i32,
         // The message yields space first and clips at the pane edge.
         status_segment(app, ui, pane, "message", message[..message_length], 80, UiClip)
         last := ui.boxes[bar].last
-        ui_size(ui, last, UiAxisX, UiSizeKind.Text, 0.0, 0.0)
+        ui_size(ui, last, UiAxisX, .Text, 0.0, 0.0)
         break
       }
       diagnostic_index += 1

@@ -17,7 +17,7 @@ fn windows_err(code: u32) io.IoErr {
   return io.windows_err(0 - #cast(isize, code))
 }
 fn windows_private_descriptor_for(directory: bool, executable: bool, output: *rawptr) !io.IoErr {
-  text: []const u8 = "D:P(A;;FRFWSDWDWO;;;OW)"
+  text: str = "D:P(A;;FRFWSDWDWO;;;OW)"
   if directory {
     text = "D:P(A;OICI;FA;;;OW)"
   } else if executable {
@@ -55,7 +55,7 @@ extern fn fs_move "MoveFileExW"(old: *const u16, new: *const u16, flags: u32) i3
 extern fn fs_delete "DeleteFileW"(path: *const u16) i32
 extern fn fs_mkdir "CreateDirectoryW"(path: *const u16, security: rawptr) i32
 extern fn fs_rmdir "RemoveDirectoryW"(path: *const u16) i32
-fn windows_path(path: []const u8, output: []u16) usize!io.IoErr {
+fn windows_path(path: str, output: []u16) usize!io.IoErr {
   if path.len == 0 || path.len > 2147483647 { fail .InvalidInput }
   for byte in path {
     if byte == 0 { fail .InvalidInput }
@@ -81,7 +81,7 @@ fn windows_metadata(handle: rawptr, nofollow: bool) Metadata!io.IoErr {
   if fs_info(handle, &information) == 0 { fail windows_err(fs_error()) }
   return Metadata{ size: (#cast(u64, information.size_high) << 32) | #cast(u64, information.size_low), inode: (#cast(u64, information.index_high) << 32) | #cast(u64, information.index_low), device: information.volume, mode: windows_mode(information.attributes, nofollow) }
 }
-fn windows_path_metadata(path: []const u8, nofollow: bool) Metadata!io.IoErr {
+fn windows_path_metadata(path: str, nofollow: bool) Metadata!io.IoErr {
   wide: [32768]u16
   _ = try windows_path(path, wide[..])
   flags: u32 = 33554432
@@ -93,17 +93,17 @@ fn windows_path_metadata(path: []const u8, nofollow: bool) Metadata!io.IoErr {
   defer _ = fs_close(handle)
   return try windows_metadata(handle, nofollow)
 }
-pub fn metadata(path: []const u8) Metadata!io.IoErr {
+pub fn metadata(path: str) Metadata!io.IoErr {
   return try windows_path_metadata(path, false)
 }
-pub fn metadata_nofollow(path: []const u8) Metadata!io.IoErr {
+pub fn metadata_nofollow(path: str) Metadata!io.IoErr {
   return try windows_path_metadata(path, true)
 }
 pub fn file_metadata(file: *const File) Metadata!io.IoErr {
   if !std_fs.is_open(file) { fail .InvalidInput }
   return try windows_metadata(#cast(rawptr, file.descriptor), false)
 }
-pub fn open_nofollow(path: []const u8) File!io.IoErr {
+pub fn open_nofollow(path: str) File!io.IoErr {
   wide: [32768]u16
   _ = try windows_path(path, wide[..])
   handle := fs_open(&wide[0], 2147483648, 7, nil, 3, 35651584, nil)
@@ -114,7 +114,7 @@ pub fn open_nofollow(path: []const u8) File!io.IoErr {
   if (info.mode & 0o170000) != 0o100000 { fail .Unsupported }
   return std_fs.adopt_handle(#cast(isize, handle))
 }
-pub fn open_directory(path: []const u8, storage: []u8) Directory!io.IoErr {
+pub fn open_directory(path: str, storage: []u8) Directory!io.IoErr {
   if storage.len == 0 { fail .Capacity }
   wide: [32768]u16
   used := try windows_path(path, wide[..])
@@ -184,7 +184,7 @@ pub fn close_directory(directory: *Directory) {
   directory.active = false
   directory.handle = nil
 }
-fn windows_rename(old: []const u8, new: []const u8, replace: bool) !io.IoErr {
+fn windows_rename(old: str, new: str, replace: bool) !io.IoErr {
   old_wide: [32768]u16
   new_wide: [32768]u16
   _ = try windows_path(old, old_wide[..])
@@ -194,18 +194,18 @@ fn windows_rename(old: []const u8, new: []const u8, replace: bool) !io.IoErr {
   if replace { flags = 1 }
   if fs_move(&old_wide[0], &new_wide[0], flags) == 0 { fail windows_err(fs_error()) }
 }
-pub fn rename(old: []const u8, new: []const u8) !io.IoErr {
+pub fn rename(old: str, new: str) !io.IoErr {
   try windows_rename(old, new, true)
 }
-pub fn rename_noreplace(old: []const u8, new: []const u8) !io.IoErr {
+pub fn rename_noreplace(old: str, new: str) !io.IoErr {
   try windows_rename(old, new, false)
 }
-pub fn remove(path: []const u8) !io.IoErr {
+pub fn remove(path: str) !io.IoErr {
   wide: [32768]u16
   _ = try windows_path(path, wide[..])
   if fs_delete(&wide[0]) == 0 { fail windows_err(fs_error()) }
 }
-pub fn make_directory(path: []const u8, mode: usize) !io.IoErr {
+pub fn make_directory(path: str, mode: usize) !io.IoErr {
   if mode != 0o700 && mode != 0o755 && mode != 0o777 { fail .Unsupported }
   wide: [32768]u16
   _ = try windows_path(path, wide[..])
@@ -224,12 +224,12 @@ pub fn make_directory(path: []const u8, mode: usize) !io.IoErr {
   defer _ = fs_close(handle)
   try windows_acl_volume(handle)
 }
-pub fn remove_directory(path: []const u8) !io.IoErr {
+pub fn remove_directory(path: str) !io.IoErr {
   wide: [32768]u16
   _ = try windows_path(path, wide[..])
   if fs_rmdir(&wide[0]) == 0 { fail windows_err(fs_error()) }
 }
-pub fn read_link(path: []const u8, destination: []u8) []u8!io.IoErr {
+pub fn read_link(path: str, destination: []u8) []u8!io.IoErr {
   wide: [32768]u16
   _ = try windows_path(path, wide[..])
   handle := fs_open(&wide[0], 0, 7, nil, 3, 35651584, nil)
@@ -271,7 +271,7 @@ pub fn read_link(path: []const u8, destination: []u8) []u8!io.IoErr {
 }
 // Restrict at creation, before any other process can acquire a permissive
 // handle. A later chmod alone cannot revoke access from already-open handles.
-fn windows_create_private(path: []const u8, executable: bool) File!io.IoErr {
+fn windows_create_private(path: str, executable: bool) File!io.IoErr {
   wide: [32768]u16
   _ = try windows_path(path, wide[..])
   descriptor: rawptr = nil
@@ -285,12 +285,12 @@ fn windows_create_private(path: []const u8, executable: bool) File!io.IoErr {
   try windows_acl_volume(handle)
   return std_fs.adopt_handle(#cast(isize, handle))
 }
-pub fn create_private_exclusive(path: []const u8) File!io.IoErr {
+pub fn create_private_exclusive(path: str) File!io.IoErr {
   return try windows_create_private(path, false)
 }
 // Private executable payloads need FILE_EXECUTE as well as the data rights.
 // Establish the protected owner-only DACL in CreateFileW, never after writing.
-pub fn create_private_executable_exclusive(path: []const u8) File!io.IoErr {
+pub fn create_private_executable_exclusive(path: str) File!io.IoErr {
   return try windows_create_private(path, true)
 }
 pub fn set_permissions(file: *File, mode: usize) !io.IoErr {
@@ -338,7 +338,7 @@ extern fn fs_set_basic "SetFileInformationByHandle"(handle: rawptr, information_
 // Intended for a sibling atomic-save temporary. Unlike POSIX mode emulation,
 // this retains the actual DACL and its inheritance policy. Never change owner
 // or group implicitly: owner-relative ACEs must retain their original meaning.
-pub fn preserve_permissions(file: *File, source: []const u8) !io.IoErr {
+pub fn preserve_permissions(file: *File, source: str) !io.IoErr {
   if !std_fs.is_open(file) { fail .InvalidInput }
   wide: [32768]u16
   _ = try windows_path(source, wide[..])
@@ -396,7 +396,7 @@ pub fn preserve_permissions(file: *File, source: []const u8) !io.IoErr {
   if code != 0 { fail windows_err(code) }
 }
 
-fn atomic_create_exclusive(path: []const u8) File!io.IoErr {
+fn atomic_create_exclusive(path: str) File!io.IoErr {
   return try create_private_exclusive(path)
 }
 // Identity, size and last write time of an open file. Windows has no
@@ -425,7 +425,7 @@ fn windows_copy_edge(source: *File, offset: u64, destination: *File, length: usi
     }
     if part == 0 {
       transferred.* += done
-      fail io.IoErr.System(0)
+      fail .System(0)
     }
     std_fs.write(destination, storage[..part]) catch err {
       transferred.* += done
@@ -488,7 +488,7 @@ extern fn fs_unmap_view "UnmapViewOfFile"(bytes: *u8) i32
 // SetEndOfFile while a view exists, so external truncation cannot invalidate it.
 pub fn map_file(descriptor: isize, length: u64) *u8 {
   if descriptor == -1 || length == 0 { return nil }
-  mapping := fs_mapping(#cast(rawptr, descriptor), nil, 2, #cast(u32, length >> 32), #cast(u32, length & 4294967295), nil)
+  mapping := fs_mapping(#cast(rawptr, descriptor), nil, 2, length >> 32, length & 4294967295, nil)
   if mapping == nil { return nil }
   bytes := fs_map_view(mapping, 4, 0, 0, #cast(usize, length))
   _ = fs_close(mapping)
@@ -500,7 +500,7 @@ pub fn unmap_file(bytes: *u8, length: u64) {
 }
 
 pub const WholeFileClones: bool = false
-pub fn clone_exclusive(source: *const File, path: []const u8) File!io.IoErr {
+pub fn clone_exclusive(source: *const File, path: str) File!io.IoErr {
   _ = source
   _ = path
   fail .Unsupported

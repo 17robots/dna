@@ -1,4 +1,3 @@
-use io "std/io"
 use "std/unicode/utf8"
 use "std/mem"
 
@@ -52,10 +51,9 @@ pub struct Document {
   // Text is a persistent piece tree. The saved baseline and every undo entry
   // retain their own root; unchanged subtrees are shared, not copied.
   root, saved_root: *RopeNode,
-  // A tail still loading in the background (lazy.dyn) and LoadComplete,
-  // LoadRunning or LoadFailed.
+  // A tail still loading in the background (lazy.dyn).
   lazy: *LazyLoad,
-  load_state: u8,
+  load_state: LoadState,
   // Last leaf read by byte_at, so sequential reads cost no tree descent.
   cache_data: *const u8,
   cache_low, cache_high: usize,
@@ -111,7 +109,7 @@ pub fn try_allocate(arena: *mem.Arena) *Document {
   used := mem.arena_used(arena)
   padding := (align - (used % align)) % align
   if mem.arena_room(arena) < #sizeof(Document) + padding { return nil }
-  document := mem.push<Document>(arena)
+  document := &mem.push_array<Document>(arena, 1)[0]
   _ = load(document, "")
   return document
 }
@@ -122,14 +120,14 @@ pub fn allocate(arena: *mem.Arena) *Document {
   }
   return result
 }
-pub fn equal(a: []const u8, b: []const u8) bool {
+pub fn equal(a: str, b: str) bool {
   if a.len != b.len { return false }
   if a.len == 0 { return true }
   return compare_bytes(&a[0], &b[0], a.len) == 0
 }
 // Copies source into the start of destination with the C library's bulk copy.
 // The ranges must not overlap; use move for that. Panics when destination is short.
-pub fn copy(destination: []u8, source: []const u8) {
+pub fn copy(destination: []u8, source: str) {
   if source.len > destination.len {
     #panic("copy destination too small")
   }
@@ -138,7 +136,7 @@ pub fn copy(destination: []u8, source: []const u8) {
   }
 }
 // Like copy, but source and destination may overlap.
-pub fn move(destination: []u8, source: []const u8) {
+pub fn move(destination: []u8, source: str) {
   if source.len > destination.len {
     #panic("move destination too small")
   }
@@ -148,7 +146,7 @@ pub fn move(destination: []u8, source: []const u8) {
 }
 // UTF-8 without NUL. Aligned ASCII runs are checked a word at a time, so
 // loading a large file costs a fraction of decoding it byte by byte.
-pub fn valid(text: []const u8) bool {
+pub fn valid(text: str) bool {
   length := text.len
   at: usize = 0
   for at < length {
@@ -196,6 +194,7 @@ fn set_saved(document: *Document) {
   document.saved_root = retained
   document.saved_prefix = document.length
   document.saved_suffix = document.length
+  release_views(document)
 }
 pub fn mark_saved(document: *Document) {
   set_saved(document)
@@ -222,7 +221,7 @@ fn before_change(document: *Document, low: usize, high: usize) {
   saved_change(document, low, high)
   shrink_bounds(document, &document.checkpoint_prefix, &document.checkpoint_suffix, low, high)
 }
-pub fn load(document: *Document, text: []const u8) bool {
+pub fn load(document: *Document, text: str) bool {
   if !valid(text) { return false }
   // Build first: text may be a view of this document.
   return load_root(document, rope_from(text))
@@ -341,12 +340,10 @@ fn move_marks(document: *Document, low: usize, high: usize, inserted: usize) {
     }
     document.marks[mark] = offset
   }
-  selection: usize = 0
-  for selection < document.secondary.count {
+  for selection in 0..document.secondary.count {
     range := &document.secondary.ranges[selection]
     range.cursor = shifted_mark(range.cursor, low, high, inserted, document.length)
     range.anchor = shifted_mark(range.anchor, low, high, inserted, document.length)
-    selection += 1
   }
 }
 fn shifted_mark(position: usize, low: usize, high: usize, inserted: usize, length: usize) usize {
@@ -358,7 +355,7 @@ fn shifted_mark(position: usize, low: usize, high: usize, inserted: usize, lengt
   if offset > low { return low + inserted }
   return offset
 }
-pub fn replace(document: *Document, text: []const u8) bool {
+pub fn replace(document: *Document, text: str) bool {
   if !valid(text) { return false }
   // Build the new tree before anything is released: text may be a view.
   replace_built(document, rope_replace(rope_retain(document.root), start(document), end(document), text), text.len)
@@ -648,7 +645,7 @@ pub fn extend_line_above(document: *Document) {
   document.anchor = high
   document.cursor = low
 }
-pub fn find(document: *Document, query: []const u8, backwards: bool) bool {
+pub fn find(document: *Document, query: str, backwards: bool) bool {
   if query.len == 0 || query.len > document.length { return false }
   base := document.cursor
   if backwards {
@@ -814,7 +811,7 @@ pub fn codepoints(document: *const Document, low: usize, high: usize) usize {
   return count
 }
 // Up to four bytes from offset, enough to decode one UTF-8 code point.
-fn decode_window(document: *const Document, offset: usize) []const u8 {
+fn decode_window(document: *const Document, offset: usize) str {
   high := offset + 4
   if high > document.length {
     high = document.length

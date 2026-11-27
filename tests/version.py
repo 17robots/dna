@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--binary', action='append', type=Path, required=True)
 args = parser.parse_args()
-version = re.search(r'const DnaVersion: \[\]const u8 = "([^"]+)"', (ROOT/'src/version.dyn').read_text())[1]
+version = re.search(r'const DnaVersion: (?:str|\[\]const u8) = "([^"]+)"', (ROOT/'src/version.dyn').read_text())[1]
 with tempfile.TemporaryDirectory(prefix='dna-version-') as directory:
     work = Path(directory)
     config = work/'config.toml'

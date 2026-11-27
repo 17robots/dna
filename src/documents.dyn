@@ -107,6 +107,7 @@ fn documents_append_slot(app: *App) *Slot {
   documents := &app.documents
   if documents.storage == nil {
     documents.storage = mem.arena_alloc(65536)
+    host.small_pages(documents.storage.data)
   }
   maximum := #cast(usize, -1)
   if documents.slots.len == maximum { return nil }
@@ -135,7 +136,7 @@ fn documents_append_slot(app: *App) *Slot {
   slot := documents.index_storage[documents.slots.len]
   if slot == nil {
     if mem.arena_room(documents.storage) < #sizeof(Slot) + #alignof(Slot) { return nil }
-    slot = mem.push<Slot>(documents.storage)
+    slot = &mem.push_array<Slot>(documents.storage, 1)[0]
     documents.index_storage[documents.slots.len] = slot
   }
   slot.index = needed - 1
@@ -159,6 +160,7 @@ fn new_buffer(app: *App) bool {
     notice(app, "Could not allocate a new buffer. Existing buffers are unchanged.")
     return false
   }
+  host.small_pages(allocated.data)
   document := buffer.try_allocate(allocated)
   if document == nil || mem.arena_room(allocated) < buffer.Capacity + 1 {
     if document != nil {
@@ -252,9 +254,9 @@ fn documents_load_tick(app: *App) bool {
   changed := false
   for index in 0..app.documents.slots.len {
     doc := app.documents.slots[index].document
-    if doc != nil && buffer.load_state(doc) == buffer.LoadRunning && buffer.load_tick(doc) {
+    if doc != nil && buffer.load_state(doc) == .Running && buffer.load_tick(doc) {
       changed = true
-      if buffer.load_state(doc) == buffer.LoadFailed {
+      if buffer.load_state(doc) == .Failed {
         notice(app, "Later text in this file is not valid UTF-8; only its start is open, and saving is disabled.")
       }
     }
@@ -264,7 +266,7 @@ fn documents_load_tick(app: *App) bool {
 fn documents_loading(app: *const App) bool {
   for index in 0..app.documents.slots.len {
     doc := app.documents.slots[index].document
-    if doc != nil && buffer.load_state(doc) == buffer.LoadRunning { return true }
+    if doc != nil && buffer.load_state(doc) == .Running { return true }
   }
   return false
 }

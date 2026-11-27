@@ -99,17 +99,16 @@ fn load_run(jobs: []LoadJob) {
   }
 }
 // Validate a block's first total bytes and build its tree, using every CPU
-// for large blocks. Returns nil with ok false for text that is not UTF-8.
-struct LoadResult { root: *RopeNode, valid: bool }
-fn rope_load_block(block: *RopeBlock, total: usize) LoadResult {
-  if total == 0 { return LoadResult{valid: true} }
+// for large blocks. Fails for text that is not valid UTF-8.
+fn rope_load_block(block: *RopeBlock, total: usize) *RopeNode! {
+  if total == 0 { return nil }
   workers := load_cpus()
   if workers > ParallelWorkers {
     workers = ParallelWorkers
   }
   if total < ParallelMinimum || workers < 2 {
-    if !valid(#slice(block.bytes, total)) { return LoadResult{} }
-    return LoadResult{root: rope_from_block(block, total), valid: true}
+    if !valid(#slice(block.bytes, total)) { fail }
+    return rope_from_block(block, total)
   }
   leaves := (total + LeafLimit - 1) / LeafLimit
   counts := #cast(*usize, rope_malloc(leaves * #sizeof(usize)))
@@ -126,7 +125,7 @@ fn rope_load_block(block: *RopeBlock, total: usize) LoadResult {
   }
   load_run(jobs)
   for index in 0..workers {
-    if !jobs[index].valid { return LoadResult{} }
+    if !jobs[index].valid { fail }
   }
   for leaf in 0..leaves {
     count := #slice(counts, leaves)[leaf]
@@ -142,7 +141,7 @@ fn rope_load_block(block: *RopeBlock, total: usize) LoadResult {
     jobs[index].fill = true
   }
   load_run(jobs)
-  return LoadResult{root: rope_build_prepared(block, block.bytes, total, 0, leaves, counts, tables), valid: true}
+  return rope_build_prepared(block, block.bytes, total, 0, leaves, counts, tables)
 }
 // Leaves over data (inside block) of total bytes, LeafLimit each from data.
 fn rope_build_prepared(block: *RopeBlock, data: *const u8, total: usize, first: usize, count: usize, counts: *usize, tables: **u16) *RopeNode {

@@ -7,6 +7,7 @@ struct LineText { text: rawptr, hash: u64, length: usize, used: bool }
 struct LineLayout {
   builds:u64,
   lines: [256]LineText,
+  allocated: usize,
   // Pool slot drawn on each visible row.
   rows: [256]usize,
   origins: [256]usize,
@@ -22,12 +23,11 @@ struct LineLayout {
   end: usize,
 }
 
-// Polynomial hash modulo a prime below 2^56: Dyn arithmetic is checked, so
-// every intermediate stays under 2^64. Matches also compare lengths.
-fn line_hash(bytes: []const u8) u64 {
+// Fast 64-bit wrapping polynomial hash; matches also compare lengths.
+fn line_hash(bytes: str) u64 {
   hash: u64 = 1
   for byte in bytes {
-    hash = (hash * 251 + byte + 1) % 72057594037927931
+    hash = #wrapping(hash * 251 + byte + 1)
   }
   return hash
 }
@@ -37,15 +37,6 @@ fn line_hash(bytes: []const u8) u64 {
 // block input for seconds. Keep enough context for wide views without making
 // each cursor move shape an enormous off-screen prefix.
 const LineDrawLimit: usize = 65536
-fn line_bytes(doc: *const buffer.Document, row: usize) []const u8 {
-  low := buffer.row_start(doc, row)
-  high := doc.length
-  if row + 1 < doc.line_count {
-    high = buffer.row_start(doc, row + 1)
-  }
-  low = line_draw_start(doc, low, buffer.line_end(doc, low))
-  return buffer.range(doc, low, line_draw_end(doc, low, high))
-}
 // Share this origin across drawing, caret geometry, selections and hit tests.
 fn line_draw_start(doc: *const buffer.Document, low: usize, high: usize) usize {
   position := buffer.head(doc)
@@ -73,6 +64,14 @@ fn line_draw_end(doc: *const buffer.Document, low: usize, high: usize) usize {
   }
   return end
 }
+fn line_slot_claim(arranged: *LineLayout, slot: usize, hash: u64, length: usize) bool {
+  candidate := &arranged.lines[slot]
+  if candidate.text == nil || candidate.used || candidate.hash != hash || candidate.length != length {
+    return false
+  }
+  candidate.used = true
+  return true
+}
 // Bring the visible rows up to date. Returns the number of lines shaped.
 fn line_layout_update(typography: *Typography, arranged: *LineLayout, doc: *const buffer.Document, identity: u64, viewport: TextViewport) usize {
   if arranged.document == doc && arranged.identity == identity && arranged.start == viewport.start && arranged.end == viewport.end && arranged.line == typography.line && arranged.window == line_window_key(doc) {
@@ -91,19 +90,39 @@ fn line_layout_update(typography: *Typography, arranged: *LineLayout, doc: *cons
   for count < LineSlots && first + count < doc.line_count && (count == 0 || buffer.row_start(doc, first + count) < viewport.end) {
     count += 1
   }
-  for slot in 0..LineSlots {
+  for slot in 0..arranged.allocated {
     arranged.lines[slot].used = false
   }
   hashes: [256]u64
-  // Lines already shaped keep their text objects wherever they moved.
+  row_ends: [256]usize
+  prev_count := arranged.count
+  // Compute each visible line's origin and range once, then reuse already-shaped
+  // text objects (checking the row's prior slot first for O(1) hits while typing).
   for index in 0..count {
-    bytes := line_bytes(doc, first + index)
-    hashes[index] = line_hash(bytes)
+    row := first + index
+    low := buffer.row_start(doc, row)
+    high := doc.length
+    if row + 1 < doc.line_count {
+      high = buffer.row_start(doc, row + 1)
+    }
+    origin := line_draw_start(doc, low, buffer.line_end(doc, low))
+    end := line_draw_end(doc, origin, high)
+    arranged.origins[index] = origin
+    row_ends[index] = end
+    bytes := buffer.range(doc, origin, end)
+    h := line_hash(bytes)
+    hashes[index] = h
+    prior := LineSlots
+    if index < prev_count {
+      prior = arranged.rows[index]
+    }
     arranged.rows[index] = LineSlots
-    for slot in 0..LineSlots {
-      candidate := &arranged.lines[slot]
-      if candidate.text != nil && !candidate.used && candidate.hash == hashes[index] && candidate.length == bytes.len {
-        candidate.used = true
+    if prior < arranged.allocated && line_slot_claim(arranged, prior, h, bytes.len) {
+      arranged.rows[index] = prior
+      continue
+    }
+    for slot in 0..arranged.allocated {
+      if line_slot_claim(arranged, slot, h, bytes.len) {
         arranged.rows[index] = slot
         break
       }
@@ -119,6 +138,9 @@ fn line_layout_update(typography: *Typography, arranged: *LineLayout, doc: *cons
     entry := &arranged.lines[free_slot]
     entry.used = true
     arranged.rows[index] = free_slot
+    if free_slot + 1 > arranged.allocated {
+      arranged.allocated = free_slot + 1
+    }
     if entry.text == nil {
       blank: [1]u8 = [0]
       entry.text = ttf.create(typography.engine, typography.font, &blank[0], 0)
@@ -126,7 +148,7 @@ fn line_layout_update(typography: *Typography, arranged: *LineLayout, doc: *cons
         #panic("line text allocation")
       }
     }
-    bytes := line_bytes(doc, first + index)
+    bytes := buffer.range(doc, arranged.origins[index], row_ends[index])
     // the native text backend reads length 0 as a C string; give empty lines a real one.
     empty: [1]u8 = [0]
     source: *const u8 = &empty[0]
@@ -139,11 +161,6 @@ fn line_layout_update(typography: *Typography, arranged: *LineLayout, doc: *cons
     entry.hash = hashes[index]
     entry.length = bytes.len
     shaped += 1
-  }
-  for index in 0..count {
-    low := buffer.row_start(doc, first + index)
-    high := buffer.line_end(doc, low)
-    arranged.origins[index] = line_draw_start(doc, low, high)
   }
   arranged.window = line_window_key(doc)
   arranged.first_row = first
