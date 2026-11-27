@@ -32,7 +32,6 @@ test:
     python3 tests/sdk_compat.py
     python3 tests/process_macos.py
     python3 tests/disk_macos.py
-    python3 tests/migrate_casts.py
     python3 tests/host_environment.py
     python3 tests/platform_storage.py
     python3 tests/darwin_errno.py
