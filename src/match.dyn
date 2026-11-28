@@ -11,7 +11,10 @@ fn match_syntax(app: *App, explorer: bool) buffer.ObjectSyntax {
   return buffer.ObjectSyntax{line_comment: token, block_comments: blocks, nested_comments: nested}
 }
 
-struct MatchState { stage, from: u8, count: usize, explorer, error, syntax_error: bool }
+// The match menu, then the step after it: inside or around an object, add,
+// delete or replace a surround (the old delimiter, then the new one).
+enum MatchStage { Menu, Inside, Around, Add, Delete, ReplaceOld, ReplaceNew }
+struct MatchState { stage: MatchStage, from: u8, count: usize, explorer, error, syntax_error: bool }
 
 fn match_open(app: *App, explorer: bool) {
   count := app.input_state.repeat_count
@@ -26,22 +29,22 @@ fn match_close(app: *App) {
   if app.match_state.explorer {
     app.prompt_state.panel = .Directory
   }
-  app.match_state.stage = 0
+  app.match_state.stage = .Menu
 }
 fn match_key(app: *App, key: u32) {
   state := &app.match_state
-  if state.stage != 0 { return }
+  if state.stage != .Menu { return }
   state.error = false
   if key == KeyI {
-    state.stage = 1
+    state.stage = .Inside
   } else if key == KeyA {
-    state.stage = 2
+    state.stage = .Around
   } else if key == KeyS {
-    state.stage = 3
+    state.stage = .Add
   } else if key == KeyD {
-    state.stage = 4
+    state.stage = .Delete
   } else if key == KeyR {
-    state.stage = 5
+    state.stage = .ReplaceOld
   } else if key == KeyM {
     doc := app.documents.current
     extending := app.view.extend
@@ -58,7 +61,7 @@ fn match_key(app: *App, key: u32) {
 }
 fn match_character(app: *App, text: str) {
   state := &app.match_state
-  if state.stage == 0 || text.len == 0 { return }
+  if state.stage == .Menu || text.len == 0 { return }
   if text.len != 1 || text[0] < 32 || text[0] > 126 {
     state.error = true
     return
@@ -71,9 +74,9 @@ fn match_character(app: *App, text: str) {
   }
   ok: bool = false
   case state.stage {
-    1, 2 => {
+    .Inside, .Around => {
       if key == 102 || key == 116 || key == 97 || key == 99 {
-        if !state.explorer && syntax_textobject(app, key, state.stage == 2, state.count) {
+        if !state.explorer && syntax_textobject(app, key, state.stage == .Around, state.count) {
           match_close(app)
         } else {
           state.error = true
@@ -86,21 +89,21 @@ fn match_character(app: *App, text: str) {
         state.syntax_error = true
         return
       }
-      ok = buffer.select_objects_with_syntax(doc, key, state.stage == 2, state.count, false, false, match_syntax(app, state.explorer))
+      ok = buffer.select_objects_with_syntax(doc, key, state.stage == .Around, state.count, false, false, match_syntax(app, state.explorer))
     }
-    3 => {
+    .Add => {
       ok = buffer.surround_with_syntax(doc, 0, 0, key, 1, match_syntax(app, state.explorer))
     }
-    4 => {
+    .Delete => {
       ok = buffer.surround_with_syntax(doc, 1, key, 0, state.count, match_syntax(app, state.explorer))
     }
-    5 => {
+    .ReplaceOld => {
       state.from = key
-      state.stage = 6
+      state.stage = .ReplaceNew
       state.error = false
       return
     }
-    6 => {
+    .ReplaceNew => {
       ok = buffer.surround_with_syntax(doc, 2, state.from, key, state.count, match_syntax(app, state.explorer))
     }
     _ => {}
@@ -113,17 +116,17 @@ fn match_character(app: *App, text: str) {
 }
 fn match_title(app: *const App) str {
   case app.match_state.stage {
-    1 => { return "select inside (mi)" }
-    2 => { return "select around (ma)" }
-    3 => { return "add surround (ms): delimiter" }
-    4 => { return "delete surround (md): delimiter" }
-    5 => { return "replace surround (mr): old delimiter" }
-    6 => { return "replace surround: new delimiter" }
+    .Inside => { return "select inside (mi)" }
+    .Around => { return "select around (ma)" }
+    .Add => { return "add surround (ms): delimiter" }
+    .Delete => { return "delete surround (md): delimiter" }
+    .ReplaceOld => { return "replace surround (mr): old delimiter" }
+    .ReplaceNew => { return "replace surround: new delimiter" }
     _ => { return "match (m)" }
   }
 }
-fn match_hint(stage: u8, index: usize) KeyHint {
-  if stage == 0 {
+fn match_hint(stage: MatchStage, index: usize) KeyHint {
+  if stage == .Menu {
     case index {
       0 => { return KeyHint{key: "m", label: "matching bracket"} }
       1 => { return KeyHint{key: "i", label: "select inside..."} }

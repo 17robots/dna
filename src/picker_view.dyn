@@ -146,8 +146,9 @@ fn key_menu_count(app: *const App) usize {
     .Bracket => { return 10 }
     .Windows => { return 10 }
     .Match => {
-      if app.match_state.stage >= 3 { return 0 }
-      if app.match_state.stage != 0 { return 14 }
+      // Surround steps take a delimiter; inside and around list objects.
+      if app.match_state.stage == .Inside || app.match_state.stage == .Around { return 14 }
+      if app.match_state.stage != .Menu { return 0 }
       return 6
     }
     _ => {}
@@ -201,12 +202,12 @@ fn leader_builtin(key: u32) bool {
 }
 fn leader_custom_shown(app: *const App, index: usize) bool {
   binding := &app.config.bindings[index]
-  if !binding_applies(app, binding, settings.ScopeSpace) { return false }
+  if !binding_applies(app, binding, settings.KeysMode.Space) { return false }
   first := leader_custom_first(binding)
   if first == 0 || leader_builtin(first) { return false }
   for earlier in 0..index {
     other := &app.config.bindings[earlier]
-    if binding_applies(app, other, settings.ScopeSpace) && leader_custom_first(other) == first {
+    if binding_applies(app, other, settings.KeysMode.Space) && leader_custom_first(other) == first {
       return false
     }
   }
@@ -232,11 +233,11 @@ fn leader_custom_label(binding: *const settings.Binding) str {
 fn leader_custom_for(app: *const App, key: u32) *const settings.Binding {
   if app.input_state.leader_explorer { return nil }
   typed: [1]settings.Stroke = [settings.Stroke{key: key, character: key}]
-  found := binding_search(app, typed[..], settings.ScopeSpace)
+  found := binding_search(app, typed[..], settings.KeysMode.Space)
   if found.longer {
     for index in 0..app.config.binding_count {
       binding := &app.config.bindings[index]
-      if binding_applies(app, binding, settings.ScopeSpace) && binding_length(binding) > 1 && leader_custom_first(binding) == key {
+      if binding_applies(app, binding, settings.KeysMode.Space) && binding_length(binding) > 1 && leader_custom_first(binding) == key {
         return binding
       }
     }
@@ -366,7 +367,7 @@ fn draw_key_menu(renderer: rawptr, app: *App, typography: *Typography, width: i3
   if vim_menu_active(app) {
     footer = "esc cancels; counts/operators stay active"
   }
-  if app.prompt_state.panel == .Match && (app.match_state.stage == 1 || app.match_state.stage == 2) {
+  if app.prompt_state.panel == .Match && (app.match_state.stage == .Inside || app.match_state.stage == .Around) {
     footer = "esc cancel; syntax objects need queries"
   }
   if app.prompt_state.panel == .Match && app.match_state.error {
@@ -405,7 +406,7 @@ fn key_menu_mouse(app: *App, typography: *Typography, x: f32, y: f32, pressed: b
     app.input_state.character = character
     return
   }
-  if app.prompt_state.panel == .Match && app.match_state.stage != 0 {
+  if app.prompt_state.panel == .Match && app.match_state.stage != .Menu {
     // Object and delimiter stages read typed characters.
     text_input(app, hint.key[..1])
     return
@@ -520,7 +521,7 @@ fn picker_slim_geometry(app: *const App, typography: *const Typography, width: i
   line := typography.line
   padding := 10.0 * scale
   limit: usize = 12
-  if app.config.picker_style == 2 {
+  if app.config.picker_style == .Dropdown {
     limit = 10
   }
   room := (#cast(f32, height) - status) * 0.7 / line - 2.0
@@ -538,7 +539,7 @@ fn picker_slim_geometry(app: *const App, typography: *const Typography, width: i
   }
   content := #cast(f32, (rows + 2)) * line + padding * 2.0
   natural := picker_compact_rect(width, height, status, content, scale)
-  if app.config.picker_style == 2 {
+  if app.config.picker_style == .Dropdown {
     natural = picker_dropdown_rect(width, content, scale)
   }
   rect := place_rect(app, SurfacePicker, width, height, status, scale, natural)
@@ -553,7 +554,7 @@ fn picker_slim_geometry(app: *const App, typography: *const Typography, width: i
   return PickerGeometry{rect: rect, padding: padding, body_y: rect.y + padding + line * 2.0, rows: rows, preview: false, footer: false, list_width: rect.width - padding * 2.0}
 }
 fn picker_geometry(app: *const App, typography: *const Typography, width: i32, height: i32, status: f32, count: usize) PickerGeometry {
-  if app.config.picker_style != 0 {
+  if app.config.picker_style != .Full {
     return picker_slim_geometry(app, typography, width, height, status, count)
   }
   padding := 12.0 * typography.scale

@@ -34,7 +34,7 @@ struct SearchState {
   secondary: buffer.SelectionSet,
   explorer: bool,
   extend: bool,
-  status: u8,
+  status: pattern.SearchStatus,
   error_offset: usize,
   scroll_x: f32,
   scroll_y: f32,
@@ -150,19 +150,19 @@ fn search_range(doc: *const buffer.Document, original: buffer.Selection, match: 
   }
   return buffer.Selection{anchor: fixed, cursor: destination}
 }
-fn search_apply(doc: *buffer.Document, compiled: *pattern.Pattern, extending: bool, backwards: bool) u8 {
+fn search_apply(doc: *buffer.Document, compiled: *pattern.Pattern, extending: bool, backwards: bool) pattern.SearchStatus {
   // The primary must match; secondaries without a match stay where they are.
   selections := buffer.collect(doc)
   for index in 0..selections.count {
     original := selections.items[index]
     result := search_step(doc, compiled, original, backwards)
-    if result.error { return 3 }
+    if result.error { return .WorkLimit }
     if result.found {
       selections.items[index] = search_range(doc, original, result, extending, backwards)
-    } else if index == 0 { return 1 }
+    } else if index == 0 { return .NoMatch }
   }
   buffer.store(doc, &selections)
-  return 0
+  return .Found
 }
 fn selection_add(output: *buffer.Selections, low: usize, high: usize) bool {
   for index in 0..output.count {
@@ -173,7 +173,7 @@ fn selection_add(output: *buffer.Selections, low: usize, high: usize) bool {
   output.count += 1
   return true
 }
-fn select_matches(doc: *buffer.Document, compiled: *pattern.Pattern, split: bool) u8 {
+fn select_matches(doc: *buffer.Document, compiled: *pattern.Pattern, split: bool) pattern.SearchStatus {
   originals := buffer.collect(doc)
   output := buffer.Selections{}
   for current in 0..originals.count {
@@ -185,17 +185,17 @@ fn select_matches(doc: *buffer.Document, compiled: *pattern.Pattern, split: bool
     segment: usize = 0
     attempts: usize = 0
     for at <= text.len {
-      if attempts == 4096 { return 3 }
+      if attempts == 4096 { return .WorkLimit }
       attempts += 1
       found := pattern.find(compiled, text, at)
-      if found.error { return 3 }
+      if found.error { return .WorkLimit }
       if !found.found { break }
       if split {
         if found.start > segment && !selection_add(&output, low + segment, low + found.start) {
-          return 4
+          return .TooMany
         }
         segment = found.end
-      } else if !selection_add(&output, low + found.start, low + found.end) { return 4 }
+      } else if !selection_add(&output, low + found.start, low + found.end) { return .TooMany }
       if found.end > at {
         at = found.end
       } else {
@@ -203,11 +203,11 @@ fn select_matches(doc: *buffer.Document, compiled: *pattern.Pattern, split: bool
         at = buffer.next(doc, low + found.end) - low
       }
     }
-    if split && segment < text.len && !selection_add(&output, low + segment, high) { return 4 }
+    if split && segment < text.len && !selection_add(&output, low + segment, high) { return .TooMany }
   }
-  if output.count == 0 { return 1 }
+  if output.count == 0 { return .NoMatch }
   buffer.store(doc, &output)
-  return 0
+  return .Found
 }
 fn search_preview_request(app: *App) {
   if app.search_state.in_event_batch {
@@ -227,7 +227,7 @@ fn search_preview(app: *App) {
   app.search_state.preview_pending = false
   search_restore(app)
   state := &app.search_state
-  state.status = 0
+  state.status = .Found
   pattern.task_finish(state.task)
   state.task = nil
   if app.prompt_state.length == 0 { return }
@@ -249,7 +249,7 @@ fn search_preview(app: *App) {
     ranges := buffer.collect(doc)
     state.task = pattern.task_start_ranges(app.prompt_state.text[..app.prompt_state.length], doc, &ranges, mode)
     if state.task != nil {
-      state.status = 5
+      state.status = .Searching
       return
     }
   }
@@ -265,14 +265,14 @@ fn search_preview(app: *App) {
     base := search_base(doc, buffer.Selection{anchor: doc.anchor, cursor: doc.cursor}, backwards)
     state.task = pattern.task_start(typed, doc, base, backwards)
     if state.task != nil {
-      state.status = 5
+      state.status = .Searching
       return
     }
   }
   compiled := pattern.open(typed)
   defer pattern.close(&compiled)
   if !compiled.valid {
-    state.status = 2
+    state.status = .Invalid
     state.error_offset = compiled.error_offset
     return
   }
@@ -304,21 +304,21 @@ fn search_tick(app: *App) bool {
   }
   if app.prompt_state.panel != .Search {
     state.status = ranges_status
-    if ranges_status == 0 {
+    if ranges_status == .Found {
       buffer.store(state.document, &ranges_output)
     }
     return true
   }
-  state.status = 1
+  state.status = .NoMatch
   if result.error {
-    state.status = 3
+    state.status = .WorkLimit
   } else if result.found {
     doc := state.document
     original := buffer.Selection{anchor: doc.anchor, cursor: doc.cursor}
     selection := search_range(doc, original, result, state.extend, app.input_state.search_backwards)
     doc.anchor = selection.anchor
     doc.cursor = selection.cursor
-    state.status = 0
+    state.status = .Found
   }
   return true
 }
@@ -337,14 +337,14 @@ fn search_submit(app: *App) {
   // A large document's preview already ran on the worker; repeating it
   // would only start another.
   background := app.search_state.document != nil && app.search_state.document.length >= pattern.BackgroundMinimum
-  if app.prompt_state.length > 0 && (had_pending || (app.search_state.status != 1 && !(background && app.search_state.status == 0))) {
+  if app.prompt_state.length > 0 && (had_pending || (app.search_state.status != .NoMatch && !(background && app.search_state.status == .Found))) {
     search_preview(app)
     if app.search_state.task != nil {
       pattern.task_wait(app.search_state.task)
     }
     _ = search_tick(app)
   }
-  if app.prompt_state.length == 0 || app.search_state.status == 1 {
+  if app.prompt_state.length == 0 || app.search_state.status == .NoMatch {
     missed := app.prompt_state.length > 0
     pattern_text: [512]u8
     pattern_length := copy_text(pattern_text[..], app.prompt_state.text[..app.prompt_state.length])
@@ -355,7 +355,7 @@ fn search_submit(app: *App) {
     }
     return
   }
-  if app.search_state.status != 0 {
+  if app.search_state.status != .Found {
     macro_fail(app)
     return
   }
@@ -393,7 +393,7 @@ fn search_repeat(app: *App, backwards: bool, explorer: bool) {
     pattern.set_callout(&compiled, search_callout, #cast(rawptr, &callout))
   }
   result := search_apply(doc, &compiled, extending, backwards)
-  if result != 0 {
+  if result != .Found {
     macro_fail(app)
     status_error_with(app, "Pattern not found: ", app.search_history.text[..app.search_history.length])
   }
@@ -422,35 +422,35 @@ fn search_repeat_windowed(app: *App, doc: *buffer.Document, extending: bool, bac
 fn search_label(app: *const App) str {
   if app.prompt_state.length == 0 { return "Type a regular expression. Escape cancels." }
   case app.search_state.status {
-    1 => { return "No matches. Enter or Escape closes." }
-    2 => {
+    .NoMatch => { return "No matches. Enter or Escape closes." }
+    .Invalid => {
       return "Invalid regular expression. Edit pattern or Escape to cancel."
     }
-    3 => {
+    .WorkLimit => {
       return "Pattern exceeded its work limit. Try a simpler expression."
     }
-    4 => {
+    .TooMany => {
       return "More than 32 selections. Narrow the pattern; selection unchanged."
     }
-    5 => { return "Searching..." }
+    .Searching => { return "Searching..." }
     _ => {}
   }
   return "Enter accepts. Escape restores the original selection."
 }
 
-fn filter_selections(doc: *buffer.Document, compiled: *pattern.Pattern, remove: bool) u8 {
+fn filter_selections(doc: *buffer.Document, compiled: *pattern.Pattern, remove: bool) pattern.SearchStatus {
   originals := buffer.collect(doc)
   output := buffer.Selections{}
   for index in 0..originals.count {
     range := buffer.ordered(originals.items[index])
     found := pattern.find(compiled, buffer.range(doc, range.anchor, range.cursor), 0)
-    if found.error { return 3 }
+    if found.error { return .WorkLimit }
     if found.found != remove {
       output.items[output.count] = originals.items[index]
       output.count += 1
     }
   }
-  if output.count == 0 { return 1 }
+  if output.count == 0 { return .NoMatch }
   buffer.store(doc, &output)
-  return 0
+  return .Found
 }

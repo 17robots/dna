@@ -47,12 +47,11 @@ pub struct SearchTask {
   subject_low, subject_high: usize,
   // Range modes: 0 steps from offset; 1 selects matches, 2 splits on them,
   // 3 keeps and 4 removes ranges containing one. They read ranges and write
-  // output and status (codes as in search.dyn: 0 applied, 1 nothing left,
-  // 3 work limit or error, 4 too many selections).
+  // output and status.
   mode: u8,
   ranges: buffer.Selections,
   output: buffer.Selections,
-  status: u8,
+  status: SearchStatus,
   cancel, done: sync.AtomicU32,
   result: Match,
   worker: *thread.Thread,
@@ -78,7 +77,11 @@ pub fn task_start_ranges(text: str, document: *const buffer.Document, ranges: *c
   task.ranges = ranges.*
   return task_launch(task)
 }
-pub fn task_status(task: *const SearchTask) u8 {
+// How a search ended: it changed the selection, found nothing, could not
+// compile, hit its work limit (or failed), would make too many selections,
+// or is still running in the background.
+pub enum SearchStatus { Found, NoMatch, Invalid, WorkLimit, TooMany, Searching }
+pub fn task_status(task: *const SearchTask) SearchStatus {
   return task.status
 }
 pub fn task_output(task: *const SearchTask) *const buffer.Selections {
@@ -354,14 +357,14 @@ fn task_next(task: *SearchTask, offset: usize) usize {
 }
 // The range modes, mirroring select_matches and filter_selections in
 // search.dyn but searching each range in windows instead of one copy.
-fn task_ranges(task: *SearchTask) u8 {
+fn task_ranges(task: *SearchTask) SearchStatus {
   for current in 0..task.ranges.count {
     range := buffer.ordered(task.ranges.items[current])
     task.subject_low = range.anchor
     task.subject_high = range.cursor
     if task.mode >= 3 {
       found := task_find(task, range.anchor, range.cursor + 1)
-      if found.error { return 3 }
+      if found.error { return .WorkLimit }
       if found.found != (task.mode == 4) {
         task.output.items[task.output.count] = task.ranges.items[current]
         task.output.count += 1
@@ -372,16 +375,16 @@ fn task_ranges(task: *SearchTask) u8 {
     segment := range.anchor
     attempts: usize = 0
     for at <= range.cursor {
-      if task_cancelled(task) { return 3 }
-      if attempts == 4096 { return 3 }
+      if task_cancelled(task) { return .WorkLimit }
+      if attempts == 4096 { return .WorkLimit }
       attempts += 1
       found := task_find(task, at, range.cursor + 1)
-      if found.error { return 3 }
+      if found.error { return .WorkLimit }
       if !found.found { break }
       if task.mode == 2 {
-        if found.start > segment && !task_add(task, segment, found.start) { return 4 }
+        if found.start > segment && !task_add(task, segment, found.start) { return .TooMany }
         segment = found.end
-      } else if !task_add(task, found.start, found.end) { return 4 }
+      } else if !task_add(task, found.start, found.end) { return .TooMany }
       if found.end > at {
         at = found.end
       } else {
@@ -390,11 +393,11 @@ fn task_ranges(task: *SearchTask) u8 {
       }
     }
     if task.mode == 2 && segment < range.cursor && !task_add(task, segment, range.cursor) {
-      return 4
+      return .TooMany
     }
   }
-  if task.output.count == 0 { return 1 }
-  return 0
+  if task.output.count == 0 { return .NoMatch }
+  return .Found
 }
 fn task_add(task: *SearchTask, low: usize, high: usize) bool {
   for index in 0..task.output.count {

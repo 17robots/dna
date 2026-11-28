@@ -401,7 +401,7 @@ struct BindingState {
   pending_keys: [4]u32,
   pending_modifiers: [4]u16,
   count: usize,
-  scope: u8,
+  scope: settings.KeysMode,
   deadline: u64,
   // A shorter binding the pending keys already complete, run on timeout.
   exact: usize,
@@ -451,15 +451,15 @@ fn stroke_matches(want: settings.Stroke, typed: settings.Stroke) bool {
   if want.character != 0 { return typed.character == want.character }
   return want.key == typed.key && want.modifiers == typed.modifiers
 }
-fn binding_applies(app: *const App, binding: *const settings.Binding, scope: u8) bool {
+fn binding_applies(app: *const App, binding: *const settings.Binding, scope: settings.KeysMode) bool {
   if binding.scope != scope { return false }
-  if binding.keymap == 1 { return !app.config.vim_keys }
-  if binding.keymap == 2 { return app.config.vim_keys }
+  if binding.keymap == .Helix { return !app.config.vim_keys }
+  if binding.keymap == .Vim { return app.config.vim_keys }
   return true
 }
 struct BindingMatch { exact: usize, has_exact: bool, longer: bool }
 // Bindings for this keymap win over shared ones with the same keys.
-fn binding_search(app: *const App, keys: []const settings.Stroke, scope: u8) BindingMatch {
+fn binding_search(app: *const App, keys: []const settings.Stroke, scope: settings.KeysMode) BindingMatch {
   result := BindingMatch{}
   exact_specific := false
   for index in 0..app.config.binding_count {
@@ -477,36 +477,37 @@ fn binding_search(app: *const App, keys: []const settings.Stroke, scope: u8) Bin
     if !matched { continue }
     if length > keys.len {
       result.longer = true
-    } else if !result.has_exact || (!exact_specific && binding.keymap != 0) {
+    } else if !result.has_exact || (!exact_specific && binding.keymap != .Any) {
       result.exact = index
       result.has_exact = true
-      exact_specific = binding.keymap != 0
+      exact_specific = binding.keymap != .Any
     }
   }
   return result
 }
-fn binding_scope(app: *App) u8 {
+// The mode custom bindings apply in now; None while no binding may run.
+fn binding_scope(app: *App) settings.KeysMode {
   if app.prompt_state.panel==.Tree && !app.tree.searching && !app.tree.goto_pending {
-    return settings.ScopeNormal
+    return settings.KeysMode.Normal
   }
   if app.prompt_state.panel==.Directory && !app.explorer.insert && !app.explorer.extend && (!app.config.vim_keys || vim_idle(app)) {
-    return settings.ScopeNormal
+    return settings.KeysMode.Normal
   }
   if app.prompt_state.panel == .Leader && !app.input_state.leader_explorer {
-    return settings.ScopeSpace
+    return settings.KeysMode.Space
   }
   if app.prompt_state.panel != .None || app.documents.slots[app.documents.active].terminal.handle != nil || app.input_state.pending != 0 || app.register_state.pending {
-    return 0
+    return .None
   }
-  if app.view.insert { return settings.ScopeInsert }
+  if app.view.insert { return settings.KeysMode.Insert }
   if app.config.vim_keys {
     // A count may come first: 3Y with Y = "keys:y$" yanks three lines.
-    if vim_binding_blocked(app) { return 0 }
-    if vim_visual(app) { return settings.ScopeSelect }
-    return settings.ScopeNormal
+    if vim_binding_blocked(app) { return .None }
+    if vim_visual(app) { return settings.KeysMode.Select }
+    return settings.KeysMode.Normal
   }
-  if app.view.extend { return settings.ScopeSelect }
-  return settings.ScopeNormal
+  if app.view.extend { return settings.KeysMode.Select }
+  return settings.KeysMode.Normal
 }
 // Keys typed by a "keys:" binding are never remapped (like Vim's noremap).
 fn binding_replaying_mapping(app: *const App) bool {
@@ -525,7 +526,7 @@ fn configured_key(app: *App, typography: *Typography, key: u32, modifiers: u16) 
     binding_flush(app, typography)
     scope = binding_scope(app)
   }
-  if scope == 0 { return false }
+  if scope == .None { return false }
   typed := binding_stroke(app, key, modifiers)
   keys: [5]settings.Stroke
   for index in 0..state.count {

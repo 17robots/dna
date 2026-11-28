@@ -8,18 +8,26 @@ pub struct Stroke { key: u32, modifiers: u16, character: u32 }
 pub const BindingSteps: usize = 4
 pub const BindingLimit: usize = 128
 // Scopes: 1 normal, 2 Space menu, 6 insert, 7 select/visual.
-pub const ScopeNormal: u8 = 1
-pub const ScopeSpace: u8 = 2
-pub const ScopeInsert: u8 = 6
-pub const ScopeSelect: u8 = 7
+// The mode a [keys.MODE] table binds in.
+pub enum KeysMode { None, Normal, Space, Insert, Select }
+// The keymap a binding is for: [keys.MODE] applies to both, [keys.vim.MODE]
+// and [keys.helix.MODE] to one.
+pub enum BindingKeymap { Any, Helix, Vim }
+// [modules] choices.
+pub enum Frontend { Auto, Gui, Tui }
+pub enum ExplorerStyle { Buffer, Tree }
+pub enum PickerStyle { Full, Compact, Dropdown }
+// Closing the last buffer: auto quits in the terminal and keeps the window.
+pub enum CloseLastBuffer { Auto, Quit, Keep }
 // keymap: 0 both, 1 helix only, 2 vim only.
-pub struct Binding { key: u32, modifiers: u16, scope: u8, keymap: u8, from_project: bool, command: str, steps: [4]Stroke, count: usize }
+pub struct Binding { key: u32, modifiers: u16, scope: KeysMode, keymap: BindingKeymap, from_project: bool, command: str, steps: [4]Stroke, count: usize }
 // Where a surface shows: float at one of nine anchors, docked to a side
 // (taking space from the editor panes), or next to the cursor. Sizes at or
 // below 1 are fractions of the window; above 1, logical pixels.
 pub enum PlaceMode { Default, Float, Dock, Cursor }
 pub const PlaceSurfaces: usize = 8
-pub struct Placement { mode: PlaceMode, anchor, side: u8, width, height, size, margin: f32 }
+pub enum PlaceSide { Left, Right, Top, Bottom }
+pub struct Placement { mode: PlaceMode, anchor: u8, side: PlaceSide, width, height, size, margin: f32 }
 pub fn place_surface(name: str) usize {
   names: [8]str = ["palette", "picker", "menu", "dialog", "explorer", "terminal", "completion", "hover"]
   for index in 0..8 {
@@ -36,12 +44,28 @@ pub fn place_anchor(name: str) u8 {
   }
   return 255
 }
-pub fn place_side(name: str) u8 {
-  names: [4]str = ["left", "right", "top", "bottom"]
-  for index in 0..4 {
-    if buffer.equal(names[index], name) { return #cast(u8, index) }
+// The side NAME names, written to side; false for any other name.
+pub fn place_side(name: str, side: *PlaceSide) bool {
+  case name {
+    "left" => { side.* = .Left }
+    "right" => { side.* = .Right }
+    "top" => { side.* = .Top }
+    "bottom" => { side.* = .Bottom }
+    _ => { return false }
   }
-  return 255
+  return true
+}
+pub fn place_side_name(side: PlaceSide) str {
+  case side {
+    .Left => { return "left" }
+    .Right => { return "right" }
+    .Top => { return "top" }
+    .Bottom => { return "bottom" }
+  }
+}
+// A left or right dock spans the window's height.
+pub fn place_horizontal(side: PlaceSide) bool {
+  return side == .Left || side == .Right
 }
 fn place_apply(place: *Placement, key: str, value: str) bool {
   if buffer.equal(key, "mode") || buffer.equal(key, "anchor") || buffer.equal(key, "side") {
@@ -68,16 +92,14 @@ fn place_apply(place: *Placement, key: str, value: str) bool {
       }
       return true
     }
-    choice := place_anchor(text)
     if buffer.equal(key, "side") {
-      choice = place_side(text)
-      if choice == 255 { return false }
-      place.side = choice
+      if !place_side(text, &place.side) { return false }
       if place.mode == .Default {
         place.mode = .Dock
       }
       return true
     }
+    choice := place_anchor(text)
     if choice == 255 { return false }
     place.anchor = choice
     if place.mode == .Default {
@@ -140,12 +162,11 @@ pub struct Settings {
   light_theme, ok, reduced_motion: bool,
   automatic_completion: bool,
   vim_keys: bool,
-  // [modules]: 0 is the default module of each slot. frontend: auto, gui,
-  // tui; explorer: buffer, tree; picker: full, compact, dropdown.
-  frontend, explorer_style, picker_style: u8,
-  // Closing the last buffer: 0 auto (quit in the terminal, keep the window),
-  // 1 quit, 2 keep an empty buffer.
-  close_last_buffer: u8,
+  // [modules] slots.
+  frontend: Frontend,
+  explorer_style: ExplorerStyle,
+  picker_style: PickerStyle,
+  close_last_buffer: CloseLastBuffer,
   reload_config: bool,
   line_numbers: bool,
   relative_numbers: bool,
@@ -308,6 +329,10 @@ fn parse_locks(layer: *Layer, value: str) bool {
   }
   return true
 }
+// The section parse_layer is reading: plain options, a [keys.MODE] table, a
+// [languages.NAME] or [place.SURFACE] section, or a [project."PATH"] section
+// (applied separately, through project_sections).
+enum Section { Options, Keys, Language, Place, Project }
 // Apply one file. The first (global) layer starts from defaults; a project
 // layer applies over the result and may repeat keys the global file set.
 pub fn parse_layer(source: str, result: *Settings, layer: *Layer) bool {
@@ -321,8 +346,10 @@ pub fn parse_layer(source: str, result: *Settings, layer: *Layer) bool {
   }
   at: usize = 0
   seen: u64 = 0
-  scope: u8 = 0
-  keymap: u8 = 0
+  // What kind of section the next key belongs to.
+  in_section := Section.Options
+  scope := KeysMode.None
+  keymap := BindingKeymap.Any
   language_index: usize = 16
   place_index: usize = PlaceSurfaces
   section: str = ""
@@ -337,8 +364,9 @@ pub fn parse_layer(source: str, result: *Settings, layer: *Layer) bool {
     if line.len == 0 || line[0] == 35 { continue }
     if line[0] == 91 && line.len > 7 && buffer.equal(line[..6], "[keys.") && line[line.len - 1] == 93 {
       keys_scope := keys_section(line[6..line.len - 1])
-      if keys_scope.scope == 0 { return false }
+      if keys_scope.scope == .None { return false }
       section = line[1..line.len - 1]
+      in_section = .Keys
       scope = keys_scope.scope
       keymap = keys_scope.keymap
       continue
@@ -346,29 +374,29 @@ pub fn parse_layer(source: str, result: *Settings, layer: *Layer) bool {
     if line[0] == 91 {
       if line.len < 3 || line[line.len - 1] != 93 { return false }
       section = line[1..line.len - 1]
-      scope = 0
+      in_section = .Options
       // [project."PATH"] applies separately, through project_sections.
       if project_section_path(section).valid {
         if layer.project { return false }
-        scope = 5
+        in_section = .Project
         continue
       }
       if section.len > 6 && buffer.equal(section[..6], "place.") {
         place_index = place_surface(section[6..])
         if place_index == PlaceSurfaces { return false }
-        scope = 4
+        in_section = .Place
         continue
       }
       if section.len > 10 && buffer.equal(section[..10], "languages.") {
         language_index = language_section(result, section)
         if language_index == 16 { return false }
-        scope = 3
+        in_section = .Language
         continue
       }
       if !known_section(section) { return false }
       continue
     }
-    if scope == 5 { continue }
+    if in_section == .Project { continue }
     split: usize = 0
     for split < line.len && line[split] != 61 {
       split += 1
@@ -376,24 +404,24 @@ pub fn parse_layer(source: str, result: *Settings, layer: *Layer) bool {
     if split == line.len { return false }
     key := trim(line[..split])
     value := trim(line[split + 1..])
-    if scope == 3 {
+    if in_section == .Language {
       if layer_skip(layer, section, key, key) != .None { continue }
       if !language_apply(&result.languages[language_index], key, value) { return false }
       layer_applied(layer, section)
       continue
     }
-    if scope == 4 {
+    if in_section == .Place {
       if layer_skip(layer, section, key, section) != .None { continue }
       if !place_apply(&result.places[place_index], key, value) { return false }
       layer_applied(layer, section)
       continue
     }
-    if scope == 0 && buffer.equal(key, "lock") {
+    if in_section == .Options && buffer.equal(key, "lock") {
       if !parse_locks(layer, value) { return false }
       continue
     }
-    if scope != 0 && layer_skip(layer, section, key, section) != .None { continue }
-    if scope != 0 {
+    if in_section == .Keys && layer_skip(layer, section, key, section) != .None { continue }
+    if in_section == .Keys {
       if key.len < 3 || key[0] != 34 || key[key.len - 1] != 34 || value.len < 3 || value.len > 129 || value[0] != 34 || value[value.len - 1] != 34 || result.binding_count == BindingLimit {
         return false
       }
@@ -471,31 +499,31 @@ pub fn parse_key(text: str) Binding {
   return result
 }
 
-pub struct KeysScope { scope: u8, keymap: u8 }
+pub struct KeysScope { scope: KeysMode, keymap: BindingKeymap }
 // [keys.MODE] or [keys.KEYMAP.MODE]: MODE is normal, insert, select (or
 // visual) or space; KEYMAP is vim or helix.
 pub fn keys_section(name: str) KeysScope {
   result := KeysScope{}
   mode := name
   if name.len > 4 && buffer.equal(name[..4], "vim.") {
-    result.keymap = 2
+    result.keymap = .Vim
     mode = name[4..]
   } else if name.len > 6 && buffer.equal(name[..6], "helix.") {
-    result.keymap = 1
+    result.keymap = .Helix
     mode = name[6..]
   }
   case mode {
     "normal" => {
-      result.scope = ScopeNormal
+      result.scope = .Normal
     }
     "space" => {
-      result.scope = ScopeSpace
+      result.scope = .Space
     }
     "insert" => {
-      result.scope = ScopeInsert
+      result.scope = .Insert
     }
     "select", "visual" => {
-      result.scope = ScopeSelect
+      result.scope = .Select
     }
     _ => {}
   }
