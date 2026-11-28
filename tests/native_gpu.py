@@ -77,11 +77,12 @@ fn scene(renderer:rawptr,phase:i32) {
  check(native_text_cached_bitmap(renderer,1,&mask[0],7,5,1.0,1.0,255,255,255,255),"target glyph")
  check(sdl_target(renderer,nil),"window target")
  rect=Rect{x:145.0,y:12.0,width:26.0,height:18.0}
- check(sdl_texture_alpha(texture,177) && sdl_draw_opacity(renderer,193),"opacity")
+ native_gui.draw_alpha=193
+ check(sdl_texture_alpha(texture,177),"opacity")
  check(sdl_render_texture(renderer,texture,nil,&rect),"target composite")
  rect.x=180.0
  check(sdl_render_texture(renderer,texture,nil,&rect),"target reuse")
- check(sdl_draw_opacity(renderer,255),"opacity reset")
+ native_gui.draw_alpha=255
  for sample in 0..8 {
   crop:=Rect{x:-2.5+#cast(f32,sample)*0.75,y:-0.5,width:16.75,height:11.25}
   destination:=Rect{x:#cast(f32,sample*30),y:155.0,width:23.5,height:14.5}

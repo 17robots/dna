@@ -105,7 +105,7 @@ pub struct SaveJob {}
 pub finished:usize=0
 pub aborted:usize=0
 pub fn name(state:*State) []const u8 {return "example.txt"}
-pub fn save_finish(job:*SaveJob,state:*State,document:*buffer.Document,scratch:rawptr) []const u8 {finished+=1
+pub fn save_finish(job:*SaveJob,state:*State,document:*buffer.Document) []const u8 {finished+=1
  return ""}
 pub fn save_abort(job:*SaveJob) {aborted+=1}
 ''',

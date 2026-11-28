@@ -1529,7 +1529,7 @@ fn vim_key(app: *App, typography: *Typography, key: u32, modifiers: u16) bool {
   }
   if app.view.insert { return vim_insert_key(app, key, modifiers) }
   doc := vim_doc(app)
-  if (modifiers & ModCtrl) != 0 { return vim_control(app, typography, key, modifiers) }
+  if (modifiers & ModCtrl) != 0 { return vim_control(app, typography, key) }
   character := vim_character(app, key, modifiers)
   if key == KeyDelete && app.vim.pending == 0 {
     character = 'x'
@@ -1612,7 +1612,7 @@ fn vim_insert_key(app: *App, key: u32, modifiers: u16) bool {
   _ = buffer.replace(doc, "")
   return true
 }
-fn vim_control(app: *App, typography: *Typography, key: u32, modifiers: u16) bool {
+fn vim_control(app: *App, typography: *Typography, key: u32) bool {
   doc := vim_doc(app)
   // Ctrl+Z stops Vim in a terminal; the terminal frontend does the same.
   if key == KeyZ && sdl.tui_active() {
@@ -1714,7 +1714,7 @@ fn vim_pending(app: *App, typography: *Typography, character: u32, key: u32) {
       count *= app.vim.operator_count
     }
     movement := vim_find(doc, vim_head(app), pending, app.vim.find_text[..app.vim.find_length], count, false)
-    vim_finish_motion(app, movement, count)
+    vim_finish_motion(app, movement)
     return
   }
   if pending == 'm' {
@@ -1759,7 +1759,7 @@ fn vim_pending(app: *App, typography: *Typography, character: u32, key: u32) {
     if movement.valid && app.vim.operator == 0 && !vim_visual(app) {
       jump_push(app)
     }
-    vim_finish_motion(app, movement, 1)
+    vim_finish_motion(app, movement)
     return
   }
   if pending == 'q' {
@@ -1850,7 +1850,7 @@ fn vim_g_key(app: *App, typography: *Typography, character: u32, key: u32) {
       return
     }
     if app.vim.operator == 0 && vim_visual(app) {
-      vim_visual_operator(app, typography, 'Q')
+      vim_visual_operator(app, 'Q')
       return
     }
     app.vim.operator = 'Q'
@@ -1866,7 +1866,7 @@ fn vim_g_key(app: *App, typography: *Typography, character: u32, key: u32) {
       return
     }
     if app.vim.operator == 0 && vim_visual(app) {
-      vim_visual_operator(app, typography, character)
+      vim_visual_operator(app, character)
       return
     }
     app.vim.operator = character
@@ -1911,10 +1911,10 @@ fn vim_g_key(app: *App, typography: *Typography, character: u32, key: u32) {
   count *= vim_take_count(app)
   movement := vim_motion(app, typography, character, key, count, typed, true, app.vim.operator != 0)
   if app.vim.operator != 0 {
-    vim_apply_motion(app, movement, character, true)
+    vim_apply_motion(app, movement)
     return
   }
-  vim_finish_motion(app, movement, count)
+  vim_finish_motion(app, movement)
 }
 // Move the cursor (normal) or the visual head to a motion's target.
 // Where the newest jump-list entry in this document points (for `` and '').
@@ -2022,7 +2022,7 @@ fn vim_last_jump(app: *App, target: *usize) bool {
   target.* = buffer.boundary(doc, doc.marks[JumpMarkBase + entry])
   return true
 }
-fn vim_finish_motion(app: *App, movement: VimMotion, count: usize) {
+fn vim_finish_motion(app: *App, movement: VimMotion) {
   if !movement.valid {
     macro_fail(app)
     if app.vim.operator != 0 {
@@ -2032,7 +2032,7 @@ fn vim_finish_motion(app: *App, movement: VimMotion, count: usize) {
     return
   }
   if app.vim.operator != 0 {
-    vim_apply_motion(app, movement, 0, false)
+    vim_apply_motion(app, movement)
     return
   }
   goal := app.vim.goal
@@ -2055,8 +2055,8 @@ fn vim_finish_motion(app: *App, movement: VimMotion, count: usize) {
   }
 }
 // Apply the pending operator over a motion, with Vim's exclusive-motion
-// adjustments and the cw special case.
-fn vim_apply_motion(app: *App, movement: VimMotion, character: u32, prefix_g: bool) {
+// adjustments. The caller turns cw into ce first.
+fn vim_apply_motion(app: *App, movement: VimMotion) {
   operator := app.vim.operator
   app.vim.operator = 0
   app.vim.operator_g = false
@@ -2211,11 +2211,11 @@ fn vim_operator_key(app: *App, typography: *Typography, character: u32, key: u32
     for step in 1..count {
       at = vim_word_end(doc, at, big)
     }
-    vim_apply_motion(app, VimMotion{target: at, inclusive: true, valid: true}, character, false)
+    vim_apply_motion(app, VimMotion{target: at, inclusive: true, valid: true})
     return
   }
   movement := vim_motion(app, typography, character, key, count, has_count, false, true)
-  vim_apply_motion(app, movement, character, false)
+  vim_apply_motion(app, movement)
 }
 fn vim_normal_key(app: *App, typography: *Typography, character: u32, key: u32, doc: *buffer.Document) {
   // & repeats the last :s on this line without its flags.
@@ -2286,7 +2286,7 @@ fn vim_normal_key(app: *App, typography: *Typography, character: u32, key: u32, 
       if character == 'C' {
         app.vim.operator = 'c'
       }
-      vim_apply_motion(app, vim_motion(app, typography, '$', 0, count, false, false, true), '$', false)
+      vim_apply_motion(app, vim_motion(app, typography, '$', 0, count, false, false, true))
       return
     }
     if vim_line_empty(doc, head) && character != 's' { return }
@@ -2298,7 +2298,7 @@ fn vim_normal_key(app: *App, typography: *Typography, character: u32, key: u32, 
     if character == 'X' {
       motion_key = 'h'
     }
-    vim_apply_motion(app, vim_motion(app, typography, motion_key, 0, count, false, false, true), motion_key, false)
+    vim_apply_motion(app, vim_motion(app, typography, motion_key, 0, count, false, false, true))
     return
   }
   if character == 'p' || character == 'P' {
@@ -2365,9 +2365,9 @@ fn vim_normal_key(app: *App, typography: *Typography, character: u32, key: u32, 
   typed := app.vim.count > 0
   count := vim_take_count(app)
   movement := vim_motion(app, typography, character, key, count, typed, false, false)
-  vim_finish_motion(app, movement, count)
+  vim_finish_motion(app, movement)
 }
-fn vim_visual_operator(app: *App, typography: *Typography, operator: u32) {
+fn vim_visual_operator(app: *App, operator: u32) {
   doc := vim_doc(app)
   linewise := app.vim.mode == .VisualLine
   if app.vim.mode == .VisualBlock {
@@ -2482,7 +2482,7 @@ fn vim_visual_key(app: *App, typography: *Typography, character: u32, key: u32) 
     } else if character == 's' {
       operator = 'c'
     }
-    vim_visual_operator(app, typography, operator)
+    vim_visual_operator(app, operator)
     return
   }
   if character == 'D' || character == 'X' || character == 'Y' || character == 'C' || character == 'S' || character == 'R' {
@@ -2496,7 +2496,7 @@ fn vim_visual_key(app: *App, typography: *Typography, character: u32, key: u32) 
     } else if character == 'C' || character == 'S' || character == 'R' {
       operator = 'c'
     }
-    vim_visual_operator(app, typography, operator)
+    vim_visual_operator(app, operator)
     return
   }
   if character == 'J' {
@@ -2544,7 +2544,7 @@ fn vim_visual_key(app: *App, typography: *Typography, character: u32, key: u32) 
   typed := app.vim.count > 0
   count := vim_take_count(app)
   movement := vim_motion(app, typography, character, key, count, typed, false, false)
-  vim_finish_motion(app, movement, count)
+  vim_finish_motion(app, movement)
 }
 // p in visual mode replaces the selection; the replaced text is yanked
 // (P keeps the register unchanged).
