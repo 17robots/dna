@@ -94,51 +94,27 @@ fn palette_add_row(app: *App, label: str, value: str) usize {
 // ---------------------------------------------------------------------------
 // Options
 
-const LegacyOptionCount: usize = 21
-fn legacy_option(index: usize) str {
-  names: [21]str = ["close_last_buffer", "font", "font_family", "font_size", "line_height", "fallback_font", "theme", "indent_width", "reduced_motion", "line_numbers", "relative_numbers", "status_line", "highlight_line", "shell", "terminal_escape", "explorer_icons", "explorer_columns", "explorer_preview", "build_command", "test_command", "run_command"]
-  return names[index]
-}
-// Every option :set accepts: the top-level keys, the sectioned options by
-// their full names, and the [modules] slots.
+// Every option :set accepts, by the name :set uses.
 fn palette_option_count() usize {
-  return LegacyOptionCount + settings.ExtraCount + 4
+  return settings.OptionCount
 }
 fn palette_option_key(index: usize) str {
-  if index < LegacyOptionCount { return legacy_option(index) }
-  if index < LegacyOptionCount + settings.ExtraCount {
-    return settings.option(index - LegacyOptionCount).key
-  }
-  slots: [4]str = ["keymap", "frontend", "explorer", "picker"]
-  return slots[index - LegacyOptionCount - settings.ExtraCount]
+  return settings.set_name(settings.option(index))
 }
 fn module_option(key: str) bool {
-  return buffer.equal(key, "keymap") || buffer.equal(key, "frontend") || buffer.equal(key, "explorer") || buffer.equal(key, "picker")
+  index := settings.lookup(key)
+  return index < settings.OptionCount && buffer.equal(settings.option(index).section, "modules")
 }
 fn flag_option(key: str) bool {
-  for index in 0..settings.ExtraCount {
-    spec := settings.option(index)
-    if buffer.equal(spec.key, key) { return spec.flag }
-  }
-  return buffer.equal(key, "reduced_motion") || buffer.equal(key, "line_numbers") || buffer.equal(key, "relative_numbers") || buffer.equal(key, "status_line") || buffer.equal(key, "highlight_line") || buffer.equal(key, "explorer_icons") || buffer.equal(key, "explorer_columns") || buffer.equal(key, "explorer_preview")
+  index := settings.lookup(key)
+  return index < settings.OptionCount && settings.option(index).kind == .Flag
 }
 // The value an option has now, where DNA can tell; empty otherwise.
 fn option_current(app: *App, key: str, output: []u8) str {
   if module_option(key) { return module_active(app, key) }
-  for index in 0..settings.ExtraCount {
-    spec := settings.option(index)
-    if buffer.equal(spec.key, key) {
-      value := settings.option_value(&app.config, index)
-      if spec.flag {
-        if value != 0.0 { return "true" }
-        return "false"
-      }
-      used: usize = 0
-      setting_decimal(output, &used, value)
-      return output[..used]
-    }
-  }
-  return ""
+  index := settings.lookup(key)
+  if index == settings.OptionCount { return "" }
+  return setting_value_text(app, settings.option(index), output)
 }
 fn palette_option_rows(app: *App, query: str, scores: []i32) {
   if query.len == 0 { return }
@@ -406,9 +382,10 @@ fn suggest_option_values(app: *App, scores: []i32, key: str, fragment: str) {
       app.command_menu.rows[row].soft = true
     }
   }
-  for index in 0..settings.ExtraCount {
+  index := settings.lookup(key)
+  if index < settings.OptionCount {
     spec := settings.option(index)
-    if buffer.equal(spec.key, key) {
+    if spec.kind == .Flag || spec.kind == .Number {
       row := suggest(app, scores, fragment, spec.default_value, "default", false)
       if row < PaletteRowLimit {
         app.command_menu.rows[row].soft = true
@@ -769,12 +746,7 @@ fn set_command(app: *App, typography: *Typography, argument: str) {
     return
   }
   modules = module_option(key)
-  canonical := key
-  if buffer.equal(key, "explorer") {
-    canonical = "explorer_style"
-  } else if buffer.equal(key, "picker") {
-    canonical = "picker_style"
-  }
+  canonical := settings.option(settings.lookup(key)).key
   if config_locked(app, key) || config_locked(app, canonical) || (modules && config_locked(app, "modules")) {
     notice(app, "That option is locked in the global config.")
     return
