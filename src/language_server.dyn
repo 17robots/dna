@@ -114,12 +114,17 @@ fn lsp_escape(out: *u8, bytes: str) usize {
       } else {
         target[used] = 92
         target[used + 1] = byte
-        if byte == 10 {
-          target[used + 1] = 'n'
-        } else if byte == 13 {
-          target[used + 1] = 'r'
-        } else if byte == 9 {
-          target[used + 1] = 't'
+        case byte {
+          10 => {
+            target[used + 1] = 'n'
+          }
+          13 => {
+            target[used + 1] = 'r'
+          }
+          9 => {
+            target[used + 1] = 't'
+          }
+          _ => {}
         }
       }
     }
@@ -1521,17 +1526,20 @@ fn lsp_handle(app: *App, index: usize, source: str, arena: *mem.Arena) bool {
   state.revision = app.lsp.revision
   state.position = app.lsp.position
   state.insert = app.lsp.insert
-  if state.kind == 10 {
-    lsp_prepare_format(app, result)
-    return true
-  }
-  if state.kind == 5 {
-    lsp_prepare_edit(app, result)
-    return true
-  }
-  if state.kind == 7 {
-    state.kind = 6
-    state.resolved = true
+  case state.kind {
+    10 => {
+      lsp_prepare_format(app, result)
+      return true
+    }
+    5 => {
+      lsp_prepare_edit(app, result)
+      return true
+    }
+    7 => {
+      state.kind = 6
+      state.resolved = true
+    }
+    _ => {}
   }
   if state.kind == 13 || state.kind == 14 {
     lsp_symbols_collect(state, result, 0)
@@ -1792,11 +1800,14 @@ fn lsp_symbols_open(app: *App, kind: usize) {
   lsp_request(app, kind, "")
 }
 fn lsp_result_label(app: *App, item: *const json.Value, output: []u8) usize {
-  if app.lsp.results.kind == 13 || app.lsp.results.kind == 14 {
-    return lsp_symbol_label(app, item, output)
+  case app.lsp.results.kind {
+    13, 14 => {
+      return lsp_symbol_label(app, item, output)
+    }
+    1 => { return copy_text(output, json_text(item, "label")) }
+    6 => { return copy_text(output, json_text(item, "title")) }
+    _ => {}
   }
-  if app.lsp.results.kind == 1 { return copy_text(output, json_text(item, "label")) }
-  if app.lsp.results.kind == 6 { return copy_text(output, json_text(item, "title")) }
   uri := json_text(item, "uri")
   if uri.len == 0 {
     uri = json_text(item, "targetUri")
@@ -1896,113 +1907,116 @@ fn lsp_config(app: *App) {
   }
 }
 fn lsp_command(app: *App, verb: str, argument: str) bool {
-  if buffer.equal(verb, "lsp-start") {
-    split: usize = 0
-    for split < argument.len && argument[split] != 32 {
-      split += 1
+  case verb {
+    "lsp-start" => {
+      split: usize = 0
+      for split < argument.len && argument[split] != 32 {
+        split += 1
+      }
+      rest := split
+      for rest < argument.len && argument[rest] == 32 {
+        rest += 1
+      }
+      lsp_start(app, argument[..split], argument[rest..])
+      return true
     }
-    rest := split
-    for rest < argument.len && argument[rest] == 32 {
-      rest += 1
-    }
-    lsp_start(app, argument[..split], argument[rest..])
-    return true
-  }
-  if buffer.equal(verb, "lsp-config") {
-    lsp_config(app)
-    return true
-  }
-  if buffer.equal(verb, "lsp-stop") {
-    lsp_release(app)
-    app.prompt_state.panel = .None
-    return true
-  }
-  if buffer.equal(verb, "lsp-restart") {
-    index: usize = 0
-    current_language := filetype_name(app.documents.slots[app.documents.active])
-    for index < 8 && !buffer.equal(app.lsp.servers[index].language[..app.lsp.servers[index].length], current_language) {
-      index += 1
-    }
-    if index < 8 {
-      language: [65]u8
-      command: [4096]u8
-      server := &app.lsp.servers[index]
-      name_length := copy_text(language[..], server.language[..server.length])
-      command_length := copy_text(command[..], server.command[..c.string_length(&server.command[0], 4096)])
-      managed := server.managed
-      lsp_start(app, language[..name_length], command[..command_length])
-      app.lsp.servers[index].managed = managed
-    } else {
+    "lsp-config" => {
       lsp_config(app)
+      return true
     }
-    return true
-  }
-  if buffer.equal(verb, "lsp-log") {
-    lsp_status(app)
-    return true
-  }
-  if buffer.equal(verb, "complete") {
-    lsp_request(app, 1, "")
-    return true
-  }
-  if buffer.equal(verb, "hover") {
-    lsp_request(app, 2, "")
-    return true
-  }
-  if buffer.equal(verb, "definition") {
-    lsp_request(app, 3, "")
-    return true
-  }
-  if buffer.equal(verb, "type-definition") {
-    lsp_request(app, 11, "")
-    return true
-  }
-  if buffer.equal(verb, "implementation") {
-    lsp_request(app, 12, "")
-    return true
-  }
-  if buffer.equal(verb, "references") {
-    lsp_request(app, 4, "")
-    return true
-  }
-  if buffer.equal(verb, "symbols") {
-    lsp_symbols_open(app, 13)
-    return true
-  }
-  if buffer.equal(verb, "workspace-symbols") {
-    lsp_symbols_open(app, 14)
-    if argument.len > 0 {
-      lsp_symbol_query(app, argument, false)
+    "lsp-stop" => {
+      lsp_release(app)
+      app.prompt_state.panel = .None
+      return true
     }
-    return true
-  }
-  if buffer.equal(verb, "rename-symbol") {
-    lsp_request(app, 5, argument)
-    return true
-  }
-  if buffer.equal(verb, "code-actions") {
-    lsp_request(app, 6, "")
-    return true
-  }
-  if buffer.equal(verb, "signature-help") {
-    lsp_request(app, 9, "")
-    return true
-  }
-  if buffer.equal(verb, "lsp-format") {
-    lsp_request(app, 10, "")
-    return true
-  }
-  if buffer.equal(verb, "diagnostic-next") {
-    diagnostic_jump(app, false)
-    return true
-  }
-  if buffer.equal(verb, "diagnostic-prev") {
-    diagnostic_jump(app, true)
-    return true
-  }
-  if buffer.equal(verb, "diagnostics") {
-    diagnostics_show(app)
-    return true
+    "lsp-restart" => {
+      index: usize = 0
+      current_language := filetype_name(app.documents.slots[app.documents.active])
+      for index < 8 && !buffer.equal(app.lsp.servers[index].language[..app.lsp.servers[index].length], current_language) {
+        index += 1
+      }
+      if index < 8 {
+        language: [65]u8
+        command: [4096]u8
+        server := &app.lsp.servers[index]
+        name_length := copy_text(language[..], server.language[..server.length])
+        command_length := copy_text(command[..], server.command[..c.string_length(&server.command[0], 4096)])
+        managed := server.managed
+        lsp_start(app, language[..name_length], command[..command_length])
+        app.lsp.servers[index].managed = managed
+      } else {
+        lsp_config(app)
+      }
+      return true
+    }
+    "lsp-log" => {
+      lsp_status(app)
+      return true
+    }
+    "complete" => {
+      lsp_request(app, 1, "")
+      return true
+    }
+    "hover" => {
+      lsp_request(app, 2, "")
+      return true
+    }
+    "definition" => {
+      lsp_request(app, 3, "")
+      return true
+    }
+    "type-definition" => {
+      lsp_request(app, 11, "")
+      return true
+    }
+    "implementation" => {
+      lsp_request(app, 12, "")
+      return true
+    }
+    "references" => {
+      lsp_request(app, 4, "")
+      return true
+    }
+    "symbols" => {
+      lsp_symbols_open(app, 13)
+      return true
+    }
+    "workspace-symbols" => {
+      lsp_symbols_open(app, 14)
+      if argument.len > 0 {
+        lsp_symbol_query(app, argument, false)
+      }
+      return true
+    }
+    "rename-symbol" => {
+      lsp_request(app, 5, argument)
+      return true
+    }
+    "code-actions" => {
+      lsp_request(app, 6, "")
+      return true
+    }
+    "signature-help" => {
+      lsp_request(app, 9, "")
+      return true
+    }
+    "lsp-format" => {
+      lsp_request(app, 10, "")
+      return true
+    }
+    "diagnostic-next" => {
+      diagnostic_jump(app, false)
+      return true
+    }
+    "diagnostic-prev" => {
+      diagnostic_jump(app, true)
+      return true
+    }
+    "diagnostics" => {
+      diagnostics_show(app)
+      return true
+    }
+    _ => {}
   }
   return false
 }
