@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import os, resource, shutil, signal, subprocess, tempfile
 from pathlib import Path
+import private_display  # hides the desktop display; see tests/private_display.py
 root=Path(__file__).resolve().parents[1];stage=root/'build/save-failures';stage.mkdir(exist_ok=True)
 for module in ('owned_arena','cstring','filesystem','files','buffer'):shutil.copytree(root/'src'/module,stage/module,dirs_exist_ok=True)
 shutil.copyfile(root/'tests/save_failures/main.dyn',stage/'main.dyn')

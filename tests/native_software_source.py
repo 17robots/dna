@@ -4,6 +4,7 @@ Direct GPU rendering is covered by native_gpu.py on a real GL context. These
 oracles deliberately retain their small fake surfaces and frozen CPU references.
 """
 from source_patch import patched
+import private_display  # hides the desktop display; see tests/private_display.py
 def function(path, name):
     text=path.read_text()
     actual='native_text_cached_bitmap' if name=='native_text_bitmap' and 'pub fn native_text_cached_bitmap(' in text else name

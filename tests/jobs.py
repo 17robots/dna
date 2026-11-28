@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import sys
 import time
+import private_display  # hides the desktop display; see tests/private_display.py
 
 root = Path(__file__).resolve().parents[1]
 lib = c.CDLL(str(root / ('build/deps/install/lib/libdna_native.dylib' if sys.platform == 'darwin' else 'build/deps/install/lib/libdna_native.so')))

@@ -11,10 +11,11 @@ import os
 from pathlib import Path
 import sys
 import tempfile
+import private_display  # hides the desktop display; see tests/private_display.py
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'scripts'))
-from benchmark_editors import Session
+from benchmark_editors import QUIET, Session
 
 HORIZONTAL = set('─┬┴┼')
 LEFT = set('│┃├┼')
@@ -93,7 +94,7 @@ def main():
                     for byte in data:
                         os.write(session.fd, bytes([byte]))
                         session.settle(.02)
-                    session.settle(settle)
+                    session.settle(settle, QUIET)
 
                 try:
                     session.wait(lambda: 'notes.txt' in session.text())

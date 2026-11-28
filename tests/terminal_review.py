@@ -2,6 +2,7 @@
 """Review spans retained history; cursor follows selections and survives resize."""
 import ctypes as c, time
 from pathlib import Path
+import private_display  # hides the desktop display; see tests/private_display.py
 root=Path(__file__).resolve().parents[1]
 lib=c.CDLL(str(root/'build/deps/install/lib/libdna_native.so'))
 lib.dna_terminal_open.argtypes=[c.c_char_p]*3;lib.dna_terminal_open.restype=c.c_void_p

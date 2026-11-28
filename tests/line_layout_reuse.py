@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 from source_patch import patched
+import private_display  # hides the desktop display; see tests/private_display.py
 ROOT=Path(__file__).resolve().parents[1]
 WORK=ROOT/'build/render-reuse'
 DYN=str(Path(os.environ.get('DYN',ROOT.parent/'dyn/compiler/build/dyn-release')).resolve())

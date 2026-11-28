@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Deterministic stdio LSP peer, including fragmented frames and Unicode."""
 import json, os, sys
+import private_display  # hides the desktop display; see tests/private_display.py
 versions={}; texts={}; commands={}
 def send(message):
     body=json.dumps(dict(jsonrpc='2.0',**message),ensure_ascii=False).encode()

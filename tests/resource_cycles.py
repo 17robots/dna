@@ -2,6 +2,7 @@
 """Repeated native lifecycles must release descriptors, threads and owned files."""
 import ctypes as c, os, subprocess, sys, tempfile, time
 from pathlib import Path
+import private_display  # hides the desktop display; see tests/private_display.py
 root=Path(__file__).resolve().parents[1]
 # This executable is a fixture, not a checked-in or preinstalled dependency.
 plugin_path=root/'examples/plugins/uppercase/uppercase'

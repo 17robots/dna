@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import private_display  # hides the desktop display; see tests/private_display.py
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('render_report', ROOT/'scripts/render_report.py')

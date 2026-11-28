@@ -11,6 +11,7 @@ import subprocess
 import statistics
 import time
 import tempfile
+import private_display  # hides the desktop display; see tests/private_display.py
 ROOT=Path(__file__).resolve().parents[1]
 parser=argparse.ArgumentParser()
 parser.add_argument('--baseline',type=Path,default=ROOT/'tests/fixtures/native_geometry_reference.dyn')

@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+import private_display  # hides the desktop display; see tests/private_display.py
 
 ROOT = Path(__file__).resolve().parents[1]
 DYN = os.environ.get("DYN") or subprocess.check_output(

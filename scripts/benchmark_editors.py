@@ -44,6 +44,8 @@ for name, result, args in (
 ):
     fn=getattr(V,'vterm_'+name);fn.restype=result;fn.argtypes=args
 
+# Tests pass this to Session.settle: a redraw that pauses this long is done.
+QUIET=float(os.environ.get('DNA_TUI_QUIET','0.1'))
 class Session:
     def __init__(self, command, env, cwd, rows=32, columns=120):
         self.rows,self.columns=rows,columns
@@ -96,9 +98,17 @@ class Session:
             if time.monotonic()>=deadline:
                 raise RuntimeError('screen acknowledgment timed out:\n'+self.text())
             self.read(deadline-time.monotonic())
-    def settle(self, seconds=.025):
-        deadline=time.monotonic()+seconds
-        while time.monotonic()<deadline:self.read(deadline-time.monotonic())
+    def settle(self, seconds=.025, quiet=None):
+        """Read output for seconds. With quiet, stop early once output has
+        arrived and then paused for quiet seconds: the redraw is done. Input
+        that redraws nothing still waits the full seconds."""
+        deadline=time.monotonic()+seconds;last=None
+        while (now:=time.monotonic())<deadline:
+            if quiet and last is not None:
+                if now-last>=quiet:return
+                limit=min(deadline,last+quiet)-now
+            else:limit=deadline-now
+            if self.read(limit):last=time.monotonic()
     def send(self, keys, predicate, timeout=8):
         started=time.perf_counter_ns();os.write(self.fd,keys)
         return self.wait(predicate,started,timeout)

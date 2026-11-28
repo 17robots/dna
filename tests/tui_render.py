@@ -14,6 +14,7 @@ import sys
 import tempfile
 import termios
 import time
+import private_display  # hides the desktop display; see tests/private_display.py
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(os.environ.get('DNA_TUI_BINARY', str(ROOT / 'build' / ('dna-' + (sys.argv[1] if len(sys.argv) > 1 else 'release')))))
@@ -27,6 +28,8 @@ for language in ('json', 'dyn'):
                        env=dict(os.environ, DNA_LANGUAGE_DIR=str(LANGUAGES)),
                        check=True, timeout=180)
 ROWS, COLUMNS = 24, 80
+# A redraw that pauses this long is finished (see Session.send).
+QUIET = float(os.environ.get('DNA_TUI_QUIET', '0.1'))
 # The terminal profile (just build-profile terminal) has no GUI to switch to.
 TERMINAL_ONLY = BINARY.name == 'dna-terminal'
 
@@ -70,12 +73,22 @@ class Session:
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack('HHHH', ROWS, COLUMNS, 0, 0))
         self.open = True
 
-    def pump(self, seconds):
-        deadline = time.time() + seconds
+    def pump(self, seconds, quiet=None, idle=None):
+        """Read output for up to seconds. With quiet, stop early once output
+        has arrived and then paused for quiet seconds: the frame is done.
+        With idle, also stop if nothing at all arrives for idle seconds."""
+        started = time.time()
+        deadline = started + seconds
+        last = None
         while self.open and time.time() < deadline:
-            ready, _, _ = select.select([self.fd], [], [], 0.05)
+            ready, _, _ = select.select([self.fd], [], [], 0.01 if quiet else 0.05)
             if not ready:
+                if quiet and last is not None and time.time() - last >= quiet:
+                    return
+                if idle and last is None and time.time() - started >= idle:
+                    return
                 continue
+            last = time.time()
             try:
                 data = os.read(self.fd, 65536)
             except OSError:
@@ -103,14 +116,18 @@ class Session:
     def wait_for(self, needle, seconds=5.0):
         deadline = time.time() + seconds
         while time.time() < deadline:
-            self.pump(0.1)
             if any(needle in row for row in self.text()):
+                # Let the rest of the frame arrive before callers read it.
+                self.pump(0.1, QUIET, idle=0.03)
                 return self.text()
+            self.pump(0.1, 0.01)
         fail(f'screen never showed {needle!r}', self.text())
 
     def send(self, data, settle=0.3):
+        """Type data, then read until the editor's redraw goes quiet; settle
+        caps the wait, and a key that redraws nothing waits all of it."""
         os.write(self.fd, data)
-        self.pump(settle)
+        self.pump(settle, QUIET)
 
     def close(self):
         if self.open:

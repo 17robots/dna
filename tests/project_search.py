@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import private_display  # hides the desktop display; see tests/private_display.py
 root = Path(__file__).resolve().parents[1]
 lib = c.CDLL(os.environ.get('DNA_NATIVE_LIBRARY',str(root/'build/deps/install/lib/libdna_native.so')))
 class Row(c.Structure):

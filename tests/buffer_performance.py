@@ -2,6 +2,7 @@
 """Measure actual bounded document edits before choosing a storage redesign."""
 import os, shutil, subprocess
 from pathlib import Path
+import private_display  # hides the desktop display; see tests/private_display.py
 root=Path(__file__).resolve().parents[1]; stage=root/'build/buffer-performance';stage.mkdir(exist_ok=True)
 shutil.copytree(root/'src/buffer',stage/'buffer',dirs_exist_ok=True)
 shutil.copytree(root/'src/owned_arena',stage/'owned_arena',dirs_exist_ok=True)

@@ -13,10 +13,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import private_display  # hides the desktop display; see tests/private_display.py
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'scripts'))
-from benchmark_editors import Session
+from benchmark_editors import QUIET, Session
 
 
 def fail(message, session=None):
@@ -64,7 +65,7 @@ def main():
                     for byte in data:
                         os.write(session.fd, bytes([byte]))
                         session.settle(.02)
-                    session.settle(settle)
+                    session.settle(settle, QUIET)
 
                 def expect_status(text, label):
                     deadline = time.monotonic() + 3
@@ -94,9 +95,9 @@ def main():
                     # An explicitly picked row runs even when the query is fuzzy.
                     keys(b':wrt')
                     os.write(session.fd, b'\x1b[B')
-                    session.settle(.2)
+                    session.settle(.2, QUIET)
                     os.write(session.fd, b'\x1b[A')
-                    session.settle(.2)
+                    session.settle(.2, QUIET)
                     keys(b'\r')
                     if 'Not an editor command' in status(session):
                         fail(f'{keymap} picked row did not run', session)

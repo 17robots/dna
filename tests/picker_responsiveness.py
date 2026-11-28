@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 from source_patch import patched
+import private_display  # hides the desktop display; see tests/private_display.py
 ROOT=Path(__file__).resolve().parents[1]
 source=Path(os.environ.get('DNA_PICKER_SOURCE',ROOT/'src'))
 BASE='''use "std/mem"

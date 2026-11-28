@@ -6,6 +6,7 @@ from pathlib import Path
 import random
 import subprocess
 import tempfile
+import private_display  # hides the desktop display; see tests/private_display.py
 ROOT=Path(__file__).resolve().parents[1];SOURCE=ROOT/'src/platform/gui.dyn';REFERENCE=ROOT/'tests/fixtures/native_fill_reference.dyn'
 from native_software_source import function
 from source_patch import patched

@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import private_display  # hides the desktop display; see tests/private_display.py
 
 root = Path(__file__).resolve().parents[1]
 guard = root / 'scripts/compile.py'
