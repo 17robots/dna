@@ -5,6 +5,10 @@ from pathlib import Path
 import shutil,subprocess,sys,tempfile
 from native_gpu_probe import install as gpu_probe
 from source_patch import patched
+import private_display  # hides the desktop display; see tests/private_display.py
+if not private_display.available():
+    print('SKIP popup_surface_motion: native windows need a private display; see tests/private_display.py')
+    raise SystemExit(0)
 ROOT=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='dna-popup-motion-',dir=ROOT/'build') as temporary:
     work=Path(temporary);stage=work/'src';shutil.copytree(ROOT/'src',stage)

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import time
 from types import SimpleNamespace
+import private_display  # hides the desktop display; see tests/private_display.py
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))

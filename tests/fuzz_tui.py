@@ -20,6 +20,7 @@ import sys
 import tempfile
 import termios
 import time
+import private_display  # hides the desktop display; see tests/private_display.py
 
 ROOT = Path(__file__).resolve().parents[1]
 first = int(sys.argv[1]) if len(sys.argv) > 1 else 1

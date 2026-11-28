@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 from source_patch import patched
+import private_display  # hides the desktop display; see tests/private_display.py
 
 ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser()
@@ -72,6 +73,7 @@ pub fn pointer(doc:*const Document, low:usize, high:usize) *const u8 { return &d
 pub fn release_views(doc:*Document) {}
 pub fn copy_range(doc:*const Document, low:usize, high:usize, output:[]u8) {}
 pub fn saved_hash(doc:*const Document) u64 { return 0 }
+pub fn saved_equal(doc:*const Document, text:[]const u8) bool { return false }
 pub enum LoadState { Complete, Running, Failed }
 pub fn load_state(doc:*const Document) LoadState { return .Complete }
 pub fn chunk_at(doc:*const Document, offset:usize) []const u8 { return doc.bytes[offset..doc.length] }

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import tempfile
 import time
+import private_display  # hides the desktop display; see tests/private_display.py
 lib=c.CDLL(os.environ.get('DNA_NATIVE_LIBRARY',str(Path(__file__).resolve().parents[1]/'build/deps/install/lib/libdna_native.so')))
 lib.dna_recovery_open.argtypes=[c.c_char_p];lib.dna_recovery_open.restype=c.c_void_p
 lib.dna_recovery_submit.argtypes=[c.c_void_p,c.c_char_p,c.c_size_t]

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import private_display  # hides the desktop display; see tests/private_display.py
 ROOT=Path(__file__).resolve().parents[1]
 if os.environ.get('DNA_DISK_DYNAMIC_CHILD')!='1':
     subprocess.run([sys.executable,__file__],check=True,timeout=30,

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import tempfile
 import time
+import private_display  # hides the desktop display; see tests/private_display.py
 ROOT = Path(__file__).resolve().parents[1]
 os.environ['DNA_RENDER_TRACE'] = 'picker-memory-test'
 lib = c.CDLL(str(ROOT / 'build/deps/install/lib/libdna_native.so'))

@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 from source_patch import patched
+import private_display  # hides the desktop display; see tests/private_display.py
 
 ROOT=Path(__file__).resolve().parents[1]
 CHECK='''fn storage_check(ok:bool) { if !ok { #panic("TUI screen storage lifecycle") } }

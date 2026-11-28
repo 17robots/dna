@@ -4,6 +4,7 @@ import ctypes
 import os
 from pathlib import Path
 import runpy
+import private_display  # hides the desktop display; see tests/private_display.py
 ROOT = Path(__file__).resolve().parents[1]
 os.environ['DNA_RENDER_TRACE'] = 'native-memory-test'
 runpy.run_path(str(ROOT/'tests/resource_cycles.py'), run_name='__main__')

@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+import private_display  # hides the desktop display; see tests/private_display.py
 
 ROOT = Path(__file__).resolve().parents[1]
 LANGUAGES = ROOT / 'build/test-languages'

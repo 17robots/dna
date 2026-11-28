@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import private_display  # hides the desktop display; see tests/private_display.py
 ROOT=Path(__file__).resolve().parents[1]
 subprocess.run(['python3',str(ROOT/'scripts/native_test.py'),'disk_idle',str(ROOT/'build/disk-idle'),'--executable'],check=True)
 with tempfile.TemporaryDirectory() as tmp:

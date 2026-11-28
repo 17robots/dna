@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import subprocess
 import time
+import private_display  # hides the desktop display; see tests/private_display.py
 ROOT=Path(__file__).resolve().parents[1]
 lib=c.CDLL(str(ROOT/'build/deps/install/lib/libdna_native.so'))
 lib.dna_language_helper.argtypes=[c.c_void_p,c.c_size_t]

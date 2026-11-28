@@ -67,6 +67,25 @@ language-server installation also require the configured MSYS2 tools. Windows
 recovery flushes each atomic rename so it survives power loss as well as
 process crashes.
 
+## Tests
+
+`just test` runs the fast checks and `just smoke` runs the full Linux suite.
+Both call `tests/run.py`, which holds the step lists. Steps run in parallel
+inside each stage, using half the CPUs; the build stage runs first, one build at
+a time, because the editor checks use its binaries. Checks that measure time or
+bounded memory run one at a time after the parallel group.
+
+- `DNA_TEST_JOBS=1` runs every step in order.
+- `DNA_TEST_ONLY=buffer_close,jobs` runs only those steps (builds still run).
+- `DNA_TEST_TIMES=times.txt` appends each step's seconds to the file.
+
+Tests never see your desktop display. `tests/private_display.py` removes
+`DISPLAY`, `WAYLAND_DISPLAY`, `WAYLAND_SOCKET` and `NIRI_SOCKET` before a test
+starts, so checks that need a native window print SKIP locally. Test windows on
+a live Wayland session have crashed `xwayland-satellite` and closed every X
+application with it. CI runs the window checks in a private headless weston and
+sets `DNA_TEST_DISPLAY=private`; do the same to run them locally.
+
 ## Run
 
 `dna --version` (or `dna version`) prints the application version and exits

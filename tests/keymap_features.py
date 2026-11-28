@@ -6,10 +6,11 @@ from pathlib import Path
 import sys
 import tempfile
 import time
+import private_display  # hides the desktop display; see tests/private_display.py
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT/'scripts'))
-from benchmark_editors import Session
+from benchmark_editors import QUIET, Session
 
 
 def run(binary, keymap, root, name, text, steps, extra=()):
@@ -33,13 +34,15 @@ def run(binary, keymap, root, name, text, steps, extra=()):
         session.wait(lambda: name in session.text())
         for step in steps:
             os.write(session.fd, step)
-            session.settle(.25)
+            session.settle(.25, QUIET)
         status = session.grid()[-1]
         for step in (b'\x1b', b':wa\r'):
             os.write(session.fd, step)
-            session.settle(.3)
+            session.settle(.3, QUIET)
+        # The write report means the save finished. A run with nothing to
+        # save shows none and waits the full two seconds.
         deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
+        while 'B written' not in session.text() and time.monotonic() < deadline:
             session.read(.05)
     finally:
         session.close()

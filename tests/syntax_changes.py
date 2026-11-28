@@ -4,6 +4,7 @@ import ctypes as c
 import os
 from pathlib import Path
 import time
+import private_display  # hides the desktop display; see tests/private_display.py
 
 ROOT = Path(__file__).resolve().parents[1]
 os.environ['DNA_RENDER_TRACE'] = 'syntax-changes-test'

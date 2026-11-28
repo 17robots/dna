@@ -6,6 +6,10 @@ import shutil
 import re
 import subprocess
 import tempfile
+import private_display  # hides the desktop display; see tests/private_display.py
+if not private_display.available():
+    print('SKIP native_platform: native windows need a private display; see tests/private_display.py')
+    raise SystemExit(0)
 ROOT=Path(__file__).resolve().parents[1]
 BACKEND=os.environ.get('DNA_NATIVE_BACKEND','x11')
 if BACKEND not in ('x11','wayland'):

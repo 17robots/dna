@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import ctypes as c, os, subprocess, tempfile, time
 from pathlib import Path
+import private_display  # hides the desktop display; see tests/private_display.py
 root=Path(__file__).resolve().parents[1]
 if not os.environ.get('DNA_FAULT_CHILD'):
     probe=root/'build/recovery-faults.so'

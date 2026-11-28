@@ -2,6 +2,7 @@
 import ctypes as c, tempfile, time
 from pathlib import Path
 import sys
+import private_display  # hides the desktop display; see tests/private_display.py
 root=Path(__file__).resolve().parents[1];lib=c.CDLL(str(root/('build/deps/install/lib/libdna_native.dylib' if sys.platform == 'darwin' else 'build/deps/install/lib/libdna_native.so')))
 lib.dna_disk_open.restype=c.c_void_p
 lib.dna_disk_watch.argtypes=[c.c_void_p,c.c_uint,c.c_uint64,c.c_char_p,c.c_void_p,c.c_size_t]

@@ -5,6 +5,12 @@ from pathlib import Path
 import subprocess
 import tempfile
 import sys as _sys
+# Keep editors off the desktop display; see tests/private_display.py.
+_sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tests'))
+import private_display  # noqa: E402
+if not private_display.available():
+    print('SKIP native UI smoke: native windows need a private display; see tests/private_display.py')
+    raise SystemExit(0)
 _sys.path.insert(0, str(__import__('pathlib').Path(__file__).resolve().parents[1] / 'scripts'))
 from dyn_path import with_real_dyn
 ROOT = Path(__file__).resolve().parents[1]

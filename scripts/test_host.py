@@ -6,6 +6,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+# Keep editors off the desktop display; see tests/private_display.py.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tests'))
+import private_display  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'scripts'))

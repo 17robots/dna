@@ -2,6 +2,7 @@
 """Exercise the shared owned-process interface in debug and release."""
 import os, shutil, subprocess
 from pathlib import Path
+import private_display  # hides the desktop display; see tests/private_display.py
 root=Path(__file__).resolve().parents[1]
 stage=root/'build/test-process-transport'
 stage.mkdir(parents=True,exist_ok=True)

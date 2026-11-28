@@ -4,6 +4,10 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import private_display  # hides the desktop display; see tests/private_display.py
+if not private_display.available():
+    print('SKIP launch: native windows need a private display; see tests/private_display.py')
+    raise SystemExit(0)
 
 ROOT = Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix="dna-launch-") as temporary:

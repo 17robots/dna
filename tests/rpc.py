@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import ctypes as c, json, os, shlex, tempfile, time
 from pathlib import Path
+import private_display  # hides the desktop display; see tests/private_display.py
 root=Path(__file__).resolve().parents[1]
 lib=c.CDLL(str(root/'build/deps/install/lib/libdna_native.so'))
 lib.dna_rpc_open.argtypes=[c.c_char_p,c.c_char_p];lib.dna_rpc_open.restype=c.c_void_p

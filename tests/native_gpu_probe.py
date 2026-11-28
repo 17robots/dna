@@ -5,6 +5,7 @@ window manager. Readback storage and FBOs never enter the production executable.
 """
 import re
 from source_patch import patched
+import private_display  # hides the desktop display; see tests/private_display.py
 HELPER=r'''
 native_probe_framebuffer:u32
 native_probe_texture:u32

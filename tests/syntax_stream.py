@@ -7,6 +7,7 @@ import threading
 import shutil
 import tempfile
 import time
+import private_display  # hides the desktop display; see tests/private_display.py
 
 ROOT = Path(__file__).resolve().parents[1]
 lib = c.CDLL(str(ROOT / 'build/deps/install/lib/libdna_native.so'))

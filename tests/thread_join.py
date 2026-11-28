@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 from source_patch import patched
+import private_display  # hides the desktop display; see tests/private_display.py
 
 ROOT = Path(__file__).resolve().parents[1]
 STAGE = ROOT / 'build/thread-join'

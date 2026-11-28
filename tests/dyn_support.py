@@ -2,6 +2,7 @@
 """Exercise the Dyn adapter library through its real C ABI."""
 import ctypes as c
 from pathlib import Path
+import private_display  # hides the desktop display; see tests/private_display.py
 
 root = Path(__file__).resolve().parents[1]
 lib = c.CDLL(str(root/'build/deps/install/lib/libdna_native.so'))

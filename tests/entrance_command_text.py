@@ -4,6 +4,10 @@ import os
 from pathlib import Path
 import shutil,subprocess,sys,tempfile
 from source_patch import patched
+import private_display  # hides the desktop display; see tests/private_display.py
+if not private_display.available():
+    print('SKIP entrance_command_text: native windows need a private display; see tests/private_display.py')
+    raise SystemExit(0)
 ROOT=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='dna-entrance-event-',dir=ROOT/'build') as temp:
  work=Path(temp);stage=work/'src';shutil.copytree(ROOT/'src',stage)

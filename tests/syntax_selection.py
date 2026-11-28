@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import time
 import subprocess
+import private_display  # hides the desktop display; see tests/private_display.py
 root = Path(__file__).resolve().parents[1]
 for language in ('json','dyn'):
     if not (root/'build/test-languages'/language/'parser.so').exists():

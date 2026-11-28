@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import time
+import private_display  # hides the desktop display; see tests/private_display.py
 
 ROOT = Path(__file__).resolve().parents[1]
 if sys.platform != 'darwin':

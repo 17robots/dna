@@ -12,6 +12,10 @@ import subprocess
 import tempfile
 from native_gpu_probe import install as install_gpu_probe
 from source_patch import patched
+import private_display  # hides the desktop display; see tests/private_display.py
+if not private_display.available():
+    print('SKIP native_gpu: native windows need a private display; see tests/private_display.py')
+    raise SystemExit(0)
 ROOT=Path(__file__).resolve().parents[1]
 BACKEND=os.environ.get('DNA_NATIVE_BACKEND','wayland')
 DYN=os.environ['DYN']

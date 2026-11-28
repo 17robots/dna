@@ -8,6 +8,10 @@ import subprocess
 import sys
 import tempfile
 from source_patch import patched
+import private_display  # hides the desktop display; see tests/private_display.py
+if not private_display.available():
+    print('SKIP typography_metrics: native windows need a private display; see tests/private_display.py')
+    raise SystemExit(0)
 ROOT=Path(__file__).resolve().parents[1]
 font=next((Path(x) for x in [os.environ.get('DNA_TYPOGRAPHY_FONT',''),'/usr/share/fonts/noto/NotoSansMono-Regular.ttf','/usr/share/fonts/TTF/DejaVuSansMono.ttf','/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf'] if x and Path(x).is_file()),None)
 if font is None:raise SystemExit('Set DNA_TYPOGRAPHY_FONT to a monospace face')
