@@ -22,12 +22,10 @@ def environment(compiler, base=None):
         source = installed
     installed_layout = not (source/'std').is_dir()
     standard = source if installed_layout else source/'std'
-    original = (standard/'dynlib/windows.dyn').read_text()
-    declaration = 'extern fn native_error "dyn_win_last_error"() u32'
     errno_files = ('thread/macos.dyn', 'process/macos.dyn', 'fs/watch/macos.dyn')
     darwin_sources = [(standard/name).read_text() for name in errno_files if (standard/name).is_file()]
     needs_darwin = sum('extern fn native_errno "__error"() *i32' in text for text in darwin_sources) > 1
-    if declaration not in original and not needs_darwin:
+    if not needs_darwin:
         return result
     fingerprint = hashlib.sha256((str(source.resolve())+'v4').encode())
     # A developer SDK can change in place. Never retain stale modules behind
@@ -49,10 +47,6 @@ def environment(compiler, base=None):
             else:
                 shutil.copytree(source/'std', destination/'std', dirs_exist_ok=True)
                 shutil.copytree(source/'vendor', destination/'vendor', dirs_exist_ok=True)
-            patched = original.replace(declaration,
-                'use compat_windows "std/os/windows"\n'
-                'fn native_error() u32 { return #cast(u32, 0 - compat_windows.thread_error()) }')
-            (destination/'std/dynlib/windows.dyn').write_text(patched)
             # The pinned Darwin thread/process/watch modules independently import
             # __error. Route all three through one declaration, without calling a
             # loader after a failed syscall (which could overwrite errno).

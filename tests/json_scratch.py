@@ -69,10 +69,10 @@ fn aliased(input: []const u8) {
   if lsp_json_string(output[..64], output[4..4 + input.len]).len != 0 { #panic("alias accepted") }
   if !same(output[..], saved[..]) { #panic("alias modified backing") }
   if lsp_json_string(output[5..64], output[4..4 + input.len]).len != 0 || !same(output[..], saved[..]) { #panic("reverse alias") }
-  value := json.Value{ kind: json.KindNumber, text: output[4..4 + input.len] }
+  value := json.Value{ kind: json.Kind.Number, text: output[4..4 + input.len] }
   if lsp_json_encode(output[..64], &value).len != 0 || !same(output[..], saved[..]) { #panic("number alias") }
-  value = json.Value{ kind: json.KindObject }
-  child := json.Value{ kind: json.KindNull, key: output[4..4 + input.len] }
+  value = json.Value{ kind: json.Kind.Object }
+  child := json.Value{ kind: json.Kind.Null, key: output[4..4 + input.len] }
   value.first = &child
   if lsp_json_encode(output[..64], &value).len != 0 || !same(output[..], saved[..]) { #panic("key alias") }
 }
@@ -139,7 +139,7 @@ fixture += '''  output: [16]u8
   unchanged(output[..])
   node_storage: [16]u64
   node := #cast(*json.Value, &node_storage[0])
-  node.* = json.Value{ kind: json.KindNull }
+  node.* = json.Value{ kind: json.Kind.Null }
   before := node_storage
   if lsp_json_encode(#slice(#cast(*u8, node), #sizeof(json.Value)), node).len != 0 { #panic("node alias accepted") }
   for index in 0..before.len { if before[index] != node_storage[index] { #panic("node alias changed metadata") } }
