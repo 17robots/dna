@@ -13,7 +13,7 @@ with tempfile.TemporaryDirectory(prefix='dna-syntax-idle-',dir=ROOT/'build') as 
  shutil.copyfile(ROOT/'tests/fixtures/native_syntax_idle.dyn',stage/'startup_probe.dyn')
  gui=stage/'platform/gui.dyn';source=gui.read_text()
  # Queue delivery remains production; remove unrelated desktop input/readiness.
- start=source.index('  for native_gui.deferred_count!=0',source.index('fn gui_poll('))
+ start=source.index('  for native_gui.deferred_count != 0',source.index('fn gui_poll('))
  end=source.index('\nfn gui_wait_timeout(',start)
  source=source[:start]+'  return false\n}\n'+source[end:]
  start=source.index('fn gui_wait_timeout(');end=source.index('\nfn gui_wait(',start)

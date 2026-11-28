@@ -24,5 +24,5 @@ def function(path, name):
         body=body[:begin]+body[finish:]
     body=body.replace('    if !native_gui.direct {\n      native_texture_cpu(t)\n    }\n','').replace('  native_texture_cpu(t)\n','').replace('    t.dirty=true\n','')
     if actual!=name:
-        body=patched(body, 'native_text_cached_bitmap(_renderer:rawptr, key:u64,', 'native_text_bitmap(_renderer:rawptr,')
+        body=patched(body, 'native_text_cached_bitmap(_renderer: rawptr, key: u64,', 'native_text_bitmap(_renderer:rawptr,')
     return body
