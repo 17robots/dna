@@ -17,7 +17,8 @@ source=(ROOT/'src/line_layout.dyn').read_text();baseline=WORK/'baseline-line_lay
 if not baseline.exists():baseline.write_text(source)
 name='layout-baseline' if args.baseline else 'layout-candidate';stage=WORK/name;stage.mkdir(exist_ok=True)
 for module in ('buffer','owned_arena'):
- shutil.copytree(ROOT/'src'/module,stage/module,dirs_exist_ok=True)
+ shutil.rmtree(stage/module,ignore_errors=True)
+ shutil.copytree(ROOT/'src'/module,stage/module)
 (stage/'ttf').mkdir(exist_ok=True)
 (stage/'ttf/ttf.dyn').write_text('''pub struct Substring {flags:u32,offset:i32,length:i32,line:i32,cluster:i32,x:i32,y:i32,width:i32,height:i32}
 pub fn create(engine,font:rawptr,bytes:*const u8,length:usize)rawptr{return #cast(rawptr,1)}

@@ -12,7 +12,8 @@ for suite in ("objects", "buffer", "files", "layout", "motion", "pattern", "sett
     stage = ROOT / "build" / f"test-{suite}"
     stage.mkdir(parents=True, exist_ok=True)
     for module in ("owned_arena", "cstring", "host", "filesystem", "buffer", "files", "layout", "motion", "pattern", "settings", "workspace", "lsp", "servers"):
-        shutil.copytree(ROOT / "src" / module, stage / module, dirs_exist_ok=True)
+        shutil.rmtree(stage / module, ignore_errors=True)  # no stale files from earlier runs
+        shutil.copytree(ROOT / "src" / module, stage / module)
     source = (ROOT / "tests" / suite / "main.dyn").read_text()
     (stage / "main.dyn").write_text(source.replace('../../src/', './'))
     for mode in ("debug", "release"):

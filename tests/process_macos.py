@@ -71,6 +71,9 @@ def main():
         source = replace_once(source,
             'extern fn proc_fcntl_native "fcntl$NOCANCEL"(fd: i32, operation: i32, ...) i32',
             'fn proc_fcntl_native(fd: i32, operation: i32, value: i32) i32 { return fake_fcntl(fd, operation, value) }')
+        # The helpers macOS shares with Linux and Windows live beside it.
+        for shared in ('process_common.dyn', 'process_unix.dyn'):
+            source += '\n' + (NATIVE / shared).read_text().replace('#target(family: unix)\n', '')
         (mocked / 'process.dyn').write_text(source)
         shutil.copyfile(ROOT / 'tests/fixtures/process_macos_mock.dyn', mocked / 'main.dyn')
         for mode in ('debug', 'release'):
@@ -83,7 +86,8 @@ def main():
 
         production = work / 'production'
         production.mkdir()
-        for name in ('process_macos.dyn', 'rec_io_macos.dyn', 'clock.dyn',
+        for name in ('process_macos.dyn', 'process_unix.dyn', 'process_common.dyn',
+                     'rec_io_macos.dyn', 'rec_io_unix.dyn', 'clock.dyn',
                      'sync_desktop.dyn', 'sync_macos.dyn'):
             shutil.copyfile(NATIVE / name, production / name)
         marker = "// Dyn's current executable entry point"

@@ -93,6 +93,10 @@ subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror',
                input='\n'.join(code), text=True, check=True)
 values = subprocess.check_output([str(STAGE/'headers')],text=True).split()
 assert len(values)==len(checks)
+# Stage exactly the current sources: a file removed from src/native/dyn
+# must not linger from an earlier run.
+for stale in STAGE.glob('*.dyn'):
+    stale.unlink()
 for source in (ROOT/'src/native/dyn').glob('*.dyn'):
     shutil.copyfile(source, STAGE/source.name)
 main = ['fn main() {'] + [f'  v{name} := {name}{{}}' for name,_,fields in LAYOUTS if fields]

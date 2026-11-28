@@ -184,6 +184,7 @@ with tempfile.TemporaryDirectory(prefix='dna-frontend-win-') as temporary:
     for module in ('host', 'cstring', 'owned_arena', 'filesystem', 'servers'):
         shutil.copytree(ROOT / 'src' / module, stage / module)
     shutil.copyfile(ROOT / 'src/c_windows.dyn', stage / 'c_windows.dyn')
+    shutil.copyfile(ROOT / 'src/environment.dyn', stage / 'environment.dyn')
     (stage / 'main.dyn').write_text(FIXTURE, encoding='utf-8')
     env = environment(compiler)
     for target in ('x86_64-windows', 'aarch64-windows'):

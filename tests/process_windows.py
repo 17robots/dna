@@ -225,7 +225,7 @@ def main():
         stage.mkdir()
         for module in ('filesystem', 'host', 'cstring', 'owned_arena'):
             shutil.copytree(ROOT / 'src' / module, stage / module)
-        for source in ('process_windows.dyn', 'rec_io_windows.dyn'):
+        for source in ('process_windows.dyn', 'process_common.dyn', 'rec_io_windows.dyn'):
             shutil.copyfile(ROOT / 'src/native/dyn' / source, stage / source)
         (stage / 'main.dyn').write_text(FIXTURE, encoding="utf-8")
         if os.name == 'nt':

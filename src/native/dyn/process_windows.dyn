@@ -1,58 +1,44 @@
 #target(kernel: windows)
+use win_proc_sync "std/sync"
+use win_proc_loader "std/dynlib"
+use "std/io"
+
 #link("kernel32")
+
 #link("ucrt")
 
 // CRT descriptor tokens own pipe handles. Process and Job handles stay pointer
 // sized; the positive pid is only the shared policy's live-owner marker.
 struct OwnedProcess { pid: i32, process, job: rawptr, input: i32, output: i32, error: i32}
-struct PollDescriptor { fd: i32, events, returned: i16 }
+
 struct WinProcStartup {
   size: u32, reserved, desktop, title: rawptr,
   x, y, width, height, columns, rows, fill, flags: u32,
   show, reserved_size: u16, reserved_bytes, input, output, error, attributes: rawptr,
 }
+
 struct WinProcInformation { process, thread: rawptr, process_id, thread_id: u32 }
+
 struct WinProcBasicLimits {
   process_time, job_time: i64, flags: u32,
   minimum_working, maximum_working: usize, active_processes: u32,
   affinity: usize, priority, scheduling: u32,
 }
+
 struct WinProcLimits { basic: WinProcBasicLimits, counters: [6]u64, process_memory, job_memory, peak_process, peak_job: usize }
+
 struct WinProcSpace { executable, directory, command: [32768]u16, attributes: rawptr }
-
-
-
-
-
-
-
-
-
-
-
-
 
 extern fn win_proc_attributes_free "DeleteProcThreadAttributeList"(list: rawptr)
 
-
-
-
-
-
-
-
-
-
-
 extern fn win_proc_sleep "Sleep"(milliseconds: u32)
 
-
 extern fn win_proc_dup "_dup"(fd: i32) i32
+
 extern fn proc_realloc "realloc"(bytes: *u8, length: usize) *u8
+
 extern fn proc_move "memmove"(output: *u8, source: *const u8, length: usize) rawptr
-use win_proc_sync "std/sync"
-use win_proc_loader "std/dynlib"
-use "std/io"
+
 struct WinProcAPI {
   create: fn(*const u16, *u16, rawptr, rawptr, i32, u32, rawptr, rawptr, *WinProcStartup, *WinProcInformation) i32,
   job: fn(rawptr, rawptr) rawptr,
@@ -81,8 +67,11 @@ struct WinProcAPI {
   wide: fn(u32, u32, *const u8, i32, *u16, i32) i32,
   system: fn(*u16, u32) u32,
 }
+
 win_proc_api: WinProcAPI
+
 win_proc_once: win_proc_sync.Once
+
 fn win_proc_prepare() {
   if win_proc_sync.once_begin(&win_proc_once) {
     kernel := win_proc_loader.open("kernel32.dll", 0) catch {
@@ -117,21 +106,18 @@ fn win_proc_prepare() {
     win_proc_sync.once_complete(&win_proc_once)
   }
 }
+
 win_proc_pipe_sequence: win_proc_sync.AtomicU32
 
-fn proc_watch(fd: i32, writing: i32) {
-  dna_watch(fd, writing)
-}
-fn proc_unwatch(fd: i32) {
-  dna_unwatch(fd)
-}
 fn proc_ticks() u64 {
   win_proc_prepare()
   return win_proc_api.ticks()
 }
+
 fn win_proc_valid(handle: rawptr) bool {
   return handle != nil && #cast(usize, handle) != ~#cast(usize, 0)
 }
+
 fn win_proc_errno(code: u32) isize {
   error: i32 = 5
   if code == 109 || code == 233 || code == 232 {
@@ -146,6 +132,7 @@ fn win_proc_errno(code: u32) isize {
   rec_errno().* = error
   return -#cast(isize, error)
 }
+
 fn win_proc_utf16(text: *const u8, output: *u16, capacity: i32) i32 {
   length := string_length(text)
   if length == 0 || length > 32766 { return 0 }
@@ -154,6 +141,7 @@ fn win_proc_utf16(text: *const u8, output: *u16, capacity: i32) i32 {
   #slice(output, #cast(usize, capacity))[#cast(usize, size)] = 0
   return size
 }
+
 // Keep descriptors out of stdio even when the embedding process closed them.
 fn win_proc_descriptor(handle: rawptr) i32 {
   fd := win_io_adopt(handle, 32898)
@@ -175,6 +163,7 @@ fn win_proc_descriptor(handle: rawptr) i32 {
   }
   return fd
 }
+
 fn win_proc_append_decimal(output: []u16, used: *usize, value: u32) {
   digits: [10]u16
   size: usize = 0
@@ -191,6 +180,7 @@ fn win_proc_append_decimal(output: []u16, used: *usize, value: u32) {
     used.* += 1
   }
 }
+
 // Unique first-instance pipes cannot be substituted by another local process.
 // Both endpoints start nonblocking. Spawn switches only each child endpoint to
 // blocking mode; the parent keeps bounded, partial byte-stream IO.
@@ -249,20 +239,14 @@ fn proc_pipe(fds: *i32, flags: i32) i32 {
   #slice(fds, 2)[1] = write_fd
   return 0
 }
+
 fn proc_nonblocking(fd: i32) bool {
   win_proc_prepare()
   handle := win_io_handle(fd)
   mode: u32 = 1
   return win_proc_valid(handle) && win_proc_api.pipe_mode(handle, &mode, nil, nil) != 0
 }
-fn proc_none() OwnedProcess {
-  return OwnedProcess{ input: -1, output: -1, error: -1 }
-}
-fn proc_take(child: *OwnedProcess) OwnedProcess {
-  owned := child.*
-  child.* = proc_none()
-  return owned
-}
+
 fn proc_close(child: *OwnedProcess) {
   win_proc_prepare()
   owned := proc_take(child)
@@ -286,6 +270,7 @@ fn proc_close(child: *OwnedProcess) {
     _ = win_proc_api.close(owned.job)
   }
 }
+
 fn win_proc_absolute(path: *const u8) bool {
   size := string_length(path)
   if size >= 3 && #slice(path, size)[1] == 58 && (#slice(path, size)[2] == 92 || #slice(path, size)[2] == 47) {
@@ -293,6 +278,7 @@ fn win_proc_absolute(path: *const u8) bool {
   }
   return size >= 2 && ((#slice(path, size)[0] == 92 && #slice(path, size)[1] == 92) || (#slice(path, size)[0] == 47 && #slice(path, size)[1] == 47))
 }
+
 fn proc_open(command: *const u8, directory: *const u8, shell: bool) OwnedProcess {
   win_proc_prepare()
   if command == nil || directory == nil || command.* == 0 || !win_proc_absolute(directory) || (!shell && !win_proc_absolute(command)) {
@@ -394,6 +380,7 @@ fn proc_open(command: *const u8, directory: *const u8, shell: bool) OwnedProcess
   descriptors[4] = -1
   return owned
 }
+
 fn proc_read_raw(fd: i32, bytes: *u8, length: usize) isize {
   win_proc_prepare()
   if length == 0 { return 0 }
@@ -431,11 +418,13 @@ fn proc_read_raw(fd: i32, bytes: *u8, length: usize) isize {
   }
   return #cast(isize, read)
 }
+
 fn proc_read(fd: i32, bytes: *u8, length: usize) isize {
   value := proc_read_raw(fd, bytes, length)
   if value < 0 { return -#cast(isize, rec_errno().*) }
   return value
 }
+
 fn proc_write(fd: i32, bytes: *const u8, length: usize) isize {
   win_proc_prepare()
   amount := length
@@ -460,6 +449,7 @@ fn proc_write(fd: i32, bytes: *const u8, length: usize) isize {
   }
   return #cast(isize, written)
 }
+
 fn proc_poll(fds: *PollDescriptor, count: usize, timeout: i32) i32 {
   win_proc_prepare()
   started := proc_ticks()
@@ -501,6 +491,7 @@ fn proc_poll(fds: *PollDescriptor, count: usize, timeout: i32) i32 {
   }
   return 0
 }
+
 fn proc_peek(child: *const OwnedProcess) i32 {
   win_proc_prepare()
   if child.process == nil { return -1 }
@@ -511,31 +502,6 @@ fn proc_peek(child: *const OwnedProcess) i32 {
   if win_proc_api.exit(child.process, &status) == 0 { return -1 }
   if status == 0 { return 1 }
   return 2
-}
-fn proc_log(log: []u8, used: *usize, bytes: str) {
-  amount := bytes.len
-  if amount >= log.len {
-    amount = log.len - 1
-  }
-  keep := used.*
-  if keep > log.len - 1 - amount {
-    keep = log.len - 1 - amount
-  }
-  if keep > 0 {
-    _ = proc_move(&log[0], &log[used.* - keep], keep)
-  }
-  if amount > 0 {
-    _ = copy(&log[keep], &bytes[bytes.len - amount], amount)
-  }
-  used.* = keep + amount
-  log[used.*] = 0
-}
-fn proc_close_fds(fds: []i32) {
-  for fd in fds {
-    if fd >= 0 {
-      _ = rec_close(fd)
-    }
-  }
 }
 
 fn proc_symbol(library: rawptr, name: *const u8) rawptr {
