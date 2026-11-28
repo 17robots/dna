@@ -215,7 +215,7 @@ def main():
         stage.mkdir()
         for module in ('filesystem', 'host', 'cstring', 'owned_arena'):
             shutil.copytree(ROOT / 'src' / module, stage / module)
-        for source in ('process_windows.dyn', 'rec_io_windows.dyn', 'install_windows.dyn', 'disk_windows.dyn', 'sync_desktop.dyn', 'sync_windows.dyn', 'clock.dyn'):
+        for source in ('process_windows.dyn', 'process_common.dyn', 'rec_io_windows.dyn', 'install_windows.dyn', 'disk_windows.dyn', 'sync_desktop.dyn', 'sync_windows.dyn', 'clock.dyn'):
             shutil.copyfile(ROOT / 'src/native/dyn' / source, stage / source)
         source = (ROOT / 'src/native/dyn/sync.dyn').read_text(encoding='utf-8')
         (stage / 'sync.dyn').write_text(source.split("// Dyn's current executable entry point", 1)[0], encoding='utf-8')

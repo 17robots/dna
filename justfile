@@ -24,9 +24,9 @@ clean-scratch *flags:
     python3 scripts/clean_scratch.py {{flags}}
 # dyn fmt skips nested module directories, so visit each one.
 fmt:
-    find src tests examples -name '*.dyn' -printf '%h\n' | sort -u | xargs -n1 "$DYN" fmt
+    find src tests examples modules -name '*.dyn' -printf '%h\n' | sort -u | xargs -n1 "$DYN" fmt
 fmt-check:
-    find src tests examples -name '*.dyn' -printf '%h\n' | sort -u | xargs -n1 "$DYN" fmt --check
+    find src tests examples modules -name '*.dyn' -printf '%h\n' | sort -u | xargs -n1 "$DYN" fmt --check
 test:
     python3 tests/sdk_requirements.py
     python3 tests/sdk_compat.py

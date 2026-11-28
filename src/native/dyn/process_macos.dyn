@@ -1,14 +1,15 @@
 #target(kernel: darwin)
-#link("System")
 use proc_loader "std/dynlib"
 use "std/io"
+
+#link("System")
 
 // Darwin owns pointer-sized spawn objects. The child remains waitable until
 // close, pinning its PID while this adapter owns the process group.
 // ABI sources: apple-oss-distributions/xnu, bsd/sys/{fcntl,wait,signal}.h
 // and libsyscall/wrappers/spawn/spawn.h.
 struct OwnedProcess { pid: i32, input: i32, output: i32, error: i32}
-struct PollDescriptor { fd: i32, events, returned: i16 }
+
 struct DarwinChildInfo {
   signal, error, code, pid: i32,
   uid: u32,
@@ -16,6 +17,7 @@ struct DarwinChildInfo {
   address, value, band: usize,
   reserved: [7]usize,
 }
+
 struct DarwinProcessAPI {
   pipe: fn(*i32) i32,
   close: fn(i32) i32,
@@ -35,8 +37,11 @@ struct DarwinProcessAPI {
   move: fn(*u8, *const u8, usize) rawptr,
   environment: fn() *rawptr,
 }
+
 proc_api: DarwinProcessAPI
+
 proc_api_once: sync.Once
+
 fn proc_library_symbol(name: str) rawptr {
   found := proc_loader.symbol(#cast(rawptr, #cast(isize, -2)), name) catch {
     #panic("missing libSystem process routine")
@@ -46,6 +51,7 @@ fn proc_library_symbol(name: str) rawptr {
   }
   return found
 }
+
 fn proc_prepare() {
   // Resolve errno before IO; loader initialization can otherwise clobber it.
   _ = rec_errno()
@@ -72,10 +78,12 @@ fn proc_prepare() {
     sync.once_complete(&proc_api_once)
   }
 }
+
 // Darwin arm64 places variadic arguments on the stack. Function-pointer types
 // cannot express a C ellipsis in the pinned compiler. The native NOCANCEL alias
 // keeps this call variadic without redeclaring the SDK's fcntl foreign symbol.
 extern fn proc_fcntl_native "fcntl$NOCANCEL"(fd: i32, operation: i32, ...) i32
+
 fn proc_fcntl(fd: i32, operation: i32, value: i32) i32 {
   proc_prepare()
   if operation == 1030 {
@@ -86,6 +94,7 @@ fn proc_fcntl(fd: i32, operation: i32, value: i32) i32 {
   }
   return proc_fcntl_native(fd, operation, value)
 }
+
 fn proc_pipe(fds: *i32, flags: i32) i32 {
   proc_prepare()
   if proc_api.pipe(fds) != 0 { return -1 }
@@ -101,58 +110,50 @@ fn proc_pipe(fds: *i32, flags: i32) i32 {
   }
   return 0
 }
+
 fn proc_symbol(library: rawptr, name: *const u8) rawptr {
   if library == nil {
     library = #cast(rawptr, #cast(isize, -2))
   }
   return proc_loader.symbol(library, #slice(name, string_length(name))) catch nil
 }
-fn proc_watch(fd: i32, writing: i32) {
-  dna_watch(fd, writing)
-}
-fn proc_unwatch(fd: i32) {
-  dna_unwatch(fd)
-}
+
 fn proc_realloc(bytes: *u8, length: usize) *u8 {
   proc_prepare()
   return proc_api.resize(bytes, length)
 }
+
 fn proc_move(output: *u8, source: *const u8, length: usize) rawptr {
   proc_prepare()
   return proc_api.move(output, source, length)
 }
-fn proc_ticks() u64 {
-  return dna_ticks()
-}
+
 fn proc_kill(pid: i32, signal: i32) i32 {
   proc_prepare()
   return proc_api.kill(pid, signal)
 }
+
 fn proc_wait(pid: i32, status: *i32, flags: i32) i32 {
   proc_prepare()
   return proc_api.wait(pid, status, flags)
 }
+
 fn proc_poll(fds: *PollDescriptor, count: usize, timeout: i32) i32 {
   proc_prepare()
   if count > 4294967295 { return -1 }
   return proc_api.poll(fds, #cast(u32, count), timeout)
 }
+
 fn proc_read_raw(fd: i32, bytes: *u8, length: usize) isize {
   proc_prepare()
   return proc_api.read(fd, bytes, length)
 }
+
 fn proc_nonblocking(fd: i32) bool {
   flags := proc_fcntl(fd, 3, 0)
   return flags >= 0 && proc_fcntl(fd, 4, flags | 4) == 0
 }
-fn proc_none() OwnedProcess {
-  return OwnedProcess{ input: -1, output: -1, error: -1 }
-}
-fn proc_take(child: *OwnedProcess) OwnedProcess {
-  owned := child.*
-  child.* = proc_none()
-  return owned
-}
+
 fn proc_close(child: *OwnedProcess) {
   owned := proc_take(child)
   proc_unwatch(owned.input)
@@ -171,6 +172,7 @@ fn proc_close(child: *OwnedProcess) {
     for proc_wait(owned.pid, nil, 0) < 0 && rec_errno().* == 4 {}
   }
 }
+
 fn proc_open(command: *const u8, directory: *const u8, shell: bool) OwnedProcess {
   empty := proc_none()
   if command == nil || command.* == 0 || directory == nil || directory.* != 47 || (!shell && command.* != 47) {
@@ -232,22 +234,26 @@ fn proc_open(command: *const u8, directory: *const u8, shell: bool) OwnedProcess
   }
   return child
 }
+
 fn proc_error_code() isize {
   error := rec_errno().*
   if error == 35 { return -11 } // Shared transport callers use EAGAIN = 11.
   return -#cast(isize, error)
 }
+
 fn proc_read(fd: i32, bytes: *u8, length: usize) isize {
   value := proc_read_raw(fd, bytes, length)
   if value < 0 { return proc_error_code() }
   return value
 }
+
 fn proc_write(fd: i32, bytes: *const u8, length: usize) isize {
   proc_prepare()
   value := rec_write(fd, bytes, length)
   if value < 0 { return proc_error_code() }
   return value
 }
+
 // WNOWAIT pins the leader PID until proc_close kills the owned group and reaps.
 fn proc_peek(child: *const OwnedProcess) i32 {
   proc_prepare()
@@ -259,29 +265,4 @@ fn proc_peek(child: *const OwnedProcess) i32 {
   if info.pid != child.pid { return 0 }
   if info.code == 1 && info.status == 0 { return 1 }
   return 2
-}
-fn proc_log(log: []u8, used: *usize, bytes: str) {
-  amount := bytes.len
-  if amount >= log.len {
-    amount = log.len - 1
-  }
-  keep := used.*
-  if keep > log.len - 1 - amount {
-    keep = log.len - 1 - amount
-  }
-  if keep > 0 {
-    _ = proc_move(&log[0], &log[used.* - keep], keep)
-  }
-  if amount > 0 {
-    _ = copy(&log[keep], &bytes[bytes.len - amount], amount)
-  }
-  used.* = keep + amount
-  log[used.*] = 0
-}
-fn proc_close_fds(fds: []i32) {
-  for fd in fds {
-    if fd >= 0 {
-      _ = rec_close(fd)
-    }
-  }
 }
