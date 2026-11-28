@@ -225,7 +225,7 @@ with tempfile.TemporaryDirectory(prefix='dna-native-text-') as directory:
     SOURCE=SOURCE.replace('LARGE_FONT_FILE',str(work/'large.ttf'))
     with (work/'oversized.ttf').open('wb') as output:output.truncate(67108865)
     SOURCE=SOURCE.replace('OVERSIZED_FONT_FILE',str(work/'oversized.ttf'))
-    backend=(ROOT/'src/text/native.dyn').read_text().replace('use sdl "../platform"','use sdl "./platform"')
+    backend=(ROOT/'src/text/native.dyn').read_text().replace('use platform "../platform"','use platform "./platform"')
     backend=re.sub(r'extern fn native_text_attach[^\n]+','fn native_text_attach(callbacks:*const NativeTextCallbacks) bool { return dna_native_text_attach(callbacks) }',backend)
     backend=re.sub(r'extern fn native_tracked_create[^\n]+','fn native_tracked_create(engine:rawptr,font:rawptr,text:*const u8,length:usize) rawptr { return dna_text_create(engine,font,text,length) }',backend)
     backend=re.sub(r'extern fn native_tracked_destroy[^\n]+','fn native_tracked_destroy(text:rawptr) { dna_text_destroy(text) }',backend)

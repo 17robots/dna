@@ -21,14 +21,14 @@ pub fn probe_setup(pixels:*u8,vx,vy,vw,vh,cx,cy,cw,ch:i32,sx,sy:f32,r,g,b,a:u8) 
 }
 pub fn probe_draw(reference,clear:i32,rect:*const Rect) bool {
  if reference!=0 {if clear!=0 {return reference_clear(nil)};return reference_fill(nil,rect)}
- if clear!=0 {return sdl_clear(nil)}
- return sdl_fill(nil,rect)
+ if clear!=0 {return gui_clear(nil)}
+ return gui_fill(nil,rect)
 }
 '''.replace(';','\n')
 rng=random.Random(7213)
 class Rect(c.Structure):_fields_=[(x,c.c_float) for x in ('x','y','width','height')]
 with tempfile.TemporaryDirectory(prefix='dna-fill-spans-') as directory:
- stage=Path(directory);names=['native_surface','native_clip','sdl_clear','sdl_fill','native_draw_alpha']
+ stage=Path(directory);names=['native_surface','native_clip','gui_clear','gui_fill','native_draw_alpha']
  if 'fn native_fill_span(' in SOURCE.read_text():names.append('native_fill_span')
  code='\n'.join(function(SOURCE,n) for n in names)
  if (ROOT/'src/platform/memory_linux.dyn').is_file():

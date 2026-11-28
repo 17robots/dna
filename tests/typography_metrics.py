@@ -32,7 +32,7 @@ pub fn typography_probe_bottom()f32{return typography_probe_ink_bottom}
 }
 ''')
     (stage/'startup_probe.dyn').write_text('''fn startup_probe(app:*App,typography:*Typography,renderer:rawptr,window:rawptr,input_storage:[]u8){
- typography_metrics_smoke(app,typography,renderer,sdl.typography_probe_reset,sdl.typography_probe_bottom,ttf.typography_probe_uses_fallback,FALLBACK_PATH)
+ typography_metrics_smoke(app,typography,renderer,platform.typography_probe_reset,platform.typography_probe_bottom,ttf.typography_probe_uses_fallback,FALLBACK_PATH)
 }
 fn finish_probe(app:*App){}
 '''.replace('FALLBACK_PATH',json.dumps(str(fallback) if fallback else '')))

@@ -20,7 +20,7 @@ HEADER='''use "std/mem"
 use arena_owner "./owner"
 use buffer "./buffer"
 use host "./host"
-use sdl "./sdl"
+use platform "./platform"
 struct LspShadow {snapshot:buffer.TextSnapshot,ready:bool}
 struct LspDocument {shadow:LspShadow,identity:u64,revision:u64,observed:u64,changed:u64,path:[4096]u8}
 struct LanguageServer {documents:[]LspDocument,documents_arena:*mem.Arena,allocation_retry_due:u64,ready:bool,dirty_first:*Slot,attach_scan:bool}
@@ -51,12 +51,12 @@ fn main(){
  check(!lsp_documents_ensure(server,97) && server.documents_arena==records && server.documents.len==1)
  // No record exists for the unattached new slot, but scheduler still wakes.
  server.ready=true
- sdl.now=100
- lsp_allocation_retry(server,sdl.now)
+ platform.now=100
+ lsp_allocation_retry(server,platform.now)
  check(lsp_allocation_wait(server,100)==250 && lsp_wait_ms(&app,1000)==250)
- sdl.now=250
+ platform.now=250
  check(lsp_wait_ms(&app,1000)==100)
- sdl.now=350
+ platform.now=350
  check(lsp_wait_ms(&app,1000)==0)
  server.allocation_retry_due=0
  // A dirty existing shadow must not override backoff with an expired 0ms
@@ -67,10 +67,10 @@ fn main(){
  app.documents.slots=slots[..]
  server.dirty_first=&slot
  server.documents[0].revision=1
- sdl.now=500
- lsp_allocation_retry(server,sdl.now)
+ platform.now=500
+ lsp_allocation_retry(server,platform.now)
  check(lsp_wait_ms(&app,1000)==250 && lsp_wait_ms(&app,40)==40)
- sdl.now=750
+ platform.now=750
  check(lsp_wait_ms(&app,1000)==0)
  server.allocation_retry_due=0
  failed=false
@@ -96,7 +96,7 @@ with tempfile.TemporaryDirectory(prefix='dna-lsp-storage-') as temporary:
     shutil.copytree(ROOT/'src/owned_arena',work/'owner')
     (work/'buffer').mkdir();(work/'buffer/buffer.dyn').write_text('pub struct TextSnapshot {length:usize,held:bool}\npub live:usize=0\npub fn snapshot_take(length:usize)TextSnapshot {live+=1\n return TextSnapshot{length:length,held:true}}\npub fn snapshot_release(snapshot:*TextSnapshot) {if snapshot.held {live-=1}\n snapshot.* = TextSnapshot{}}\n')
     (work/'host').mkdir();(work/'host/host.dyn').write_text('pub fn small_pages(memory:[]u8) {}\n')
-    (work/'sdl').mkdir();(work/'sdl/sdl.dyn').write_text('pub now:u64=0\npub fn ticks()u64 {return now}\n')
+    (work/'platform').mkdir();(work/'platform/platform.dyn').write_text('pub now:u64=0\npub fn ticks()u64 {return now}\n')
     (work/'main.dyn').write_text(HEADER+helpers)
     for mode in ('--debug','--release'):
         output=work/('probe'+mode)

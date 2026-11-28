@@ -32,7 +32,7 @@ pub fn probe_texture(reference:i32,pixels:*u8,width,height:i32,alpha:u8,alias:i3
  if alias!=0 {texture.pixels=native_gui.surface.pixels}
  result:=false
  if reference!=0 {result=reference_texture(nil,&texture,source,destination)}
- else {result=sdl_render_texture(nil,&texture,source,destination)}
+ else {result=gui_render_texture(nil,&texture,source,destination)}
  #slice(checks, 3)[0]=clips
  #slice(checks, 3)[1]=span_copies
  #slice(checks, 3)[2]=blends
@@ -71,7 +71,7 @@ with tempfile.TemporaryDirectory(prefix='dna-native-texture-') as temporary:
  shared=shared.replace('fn native_clip(surface: software.Surface) ui.Rect {','fn native_clip(surface: software.Surface) ui.Rect {\n clips+=1')
  shared=shared.replace('fn native_blend_at(surface:*software.Surface, at:usize, r,g,b,a:u8) {','fn native_blend_at(surface:*software.Surface, at:usize, r,g,b,a:u8) {\n blends+=1')
  copy='extern fn raw_span_copy "__mempcpy_chk"(destination:*u8,source:*const u8,length,capacity:usize)rawptr\nfn native_span_copy(destination:*u8,source:*const u8,length,capacity:usize)rawptr {span_copies+=1\n return raw_span_copy(destination,source,length,capacity)}\n'
- (stage/'main.dyn').write_text(HEADER+'\n'+copy+shared+'\n'+REFERENCE.read_text()+'\n'+function(SOURCE,'sdl_render_texture'))
+ (stage/'main.dyn').write_text(HEADER+'\n'+copy+shared+'\n'+REFERENCE.read_text()+'\n'+function(SOURCE,'gui_render_texture'))
  for mode in ('debug','release'):
   output=stage/(mode+'.so')
   subprocess.run(['python3',str(ROOT/'scripts/compile.py'),os.environ.get('DYN','dyn'),'build',str(stage),'--shared','--'+mode,'--output',str(output)],check=True)

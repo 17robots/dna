@@ -12,18 +12,18 @@ with tempfile.TemporaryDirectory(prefix='dna-syntax-idle-',dir=ROOT/'build') as 
  shutil.copyfile(ROOT/'tests/fixtures/native_syntax_idle.dyn',stage/'startup_probe.dyn')
  gui=stage/'platform/gui.dyn';source=gui.read_text()
  # Queue delivery remains production; remove unrelated desktop input/readiness.
- start=source.index('  for native_gui.deferred_count!=0',source.index('fn sdl_poll('))
- end=source.index('\nfn sdl_wait_timeout(',start)
+ start=source.index('  for native_gui.deferred_count!=0',source.index('fn gui_poll('))
+ end=source.index('\nfn gui_wait_timeout(',start)
  source=source[:start]+'  return false\n}\n'+source[end:]
- start=source.index('fn sdl_wait_timeout(');end=source.index('\nfn sdl_wait(',start)
- source=source[:start]+'''fn sdl_wait_timeout(event:*Event,milliseconds:i32)bool {
- if sdl_poll(event) {return true}
+ start=source.index('fn gui_wait_timeout(');end=source.index('\nfn gui_wait(',start)
+ source=source[:start]+'''fn gui_wait_timeout(event:*Event,milliseconds:i32)bool {
+ if gui_poll(event) {return true}
  syntax_idle_callback(milliseconds)
  return false
 }
 '''+source[end:]
- start=source.index('fn sdl_present(');end=source.index('\nfn sdl_scale(',start)
- source=source[:start]+'fn sdl_present(renderer:rawptr)bool{return true}\n'+source[end:]
+ start=source.index('fn gui_present(');end=source.index('\nfn gui_scale(',start)
+ source=source[:start]+'fn gui_present(renderer:rawptr)bool{return true}\n'+source[end:]
  source+='''\nsyntax_idle_callback:fn(i32)
 pub fn syntax_idle_setup(callback:fn(i32)){syntax_idle_callback=callback}
 '''

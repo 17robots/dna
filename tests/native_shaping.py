@@ -55,7 +55,7 @@ with tempfile.TemporaryDirectory(prefix='dna-shaping-') as directory:
     flags=subprocess.check_output(['pkg-config','--cflags','--libs','harfbuzz'],text=True).split()
     subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror',str(work/'oracle.c'),*flags,'-o',str(work/'oracle')],check=True)
     platform=work/'platform';platform.mkdir();(platform/'platform.dyn').write_text(PLATFORM)
-    backend=(ROOT/'src/text/native.dyn').read_text().replace('use sdl "../platform"','use sdl "./platform"')
+    backend=(ROOT/'src/text/native.dyn').read_text().replace('use platform "../platform"','use platform "./platform"')
     backend=re.sub(r'extern fn native_text_attach[^\n]+','fn native_text_attach(callbacks:*const NativeTextCallbacks)bool{return dna_native_text_attach(callbacks)}',backend)
     backend=re.sub(r'extern fn native_tracked_create[^\n]+','fn native_tracked_create(engine:rawptr,font:rawptr,text:*const u8,length:usize)rawptr{return dna_text_create(engine,font,text,length)}',backend)
     backend=re.sub(r'extern fn native_tracked_destroy[^\n]+','fn native_tracked_destroy(text:rawptr){dna_text_destroy(text)}',backend)

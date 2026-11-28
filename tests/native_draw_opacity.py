@@ -29,9 +29,9 @@ pub fn probe_setup(pixels:*u8,target:i32,opacity:u8) {
 }
 pub fn probe_draw(kind:i32,alpha:u8,texture:*u8) bool {
  color:=ui.Color{r:220,g:125,b:63,a:alpha}
- _=sdl_color(nil,color.r,color.g,color.b,color.a)
+ _=gui_color(nil,color.r,color.g,color.b,color.a)
  rect:=Rect{width:8.0,height:8.0}
- if kind==0 {return sdl_fill(nil,&rect)}
+ if kind==0 {return gui_fill(nil,&rect)}
  if kind==1 {
   mask:[64]u8
   for i in 0..64 {mask[i]=#cast(u8,(i*41)%256)}
@@ -39,26 +39,26 @@ pub fn probe_draw(kind:i32,alpha:u8,texture:*u8) bool {
  }
  if kind==2 {
   t:=NativeTexture{pixels:#slice(texture, 256),width:8,height:8,alpha:alpha}
-  return sdl_render_texture(nil,&t,nil,nil)
+  return gui_render_texture(nil,&t,nil,nil)
  }
  if kind==3 {
   vertices:[3]Vertex=[Vertex{x:0.0,y:0.0,red:220.0/255.0,green:125.0/255.0,blue:63.0/255.0,alpha:#cast(f32,alpha)/255.0},Vertex{x:8.0,y:0.0,red:220.0/255.0,green:125.0/255.0,blue:63.0/255.0,alpha:#cast(f32,alpha)/255.0},Vertex{x:0.0,y:8.0,red:220.0/255.0,green:125.0/255.0,blue:63.0/255.0,alpha:#cast(f32,alpha)/255.0}]
   indices:[3]i32=[0,1,2]
-  return sdl_geometry(nil,nil,&vertices[0],3,&indices[0],3)
+  return gui_geometry(nil,nil,&vertices[0],3,&indices[0],3)
  }
- if kind==4 {return sdl_clear(nil)}
+ if kind==4 {return gui_clear(nil)}
  return false
 }
 pub fn probe_reset() {native_gui.draw_alpha=255}
 pub fn probe_preserve_color() bool {
- _=sdl_color(nil,220,125,63,137)
+ _=gui_color(nil,220,125,63,137)
  native_gui.draw_alpha=96
  native_gui.draw_alpha=255
  rect:=Rect{width:8.0,height:8.0}
- return sdl_fill(nil,&rect)
+ return gui_fill(nil,&rect)
 }
 '''
-NAMES=['native_surface','native_clip','sdl_color','native_draw_alpha','native_fill_span','sdl_fill','sdl_clear','native_blend','native_blend_at','sdl_render_texture','native_text_bitmap','native_edge','native_top_left','sdl_geometry']
+NAMES=['native_surface','native_clip','gui_color','native_draw_alpha','native_fill_span','gui_fill','gui_clear','native_blend','native_blend_at','gui_render_texture','native_text_bitmap','native_edge','native_top_left','gui_geometry']
 code=HEADER+'\n'.join(function(name) for name in NAMES)+'\n'+'\n'.join(line for line in (ROOT/'src/platform/memory_linux.dyn').read_text().splitlines() if line.startswith('extern fn native_span_'))
 with tempfile.TemporaryDirectory(prefix='dna-draw-opacity-') as temporary:
     work=Path(temporary);(work/'main.dyn').write_text(code)

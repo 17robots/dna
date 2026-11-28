@@ -48,85 +48,85 @@ fn storage(target:u32,level,internal,w,h,border:i32,format,kind:u32,data:rawptr)
  original_storage(target,level,internal,w,h,border,format,kind,data)
 }
 fn scene(renderer:rawptr,phase:i32) {
- check(sdl_color(renderer,13,29,47,255) && sdl_clear(renderer),"clear")
- check(sdl_viewport(renderer,nil) && sdl_scale(renderer,1.0,1.0),"reset")
+ check(gui_color(renderer,13,29,47,255) && gui_clear(renderer),"clear")
+ check(gui_viewport(renderer,nil) && gui_scale(renderer,1.0,1.0),"reset")
  viewport:=PixelRect{x:7,y:9,width:120,height:90}
  clip:=PixelRect{x:3,y:4,width:80,height:65}
- check(sdl_viewport(renderer,&viewport) && sdl_clip(renderer,&clip),"clip")
+ check(gui_viewport(renderer,&viewport) && gui_clip(renderer,&clip),"clip")
  rect:=Rect{x:-5.0,y:2.0,width:90.0,height:45.0}
- check(sdl_color(renderer,221,39,11,128) && sdl_fill(renderer,&rect),"alpha fill")
+ check(gui_color(renderer,221,39,11,128) && gui_fill(renderer,&rect),"alpha fill")
  rect=Rect{x:28.0,y:20.0,width:50.0,height:50.0}
- check(sdl_color(renderer,1,201,117,255) && sdl_fill(renderer,&rect),"opaque fill")
- check(sdl_viewport(renderer,nil),"viewport reset")
+ check(gui_color(renderer,1,201,117,255) && gui_fill(renderer,&rect),"opaque fill")
+ check(gui_viewport(renderer,nil),"viewport reset")
  mask:[35]u8=[0,31,63,127,191,223,255,255,223,191,127,63,31,0,0,128,255,128,0,128,255,255,0,255,0,255,0,255,1,2,3,4,5,6,7]
  for i in 0..20 {
   check(native_text_cached_bitmap(renderer,1,&mask[0],7,5,#cast(f32,10+i*8),105.0,239,151,33,201),"cached glyph")
  }
- check(sdl_scale(renderer,2.0,3.0),"scale")
+ check(gui_scale(renderer,2.0,3.0),"scale")
  check(native_text_cached_bitmap(renderer,1,&mask[0],7,5,90.0,35.0,233,147,17,128),"scaled mask")
- check(sdl_scale(renderer,1.0,1.0),"scale reset")
- texture:=sdl_create_texture(renderer,0,2,13,9)
- check(texture!=nil && sdl_target(renderer,texture),"texture target")
+ check(gui_scale(renderer,1.0,1.0),"scale reset")
+ texture:=gui_create_texture(renderer,0,2,13,9)
+ check(texture!=nil && gui_target(renderer,texture),"texture target")
  if native_gui.direct {
   cached:=#cast(*NativeTexture,texture)
   check(cached.storage==nil && cached.pixels.len==0 && cached.framebuffer!=0,"GPU target retained CPU pixels")
  }
- check(sdl_color(renderer,19,203,77,123) && sdl_clear(renderer),"target clear")
+ check(gui_color(renderer,19,203,77,123) && gui_clear(renderer),"target clear")
  rect=Rect{x:3.0,y:2.0,width:6.0,height:5.0}
- check(sdl_color(renderer,223,31,89,111) && sdl_fill(renderer,&rect),"target alpha")
+ check(gui_color(renderer,223,31,89,111) && gui_fill(renderer,&rect),"target alpha")
  check(native_text_cached_bitmap(renderer,1,&mask[0],7,5,1.0,1.0,255,255,255,255),"target glyph")
- check(sdl_target(renderer,nil),"window target")
+ check(gui_target(renderer,nil),"window target")
  rect=Rect{x:145.0,y:12.0,width:26.0,height:18.0}
  native_gui.draw_alpha=193
- check(sdl_texture_alpha(texture,177),"opacity")
- check(sdl_render_texture(renderer,texture,nil,&rect),"target composite")
+ check(gui_texture_alpha(texture,177),"opacity")
+ check(gui_render_texture(renderer,texture,nil,&rect),"target composite")
  rect.x=180.0
- check(sdl_render_texture(renderer,texture,nil,&rect),"target reuse")
+ check(gui_render_texture(renderer,texture,nil,&rect),"target reuse")
  native_gui.draw_alpha=255
  for sample in 0..8 {
   crop:=Rect{x:-2.5+#cast(f32,sample)*0.75,y:-0.5,width:16.75,height:11.25}
   destination:=Rect{x:#cast(f32,sample*30),y:155.0,width:23.5,height:14.5}
-  check(sdl_render_texture(renderer,texture,&crop,&destination),"fractional source crop")
+  check(gui_render_texture(renderer,texture,&crop,&destination),"fractional source crop")
  }
- check(sdl_target(renderer,texture),"target edit")
- check(sdl_color(renderer,37,99,211,255) && sdl_clear(renderer),"target repaint")
- check(sdl_target(renderer,nil),"target restore")
+ check(gui_target(renderer,texture),"target edit")
+ check(gui_color(renderer,37,99,211,255) && gui_clear(renderer),"target repaint")
+ check(gui_target(renderer,nil),"target restore")
  rect.x=215.0
- check(sdl_render_texture(renderer,texture,nil,&rect),"dirty target upload")
- sdl_destroy_texture(texture)
+ check(gui_render_texture(renderer,texture,nil,&rect),"dirty target upload")
+ gui_destroy_texture(texture)
  vertices:[4]Vertex=[Vertex{x:145.0,y:45.0,red:1.0,alpha:0.5},Vertex{x:175.0,y:45.0,red:1.0,alpha:0.5},Vertex{x:175.0,y:75.0,red:1.0,alpha:0.5},Vertex{x:145.0,y:75.0,red:1.0,alpha:0.5}]
  indices:[6]i32=[0,1,2,0,2,3]
  if phase==0 {
   // The software triangle rasterizer can leave floating-point cracks on a
   // shared diagonal. Use the mathematical square as the independent oracle.
   rect=Rect{x:145.0,y:45.0,width:30.0,height:30.0}
-  check(sdl_color(renderer,255,0,0,127) && sdl_fill(renderer,&rect),"triangle reference")
- } else {check(sdl_geometry(renderer,nil,&vertices[0],4,&indices[0],6),"triangles")}
- check(sdl_scale(renderer,1.5,1.3),"fractional scale")
+  check(gui_color(renderer,255,0,0,127) && gui_fill(renderer,&rect),"triangle reference")
+ } else {check(gui_geometry(renderer,nil,&vertices[0],4,&indices[0],6),"triangles")}
+ check(gui_scale(renderer,1.5,1.3),"fractional scale")
  check(native_text_cached_bitmap(renderer,1,&mask[0],7,5,140.0,80.0,233,147,17,128),"fractional scaled mask")
- check(sdl_scale(renderer,1.0,1.0),"fractional scale reset")
+ check(gui_scale(renderer,1.0,1.0),"fractional scale reset")
  // More than one batch of rectangles, retaining order and bounded storage.
  for i in 0..1200 {
   rect=Rect{x:#cast(f32,i%200),y:140.0+#cast(f32,i/200),width:1.0,height:1.0}
-  check(sdl_color(renderer,#cast(u8,i%255),93,211,255) && sdl_fill(renderer,&rect),"batch rollover")
+  check(gui_color(renderer,#cast(u8,i%255),93,211,255) && gui_fill(renderer,&rect),"batch rollover")
  }
 }
 fn popup_scene(renderer:rawptr) {
  mask:[35]u8=[0,31,63,127,191,223,255,255,223,191,127,63,31,0,0,128,255,128,0,128,255,255,0,255,0,255,0,255,1,2,3,4,5,6,7]
  // Popups use a full-window framebuffer texture. Non-power-of-two desktop
  // dimensions must preserve every glyph texel during one-to-one composition.
- popup:=sdl_create_texture(renderer,0,2,2548,1407)
- check(popup!=nil && sdl_target(renderer,popup),"desktop popup target")
- check(sdl_clip(renderer,nil) && sdl_color(renderer,33,37,43,255) && sdl_clear(renderer),"desktop popup clear")
+ popup:=gui_create_texture(renderer,0,2,2548,1407)
+ check(popup!=nil && gui_target(renderer,popup),"desktop popup target")
+ check(gui_clip(renderer,nil) && gui_color(renderer,33,37,43,255) && gui_clear(renderer),"desktop popup clear")
  for row in 0..234 {
   for col in 0..318 {
    check(native_text_cached_bitmap(renderer,1,&mask[0],7,5,#cast(f32,col*8),#cast(f32,row*6),220,225,235,255),"desktop popup glyph")
   }
  }
- check(sdl_target(renderer,nil),"desktop popup restore")
+ check(gui_target(renderer,nil),"desktop popup restore")
  popup_rect:=Rect{width:2548.0,height:1407.0}
- check(sdl_render_texture(renderer,popup,nil,&popup_rect),"desktop popup composite")
- sdl_destroy_texture(popup)
+ check(gui_render_texture(renderer,popup,nil,&popup_rect),"desktop popup composite")
+ gui_destroy_texture(popup)
 }
 fn snapshot(destination:[]u8) {
  width:=native_gui.surface.width
@@ -149,15 +149,15 @@ fn snapshot(destination:[]u8) {
 }
 fn main() {
  title:="DNA GPU parity\x00"
- window:=sdl_create_window(&title[0],320,180,0)
+ window:=gui_create_window(&title[0],320,180,0)
  check(window!=nil,"window")
- defer sdl_destroy_window(window)
+ defer gui_destroy_window(window)
  // The compositor may constrain the actual drawable; rendering below uses
  // an exact-size test framebuffer rather than reading beyond that drawable.
  native_gui.window.width=2548
  native_gui.window.height=1407
  native_probe_software=true
- renderer:=sdl_create_renderer(window,nil)
+ renderer:=gui_create_renderer(window,nil)
  check(renderer!=nil && !native_gui.direct,"software reference")
  owner:=mem.arena_alloc(65536)
  defer mem.arena_release(owner)
@@ -169,11 +169,11 @@ fn main() {
  snapshot(reference)
  popup_scene(renderer)
  snapshot(popup_reference)
- sdl_destroy_renderer(renderer)
+ gui_destroy_renderer(renderer)
  native_probe_software=false
- renderer=sdl_create_renderer(window,nil)
+ renderer=gui_create_renderer(window,nil)
  check(renderer!=nil && native_gui.direct,"direct renderer")
- check(sdl_create_renderer(window,nil)==nil && native_gui.direct,"duplicate renderer changed active state")
+ check(gui_create_renderer(window,nil)==nil && native_gui.direct,"duplicate renderer changed active state")
  check(native_gui.pixels==nil && native_gui.surface.pixels.len==0,"direct path allocated window pixels")
  original_upload=native_gui.gpu.api.tex_sub_image_2d
  original_storage=native_gui.gpu.api.tex_image_2d
@@ -242,8 +242,8 @@ fn main() {
  // be submitted before their texels are overwritten by the new generation.
  large:=mem.push_bytes(owner,1024*512)
  clear:=Rect{x:250.0,y:150.0,width:3.0,height:1.0}
- check(sdl_color(renderer,0,0,0,255) && sdl_fill(renderer,&clear),"rollover background")
- check(sdl_scale(renderer,1.0/1024.0,1.0/512.0),"rollover scale")
+ check(gui_color(renderer,0,0,0,255) && gui_fill(renderer,&clear),"rollover background")
+ check(gui_scale(renderer,1.0/1024.0,1.0/512.0),"rollover scale")
  for i in 0..3 {
   value:u8=55
   if i==1 {value=111}
@@ -251,42 +251,42 @@ fn main() {
   for at in 0..large.len {large[at]=value}
   check(native_text_cached_bitmap(renderer,#cast(u64,900000+i),&large[0],1024,512,#cast(f32,(250+i)*1024),150.0*512.0,255,255,255,255),"atlas space rollover")
  }
- check(sdl_scale(renderer,1.0,1.0),"rollover scale reset")
+ check(gui_scale(renderer,1.0,1.0),"rollover scale reset")
  snapshot(actual)
  at:=#cast(usize,150*native_gui.surface.width+250)*4
  check(actual[at]==55 && actual[at+4]==111 && actual[at+8]==199,"atlas eviction overwrote pending glyph pixels")
- check(sdl_present(renderer),"swap")
- retained:=sdl_create_texture(renderer,0,2,2,2)
+ check(gui_present(renderer),"swap")
+ retained:=gui_create_texture(renderer,0,2,2,2)
  check(retained!=nil,"retained target")
  retained_texture:=#cast(*NativeTexture,retained)
  fail_storage=true
- check(!sdl_target(renderer,retained),"storage failure accepted")
+ check(!gui_target(renderer,retained),"storage failure accepted")
  check(retained_texture.gpu==0 && retained_texture.framebuffer==0,"failed texture allocation retained an invalid ID")
  check(native_gui.target==nil,"failed target switch changed active target")
  fail_attachment=true
- check(!sdl_target(renderer,retained),"incomplete framebuffer accepted")
+ check(!gui_target(renderer,retained),"incomplete framebuffer accepted")
  check(retained_texture.gpu==0 && retained_texture.framebuffer==0 && native_gui.target==nil,"incomplete framebuffer cleanup changed active target")
  binding:i32=-1
  native_gui.gpu.api.get_integer(36006,&binding)
  check(binding==#cast(i32,native_gui.gpu.window_framebuffer),"failed framebuffer switch did not restore binding")
- check(sdl_target(renderer,retained),"storage allocation retry")
- check(sdl_color(renderer,23,59,181,255) && sdl_clear(renderer),"retained background")
+ check(gui_target(renderer,retained),"storage allocation retry")
+ check(gui_color(renderer,23,59,181,255) && gui_clear(renderer),"retained background")
  corner:=Rect{width:1.0,height:1.0}
- check(sdl_color(renderer,177,11,55,255) && sdl_fill(renderer,&corner),"retained corner")
+ check(gui_color(renderer,177,11,55,255) && gui_fill(renderer,&corner),"retained corner")
  shifted:=Rect{x:1.0,width:2.0,height:2.0}
- check(sdl_render_texture(renderer,retained,nil,&shifted),"sequential self-blit")
+ check(gui_render_texture(renderer,retained,nil,&shifted),"sequential self-blit")
  check(retained_texture.storage==nil && retained_texture.pixels.len==0,"self-blit retained CPU scratch")
- check(sdl_target(renderer,nil),"retained target reset")
+ check(gui_target(renderer,nil),"retained target reset")
  destination:=Rect{x:1.0,y:1.0,width:2.0,height:2.0}
- check(sdl_render_texture(renderer,retained,nil,&destination),"retained composite")
+ check(gui_render_texture(renderer,retained,nil,&destination),"retained composite")
  check(retained_texture.gpu!=0 && retained_texture.storage==nil,"texture allocation retry state")
- sdl_destroy_renderer(renderer)
+ gui_destroy_renderer(renderer)
  check(retained_texture.gpu==0 && retained_texture.framebuffer==0 && retained_texture.pixels.len==16,"renderer recreation lost target backup")
  check(native_gui.gpu.program==0,"destroy resources")
- renderer=sdl_create_renderer(window,nil)
+ renderer=gui_create_renderer(window,nil)
  check(renderer!=nil && native_gui.gpu.slot_count==0,"recreate context resources")
  check(native_gui.pixels==nil,"recreate allocated window pixels")
- check(sdl_render_texture(renderer,retained,nil,&destination),"recreated texture upload")
+ check(gui_render_texture(renderer,retained,nil,&destination),"recreated texture upload")
  check(retained_texture.storage==nil && retained_texture.pixels.len==0,"recreated target retained CPU backup")
  snapshot(actual)
  top:=#cast(usize,native_gui.surface.width+1)*4
@@ -294,16 +294,16 @@ fn main() {
  check(actual[top]==177 && actual[top+1]==11 && actual[top+2]==55,"recreated target top-left flipped or changed")
  check(actual[top+4]==177 && actual[top+5]==11 && actual[top+6]==55,"self-blit result lost on renderer recreation")
  check(actual[bottom]==23 && actual[bottom+1]==59 && actual[bottom+2]==181,"recreated target bottom-right flipped or changed")
- sdl_destroy_renderer(renderer)
+ gui_destroy_renderer(renderer)
  native_probe_software=true
- renderer=sdl_create_renderer(window,nil)
+ renderer=gui_create_renderer(window,nil)
  check(renderer!=nil && !native_gui.direct,"software after GPU recreation")
- check(sdl_render_texture(renderer,retained,nil,&destination),"software target restore")
+ check(gui_render_texture(renderer,retained,nil,&destination),"software target restore")
  snapshot(actual)
  check(actual[top]==177 && actual[top+1]==11 && actual[bottom]==23 && actual[bottom+2]==181,"software restored target orientation")
- sdl_destroy_texture(retained)
+ gui_destroy_texture(retained)
  check(native_gui.textures==nil,"texture owner list leaked")
- sdl_destroy_renderer(renderer)
+ gui_destroy_renderer(renderer)
 }
 '''
 with tempfile.TemporaryDirectory(prefix='dna-native-gpu-') as directory:
@@ -320,7 +320,7 @@ with tempfile.TemporaryDirectory(prefix='dna-native-gpu-') as directory:
     gui=(ROOT/'src/platform/gui.dyn').read_text().replace('native_gui.direct=!native_software_requested()','native_gui.direct=!native_probe_software')
     gui=install_gpu_probe(gui)
     gui+='\nnative_probe_software:bool\n'
-    (stage/'sdl.dyn').write_text(gui)
+    (stage/'platform.dyn').write_text(gui)
     for module in ('host','owned_arena','cstring'):
         shutil.copytree(ROOT/'src'/module,stage/module)
     for selection in [*(ROOT/'src/platform').glob('window_*.dyn'), *(ROOT/'src/platform').glob('memory_*.dyn')]:
@@ -328,7 +328,7 @@ with tempfile.TemporaryDirectory(prefix='dna-native-gpu-') as directory:
     shutil.copytree(ROOT/'src/platform/native_present',stage/'native_present')
     (stage/'backend').mkdir();shutil.copyfile(ROOT/f'modules/native/platform_{BACKEND}.dyn',stage/'backend/backend.dyn')
     if BACKEND=='x11':
-        for source in [stage/'sdl.dyn',*stage.glob('window_*.dyn'),*(stage/'native_present').rglob('*.dyn')]:
+        for source in [stage/'platform.dyn',*stage.glob('window_*.dyn'),*(stage/'native_present').rglob('*.dyn')]:
             source.write_text(source.read_text().replace('"vendor/window/wayland"','"vendor/window"'))
     (stage/'main.dyn').write_text(SOURCE)
     library=ROOT/('build/native-wayland' if BACKEND=='wayland' else 'build/native-gui')

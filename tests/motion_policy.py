@@ -17,7 +17,7 @@ def function(source,name):
         end+=1
     return source[start:end]+'\n'
 BASE='''use motion "./motion"
-use sdl "./sdl"
+use platform "./platform"
 struct Animation { now:f32, line:f32, active:bool, reset:bool, panel:Panel }
 enum Panel { None }
 struct View { reduced_motion:bool, insert:bool, animation:Animation, scroll_x,scroll_y:f32 }
@@ -37,7 +37,7 @@ trail_snapped:bool=false
 hovered:bool=false
 fn theme() Theme { return Theme{} }
 fn paint(renderer:rawptr,color:Rgb) bool { return true }
-fn draw_cursor_trail(renderer:rawptr,app:*App,trail:*CursorTrail,target:sdl.Rect,snap:bool,color:Rgb) bool {trail_snapped=snap
+fn draw_cursor_trail(renderer:rawptr,app:*App,trail:*CursorTrail,target:platform.Rect,snap:bool,color:Rgb) bool {trail_snapped=snap
  return trail_active}
 fn ui_hovered(ui:*UiState,index:usize) bool { return hovered }
 fn key_menu_is(panel:Panel) bool { return false }
@@ -124,10 +124,10 @@ fn main() {
  motion.snap(&visual.cursor_x,0.0)
  motion.snap(&visual.cursor_y,0.0)
  draw_primary(&app,&visual,&typography)
- if sdl.fills!=1 || sdl.last.x!=80.0 || sdl.last.y!=120.0 {#panic("primary caret lags its logical target")}
+ if platform.fills!=1 || platform.last.x!=80.0 || platform.last.y!=120.0 {#panic("primary caret lags its logical target")}
  trail_active=true
  draw_primary(&app,&visual,&typography)
- if sdl.fills!=2 {#panic("decorative trail hides the actual caret")}
+ if platform.fills!=2 {#panic("decorative trail hides the actual caret")}
  if trail_snapped {#panic("drawing the same caret twice cancels its jump decoration")}
 }
 ''',
@@ -152,7 +152,7 @@ CASES['explorer_caret']='''fn main() {
  cursor_width:f32=8.0
  cursor_snap:=false
 '''+explorer[start:end]+'''
- if sdl.fills!=1 || sdl.last.x!=80.0 || sdl.last.y!=120.0 {#panic("explorer primary caret lags")}
+ if platform.fills!=1 || platform.last.x!=80.0 || platform.last.y!=120.0 {#panic("explorer primary caret lags")}
 }
 '''
 terminal=(ROOT/'src/terminal.dyn').read_text()
@@ -308,7 +308,7 @@ with tempfile.TemporaryDirectory(prefix='dna-motion-policy-') as directory:
     for name,body in CASES.items():
         stage=work/name;stage.mkdir()
         shutil.copytree(ROOT/'src/motion',stage/'motion')
-        (stage/'sdl').mkdir();(stage/'sdl/sdl.dyn').write_text(SDL)
+        (stage/'platform').mkdir();(stage/'platform/platform.dyn').write_text(SDL)
         (stage/'main.dyn').write_text(BASE+helpers+body.replace('app:=App{}','app:=App{config:Config{popup_animation_ms:40.0,smooth_cursor:true,smooth_scroll:true,scroll_animation_ms:100.0,cursor_animation_ms:100.0,cursor_thickness:2.0}}'))
         for mode in ('debug','release'):
             output=work/(name+'-'+mode)

@@ -9,7 +9,7 @@ ROOT=Path(__file__).resolve().parents[1]
 source=Path(os.environ.get('DNA_PICKER_SOURCE',ROOT/'src'))
 BASE='''use "std/mem"
 use "./buffer"
-use sdl "./platform"
+use platform "./platform"
 struct Entry {name:[512]u8,length:usize,directory:bool}
 enum Panel {None,Open,SaveAs}
 enum ResourceKind {None,Themes,Layouts,Settings,Recovery,TaskOutput,Languages}

@@ -13,8 +13,8 @@ with tempfile.TemporaryDirectory(prefix='dna-syntax-frames-',dir=ROOT/'build') a
     for name in ('native_typing_frame_smoke.dyn','native_syntax_pending_frame_smoke.dyn'):
         shutil.copyfile(ROOT/'tests/editor'/name,stage/name)
     gui=stage/'platform/gui.dyn';source=gui.read_text()
-    begin=source.index('fn sdl_present(');end=source.index('\nfn sdl_scale(',begin)
-    source=source[:begin]+'fn sdl_present(renderer:rawptr)bool{return true}\n'+source[end:]
+    begin=source.index('fn gui_present(');end=source.index('\nfn gui_scale(',begin)
+    source=source[:begin]+'fn gui_present(renderer:rawptr)bool{return true}\n'+source[end:]
     source+='''\npub fn typing_probe_pixels() []const u8 {return native_gui.surface.pixels}
 pub fn typing_probe_resize(width,height:i32) {
  native_gui.window.width=width
@@ -24,7 +24,7 @@ pub fn typing_probe_resize(width,height:i32) {
 '''
     gui.write_text(gpu_probe(source))
     (stage/'startup_probe.dyn').write_text('''fn startup_probe(app:*App,typography:*Typography,renderer:rawptr,window:rawptr,input_storage:[]u8){
- native_syntax_pending_frame_smoke(app,typography,renderer,window,NativeTypingFrameProbe{pixels:sdl.typing_probe_pixels,resize:sdl.typing_probe_resize})
+ native_syntax_pending_frame_smoke(app,typography,renderer,window,NativeTypingFrameProbe{pixels:platform.typing_probe_pixels,resize:platform.typing_probe_resize})
 }
 fn finish_probe(app:*App){}
 ''')

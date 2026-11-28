@@ -110,20 +110,20 @@ fn editor_main() i32 {
     launch_error_length = copy_text(launch_error[..], app.prompt_state.message[..app.prompt_state.message_length])
   }
   terminal := frontend_choose(app, flag_frontend)
-  if terminal && !sdl.tui_start() {
+  if terminal && !platform.tui_start() {
     return startup_failure("--tui needs a terminal on stdin and stdout")
   }
-  defer sdl.tui_stop()
+  defer platform.tui_stop()
   // Native notifications wake either frontend through its event queue.
-  sdl_flags: u32 = 32
+  gui_flags: u32 = 32
   if terminal {
-    sdl_flags = 16384
+    gui_flags = 16384
   }
-  if !sdl.init(sdl_flags) {
+  if !platform.init(gui_flags) {
     if terminal { return startup_failure("terminal frontend could not start") }
     return startup_failure("no usable display (set WAYLAND_DISPLAY or DISPLAY, or run dna --tui)")
   }
-  defer sdl.quit()
+  defer platform.quit()
 
   notifications := notifications_start() != 0
   app.configuration.notifications = notifications
@@ -135,20 +135,20 @@ fn editor_main() i32 {
   }
 
   egl_selected := egl_vendor_set()
-  window := sdl.create_window(encoded_title, 1100, 760, 8224)
+  window := platform.create_window(encoded_title, 1100, 760, 8224)
   if egl_selected {
     egl_vendor_clear()
   }
   if window == nil {
     return startup_failure("window creation failed (no usable display or GPU driver; try dna --tui)")
   }
-  defer sdl.destroy_window(window)
+  defer platform.destroy_window(window)
 
-  renderer := sdl.create_renderer(window, nil)
+  renderer := platform.create_renderer(window, nil)
   if renderer == nil {
     return startup_failure("renderer creation failed (OpenGL 3.3 unavailable; try DNA_RENDERER=software or dna --tui)")
   }
-  defer sdl.destroy_renderer(renderer)
+  defer platform.destroy_renderer(renderer)
   // Frames land on the display's refresh, evenly spaced and without tearing.
   // DNA_VSYNC=0 opts out (timer pacing from the display refresh instead).
   vsync_storage: [8]u8
@@ -156,7 +156,7 @@ fn editor_main() i32 {
   if !buffer.equal(vsync_setting, "0") {
     // Probe support, then start with immediate presentation; draw() turns
     // vsync on only while something animates.
-    app.view.vsync_supported = sdl.render_vsync(renderer, 1) && sdl.render_vsync(renderer, 0)
+    app.view.vsync_supported = platform.render_vsync(renderer, 1) && platform.render_vsync(renderer, 0)
   }
   display_refresh(app, window)
 
@@ -237,7 +237,7 @@ fn editor_main() i32 {
     #panic("syntax text")
   }
   defer ttf.destroy(syntax_text)
-  typography := Typography{line_height: 1.25, palette_wrap: -1, primary_caret: caret_text, engine: engine, primary_document: document, syntax_text: syntax_text, original_font: font, preview_text: preview_text, directory_text: directory_text, chrome: chrome, font: font, palette: palette, points: 16.0, scale: sdl.display_scale(window)}
+  typography := Typography{line_height: 1.25, palette_wrap: -1, primary_caret: caret_text, engine: engine, primary_document: document, syntax_text: syntax_text, original_font: font, preview_text: preview_text, directory_text: directory_text, chrome: chrome, font: font, palette: palette, points: 16.0, scale: platform.display_scale(window)}
   typography.observer = app
   if typography.scale <= 0.0 {
     typography.scale = 1.0
@@ -275,7 +275,7 @@ fn editor_main() i32 {
   frontend_handoff_restore(app, &typography)
   render_request(app, RenderStartup)
   draw(renderer, window, app, &typography)
-  event := sdl.Event{}
+  event := platform.Event{}
   receiving: bool = false
   event_ready: bool = false
   background_phase: usize = 0
@@ -307,14 +307,14 @@ fn editor_main() i32 {
       draw(renderer, window, app, &typography)
     }
 
-    wants_text := wants_text_input(app) || !sdl.tui_active()
+    wants_text := wants_text_input(app) || !platform.tui_active()
     if wants_text != receiving {
       if wants_text {
-        if !sdl.start_text(window) {
+        if !platform.start_text(window) {
           #panic("start input failed")
         }
       } else {
-        if !sdl.stop_text(window) {
+        if !platform.stop_text(window) {
           #panic("stop input failed")
         }
       }
@@ -343,7 +343,7 @@ fn editor_main() i32 {
         continue
       }
     } else {
-      event_ready = sdl.wait_timeout(&event, wait_ms)
+      event_ready = platform.wait_timeout(&event, wait_ms)
       if event_ready {
         render_trace_event(app, &event)
       }
@@ -374,23 +374,23 @@ fn editor_main() i32 {
       if kind >= 1024 && kind <= 1026 && app.render_pending != 0 {
         draw(renderer, window, app, &typography)
       }
-      if kind == sdl.WorkerWakeEvent {
+      if kind == platform.WorkerWakeEvent {
         // Completion may arrive after its service phase in the current pass.
         // Finish this pass, then revisit every phase before waiting for input.
         background_again = true
       } else if kind == 256 || kind == 528 {
         run_command(app, &typography, .QuitAll)
       } else if kind == 768 {
-        key := #cast(*const sdl.KeyEvent, &event)
+        key := #cast(*const platform.KeyEvent, &event)
         if app.composition.length > 0 {
           if key.key == KeyEscape {
-            _ = sdl.clear_composition(window)
+            _ = platform.clear_composition(window)
             app.composition.length = 0
             redraw = true
             render_request(app, RenderIme)
           }
         } else if !(key.repeated && (key.key == KeyEscape || (key.key == KeyX && (key.modifiers & ModCtrl) != 0 && !terminal_typing(app)))) {
-          app.input_state.character = sdl.key_from_scancode(key.scancode, key.modifiers, false)
+          app.input_state.character = platform.key_from_scancode(key.scancode, key.modifiers, false)
           // Its text event follows; when the key was a command rather
           // than typing, that text must not type (i must not type an i).
           command_character = 0
@@ -421,29 +421,29 @@ fn editor_main() i32 {
           redraw = true
           render_request(app, RenderMouse)
         }
-      } else if kind == sdl.ImeEditEvent {
+      } else if kind == platform.ImeEditEvent {
         surrounding_edit_apply(app)
         redraw = true
         render_request(app, RenderText)
-      } else if kind == sdl.InputOverflowEvent {
+      } else if kind == platform.InputOverflowEvent {
         app.composition.length = 0
         app.pointer.dragging = false
         command_character = 0
         notice(app, "Input was dropped because the input queue filled. Retry the last action.")
         redraw = true
         render_request(app, RenderWindow)
-      } else if kind == sdl.PasteEvent {
+      } else if kind == platform.PasteEvent {
         // A whole bracketed paste from the terminal frontend.
-        paste_input(app, sdl.tui_paste())
-        sdl.tui_paste_clear()
+        paste_input(app, platform.tui_paste())
+        platform.tui_paste_clear()
         redraw = true
         render_request(app, RenderText)
       } else if kind == 770 {
-        composition_update(app, #cast(*const sdl.EditingEvent, &event))
+        composition_update(app, #cast(*const platform.EditingEvent, &event))
       } else if kind == 771 {
-        received := #cast(*const sdl.TextEvent, &event)
-        typing := sdl.tui_active() || wants_text_input(app)
-        if !sdl.tui_active() && received.text != nil && command_character != 0 && command_character < 128 && c.string_length(received.text, 8) == 1 && #slice(received.text, 1)[0] == #cast(u8, command_character) {
+        received := #cast(*const platform.TextEvent, &event)
+        typing := platform.tui_active() || wants_text_input(app)
+        if !platform.tui_active() && received.text != nil && command_character != 0 && command_character < 128 && c.string_length(received.text, 8) == 1 && #slice(received.text, 1)[0] == #cast(u8, command_character) {
           typing = false
         }
         command_character = 0
@@ -461,7 +461,7 @@ fn editor_main() i32 {
       if kind >= 512 && kind <= 540 {
         // Moving to another monitor can change its refresh rate.
         display_refresh(app, window)
-        scale := sdl.display_scale(window)
+        scale := platform.display_scale(window)
         if scale > 0.0 && scale != typography.scale {
           typography.scale = scale
           resize_font(&typography)
@@ -476,14 +476,14 @@ fn editor_main() i32 {
         render_request(app, RenderWindow)
       }
 
-      input_now := wants_text_input(app) || !sdl.tui_active()
+      input_now := wants_text_input(app) || !platform.tui_active()
       if input_now != receiving {
         if input_now {
-          if !sdl.start_text(window) {
+          if !platform.start_text(window) {
             #panic("start input failed")
           }
         } else {
-          if !sdl.stop_text(window) {
+          if !platform.stop_text(window) {
             #panic("stop input failed")
           }
         }

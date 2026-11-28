@@ -825,7 +825,7 @@ fn lsp_start(app: *App, language: str, command: str) {
     notice(app, "Could not start language server.")
     return
   }
-  server.deadline = sdl.ticks() + #cast(u64, app.config.lsp_timeout_ms)
+  server.deadline = platform.ticks() + #cast(u64, app.config.lsp_timeout_ms)
   mark := mem.arena_mark(app.scratch)
   defer mem.arena_rewind(app.scratch, mark)
   uri := mem.push_bytes(app.scratch, 12288)
@@ -908,9 +908,9 @@ fn lsp_sync_slot(app:*App, index:usize, slot_index:usize, force:bool) bool {
   if tracked.identity == slot.identity && tracked.revision == doc.revision { return true }
   if tracked.observed != doc.revision {
     tracked.observed = doc.revision
-    tracked.changed = sdl.ticks()
+    tracked.changed = platform.ticks()
   }
-  if !force && tracked.identity != 0 && sdl.ticks() - tracked.changed < #cast(u64, app.config.lsp_change_delay_ms) {
+  if !force && tracked.identity != 0 && platform.ticks() - tracked.changed < #cast(u64, app.config.lsp_change_delay_ms) {
     return false
   }
   opening := tracked.identity == 0
@@ -964,13 +964,13 @@ fn lsp_sync_slot(app:*App, index:usize, slot_index:usize, force:bool) bool {
     capacity = 1073741824
   }
   if !work_acquire(app, work, 65536 + 64, "lsp_send") {
-    lsp_allocation_retry(server, sdl.ticks())
+    lsp_allocation_retry(server, platform.ticks())
     return false
   }
   target := rpc_send_begin(server.process, capacity)
   if target == nil {
     work_finish(app, work, "lsp_send")
-    lsp_allocation_retry(server, sdl.ticks())
+    lsp_allocation_retry(server, platform.ticks())
     return false
   }
   message := #slice(target, capacity)
@@ -1025,7 +1025,7 @@ fn lsp_sync_slot(app:*App, index:usize, slot_index:usize, force:bool) bool {
       rpc_send_abort(server.process)
       work_finish(app, work, "lsp_send")
       lsp_note(app, "Cannot encode document for language server.")
-      lsp_allocation_retry(server, sdl.ticks())
+      lsp_allocation_retry(server, platform.ticks())
       return false
     }
     used += quoted.len
@@ -1061,7 +1061,7 @@ fn lsp_sync_slot(app:*App, index:usize, slot_index:usize, force:bool) bool {
 fn lsp_sync(app:*App, index:usize, force:bool) {
   server:=&app.lsp.servers[index]
   if !server.ready { return }
-  if lsp_allocation_wait(server, sdl.ticks())>0 { return }
+  if lsp_allocation_wait(server, platform.ticks())>0 { return }
   server.allocation_retry_due=0
   // A server attaches the existing workspace once. Later edits/lifecycle
   // changes arrive through stable-slot worksets rather than polling buffers.
@@ -1076,7 +1076,7 @@ fn lsp_sync(app:*App, index:usize, force:bool) {
   }
   if server.dirty_first==nil { return }
   if !lsp_documents_ensure(server, app.documents.slots.len) {
-    lsp_allocation_retry(server, sdl.ticks())
+    lsp_allocation_retry(server, platform.ticks())
     lsp_note(app, "Could not grow language-server document tracking.")
     return
   }
@@ -1163,7 +1163,7 @@ fn lsp_request(app: *App, kind: usize, argument: str) {
   if app.lsp.serial < 2 {
     app.lsp.serial = 2
   }
-  app.lsp.request_started = sdl.ticks()
+  app.lsp.request_started = platform.ticks()
   app.lsp.pending = app.lsp.serial
   app.lsp.kind = kind
   app.lsp.server = index
@@ -1172,7 +1172,7 @@ fn lsp_request(app: *App, kind: usize, argument: str) {
   app.lsp.revision = doc.revision
   app.lsp.position = position
   app.lsp.insert = app.view.insert
-  app.lsp.deadline = sdl.ticks() + #cast(u64, app.config.lsp_timeout_ms)
+  app.lsp.deadline = platform.ticks() + #cast(u64, app.config.lsp_timeout_ms)
   mark := mem.arena_mark(app.scratch)
   defer mem.arena_rewind(app.scratch, mark)
   message := mem.push_bytes(app.scratch, 65536)
@@ -1447,7 +1447,7 @@ fn lsp_handle(app: *App, index: usize, source: str, arena: *mem.Arena) bool {
     return false
   }
   if id.value != app.lsp.pending || index != app.lsp.server { return false }
-  app.lsp.response_elapsed = sdl.ticks() - app.lsp.request_started
+  app.lsp.response_elapsed = platform.ticks() - app.lsp.request_started
   app.lsp.response_received = true
   app.lsp.pending = 0
   if !json.is_missing(json.object_get(root, "error")) {
@@ -1607,7 +1607,7 @@ fn lsp_tick(app: *App) bool {
   for index < 8 {
     server := &app.lsp.servers[index]
     if server.process != nil {
-      if server.deadline > 0 && sdl.ticks() >= server.deadline {
+      if server.deadline > 0 && platform.ticks() >= server.deadline {
         lsp_failure(app, "Language server initialization timed out.")
         lsp_failure_record(app, server.language[..server.length], "initialization timed out")
         changed = true
@@ -1653,7 +1653,7 @@ fn lsp_tick(app: *App) bool {
     }
     index += 1
   }
-  if app.lsp.pending != 0 && sdl.ticks() >= app.lsp.deadline {
+  if app.lsp.pending != 0 && platform.ticks() >= app.lsp.deadline {
     app.lsp.pending = 0
     lsp_note(app, "Language request timed out. Editing remains available.")
   }
@@ -2092,7 +2092,7 @@ fn lsp_saved(app: *App, index: usize, slot_index: usize) {
 
 fn lsp_wait_ms(app:*App, fallback:i32)i32 {
   delay:=fallback
-  now:=sdl.ticks()
+  now:=platform.ticks()
   for index in 0..8 {
     server:=&app.lsp.servers[index]
     if !server.ready { continue }
@@ -2208,7 +2208,7 @@ fn lsp_status(app: *App) {
   add_text(text[..], &used, " ms\n")
   if app.lsp.pending != 0 {
     add_text(text[..], &used, "Pending request: ")
-    add_number(text[..], &used, #cast(usize, (sdl.ticks() - app.lsp.request_started)))
+    add_number(text[..], &used, #cast(usize, (platform.ticks() - app.lsp.request_started)))
     add_text(text[..], &used, " ms\n")
   } else if app.lsp.response_received {
     add_text(text[..], &used, "Last response: ")
