@@ -739,20 +739,28 @@ fn vim_ex_substitute(app: *App, typography: *Typography, doc: *buffer.Document, 
   use_search := kind == '~'
   for at < text.len && rx_one_of(text[at], "cegiInp#lr") {
     flag := text[at]
-    if flag == 'g' {
-      flags.global = !flags.global
-    } else if flag == 'c' {
-      flags.confirm = true
-    } else if flag == 'e' {
-      flags.quiet = true
-    } else if flag == 'i' || flag == 'I' {
-      flags.case = flag
-    } else if flag == 'n' {
-      flags.count_only = true
-    } else if flag == 'r' {
-      use_search = true
-    } else {
-      flags.print = flag
+    case flag {
+      'g' => {
+        flags.global = !flags.global
+      }
+      'c' => {
+        flags.confirm = true
+      }
+      'e' => {
+        flags.quiet = true
+      }
+      'i', 'I' => {
+        flags.case = flag
+      }
+      'n' => {
+        flags.count_only = true
+      }
+      'r' => {
+        use_search = true
+      }
+      _ => {
+        flags.print = flag
+      }
     }
     at += 1
   }
@@ -853,74 +861,78 @@ fn vim_filter_check(app: *App, doc: *buffer.Document, filter: VimRegexFilter, po
   for once in 0..1 {
     actual: usize = 0
     wanted := filter.value
-    if filter.kind == 'V' {
-      if !app.vim.last_valid { return false }
-      low := app.vim.last_anchor
-      high := app.vim.last_head
-      if high < low {
-        low = app.vim.last_head
-        high = app.vim.last_anchor
-      }
-      if app.vim.last_mode == .Visual {
-        if position < low || position > high { return false }
+    case filter.kind {
+      'V' => {
+        if !app.vim.last_valid { return false }
+        low := app.vim.last_anchor
+        high := app.vim.last_head
+        if high < low {
+          low = app.vim.last_head
+          high = app.vim.last_anchor
+        }
+        if app.vim.last_mode == .Visual {
+          if position < low || position > high { return false }
+          continue
+        }
+        first_row := buffer.row_at(doc, low)
+        last_row := buffer.row_at(doc, high)
+        if row < first_row || row > last_row { return false }
+        if app.vim.last_mode == .VisualBlock {
+          left := low - buffer.row_start(doc, first_row)
+          right := high - buffer.row_start(doc, last_row)
+          if right < left {
+            swap := left
+            left = right
+            right = swap
+          }
+          if column < left || column > right { return false }
+        }
         continue
       }
-      first_row := buffer.row_at(doc, low)
-      last_row := buffer.row_at(doc, high)
-      if row < first_row || row > last_row { return false }
-      if app.vim.last_mode == .VisualBlock {
-        left := low - buffer.row_start(doc, first_row)
-        right := high - buffer.row_start(doc, last_row)
-        if right < left {
-          swap := left
-          left = right
-          right = swap
-        }
-        if column < left || column > right { return false }
+      '#' => {
+        if position != cursor { return false }
+        continue
       }
-      continue
-    }
-    if filter.kind == '#' {
-      if position != cursor { return false }
-      continue
-    }
-    if filter.kind == 'm' {
-      mark_row: usize = 0
-      mark := #cast(u8, filter.value)
-      if !vim_mark_row(app, doc, mark, &mark_row) { return false }
-      // Marks compare by position; '< and '> by their visual ends.
-      target := buffer.row_start(doc, mark_row)
-      if mark >= 'a' && mark <= 'z' {
-        target = doc.marks[buffer.NamedMarkBase + (mark - 'a')]
-      } else if mark == '<' {
-        target = app.vim.last_anchor
-        if app.vim.last_head < target {
-          target = app.vim.last_head
+      'm' => {
+        mark_row: usize = 0
+        mark := #cast(u8, filter.value)
+        if !vim_mark_row(app, doc, mark, &mark_row) { return false }
+        // Marks compare by position; '< and '> by their visual ends.
+        target := buffer.row_start(doc, mark_row)
+        if mark >= 'a' && mark <= 'z' {
+          target = doc.marks[buffer.NamedMarkBase + (mark - 'a')]
+        } else if mark == '<' {
+          target = app.vim.last_anchor
+          if app.vim.last_head < target {
+            target = app.vim.last_head
+          }
+        } else {
+          target = app.vim.last_anchor
+          if app.vim.last_head > target {
+            target = app.vim.last_head
+          }
         }
-      } else {
-        target = app.vim.last_anchor
-        if app.vim.last_head > target {
-          target = app.vim.last_head
+        actual = position
+        wanted = target
+      }
+      'l' => {
+        actual = row + 1
+        if wanted == VimRxCursor {
+          wanted = buffer.row_at(doc, cursor) + 1
         }
       }
-      actual = position
-      wanted = target
-    } else if filter.kind == 'l' {
-      actual = row + 1
-      if wanted == VimRxCursor {
-        wanted = buffer.row_at(doc, cursor) + 1
-      }
-    } else {
-      // c counts bytes, v screen columns (tabs to the next multiple of 8).
-      actual = column + 1
-      if filter.kind == 'v' {
-        actual = vim_virtual_column(doc, buffer.row_start(doc, row), position) + 1
-      }
-      if wanted == VimRxCursor {
-        cursor_low := buffer.row_start(doc, buffer.row_at(doc, cursor))
-        wanted = cursor - cursor_low + 1
+      _ => {
+        // c counts bytes, v screen columns (tabs to the next multiple of 8).
+        actual = column + 1
         if filter.kind == 'v' {
-          wanted = vim_virtual_column(doc, cursor_low, cursor) + 1
+          actual = vim_virtual_column(doc, buffer.row_start(doc, row), position) + 1
+        }
+        if wanted == VimRxCursor {
+          cursor_low := buffer.row_start(doc, buffer.row_at(doc, cursor))
+          wanted = cursor - cursor_low + 1
+          if filter.kind == 'v' {
+            wanted = vim_virtual_column(doc, cursor_low, cursor) + 1
+          }
         }
       }
     }
@@ -1748,12 +1760,15 @@ fn vim_encode(character: u32, output: []u8) usize {
 }
 
 fn vim_decode(bytes: str) u32 {
-  if bytes.len == 2 { return (#cast(u32, bytes[0] & 0x1f) << 6) | #cast(u32, bytes[1] & 0x3f) }
-  if bytes.len == 3 {
-    return (#cast(u32, bytes[0] & 0x0f) << 12) | (#cast(u32, bytes[1] & 0x3f) << 6) | #cast(u32, bytes[2] & 0x3f)
-  }
-  if bytes.len == 4 {
-    return (#cast(u32, bytes[0] & 0x07) << 18) | (#cast(u32, bytes[1] & 0x3f) << 12) | (#cast(u32, bytes[2] & 0x3f) << 6) | #cast(u32, bytes[3] & 0x3f)
+  case bytes.len {
+    2 => { return (#cast(u32, bytes[0] & 0x1f) << 6) | #cast(u32, bytes[1] & 0x3f) }
+    3 => {
+      return (#cast(u32, bytes[0] & 0x0f) << 12) | (#cast(u32, bytes[1] & 0x3f) << 6) | #cast(u32, bytes[2] & 0x3f)
+    }
+    4 => {
+      return (#cast(u32, bytes[0] & 0x07) << 18) | (#cast(u32, bytes[1] & 0x3f) << 12) | (#cast(u32, bytes[2] & 0x3f) << 6) | #cast(u32, bytes[3] & 0x3f)
+    }
+    _ => {}
   }
   return bytes[0]
 }

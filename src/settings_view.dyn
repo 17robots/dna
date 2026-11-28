@@ -13,42 +13,94 @@ fn setting_decimal(out: []u8, used: *usize, value: f32) {
   }
   add_text(out, used, digits[..length])
 }
+fn setting_bool(out: []u8, used: *usize, value: bool) {
+  if value {
+    add_text(out, used, "true")
+  } else {
+    add_text(out, used, "false")
+  }
+}
+// The configured value of SPEC as configuration text, without quotes.
+fn setting_value_text(app: *const App, spec: settings.Option, out: []u8) str {
+  used: usize = 0
+  case spec.kind {
+    .Flag => { setting_bool(out, &used, settings.option_flag(&app.config, spec.key)) }
+    .Number => { setting_decimal(out, &used, settings.option_number(&app.config, spec.key)) }
+    .Text => { return settings.option_text(&app.config, spec.key) }
+    .Choice => { return settings.choice_name(spec, settings.option_choice(&app.config, spec.key)) }
+    .Key => { setting_key_name(out, &used, app.config.terminal_escape, app.config.terminal_modifiers) }
+  }
+  return out[..used]
+}
+// What DNA uses now, for options whose running value can differ from the
+// configuration (a font that failed to load, a toggled gutter). False for
+// options that take effect exactly as configured.
+fn setting_current(app: *App, typography: *Typography, key: str, out: []u8, current: *str) bool {
+  used: usize = 0
+  case key {
+    "font_size" => { setting_decimal(out, &used, typography.points) }
+    "line_height" => { setting_decimal(out, &used, typography.line_height) }
+    "indent_width" => { setting_decimal(out, &used, #cast(f32, indent_width(app))) }
+    "reduced_motion" => { setting_bool(out, &used, app.view.reduced_motion) }
+    "line_numbers" => { setting_bool(out, &used, app.view.line_numbers) }
+    "relative_numbers" => { setting_bool(out, &used, app.view.relative_numbers) }
+    "status_line" => { setting_bool(out, &used, app.view.status_line) }
+    "highlight_line" => { setting_bool(out, &used, app.view.highlight_line) }
+    "font", "font_family" => {
+      current.* = app.fonts.active_font_path[..app.fonts.active_font_length]
+      return true
+    }
+    "fallback_font" => {
+      current.* = app.fonts.active_fallback_path[..app.fonts.active_fallback_length]
+      return true
+    }
+    "theme" => {
+      current.* = app.theme_state.name[..app.theme_state.name_length]
+      return true
+    }
+    _ => { return false }
+  }
+  current.* = out[..used]
+  return true
+}
 fn setting_inspect(app: *App, typography: *Typography, key: str) bool {
   if setting_group(app, key) { return true }
-  index: usize = 0
-  for index < settings.ExtraCount && !buffer.equal(settings.option(index).key, key) {
-    index += 1
-  }
-  if index == settings.ExtraCount { return setting_legacy(app, typography, key) }
+  index := settings.lookup(key)
+  if index == settings.OptionCount { return false }
   spec := settings.option(index)
-  value := settings.option_value(&app.config, index)
-  app.configuration.setting_key_length = copy_text(app.configuration.setting_key[..], key)
-  app.prompt_state.message_length = copy_text(app.prompt_state.message[..], spec.key)
-  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\n\n")
-  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, spec.description)
-  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\n\nConfigured value: ")
-  if spec.flag {
-    if value != 0.0 {
-      add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "true")
-    } else {
-      add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "false")
-    }
-  } else {
-    setting_decimal(app.prompt_state.message[..], &app.prompt_state.message_length, value)
+  value_storage: [64]u8
+  configured := setting_value_text(app, spec, value_storage[..])
+  if configured.len == 0 {
+    configured = settings.shown_default(spec)
   }
-  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\nDefault: ")
-  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, spec.default_value)
-  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\nSource: ")
-  if (app.config.explicit_extra & (#cast(u64, 1) << index)) != 0 {
-    add_text(app.prompt_state.message[..], &app.prompt_state.message_length, app.configuration.path[..app.configuration.path_length])
-  } else {
-    add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "built-in default")
+  current_storage: [64]u8
+  current := configured
+  if setting_current(app, typography, spec.key, current_storage[..], &current) && current.len == 0 {
+    current = settings.shown_default(spec)
   }
-  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\n\nSection form: [")
-  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, spec.section)
-  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "] ")
-  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, spec.local)
-  add_text(app.prompt_state.message[..], &app.prompt_state.message_length, "\nEnter opens config / Escape closes. Save and :config-reload to apply.")
+  message := app.prompt_state.message[..]
+  used := &app.prompt_state.message_length
+  app.configuration.setting_key_length = copy_text(app.configuration.setting_key[..], spec.key)
+  used.* = copy_text(message, settings.set_name(spec))
+  add_text(message, used, "\n\n")
+  add_text(message, used, spec.description)
+  add_text(message, used, "\n\nCurrent: ")
+  add_text(message, used, current)
+  add_text(message, used, "\nConfigured: ")
+  add_text(message, used, configured)
+  add_text(message, used, "\nDefault: ")
+  add_text(message, used, settings.shown_default(spec))
+  add_text(message, used, "\nSource: ")
+  if settings.explicit(&app.config, spec.key) {
+    add_text(message, used, app.configuration.path[..app.configuration.path_length])
+  } else {
+    add_text(message, used, "built-in default")
+  }
+  add_text(message, used, "\nSection form: [")
+  add_text(message, used, spec.section)
+  add_text(message, used, "] ")
+  add_text(message, used, spec.local)
+  add_text(message, used, "\n\nEnter opens config / Escape closes. Save and :config-reload to apply.")
   app.prompt_state.panel = .Setting
   return true
 }
@@ -81,14 +133,7 @@ fn setting_edit(app: *App) {
     open_file(app, app.configuration.path[..app.configuration.path_length])
     if app.prompt_state.panel == .Message { return }
   }
-  for index in 0..settings.ExtraCount {
-    spec := settings.option(index)
-    if buffer.equal(spec.key, key) {
-      if !buffer.find(app.documents.current, key, false) {
-        _ = buffer.find(app.documents.current, spec.local, false)
-      }
-      return
-    }
-  }
-  _ = buffer.find(app.documents.current, key, false)
+  index := settings.find(key)
+  if buffer.find(app.documents.current, key, false) || index == settings.OptionCount { return }
+  _ = buffer.find(app.documents.current, settings.option(index).local, false)
 }

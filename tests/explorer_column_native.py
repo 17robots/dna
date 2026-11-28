@@ -10,15 +10,15 @@ with tempfile.TemporaryDirectory(prefix='dna-explorer-column-native-',dir=ROOT/'
     shutil.copyfile(ROOT/'tests/editor/explorer_column_motion_smoke.dyn',stage/'explorer_column_motion_smoke.dyn')
     platform=stage/'platform/platform.dyn';s=platform.read_text().replace('pub extern fn ticks "dna_ticks"() u64','pub fn ticks()u64{return popup_probe_now}')
     s+='\npopup_probe_now:u64=1000\npub fn popup_probe_time(now:u64){popup_probe_now=now}\n';platform.write_text(s)
-    gui=stage/'platform/gui.dyn';s=gui.read_text();start=s.index('fn sdl_present(');end=s.index('\nfn sdl_scale(',start)
-    s=s[:start]+'fn sdl_present(renderer:rawptr)bool{return true}\n'+s[end:]
+    gui=stage/'platform/gui.dyn';s=gui.read_text();start=s.index('fn gui_present(');end=s.index('\nfn gui_scale(',start)
+    s=s[:start]+'fn gui_present(renderer:rawptr)bool{return true}\n'+s[end:]
     s+='''\npub fn popup_probe_pixels()[]const u8{return native_gui.surface.pixels}
 pub fn popup_probe_resize(width,height:i32){native_gui.window.width=width
  native_gui.window.height=height
  if !native_resize(){#panic("popup motion resize")}}
 ''';gui.write_text(gpu_probe(s))
     (stage/'startup_probe.dyn').write_text('''fn startup_probe(app:*App,typography:*Typography,renderer:rawptr,window:rawptr,input_storage:[]u8){
- explorer_column_motion_smoke(app,typography,renderer,window,ExplorerColumnProbe{time:sdl.popup_probe_time,resize:sdl.popup_probe_resize})
+ explorer_column_motion_smoke(app,typography,renderer,window,ExplorerColumnProbe{time:platform.popup_probe_time,resize:platform.popup_probe_resize})
 }
 fn finish_probe(app:*App){}
 ''')

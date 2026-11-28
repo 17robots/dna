@@ -31,7 +31,7 @@ use buffer "./buffer"
 use workspace "./workspace"
 use files "./files"
 use fs "./fs"
-use sdl "./sdl"
+use platform "./platform"
 extern fn fill "__memset_chk"(target:*u8,byte:i32,length:usize,room:usize) rawptr
 struct Terminal {handle:rawptr}
 struct Slot {document:*buffer.Document,file:files.State,filetype:[65]u8,filetype_length:usize,inferred_filetype:bool,terminal:Terminal}
@@ -223,7 +223,7 @@ pub struct State {length:usize,stamp:fs.Stamp}
 pub fn saved_stamp(state:*const State) fs.Stamp {return state.stamp}
 pub fn name(state:*const State) []const u8 {return "/tmp/big.log"}
 ''',
-        "sdl": '''pub fn ticks() u64 {return 100}
+        "platform": '''pub fn ticks() u64 {return 100}
 ''',
     }.items():
         (stage / name).mkdir()

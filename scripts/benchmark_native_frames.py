@@ -35,7 +35,7 @@ PROBE = r'''fn startup_probe(app:*App, typography:*Typography, renderer:rawptr, 
    height=1080}
   if size==2 {width=2560
    height=1440}
-  sdl.frame_probe_size(width,height)
+  platform.frame_probe_size(width,height)
   for frame in 0..SAMPLE_COUNT {
    buffer.move_to(app.documents.current,frame%20*100,false)
    cpu_started:=frame_probe_cpu()
@@ -96,9 +96,9 @@ def main():
         if args.ui_cache:
             shutil.copyfile(args.ui_cache, stage/'ui_cache.dyn')
         original = args.renderer.read_text()
-        start = original.index('fn sdl_present(')
-        end = original.index('\nfn sdl_scale(', start)
-        renderer = original[:start]+'fn sdl_present(renderer:rawptr) bool { return true }\n'+original[end:]
+        start = original.index('fn gui_present(')
+        end = original.index('\nfn gui_scale(', start)
+        renderer = original[:start]+'fn gui_present(renderer:rawptr) bool { return true }\n'+original[end:]
         renderer += '''\npub fn frame_probe_size(width,height:i32) {
  native_gui.window.width=width
  native_gui.window.height=height

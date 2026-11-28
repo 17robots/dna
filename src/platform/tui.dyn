@@ -1137,25 +1137,30 @@ fn kitty_modifiers(value: u32) u16 {
 }
 // Internal keycodes for special keys (scancode | 1 << 30).
 fn special_key(final: u8, number: u32) u32 {
-  if final == 'A' { return 1073741906 }
-  if final == 'B' { return 1073741905 }
-  if final == 'C' { return 1073741903 }
-  if final == 'D' { return 1073741904 }
-  if final == 'H' { return 1073741898 }
-  if final == 'F' { return 1073741901 }
-  if final == 'P' { return 1073741882 }
-  if final == '~' {
-    if number == 1 || number == 7 { return 1073741898 }
-    if number == 4 || number == 8 { return 1073741901 }
-    if number == 5 { return 1073741899 }
-    if number == 6 { return 1073741902 }
-    if number == 3 { return 127 }
-    if number == 2 { return 1073741897 }
-    if number >= 11 && number <= 15 { return 1073741882 + (number - 11) }
-    if number >= 17 && number <= 21 { return 1073741887 + (number - 17) }
-    if number == 23 || number == 24 { return 1073741892 + (number - 23) }
+  case final {
+    'A' => { return 1073741906 }
+    'B' => { return 1073741905 }
+    'C' => { return 1073741903 }
+    'D' => { return 1073741904 }
+    'H' => { return 1073741898 }
+    'F' => { return 1073741901 }
+    'P' => { return 1073741882 }
+    '~' => {
+      case number {
+        1, 7 => { return 1073741898 }
+        4, 8 => { return 1073741901 }
+        5 => { return 1073741899 }
+        6 => { return 1073741902 }
+        3 => { return 127 }
+        2 => { return 1073741897 }
+        11..=15 => { return 1073741882 + (number - 11) }
+        17..=21 => { return 1073741887 + (number - 17) }
+        23, 24 => { return 1073741892 + (number - 23) }
+        _ => { return 0 }
+      }
+    }
+    _ => { return 0 }
   }
-  return 0
 }
 fn mouse_event(kind: u32, button: u8, column: i32, row: i32, down: bool) {
   event := Event{}
@@ -1266,21 +1271,24 @@ fn parse_one(bytes: str, force_escape: bool) usize {
   if state.pasting { return paste_continue(bytes) }
   first := bytes[0]
   if first != 27 {
-    if first == 13 || first == 10 {
-      queue_key(13, 0, 0)
-      return 1
-    }
-    if first == 9 {
-      queue_key(9, 0, 0)
-      return 1
-    }
-    if first == 127 || first == 8 {
-      queue_key(8, 0, 0)
-      return 1
-    }
-    if first == 0 {
-      queue_key(32, ModCtrl, 0)
-      return 1
+    case first {
+      13, 10 => {
+        queue_key(13, 0, 0)
+        return 1
+      }
+      9 => {
+        queue_key(9, 0, 0)
+        return 1
+      }
+      127, 8 => {
+        queue_key(8, 0, 0)
+        return 1
+      }
+      0 => {
+        queue_key(32, ModCtrl, 0)
+        return 1
+      }
+      _ => {}
     }
     if first < 27 {
       queue_key(#cast(u32, first) + 96, ModCtrl, 0)
@@ -1391,19 +1399,19 @@ fn parse_one(bytes: str, force_escape: bool) usize {
       } else if (button & 32) != 0 {
         mouse_event(1024, 0, column, row, true)
       } else {
-        sdl_button: u8 = 1
+        gui_button: u8 = 1
         if (button & 3) == 1 {
-          sdl_button = 2
+          gui_button = 2
         } else if (button & 3) == 2 {
-          sdl_button = 3
+          gui_button = 3
         }
-        bit := #cast(u32, 1) << (#cast(u32, sdl_button) - 1)
+        bit := #cast(u32, 1) << (#cast(u32, gui_button) - 1)
         if final == 'M' {
           state.buttons = state.buttons | bit
-          mouse_event(1025, sdl_button, column, row, true)
+          mouse_event(1025, gui_button, column, row, true)
         } else {
           state.buttons = state.buttons & ~bit
-          mouse_event(1026, sdl_button, column, row, false)
+          mouse_event(1026, gui_button, column, row, false)
         }
       }
     }
@@ -1561,7 +1569,7 @@ fn take(event: *Event) bool {
 // Wait up to milliseconds (-1 forever) for an event, with a bounded native wait.
 pub fn tui_wait(event: *Event, milliseconds: i32) bool {
   // Thread wake-ups and pushed events arrive through the native queue.
-  if sdl_poll(event) { return true }
+  if gui_poll(event) { return true }
   if take(event) { return true }
   // Bytes left over when the queue filled come before any new read.
   if state.input_used > 0 {
@@ -1598,7 +1606,7 @@ pub fn tui_wait(event: *Event, milliseconds: i32) bool {
   // Woken by a worker thread: consume a queued native event or synthesize
   // a user event so either frontend runs its pending service work.
   if count == -2 {
-    if sdl_poll(event) { return true }
+    if gui_poll(event) { return true }
     wake := Event{}
     wake.words[0] = WorkerWakeEvent
     event.* = wake
@@ -1612,7 +1620,7 @@ pub fn tui_wait(event: *Event, milliseconds: i32) bool {
   }
   parse_input(count == 0 && escape_pending)
   if take(event) { return true }
-  return sdl_poll(event)
+  return gui_poll(event)
 }
 pub fn tui_poll(event: *Event) bool {
   return tui_wait(event, 0)

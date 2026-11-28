@@ -109,7 +109,7 @@ fn main(){
 }
 '''
 TUI=r'''use text "./text"
-use sdl "./platform"
+use platform "./platform"
 fn check(ok:bool){if !ok{#panic("TUI selection geometry")}}
 struct Captured {count:usize,width:i32,first:i32,last:i32,stop:bool}
 fn capture(data:rawptr,region:*const text.Substring)bool {
@@ -122,7 +122,7 @@ fn capture(data:rawptr,region:*const text.Substring)bool {
  return !result.stop
 }
 fn main(){
- sdl.selection_probe_active()
+ platform.selection_probe_active()
  handle:=text.create(#cast(rawptr,1),#cast(rawptr,1),nil,0)
  check(handle!=nil)
  defer text.destroy(handle)
@@ -196,7 +196,7 @@ with tempfile.TemporaryDirectory(prefix='dna-selection-') as directory:
     flags=shlex.split(subprocess.check_output(['pkg-config','--cflags','--libs','harfbuzz','fribidi'],text=True))
     subprocess.run(['cc','-std=c11','-O2',str(work/'oracle.c'),*flags,'-o',str(work/'oracle')],check=True)
     stage=work/'native';stage.mkdir();(stage/'platform').mkdir();(stage/'platform/platform.dyn').write_text(PLATFORM)
-    backend=(ROOT/'src/text/native.dyn').read_text().replace('use sdl "../platform"','use sdl "./platform"')
+    backend=(ROOT/'src/text/native.dyn').read_text().replace('use platform "../platform"','use platform "./platform"')
     backend=re.sub(r'extern fn native_text_attach[^\n]+','fn native_text_attach(callbacks:*const NativeTextCallbacks)bool{return dna_native_text_attach(callbacks)}',backend)
     backend=re.sub(r'extern fn native_tracked_create[^\n]+','fn native_tracked_create(engine:rawptr,font:rawptr,text:*const u8,length:usize)rawptr{return dna_text_create(engine,font,text,length)}',backend)
     backend=re.sub(r'extern fn native_tracked_destroy[^\n]+','fn native_tracked_destroy(text:rawptr){dna_text_destroy(text)}',backend)

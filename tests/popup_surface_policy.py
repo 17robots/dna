@@ -14,7 +14,7 @@ def function(source,name):
  return source[start:end]+'\n'
 s=(ROOT/'src/animation.dyn').read_text()
 source='''use motion "./motion"
-use sdl "./sdl"
+use platform "./platform"
 use settings "./settings"
 struct Config {popup_animation_ms:f32,popup_transitions:bool,placement:settings.Placement}
 struct Animation {now:f32,active,surfaces_ready,resized,geometry_active:bool,geometry_elapsed:f32,surface_geometry:[8]motion.Rectangle,surface_seen:[8]u64}
@@ -29,17 +29,17 @@ const RenderMouse:u32=8
 const RenderIme:u32=32
 const RenderWindow:u32=16
 fn answering_input(app:*const App)bool{return (app.render_pending&(RenderKey|RenderText|RenderMouse|RenderIme|RenderWindow))!=0}
-placed_rects:[8]sdl.Rect
+placed_rects:[8]platform.Rect
 placed_frames:[8]u64
 fn place_of(app:*const App,surface:usize)settings.Placement{return app.config.placement}
 '''+function(s,'surface_motion_enabled')+function(s,'animated_surface')+'''
-fn equal(a,b:sdl.Rect) bool {return a.x==b.x && a.y==b.y && a.width==b.width && a.height==b.height}
+fn equal(a,b:platform.Rect) bool {return a.x==b.x && a.y==b.y && a.width==b.width && a.height==b.height}
 fn dock_case(side:u8) {
  app:=App{config:Config{popup_animation_ms:40.0,popup_transitions:true}}
  app.config.placement=settings.Placement{mode:.Dock,side:side}
  app.view.animation.surfaces_ready=true
  app.ui.frame=10
- target:=sdl.Rect{width:1000.0,height:600.0}
+ target:=platform.Rect{width:1000.0,height:600.0}
  pane_target:[4]f32=[0.0,0.0,1000.0,600.0]
  if side==0 {target.width=200.75
   pane_target[0]=200.0}
@@ -72,7 +72,7 @@ fn main() {
  for side in 0..4 {dock_case(#cast(u8,side))}
  app:=App{config:Config{popup_animation_ms:40.0,popup_transitions:true}}
  app.ui.frame=1
- target:=sdl.Rect{x:100.25,y:80.75,width:600.5,height:400.5}
+ target:=platform.Rect{x:100.25,y:80.75,width:600.5,height:400.5}
  if !equal(animated_surface(&app,0,target,1.0),target) {#panic("startup surface must retain exact placement")}
  app.view.animation.surfaces_ready=true
  app.ui.frame=2
@@ -118,7 +118,7 @@ fn main() {
   app.config.popup_animation_ms=40.0
   if reason==2 {app.config.popup_animation_ms=0.0}
   app.pointer.dragging=reason==3
-  sdl.terminal=reason==4
+  platform.terminal=reason==4
   app.view.animation.resized=reason==5
   app.view.animation.active=false
   if !equal(animated_surface(&app,2,target,1.0),target) || app.view.animation.active {#panic("motion opt-out must preserve exact popup placement")}
@@ -126,8 +126,8 @@ fn main() {
 }
 '''
 with tempfile.TemporaryDirectory(prefix='dna-popup-policy-') as temporary:
- work=Path(temporary);shutil.copytree(ROOT/'src/motion',work/'motion');(work/'sdl').mkdir()
- (work/'sdl/sdl.dyn').write_text('pub struct Rect{x,y,width,height:f32}\npub terminal:bool\npub fn tui_active()bool{return terminal}\n')
+ work=Path(temporary);shutil.copytree(ROOT/'src/motion',work/'motion');(work/'platform').mkdir()
+ (work/'platform/platform.dyn').write_text('pub struct Rect{x,y,width,height:f32}\npub terminal:bool\npub fn tui_active()bool{return terminal}\n')
  (work/'settings').mkdir()
  (work/'settings/settings.dyn').write_text('pub enum PlaceMode{Default,Float,Dock,Cursor}\npub struct Placement{mode:PlaceMode,side:u8}\n')
  (work/'main.dyn').write_text(source)

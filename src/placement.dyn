@@ -41,7 +41,7 @@ fn surface_visible(app: *const App, surface: usize) bool {
   return false
 }
 // The strip a docked surface occupies, given the window and earlier docks.
-fn dock_strip(place: *const settings.Placement, area: *sdl.Rect, scale: f32) sdl.Rect {
+fn dock_strip(place: *const settings.Placement, area: *platform.Rect, scale: f32) platform.Rect {
   horizontal := place.side == 0 || place.side == 1
   whole := area.height
   if horizontal {
@@ -54,57 +54,62 @@ fn dock_strip(place: *const settings.Placement, area: *sdl.Rect, scale: f32) sdl
   }
   // Keep dock drawing, hitboxes and the remaining pane area on the same
   // terminal grid; fractional cells clip syntax spans at their last column.
-  if sdl.tui_active() {
-    cell := sdl.CellHeight
+  if platform.tui_active() {
+    cell := platform.CellHeight
     if horizontal {
-      cell = sdl.CellWidth
+      cell = platform.CellWidth
     }
     size = #cast(f32, (#cast(i32, (size / cell)))) * cell
   }
   strip := area.*
-  if place.side == 0 {
-    strip.width = size
-    area.x += size
-    area.width -= size
-  } else if place.side == 1 {
-    strip.x = area.x + area.width - size
-    strip.width = size
-    area.width -= size
-  } else if place.side == 2 {
-    strip.height = size
-    area.y += size
-    area.height -= size
-  } else {
-    strip.y = area.y + area.height - size
-    strip.height = size
-    area.height -= size
+  case place.side {
+    0 => {
+      strip.width = size
+      area.x += size
+      area.width -= size
+    }
+    1 => {
+      strip.x = area.x + area.width - size
+      strip.width = size
+      area.width -= size
+    }
+    2 => {
+      strip.height = size
+      area.y += size
+      area.height -= size
+    }
+    _ => {
+      strip.y = area.y + area.height - size
+      strip.height = size
+      area.height -= size
+    }
   }
   return strip
 }
 // Editor panes fill what the visible docks leave, in surface order.
-fn editor_area(app: *const App, width: i32, height: i32, scale: f32) sdl.PixelRect {
-  area := sdl.Rect{width: #cast(f32, width), height: #cast(f32, height)}
+fn editor_area(app: *const App, width: i32, height: i32, scale: f32) platform.PixelRect {
+  area := platform.Rect{width: #cast(f32, width), height: #cast(f32, height)}
   for surface in 0..settings.PlaceSurfaces {
     place := place_of(app, surface)
     if place.mode == .Dock && surface_visible(app, surface) {
       _ = dock_strip(&place, &area, scale)
     }
   }
-  return sdl.PixelRect{x: #cast(i32, area.x), y: #cast(i32, area.y), width: #cast(i32, area.width), height: #cast(i32, area.height)}
+  return platform.PixelRect{x: #cast(i32, area.x), y: #cast(i32, area.y), width: #cast(i32, area.width), height: #cast(i32, area.height)}
 }
 // Where a surface draws, including shared defaults and explicit overrides.
 // Where each surface drew last frame, so the mouse can grab it, and the
 // grab in progress.
 struct PlaceDrag { surface: usize, dock: bool, grab_x, grab_y, x, y: f32 }
-placed_rects: [8]sdl.Rect
+placed_rects: [8]platform.Rect
 placed_frames: [8]u64
 place_drag: PlaceDrag = PlaceDrag{}
 
 // Shared full-size popup bounds, before per-surface placement overrides.
-fn window_popup_rect(width: i32, height: i32, status: f32) sdl.Rect {
-  return sdl.Rect{x: #cast(f32, width) * 0.05, y: (#cast(f32, height) - status) * 0.06, width: #cast(f32, width) * 0.9, height: (#cast(f32, height) - status) * 0.88}
+fn window_popup_rect(width: i32, height: i32, status: f32) platform.Rect {
+  return platform.Rect{x: #cast(f32, width) * 0.05, y: (#cast(f32, height) - status) * 0.06, width: #cast(f32, width) * 0.9, height: (#cast(f32, height) - status) * 0.88}
 }
-fn place_rect(app: *const App, surface: usize, width: i32, height: i32, status: f32, scale: f32, natural: sdl.Rect) sdl.Rect {
+fn place_rect(app: *const App, surface: usize, width: i32, height: i32, status: f32, scale: f32, natural: platform.Rect) platform.Rect {
   rect := place_rect_for(app, surface, width, height, status, scale, natural)
   // A floating surface being dragged follows the pointer until released.
   if place_drag.surface == surface + 1 && !place_drag.dock {
@@ -117,7 +122,7 @@ fn place_rect(app: *const App, surface: usize, width: i32, height: i32, status: 
   }
   return rect
 }
-fn place_rect_for(app: *const App, surface: usize, width: i32, height: i32, status: f32, scale: f32, natural: sdl.Rect) sdl.Rect {
+fn place_rect_for(app: *const App, surface: usize, width: i32, height: i32, status: f32, scale: f32, natural: platform.Rect) platform.Rect {
   effective := place_of(app, surface)
   place := &effective
   if place.mode == .Default {
@@ -145,7 +150,7 @@ fn place_rect_for(app: *const App, surface: usize, width: i32, height: i32, stat
     }
     return natural
   }
-  window := sdl.Rect{width: #cast(f32, width), height: #cast(f32, height) - status}
+  window := platform.Rect{width: #cast(f32, width), height: #cast(f32, height) - status}
   if place.mode == .Dock {
     area := window
     for earlier in 0..surface {
@@ -424,7 +429,7 @@ fn place_drag_mouse(app: *App, x: f32, y: f32, width: i32, height: i32, pressed:
 struct PlaceGrab { surface: usize, dock: bool, horizontal: bool }
 fn place_grab_at(app: *const App, x: f32, y: f32) PlaceGrab {
   grip := 5.0 * app.ui.scale
-  if sdl.tui_active() {
+  if platform.tui_active() {
     grip = app.ui.cell
   }
   surface := settings.PlaceSurfaces
@@ -484,12 +489,17 @@ fn place_dock_resize(app: *App, surface: usize, x: f32, y: f32) {
   place := place_of(app, surface)
   rect := placed_rects[surface]
   size := x - rect.x
-  if place.side == 1 {
-    size = rect.x + rect.width - x
-  } else if place.side == 2 {
-    size = y - rect.y
-  } else if place.side == 3 {
-    size = rect.y + rect.height - y
+  case place.side {
+    1 => {
+      size = rect.x + rect.width - x
+    }
+    2 => {
+      size = y - rect.y
+    }
+    3 => {
+      size = rect.y + rect.height - y
+    }
+    _ => {}
   }
   minimum := 8.0 * app.ui.line
   if size < minimum {

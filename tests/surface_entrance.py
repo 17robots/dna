@@ -10,8 +10,8 @@ with tempfile.TemporaryDirectory(prefix='dna-panel-geometry-',dir=ROOT/'build') 
     shutil.copyfile(ROOT/'tests/editor/surface_entrance_smoke.dyn',stage/'surface_entrance_smoke.dyn')
     platform=stage/'platform/platform.dyn';s=platform.read_text().replace('pub extern fn ticks "dna_ticks"() u64','pub fn ticks()u64{return geometry_probe_now}')
     s+='\ngeometry_probe_now:u64=1000\npub fn geometry_probe_time(now:u64){geometry_probe_now=now}\n';platform.write_text(s)
-    gui=stage/'platform/gui.dyn';s=gui.read_text();start=s.index('fn sdl_present(');end=s.index('\nfn sdl_scale(',start)
-    s=s[:start]+'fn sdl_present(renderer:rawptr)bool{return true}\n'+s[end:]
+    gui=stage/'platform/gui.dyn';s=gui.read_text();start=s.index('fn gui_present(');end=s.index('\nfn gui_scale(',start)
+    s=s[:start]+'fn gui_present(renderer:rawptr)bool{return true}\n'+s[end:]
     s+='''\npub fn geometry_probe_pixels()[]const u8{return native_gui.surface.pixels}
 pub fn geometry_probe_resize(width,height:i32){native_gui.window.width=width
  native_gui.window.height=height
@@ -20,7 +20,7 @@ pub fn geometry_probe_resize(width,height:i32){native_gui.window.width=width
     if '--negative-control' in sys.argv:
         view=stage/'view.dyn';s=view.read_text().replace('  pane_animate_layout(app, 0)','  app.view.animation.resized=true\n  pane_animate_layout(app, 0)');view.write_text(s)
     (stage/'startup_probe.dyn').write_text('''fn startup_probe(app:*App,typography:*Typography,renderer:rawptr,window:rawptr,input_storage:[]u8){
- surface_entrance_smoke(app,typography,renderer,window,SurfaceEntranceProbe{time:sdl.geometry_probe_time,pixels:sdl.geometry_probe_pixels,resize:sdl.geometry_probe_resize})
+ surface_entrance_smoke(app,typography,renderer,window,SurfaceEntranceProbe{time:platform.geometry_probe_time,pixels:platform.geometry_probe_pixels,resize:platform.geometry_probe_resize})
 }
 fn finish_probe(app:*App){}
 ''')

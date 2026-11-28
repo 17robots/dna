@@ -11,8 +11,8 @@ sys.path.insert(0, str(ROOT / 'scripts'))
 from dyn_path import real_dyn
 
 source = (ROOT / 'src/platform/gui.dyn').read_text()
-start = source.index('fn sdl_clipboard_get(')
-end = source.index('\nfn sdl_free(', start)
+start = source.index('fn gui_clipboard_get(')
+end = source.index('\nfn gui_free(', start)
 clipboard = source[start:end]
 if '--negative-control' in sys.argv:
     low = clipboard.index('  started:=')
@@ -63,19 +63,19 @@ native_gui:NativeGui=NativeGui{}
 ''' + clipboard + '''
 fn main() {
  // Two hundred 10 ms protocol polls exceed the old 100-poll cap.
- pointer:=sdl_clipboard_get()
+ pointer:=gui_clipboard_get()
  if pointer==nil || window_api.polls!=200 {#panic("slow valid clipboard abandoned")}
  if native_gui.clipboards.bytes[0]!=115 || native_gui.clipboards.bytes[14]!=0 {#panic("clipboard snapshot ownership")}
  mem.arena_release(native_gui.clipboards.owner)
  native_gui.clipboards=nil
  window_api.success=false
- if sdl_clipboard_get()!=nil {#panic("failed transfer published")}
+ if gui_clipboard_get()!=nil {#panic("failed transfer published")}
  window_api.success=true
  window_api.goal=10000
  time.tick=0
- if sdl_clipboard_get()!=nil || window_api.polls<2990 || window_api.polls>3000 {#panic("clipboard total deadline")}
+ if gui_clipboard_get()!=nil || window_api.polls<2990 || window_api.polls>3000 {#panic("clipboard total deadline")}
  time.failed=true
- if sdl_clipboard_get()!=nil {#panic("failed clock must bound clipboard wait")}
+ if gui_clipboard_get()!=nil {#panic("failed clock must bound clipboard wait")}
 }
 ''')
     for mode in ('debug', 'release'):

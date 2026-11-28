@@ -171,7 +171,7 @@ fn syntax_reset(slot:*Slot) {slot_syntax_release(slot)}
 fn preview_syntax_tick(app:*App) bool {return false}
 fn preview_syntax_waiting(app:*App) bool {return false}
 '''
-SYNTHETIC_SDL='''pub fn ticks() u64 {return 1}'''
+SYNTHETIC_PLATFORM='''pub fn ticks() u64 {return 1}'''
 
 def report(label, value):
     return f'  if !({value}) {{ #panic("{label}") }}\n'
@@ -180,10 +180,10 @@ with tempfile.TemporaryDirectory(prefix='dna-worksets-') as temporary:
     directory = Path(temporary)
     (directory/'buffer').mkdir(); (directory/'buffer/buffer.dyn').write_text(BUFFER.replace('} for', '}\n for').replace('} return', '}\n return'))
     (directory/'files').mkdir(); (directory/'files/files.dyn').write_text(FILES)
-    (directory/'sdl').mkdir(); (directory/'sdl/sdl.dyn').write_text(SYNTHETIC_SDL)
+    (directory/'platform').mkdir(); (directory/'platform/platform.dyn').write_text(SYNTHETIC_PLATFORM)
     shutil.copytree(args.source_root/'owned_arena',directory/'owned_arena')
     (directory/'settings').mkdir(); (directory/'settings/settings.dyn').write_text('pub fn trim(value:[]const u8) []const u8 {return value}')
-    source = BASE + '\nuse "./sdl"\nuse "./settings"\n'
+    source = BASE + '\nuse "./platform"\nuse "./settings"\n'
     source += functions(args.source_root/'disk.dyn', ['disk_dirty_slot', 'disk_register', 'disk_process', 'disk_tick'])
     source += '\n' + functions(args.source_root/'syntax.dyn', ['syntax_track', 'syntax_untrack', 'slot_syntax_release', 'syntax_trim', 'syntax_slot_tick', 'syntax_copy', 'syntax_window_needed', 'syntax_window_tick', 'syntax_visible', 'syntax_tick', 'syntax_waiting', 'filetype_dirty_slot', 'configured_filetype_slot', 'configured_filetypes'])
     source += '\nconst SyntaxMargin: usize = 524288\nconst SyntaxWindowBit: u64 = 9223372036854775808\nconst SyntaxWindowLimit: usize = 8388608\n'

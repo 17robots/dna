@@ -252,7 +252,7 @@ fn plugin_start_pending(app: *App) {
   app.plugin_state.slots[index] = plugin.*
   app.plugin_state.slots[index].process = process_handle
   app.plugin_state.slots[index].active = true
-  app.plugin_state.slots[index].deadline = sdl.ticks() + #cast(u64, app.config.plugin_timeout_ms)
+  app.plugin_state.slots[index].deadline = platform.ticks() + #cast(u64, app.config.plugin_timeout_ms)
   greeting: str = "{\"type\":\"initialize\",\"version\":1}\n"
   _ = plugin_send(process_handle, &greeting[0], greeting.len)
   app.prompt_state.panel = .None
@@ -298,7 +298,7 @@ fn plugin_run_command(app: *App, command_index: usize) {
   if plugin_send(plugin.process, &message[0], used) == 0 {
     plugin_stop(app, command.owner, "Plugin request queue overflow; disabled.")
   } else {
-    plugin.deadline = sdl.ticks() + #cast(u64, app.config.plugin_timeout_ms)
+    plugin.deadline = platform.ticks() + #cast(u64, app.config.plugin_timeout_ms)
   }
   app.prompt_state.panel = .None
 }
@@ -328,107 +328,110 @@ fn plugin_message(app: *App, index: usize, source: str) {
   }
   plugin := &app.plugin_state.slots[index]
   kind := json_text(root, "type")
-  if buffer.equal(kind, "ready") || buffer.equal(kind, "done") {
-    plugin.deadline = 0
-    return
-  }
-  if buffer.equal(kind, "notice") {
-    message_text := json_text(root, "text")
-    if !buffer.valid(message_text) {
-      plugin_stop(app, index, "Plugin notice is not valid text; disabled.")
+  case kind {
+    "ready", "done" => {
+      plugin.deadline = 0
       return
     }
-    plugin_log(app, message_text)
-    return
-  }
-  if buffer.equal(kind, "command") {
-    name := json_text(root, "name")
-    if name.len == 0 || name.len >= 128 || !utf8.valid(name) {
-      plugin_stop(app, index, "Invalid plugin command name; disabled.")
-      return
-    }
-    slot: usize = 0
-    for slot < app.plugin_state.command_count && app.plugin_state.commands[slot].length != 0 {
-      if app.plugin_state.commands[slot].owner == index && buffer.equal(app.plugin_state.commands[slot].name[..app.plugin_state.commands[slot].length], name) {
+    "notice" => {
+      message_text := json_text(root, "text")
+      if !buffer.valid(message_text) {
+        plugin_stop(app, index, "Plugin notice is not valid text; disabled.")
         return
       }
-      slot += 1
-    }
-    if slot == 32 {
-      plugin_stop(app, index, "Plugin command limit reached; disabled.")
+      plugin_log(app, message_text)
       return
     }
-    for byte in name {
-      if byte < 32 || byte == 127 {
-        plugin_stop(app, index, "Control characters in plugin command; disabled.")
+    "command" => {
+      name := json_text(root, "name")
+      if name.len == 0 || name.len >= 128 || !utf8.valid(name) {
+        plugin_stop(app, index, "Invalid plugin command name; disabled.")
         return
       }
-    }
-    registered := &app.plugin_state.commands[slot]
-    registered.owner = index
-    registered.length = copy_text(registered.name[..], name)
-    registered.label_length = copy_text(registered.label[..], plugin.name[..plugin.length])
-    add_text(registered.label[..], &registered.label_length, ": ")
-    add_text(registered.label[..], &registered.label_length, name)
-    if slot == app.plugin_state.command_count {
-      app.plugin_state.command_count += 1
-    }
-    app.command_menu.cached = false
-    return
-  }
-  if buffer.equal(kind, "buffer") {
-    if !plugin.create {
-      plugin_stop(app, index, "Plugin requested buffer.create without permission; disabled.")
-      return
-    }
-    content := json_text(root, "text")
-    if !json.is_string(json.object_get(root, "text")) || !buffer.valid(content) {
-      plugin_stop(app, index, "Plugin buffer exceeds text limit; disabled.")
-      return
-    }
-    // Never interrupt an active prompt with an unsolicited buffer.
-    if app.prompt_state.panel != .None {
-      plugin_log(app, "Plugin buffer deferred: close the current prompt and invoke its command again.")
-      return
-    }
-    if new_buffer(app) {
-      _ = buffer.replace(app.documents.current, content)
-      buffer.checkpoint(app.documents.current)
-    }
-    return
-  }
-  if buffer.equal(kind, "replace") {
-    if !plugin.write {
-      plugin_stop(app, index, "Plugin requested document.write without permission; disabled.")
-      return
-    }
-    target := json_unsigned(json.object_get(root, "buffer"))
-    revision := json_unsigned(json.object_get(root, "revision"))
-    replacement := json_text(root, "text")
-    if target >= app.documents.slots.len || target != plugin.command_slot || plugin.command_identity != app.documents.slots[target].identity || plugin.command_revision != revision || app.documents.slots[target].document == nil || app.documents.slots[target].terminal.handle != nil || app.documents.slots[target].document.revision != revision || !json.is_string(json.object_get(root, "text")) || replacement.len > 65535 || !buffer.valid(replacement) {
-      plugin_log(app, "Plugin edit rejected: stale buffer/revision or invalid text.")
-      return
-    }
-    if app.prompt_state.panel != .None {
-      plugin_log(app, "Plugin edit rejected while another prompt is active. Invoke again.")
-      return
-    }
-    app.plugin_state.edit_length = copy_text(app.plugin_state.edit[..], replacement)
-    app.plugin_state.edit_target = target
-    app.plugin_state.edit_revision = revision
-    app.plugin_state.edit_identity = app.documents.slots[target].identity
-    app.plugin_state.edit_document = app.documents.slots[target].document
-    app.prompt_state.panel = .PluginEdit
-    app.prompt_state.message_length = copy_text(app.prompt_state.message[..], "Plugin replacement preview (whole buffer).\nEnter applies as one undoable edit; Escape cancels.\n\n")
-    preview_length := replacement.len
-    if preview_length > 7000 {
-      preview_length = 7000
-      for preview_length > 0 && (replacement[preview_length] & 192) == 128 {
-        preview_length -= 1
+      slot: usize = 0
+      for slot < app.plugin_state.command_count && app.plugin_state.commands[slot].length != 0 {
+        if app.plugin_state.commands[slot].owner == index && buffer.equal(app.plugin_state.commands[slot].name[..app.plugin_state.commands[slot].length], name) {
+          return
+        }
+        slot += 1
       }
+      if slot == 32 {
+        plugin_stop(app, index, "Plugin command limit reached; disabled.")
+        return
+      }
+      for byte in name {
+        if byte < 32 || byte == 127 {
+          plugin_stop(app, index, "Control characters in plugin command; disabled.")
+          return
+        }
+      }
+      registered := &app.plugin_state.commands[slot]
+      registered.owner = index
+      registered.length = copy_text(registered.name[..], name)
+      registered.label_length = copy_text(registered.label[..], plugin.name[..plugin.length])
+      add_text(registered.label[..], &registered.label_length, ": ")
+      add_text(registered.label[..], &registered.label_length, name)
+      if slot == app.plugin_state.command_count {
+        app.plugin_state.command_count += 1
+      }
+      app.command_menu.cached = false
+      return
     }
-    add_text(app.prompt_state.message[..], &app.prompt_state.message_length, replacement[..preview_length])
-    return
+    "buffer" => {
+      if !plugin.create {
+        plugin_stop(app, index, "Plugin requested buffer.create without permission; disabled.")
+        return
+      }
+      content := json_text(root, "text")
+      if !json.is_string(json.object_get(root, "text")) || !buffer.valid(content) {
+        plugin_stop(app, index, "Plugin buffer exceeds text limit; disabled.")
+        return
+      }
+      // Never interrupt an active prompt with an unsolicited buffer.
+      if app.prompt_state.panel != .None {
+        plugin_log(app, "Plugin buffer deferred: close the current prompt and invoke its command again.")
+        return
+      }
+      if new_buffer(app) {
+        _ = buffer.replace(app.documents.current, content)
+        buffer.checkpoint(app.documents.current)
+      }
+      return
+    }
+    "replace" => {
+      if !plugin.write {
+        plugin_stop(app, index, "Plugin requested document.write without permission; disabled.")
+        return
+      }
+      target := json_unsigned(json.object_get(root, "buffer"))
+      revision := json_unsigned(json.object_get(root, "revision"))
+      replacement := json_text(root, "text")
+      if target >= app.documents.slots.len || target != plugin.command_slot || plugin.command_identity != app.documents.slots[target].identity || plugin.command_revision != revision || app.documents.slots[target].document == nil || app.documents.slots[target].terminal.handle != nil || app.documents.slots[target].document.revision != revision || !json.is_string(json.object_get(root, "text")) || replacement.len > 65535 || !buffer.valid(replacement) {
+        plugin_log(app, "Plugin edit rejected: stale buffer/revision or invalid text.")
+        return
+      }
+      if app.prompt_state.panel != .None {
+        plugin_log(app, "Plugin edit rejected while another prompt is active. Invoke again.")
+        return
+      }
+      app.plugin_state.edit_length = copy_text(app.plugin_state.edit[..], replacement)
+      app.plugin_state.edit_target = target
+      app.plugin_state.edit_revision = revision
+      app.plugin_state.edit_identity = app.documents.slots[target].identity
+      app.plugin_state.edit_document = app.documents.slots[target].document
+      app.prompt_state.panel = .PluginEdit
+      app.prompt_state.message_length = copy_text(app.prompt_state.message[..], "Plugin replacement preview (whole buffer).\nEnter applies as one undoable edit; Escape cancels.\n\n")
+      preview_length := replacement.len
+      if preview_length > 7000 {
+        preview_length = 7000
+        for preview_length > 0 && (replacement[preview_length] & 192) == 128 {
+          preview_length -= 1
+        }
+      }
+      add_text(app.prompt_state.message[..], &app.prompt_state.message_length, replacement[..preview_length])
+      return
+    }
+    _ => {}
   }
   plugin_stop(app, index, "Unknown plugin message type; disabled.")
 }
@@ -437,7 +440,7 @@ fn plugin_tick(app: *App) bool {
   for index in 0..8 {
     plugin := &app.plugin_state.slots[index]
     if plugin.process != nil {
-      if plugin.deadline != 0 && sdl.ticks() >= plugin.deadline {
+      if plugin.deadline != 0 && platform.ticks() >= plugin.deadline {
         plugin_stop(app, index, "Plugin request timed out; disabled.")
       } else {
         messages: usize = 0

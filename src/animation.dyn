@@ -32,7 +32,7 @@ struct Animation {
 
 fn animation_begin(app: *App, typography: *Typography, width: i32, height: i32) {
   state := &app.view.animation
-  ticks := sdl.ticks()
+  ticks := platform.ticks()
   state.geometry_elapsed = 8.0
   if state.geometry_active && ticks >= state.frame {
     state.geometry_elapsed = #cast(f32, ticks - state.frame)
@@ -50,7 +50,7 @@ fn animation_begin(app: *App, typography: *Typography, width: i32, height: i32) 
   state.reset = app.view.reduced_motion || state.document != app.documents.current || state.view_revision != app.view.revision || state.line != typography.line || state.width != width || state.height != height
   if state.width != width || state.height != height {
     if state.texture != nil {
-      sdl.destroy_texture(state.texture)
+      platform.destroy_texture(state.texture)
       state.texture = nil
     }
   }
@@ -61,12 +61,12 @@ fn animation_begin(app: *App, typography: *Typography, width: i32, height: i32) 
   state.height = height
 }
 fn surface_motion_enabled(app: *const App) bool {
-  return !sdl.tui_active() && !app.view.reduced_motion && app.config.popup_transitions && app.config.popup_animation_ms > 0.0 && !app.pointer.dragging
+  return !platform.tui_active() && !app.view.reduced_motion && app.config.popup_transitions && app.config.popup_animation_ms > 0.0 && !app.pointer.dragging
 }
-fn rectangle_edges(rect: sdl.PixelRect) [4]f32 {
+fn rectangle_edges(rect: platform.PixelRect) [4]f32 {
   return [#cast(f32, rect.x), #cast(f32, rect.y), #cast(f32, rect.x + rect.width), #cast(f32, rect.y + rect.height)]
 }
-fn animated_rectangle(app: *App, state: *motion.Rectangle, target: sdl.PixelRect) sdl.PixelRect {
+fn animated_rectangle(app: *App, state: *motion.Rectangle, target: platform.PixelRect) platform.PixelRect {
   edges := rectangle_edges(target)
   changed := !state.ready
   for axis in 0..4 {
@@ -89,13 +89,13 @@ fn animated_rectangle(app: *App, state: *motion.Rectangle, target: sdl.PixelRect
   top := #cast(i32, state.current[1] + 0.5)
   right := #cast(i32, state.current[2] + 0.5)
   bottom := #cast(i32, state.current[3] + 0.5)
-  return sdl.PixelRect{x: left, y: top, width: right - left, height: bottom - top}
+  return platform.PixelRect{x: left, y: top, width: right - left, height: bottom - top}
 }
 // The explorer expands from its left edge; other floating surfaces settle
 // from a slight centered squish. Docks grow from
 // their outer edge with the editor's moving boundary. Current rectangles own
 // both UI layout and placement handles throughout the motion.
-fn animated_surface(app: *App, surface: usize, target: sdl.Rect, scale: f32) sdl.Rect {
+fn animated_surface(app: *App, surface: usize, target: platform.Rect, scale: f32) platform.Rect {
   if surface >= 8 { return target }
   animation := &app.view.animation
   state := &animation.surface_geometry[surface]
@@ -115,14 +115,19 @@ fn animated_surface(app: *App, surface: usize, target: sdl.Rect, scale: f32) sdl
     initial := edges
     if enabled {
       if docked {
-        if place.side == 0 {
-          initial[2] = initial[0]
-        } else if place.side == 1 {
-          initial[0] = initial[2]
-        } else if place.side == 2 {
-          initial[3] = initial[1]
-        } else {
-          initial[1] = initial[3]
+        case place.side {
+          0 => {
+            initial[2] = initial[0]
+          }
+          1 => {
+            initial[0] = initial[2]
+          }
+          2 => {
+            initial[3] = initial[1]
+          }
+          _ => {
+            initial[1] = initial[3]
+          }
         }
       } else if surface == SurfaceExplorer {
         initial[2] = initial[0]
@@ -169,7 +174,7 @@ fn animated_surface(app: *App, surface: usize, target: sdl.Rect, scale: f32) sdl
     right = #cast(f32, #cast(i32, right + 0.5))
     bottom = #cast(f32, #cast(i32, bottom + 0.5))
   }
-  result := sdl.Rect{x: left, y: top, width: right - left, height: bottom - top}
+  result := platform.Rect{x: left, y: top, width: right - left, height: bottom - top}
   placed_rects[surface] = result
   placed_frames[surface] = app.ui.frame
   return result
@@ -214,7 +219,7 @@ fn corner_y(index: usize, height: f32) f32 {
 }
 // Draws the optional stretched decoration while a jump is in flight. The
 // caller always draws the primary caret at its logical destination too.
-fn draw_cursor_trail(renderer: rawptr, app: *App, trail: *CursorTrail, target: sdl.Rect, snap: bool, color: Rgb) bool {
+fn draw_cursor_trail(renderer: rawptr, app: *App, trail: *CursorTrail, target: platform.Rect, snap: bool, color: Rgb) bool {
   size := app.config.cursor_trail_size
   duration := app.config.cursor_animation_ms
   if snap || size <= 0.0 || duration <= 0.0 || app.view.reduced_motion || !trail.corners[0].ready {
@@ -260,18 +265,18 @@ fn draw_cursor_trail(renderer: rawptr, app: *App, trail: *CursorTrail, target: s
     trail.target_y = target.y
   }
   moving := false
-  vertices: [4]sdl.Vertex = [sdl.Vertex{}, sdl.Vertex{}, sdl.Vertex{}, sdl.Vertex{}]
+  vertices: [4]platform.Vertex = [platform.Vertex{}, platform.Vertex{}, platform.Vertex{}, platform.Vertex{}]
   for index in 0..4 {
     x := animated_follow(app, &trail.corners[index * 2], target.x + corner_x(index, target.width), trail.durations[index], false)
     y := animated_follow(app, &trail.corners[index * 2 + 1], target.y + corner_y(index, target.height), trail.durations[index], false)
     moving = moving || trail.corners[index * 2].active || trail.corners[index * 2 + 1].active
-    vertices[index] = sdl.Vertex{x: x, y: y, red: #cast(f32, color.red) / 255.0, green: #cast(f32, color.green) / 255.0, blue: #cast(f32, color.blue) / 255.0, alpha: 1.0}
+    vertices[index] = platform.Vertex{x: x, y: y, red: #cast(f32, color.red) / 255.0, green: #cast(f32, color.green) / 255.0, blue: #cast(f32, color.blue) / 255.0, alpha: 1.0}
   }
   if !moving { return false }
   // Both diagonals' triangles cover the corners' convex hull, so a stretched
   // quad that folds over itself still draws as one solid smear.
   indices: [12]i32 = [0, 1, 2, 0, 2, 3, 0, 1, 3, 1, 2, 3]
-  if !sdl.geometry(renderer, nil, &vertices[0], 4, &indices[0], 12) {
+  if !platform.geometry(renderer, nil, &vertices[0], 4, &indices[0], 12) {
     #panic("cursor trail draw failed")
   }
   return true
@@ -357,12 +362,12 @@ fn measure_position(doc: *const buffer.Document, typography: *Typography, positi
 fn popup_begin(renderer: rawptr, app: *App) {
   state := &app.view.animation
   if state.texture == nil {
-    state.texture = sdl.create_texture(renderer, 0x16462004, 2, state.width, state.height)
-    if state.texture == nil || !sdl.texture_blend(state.texture, 1) {
+    state.texture = platform.create_texture(renderer, 0x16462004, 2, state.width, state.height)
+    if state.texture == nil || !platform.texture_blend(state.texture, 1) {
       #panic("popup surface")
     }
   }
-  if !sdl.target(renderer, state.texture) || !sdl.color(renderer, 0, 0, 0, 0) || !sdl.clear(renderer) {
+  if !platform.target(renderer, state.texture) || !platform.color(renderer, 0, 0, 0, 0) || !platform.clear(renderer) {
     #panic("popup target")
   }
 }
@@ -373,7 +378,7 @@ fn popup_shown(app: *const App) bool {
 }
 // Retain only the last painted layer while the explorer retracts. Its input
 // panel is already closed; subsequent input can finish this decoration.
-fn explorer_exit(app: *App, showing: bool) sdl.PixelRect {
+fn explorer_exit(app: *App, showing: bool) platform.PixelRect {
   animation := &app.view.animation
   state := &animation.surface_geometry[SurfaceExplorer]
   starting := !showing && animation.panel == .Directory && !animation.explorer_closing
@@ -384,7 +389,7 @@ fn explorer_exit(app: *App, showing: bool) sdl.PixelRect {
   if starting && enabled && state.ready {
     animation.explorer_closing = true
   }
-  if !animation.explorer_closing { return sdl.PixelRect{} }
+  if !animation.explorer_closing { return platform.PixelRect{} }
   edges := state.target
   edges[2] = edges[0]
   answering := answering_input(app)
@@ -398,7 +403,7 @@ fn explorer_exit(app: *App, showing: bool) sdl.PixelRect {
     animation.active = true
     animation.geometry_active = true
   }
-  return sdl.PixelRect{x:#cast(i32, state.current[0]), y:#cast(i32, state.current[1]), width:#cast(i32, state.current[2]-state.current[0]+0.5), height:#cast(i32, state.current[3]-state.current[1]+0.5)}
+  return platform.PixelRect{x:#cast(i32, state.current[0]), y:#cast(i32, state.current[1]), width:#cast(i32, state.current[2]-state.current[0]+0.5), height:#cast(i32, state.current[3]-state.current[1]+0.5)}
 }
 
 fn popup_present(renderer: rawptr, app: *App) {
@@ -418,15 +423,15 @@ fn popup_present(renderer: rawptr, app: *App) {
   opacity := animated_value(app, &state.popup, target, app.config.popup_animation_ms, app.view.reduced_motion || !app.config.popup_transitions || !showing)
   state.panel = app.prompt_state.panel
   if state.texture != nil {
-    if !sdl.target(renderer, nil) {
+    if !platform.target(renderer, nil) {
       #panic("popup target reset")
     }
     if closing.width > 0 && closing.height > 0 {
-      if !sdl.clip(renderer, &closing) || !sdl.texture_alpha(state.texture, 255) || !sdl.render_texture(renderer, state.texture, nil, nil) || !sdl.clip(renderer, nil) {
+      if !platform.clip(renderer, &closing) || !platform.texture_alpha(state.texture, 255) || !platform.render_texture(renderer, state.texture, nil, nil) || !platform.clip(renderer, nil) {
         #panic("explorer exit composite")
       }
     } else if opacity > 0.0 {
-      if !sdl.texture_alpha(state.texture, #cast(u8, (opacity * 255.0))) || !sdl.render_texture(renderer, state.texture, nil, nil) {
+      if !platform.texture_alpha(state.texture, #cast(u8, (opacity * 255.0))) || !platform.render_texture(renderer, state.texture, nil, nil) {
         #panic("popup composite")
       }
     }
@@ -436,7 +441,7 @@ fn popup_present(renderer: rawptr, app: *App) {
 fn release_popup(app: *App) {
   ui_cursors_release(&app.ui)
   if app.view.animation.texture != nil {
-    sdl.destroy_texture(app.view.animation.texture)
+    platform.destroy_texture(app.view.animation.texture)
   }
 }
 

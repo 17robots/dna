@@ -81,7 +81,7 @@ with tempfile.TemporaryDirectory(prefix='dna-native-triangles-') as temporary:
     shared='\n'.join(function(current,name) for name in names)
     bodies=[]
     for path,name in ((args.baseline,'baseline_geometry'),(current,'candidate_geometry')):
-        body=function(path,'sdl_geometry').replace('fn sdl_geometry(',f'fn {name}(')
+        body=function(path,'gui_geometry').replace('fn gui_geometry(',f'fn {name}(')
         body=body.replace('        wa:=native_edge','        visits+=1\n        wa:=native_edge')
         bodies.append(body)
     (stage/'main.dyn').write_text(HEADER+'\n'+shared+'\n'+'\n'.join(bodies)+'\n'+WRAPPER)

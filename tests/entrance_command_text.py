@@ -11,17 +11,17 @@ with tempfile.TemporaryDirectory(prefix='dna-entrance-event-',dir=ROOT/'build') 
  s+='\nentrance_event_now:u64=1000\n'
  platform.write_text(s)
  gui=stage/'platform/gui.dyn';s=gui.read_text()
- start=s.index('  for native_gui.deferred_count!=0',s.index('fn sdl_poll('));end=s.index('\nfn sdl_wait_timeout(',start)
+ start=s.index('  for native_gui.deferred_count!=0',s.index('fn gui_poll('));end=s.index('\nfn gui_wait_timeout(',start)
  s=s[:start]+'  return false\n}\n'+s[end:]
- start=s.index('fn sdl_wait_timeout(');end=s.index('\nfn sdl_wait(',start)
- s=s[:start]+'''fn sdl_wait_timeout(event:*Event,milliseconds:i32)bool {
- if sdl_poll(event) {return true}
+ start=s.index('fn gui_wait_timeout(');end=s.index('\nfn gui_wait(',start)
+ s=s[:start]+'''fn gui_wait_timeout(event:*Event,milliseconds:i32)bool {
+ if gui_poll(event) {return true}
  entrance_event_now+=8
  return false
 }
 '''+s[end:]
- start=s.index('fn sdl_present(');end=s.index('\nfn sdl_scale(',start)
- s=s[:start]+'''fn sdl_present(renderer:rawptr)bool {
+ start=s.index('fn gui_present(');end=s.index('\nfn gui_scale(',start)
+ s=s[:start]+'''fn gui_present(renderer:rawptr)bool {
  entrance_event_callback()
  entrance_event_now+=8
  return true

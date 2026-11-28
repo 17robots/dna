@@ -12,11 +12,11 @@ with tempfile.TemporaryDirectory(prefix='dna-typing-frames-',dir=ROOT/'build') a
     work=Path(temporary);stage=work/'src';shutil.copytree(ROOT/'src',stage)
     shutil.copyfile(ROOT/'tests/editor/native_typing_frame_smoke.dyn',stage/'native_typing_frame_smoke.dyn')
     gui=stage/'platform/gui.dyn';source=gui.read_text()
-    begin=source.index('fn sdl_present(');end=source.index('\nfn sdl_scale(',begin)
-    present='fn sdl_present(renderer:rawptr)bool{return true}\n'
+    begin=source.index('fn gui_present(');end=source.index('\nfn gui_scale(',begin)
+    present='fn gui_present(renderer:rawptr)bool{return true}\n'
     if '--negative-control' in sys.argv:
         present='''typing_probe_present_count:usize=0
-fn sdl_present(renderer:rawptr)bool{
+fn gui_present(renderer:rawptr)bool{
  typing_probe_present_count+=1
  if typing_probe_present_count%3==1 {native_memory.zero(native_gui.surface.pixels)}
  return true
@@ -32,7 +32,7 @@ pub fn typing_probe_resize(width,height:i32) {
 '''
     gui.write_text(gpu_probe(source))
     (stage/'startup_probe.dyn').write_text('''fn startup_probe(app:*App,typography:*Typography,renderer:rawptr,window:rawptr,input_storage:[]u8){
- native_typing_frame_smoke(app,typography,renderer,window,NativeTypingFrameProbe{pixels:sdl.typing_probe_pixels,resize:sdl.typing_probe_resize})
+ native_typing_frame_smoke(app,typography,renderer,window,NativeTypingFrameProbe{pixels:platform.typing_probe_pixels,resize:platform.typing_probe_resize})
 }
 fn finish_probe(app:*App){}
 ''')

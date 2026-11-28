@@ -91,12 +91,12 @@ fn native_probe_destroy() {
 }
 '''
 def install(source):
-    source=source.replace("fn sdl_present(renderer:rawptr)bool{", "fn sdl_present(renderer:rawptr)bool{native_probe_dirty=true\n")
+    source=source.replace("fn gui_present(renderer:rawptr)bool{", "fn gui_present(renderer:rawptr)bool{native_probe_dirty=true\n")
     source=source.replace('return native_gui.surface.pixels','return native_probe_pixels()')
     source=source.replace('if !native_resize()', 'if !native_probe_resize()')
     source=source.replace('native_memory.zero(native_gui.surface.pixels)','native_probe_blank()')
     # The hook must land: without it renderer recreation keeps stale probe
     # storage. Match the signature by shape, not its parameter name.
-    source,hooked=re.subn(r'(fn sdl_destroy_renderer\(\w+: rawptr\) \{)',r'\1\n native_probe_destroy()',source)
-    assert hooked==1,'native_gpu_probe: sdl_destroy_renderer hook did not apply'
+    source,hooked=re.subn(r'(fn gui_destroy_renderer\(\w+: rawptr\) \{)',r'\1\n native_probe_destroy()',source)
+    assert hooked==1,'native_gpu_probe: gui_destroy_renderer hook did not apply'
     return source+'\n'+HELPER

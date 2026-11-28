@@ -14,7 +14,7 @@ def function(source,name):
     return source[start:end]+'\n'
 s=(ROOT/'src/animation.dyn').read_text()
 base='''use motion "./motion"
-use sdl "./sdl"
+use platform "./platform"
 struct Config {popup_animation_ms:f32,popup_transitions:bool}
 struct Animation {now,geometry_elapsed:f32,active,surfaces_ready,resized,geometry_active,geometry_retargeted:bool}
 struct View {animation:Animation,reduced_motion:bool}
@@ -39,9 +39,9 @@ cases='''fn main() {
  app:=App{config:Config{popup_animation_ms:40.0,popup_transitions:true}}
  left:=motion.Rectangle{}
  right:=motion.Rectangle{}
- full:=sdl.PixelRect{width:1000,height:600}
- first:=sdl.PixelRect{width:500,height:600}
- second:=sdl.PixelRect{x:500,width:500,height:600}
+ full:=platform.PixelRect{width:1000,height:600}
+ first:=platform.PixelRect{width:500,height:600}
+ second:=platform.PixelRect{x:500,width:500,height:600}
  frame(&app,0.0,8.0,0,false)
  if animated_rectangle(&app,&left,full).width!=1000 || left.active {#panic("startup must land immediately")}
  app.view.animation.surfaces_ready=true
@@ -79,7 +79,7 @@ cases='''fn main() {
   app.config.popup_animation_ms=40.0
   if reason==2 {app.config.popup_animation_ms=0.0}
   app.pointer.dragging=reason==3
-  sdl.terminal=reason==4
+  platform.terminal=reason==4
   app.view.animation.resized=reason==5
   frame(&app,1000.0,8.0,RenderKey,true)
   if animated_rectangle(&app,&left,full).width!=1000 || app.view.animation.active {#panic("motion opt-out or interactive resize must snap")}
@@ -87,8 +87,8 @@ cases='''fn main() {
 }
 '''
 with tempfile.TemporaryDirectory(prefix='dna-pane-policy-') as temporary:
-    work=Path(temporary);shutil.copytree(ROOT/'src/motion',work/'motion');(work/'sdl').mkdir()
-    (work/'sdl/sdl.dyn').write_text('pub struct PixelRect{x,y,width,height:i32}\npub terminal:bool\npub fn tui_active()bool{return terminal}\n')
+    work=Path(temporary);shutil.copytree(ROOT/'src/motion',work/'motion');(work/'platform').mkdir()
+    (work/'platform/platform.dyn').write_text('pub struct PixelRect{x,y,width,height:i32}\npub terminal:bool\npub fn tui_active()bool{return terminal}\n')
     helpers=''.join(function(s,name) for name in ('surface_motion_enabled','rectangle_edges','animated_rectangle'))
     (work/'main.dyn').write_text(base+helpers+cases)
     for mode in ('debug','release'):

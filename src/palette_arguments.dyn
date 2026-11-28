@@ -94,51 +94,27 @@ fn palette_add_row(app: *App, label: str, value: str) usize {
 // ---------------------------------------------------------------------------
 // Options
 
-const LegacyOptionCount: usize = 21
-fn legacy_option(index: usize) str {
-  names: [21]str = ["close_last_buffer", "font", "font_family", "font_size", "line_height", "fallback_font", "theme", "indent_width", "reduced_motion", "line_numbers", "relative_numbers", "status_line", "highlight_line", "shell", "terminal_escape", "explorer_icons", "explorer_columns", "explorer_preview", "build_command", "test_command", "run_command"]
-  return names[index]
-}
-// Every option :set accepts: the top-level keys, the sectioned options by
-// their full names, and the [modules] slots.
+// Every option :set accepts, by the name :set uses.
 fn palette_option_count() usize {
-  return LegacyOptionCount + settings.ExtraCount + 4
+  return settings.OptionCount
 }
 fn palette_option_key(index: usize) str {
-  if index < LegacyOptionCount { return legacy_option(index) }
-  if index < LegacyOptionCount + settings.ExtraCount {
-    return settings.option(index - LegacyOptionCount).key
-  }
-  slots: [4]str = ["keymap", "frontend", "explorer", "picker"]
-  return slots[index - LegacyOptionCount - settings.ExtraCount]
+  return settings.set_name(settings.option(index))
 }
 fn module_option(key: str) bool {
-  return buffer.equal(key, "keymap") || buffer.equal(key, "frontend") || buffer.equal(key, "explorer") || buffer.equal(key, "picker")
+  index := settings.lookup(key)
+  return index < settings.OptionCount && buffer.equal(settings.option(index).section, "modules")
 }
 fn flag_option(key: str) bool {
-  for index in 0..settings.ExtraCount {
-    spec := settings.option(index)
-    if buffer.equal(spec.key, key) { return spec.flag }
-  }
-  return buffer.equal(key, "reduced_motion") || buffer.equal(key, "line_numbers") || buffer.equal(key, "relative_numbers") || buffer.equal(key, "status_line") || buffer.equal(key, "highlight_line") || buffer.equal(key, "explorer_icons") || buffer.equal(key, "explorer_columns") || buffer.equal(key, "explorer_preview")
+  index := settings.lookup(key)
+  return index < settings.OptionCount && settings.option(index).kind == .Flag
 }
 // The value an option has now, where DNA can tell; empty otherwise.
 fn option_current(app: *App, key: str, output: []u8) str {
   if module_option(key) { return module_active(app, key) }
-  for index in 0..settings.ExtraCount {
-    spec := settings.option(index)
-    if buffer.equal(spec.key, key) {
-      value := settings.option_value(&app.config, index)
-      if spec.flag {
-        if value != 0.0 { return "true" }
-        return "false"
-      }
-      used: usize = 0
-      setting_decimal(output, &used, value)
-      return output[..used]
-    }
-  }
-  return ""
+  index := settings.lookup(key)
+  if index == settings.OptionCount { return "" }
+  return setting_value_text(app, settings.option(index), output)
 }
 fn palette_option_rows(app: *App, query: str, scores: []i32) {
   if query.len == 0 { return }
@@ -386,17 +362,20 @@ fn suggest_option_values(app: *App, scores: []i32, key: str, fragment: str) {
     suggest_words(app, scores, fragment, names, "", false)
     return
   }
-  if buffer.equal(key, "theme") {
-    suggest_themes(app, scores, fragment)
-    return
-  }
-  if buffer.equal(key, "font_family") {
-    suggest_fonts(app, scores, fragment, true)
-    return
-  }
-  if buffer.equal(key, "font") || buffer.equal(key, "fallback_font") {
-    suggest_paths(app, scores, fragment, false, false, true)
-    return
+  case key {
+    "theme" => {
+      suggest_themes(app, scores, fragment)
+      return
+    }
+    "font_family" => {
+      suggest_fonts(app, scores, fragment, true)
+      return
+    }
+    "font", "fallback_font" => {
+      suggest_paths(app, scores, fragment, false, false, true)
+      return
+    }
+    _ => {}
   }
   current: [64]u8
   value := option_current(app, key, current[..])
@@ -406,9 +385,10 @@ fn suggest_option_values(app: *App, scores: []i32, key: str, fragment: str) {
       app.command_menu.rows[row].soft = true
     }
   }
-  for index in 0..settings.ExtraCount {
+  index := settings.lookup(key)
+  if index < settings.OptionCount {
     spec := settings.option(index)
-    if buffer.equal(spec.key, key) {
+    if spec.kind == .Flag || spec.kind == .Number {
       row := suggest(app, scores, fragment, spec.default_value, "default", false)
       if row < PaletteRowLimit {
         app.command_menu.rows[row].soft = true
@@ -462,97 +442,103 @@ fn palette_arguments(app: *App, query: str, scores: []i32) bool {
   // Paths and free text are one argument, spaces included.
   whole := query[rest..]
   app.command_menu.fragment_start = rest
-  if buffer.equal(kind, "file") || buffer.equal(kind, "path") {
-    // "path" may name a file that does not exist yet.
-    suggest_paths(app, scores, whole, false, false, buffer.equal(kind, "path"))
-    return true
-  }
-  if buffer.equal(kind, "directory") {
-    suggest_paths(app, scores, whole, true, true, false)
-    return true
-  }
-  if buffer.equal(kind, "theme") {
-    suggest_themes(app, scores, whole)
-    return true
-  }
-  if buffer.equal(kind, "layout") {
-    suggest_words(app, scores, whole, "compact wide", "built-in", false)
-    suggest_config_files(app, scores, whole, "layouts/", ".dna-layout", "layout file")
-    return true
-  }
-  if buffer.equal(kind, "font") {
-    suggest_fonts(app, scores, whole, false)
-    return true
-  }
-  if buffer.equal(kind, "plugin") {
-    for index in 0..8 {
-      plugin := &app.plugin_state.slots[index]
-      if plugin.length > 0 {
-        _ = suggest(app, scores, whole, plugin.name[..plugin.length], "running", false)
-      }
+  case kind {
+    "file", "path" => {
+      // "path" may name a file that does not exist yet.
+      suggest_paths(app, scores, whole, false, false, buffer.equal(kind, "path"))
+      return true
     }
-    suggest_config_files(app, scores, whole, "plugins/", "", "installed")
-    return true
+    "directory" => {
+      suggest_paths(app, scores, whole, true, true, false)
+      return true
+    }
+    "theme" => {
+      suggest_themes(app, scores, whole)
+      return true
+    }
+    "layout" => {
+      suggest_words(app, scores, whole, "compact wide", "built-in", false)
+      suggest_config_files(app, scores, whole, "layouts/", ".dna-layout", "layout file")
+      return true
+    }
+    "font" => {
+      suggest_fonts(app, scores, whole, false)
+      return true
+    }
+    "plugin" => {
+      for index in 0..8 {
+        plugin := &app.plugin_state.slots[index]
+        if plugin.length > 0 {
+          _ = suggest(app, scores, whole, plugin.name[..plugin.length], "running", false)
+        }
+      }
+      suggest_config_files(app, scores, whole, "plugins/", "", "installed")
+      return true
+    }
+    _ => {}
   }
   words := palette_words(query, rest)
   app.command_menu.fragment_start = words.fragment_start
   fragment := words.fragment
-  if buffer.equal(kind, "language") || buffer.equal(kind, "filetype") {
-    if words.count == 0 {
-      suggest_languages(app, scores, fragment)
-    }
-    return true
-  }
-  if buffer.equal(kind, "keymap") || buffer.equal(kind, "frontend") {
-    if words.count == 0 {
-      suggest_words(app, scores, fragment, module_slot(kind), "", false)
-    }
-    return true
-  }
-  if buffer.equal(kind, "module") {
-    if words.count == 0 {
-      suggest_words(app, scores, fragment, "keymap frontend explorer picker", "slot", true)
-    } else if words.count == 1 {
-      if buffer.equal(words.words[0], "frontend") {
-        _ = suggest(app, scores, fragment, "auto", "terminal without a display", false)
-      }
-      suggest_words(app, scores, fragment, module_slot(words.words[0]), "", false)
-    }
-    return true
-  }
-  if buffer.equal(kind, "place") {
-    if words.count == 0 {
-      suggest_words(app, scores, fragment, "palette picker menu dialog explorer terminal completion hover", "surface", true)
-    } else if words.count == 1 {
-      suggest_words(app, scores, fragment, "float dock", "", true)
-      suggest_words(app, scores, fragment, "cursor default", "", false)
-    } else if words.count == 2 && buffer.equal(words.words[1], "float") {
-      suggest_words(app, scores, fragment, "top-left top top-right left center right bottom-left bottom bottom-right", "anchor", false)
-    } else if words.count == 2 && buffer.equal(words.words[1], "dock") {
-      suggest_words(app, scores, fragment, "left right top bottom", "side", false)
-    }
-    return true
-  }
-  if buffer.equal(kind, "set") {
-    // A Vim option typed out (ic, noscs, gd!) runs as typed on Enter.
-    if app.config.vim_keys && vim_option_word(fragment) { return true }
-    if words.count == 0 {
-      for index in 0..palette_option_count() {
-        key := palette_option_key(index)
-        current: [64]u8
-        _ = suggest(app, scores, fragment, key, option_current(app, key, current[..]), true)
+  case kind {
+    "language", "filetype" => {
+      if words.count == 0 {
+        suggest_languages(app, scores, fragment)
       }
       return true
     }
-    // The value is the rest of the line after the key.
-    key := words.words[0]
-    value_start := rest + key.len
-    for value_start < query.len && query[value_start] == ' ' {
-      value_start += 1
+    "keymap", "frontend" => {
+      if words.count == 0 {
+        suggest_words(app, scores, fragment, module_slot(kind), "", false)
+      }
+      return true
     }
-    app.command_menu.fragment_start = value_start
-    suggest_option_values(app, scores, key, query[value_start..])
-    return true
+    "module" => {
+      if words.count == 0 {
+        suggest_words(app, scores, fragment, "keymap frontend explorer picker", "slot", true)
+      } else if words.count == 1 {
+        if buffer.equal(words.words[0], "frontend") {
+          _ = suggest(app, scores, fragment, "auto", "terminal without a display", false)
+        }
+        suggest_words(app, scores, fragment, module_slot(words.words[0]), "", false)
+      }
+      return true
+    }
+    "place" => {
+      if words.count == 0 {
+        suggest_words(app, scores, fragment, "palette picker menu dialog explorer terminal completion hover", "surface", true)
+      } else if words.count == 1 {
+        suggest_words(app, scores, fragment, "float dock", "", true)
+        suggest_words(app, scores, fragment, "cursor default", "", false)
+      } else if words.count == 2 && buffer.equal(words.words[1], "float") {
+        suggest_words(app, scores, fragment, "top-left top top-right left center right bottom-left bottom bottom-right", "anchor", false)
+      } else if words.count == 2 && buffer.equal(words.words[1], "dock") {
+        suggest_words(app, scores, fragment, "left right top bottom", "side", false)
+      }
+      return true
+    }
+    "set" => {
+      // A Vim option typed out (ic, noscs, gd!) runs as typed on Enter.
+      if app.config.vim_keys && vim_option_word(fragment) { return true }
+      if words.count == 0 {
+        for index in 0..palette_option_count() {
+          key := palette_option_key(index)
+          current: [64]u8
+          _ = suggest(app, scores, fragment, key, option_current(app, key, current[..]), true)
+        }
+        return true
+      }
+      // The value is the rest of the line after the key.
+      key := words.words[0]
+      value_start := rest + key.len
+      for value_start < query.len && query[value_start] == ' ' {
+        value_start += 1
+      }
+      app.command_menu.fragment_start = value_start
+      suggest_option_values(app, scores, key, query[value_start..])
+      return true
+    }
+    _ => {}
   }
   // Free text and numbers: no suggestions, and no unrelated commands either.
   return true
@@ -769,12 +755,7 @@ fn set_command(app: *App, typography: *Typography, argument: str) {
     return
   }
   modules = module_option(key)
-  canonical := key
-  if buffer.equal(key, "explorer") {
-    canonical = "explorer_style"
-  } else if buffer.equal(key, "picker") {
-    canonical = "picker_style"
-  }
+  canonical := settings.option(settings.lookup(key)).key
   if config_locked(app, key) || config_locked(app, canonical) || (modules && config_locked(app, "modules")) {
     notice(app, "That option is locked in the global config.")
     return
