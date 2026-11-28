@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from source_patch import patched
 ROOT=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='dna-syntax-idle-',dir=ROOT/'build') as temporary:
  work=Path(temporary);stage=work/'src';shutil.copytree(ROOT/'src',stage)
@@ -28,9 +29,9 @@ with tempfile.TemporaryDirectory(prefix='dna-syntax-idle-',dir=ROOT/'build') as 
 pub fn syntax_idle_setup(callback:fn(i32)){syntax_idle_callback=callback}
 '''
  gui.write_text(source)
- scheduler=stage/'scheduler.dyn';source=scheduler.read_text().replace('  phase.* = (phase.* + 1) % 11','  syntax_idle_phase(app,phase.*)\n  phase.* = (phase.* + 1) % 11')
+ scheduler=stage/'scheduler.dyn';source=patched(scheduler.read_text(), '  phase.* = (phase.* + 1) % 11', '  syntax_idle_phase(app,phase.*)\n  phase.* = (phase.* + 1) % 11')
  scheduler.write_text(source)
- syntax=stage/'syntax.dyn';source=syntax.read_text().replace('  if syntax_colors(slot.syntax,','  if !syntax_idle_hold_ack && syntax_colors(slot.syntax,')
+ syntax=stage/'syntax.dyn';source=patched(syntax.read_text(), '  if syntax_colors(slot.syntax,', '  if !syntax_idle_hold_ack && syntax_colors(slot.syntax,')
  syntax.write_text(source)
  env=dict(os.environ,DYN_EDITOR_SMOKE='1',DNA_DEFAULT_SERVERS='0',DNA_RECOVERY='0',DNA_CONFIG=str(work/'missing.toml'),DNA_LANGUAGE_DIR=str(ROOT/'build/test-languages'),XDG_CONFIG_HOME=str(work/'config'),XDG_STATE_HOME=str(work/'state'))
  for mode in os.environ.get('DNA_SMOKE_MODES','debug release').split():

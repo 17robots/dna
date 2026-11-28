@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from source_patch import patched
 ROOT=Path(__file__).resolve().parents[1]
 DYN=os.environ.get('DYN',str(ROOT.parent/'dyn/compiler/build/dyn-release'))
 def function(source,name):
@@ -286,7 +287,7 @@ CASES['cursor_continuation']='''fn main() {
  if !cursor_step_snaps(&x,&y,0.0,120.0,8.0,20.0) {#panic("newline steps must remain immediate")}
 }
 '''
-CASES['existing_contracts']=(ROOT/'tests/motion/main.dyn').read_text().replace('use motion "../../src/motion"','')
+CASES['existing_contracts']=patched((ROOT/'tests/motion/main.dyn').read_text(), 'use motion "../../src/motion"', '')
 CASES['settings']='''fn main() {
  fast:=motion.Tween{}
  slow:=motion.Tween{}

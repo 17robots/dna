@@ -11,6 +11,7 @@ import shutil
 from pathlib import Path
 import subprocess
 import tempfile
+from source_patch import patched
 
 ROOT = Path(__file__).resolve().parents[1]
 DYN = os.environ.get('DYN', str(ROOT.parent / 'dyn/compiler/build/dyn-release'))
@@ -23,8 +24,8 @@ with tempfile.TemporaryDirectory(prefix='dna-host-environment-') as directory:
         shutil.copytree(ROOT / "src" / module, stage / module)
     (host / 'host.dyn').write_text((ROOT / 'src/host/host.dyn').read_text())
     adapter = (ROOT / 'src/host/windows.dyn').read_text()
-    adapter = adapter.replace('#target(kernel: windows)\n', '').replace('#link("kernel32")\n', '')
-    adapter = adapter.replace('use process "std/process"', 'use process "../process"')
+    adapter = patched(patched(adapter, '#target(kernel: windows)\n', ''), '#link("kernel32")\n', '')
+    adapter = patched(adapter, 'use process "std/process"', 'use process "../process"')
     (host / 'windows.dyn').write_text(adapter)
     process = stage / 'process'
     process.mkdir()

@@ -3,11 +3,12 @@
 import os
 from pathlib import Path
 import shutil,subprocess,sys,tempfile
+from source_patch import patched
 ROOT=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='dna-entrance-event-',dir=ROOT/'build') as temp:
  work=Path(temp);stage=work/'src';shutil.copytree(ROOT/'src',stage)
  shutil.copyfile(ROOT/'tests/fixtures/entrance_command_text.dyn',stage/'startup_probe.dyn')
- platform=stage/'platform/platform.dyn';s=platform.read_text().replace('pub extern fn ticks "dna_ticks"() u64','pub fn ticks()u64{return entrance_event_now}')
+ platform=stage/'platform/platform.dyn';s=patched(platform.read_text(), 'pub extern fn ticks "dna_ticks"() u64', 'pub fn ticks()u64{return entrance_event_now}')
  s+='\nentrance_event_now:u64=1000\n'
  platform.write_text(s)
  gui=stage/'platform/gui.dyn';s=gui.read_text()

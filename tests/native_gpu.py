@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import tempfile
 from native_gpu_probe import install as install_gpu_probe
+from source_patch import patched
 ROOT=Path(__file__).resolve().parents[1]
 BACKEND=os.environ.get('DNA_NATIVE_BACKEND','wayland')
 DYN=os.environ['DYN']
@@ -317,7 +318,7 @@ with tempfile.TemporaryDirectory(prefix='dna-native-gpu-') as directory:
             end+=1
         declarations.append(types[match.start():end])
     (stage/'types.dyn').write_text('use "std/mem"\n#link("dna_native")\n'+'\n'.join(re.findall(r'^pub const [A-Za-z_]+\s*:\s*u32\s*=\s*[0-9]+$',types,re.M))+'\n'+'\n'.join(declarations))
-    gui=(ROOT/'src/platform/gui.dyn').read_text().replace('native_gui.direct=!native_software_requested()','native_gui.direct=!native_probe_software')
+    gui=patched((ROOT/'src/platform/gui.dyn').read_text(), 'native_gui.direct=!native_software_requested()', 'native_gui.direct=!native_probe_software')
     gui=install_gpu_probe(gui)
     gui+='\nnative_probe_software:bool\n'
     (stage/'platform.dyn').write_text(gui)

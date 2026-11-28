@@ -10,6 +10,7 @@ ROOT=Path(__file__).resolve().parents[1]
 SOURCE=ROOT/'src/platform/gui.dyn'
 REFERENCE=ROOT/'tests/fixtures/native_bitmap_reference.dyn'
 from native_software_source import function
+from source_patch import patched
 
 HEADER='''use "std/ui"
 use "std/ui/software"
@@ -39,7 +40,7 @@ with tempfile.TemporaryDirectory(prefix='dna-native-bitmap-') as temporary:
  names=['native_surface','native_clip','native_blend','native_draw_alpha']
  if 'fn native_blend_at(' in SOURCE.read_text():names.append('native_blend_at')
  shared='\n'.join(function(SOURCE,n) for n in names)
- shared=shared.replace('fn native_clip(surface: software.Surface) ui.Rect {','fn native_clip(surface: software.Surface) ui.Rect {\n clips+=1')
+ shared=patched(shared, 'fn native_clip(surface: software.Surface) ui.Rect {', 'fn native_clip(surface: software.Surface) ui.Rect {\n clips+=1')
  (stage/'main.dyn').write_text(HEADER+'\n'+shared+'\n'+REFERENCE.read_text()+'\n'+function(SOURCE,'native_text_bitmap'))
  for mode in ('debug','release'):
   output=stage/(mode+'.so')

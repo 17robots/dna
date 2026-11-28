@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from source_patch import patched
 ROOT=Path(__file__).resolve().parents[1]
 source=Path(os.environ.get('DNA_PICKER_SOURCE',ROOT/'src'))
 BASE='''use "std/mem"
@@ -86,7 +87,7 @@ with tempfile.TemporaryDirectory(prefix='dna-picker-state-',dir=ROOT/'build') as
  start=completion.index('fn expand_home(');end=completion.index('// Bounded, cached',start)
  completion=completion[:start]+completion[end:]
  index=(source/'picker_index.dyn').read_text();index=index[index.index('fn picker_index_submit('):]
- (stage/'main.dyn').write_text('\n'.join((BASE.replace(';','\n'),completion,index,CHECK.replace(';','\n'))).replace('}for','}\nfor').replace('}return','}\nreturn').replace('} for','}\nfor').replace('}if','}\nif'))
+ (stage/'main.dyn').write_text('\n'.join((patched(BASE, ';', '\n'),completion,index,patched(CHECK, ';', '\n'))).replace('}for','}\nfor').replace('}return','}\nreturn').replace('} for','}\nfor').replace('}if','}\nif'))
  (ROOT/'build/picker-probe-source.dyn').write_text((stage/'main.dyn').read_text())
  for mode in ('debug','release'):
   binary=stage/'probe'

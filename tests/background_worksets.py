@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from source_patch import patched
 
 ROOT = Path(__file__).resolve().parents[1]
 parser = argparse.ArgumentParser()
@@ -34,6 +35,9 @@ def functions(path, names):
             elif source[end] == '}': depth -= 1
             end += 1
         body = source[start:end]
+        # syntax_tick, configured_filetypes and recovery_needed no longer scan
+        # every slot; these counters only find the scans in --expect baseline
+        # builds of the older source, so they may match nothing here.
         if name == 'syntax_tick':
             body = body.replace('for index < app.documents.slots.len {', 'for index < app.documents.slots.len {\n    probe_visits += 1')
         if name == 'configured_filetypes':
@@ -178,7 +182,7 @@ def report(label, value):
 
 with tempfile.TemporaryDirectory(prefix='dna-worksets-') as temporary:
     directory = Path(temporary)
-    (directory/'buffer').mkdir(); (directory/'buffer/buffer.dyn').write_text(BUFFER.replace('} for', '}\n for').replace('} return', '}\n return'))
+    (directory/'buffer').mkdir(); (directory/'buffer/buffer.dyn').write_text(patched(patched(BUFFER, '} for', '}\n for'), '} return', '}\n return'))
     (directory/'files').mkdir(); (directory/'files/files.dyn').write_text(FILES)
     (directory/'platform').mkdir(); (directory/'platform/platform.dyn').write_text(SYNTHETIC_PLATFORM)
     shutil.copytree(args.source_root/'owned_arena',directory/'owned_arena')

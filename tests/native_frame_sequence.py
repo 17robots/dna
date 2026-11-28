@@ -12,6 +12,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from source_patch import patched
 ROOT=Path(__file__).resolve().parents[1]
 FIXTURE=r'''use window_api "vendor/window/wayland"
 use "vendor/window/events"
@@ -104,7 +105,7 @@ compiler=Path(os.environ.get('DYN',ROOT.parent/'dyn/compiler/build/dyn-release')
 with tempfile.TemporaryDirectory(prefix='dna-frame-sequence-') as directory:
  work=Path(directory);stage=work/'probe';stage.mkdir()
  shutil.copytree(ROOT/'src/platform/native_present',stage/'presenter')
- (stage/'main.dyn').write_text(FIXTURE.replace('FRAME_COUNT',str(args.frames)))
+ (stage/'main.dyn').write_text(patched(FIXTURE, 'FRAME_COUNT', str(args.frames)))
  library=ROOT/'build/deps/install/lib'
  env=dict(os.environ,DYN_LIBRARY_PATH=str(library),LD_LIBRARY_PATH=str(library))
  runner=ROOT/'tests/wayland_runner.py'

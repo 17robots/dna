@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import subprocess
+from source_patch import patched
 
 ROOT = Path(__file__).resolve().parents[1]
 STAGE = ROOT / 'build/thread-join'
@@ -11,9 +12,7 @@ source = (ROOT / 'src/native/dyn/sync.dyn').read_text()
 # The remainder initializes unrelated native subsystems; keep the full adapter.
 source = source.split('// Dyn\'s current executable entry point')[0]
 platform_source = (ROOT / 'src/native/dyn/sync_linux.dyn').read_text()
-platform_source = platform_source.replace(
-    'extern fn sync_thread_join "pthread_join"(thread: usize, result: rawptr) i32',
-    '''extern fn actual_join "pthread_join"(thread: usize, result: rawptr) i32
+platform_source = patched(platform_source, 'extern fn sync_thread_join "pthread_join"(thread: usize, result: rawptr) i32', '''extern fn actual_join "pthread_join"(thread: usize, result: rawptr) i32
 failures: i32 = 0
 fn sync_thread_join(thread: usize, result: rawptr) i32 {
   if failures != 0 {

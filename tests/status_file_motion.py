@@ -3,11 +3,12 @@
 import os
 from pathlib import Path
 import shutil,subprocess,sys,tempfile
+from source_patch import patched
 ROOT=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='dna-status-file-motion-',dir=ROOT/'build') as temporary:
     work=Path(temporary);stage=work/'src';shutil.copytree(ROOT/'src',stage)
     shutil.copyfile(ROOT/'tests/editor/status_file_motion_smoke.dyn',stage/'status_file_motion_smoke.dyn')
-    platform=stage/'platform/platform.dyn';source=platform.read_text().replace('pub extern fn ticks "dna_ticks"() u64','pub fn ticks()u64{return status_file_probe_now}')
+    platform=stage/'platform/platform.dyn';source=patched(platform.read_text(), 'pub extern fn ticks "dna_ticks"() u64', 'pub fn ticks()u64{return status_file_probe_now}')
     source+='\nstatus_file_probe_now:u64=1000\npub fn status_file_probe_time(now:u64){status_file_probe_now=now}\n'
     platform.write_text(source)
     gui=stage/'platform/gui.dyn';source=gui.read_text();start=source.index('fn gui_present(');end=source.index('\nfn gui_scale(',start)

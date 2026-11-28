@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from source_patch import patched
 ROOT=Path(__file__).resolve().parents[1]
 DYN=str(Path(os.environ.get('DYN',ROOT.parent/'dyn/compiler/build/dyn-release')).resolve())
 C=r'''#include <hb.h>
@@ -55,7 +56,7 @@ with tempfile.TemporaryDirectory(prefix='dna-shaping-') as directory:
     flags=subprocess.check_output(['pkg-config','--cflags','--libs','harfbuzz'],text=True).split()
     subprocess.run(['cc','-std=c11','-Wall','-Wextra','-Werror',str(work/'oracle.c'),*flags,'-o',str(work/'oracle')],check=True)
     platform=work/'platform';platform.mkdir();(platform/'platform.dyn').write_text(PLATFORM)
-    backend=(ROOT/'src/text/native.dyn').read_text().replace('use platform "../platform"','use platform "./platform"')
+    backend=patched((ROOT/'src/text/native.dyn').read_text(), 'use platform "../platform"', 'use platform "./platform"')
     backend=re.sub(r'extern fn native_text_attach[^\n]+','fn native_text_attach(callbacks:*const NativeTextCallbacks)bool{return dna_native_text_attach(callbacks)}',backend)
     backend=re.sub(r'extern fn native_tracked_create[^\n]+','fn native_tracked_create(engine:rawptr,font:rawptr,text:*const u8,length:usize)rawptr{return dna_text_create(engine,font,text,length)}',backend)
     backend=re.sub(r'extern fn native_tracked_destroy[^\n]+','fn native_tracked_destroy(text:rawptr){dna_text_destroy(text)}',backend)
@@ -104,7 +105,7 @@ if true {
  check(ttf_at_point(handle,start.x+start.width/2,0,&end) && end.offset==start.offset && end.length==start.length)
  ttf_destroy(handle)
 }''')
-    source=SOURCE.replace('FONT_PATH',str(font)).replace('FIXTURES','\n'.join(cases))
+    source=patched(patched(SOURCE, 'FONT_PATH', str(font)), 'FIXTURES', '\n'.join(cases))
     counter=[0]
     def numbered(match):
         counter[0]+=1

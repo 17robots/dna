@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from source_patch import patched
 
 ROOT=Path(__file__).resolve().parents[1]
 CHECK='''fn storage_check(ok:bool) { if !ok { #panic("TUI screen storage lifecycle") } }
@@ -55,7 +56,7 @@ with tempfile.TemporaryDirectory(prefix='dna-tui-storage-') as directory:
     for module in ('host','cstring','owned_arena'):
         shutil.copytree(ROOT/'src'/module,stage/module)
     tui=stage/'tui.dyn'
-    tui.write_text(tui.read_text().replace('use "../host"','use "./host"'))
+    tui.write_text(patched(tui.read_text(), 'use "../host"', 'use "./host"'))
     (stage/'main.dyn').write_text(CHECK)
     output=work/'check'
     env=dict(os.environ,DYN_LIBRARY_PATH=str(ROOT/'build/deps/install/lib'),LD_LIBRARY_PATH=str(ROOT/'build/deps/install/lib'))

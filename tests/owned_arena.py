@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from source_patch import patched
 
 ROOT = Path(__file__).resolve().parents[1]
 DYN = os.environ.get('DYN', 'dyn')
@@ -52,7 +53,7 @@ with tempfile.TemporaryDirectory(prefix='dna-arena-') as directory:
         shutil.copytree(ROOT / 'src' / module, work / module)
     native_source = SOURCE
     if os.uname().sysname == 'Linux':
-        native_source = SOURCE.replace('// LINUX_RESERVATION_CHECK', 'check(owner.try_create(#cast(usize, 1) << 62) == nil)\n  check(bytes[0] == 11 && bytes[2499999] == 99 && mem.arena_used(arena) == 2500000)')
+        native_source = patched(SOURCE, '// LINUX_RESERVATION_CHECK', 'check(owner.try_create(#cast(usize, 1) << 62) == nil)\n  check(bytes[0] == 11 && bytes[2499999] == 99 && mem.arena_used(arena) == 2500000)')
     (work / 'main.dyn').write_text(native_source)
     for mode in ('debug', 'release'):
         output = work / mode
