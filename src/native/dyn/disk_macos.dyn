@@ -1,14 +1,19 @@
 #target(kernel: darwin)
+
 // Each queue owns vnode registrations and a pump thread. Its nonblocking pipe
 // carries small rescan records into the existing event-first disk/picker policy.
 // A full pipe already has an unread rescan, so coalescing never loses coverage.
 struct DarwinVnode { next:*DarwinVnode, fd:i32, device, inode:u64, parent:i32, generation:u64, path:[4096]u8 }
+
 struct DarwinDiskQueue {
   next:*DarwinDiskQueue, queue:i32, events, stop:[2]i32, thread:rawptr,
   nodes:*DarwinVnode, failed:sync.AtomicU32, generation:u64,
 }
+
 darwin_disk_queues:*DarwinDiskQueue
+
 darwin_disk_lock:NativeMutex
+
 fn disk_darwin_find(fd:i32) *DarwinDiskQueue {
   value:=darwin_disk_queues
   for value!=nil {
@@ -17,6 +22,7 @@ fn disk_darwin_find(fd:i32) *DarwinDiskQueue {
   }
   return nil
 }
+
 fn disk_darwin_pump(context:rawptr) i32 {
   owner:=#cast(*DarwinDiskQueue, context)
   events:[32]NotifyKEvent
@@ -43,6 +49,7 @@ fn disk_darwin_pump(context:rawptr) i32 {
   }
   return 0
 }
+
 fn disk_inotify(flags:i32) i32 {
   _=flags
   owner:=#cast(*DarwinDiskQueue, rec_alloc(1, #sizeof(DarwinDiskQueue)))
@@ -77,6 +84,7 @@ fn disk_inotify(flags:i32) i32 {
   rec_unlock(#cast(rawptr, &darwin_disk_lock))
   return owner.events[0]
 }
+
 fn disk_add(queue:i32, path:*const u8, requested_mask:u32) i32 {
   _=requested_mask
   rec_lock(#cast(rawptr, &darwin_disk_lock))
@@ -120,6 +128,7 @@ fn disk_add(queue:i32, path:*const u8, requested_mask:u32) i32 {
   owner.nodes=node
   return fd
 }
+
 fn disk_remove(queue:i32, descriptor:i32) i32 {
   rec_lock(#cast(rawptr, &darwin_disk_lock))
   defer rec_unlock(#cast(rawptr, &darwin_disk_lock))
@@ -151,6 +160,7 @@ fn disk_remove(queue:i32, descriptor:i32) i32 {
   }
   return -1
 }
+
 fn disk_changes_close(fd:i32) {
   rec_lock(#cast(rawptr, &darwin_disk_lock))
   link:=&darwin_disk_queues
@@ -241,6 +251,7 @@ fn disk_target_watch(queue:i32, path:*const u8, parent:i32) bool {
   link.*=next
   return true
 }
+
 fn disk_targets_begin(queue:i32) {
   rec_lock(#cast(rawptr, &darwin_disk_lock))
   defer rec_unlock(#cast(rawptr, &darwin_disk_lock))
@@ -249,6 +260,7 @@ fn disk_targets_begin(queue:i32) {
     owner.generation=(owner.generation+1)
   }
 }
+
 fn disk_targets_end(queue:i32) {
   rec_lock(#cast(rawptr, &darwin_disk_lock))
   defer rec_unlock(#cast(rawptr, &darwin_disk_lock))
@@ -265,9 +277,4 @@ fn disk_targets_end(queue:i32) {
       link=&node.next
     }
   }
-}
-
-extern fn disk_lseek "lseek"(fd: i32, offset: i64, whence: i32) i64
-fn disk_path_separator(byte: u8) bool {
-  return byte == 47
 }

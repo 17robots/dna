@@ -8,9 +8,11 @@ fn bounded_string(storage: []u8, source: str) c.string!io.IoErr {
 }
 
 pub type Directory = std_fs.Directory
+
 fn linux_check(code: isize) !io.IoErr {
   if code < 0 { fail io.linux_err(code) }
 }
+
 fn path_metadata(path: str, flags: usize) Metadata!io.IoErr {
   if path.len == 0 { fail .InvalidInput }
   storage: [4096]u8
@@ -21,28 +23,36 @@ fn path_metadata(path: str, flags: usize) Metadata!io.IoErr {
   if (raw[0] & 769) != 769 { fail .System(-5) }
   return Metadata{ size: raw[5], inode: raw[4], device: raw[17], mode: #cast(u16, (raw[3] >> 32)) }
 }
+
 pub fn metadata(path: str) Metadata!io.IoErr {
   return try path_metadata(path, 0)
 }
+
 pub fn metadata_nofollow(path: str) Metadata!io.IoErr {
   return try path_metadata(path, 256)
 }
+
 pub fn file_metadata(file: *const File) Metadata!io.IoErr {
   return try std_fs.file_metadata(file)
 }
+
 pub fn open_directory(path: str, storage: []u8) Directory!io.IoErr {
   if path.len >= 4096 { fail io.linux_err(-36) }
   return try std_fs.open_directory(path, storage)
 }
+
 pub fn directory_next(directory: *Directory) DirectoryEntry!io.IoErr {
   return try std_fs.directory_next(directory)
 }
+
 pub fn close_directory(directory: *Directory) {
   std_fs.close_directory(directory)
 }
+
 pub fn rename(old_path: str, new_path: str) !io.IoErr {
   try std_fs.rename(old_path, new_path)
 }
+
 pub fn rename_noreplace(old_path: str, new_path: str) !io.IoErr {
   if old_path.len == 0 || new_path.len == 0 { fail .InvalidInput }
   old_storage: [4096]u8
@@ -51,15 +61,19 @@ pub fn rename_noreplace(old_path: str, new_path: str) !io.IoErr {
   target := bounded_string(new_storage[..], new_path) catch { fail .InvalidInput }
   try linux_check(#syscall(316, -100, old, -100, target, 1))
 }
+
 pub fn remove(path: str) !io.IoErr {
   try std_fs.remove(path)
 }
+
 pub fn make_directory(path: str, mode: usize) !io.IoErr {
   try std_fs.make_directory_exclusive(path, mode)
 }
+
 pub fn remove_directory(path: str) !io.IoErr {
   try std_fs.remove_directory(path)
 }
+
 pub fn read_link(path: str, destination: []u8) []u8!io.IoErr {
   if path.len == 0 { fail io.linux_err(-36) }
   storage: [4096]u8
@@ -70,6 +84,7 @@ pub fn read_link(path: str, destination: []u8) []u8!io.IoErr {
   if result < 0 { fail io.linux_err(result) }
   return destination[..#cast(usize, result)]
 }
+
 pub fn set_permissions(file: *File, mode: usize) !io.IoErr {
   if !std_fs.is_open(file) { fail io.linux_err(-9) }
   try linux_check(#syscall(91, file.descriptor, mode))
@@ -84,9 +99,6 @@ pub fn open_nofollow(path: str) File!io.IoErr {
   return std_fs.adopt_handle(descriptor)
 }
 
-fn atomic_create_exclusive(path: str) File!io.IoErr {
-  return try std_fs.create_exclusive(path)
-}
 pub fn create_private_exclusive(path: str) File!io.IoErr {
   if path.len == 0 { fail .InvalidInput }
   storage: [4096]u8
@@ -95,10 +107,7 @@ pub fn create_private_exclusive(path: str) File!io.IoErr {
   if descriptor < 0 { fail io.linux_err(descriptor) }
   return std_fs.adopt_handle(descriptor)
 }
-pub fn preserve_permissions(file: *File, source: str) !io.IoErr {
-  info := try metadata(source)
-  try set_permissions(file, info.mode & 511)
-}
+
 pub fn file_stamp(file: *const File) Stamp {
   raw: [32]u64
   empty: [1]u8 = [0]
@@ -107,6 +116,7 @@ pub fn file_stamp(file: *const File) Stamp {
   if result < 0 { return Stamp{} }
   return Stamp{inode: raw[4], size: raw[5], change_seconds: raw[12], change_nanos: raw[13] & 4294967295, modify_seconds: raw[14], modify_nanos: raw[15] & 4294967295, valid: true}
 }
+
 // Copy length bytes from source at offset to the end of destination. The
 // kernel shares extents (reflink) where the filesystem supports it.
 pub fn copy_range(source: *const File, offset: u64, destination: *File, length: usize, transferred: *usize) !io.IoErr {
@@ -129,21 +139,19 @@ pub fn copy_range(source: *const File, offset: u64, destination: *File, length: 
 pub fn map_file(_descriptor: isize, _length: u64) *u8 {
   return nil
 }
+
 pub fn unmap_file(_bytes: *u8, _length: u64) {}
 
 pub const WholeFileClones: bool = false
+
 pub fn clone_exclusive(source: *const File, path: str) File!io.IoErr {
   _ = source
   _ = path
   fail .Unsupported
 }
+
 pub fn resize(file: *File, length: usize) !io.IoErr {
   if !is_open(file) { fail .InvalidInput }
   if length > 9223372036854775807 { fail .InvalidInput }
   try linux_check(#syscall(77, file.descriptor, length))
-}
-
-pub fn executable(path: str) bool {
-  info := metadata(path) catch { return false }
-  return (info.mode & 61440) == 32768 && (info.mode & 73) != 0
 }

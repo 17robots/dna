@@ -59,7 +59,7 @@ pub fn probe_preserve_color() bool {
 }
 '''
 NAMES=['native_surface','native_clip','gui_color','native_draw_alpha','native_fill_span','gui_fill','gui_clear','native_blend','native_blend_at','gui_render_texture','native_text_bitmap','native_edge','native_top_left','gui_geometry']
-code=HEADER+'\n'.join(function(name) for name in NAMES)+'\n'+'\n'.join(line for line in (ROOT/'src/platform/memory_linux.dyn').read_text().splitlines() if line.startswith('extern fn native_span_'))
+code=HEADER+'\n'.join(function(name) for name in NAMES)+'\n'+'\n'.join(line for f in ('memory_linux.dyn','memory_unix.dyn') for line in (ROOT/'src/platform'/f).read_text().splitlines() if line.startswith('extern fn native_span_'))
 with tempfile.TemporaryDirectory(prefix='dna-draw-opacity-') as temporary:
     work=Path(temporary);(work/'main.dyn').write_text(code)
     texture=bytes((220,125,63,a) [i%4] for i in range(256) for a in [255 if (i//4)%2 else 96])

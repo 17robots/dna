@@ -1,9 +1,10 @@
 #target(kernel: darwin)
-#link("System")
 use "../cstring"
 use "std/dynlib"
 use "std/sync"
 use "std/io"
+
+#link("System")
 
 // Darwin arm64 uses the 64-bit inode ABI without the Intel $INODE64 suffix.
 // Layouts: apple-oss-distributions/xnu bsd/sys/{stat,dirent,cdefs}.h.
@@ -15,25 +16,38 @@ struct DarwinStat {
   size, blocks: i64, block_size: i32, flags, generation: u32,
   spare: i32, spare_quad: [2]i64,
 }
+
 struct DarwinEntry {
   inode, seek: u64, record_length, name_length: u16, kind: u8, name: [1024]u8,
 }
+
 pub struct Directory { handle: *u8, storage: []u8, ended: bool }
+
 extern fn darwin_open "open"(path: *const u8, flags: i32, ...) i32
+
 extern fn darwin_closedir "closedir"(directory: *u8) i32
+
 extern fn darwin_rename "rename"(source: *const u8, destination: *const u8) i32
+
 extern fn darwin_rename_exclusive "renamex_np"(source: *const u8, destination: *const u8, flags: u32) i32
+
 extern fn darwin_unlink "unlink"(path: *const u8) i32
+
 extern fn darwin_mkdir "mkdir"(path: *const u8, mode: u16) i32
+
 extern fn darwin_rmdir "rmdir"(path: *const u8) i32
+
 extern fn darwin_readlink "readlink"(path: *const u8, destination: *u8, capacity: usize) isize
+
 extern fn darwin_fchmod "fchmod"(file: i32, mode: u16) i32
 
 // The SDK thread module also imports __error. Resolving this accessor
 // avoids duplicate foreign declarations when filesystem and buffer coexist.
 // Initialize before a fallible libc call so loader work cannot alter its errno.
 darwin_errno_once: sync.Once = sync.Once{}
+
 darwin_errno_get: fn() *i32 = nil
+
 fn darwin_prepare_errno() {
   if sync.once_begin(&darwin_errno_once) {
     // Darwin RTLD_DEFAULT searches process-lifetime system libraries.
@@ -47,25 +61,31 @@ fn darwin_prepare_errno() {
     sync.once_complete(&darwin_errno_once)
   }
 }
+
 fn darwin_errno() *i32 {
   darwin_prepare_errno()
   return darwin_errno_get()
 }
+
 fn darwin_path(path: str, storage: []u8) *const u8 {
   darwin_prepare_errno()
   if path.len == 0 || path.len >= storage.len { return nil }
   return cstring.bounded(storage, path) catch nil
 }
+
 fn darwin_error() isize {
   return 0 - #cast(isize, darwin_errno().*)
 }
+
 fn darwin_check(value: i32) !io.IoErr {
   if value != 0 { fail io.darwin_err(darwin_error()) }
 }
+
 fn darwin_metadata(value: i32, info: *const DarwinStat) Metadata!io.IoErr {
   if value != 0 { fail io.darwin_err(darwin_error()) }
   return Metadata{ size: #cast(u64, info.size), inode: info.inode, device: #cast(u32, info.device), mode: info.mode }
 }
+
 pub fn metadata(path: str) Metadata!io.IoErr {
   storage: [4096]u8
   name := darwin_path(path, storage[..])
@@ -73,6 +93,7 @@ pub fn metadata(path: str) Metadata!io.IoErr {
   info := DarwinStat{}
   return try darwin_metadata(darwin_stat(name, &info), &info)
 }
+
 pub fn metadata_nofollow(path: str) Metadata!io.IoErr {
   storage: [4096]u8
   name := darwin_path(path, storage[..])
@@ -80,12 +101,14 @@ pub fn metadata_nofollow(path: str) Metadata!io.IoErr {
   info := DarwinStat{}
   return try darwin_metadata(darwin_lstat(name, &info), &info)
 }
+
 pub fn file_metadata(file: *const File) Metadata!io.IoErr {
   darwin_prepare_errno()
   if !is_open(file) { fail .InvalidInput }
   info := DarwinStat{}
   return try darwin_metadata(darwin_fstat(#cast(i32, file.descriptor), &info), &info)
 }
+
 pub fn open_directory(path: str, storage: []u8) Directory!io.IoErr {
   if storage.len < 1024 { fail .InvalidInput }
   path_storage: [4096]u8
@@ -95,6 +118,7 @@ pub fn open_directory(path: str, storage: []u8) Directory!io.IoErr {
   if handle == nil { fail io.darwin_err(darwin_error()) }
   return Directory{ handle: handle, storage: storage }
 }
+
 // Returned names borrow caller storage until the next directory_next call.
 pub fn directory_next(directory: *Directory) DirectoryEntry!io.IoErr {
   if directory.handle == nil { fail .InvalidInput }
@@ -125,6 +149,7 @@ pub fn directory_next(directory: *Directory) DirectoryEntry!io.IoErr {
   }
   return DirectoryEntry{}
 }
+
 pub fn close_directory(directory: *Directory) {
   darwin_prepare_errno()
   if directory.handle == nil { return }
@@ -132,6 +157,7 @@ pub fn close_directory(directory: *Directory) {
   directory.* = Directory{}
   _ = darwin_closedir(handle)
 }
+
 fn darwin_move(source: str, destination: str, exclusive: bool) !io.IoErr {
   source_storage: [4096]u8
   destination_storage: [4096]u8
@@ -144,30 +170,36 @@ fn darwin_move(source: str, destination: str, exclusive: bool) !io.IoErr {
     try darwin_check(darwin_rename(old_name, new_name))
   }
 }
+
 pub fn rename(source: str, destination: str) !io.IoErr {
   try darwin_move(source, destination, false)
 }
+
 pub fn rename_noreplace(source: str, destination: str) !io.IoErr {
   try darwin_move(source, destination, true)
 }
+
 pub fn remove(path: str) !io.IoErr {
   storage: [4096]u8
   name := darwin_path(path, storage[..])
   if name == nil { fail .InvalidInput }
   try darwin_check(darwin_unlink(name))
 }
+
 pub fn make_directory(path: str, mode: usize) !io.IoErr {
   storage: [4096]u8
   name := darwin_path(path, storage[..])
   if name == nil || mode > 65535 { fail .InvalidInput }
   try darwin_check(darwin_mkdir(name, #cast(u16, mode)))
 }
+
 pub fn remove_directory(path: str) !io.IoErr {
   storage: [4096]u8
   name := darwin_path(path, storage[..])
   if name == nil { fail .InvalidInput }
   try darwin_check(darwin_rmdir(name))
 }
+
 pub fn read_link(path: str, destination: []u8) []u8!io.IoErr {
   storage: [4096]u8
   name := darwin_path(path, storage[..])
@@ -177,6 +209,7 @@ pub fn read_link(path: str, destination: []u8) []u8!io.IoErr {
   if #cast(usize, length) == destination.len { fail .Capacity }
   return destination[..#cast(usize, length)]
 }
+
 pub fn set_permissions(file: *File, mode: usize) !io.IoErr {
   darwin_prepare_errno()
   if !is_open(file) || mode > 65535 { fail .InvalidInput }
@@ -193,9 +226,6 @@ pub fn open_nofollow(path: str) File!io.IoErr {
   return adopt_handle(descriptor)
 }
 
-fn atomic_create_exclusive(path: str) File!io.IoErr {
-  return try std_fs.create_exclusive(path)
-}
 pub fn create_private_exclusive(path: str) File!io.IoErr {
   storage: [4096]u8
   name := darwin_path(path, storage[..])
@@ -204,16 +234,14 @@ pub fn create_private_exclusive(path: str) File!io.IoErr {
   if descriptor < 0 { fail io.darwin_err(darwin_error()) }
   return adopt_handle(descriptor)
 }
-pub fn preserve_permissions(file: *File, source: str) !io.IoErr {
-  info := try metadata(source)
-  try set_permissions(file, info.mode & 511)
-}
+
 // Identity, size and times of an open file, from fstat.
 pub fn file_stamp(file: *const File) Stamp {
   info := DarwinStat{}
   if darwin_fstat(#cast(i32, file.descriptor), &info) != 0 { return Stamp{} }
   return Stamp{inode: info.inode, size: #cast(u64, info.size), modify_seconds: #cast(u64, info.modified_seconds), modify_nanos: #cast(u64, info.modified_nanoseconds), change_seconds: #cast(u64, info.changed_seconds), change_nanos: #cast(u64, info.changed_nanoseconds), valid: true}
 }
+
 // APFS clones only whole files (clonefile), so there is no range copy;
 // callers write instead.
 pub fn copy_range(source: *const File, offset: u64, destination: *File, length: usize, transferred: *usize) !io.IoErr {
@@ -226,7 +254,9 @@ pub fn copy_range(source: *const File, offset: u64, destination: *File, length: 
 }
 
 extern fn darwin_mmap "mmap"(address: rawptr, length: usize, protection: i32, flags: i32, descriptor: i32, offset: i64) *u8
+
 extern fn darwin_munmap "munmap"(address: *u8, length: usize) i32
+
 // MAP_PRIVATE | MAP_RESILIENT_MEDIA: inaccessible backing pages (including
 // truncation) become zero pages, never SIGBUS; cached private pages may
 // retain their previous contents. Origin stamps still reject
@@ -238,6 +268,7 @@ pub fn map_file(descriptor: isize, length: u64) *u8 {
   if #cast(isize, bytes) == -1 { return nil }
   return bytes
 }
+
 pub fn unmap_file(bytes: *u8, length: u64) {
   _ = darwin_munmap(bytes, #cast(usize, length))
 }
@@ -245,8 +276,11 @@ pub fn unmap_file(bytes: *u8, length: u64) {
 // APFS can seed a save with a whole-file copy-on-write clone. The ordinary
 // exclusive-create save remains the fallback on unsupported volumes.
 pub const WholeFileClones: bool = true
+
 extern fn darwin_clone "fclonefileat"(source: i32, directory: i32, path: *const u8, flags: u32) i32
+
 extern fn darwin_truncate "ftruncate"(file: i32, length: i64) i32
+
 pub fn clone_exclusive(source: *const File, path: str) File!io.IoErr {
   if !is_open(source) { fail .InvalidInput }
   info := file_metadata(source) catch { fail .Unsupported }
@@ -271,13 +305,9 @@ pub fn clone_exclusive(source: *const File, path: str) File!io.IoErr {
   if (cloned.mode & 61440) != 32768 || cloned.size != info.size { fail .InvalidInput }
   return file
 }
+
 pub fn resize(file: *File, length: usize) !io.IoErr {
   darwin_prepare_errno()
   if !is_open(file) || length > 9223372036854775807 { fail .InvalidInput }
   try darwin_check(darwin_truncate(#cast(i32, file.descriptor), #cast(i64, length)))
-}
-
-pub fn executable(path: str) bool {
-  info := metadata(path) catch { return false }
-  return (info.mode & 61440) == 32768 && (info.mode & 73) != 0
 }
