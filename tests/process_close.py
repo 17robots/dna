@@ -6,6 +6,7 @@ import shutil
 import signal
 import subprocess
 import tempfile
+from source_patch import patched
 
 ROOT = Path(__file__).resolve().parents[1]
 DYN = os.environ.get('DYN', 'dyn')
@@ -19,7 +20,7 @@ with tempfile.TemporaryDirectory(prefix='dna-process-close-') as temporary:
                      'os.write(1,b"ready")\n'
                      'while True: time.sleep(60)\n')
     child.chmod(0o700)
-    (stage/'main.dyn').write_text('''fn main() {
+    (stage/'main.dyn').write_text(patched('''fn main() {
   command: []const u8 = "CHILD\\0"
   directory: []const u8 = "/tmp\\0"
   child := proc_open(&command[0], &directory[0], false)
@@ -37,7 +38,7 @@ with tempfile.TemporaryDirectory(prefix='dna-process-close-') as temporary:
   proc_close(&child)
   if child.pid != 0 || child.input != -1 { #panic("close invalidates") }
 }
-'''.replace('CHILD', str(child)))
+''', 'CHILD', str(child)))
     for mode in ('debug', 'release'):
         binary = stage/f'probe-{mode}'
         subprocess.run(['python3', str(ROOT/'scripts/compile.py'), DYN, 'build',

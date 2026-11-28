@@ -4,6 +4,7 @@ A private FBO gives each fake resize its exact dimensions, independent of the
 window manager. Readback storage and FBOs never enter the production executable.
 """
 import re
+from source_patch import patched
 HELPER=r'''
 native_probe_framebuffer:u32
 native_probe_texture:u32
@@ -65,13 +66,6 @@ fn native_probe_pixels()[]const u8 {
  native_probe_dirty=false
  return native_probe_buffer
 }
-fn native_probe_blank() {
- if native_gui.direct {
-  if !native_present.gpu_clear(&native_gui.gpu,native_gui.surface.width,native_gui.surface.height,ui.Color{}) {#panic("GPU blank probe")}
- } else {
-  for i in 0..native_gui.surface.pixels.len {native_gui.surface.pixels[i]=0}
- }
-}
 fn native_probe_destroy() {
  native_gui.gpu.window_framebuffer=0
  native_gui.gpu.framebuffer=0
@@ -91,10 +85,11 @@ fn native_probe_destroy() {
 }
 '''
 def install(source):
+    # Frame tests swap in a compact gui_present; presenting through it makes the
+    # next readback fetch fresh pixels. native_gpu.py keeps the real one.
     source=source.replace("fn gui_present(renderer:rawptr)bool{", "fn gui_present(renderer:rawptr)bool{native_probe_dirty=true\n")
     source=source.replace('return native_gui.surface.pixels','return native_probe_pixels()')
-    source=source.replace('if !native_resize()', 'if !native_probe_resize()')
-    source=source.replace('native_memory.zero(native_gui.surface.pixels)','native_probe_blank()')
+    source=patched(source, 'if !native_resize()', 'if !native_probe_resize()')
     # The hook must land: without it renderer recreation keeps stale probe
     # storage. Match the signature by shape, not its parameter name.
     source,hooked=re.subn(r'(fn gui_destroy_renderer\(\w+: rawptr\) \{)',r'\1\n native_probe_destroy()',source)

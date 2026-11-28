@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+from source_patch import patched
 ROOT=Path(__file__).resolve().parents[1]
 WORK=ROOT/'build/render-reuse'
 DYN=str(Path(os.environ.get('DYN',ROOT.parent/'dyn/compiler/build/dyn-release')).resolve())
@@ -61,7 +62,7 @@ pub fn probe()u64 {
 '''
 # Document exceeds the inline fixture source buffer on multibyte text; reserve
 # the exact test bound independently of production layout/cache capacities.
-main=main.replace('source:[12000]u8','source:[18000]u8')
+main=patched(main, 'source:[12000]u8', 'source:[18000]u8')
 (stage/'main.dyn').write_text(main+(baseline.read_text() if args.baseline else source))
 output=WORK/(name+'.so')
 subprocess.run([DYN,'build',str(stage),'--shared','--release','--quiet','--no-cache','--output',str(output)],check=True,timeout=120)

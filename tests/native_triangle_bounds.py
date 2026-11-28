@@ -22,6 +22,7 @@ args=parser.parse_args()
 current=args.candidate
 
 from native_software_source import function
+from source_patch import patched
 
 HEADER='''use "std/ui"
 use "std/ui/software"
@@ -81,8 +82,8 @@ with tempfile.TemporaryDirectory(prefix='dna-native-triangles-') as temporary:
     shared='\n'.join(function(current,name) for name in names)
     bodies=[]
     for path,name in ((args.baseline,'baseline_geometry'),(current,'candidate_geometry')):
-        body=function(path,'gui_geometry').replace('fn gui_geometry(',f'fn {name}(')
-        body=body.replace('        wa:=native_edge','        visits+=1\n        wa:=native_edge')
+        body=patched(function(path,'gui_geometry'), 'fn gui_geometry(', f'fn {name}(')
+        body=patched(body, '        wa:=native_edge', '        visits+=1\n        wa:=native_edge')
         bodies.append(body)
     (stage/'main.dyn').write_text(HEADER+'\n'+shared+'\n'+'\n'.join(bodies)+'\n'+WRAPPER)
     reports={}

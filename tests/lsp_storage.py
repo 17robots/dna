@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from source_patch import patched
 ROOT=Path(__file__).resolve().parents[1]
 DYN=str(Path(os.environ.get('DYN',ROOT.parent/'dyn/compiler/build/dyn-release')).resolve())
 def function(source,name):
@@ -90,7 +91,7 @@ fn main(){
 }
 '''
 source=(ROOT/'src/language_server.dyn').read_text()
-helpers='\n'.join(function(source,name) for name in ('lsp_documents_ensure','lsp_shadow_release','lsp_shadows_release','lsp_allocation_retry','lsp_allocation_wait','lsp_wait_ms')).replace('arena_owner.try_create','fault_allocate')
+helpers=patched('\n'.join(function(source,name) for name in ('lsp_documents_ensure','lsp_shadow_release','lsp_shadows_release','lsp_allocation_retry','lsp_allocation_wait','lsp_wait_ms')), 'arena_owner.try_create', 'fault_allocate')
 with tempfile.TemporaryDirectory(prefix='dna-lsp-storage-') as temporary:
     work=Path(temporary)
     shutil.copytree(ROOT/'src/owned_arena',work/'owner')

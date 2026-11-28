@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from source_patch import patched
 ROOT=Path(__file__).resolve().parents[1]
 font=next((Path(x) for x in [os.environ.get('DNA_TYPOGRAPHY_FONT',''),'/usr/share/fonts/noto/NotoSansMono-Regular.ttf','/usr/share/fonts/TTF/DejaVuSansMono.ttf','/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf'] if x and Path(x).is_file()),None)
 if font is None:raise SystemExit('Set DNA_TYPOGRAPHY_FONT to a monospace face')
@@ -31,11 +32,11 @@ pub fn typography_probe_bottom()f32{return typography_probe_ink_bottom}
  return false
 }
 ''')
-    (stage/'startup_probe.dyn').write_text('''fn startup_probe(app:*App,typography:*Typography,renderer:rawptr,window:rawptr,input_storage:[]u8){
+    (stage/'startup_probe.dyn').write_text(patched('''fn startup_probe(app:*App,typography:*Typography,renderer:rawptr,window:rawptr,input_storage:[]u8){
  typography_metrics_smoke(app,typography,renderer,platform.typography_probe_reset,platform.typography_probe_bottom,ttf.typography_probe_uses_fallback,FALLBACK_PATH)
 }
 fn finish_probe(app:*App){}
-'''.replace('FALLBACK_PATH',json.dumps(str(fallback) if fallback else '')))
+''', 'FALLBACK_PATH', json.dumps(str(fallback) if fallback else '')))
     env=dict(os.environ,DYN_EDITOR_SMOKE='1',DNA_FONT=str(font),DNA_DEFAULT_SERVERS='0',DNA_RECOVERY='0',DNA_CONFIG=str(work/'missing.toml'),XDG_CONFIG_HOME=str(work/'config'),XDG_STATE_HOME=str(work/'state'))
     for mode in os.environ.get('DNA_SMOKE_MODES','debug release').split():
         binary=work/'editor'

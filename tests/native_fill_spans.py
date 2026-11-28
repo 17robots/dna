@@ -8,8 +8,9 @@ import subprocess
 import tempfile
 ROOT=Path(__file__).resolve().parents[1];SOURCE=ROOT/'src/platform/gui.dyn';REFERENCE=ROOT/'tests/fixtures/native_fill_reference.dyn'
 from native_software_source import function
+from source_patch import patched
 
-HEADER='''use "std/ui"
+HEADER=patched('''use "std/ui"
 use "std/ui/software"
 struct PixelRect {x,y,width,height:i32}
 struct Rect {x,y,width,height:f32}
@@ -24,7 +25,7 @@ pub fn probe_draw(reference,clear:i32,rect:*const Rect) bool {
  if clear!=0 {return gui_clear(nil)}
  return gui_fill(nil,rect)
 }
-'''.replace(';','\n')
+''', ';', '\n')
 rng=random.Random(7213)
 class Rect(c.Structure):_fields_=[(x,c.c_float) for x in ('x','y','width','height')]
 with tempfile.TemporaryDirectory(prefix='dna-fill-spans-') as directory:

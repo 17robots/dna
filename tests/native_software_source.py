@@ -3,6 +3,7 @@
 Direct GPU rendering is covered by native_gpu.py on a real GL context. These
 oracles deliberately retain their small fake surfaces and frozen CPU references.
 """
+from source_patch import patched
 def function(path, name):
     text=path.read_text()
     actual='native_text_cached_bitmap' if name=='native_text_bitmap' and 'pub fn native_text_cached_bitmap(' in text else name
@@ -23,5 +24,5 @@ def function(path, name):
         body=body[:begin]+body[finish:]
     body=body.replace('    if !native_gui.direct {\n      native_texture_cpu(t)\n    }\n','').replace('  native_texture_cpu(t)\n','').replace('    t.dirty=true\n','')
     if actual!=name:
-        body=body.replace('native_text_cached_bitmap(_renderer:rawptr, key:u64,','native_text_bitmap(_renderer:rawptr,')
+        body=patched(body, 'native_text_cached_bitmap(_renderer:rawptr, key:u64,', 'native_text_bitmap(_renderer:rawptr,')
     return body

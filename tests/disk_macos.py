@@ -5,11 +5,12 @@ import os
 import subprocess
 import sys
 import tempfile
+from source_patch import patched
 ROOT=Path(__file__).resolve().parents[1]
 with tempfile.TemporaryDirectory(prefix='dna-darwin-disk-') as temporary:
     work=Path(temporary)
     source=(ROOT/'src/native/dyn/disk_macos.dyn').read_text()
-    (work/'disk.dyn').write_text(source.replace('#target(kernel: darwin)', '#target(kernel: linux)'))
+    (work/'disk.dyn').write_text(patched(source, '#target(kernel: darwin)', '#target(kernel: linux)'))
     (work/'main.dyn').write_text((ROOT/'tests/fixtures/disk_macos_mock.dyn').read_text())
     for mode in ('debug','release'):
         output=work/mode

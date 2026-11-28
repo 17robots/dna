@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from source_patch import patched
 
 ROOT = Path(__file__).resolve().parents[1]
 DYN = os.environ.get('DYN', 'dyn')
@@ -127,7 +128,7 @@ extern fn probe_mapping_check "probe_mapping_check"(present:bool) i32
         subprocess.run([DYN,'build',str(stage),'--'+mode,'--link',str(stage/'shim.o'),'--output',str(binary)],check=True)
         subprocess.run([str(binary)],check=True,timeout=10)
     macos=(ROOT/'src/filesystem/macos.dyn').read_text()
-    macos=macos[macos.index('extern fn darwin_mmap'):macos.index('// APFS can seed')].replace('"mmap"','"probe_mmap"').replace('"munmap"','"probe_munmap"')
+    macos=patched(patched(macos[macos.index('extern fn darwin_mmap'):macos.index('// APFS can seed')], '"mmap"', '"probe_mmap"'), '"munmap"', '"probe_munmap"')
     (stage/'main.dyn').write_text(BASE+macos+'''
 extern fn probe_mapping_check "probe_mapping_check"(present:bool) i32
 fn main() {

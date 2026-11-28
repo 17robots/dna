@@ -10,6 +10,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from source_patch import patched
 ROOT=Path(__file__).resolve().parents[1]
 SDK=ROOT.parent/'dyn/compiler'
 DYN=str(Path(os.environ.get('DYN',SDK/'build/dyn-release')).resolve())
@@ -196,7 +197,7 @@ with tempfile.TemporaryDirectory(prefix='dna-selection-') as directory:
     flags=shlex.split(subprocess.check_output(['pkg-config','--cflags','--libs','harfbuzz','fribidi'],text=True))
     subprocess.run(['cc','-std=c11','-O2',str(work/'oracle.c'),*flags,'-o',str(work/'oracle')],check=True)
     stage=work/'native';stage.mkdir();(stage/'platform').mkdir();(stage/'platform/platform.dyn').write_text(PLATFORM)
-    backend=(ROOT/'src/text/native.dyn').read_text().replace('use platform "../platform"','use platform "./platform"')
+    backend=patched((ROOT/'src/text/native.dyn').read_text(), 'use platform "../platform"', 'use platform "./platform"')
     backend=re.sub(r'extern fn native_text_attach[^\n]+','fn native_text_attach(callbacks:*const NativeTextCallbacks)bool{return dna_native_text_attach(callbacks)}',backend)
     backend=re.sub(r'extern fn native_tracked_create[^\n]+','fn native_tracked_create(engine:rawptr,font:rawptr,text:*const u8,length:usize)rawptr{return dna_text_create(engine,font,text,length)}',backend)
     backend=re.sub(r'extern fn native_tracked_destroy[^\n]+','fn native_tracked_destroy(text:rawptr){dna_text_destroy(text)}',backend)
@@ -221,7 +222,7 @@ with tempfile.TemporaryDirectory(prefix='dna-selection-') as directory:
                     lines+=[f'check(received.regions[{i}].x=={left} && received.regions[{i}].width=={right-left} && received.regions[{i}].offset=={low} && received.regions[{i}].length=={high-low} && received.regions[{i}].line==0 && received.regions[{i}].y==0 && received.regions[{i}].height>0)']
                 lines+=['}']
         lines+=['ttf_destroy(handle)','}'];cases.append('\n'.join(lines))
-    source=SUBSTRING+NATIVE.replace('FONT_PATH',str(font)).replace('CASES','\n'.join(cases))
+    source=SUBSTRING+patched(patched(NATIVE, 'FONT_PATH', str(font)), 'CASES', '\n'.join(cases))
     counter=[0]
     def number(match):counter[0]+=1;return 'check_'+str(counter[0])+'('
     source=re.sub(r'\bcheck\(',number,source)

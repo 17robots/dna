@@ -7,6 +7,7 @@ import subprocess
 import struct
 import re
 import tempfile
+from source_patch import patched
 ROOT = Path(__file__).resolve().parents[1]
 DYN = str(Path(os.environ.get('DYN', ROOT.parent/'dyn/compiler/build/dyn-release')).resolve())
 SOURCE = r'''
@@ -222,10 +223,10 @@ with tempfile.TemporaryDirectory(prefix='dna-native-text-') as directory:
     (platform/'platform.dyn').write_text(PLATFORM)
     shutil.copyfile(font,work/'font.ttf')
     (work/'large.ttf').write_bytes(font.read_bytes()+bytes(4*1024*1024))
-    SOURCE=SOURCE.replace('LARGE_FONT_FILE',str(work/'large.ttf'))
+    SOURCE=patched(SOURCE, 'LARGE_FONT_FILE', str(work/'large.ttf'))
     with (work/'oversized.ttf').open('wb') as output:output.truncate(67108865)
-    SOURCE=SOURCE.replace('OVERSIZED_FONT_FILE',str(work/'oversized.ttf'))
-    backend=(ROOT/'src/text/native.dyn').read_text().replace('use platform "../platform"','use platform "./platform"')
+    SOURCE=patched(SOURCE, 'OVERSIZED_FONT_FILE', str(work/'oversized.ttf'))
+    backend=patched((ROOT/'src/text/native.dyn').read_text(), 'use platform "../platform"', 'use platform "./platform"')
     backend=re.sub(r'extern fn native_text_attach[^\n]+','fn native_text_attach(callbacks:*const NativeTextCallbacks) bool { return dna_native_text_attach(callbacks) }',backend)
     backend=re.sub(r'extern fn native_tracked_create[^\n]+','fn native_tracked_create(engine:rawptr,font:rawptr,text:*const u8,length:usize) rawptr { return dna_text_create(engine,font,text,length) }',backend)
     backend=re.sub(r'extern fn native_tracked_destroy[^\n]+','fn native_tracked_destroy(text:rawptr) { dna_text_destroy(text) }',backend)
@@ -233,7 +234,7 @@ with tempfile.TemporaryDirectory(prefix='dna-native-text-') as directory:
     bridge=bridge[bridge.index('native_text_callbacks:'):]
     (module/'bridge.dyn').write_text(bridge+'\ntracked_texts:usize\nfn memory_active() bool { return true }\nfn memory_record(category:u32,size:usize,lifetime:u64,release:bool) { if release { tracked_texts-=1 } else { tracked_texts+=1 } }\n')
     backend=backend.replace('fn native_build(', 'fn native_build_actual(',1)
-    backend=backend.replace('mem.arena_alloc(', 'native_probe_arena_create(')
+    backend=patched(backend, 'mem.arena_alloc(', 'native_probe_arena_create(')
     backend+='''\nnative_arena_count:usize
 fn native_probe_arena_create(capacity:usize)*mem.Arena {native_arena_count+=1
  return mem.arena_alloc(capacity)}
@@ -275,7 +276,7 @@ fn native_build(arena:*mem.Arena,font:*NativeFont,text:[]const u8,wrap:i32)text_
  ttf_close(format_font)
  check(tracked_texts==0 && native_libraries.fonts==1)
 }''')
-    source=SOURCE.replace('FONT_PATH',str(work/'font.ttf')).replace('EXPECTED_A',str(expected_a)).replace('OTHER_FORMATS','\n'.join(other))
+    source=patched(patched(patched(SOURCE, 'FONT_PATH', str(work/'font.ttf')), 'EXPECTED_A', str(expected_a)), 'OTHER_FORMATS', '\n'.join(other))
     import re
     count=[0]
     def numbered(match):

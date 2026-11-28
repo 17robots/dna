@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from source_patch import patched
 
 ROOT = Path(__file__).resolve().parents[1]
 DYN = os.environ.get('DYN', 'dyn')
@@ -70,13 +71,13 @@ with tempfile.TemporaryDirectory(prefix='dna-clone-save-') as directory:
     subprocess.run(['cc','-x','c','-c','-o',str(stage/'shim.o'),'-'],input=SHIM,text=True,check=True)
     macos = (ROOT/'src/filesystem/macos.dyn').read_text()
     linux_path = stage/'filesystem/linux.dyn'
-    linux = linux_path.read_text().replace('WholeFileClones: bool = false', 'WholeFileClones: bool = true')
-    linux = linux.replace(function(linux, 'clone_exclusive'), function(macos, 'clone_exclusive'))
-    linux = linux.replace(function(linux, 'resize'), function(macos, 'resize'))
-    linux = linux.replace(function(linux, 'copy_range'), '''pub fn copy_range(source:*const File,offset:u64,target:*File,length:usize,transferred:*usize) !io.IoErr {transferred.*=0
+    linux = patched(linux_path.read_text(), 'WholeFileClones: bool = false', 'WholeFileClones: bool = true')
+    linux = patched(linux, function(linux, 'clone_exclusive'), function(macos, 'clone_exclusive'))
+    linux = patched(linux, function(linux, 'resize'), function(macos, 'resize'))
+    linux = patched(linux, function(linux, 'copy_range'), '''pub fn copy_range(source:*const File,offset:u64,target:*File,length:usize,transferred:*usize) !io.IoErr {transferred.*=0
  fail .Unsupported}''')
-    linux = linux.replace(function(linux, 'map_file'), 'pub fn map_file(fd:isize,length:u64) *u8 {return test_map(fd,length)}')
-    linux = linux.replace(function(linux, 'unmap_file'), 'pub fn unmap_file(bytes:*u8,length:u64) {test_unmap(bytes,length)}')
+    linux = patched(linux, function(linux, 'map_file'), 'pub fn map_file(fd:isize,length:u64) *u8 {return test_map(fd,length)}')
+    linux = patched(linux, function(linux, 'unmap_file'), 'pub fn unmap_file(bytes:*u8,length:u64) {test_unmap(bytes,length)}')
     linux += '''
 extern fn test_map "probe_map"(fd:isize,length:u64) *u8
 extern fn test_unmap "probe_unmap"(bytes:*u8,length:u64)
@@ -97,7 +98,7 @@ fn darwin_check(code:i32) !io.IoErr {
 '''
     linux_path.write_text(linux)
     boundary = stage/'filesystem/filesystem.dyn'
-    source = boundary.read_text().replace('pub fn write(file: *File, source: []const u8) !io.IoErr {', '''pub test_written:usize=0
+    source = patched(patched(boundary.read_text(), 'pub fn write(file: *File, source: []const u8) !io.IoErr {', '''pub test_written:usize=0
 pub test_seeks:usize=0
 extern fn probe_mode "probe_mode"() i32
 pub fn test_mode() i32 {return probe_mode()}
@@ -105,7 +106,7 @@ extern fn probe_after_write "probe_after_write"()
 pub fn write(file: *File, source: []const u8) !io.IoErr {
   if probe_mode()==9 {fail io.IoErr.System(-5)}
   probe_after_write()
-  test_written+=source.len''').replace('pub fn seek(file: *File, offset: usize) !io.IoErr {', 'pub fn seek(file: *File, offset: usize) !io.IoErr {\n test_seeks+=1')
+  test_written+=source.len'''), 'pub fn seek(file: *File, offset: usize) !io.IoErr {', 'pub fn seek(file: *File, offset: usize) !io.IoErr {\n test_seeks+=1')
     boundary.write_text(source)
     line = b'original line of text\n'
     data = line * ((17 << 20) // len(line))
