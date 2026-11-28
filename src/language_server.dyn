@@ -402,6 +402,9 @@ struct LanguageServer {
   save_text: bool,
   save: bool,
 }
+// What a language-server request asks for. The pending request and the
+// results it produced both carry one.
+enum LspRequest { None, Completion, Hover, Definition, References, Rename, CodeAction, CodeActionResolve, ExecuteCommand, SignatureHelp, Formatting, TypeDefinition, Implementation, DocumentSymbol, WorkspaceSymbol }
 struct LspResults {
   tracked_capacity: usize,
   tracked_born: u64,
@@ -423,7 +426,7 @@ struct LspResults {
   prefix_start: usize,
   active, incomplete, narrowed: bool,
   count: usize,
-  kind: usize,
+  kind: LspRequest,
   server: usize,
   slot: usize,
   position: usize,
@@ -471,7 +474,7 @@ struct LspState {
   completion_typed, completion_retry: bool,
   serial: usize,
   pending: usize,
-  kind: usize,
+  kind: LspRequest,
   server: usize,
   slot: usize,
   position: usize,
@@ -1116,12 +1119,12 @@ fn lsp_position(out: []u8, used: *usize, position: lsp.Position) {
   add_number(out, used, position.character)
   add_text(out, used, "}")
 }
-fn lsp_request(app: *App, kind: usize, argument: str) {
-  if kind != 1 {
+fn lsp_request(app: *App, kind: LspRequest, argument: str) {
+  if kind != .Completion {
     app.lsp.results.active = false
   }
   app.lsp.automatic = false
-  if kind == 2 && diagnostic_cursor_hover(app) { return }
+  if kind == .Hover && diagnostic_cursor_hover(app) { return }
   index := lsp_for(app)
   if index == 8 {
     notice(app, "No server for this filetype. Use :lsp-start <filetype> <command> or :lsp-config.")
@@ -1151,17 +1154,17 @@ fn lsp_request(app: *App, kind: usize, argument: str) {
   }
   method: str = "textDocument/completion"
   case kind {
-    2 => { method = "textDocument/hover" }
-    3 => { method = "textDocument/definition" }
-    4 => { method = "textDocument/references" }
-    5 => { method = "textDocument/rename" }
-    6 => { method = "textDocument/codeAction" }
-    9 => { method = "textDocument/signatureHelp" }
-    10 => { method = "textDocument/formatting" }
-    11 => { method = "textDocument/typeDefinition" }
-    12 => { method = "textDocument/implementation" }
-    13 => { method = "textDocument/documentSymbol" }
-    14 => { method = "workspace/symbol" }
+    .Hover => { method = "textDocument/hover" }
+    .Definition => { method = "textDocument/definition" }
+    .References => { method = "textDocument/references" }
+    .Rename => { method = "textDocument/rename" }
+    .CodeAction => { method = "textDocument/codeAction" }
+    .SignatureHelp => { method = "textDocument/signatureHelp" }
+    .Formatting => { method = "textDocument/formatting" }
+    .TypeDefinition => { method = "textDocument/typeDefinition" }
+    .Implementation => { method = "textDocument/implementation" }
+    .DocumentSymbol => { method = "textDocument/documentSymbol" }
+    .WorkspaceSymbol => { method = "workspace/symbol" }
     _ => {}
   }
   app.lsp.serial += 1
@@ -1184,7 +1187,7 @@ fn lsp_request(app: *App, kind: usize, argument: str) {
   escaped := mem.push_bytes(app.scratch, 32768)
   used: usize = 0
   lsp_header(message, &used, method, app.lsp.pending)
-  if kind == 14 {
+  if kind == .WorkspaceSymbol {
     add_text(message, &used, "{\"query\":")
     add_text(message, &used, lsp_json_string(escaped, argument))
     add_text(message, &used, "}}")
@@ -1193,7 +1196,7 @@ fn lsp_request(app: *App, kind: usize, argument: str) {
   }
   add_text(message[..], &used, "{\"textDocument\":{\"uri\":")
   lsp_document_uri(app.scratch, message[..], &used, files.name(app.documents.file))
-  if kind == 13 {
+  if kind == .DocumentSymbol {
     add_text(message[..], &used, "}}}")
     _ = lsp_send(app, index, message[..used])
     app.prompt_state.panel = .None
@@ -1201,7 +1204,7 @@ fn lsp_request(app: *App, kind: usize, argument: str) {
     return
   }
   add_text(message[..], &used, "},")
-  if kind == 10 {
+  if kind == .Formatting {
     add_text(message[..], &used, "\"options\":{\"tabSize\":")
     add_number(message[..], &used, indent_width(app))
     add_text(message[..], &used, ",\"insertSpaces\":")
@@ -1210,7 +1213,7 @@ fn lsp_request(app: *App, kind: usize, argument: str) {
     } else {
       add_text(message[..], &used, "true}")
     }
-  } else if kind == 6 {
+  } else if kind == .CodeAction {
     add_text(message[..], &used, "\"range\":{\"start\":")
     lsp_position(message[..], &used, lsp_document_position(doc, buffer.start(doc)))
     add_text(message[..], &used, ",\"end\":")
@@ -1220,7 +1223,7 @@ fn lsp_request(app: *App, kind: usize, argument: str) {
     add_text(message[..], &used, "\"position\":")
     lsp_position(message[..], &used, lsp_document_position(doc, position))
   }
-  if kind == 1 {
+  if kind == .Completion {
     if argument.len != 0 {
       add_text(message[..], &used, ",\"context\":{\"triggerKind\":2,\"triggerCharacter\":")
       add_text(message[..], &used, lsp_json_string(escaped[..], argument))
@@ -1229,10 +1232,10 @@ fn lsp_request(app: *App, kind: usize, argument: str) {
       add_text(message[..], &used, ",\"context\":{\"triggerKind\":1}")
     }
   }
-  if kind == 4 {
+  if kind == .References {
     add_text(message[..], &used, ",\"context\":{\"includeDeclaration\":true}")
   }
-  if kind == 5 {
+  if kind == .Rename {
     if argument.len == 0 {
       app.lsp.pending = 0
       notice(app, "Use :rename-symbol <new name>")
@@ -1245,7 +1248,7 @@ fn lsp_request(app: *App, kind: usize, argument: str) {
   _ = lsp_send(app, index, message[..used])
   // Keep locally filtered completions visible while their replacement arrives.
   // Closing here also restarts the popup animation on every typing pause.
-  if kind != 1 || !completion_visible(app) {
+  if kind != .Completion || !completion_visible(app) {
     app.prompt_state.panel = .None
   }
   lsp_note(app, "Language request pending…")
@@ -1357,7 +1360,7 @@ fn lsp_handle(app: *App, index: usize, source: str, arena: *mem.Arena) bool {
     } else if buffer.equal(method, "window/logMessage") || buffer.equal(method, "window/showMessage") {
       lsp_note(app, json_text(params, "message"))
     }
-    if buffer.equal(method, "workspace/applyEdit") && !json.is_missing(json.object_get(root, "id")) && app.lsp.kind == 8 && app.lsp.server == index && app.lsp.pending != 0 && app.prompt_state.panel == .None {
+    if buffer.equal(method, "workspace/applyEdit") && !json.is_missing(json.object_get(root, "id")) && app.lsp.kind == .ExecuteCommand && app.lsp.server == index && app.lsp.pending != 0 && app.prompt_state.panel == .None {
       lsp_prepare_edit(app, json.object_get(params, "edit"))
       if app.prompt_state.panel != .None {
         render_request(app, RenderLsp)
@@ -1463,7 +1466,7 @@ fn lsp_handle(app: *App, index: usize, source: str, arena: *mem.Arena) bool {
     }
     return false
   }
-  if app.lsp.kind == 8 {
+  if app.lsp.kind == .ExecuteCommand {
     lsp_note(app, "Language command completed.")
     return false
   }
@@ -1476,17 +1479,17 @@ fn lsp_handle(app: *App, index: usize, source: str, arena: *mem.Arena) bool {
     stale = "active buffer changed"
   } else if slot.document.revision != app.lsp.revision && !continued {
     stale = "document changed"
-  } else if (app.lsp.kind == 1 || app.lsp.kind == 2 || app.lsp.kind == 9) && app.view.insert != app.lsp.insert {
+  } else if (app.lsp.kind == .Completion || app.lsp.kind == .Hover || app.lsp.kind == .SignatureHelp) && app.view.insert != app.lsp.insert {
     stale = "editing mode changed"
-  } else if (app.lsp.kind == 1 || app.lsp.kind == 2 || app.lsp.kind == 9) && language_cursor(slot.document, app.view.insert) != app.lsp.position && !continued {
+  } else if (app.lsp.kind == .Completion || app.lsp.kind == .Hover || app.lsp.kind == .SignatureHelp) && language_cursor(slot.document, app.view.insert) != app.lsp.position && !continued {
     stale = "cursor moved"
-  } else if app.prompt_state.panel != .None && !(app.lsp.kind == 1 && completion_visible(app)) && !(app.lsp.kind == 14 && app.prompt_state.panel == .LspResults) {
+  } else if app.prompt_state.panel != .None && !(app.lsp.kind == .Completion && completion_visible(app)) && !(app.lsp.kind == .WorkspaceSymbol && app.prompt_state.panel == .LspResults) {
     stale = "another panel is open"
   }
   if stale.len > 0 {
     stale_status: [256]u8
     stale_length: usize = 0
-    if app.lsp.automatic && app.lsp.kind == 1 {
+    if app.lsp.automatic && app.lsp.kind == .Completion {
       // Never apply stale edits. Let the scheduler request the current position.
       app.lsp.completion_identity = 0
       app.lsp.completion_retry = true
@@ -1500,11 +1503,11 @@ fn lsp_handle(app: *App, index: usize, source: str, arena: *mem.Arena) bool {
     return false
   }
   render_request(app, RenderLsp)
-  if app.lsp.kind == 9 {
+  if app.lsp.kind == .SignatureHelp {
     lsp_signature(app, result)
     return false
   }
-  if app.lsp.kind == 2 {
+  if app.lsp.kind == .Hover {
     text: [8192]u8
     length: usize = 0
     lsp_markup(text[..], &length, json.object_get(result, "contents"))
@@ -1527,35 +1530,35 @@ fn lsp_handle(app: *App, index: usize, source: str, arena: *mem.Arena) bool {
   state.position = app.lsp.position
   state.insert = app.lsp.insert
   case state.kind {
-    10 => {
+    .Formatting => {
       lsp_prepare_format(app, result)
       return true
     }
-    5 => {
+    .Rename => {
       lsp_prepare_edit(app, result)
       return true
     }
-    7 => {
-      state.kind = 6
+    .CodeActionResolve => {
+      state.kind = .CodeAction
       state.resolved = true
     }
     _ => {}
   }
-  if state.kind == 13 || state.kind == 14 {
+  if state.kind == .DocumentSymbol || state.kind == .WorkspaceSymbol {
     lsp_symbols_collect(state, result, 0)
     lsp_symbols_filter(app)
     app.prompt_state.panel = .LspResults
-    if app.lsp.symbol_requery && state.kind == 14 {
+    if app.lsp.symbol_requery && state.kind == .WorkspaceSymbol {
       app.lsp.symbol_requery = false
-      lsp_request(app, 14, app.lsp.symbol_query[..app.lsp.symbol_query_length])
+      lsp_request(app, .WorkspaceSymbol, app.lsp.symbol_query[..app.lsp.symbol_query_length])
     }
     return true
   }
   items := result
-  if state.kind == 1 && json.is_object(result) {
+  if state.kind == .Completion && json.is_object(result) {
     items = json.object_get(result, "items")
   }
-  if state.kind == 1 {
+  if state.kind == .Completion {
     if json.is_array(items) {
       state.source = items.first
       state.origin = state.position
@@ -1591,7 +1594,7 @@ fn lsp_handle(app: *App, index: usize, source: str, arena: *mem.Arena) bool {
     app.prompt_state.selected = 0
     app.prompt_state.panel = .LspResults
   }
-  if state.kind == 1 {
+  if state.kind == .Completion {
     status: [256]u8
     status_length: usize = 0
     if app.lsp.automatic {
@@ -1762,7 +1765,7 @@ fn lsp_symbol_label(app: *App, item: *const json.Value, output: []u8) usize {
   range: *const json.Value = nil
   file := lsp_symbol_location(app, item, path[..], &range)
   add_text(output, &used, "  ")
-  if app.lsp.results.kind == 14 {
+  if app.lsp.results.kind == .WorkspaceSymbol {
     add_text(output, &used, file)
   }
   line := lsp.number(json.object_get(json.object_get(range, "start"), "line"))
@@ -1786,26 +1789,26 @@ fn lsp_symbol_query(app: *App, text: str, erase: bool) {
     app.lsp.symbol_query_length += text.len
   }
   lsp_symbols_filter(app)
-  if app.lsp.results.kind == 14 {
+  if app.lsp.results.kind == .WorkspaceSymbol {
     if app.lsp.pending != 0 {
       app.lsp.symbol_requery = true
     } else {
-      lsp_request(app, 14, app.lsp.symbol_query[..app.lsp.symbol_query_length])
+      lsp_request(app, .WorkspaceSymbol, app.lsp.symbol_query[..app.lsp.symbol_query_length])
     }
   }
 }
-fn lsp_symbols_open(app: *App, kind: usize) {
+fn lsp_symbols_open(app: *App, kind: LspRequest) {
   app.lsp.symbol_query_length = 0
   app.lsp.symbol_requery = false
   lsp_request(app, kind, "")
 }
 fn lsp_result_label(app: *App, item: *const json.Value, output: []u8) usize {
   case app.lsp.results.kind {
-    13, 14 => {
+    .DocumentSymbol, .WorkspaceSymbol => {
       return lsp_symbol_label(app, item, output)
     }
-    1 => { return copy_text(output, json_text(item, "label")) }
-    6 => { return copy_text(output, json_text(item, "title")) }
+    .Completion => { return copy_text(output, json_text(item, "label")) }
+    .CodeAction => { return copy_text(output, json_text(item, "title")) }
     _ => {}
   }
   uri := json_text(item, "uri")
@@ -1826,7 +1829,7 @@ fn lsp_result_label(app: *App, item: *const json.Value, output: []u8) usize {
 fn lsp_popup(app: *App, output: []u8) usize {
   used := copy_text(output, "Language results — arrows choose; Enter accepts; Escape cancels\n\n")
   state := &app.lsp.results
-  if state.kind == 13 || state.kind == 14 {
+  if state.kind == .DocumentSymbol || state.kind == .WorkspaceSymbol {
     used = copy_text(output, "Symbols — type to filter; arrows choose; Enter goes; Escape cancels\n> ")
     add_text(output, &used, app.lsp.symbol_query[..app.lsp.symbol_query_length])
     add_text(output, &used, "_\n\n")
@@ -1835,7 +1838,7 @@ fn lsp_popup(app: *App, output: []u8) usize {
     }
   }
   rows: usize = 16
-  if state.kind == 1 {
+  if state.kind == .Completion {
     used = 0
     rows = 8
   }
@@ -1954,54 +1957,54 @@ fn lsp_command(app: *App, verb: str, argument: str) bool {
       return true
     }
     "complete" => {
-      lsp_request(app, 1, "")
+      lsp_request(app, .Completion, "")
       return true
     }
     "hover" => {
-      lsp_request(app, 2, "")
+      lsp_request(app, .Hover, "")
       return true
     }
     "definition" => {
-      lsp_request(app, 3, "")
+      lsp_request(app, .Definition, "")
       return true
     }
     "type-definition" => {
-      lsp_request(app, 11, "")
+      lsp_request(app, .TypeDefinition, "")
       return true
     }
     "implementation" => {
-      lsp_request(app, 12, "")
+      lsp_request(app, .Implementation, "")
       return true
     }
     "references" => {
-      lsp_request(app, 4, "")
+      lsp_request(app, .References, "")
       return true
     }
     "symbols" => {
-      lsp_symbols_open(app, 13)
+      lsp_symbols_open(app, .DocumentSymbol)
       return true
     }
     "workspace-symbols" => {
-      lsp_symbols_open(app, 14)
+      lsp_symbols_open(app, .WorkspaceSymbol)
       if argument.len > 0 {
         lsp_symbol_query(app, argument, false)
       }
       return true
     }
     "rename-symbol" => {
-      lsp_request(app, 5, argument)
+      lsp_request(app, .Rename, argument)
       return true
     }
     "code-actions" => {
-      lsp_request(app, 6, "")
+      lsp_request(app, .CodeAction, "")
       return true
     }
     "signature-help" => {
-      lsp_request(app, 9, "")
+      lsp_request(app, .SignatureHelp, "")
       return true
     }
     "lsp-format" => {
-      lsp_request(app, 10, "")
+      lsp_request(app, .Formatting, "")
       return true
     }
     "diagnostic-next" => {
