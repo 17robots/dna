@@ -15,7 +15,7 @@ start = source.index('fn gui_clipboard_get(')
 end = source.index('\nfn gui_free(', start)
 clipboard = source[start:end]
 if '--negative-control' in sys.argv:
-    low = clipboard.index('  started:=')
+    low = clipboard.index('  started :=')
     high = clipboard.index('    if !window_api.poll', low)
     clipboard = clipboard[:low] + '  for attempt in 0..100 {\n' + clipboard[high:]
 with tempfile.TemporaryDirectory(prefix='dna-clipboard-deadline-') as directory:

@@ -244,7 +244,7 @@ extern fn rpc_log "dna_rpc_log"(rpc: rawptr, bytes: *u8, capacity: usize) usize
 extern fn rpc_close "dna_rpc_close"(rpc: rawptr)
 
 struct LspDocument {
-  shadow:LspShadow,
+  shadow: LspShadow,
   end: lsp.Position,
   saved_epoch: u64,
   identity: u64,
@@ -383,8 +383,8 @@ struct LanguageServer {
   completion_triggers: [128]u32,
   completion_trigger_count: usize,
   documents: []LspDocument,
-  documents_arena:*mem.Arena,
-  allocation_retry_due:u64,
+  documents_arena: *mem.Arena,
+  allocation_retry_due: u64,
   dirty_first, dirty_last, attached_first, attached_last: *Slot,
   attach_scan: bool,
   next_document_version: usize,
@@ -610,60 +610,60 @@ fn lsp_server_failure(app: *App, index: usize, reason: str) {
 }
 // Stable slots own intrusive links: document callbacks can enqueue without
 // allocation or service execution, including while a slot is being replaced.
-fn lsp_queue_slot(app:*App, index:usize, slot:*Slot) {
-  bit:=#cast(u32, 1)<<#cast(u32, index)
-  if (slot.lsp_dirty_mask&bit)!=0 { return }
-  slot.lsp_dirty_mask|=bit
-  slot.lsp_dirty_next[index]=nil
-  server:=&app.lsp.servers[index]
-  if server.dirty_last==nil {
-    server.dirty_first=slot
+fn lsp_queue_slot(app: *App, index: usize, slot: *Slot) {
+  bit := #cast(u32, 1) << #cast(u32, index)
+  if (slot.lsp_dirty_mask & bit) != 0 { return }
+  slot.lsp_dirty_mask |= bit
+  slot.lsp_dirty_next[index] = nil
+  server := &app.lsp.servers[index]
+  if server.dirty_last == nil {
+    server.dirty_first = slot
   } else {
-    server.dirty_last.lsp_dirty_next[index]=slot
+    server.dirty_last.lsp_dirty_next[index] = slot
   }
-  server.dirty_last=slot
+  server.dirty_last = slot
 }
-fn lsp_document_dirty(app:*App, slot_index:usize) {
-  if slot_index>=app.documents.slots.len { return }
+fn lsp_document_dirty(app: *App, slot_index: usize) {
+  if slot_index >= app.documents.slots.len { return }
   for index in 0..8 {
-    if app.lsp.servers[index].process!=nil {
+    if app.lsp.servers[index].process != nil {
       lsp_queue_slot(app, index, app.documents.slots[slot_index])
     }
   }
 }
-fn lsp_attach_slot(app:*App, index:usize, slot:*Slot) {
-  bit:=#cast(u32, 1)<<#cast(u32, index)
-  if (slot.lsp_attached_mask&bit)!=0 { return }
-  server:=&app.lsp.servers[index]
-  slot.lsp_attached_mask|=bit
-  slot.lsp_attached_next[index]=nil
-  slot.lsp_attached_previous[index]=server.attached_last
-  if server.attached_last==nil {
-    server.attached_first=slot
+fn lsp_attach_slot(app: *App, index: usize, slot: *Slot) {
+  bit := #cast(u32, 1) << #cast(u32, index)
+  if (slot.lsp_attached_mask & bit) != 0 { return }
+  server := &app.lsp.servers[index]
+  slot.lsp_attached_mask |= bit
+  slot.lsp_attached_next[index] = nil
+  slot.lsp_attached_previous[index] = server.attached_last
+  if server.attached_last == nil {
+    server.attached_first = slot
   } else {
-    server.attached_last.lsp_attached_next[index]=slot
+    server.attached_last.lsp_attached_next[index] = slot
   }
-  server.attached_last=slot
+  server.attached_last = slot
 }
-fn lsp_detach_slot(app:*App, index:usize, slot:*Slot) {
-  bit:=#cast(u32, 1)<<#cast(u32, index)
-  if (slot.lsp_attached_mask&bit)==0 { return }
-  server:=&app.lsp.servers[index]
-  previous:=slot.lsp_attached_previous[index]
-  next:=slot.lsp_attached_next[index]
-  if previous==nil {
-    server.attached_first=next
+fn lsp_detach_slot(app: *App, index: usize, slot: *Slot) {
+  bit := #cast(u32, 1) << #cast(u32, index)
+  if (slot.lsp_attached_mask & bit) == 0 { return }
+  server := &app.lsp.servers[index]
+  previous := slot.lsp_attached_previous[index]
+  next := slot.lsp_attached_next[index]
+  if previous == nil {
+    server.attached_first = next
   } else {
-    previous.lsp_attached_next[index]=next
+    previous.lsp_attached_next[index] = next
   }
-  if next==nil {
-    server.attached_last=previous
+  if next == nil {
+    server.attached_last = previous
   } else {
-    next.lsp_attached_previous[index]=previous
+    next.lsp_attached_previous[index] = previous
   }
-  slot.lsp_attached_mask&=~bit
-  slot.lsp_attached_next[index]=nil
-  slot.lsp_attached_previous[index]=nil
+  slot.lsp_attached_mask &= ~bit
+  slot.lsp_attached_next[index] = nil
+  slot.lsp_attached_previous[index] = nil
 }
 fn lsp_results_release(app: *App) {
   if app.lsp.results.owned {
@@ -688,40 +688,40 @@ fn lsp_edits_release(app: *App) {
 // Failed storage growth is retried without polling or losing a wakeup when
 // the new slot has no tracking record yet. Existing dirty records share this
 // backoff, so their expired debounce deadline cannot cause a zero-ms spin.
-fn lsp_allocation_retry(server:*LanguageServer, now:u64) {
-  server.allocation_retry_due=#cast(u64, -1)
-  if now<=#cast(u64, -1)-250 {
-    server.allocation_retry_due=now+250
+fn lsp_allocation_retry(server: *LanguageServer, now: u64) {
+  server.allocation_retry_due = #cast(u64, -1)
+  if now <= #cast(u64, -1) - 250 {
+    server.allocation_retry_due = now + 250
   }
 }
-fn lsp_allocation_wait(server:*const LanguageServer, now:u64)i32 {
-  if server.allocation_retry_due==0 { return -1 }
-  if now>=server.allocation_retry_due { return 0 }
-  remaining:=server.allocation_retry_due-now
-  if remaining>250 { return 250 }
+fn lsp_allocation_wait(server: *const LanguageServer, now: u64)i32 {
+  if server.allocation_retry_due == 0 { return -1 }
+  if now >= server.allocation_retry_due { return 0 }
+  remaining := server.allocation_retry_due - now
+  if remaining > 250 { return 250 }
   return #cast(i32, remaining)
 }
-fn lsp_documents_ensure(server:*LanguageServer, count:usize)bool {
-  if count<=server.documents.len { return true }
-  if count>(#cast(usize, -1)-#alignof(LspDocument))/#sizeof(LspDocument) { return false }
-  arena:=arena_owner.try_create(count*#sizeof(LspDocument)+#alignof(LspDocument))
-  if arena==nil || mem.arena_room(arena) < count*#sizeof(LspDocument) + #alignof(LspDocument) {
+fn lsp_documents_ensure(server: *LanguageServer, count: usize)bool {
+  if count <= server.documents.len { return true }
+  if count > (#cast(usize, -1) - #alignof(LspDocument)) / #sizeof(LspDocument) { return false }
+  arena := arena_owner.try_create(count * #sizeof(LspDocument) + #alignof(LspDocument))
+  if arena == nil || mem.arena_room(arena) < count * #sizeof(LspDocument) + #alignof(LspDocument) {
     if arena != nil { arena_owner.release(arena) }
     return false
   }
-  records:=mem.push_array<LspDocument>(arena, count)
+  records := mem.push_array<LspDocument>(arena, count)
   for index in 0..server.documents.len {
     records[index] = #take(&server.documents[index])
   }
-  previous:=server.documents_arena
-  server.documents=records
-  server.documents_arena=arena
+  previous := server.documents_arena
+  server.documents = records
+  server.documents_arena = arena
   arena_owner.release(previous)
   return true
 }
 fn lsp_shadow_release(app: *App, index: usize, slot: usize) {
-  server:=&app.lsp.servers[index]
-  if slot>=server.documents.len { return }
+  server := &app.lsp.servers[index]
+  if slot >= server.documents.len { return }
   shadow := &server.documents[slot].shadow
   buffer.snapshot_release(&shadow.snapshot)
   shadow.* = LspShadow{}
@@ -731,38 +731,38 @@ fn lsp_shadows_release(app: *App, index: usize) {
     lsp_shadow_release(app, index, slot)
   }
 }
-fn lsp_worksets_clear(app:*App, index:usize) {
-  server:=&app.lsp.servers[index]
-  bit:=#cast(u32, 1)<<#cast(u32, index)
-  slot:=server.dirty_first
-  for slot!=nil {
-    next:=slot.lsp_dirty_next[index]
-    slot.lsp_dirty_mask&=~bit
-    slot.lsp_dirty_next[index]=nil
-    slot=next
+fn lsp_worksets_clear(app: *App, index: usize) {
+  server := &app.lsp.servers[index]
+  bit := #cast(u32, 1) << #cast(u32, index)
+  slot := server.dirty_first
+  for slot != nil {
+    next := slot.lsp_dirty_next[index]
+    slot.lsp_dirty_mask &= ~bit
+    slot.lsp_dirty_next[index] = nil
+    slot = next
   }
-  slot=server.attached_first
-  for slot!=nil {
-    next:=slot.lsp_attached_next[index]
-    slot.lsp_attached_mask&=~bit
-    slot.lsp_attached_next[index]=nil
-    slot.lsp_attached_previous[index]=nil
-    slot=next
+  slot = server.attached_first
+  for slot != nil {
+    next := slot.lsp_attached_next[index]
+    slot.lsp_attached_mask &= ~bit
+    slot.lsp_attached_next[index] = nil
+    slot.lsp_attached_previous[index] = nil
+    slot = next
   }
-  server.dirty_first=nil
-  server.dirty_last=nil
-  server.attached_first=nil
-  server.attached_last=nil
-  server.attach_scan=false
+  server.dirty_first = nil
+  server.dirty_last = nil
+  server.attached_first = nil
+  server.attached_last = nil
+  server.attach_scan = false
 }
 fn lsp_stop(app: *App, index: usize) {
   lsp_worksets_clear(app, index)
   lsp_shadows_release(app, index)
   server := &app.lsp.servers[index]
   arena_owner.release(server.documents_arena)
-  server.documents_arena=nil
-  server.allocation_retry_due=0
-  server.documents=server.documents[..0]
+  server.documents_arena = nil
+  server.allocation_retry_due = 0
+  server.documents = server.documents[..0]
   lsp_encode_free(server)
   if server.process != nil {
     rpc_close(server.process)
@@ -827,7 +827,7 @@ fn lsp_start(app: *App, language: str, command: str) {
   _ = copy_text(server.command[..], command)
   server.root_length = copy_text(server.root[..], app.workspace.project[..app.workspace.project_length])
   server.process = rpc_open(&server.command[0], &server.root[0])
-  server.attach_scan=true
+  server.attach_scan = true
   if server.process == nil {
     lsp_failure_record(app, language, "could not start the server program")
     notice(app, "Could not start language server.")
@@ -849,7 +849,7 @@ fn lsp_start(app: *App, language: str, command: str) {
   app.prompt_state.panel = .None
 }
 fn lsp_for(app: *App) usize {
-  active_slot:=app.documents.slots[app.documents.active]
+  active_slot := app.documents.slots[app.documents.active]
   configured_filetype_slot(app, active_slot)
   language := filetype_name(active_slot)
   for index in 0..8 {
@@ -874,9 +874,9 @@ fn lsp_document_position(doc: *const buffer.Document, offset: usize) lsp.Positio
 }
 // One queued slot is the unit of synchronization. Never retain its metadata
 // pointer across a send that can stop the server and release the arena.
-fn lsp_sync_slot(app:*App, index:usize, slot_index:usize, force:bool) bool {
-  server:=&app.lsp.servers[index]
-  if slot_index>=app.documents.slots.len || slot_index>=server.documents.len { return true }
+fn lsp_sync_slot(app: *App, index: usize, slot_index: usize, force: bool) bool {
+  server := &app.lsp.servers[index]
+  if slot_index >= app.documents.slots.len || slot_index >= server.documents.len { return true }
   slot := app.documents.slots[slot_index]
   configured_filetype_slot(app, slot)
   tracked := &server.documents[slot_index]
@@ -904,14 +904,14 @@ fn lsp_sync_slot(app:*App, index:usize, slot_index:usize, force:bool) bool {
     lsp_detach_slot(app, index, slot)
   }
   if !matches { return true }
-  if tracked.identity!=0 {
+  if tracked.identity != 0 {
     lsp_attach_slot(app, index, slot)
   }
   doc := slot.document
   if tracked.identity == slot.identity && tracked.saved_epoch != doc.saved_epoch && !buffer.dirty_cached(doc) {
     lsp_saved(app, index, slot_index)
     // Sending didSave can stop the server and free tracking metadata.
-    if !server.ready || server.process==nil { return false }
+    if !server.ready || server.process == nil { return false }
   }
   if tracked.identity == slot.identity && tracked.revision == doc.revision { return true }
   if tracked.observed != doc.revision {
@@ -960,7 +960,7 @@ fn lsp_sync_slot(app:*App, index:usize, slot_index:usize, force:bool) bool {
   if server.encode != nil && !force && sent_high - sent_low >= LspParallelEscape { return false }
   // Versions are unique within this connection, including when a URI moves
   // to another slot. LSP's signed integer range must never wrap or repeat.
-  if server.next_document_version>=2147483647 {
+  if server.next_document_version >= 2147483647 {
     lsp_note(app, "Language-server document versions exhausted. Use :lsp-restart.")
     lsp_stop(app, index)
     return false
@@ -989,8 +989,8 @@ fn lsp_sync_slot(app:*App, index:usize, slot_index:usize, force:bool) bool {
   } else {
     lsp_header(message, &used, "textDocument/didChange", 0)
   }
-  server.next_document_version+=1
-  tracked.version=server.next_document_version
+  server.next_document_version += 1
+  tracked.version = server.next_document_version
   add_text(message, &used, "{\"textDocument\":{\"uri\":")
   lsp_document_uri(app.scratch, message, &used, files.name(&slot.file))
   add_text(message, &used, ",\"version\":")
@@ -1060,56 +1060,56 @@ fn lsp_sync_slot(app:*App, index:usize, slot_index:usize, force:bool) bool {
   tracked.end = lsp_document_position(doc, doc.length)
   tracked.length = copy_text(tracked.path[..], files.name(&slot.file))
   lsp_attach_slot(app, index, slot)
-  if tracked.saved_epoch!=doc.saved_epoch && !buffer.dirty_cached(doc) {
+  if tracked.saved_epoch != doc.saved_epoch && !buffer.dirty_cached(doc) {
     lsp_saved(app, index, slot_index)
-    if !server.ready || server.process==nil { return false }
+    if !server.ready || server.process == nil { return false }
   }
   return true
 }
-fn lsp_sync(app:*App, index:usize, force:bool) {
-  server:=&app.lsp.servers[index]
+fn lsp_sync(app: *App, index: usize, force: bool) {
+  server := &app.lsp.servers[index]
   if !server.ready { return }
-  if lsp_allocation_wait(server, platform.ticks())>0 { return }
-  server.allocation_retry_due=0
+  if lsp_allocation_wait(server, platform.ticks()) > 0 { return }
+  server.allocation_retry_due = 0
   // A server attaches the existing workspace once. Later edits/lifecycle
   // changes arrive through stable-slot worksets rather than polling buffers.
   if server.attach_scan {
     for slot_index in 0..app.documents.slots.len {
       lsp_queue_slot(app, index, app.documents.slots[slot_index])
     }
-    server.attach_scan=false
+    server.attach_scan = false
   }
-  if force && app.documents.active<app.documents.slots.len {
+  if force && app.documents.active < app.documents.slots.len {
     lsp_queue_slot(app, index, app.documents.slots[app.documents.active])
   }
-  if server.dirty_first==nil { return }
+  if server.dirty_first == nil { return }
   if !lsp_documents_ensure(server, app.documents.slots.len) {
     lsp_allocation_retry(server, platform.ticks())
     lsp_note(app, "Could not grow language-server document tracking.")
     return
   }
-  previous:*Slot=nil
-  slot:=server.dirty_first
-  for slot!=nil {
-    next:=slot.lsp_dirty_next[index]
-    completed:=lsp_sync_slot(app, index, slot.index, force && slot.index==app.documents.active)
-    if !server.ready || server.process==nil { return }
+  previous: *Slot = nil
+  slot := server.dirty_first
+  for slot != nil {
+    next := slot.lsp_dirty_next[index]
+    completed := lsp_sync_slot(app, index, slot.index, force && slot.index == app.documents.active)
+    if !server.ready || server.process == nil { return }
     if completed {
-      if previous==nil {
-        server.dirty_first=next
+      if previous == nil {
+        server.dirty_first = next
       } else {
-        previous.lsp_dirty_next[index]=next
+        previous.lsp_dirty_next[index] = next
       }
-      if next==nil {
-        server.dirty_last=previous
+      if next == nil {
+        server.dirty_last = previous
       }
-      slot.lsp_dirty_mask&=~(#cast(u32, 1)<<#cast(u32, index))
-      slot.lsp_dirty_next[index]=nil
+      slot.lsp_dirty_mask &= ~(#cast(u32, 1) << #cast(u32, index))
+      slot.lsp_dirty_next[index] = nil
     } else {
-      previous=slot
+      previous = slot
     }
-    if server.allocation_retry_due!=0 { return }
-    slot=next
+    if server.allocation_retry_due != 0 { return }
+    slot = next
   }
 }
 fn lsp_position(out: []u8, used: *usize, position: lsp.Position) {
@@ -1140,9 +1140,9 @@ fn lsp_request(app: *App, kind: LspRequest, argument: str) {
     return
   }
   lsp_sync(app, index, true)
-  if server.process == nil || server.allocation_retry_due!=0 { return }
-  active:=app.documents.active
-  if active>=server.documents.len || server.documents[active].identity!=app.documents.slots[active].identity || server.documents[active].revision!=app.documents.current.revision {
+  if server.process == nil || server.allocation_retry_due != 0 { return }
+  active := app.documents.active
+  if active >= server.documents.len || server.documents[active].identity != app.documents.slots[active].identity || server.documents[active].revision != app.documents.current.revision {
     return
   }
   lsp_cancel_request(app)
@@ -1256,14 +1256,14 @@ fn lsp_request(app: *App, kind: LspRequest, argument: str) {
 fn lsp_diagnostics(app: *App, index: usize, params: *const json.Value) {
   storage: [4096]u8
   path := lsp.path(json_text(params, "uri"), storage[..])
-  count:=app.documents.slots.len
-  if count>app.lsp.servers[index].documents.len {
-    count=app.lsp.servers[index].documents.len
+  count := app.documents.slots.len
+  if count > app.lsp.servers[index].documents.len {
+    count = app.lsp.servers[index].documents.len
   }
   for slot_index in 0..count {
     slot := app.documents.slots[slot_index]
     tracked := &app.lsp.servers[index].documents[slot_index]
-    if slot.document != nil && tracked.identity!=0 && tracked.identity==slot.identity && path.len > 0 && buffer.equal(files.name(&slot.file), path) && tracked.revision == slot.document.revision && buffer.equal(filetype_name(slot), app.lsp.servers[index].language[..app.lsp.servers[index].length]) {
+    if slot.document != nil && tracked.identity != 0 && tracked.identity == slot.identity && path.len > 0 && buffer.equal(files.name(&slot.file), path) && tracked.revision == slot.document.revision && buffer.equal(filetype_name(slot), app.lsp.servers[index].language[..app.lsp.servers[index].length]) {
       version := lsp.number(json.object_get(params, "version"))
       if version.valid && version.value != tracked.version { return }
       diagnostics := &slot.diagnostics
@@ -2060,7 +2060,7 @@ fn diagnostics_popup(app: *App, output: []u8) usize {
 
 fn lsp_saved(app: *App, index: usize, slot_index: usize) {
   server := &app.lsp.servers[index]
-  if slot_index>=app.documents.slots.len || slot_index>=server.documents.len { return }
+  if slot_index >= app.documents.slots.len || slot_index >= server.documents.len { return }
   slot := app.documents.slots[slot_index]
   tracked := &server.documents[slot_index]
   if !server.save {
@@ -2107,36 +2107,36 @@ fn lsp_saved(app: *App, index: usize, slot_index: usize) {
   }
 }
 
-fn lsp_wait_ms(app:*App, fallback:i32)i32 {
-  delay:=fallback
-  now:=platform.ticks()
+fn lsp_wait_ms(app: *App, fallback: i32)i32 {
+  delay := fallback
+  now := platform.ticks()
   for index in 0..8 {
-    server:=&app.lsp.servers[index]
+    server := &app.lsp.servers[index]
     if !server.ready { continue }
-    retry:=lsp_allocation_wait(server, now)
-    if retry>=0 {
-      if delay<0 || retry<delay {
-        delay=retry
+    retry := lsp_allocation_wait(server, now)
+    if retry >= 0 {
+      if delay < 0 || retry < delay {
+        delay = retry
       }
       continue
     }
     if server.attach_scan { return 0 }
-    slot:=server.dirty_first
-    for slot!=nil {
-      remaining:u64=0
-      if slot.index<server.documents.len && slot.document!=nil {
-        tracked:=&server.documents[slot.index]
-        if tracked.identity!=0 && tracked.identity==slot.identity && tracked.revision!=slot.document.revision && tracked.observed==slot.document.revision {
-          due:=tracked.changed+#cast(u64, app.config.lsp_change_delay_ms)
-          if due>now {
-            remaining=due-now
+    slot := server.dirty_first
+    for slot != nil {
+      remaining: u64 = 0
+      if slot.index < server.documents.len && slot.document != nil {
+        tracked := &server.documents[slot.index]
+        if tracked.identity != 0 && tracked.identity == slot.identity && tracked.revision != slot.document.revision && tracked.observed == slot.document.revision {
+          due := tracked.changed + #cast(u64, app.config.lsp_change_delay_ms)
+          if due > now {
+            remaining = due - now
           }
         }
       }
-      if delay<0 || remaining<#cast(u64, delay) {
-        delay=#cast(i32, remaining)
+      if delay < 0 || remaining < #cast(u64, delay) {
+        delay = #cast(i32, remaining)
       }
-      slot=slot.lsp_dirty_next[index]
+      slot = slot.lsp_dirty_next[index]
     }
   }
   return delay

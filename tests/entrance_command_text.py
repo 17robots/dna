@@ -12,7 +12,7 @@ with tempfile.TemporaryDirectory(prefix='dna-entrance-event-',dir=ROOT/'build') 
  s+='\nentrance_event_now:u64=1000\n'
  platform.write_text(s)
  gui=stage/'platform/gui.dyn';s=gui.read_text()
- start=s.index('  for native_gui.deferred_count!=0',s.index('fn gui_poll('));end=s.index('\nfn gui_wait_timeout(',start)
+ start=s.index('  for native_gui.deferred_count != 0',s.index('fn gui_poll('));end=s.index('\nfn gui_wait_timeout(',start)
  s=s[:start]+'  return false\n}\n'+s[end:]
  start=s.index('fn gui_wait_timeout(');end=s.index('\nfn gui_wait(',start)
  s=s[:start]+'''fn gui_wait_timeout(event:*Event,milliseconds:i32)bool {

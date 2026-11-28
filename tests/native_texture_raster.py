@@ -70,7 +70,7 @@ with tempfile.TemporaryDirectory(prefix='dna-native-texture-') as temporary:
  stage=Path(temporary)
  shared='\n'.join(function(SOURCE,n) for n in ('native_surface','native_clip','native_blend','native_blend_at','native_draw_alpha'))
  shared=patched(shared, 'fn native_clip(surface: software.Surface) ui.Rect {', 'fn native_clip(surface: software.Surface) ui.Rect {\n clips+=1')
- shared=patched(shared, 'fn native_blend_at(surface:*software.Surface, at:usize, r, g, b, a:u8) {','fn native_blend_at(surface:*software.Surface, at:usize, r, g, b, a:u8) {\n blends+=1')
+ shared=patched(shared, 'fn native_blend_at(surface: *software.Surface, at: usize, r, g, b, a: u8) {','fn native_blend_at(surface:*software.Surface, at:usize, r, g, b, a:u8) {\n blends+=1')
  copy='extern fn raw_span_copy "__mempcpy_chk"(destination:*u8,source:*const u8,length,capacity:usize)rawptr\nfn native_span_copy(destination:*u8,source:*const u8,length,capacity:usize)rawptr {span_copies+=1\n return raw_span_copy(destination,source,length,capacity)}\n'
  (stage/'main.dyn').write_text(HEADER+'\n'+copy+shared+'\n'+REFERENCE.read_text()+'\n'+function(SOURCE,'gui_render_texture'))
  for mode in ('debug','release'):
