@@ -107,8 +107,10 @@ def test_jobs(lib, work):
         assert output.raw[:size] == data.upper()
     finally:
         lib.dna_job_close(job)
-    for command, expected in ((b'exit /b 7', 3), (b'ping -n 20 127.0.0.1 >nul', 5)):
-        job = lib.dna_job_open(command, str(work).encode('utf-8'), b'', 0, 100)
+    # The failing command gets time to start and exit on a slow runner, so it
+    # can only report failure (3); the long one can only time out (5).
+    for command, expected, limit in ((b'exit /b 7', 3, 10000), (b'ping -n 20 127.0.0.1 >nul', 5, 100)):
+        job = lib.dna_job_open(command, str(work).encode('utf-8'), b'', 0, limit)
         assert job
         try:
             await_value(lambda: lib.dna_job_status(job) != 1, 'job failure/timeout')
