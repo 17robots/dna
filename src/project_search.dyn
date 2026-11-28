@@ -1,7 +1,19 @@
+// A project search is running, finished, has an invalid pattern, or stopped
+// with partial results (file or work limit, unreadable files).
+enum ProjectFindStatus { Done, Searching, Invalid, Partial }
+// The native worker's status numbers, in ProjectFindStatus order.
+fn project_find_status(native: i32) ProjectFindStatus {
+  case native {
+    1 => { return .Searching }
+    2 => { return .Invalid }
+    3 => { return .Partial }
+    _ => { return .Done }
+  }
+}
 struct ProjectSearchState {
   worker: rawptr,
   count: usize,
-  status: i32,
+  status: ProjectFindStatus,
   root: [4096]u8,
   root_length: usize,
   query: [4096]u8,
@@ -34,15 +46,15 @@ fn project_search_refresh(app: *App) {
   app.project_find.query_length = copy_text(app.project_find.query[..], app.prompt_state.text[..app.prompt_state.length])
   app.prompt_state.selected = 0
   app.project_find.count = 0
-  app.project_find.status = 1
+  app.project_find.status = .Searching
   project_search_submit(app.project_find.worker, &app.project_find.root[0], &app.prompt_state.text[0])
 }
 fn project_search_tick(app: *App) bool {
   status: i32 = 0
   count := project_search_count(app.project_find.worker, &status)
-  changed := count != app.project_find.count || status != app.project_find.status
+  changed := count != app.project_find.count || project_find_status(status) != app.project_find.status
   app.project_find.count = count
-  app.project_find.status = status
+  app.project_find.status = project_find_status(status)
   return changed && app.prompt_state.panel == .ProjectSearch
 }
 fn project_search_close(app: *App) {
@@ -132,13 +144,13 @@ fn draw_project_search(renderer: rawptr, app: *App, typography: *Typography, wid
   if count == 0 {
     footer = "No matches in saved files. Type a regular expression."
   }
-  if app.project_find.status == 1 {
+  if app.project_find.status == .Searching {
     footer = "Searching saved files… edit query to restart; esc closes"
   }
-  if app.project_find.status == 2 {
+  if app.project_find.status == .Invalid {
     footer = "Invalid regular expression. Edit query to retry."
   }
-  if app.project_find.status == 3 {
+  if app.project_find.status == .Partial {
     footer = "Partial results: file/work limit or unreadable files. Narrow search."
   }
   ui_sheet_end(ui, footer)

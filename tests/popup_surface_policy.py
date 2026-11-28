@@ -34,19 +34,19 @@ placed_frames:[8]u64
 fn place_of(app:*const App,surface:usize)settings.Placement{return app.config.placement}
 '''+function(s,'surface_motion_enabled')+function(s,'animated_surface')+'''
 fn equal(a,b:platform.Rect) bool {return a.x==b.x && a.y==b.y && a.width==b.width && a.height==b.height}
-fn dock_case(side:u8) {
+fn dock_case(side:settings.PlaceSide) {
  app:=App{config:Config{popup_animation_ms:40.0,popup_transitions:true}}
  app.config.placement=settings.Placement{mode:.Dock,side:side}
  app.view.animation.surfaces_ready=true
  app.ui.frame=10
  target:=platform.Rect{width:1000.0,height:600.0}
  pane_target:[4]f32=[0.0,0.0,1000.0,600.0]
- if side==0 {target.width=200.75
+ if side==.Left {target.width=200.75
   pane_target[0]=200.0}
- else if side==1 {target.x=799.25
+ else if side==.Right {target.x=799.25
   target.width=200.75
   pane_target[2]=799.0}
- else if side==2 {target.height=120.75
+ else if side==.Top {target.height=120.75
   pane_target[1]=120.0}
  else {target.y=479.25
   target.height=120.75
@@ -61,15 +61,16 @@ fn dock_case(side:u8) {
   app.view.animation.now+=step
   shown:=animated_surface(&app,3,target,1.0)
   motion.rectangle_step(&pane,pane_target,app.view.animation.now,step,70.0,false)
-  if side==0 && shown.x+shown.width!=#cast(f32,#cast(i32,pane.current[0]+0.5)) {#panic("left dock lost shared animated boundary")}
-  if side==1 && shown.x!=#cast(f32,#cast(i32,pane.current[2]+0.5)) {#panic("right dock lost shared animated boundary")}
-  if side==2 && shown.y+shown.height!=#cast(f32,#cast(i32,pane.current[1]+0.5)) {#panic("top dock lost shared animated boundary")}
-  if side==3 && shown.y!=#cast(f32,#cast(i32,pane.current[3]+0.5)) {#panic("bottom dock lost shared animated boundary")}
+  if side==.Left && shown.x+shown.width!=#cast(f32,#cast(i32,pane.current[0]+0.5)) {#panic("left dock lost shared animated boundary")}
+  if side==.Right && shown.x!=#cast(f32,#cast(i32,pane.current[2]+0.5)) {#panic("right dock lost shared animated boundary")}
+  if side==.Top && shown.y+shown.height!=#cast(f32,#cast(i32,pane.current[1]+0.5)) {#panic("top dock lost shared animated boundary")}
+  if side==.Bottom && shown.y!=#cast(f32,#cast(i32,pane.current[3]+0.5)) {#panic("bottom dock lost shared animated boundary")}
   if !equal(shown,placed_rects[3]) {#panic("docked placement hits differ from paint")}
  }
 }
 fn main() {
- for side in 0..4 {dock_case(#cast(u8,side))}
+ sides:[4]settings.PlaceSide=[settings.PlaceSide.Left,settings.PlaceSide.Right,settings.PlaceSide.Top,settings.PlaceSide.Bottom]
+ for side in sides {dock_case(side)}
  app:=App{config:Config{popup_animation_ms:40.0,popup_transitions:true}}
  app.ui.frame=1
  target:=platform.Rect{x:100.25,y:80.75,width:600.5,height:400.5}
@@ -129,7 +130,7 @@ with tempfile.TemporaryDirectory(prefix='dna-popup-policy-') as temporary:
  work=Path(temporary);shutil.copytree(ROOT/'src/motion',work/'motion');(work/'platform').mkdir()
  (work/'platform/platform.dyn').write_text('pub struct Rect{x,y,width,height:f32}\npub terminal:bool\npub fn tui_active()bool{return terminal}\n')
  (work/'settings').mkdir()
- (work/'settings/settings.dyn').write_text('pub enum PlaceMode{Default,Float,Dock,Cursor}\npub struct Placement{mode:PlaceMode,side:u8}\n')
+ (work/'settings/settings.dyn').write_text('pub enum PlaceMode{Default,Float,Dock,Cursor}\npub enum PlaceSide{Left,Right,Top,Bottom}\npub struct Placement{mode:PlaceMode,side:PlaceSide}\n')
  (work/'main.dyn').write_text(source)
  for mode in ('debug','release'):
   binary=work/'test'
