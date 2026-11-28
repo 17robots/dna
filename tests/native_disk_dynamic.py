@@ -45,7 +45,10 @@ def await_bytes(worker,index,identity,expected):
             out=c.create_string_buffer(max(len(expected)+1,4096))
             status=lib.dna_disk_take_at(worker,index,identity,out,len(out))
             if status==1 and out.value==expected:return
-            assert status in (1,5),(index,pending,status)
+            # 3: the file changed while the worker read it (a write or rename
+            # landed mid-read). The worker reads it again on its next pass; a
+            # lasting failure still ends in the timeout below.
+            assert status in (1,3,5),(index,pending,status)
         time.sleep(.002)
     raise AssertionError(('disk notification timeout',index,identity,expected))
 
